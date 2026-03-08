@@ -29,6 +29,11 @@ export class Localization {
         public static readonly DELETE_REMOTE_TITLE = "Delete Remote File";
         public static readonly DELETE_REMOTE_MESSAGE =
             (name: string) => `Are you sure you want to delete <b>${name}</b> from the remote server?`
+
+        public static readonly RESTART_TITLE = "Restart SeedSync";
+        public static readonly RESTART_MESSAGE =
+            "Are you sure you want to restart the server?<br /><br />" +
+            "Active downloads will pause briefly while the page reconnects."
     };
 
     static Log = class {
