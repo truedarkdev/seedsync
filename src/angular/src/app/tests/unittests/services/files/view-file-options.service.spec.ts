@@ -189,6 +189,30 @@ describe("Testing view file options service", () => {
         );
     }));
 
+    it("should load selectedStatusFilter from storage", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) {
+                return ViewFile.Status.EXTRACTED;
+            }
+        });
+        viewOptionsService = createViewOptionsService();
+        expect(storageService.get).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER
+        );
+
+        let count = 0;
+        let selectedStatusFilter = null;
+        viewOptionsService.options.subscribe({
+            next: options => {
+                selectedStatusFilter = options.selectedStatusFilter;
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(1);
+        expect(selectedStatusFilter).toBe(ViewFile.Status.EXTRACTED);
+    }));
+
     it("should forward updates to selectedStatusFilter", fakeAsync(() => {
         let count = 0;
         let selectedStatusFilter = null;
@@ -224,6 +248,44 @@ describe("Testing view file options service", () => {
         expect(count).toBe(4);
     }));
 
+    it("should save selectedStatusFilter to storage", fakeAsync(() => {
+        spyOn(storageService, "set");
+        viewOptionsService.setSelectedStatusFilter(ViewFile.Status.EXTRACTED);
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER,
+            ViewFile.Status.EXTRACTED
+        );
+        viewOptionsService.setSelectedStatusFilter(null);
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER,
+            null
+        );
+    }));
+
+    it("should load nameFilter from storage", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.VIEW_OPTION_NAME_FILTER) {
+                return "tofu";
+            }
+        });
+        viewOptionsService = createViewOptionsService();
+        expect(storageService.get).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_NAME_FILTER
+        );
+
+        let count = 0;
+        let nameFilter = null;
+        viewOptionsService.options.subscribe({
+            next: options => {
+                nameFilter = options.nameFilter;
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(1);
+        expect(nameFilter).toBe("tofu");
+    }));
+
     it("should forward updates to nameFilter", fakeAsync(() => {
         let count = 0;
         let nameFilter = null;
@@ -257,6 +319,20 @@ describe("Testing view file options service", () => {
         tick();
         expect(nameFilter).toBeNull();
         expect(count).toBe(4);
+    }));
+
+    it("should save nameFilter to storage", fakeAsync(() => {
+        spyOn(storageService, "set");
+        viewOptionsService.setNameFilter("tofu");
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_NAME_FILTER,
+            "tofu"
+        );
+        viewOptionsService.setNameFilter(null);
+        expect(storageService.set).toHaveBeenCalledWith(
+            StorageKeys.VIEW_OPTION_NAME_FILTER,
+            null
+        );
     }));
 
     it("should forward updates to pinFilter", fakeAsync(() => {

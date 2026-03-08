@@ -13,7 +13,10 @@
     <div id="filter-status" class="dropdown" >
         <button class="btn btn-secondary dropdown-toggle"
                 type="button"
-                data-toggle="dropdown">
+                data-toggle="dropdown"
+                data-bs-toggle="dropdown"
+                aria-haspopup="true"
+                aria-expanded="false">
             <div class="title">
                 Status:
             </div>
@@ -65,45 +68,51 @@
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.EXTRACTED"
-                 [class.disabled]="isExtractedStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.EXTRACTED) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.EXTRACTED)">
                 <div class="icon"><img src="assets/icons/extracted.svg" class="extracted" /></div>
                 <span class="text">Extracted</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.EXTRACTED) }}</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.EXTRACTING"
-                 [class.disabled]="isExtractingStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.EXTRACTING) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.EXTRACTING)">
                 <div class="icon"><img src="assets/icons/extracting.svg" class="extracting" /></div>
                 <span class="text">Extracting</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.EXTRACTING) }}</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.DOWNLOADED"
-                 [class.disabled]="isDownloadedStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.DOWNLOADED) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.DOWNLOADED)">
                 <div class="icon"><img src="assets/icons/downloaded.svg" class="downloaded" /></div>
                 <span class="text">Downloaded</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.DOWNLOADED) }}</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.DOWNLOADING"
-                 [class.disabled]="isDownloadingStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.DOWNLOADING) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.DOWNLOADING)">
                 <div class="icon"><img src="assets/icons/downloading.svg" class="downloading" /></div>
                 <span class="text">Downloading</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.DOWNLOADING) }}</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.QUEUED"
-                 [class.disabled]="isQueuedStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.QUEUED) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.QUEUED)">
                 <div class="icon"><img src="assets/icons/queued.svg" class="queued" /></div>
                 <span class="text">Queued</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.QUEUED) }}</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.STOPPED"
-                 [class.disabled]="isStoppedStatusEnabled ? null : true"
+                 [class.disabled]="isStatusDisabled(ViewFile.Status.STOPPED) ? true : null"
                  (click)="onFilterByStatus(ViewFile.Status.STOPPED)">
                 <div class="icon"><img src="assets/icons/stopped.svg" class="stopped" /></div>
                 <span class="text">Stopped</span>
+                <span class="count">{{ getStatusCount(ViewFile.Status.STOPPED) }}</span>
             </div>
         </div>
     </div>
@@ -111,7 +120,10 @@
     <div id="sort-status" class="dropdown" >
         <button class="btn btn-secondary dropdown-toggle"
                 type="button"
-                data-toggle="dropdown">
+                data-toggle="dropdown"
+                data-bs-toggle="dropdown"
+                aria-haspopup="true"
+                aria-expanded="false">
             <div class="title">
                 Sort:
             </div>

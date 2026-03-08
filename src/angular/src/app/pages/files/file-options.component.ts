@@ -21,16 +21,17 @@ export class FileOptionsComponent implements OnInit {
     public ViewFile = ViewFile;
     public ViewFileOptions = ViewFileOptions;
 
+    public statusCounts = {
+        [ViewFile.Status.EXTRACTED]: 0,
+        [ViewFile.Status.EXTRACTING]: 0,
+        [ViewFile.Status.DOWNLOADED]: 0,
+        [ViewFile.Status.DOWNLOADING]: 0,
+        [ViewFile.Status.QUEUED]: 0,
+        [ViewFile.Status.STOPPED]: 0
+    };
+
     public options: Observable<ViewFileOptions>;
     public headerHeight: Observable<number>;
-
-    // These track which status filters are enabled
-    public isExtractedStatusEnabled = false;
-    public isExtractingStatusEnabled = false;
-    public isDownloadedStatusEnabled = false;
-    public isDownloadingStatusEnabled = false;
-    public isQueuedStatusEnabled = false;
-    public isStoppedStatusEnabled = false;
 
     private _latestOptions: ViewFileOptions;
 
@@ -43,24 +44,24 @@ export class FileOptionsComponent implements OnInit {
     }
 
     ngOnInit() {
-        // Use the unfiltered files to enable/disable the filter status buttons
+        // Use the unfiltered files so filter counts reflect the full file list.
         this._viewFileService.files.subscribe(files => {
-            this.isExtractedStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.EXTRACTED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.EXTRACTED
             );
-            this.isExtractingStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.EXTRACTING] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.EXTRACTING
             );
-            this.isDownloadedStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.DOWNLOADED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.DOWNLOADED
             );
-            this.isDownloadingStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.DOWNLOADING] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.DOWNLOADING
             );
-            this.isQueuedStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.QUEUED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.QUEUED
             );
-            this.isStoppedStatusEnabled = FileOptionsComponent.isStatusEnabled(
+            this.statusCounts[ViewFile.Status.STOPPED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.STOPPED
             );
             this._changeDetector.detectChanges();
@@ -90,7 +91,20 @@ export class FileOptionsComponent implements OnInit {
         this.viewFileOptionsService.setPinFilter(!this._latestOptions.pinFilter);
     }
 
-    private static isStatusEnabled(files: Immutable.List<ViewFile>, status: ViewFile.Status) {
-        return files.findIndex(f => f.status === status) >= 0;
+    public getStatusCount(status: ViewFile.Status) {
+        return this.statusCounts[status] || 0;
+    }
+
+    public isStatusAvailable(status: ViewFile.Status) {
+        return this.getStatusCount(status) > 0;
+    }
+
+    public isStatusDisabled(status: ViewFile.Status) {
+        return !this.isStatusAvailable(status) &&
+            (!this._latestOptions || this._latestOptions.selectedStatusFilter !== status);
+    }
+
+    private static getStatusCount(files: Immutable.List<ViewFile>, status: ViewFile.Status) {
+        return files.count(file => file.status === status);
     }
 }
