@@ -1,5 +1,7 @@
 import {AfterViewInit, Component, ElementRef, OnDestroy, OnInit, ViewChild} from "@angular/core";
 import {NavigationEnd, Router} from "@angular/router";
+import {Subject} from "rxjs/Subject";
+import "rxjs/add/operator/takeUntil";
 import {ROUTE_INFOS, RouteInfo} from "../../routes";
 
 import {DomService} from "../../services/utils/dom.service";
@@ -14,22 +16,23 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     showSidebar = false;
     activeRoute: RouteInfo;
+    private _destroy$: Subject<void> = new Subject<void>();
     private _resizeObserver: any = null;
 
     constructor(private router: Router,
-                private _domService: DomService) {
+                private _domService: DomService) {}
+
+    ngOnInit() {
         // Navigation listener
         //    Close the sidebar
         //    Store the active route
-        router.events.subscribe(() => {
+        this.router.events.takeUntil(this._destroy$).subscribe(() => {
             this.showSidebar = false;
-            this.activeRoute = ROUTE_INFOS.find(value => "/" + value.path === router.url);
+            this.activeRoute = ROUTE_INFOS.find(value => "/" + value.path === this.router.url);
         });
-    }
 
-    ngOnInit() {
         // Scroll to top on route changes
-        this.router.events.subscribe((evt) => {
+        this.router.events.takeUntil(this._destroy$).subscribe((evt) => {
             if (!(evt instanceof NavigationEnd)) {
                 return;
             }
@@ -54,6 +57,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         if (this._resizeObserver) {
             this._resizeObserver.disconnect();
         }
+        this._destroy$.next();
+        this._destroy$.complete();
     }
 
     title = "app";

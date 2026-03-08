@@ -7,10 +7,12 @@
     #wrapper {
         margin-top: 50px;
         text-align: center;
+        max-width: 520px;
 
         #banner {
             display: flex;
             align-items: center;
+            justify-content: center;
 
             img {
                 max-width: 80px;
@@ -28,10 +30,34 @@
 
         #version {
             font-size: 150%;
+            margin-top: 10px;
+        }
+
+        #description {
+            margin-top: 15px;
+            line-height: 1.5;
+        }
+
+        #project-links {
+            margin-top: 20px;
+
+            div {
+                margin-top: 6px;
+            }
+        }
+
+        #copyright {
+            margin-top: 20px;
+        }
+
+        #fork-note {
+            margin-top: 10px;
+            color: $gray;
         }
 
         #icons {
             font-size: 80%;
+            margin-top: 20px;
         }
     }
 }
