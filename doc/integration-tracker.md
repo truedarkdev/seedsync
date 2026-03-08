@@ -940,52 +940,59 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: 25c99a4
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: a8561cd
+- Reviewed in this pass: origin/master..thejuran/master (subject-relevant web/model/serialize/handler files)
+- Last reviewed upstream commit (inclusive): a8561cd
+- Resume from next: new relevant commits after a8561cd
+- New upstream since last pass: none recorded at pass close
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `d0b9195` adapted the low-risk REST status portions of `88d96a1` so config and auto-queue handlers now return `404` for missing resources and `409` for duplicate pattern creation, with the matching integration assertions updated.
+- `d0b9195` adapted current-architecture handler and stream unit coverage from `1896c58`, `637ab8e`, and `074630c` into focused tests for config, auto-queue, server, status, model-stream, and status-stream behavior.
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `bb283e6` was already integrated in Subject 10 via `19f697d`.
+- `0a4a410`, `b9a3220`, and `9048377` were already handled during Subject 6 security/config-redaction work.
 
 Skipped:
-- none
+- `88d96a1` controller-side callback status propagation was skipped in this pass because it overlaps controller command behavior and belongs with later Subject 18 review.
+- `a50a6ec` and `05a0003` were skipped because the POST/DELETE mutation routing and endpoint-timeout wrappers depend on a broader newer controller/web contract than this branch currently carries.
+- `0cb3228` was skipped because the current pinned Bottle `0.12.19` path does not reproduce the `_stop_flag` attribute conflict; revisit only if Bottle is upgraded later.
+- `4c485d9` and `6e680df` remain classified under Subject 6 because they are primarily security-hardening changes rather than low-risk API semantics.
+- `df868bc`, `5c7bfc8`, `a4cbdc6`, `4533679`, and `7297af2` remain classified under Subject 12 because they are bulk file-operation API work coupled to files-page behavior.
+- `850f500`, `815a19d`, `cd8d78a`, `a92af56`, `2e54493`, and `9444eb2` were skipped here because they introduce larger webhook/import feature surfaces that belong with later model/controller feature subjects rather than this conservative API pass.
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `cd src/python && poetry run pytest -q tests/unittests/test_web/test_handler/test_auto_queue_handler.py tests/unittests/test_web/test_handler/test_config_handler.py tests/unittests/test_web/test_handler/test_server_handler.py tests/unittests/test_web/test_handler/test_status_handler.py tests/unittests/test_web/test_handler/test_stream_model_handler.py tests/unittests/test_web/test_handler/test_stream_status_handler.py tests/integration/test_web/test_handler/test_auto_queue.py tests/integration/test_web/test_handler/test_config.py`
+- manual checks: confirmed the adapted `88d96a1` slice stayed limited to clear REST status semantics for config and auto-queue handlers, and rechecked `0cb3228` against the current Bottle `0.12.19` environment before classifying it as a future dependency-upgrade follow-up instead of taking it blindly
+- status: verified for integrated batch
 
 Notes:
-- none
+- Subject 11 stays deliberately narrow in this pass: low-risk handler semantics and test coverage were taken, while broader controller contract and feature-surface changes were classified under later subjects instead of being half-merged here.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: 25c99a4
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: 6ce7c19
+- Reviewed in this pass: origin/master..rapidcopy/master (subject-relevant web/model/serialize/handler files)
+- Last reviewed upstream commit (inclusive): 6ce7c19
+- Resume from next: new relevant commits after 6ce7c19
+- New upstream since last pass: none recorded at pass close
+- Pass date: 2026-03-08
 
 Integrated:
 - none
@@ -994,21 +1001,23 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `de964a1` status error/failed field serialization is already present in current base behavior and did not require a new import.
 
 Skipped:
-- none
+- `5d3e1e8` and `aeb27fa` were skipped here because they depend on validation model states that are not yet present in this branch and belong with later validation/scanning work.
+- `8d6b436` was skipped because queued-file prioritization changes span file-operations and transfer semantics, which belong with Subjects 12 and 14 instead of this API-only pass.
+- `9f91d1c`, `9e1aeea`, `32acba6`, and `78a3fde` remain classified with Subject 6 and broader API-contract decisions rather than being pulled into this low-controversy Subject 11 batch.
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: none for rapidcopy-only candidates; no rapidcopy code was integrated in this pass
+- manual checks: reviewed rapidcopy's subject-relevant model/serialize/API deltas against current base and confirmed the remaining items are either already covered or belong to later validation, security, or transfer subjects
+- status: reviewed and classified
 
 Notes:
-- none
+- Subject 11 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining upstream work in this area was either integrated, consciously skipped, or classified under other subjects.
 
 ## Subject 12 - Files Page And File Operations UI
 
