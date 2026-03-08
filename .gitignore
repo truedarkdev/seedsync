@@ -5,4 +5,6 @@
 package-lock.json
 src/python/build
 src/python/site
+htmlcov/
+.coverage
 AGENTS.md
