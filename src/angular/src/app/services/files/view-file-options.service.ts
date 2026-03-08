@@ -29,6 +29,10 @@ export class ViewFileOptionsService {
         const sortMethod: ViewFileOptions.SortMethod =
             this._storage.get(StorageKeys.VIEW_OPTION_SORT_METHOD) ||
                 ViewFileOptions.SortMethod.STATUS;
+        const selectedStatusFilter: ViewFile.Status =
+            this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER);
+        const nameFilter: string =
+            this._storage.get(StorageKeys.VIEW_OPTION_NAME_FILTER);
         const pinFilter: boolean =
             this._storage.get(StorageKeys.VIEW_OPTION_PIN) || false;
 
@@ -36,8 +40,8 @@ export class ViewFileOptionsService {
             new ViewFileOptions({
                 showDetails: showDetails,
                 sortMethod: sortMethod,
-                selectedStatusFilter: null,
-                nameFilter: null,
+                selectedStatusFilter: selectedStatusFilter,
+                nameFilter: nameFilter,
                 pinFilter: pinFilter,
             })
         );
@@ -72,6 +76,7 @@ export class ViewFileOptionsService {
         if (options.selectedStatusFilter !== status) {
             const newOptions = new ViewFileOptions(options.set("selectedStatusFilter", status));
             this._options.next(newOptions);
+            this._storage.set(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER, status);
             this._logger.debug("ViewOption selectedStatusFilter set to: " + newOptions.selectedStatusFilter);
         }
     }
@@ -81,6 +86,7 @@ export class ViewFileOptionsService {
         if (options.nameFilter !== name) {
             const newOptions = new ViewFileOptions(options.set("nameFilter", name));
             this._options.next(newOptions);
+            this._storage.set(StorageKeys.VIEW_OPTION_NAME_FILTER, name);
             this._logger.debug("ViewOption nameFilter set to: " + newOptions.nameFilter);
         }
     }

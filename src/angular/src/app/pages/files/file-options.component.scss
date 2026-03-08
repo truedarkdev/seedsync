@@ -47,6 +47,7 @@
         .dropdown-item {
             color: white;
             height: 32px;
+            padding-right: 10px;
 
             display: flex;
             flex-direction: row;
@@ -74,6 +75,11 @@
             }
             .text {
                 margin-left: 5px;
+            }
+            .count {
+                margin-left: auto;
+                padding-left: 12px;
+                opacity: 0.8;
             }
         }
     }
