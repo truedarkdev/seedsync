@@ -95,8 +95,8 @@ class Checkers:
     @staticmethod
     def int_non_negative_max(max_val: int) -> Callable:
         def _checker(cls: T, name: str, value: int) -> int:
-            if value < 0:
-                raise ConfigError("Bad config: {}.{} ({}) must be zero or greater".format(
+            if value < 1:
+                raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
                     cls.__name__, name, value
                 ))
             if value > max_val:

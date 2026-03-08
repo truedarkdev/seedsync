@@ -216,7 +216,8 @@ class Seedsync:
         except OSError:
             existing_config_str = None
         if new_config_str != existing_config_str:
-            Seedsync.__backup_file(self.config_path)
+            if existing_config_str is not None:
+                Seedsync.__backup_file(self.config_path)
             with open(self.config_path, "w") as f:
                 f.write(new_config_str)
 

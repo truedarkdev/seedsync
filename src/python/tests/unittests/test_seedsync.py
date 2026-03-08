@@ -224,3 +224,27 @@ class TestSeedsync(unittest.TestCase):
                 self.assertEqual(new_config.to_str(), f.read())
         finally:
             os.remove(seedsync.config_path)
+
+    def test_persist_recreates_missing_config_without_backup(self):
+        config = Seedsync._create_default_config()
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = MagicMock()
+        seedsync.context.logger = MagicMock()
+        seedsync.context.config = config
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.controller_persist_path = "controller.persist"
+        seedsync.auto_queue_persist_path = "autoqueue.persist"
+        seedsync.config_path = tempfile.mktemp(suffix="settings.cfg")
+
+        try:
+            with patch.object(Seedsync, "_Seedsync__backup_file") as backup_file:
+                seedsync.persist()
+            backup_file.assert_not_called()
+            seedsync.controller_persist.to_file.assert_called_once_with("controller.persist")
+            seedsync.auto_queue_persist.to_file.assert_called_once_with("autoqueue.persist")
+            with open(seedsync.config_path, "r") as f:
+                self.assertEqual(config.to_str(), f.read())
+        finally:
+            if os.path.exists(seedsync.config_path):
+                os.remove(seedsync.config_path)
