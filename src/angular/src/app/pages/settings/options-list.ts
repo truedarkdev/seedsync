@@ -107,7 +107,9 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
             type: OptionType.Text,
             label: "Max Total Connections",
             valuePath: ["lftp", "num_max_total_connections"],
-            description: "Maximum number of connections.\n" +
+            description: "Maximum number of LFTP connections. Values above 32 are not recommended " +
+                         "because some systems can hit select() file descriptor limits. " +
+                         "Use 0 for no limit.\n" +
                          "(net:connection-limit)"
         },
         {

@@ -2,6 +2,7 @@ import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/co
 import {Observable} from "rxjs/Observable";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
+import {Modal} from "ngx-modialog/plugins/bootstrap";
 
 import {LoggerService} from "../../services/utils/logger.service";
 import {ConfigService} from "../../services/settings/config.service";
@@ -47,7 +48,8 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                 _streamServiceRegistry: StreamServiceRegistry,
                 private _configService: ConfigService,
                 private _notifService: NotificationService,
-                private _commandService: ServerCommandService) {
+                private _commandService: ServerCommandService,
+                private _modal: Modal) {
         this._connectedService = _streamServiceRegistry.connectedService;
         this.config = _configService.config;
         this.commandsEnabled = false;
@@ -113,14 +115,32 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     }
 
     onCommandRestart() {
-        this._commandService.restart().subscribe({
-            next: reaction => {
-                if (reaction.success) {
-                    this._logger.info(reaction.data);
-                } else {
-                    this._logger.error(reaction.errorMessage);
-                }
-            }
+        const dialogRef = this._modal.confirm()
+            .title(Localization.Modal.RESTART_TITLE)
+            .okBtn("Restart")
+            .okBtnClass("btn btn-primary")
+            .cancelBtn("Cancel")
+            .cancelBtnClass("btn btn-secondary")
+            .isBlocking(false)
+            .showClose(false)
+            .body(Localization.Modal.RESTART_MESSAGE)
+            .open();
+
+        dialogRef.then(dRef => {
+            dRef.result.then(
+                () => {
+                    this._commandService.restart().subscribe({
+                        next: reaction => {
+                            if (reaction.success) {
+                                this._logger.info(reaction.data);
+                            } else {
+                                this._logger.error(reaction.errorMessage);
+                            }
+                        }
+                    });
+                },
+                () => { return; }
+            );
         });
     }
 }
