@@ -492,6 +492,49 @@ Notes:
 
 ## Subject 6 - Security And Hardening
 
+## Verification Milestone A - Tooling, Packaging, And Compatibility Validation
+
+### local validation
+
+- State: reviewed
+- High-risk: no
+- Integration base: `master` @ `55dac61`
+- Source branch: local milestone validation
+- Fork tip seen at pass start: n/a
+- Reviewed in this pass: n/a
+- Last reviewed upstream commit (inclusive): n/a
+- Resume from next: milestone complete
+- New upstream since last pass: n/a
+- Pass date: 2026-03-08
+
+Integrated:
+- adapted from `thejuran` `8cab3ee` plus local dev-stage repair: keep the Docker Poetry bootstrap on a Python 3.8-compatible release and reinstall Poetry in `seedsync_run_python_devenv` before the second `poetry install`, so the app's pinned `requests` dependency no longer breaks Poetry itself during test-image setup
+- adapted from `thejuran` `e981c6b`, `f38ae7e`, and `655b6b2` plus a stretch-safe local install path: switch the Angular test image to archived Debian Stretch Chromium packages, add a stable `google-chrome-stable` symlink, and harden the Karma headless launchers used by `make run-tests-angular`
+- local test-image normalization: strip CRLF from `src/docker/test/python/entrypoint.sh` inside the Python test image so the container entrypoint runs correctly on Windows-backed checkouts
+
+Pending:
+- none
+
+Covered elsewhere:
+- the earlier Subject 5 browser/runtime notes about missing Chrome are resolved by this milestone's Angular test-image changes
+- the earlier Subject 5 Python/Poetry environment blocker is resolved by this milestone's Docker Poetry bootstrap changes
+
+Skipped:
+- full Angular/Node/Playwright replatforming: not needed to make the current verification path runnable
+- broader Python runtime uplift: not needed to make the current Python 3.8 test path runnable
+
+Maintainer decisions:
+- none
+
+Verification:
+- tests run: `git diff --check`; `make tests-python` (passed); `make run-tests-angular` (passed, 183 tests); `make run-tests-python` (environment now runs end-to-end under Docker and reaches real pytest execution; early suite failures observed in `tests/integration/test_controller/test_controller.py`, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`)
+- manual checks: confirmed `docker compose` test images build with working browser/runtime paths; verified `.github/workflows/master.yml` still calls the same `make run-tests-python` and `make run-tests-angular` entrypoints exercised locally
+- status: partially verified
+
+Notes:
+- This milestone completed its main purpose: Python and Angular verification are now runnable in the current local/CI container model instead of failing on missing tooling, missing browser binaries, or broken Poetry bootstraps.
+- The remaining Python issues are no longer environment blockers. They are real test or application failures and should be handled under the relevant later code subjects rather than by more packaging/tooling churn.
+
 ### thejuran
 
 - State: not started
