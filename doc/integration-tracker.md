@@ -341,7 +341,7 @@ Notes:
 Integrated:
 - adapted `a27e231` and `0fffbdf`: removed obsolete `dh-systemd` usage, raised the debhelper baseline, and stopped trying to derive host shared-library dependencies for the PyInstaller-built Debian package in local Subject 4 packaging updates
 - adapted `9759b76`, `ef283cc`, and `f2b4889`: modernized the deb build image so the PyInstaller stage still builds on current bases and ensured `scanfs` plus the Angular bundle land under the bundled `_internal` runtime layout expected by the packaged binary
-- adapted parts of `11b0944`, `7adbd5f`, `c83efbc`, `c32649c`, and `21bb73c`: fixed Docker build compatibility on current bases by creating the Angular output directory, making apt source edits work on modern slim images, using the image's bundled `pip` for Poetry, switching to `poetry install --only main`, normalizing `FROM ... AS` casing, and adding an OCI source label in the runtime image
+- adapted parts of `11b0944`, `7adbd5f`, `c83efbc`, `c32649c`, and `21bb73c`: fixed Docker build compatibility on current bases by creating the Angular output directory, making apt source edits work on modern slim images, using the image's bundled `pip` for Poetry, switching to `poetry install --only main`, normalizing `FROM ... AS` casing, normalizing copied helper-script line endings inside the image, and adding an OCI source label in the runtime image
 - adapted `777917a` as a packaging prerequisite: enabled `skipLibCheck` in `src/angular/tsconfig.json` so the legacy Angular build remains runnable inside the current Docker packaging flow
 
 Pending:
@@ -379,7 +379,7 @@ Notes:
 - Pass date: 2026-03-08
 
 Integrated:
-- adapted `207b75e` and `2e175c0`: ensured the runtime image fixes file modes for `/scripts/setup_default_config.sh` and the copied `/app/python` tree so the non-root container can execute the packaged startup path reliably
+- adapted `207b75e` and `2e175c0`: ensured the runtime image fixes file modes for `/scripts/setup_default_config.sh` and the copied `/app/python` tree so the non-root container can execute the packaged startup path reliably, while also normalizing copied helper scripts defensively for CRLF-prone Windows-backed checkouts
 
 Pending:
 - none
