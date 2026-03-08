@@ -27,10 +27,8 @@
 <div id="top-content">
     <div id="top-header">
         <!--
-            We attach the ResizeSensor to the header so that we can advertise its height
-            to other components, who can correctly position any sticky elements
-            Since ResizeSensor forces the div to be position: absolute, we create a wrapper
-            div to which to apply the sensor
+            Observe the header height so other components can correctly position
+            sticky elements without relying on the old ResizeSensor helper
          -->
         <div #topHeader>
 
