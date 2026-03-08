@@ -209,7 +209,16 @@ class Seedsync:
         self.context.logger.debug("Persisting states to file")
         self.controller_persist.to_file(self.controller_persist_path)
         self.auto_queue_persist.to_file(self.auto_queue_persist_path)
-        self.context.config.to_file(self.config_path)
+        new_config_str = self.context.config.to_str()
+        try:
+            with open(self.config_path, "r") as f:
+                existing_config_str = f.read()
+        except OSError:
+            existing_config_str = None
+        if new_config_str != existing_config_str:
+            Seedsync.__backup_file(self.config_path)
+            with open(self.config_path, "w") as f:
+                f.write(new_config_str)
 
     def signal(self, signum: int, _):
         # noinspection PyUnresolvedReferences

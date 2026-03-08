@@ -3,6 +3,9 @@
 import unittest
 import sys
 import copy
+import tempfile
+import os
+from unittest.mock import MagicMock, patch
 
 from common import overrides, Config
 from seedsync import Seedsync
@@ -168,3 +171,56 @@ class TestSeedsync(unittest.TestCase):
         config.lftp.remote_path_to_scan_script = incomplete_value
         self.assertTrue(Seedsync._detect_incomplete_config(config))
         config.lftp.remote_path_to_scan_script = "value"
+
+    def test_persist_does_not_rewrite_unchanged_config(self):
+        config = Seedsync._create_default_config()
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = MagicMock()
+        seedsync.context.logger = MagicMock()
+        seedsync.context.config = config
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.controller_persist_path = "controller.persist"
+        seedsync.auto_queue_persist_path = "autoqueue.persist"
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(config.to_str())
+            seedsync.config_path = f.name
+        try:
+            with patch.object(Seedsync, "_Seedsync__backup_file") as backup_file:
+                seedsync.persist()
+            backup_file.assert_not_called()
+            seedsync.controller_persist.to_file.assert_called_once_with("controller.persist")
+            seedsync.auto_queue_persist.to_file.assert_called_once_with("autoqueue.persist")
+            with open(seedsync.config_path, "r") as f:
+                self.assertEqual(config.to_str(), f.read())
+        finally:
+            os.remove(seedsync.config_path)
+
+    def test_persist_rewrites_changed_config(self):
+        old_config = Seedsync._create_default_config()
+        new_config = copy.deepcopy(old_config)
+        new_config.general.debug = not old_config.general.debug
+
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = MagicMock()
+        seedsync.context.logger = MagicMock()
+        seedsync.context.config = new_config
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.controller_persist_path = "controller.persist"
+        seedsync.auto_queue_persist_path = "autoqueue.persist"
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(old_config.to_str())
+            seedsync.config_path = f.name
+        try:
+            with patch.object(Seedsync, "_Seedsync__backup_file") as backup_file:
+                seedsync.persist()
+            backup_file.assert_called_once_with(seedsync.config_path)
+            seedsync.controller_persist.to_file.assert_called_once_with("controller.persist")
+            seedsync.auto_queue_persist.to_file.assert_called_once_with("autoqueue.persist")
+            with open(seedsync.config_path, "r") as f:
+                self.assertEqual(new_config.to_str(), f.read())
+        finally:
+            os.remove(seedsync.config_path)
