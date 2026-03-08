@@ -247,75 +247,81 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `19fb3ec3dd56c9f40afb331e2f461c3fd98cc18c`
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Reviewed in this pass: `origin/master..thejuran/master` (Subject 3 filtered)
+- Last reviewed upstream commit (inclusive): `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Resume from next: next commit after `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted `7f2de68`, `45ee834`, `a4356d4`, and `56463ad`: added `package-mode = false`, aligned `pytest`, `pytest-timeout`, and `pytest-cov` with the current Python 3.8 toolchain, regenerated `src/python/poetry.lock`, and switched the Makefile to `docker compose` in local commit `d7954f9`
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `0d0037d`: pytest `pythonpath` configuration already integrated in Subject 2 via `8c7be91`
+- `2bea28e` and `8a661e2`: GitHub Actions modernization and lowercase GHCR handling already integrated in Subject 2 via `8c7be91`
+- `c73205b`, `3f7af5c`, `b4fb946`, `4cbdaa5`, `2ae5173`, and `9392653`: ARM64, GLIBC, and CI matrix changes belong primarily to Subjects 4 and 5 rather than this tooling-only pass
 
 Skipped:
-- none
+- `9d72249`, `9a25b36`, `7042028`, and `4f19ec6`: broad Python 3.11 dependency refresh and lockfile modernization skipped for now because this branch still targets the existing Python 3.8 runtime baseline
+- Angular and Node upgrade chain from `ff2f075` through `5706eaf`: skipped for now because it would replace the current frontend/runtime stack and is too cross-cutting for a conservative Subject 3 pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `poetry lock --no-update` using a standalone Python 3.8 interpreter, `poetry check`, `poetry install --no-interaction --no-root`, and `poetry run pytest --version`
+- manual checks: reviewed Makefile and Poetry metadata diffs against the current Python 3.8 baseline; confirmed the Subject 2 test-tooling additions were previously unsatisfiable until this pass aligned the versions
+- status: verified for the integrated batch
 
 Notes:
-- none
+- This pass deliberately kept the repo on the current Python 3.8 toolchain. The larger Python 3.11, GLIBC, ARM64, and Angular modernization work was reviewed and explicitly left out rather than mixed into a small tooling correction batch.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `19fb3ec3dd56c9f40afb331e2f461c3fd98cc18c`
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Reviewed in this pass: `origin/master..rapidcopy/master` (Subject 3 filtered)
+- Last reviewed upstream commit (inclusive): `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Resume from next: next commit after `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- none directly; the local Subject 3 batch stayed closer to the current SeedSync toolchain than rapidcopy's broader modernization path
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `d37afa7`, `1513a91`, `e4ea3f4`, `9b2945f`, and `c70d948`: Poetry, pytest, and GitHub Actions adoption are already present in the current base or were advanced in Subject 2
+- `94b8f07` and `5df693d`: workflow and verification documentation belong to Subject 2 and later milestone validation rather than this subject
 
 Skipped:
-- none
+- `be58538`, `ad95ab2`, `035dc8c`, and `ab07571`: Python 3.11 dependency uplift, lockfile refresh, and new lint/type-check toolchain skipped for now because they would move the repo off the current Python/runtime baseline
+- `e0985b2` and `696866c`: Angular 18 and Playwright replatforming skipped for now because they are broad framework migrations rather than conservative tooling maintenance
+- rapidcopy-specific rename and publication-path changes in the Subject 3 surface were skipped because this repository remains a SeedSync integration fork rather than a rebrand
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: reused the local Subject 3 verification from `d7954f9`; no rapidcopy-specific code was imported directly
+- manual checks: compared rapidcopy's dependency and tooling changes against the current base and rejected the replatforming/rebranding portions as unnecessary divergence for this fork
+- status: verified for the integrated batch and reviewed for the skipped items
 
 Notes:
-- none
+- Rapidcopy has useful modernization ideas, but in this subject they are mostly packaged as Python 3.11, linting, Angular 18, and Playwright replatforming. Those were consciously left out to keep the fork conservative while broader compatibility subjects are still pending.
 
 ## Subject 4 - Packaging And Install
 
