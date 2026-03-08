@@ -42,12 +42,12 @@ Check the logs for details about the exact failure.
 On some servers you may see errors in the log like so:
 `Unpickling error: unpickling stack underflow b'bash: warning: setlocale: LC_ALL: cannot change locale`
 
-This means your remote server requires that the locale matches with the Seedsync app.
-We can fix this my changing the locale for Seedsync.
-For Seedsync docker, try adding the following options to the `docker run` command:
+This means your remote server requires that the locale matches with the SeedSync app.
+We can fix this by changing the locale for SeedSync.
+For SeedSync Docker installs, try adding the following options to the `docker run` command:
 ```
 -e LC_ALL=en_US.UTF-8
 -e LANG=en_US.UTF-8
 ```
 
-See [this issue](https://github.com/ipsingh06/seedsync/issues/66) for more details.
+See the [issue tracker](https://github.com/truedarkdev/seedsync/issues) for more details.

@@ -21,7 +21,7 @@ The following table describes the installation method supported for each platfor
 | Linux/Ubuntu 64-bit | &#9989;️  | &#9989; |
 | Raspberry Pi (v2, v3, v4) | &#9989;  | |
 | Windows | &#9989;  | |
-| MacOS | &#9989;  | |
+| macOS | &#9989;  | |
 
 Select the section for your platform:
 
@@ -181,7 +181,7 @@ It is strongly recommended that you set up key-based authentication.
 
 ## <a name="install-ubuntu"></a> Deb Package (Linux/Ubuntu)
 
-1. Download the deb package from the [latest](https://github.com/ipsingh06/seedsync/releases/latest) release
+1. Download the deb package from the [latest](https://github.com/truedarkdev/seedsync/releases/latest) release
 
 2. Install the deb package:
 
@@ -189,7 +189,7 @@ It is strongly recommended that you set up key-based authentication.
         sudo dpkg -i <deb file>
 
 3. During the first install, you will be prompted for a user name:
-   ![Install prompt for username](https://raw.githubusercontent.com/ipsingh06/seedsync/master/doc/images/install_1.png)
+   ![Install prompt for username](https://raw.githubusercontent.com/truedarkdev/seedsync/master/doc/images/install_1.png)
    This is the user under which the SeedSync service will run. The transferred files will be owned by this user.
    It is recommended that you set this to your user (and NOT root).
 

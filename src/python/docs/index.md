@@ -8,8 +8,13 @@ Welcome to SeedSync documentation!
 
 On the left navigation you will find useful links.
 
+This repository is a maintained integration fork of the original
+[ipsingh06/seedsync](https://github.com/ipsingh06/seedsync) project.
+
 
 External links:
 
-* Github: [ipsingh06/seedsync](https://github.com/ipsingh06/seedsync)
-* Docker Hub: [ipsingh06/seedsync](https://hub.docker.com/repository/docker/ipsingh06/seedsync)
+* GitHub: [truedarkdev/seedsync](https://github.com/truedarkdev/seedsync)
+* Releases: [Latest release](https://github.com/truedarkdev/seedsync/releases/latest)
+* Installation Guide: [install.md](install.md)
+* Usage Guide: [usage.md](usage.md)
