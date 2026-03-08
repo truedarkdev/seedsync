@@ -162,75 +162,86 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master @ 9792f9806466ff91fd47ad5216b62bc2c5c466ac
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: a8561cdc318460de32de082e3cf33f6b6a0093cb
+- Reviewed in this pass: origin/master..thejuran/master (Subject 2 filtered)
+- Last reviewed upstream commit (inclusive): a8561cdc318460de32de082e3cf33f6b6a0093cb
+- Resume from next: none at current tip
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted from `1f0fa87` -> `8c7be91`: update web handler integration tests to use POST for queue/stop/extract and DELETE for deletion endpoints
+- adapted from `a4356d4` and `56463ad` -> `8c7be91`: add pytest timeout and coverage configuration, shared pytest fixtures, coverage output ignores, and a `coverage-python` Make target
+- adapted from `2bea28e` plus repo-neutral portions of later workflow refreshes -> `8c7be91`: update deprecated GitHub Actions versions and switch GHCR CI logins to `GITHUB_TOKEN`
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- thejuran workflow and docker publish refinements such as `bbf1310`, `fd9c25f`, `eab6146`, and `a0b0e5f`: current pass took the safe action-version and GHCR-auth portions only; broader publishing behavior is better handled under packaging and install
+- test-only fixes coupled to later code subjects, such as `5e2a62c`, `4c1bbab`, and `a4faeef`: deferred because they depend on behavior changes that belong under extraction, cleanup, and controller subjects rather than standalone Subject 2 work
 
 Skipped:
-- none
+- Angular and Node compatibility migrations such as `ff2f075`, `d8fcb08`, `6a695ac`, and the Angular upgrade chain: too coupled to dependency and build-tooling work for a conservative Subject 2 pass
+- e2e environment and deb/docker matrix overhauls such as `0ac4470`, `b4fb946`, `c73205b`, `87d2d14`, and `984b8a1`: useful but tightly coupled to packaging, compatibility, and runtime-environment changes that should land with those subjects
+- selector-only e2e updates such as `1047141` and `641ea85`: depend on UI changes that have not been integrated yet
+- large new Python and Angular test suites such as `494ff3d`, `e9ac251`, `1896c58`, `637ab8e`, and later bulk-action/service test expansions: valuable, but too entangled with broader code changes to import cleanly during this narrow infrastructure-first pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `git diff --check`; `python3 -m py_compile src/python/tests/conftest.py src/python/tests/integration/test_web/test_handler/test_controller.py`
+- manual checks: parsed `src/python/pyproject.toml` with `tomllib` and reviewed the resulting CI/test-config diff against thejuran candidates
+- status: partially verified
 
 Notes:
-- none
+- A targeted `python3 -m pytest tests/integration/test_web/test_handler/test_controller.py -q` attempt failed in this shell because local Python dependencies such as `tblib` are not installed outside the project environment.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master @ 9792f9806466ff91fd47ad5216b62bc2c5c466ac
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269
+- Reviewed in this pass: origin/master..rapidcopy/master (Subject 2 filtered)
+- Last reviewed upstream commit (inclusive): c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269
+- Resume from next: none at current tip
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- no direct rapidcopy cherry-picks in this pass
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- workflow modernization in `94b8f07` and Playwright-enabling CI pieces in `5df693d`: conservative workflow refresh completed locally without adopting the rapidcopy-specific Playwright stack
+- Python test tooling modernization in `035dc8c`: core coverage tooling landed through the adapted thejuran-based pytest improvements without bringing in rapidcopy-specific lint and type-check policy
+- parser and validation test-coverage additions such as `58af9ee`, `981d707`, `9d58f10`, `64afa02`, `866921b`, and `ee0718a`: better reviewed together with their corresponding feature/code subjects instead of as isolated Subject 2 imports
 
 Skipped:
-- none
+- Playwright migration and backend/UI-only split test infrastructure such as `696866c` and `5df693d`: promising, but too entangled with rebrand-specific paths, new directories, and broader frontend/test-stack modernization for this conservative pass
+- rapidcopy-specific e2e/docker test harness renames and branding changes such as `a74c19b`, `6d59994`, and related `RAPIDCOPY_*` variable renames: not portable to this repo as-is
+- broad Angular 18 and Python 3.11 modernization-linked test churn such as `e0985b2`, `7f22141`, and `93e10ab`: belongs under dependencies, build tooling, and compatibility subjects
+- mypy/ruff policy and dev-tooling additions such as `035dc8c`, `677be93`, and `d87f403`: useful but outside the narrow test-and-verification scope we completed here
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `git diff --check`; `python3 -m py_compile src/python/tests/conftest.py src/python/tests/integration/test_web/test_handler/test_controller.py`
+- manual checks: reviewed workflow, test harness, and test-suite candidate clusters against current base and classified rapidcopy-only stacks by portability
+- status: partially verified
 
 Notes:
-- none
+- Rapidcopy has substantial test innovation, especially around Playwright and feature-specific suites, but much of it is best integrated alongside later dependency, compatibility, and feature-subject work rather than as a standalone Subject 2 import.
 
 ## Subject 3 - Dependencies And Build Tooling
 
