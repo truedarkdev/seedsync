@@ -702,16 +702,16 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `394d834`
+- Source branch: `thejuran/master`
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: subject-filtered review of `origin/master..thejuran/master`
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: `a8561cd..thejuran/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
 - none
@@ -720,54 +720,60 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `b1b7ec9`: the settings-page subscription cleanup was already integrated in Subject 7
+- the current base already keeps the existing settings layout and command/restart wiring healthy without needing thejuran's broader settings-schema additions
 
 Skipped:
-- none
+- `9929c51`: auto-delete settings UI depends on backend/config sections that are not present in the current base; revisit with the related backend subjects instead of adding dead controls here
+- `7bebe91`, `2b89bbc`, and `84a365a`: Sonarr/Radarr, webhook guidance, and connection-test settings UI require backend/config support that does not exist in the current base, so they were deferred rather than imported as broken or misleading controls
+- `528e845`: appearance/theme controls depend on a theme subsystem that is not present in the current base
+- `b7fdff1`: terminal-style settings presentation is a style-forward redesign that does not fit this fork's conservative UI direction
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `git diff --check -- src/angular/src/app/common/localization.ts src/angular/src/app/pages/settings/options-list.ts src/angular/src/app/pages/settings/settings-page.component.ts`; `make run-tests-angular` (passed, 183 tests)
+- manual checks: confirmed the thejuran settings candidates mostly depend on future backend/schema work and would create dead or misleading UI if imported now
+- status: verified
 
 Notes:
 - none
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `394d834`
+- Source branch: `rapidcopy/master`
+- Fork tip seen at pass start: `c65ddf6`
+- Reviewed in this pass: subject-filtered review of `origin/master..rapidcopy/master`
+- Last reviewed upstream commit (inclusive): `c65ddf6`
+- Resume from next: `c65ddf6..rapidcopy/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted from `rapidcopy` `207caf5`: improve the `Max Total Connections` settings guidance, but soften the wording to match the current base by warning that values above 32 are not recommended instead of falsely implying an enforced hard cap
+- adapted from `rapidcopy` `797ebfa` selectively: add a restart confirmation step before issuing the settings-page restart command, implemented with the current `ngx-modialog` stack instead of `window.confirm`
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `20ebcbc`: the current base already uses a plain label-wrapped checkbox layout instead of the Bootstrap `form-check` structure that rapidcopy was fixing, so there was no direct overlap bug left to import here
+- the percentage-cap and disabled-button tooltip portions of `797ebfa` are already outside Subject 8 or covered elsewhere in the current base
 
 Skipped:
-- none
+- `a33981b`: path-pair migration, Docker path warnings, and related validation changes cross into backend/config behavior and should be handled with the later config/path subjects instead of as a standalone settings-UI import
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: same local verification batch as the thejuran entry for this pass
+- manual checks: confirmed the updated connections help text matches current backend behavior, and that the restart safeguard now uses the repo's existing modal stack instead of introducing a second confirmation style
+- status: verified
 
 Notes:
 - none
