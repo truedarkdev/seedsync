@@ -65,6 +65,48 @@ describe("Testing view file sort service", () => {
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(3);
         expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SIZE_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(4);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SIZE_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(5);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SPEED_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(6);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SPEED_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(7);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.ETA_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(8);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.ETA_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(9);
+        expect(sortComparator).not.toBeNull();
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.STATUS_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(10);
+        expect(sortComparator).not.toBeNull();
     }));
 
     it("does not call setComparator on duplicate sort methods", fakeAsync(() => {
@@ -202,5 +244,153 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED, name: "aaaa"})
         )).toBe(0);
     }));
-});
 
+    it("correctly sorts by descending status", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.STATUS_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT, name: "alpha"}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADING, name: "beta"})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "alpha"}),
+            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "beta"})
+        )).toBeLessThan(0);
+    }));
+
+    it("correctly sorts by ascending size", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SIZE_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "small", remoteSize: 10}),
+            new ViewFile({name: "large", remoteSize: 100})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "fallback-local", localSize: 20, remoteSize: null}),
+            new ViewFile({name: "remote", remoteSize: 30})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", remoteSize: 30})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("correctly sorts by descending size", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SIZE_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "large", remoteSize: 100}),
+            new ViewFile({name: "small", remoteSize: 10})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "present", remoteSize: 30}),
+            new ViewFile({name: "missing"})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", remoteSize: 30})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("correctly sorts by ascending speed", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SPEED_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "slow", downloadingSpeed: 10}),
+            new ViewFile({name: "fast", downloadingSpeed: 100})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", downloadingSpeed: 100})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("correctly sorts by descending speed", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SPEED_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "fast", downloadingSpeed: 100}),
+            new ViewFile({name: "slow", downloadingSpeed: 10})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "present", downloadingSpeed: 100}),
+            new ViewFile({name: "missing"})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", downloadingSpeed: 100})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("correctly sorts by ascending eta", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.ETA_ASC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "soon", eta: 10}),
+            new ViewFile({name: "later", eta: 100})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", eta: 100})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("correctly sorts by descending eta", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.ETA_DESC
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({name: "later", eta: 100}),
+            new ViewFile({name: "soon", eta: 10})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "present", eta: 100}),
+            new ViewFile({name: "missing"})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "missing"}),
+            new ViewFile({name: "present", eta: 100})
+        )).toBeGreaterThan(0);
+    }));
+});

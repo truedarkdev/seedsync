@@ -135,6 +135,11 @@
                     <span class="text">Status</span>
                 </div>
                 <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.STATUS_DESC">
+                    <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
+                    <span class="text">Status Reverse</span>
+                </div>
+                <div class="sel-item"
                      *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.NAME_ASC">
                     <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
                     <span class="text">Name A&#8594;Z</span>
@@ -144,6 +149,36 @@
                     <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
                     <span class="text">Name Z&#8594;A</span>
                 </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SIZE_ASC">
+                    <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                    <span class="text">Size Small&#8594;Large</span>
+                </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SIZE_DESC">
+                    <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                    <span class="text">Size Large&#8594;Small</span>
+                </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SPEED_ASC">
+                    <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                    <span class="text">Speed Slow&#8594;Fast</span>
+                </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SPEED_DESC">
+                    <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                    <span class="text">Speed Fast&#8594;Slow</span>
+                </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.ETA_ASC">
+                    <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                    <span class="text">ETA Short&#8594;Long</span>
+                </div>
+                <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.ETA_DESC">
+                    <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                    <span class="text">ETA Long&#8594;Short</span>
+                </div>
             </div>
         </button>
         <div class="dropdown-menu">
@@ -152,6 +187,12 @@
                  (click)="onSort(ViewFileOptions.SortMethod.STATUS)">
                 <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
                 <span class="text">Status</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.STATUS_DESC"
+                 (click)="onSort(ViewFileOptions.SortMethod.STATUS_DESC)">
+                <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
+                <span class="text">Status Reverse</span>
             </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.NAME_ASC"
@@ -164,6 +205,42 @@
                  (click)="onSort(ViewFileOptions.SortMethod.NAME_DESC)">
                 <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
                 <span class="text">Name Z&#8594;A</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SIZE_ASC"
+                 (click)="onSort(ViewFileOptions.SortMethod.SIZE_ASC)">
+                <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                <span class="text">Size Small&#8594;Large</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SIZE_DESC"
+                 (click)="onSort(ViewFileOptions.SortMethod.SIZE_DESC)">
+                <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                <span class="text">Size Large&#8594;Small</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SPEED_ASC"
+                 (click)="onSort(ViewFileOptions.SortMethod.SPEED_ASC)">
+                <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                <span class="text">Speed Slow&#8594;Fast</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SPEED_DESC"
+                 (click)="onSort(ViewFileOptions.SortMethod.SPEED_DESC)">
+                <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                <span class="text">Speed Fast&#8594;Slow</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.ETA_ASC"
+                 (click)="onSort(ViewFileOptions.SortMethod.ETA_ASC)">
+                <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" /></div>
+                <span class="text">ETA Short&#8594;Long</span>
+            </div>
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.ETA_DESC"
+                 (click)="onSort(ViewFileOptions.SortMethod.ETA_DESC)">
+                <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
+                <span class="text">ETA Long&#8594;Short</span>
             </div>
         </div>
     </div>

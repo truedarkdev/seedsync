@@ -21,6 +21,7 @@ export class FileListComponent {
     public files: Observable<List<ViewFile>>;
     public identify = FileListComponent.identify;
     public options: Observable<ViewFileOptions>;
+    public SortMethod = ViewFileOptions.SortMethod;
 
     constructor(private _logger: LoggerService,
                 private viewFileService: ViewFileService,
@@ -45,6 +46,27 @@ export class FileListComponent {
         } else {
             this.viewFileService.setSelected(file);
         }
+    }
+
+    onSort(currentSortMethod: ViewFileOptions.SortMethod,
+           primarySortMethod: ViewFileOptions.SortMethod,
+           secondarySortMethod: ViewFileOptions.SortMethod): void {
+        if (currentSortMethod === primarySortMethod) {
+            this.viewFileOptionsService.setSortMethod(secondarySortMethod);
+        } else {
+            this.viewFileOptionsService.setSortMethod(primarySortMethod);
+        }
+    }
+
+    isSortedBy(currentSortMethod: ViewFileOptions.SortMethod,
+               primarySortMethod: ViewFileOptions.SortMethod,
+               secondarySortMethod: ViewFileOptions.SortMethod): boolean {
+        return currentSortMethod === primarySortMethod || currentSortMethod === secondarySortMethod;
+    }
+
+    isSortDescending(currentSortMethod: ViewFileOptions.SortMethod,
+                     descendingSortMethod: ViewFileOptions.SortMethod): boolean {
+        return currentSortMethod === descendingSortMethod;
     }
 
     onQueue(file: ViewFile) {
