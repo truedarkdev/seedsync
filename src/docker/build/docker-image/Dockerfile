@@ -3,12 +3,17 @@ ARG STAGING_VERSION=latest
 
 # Creates environment to run Seedsync python code
 # Installs all python dependencies
-FROM python:3.8-slim as seedsync_run_python_env
+FROM python:3.8-slim AS seedsync_run_python_env
 
 # Install dependencies
-RUN sed -i -e's/ main/ main contrib non-free/g' /etc/apt/sources.list && \
-    apt-get update && \
-    apt-get install -y \
+RUN set -eux; \
+    if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
+        sed -i 's/Components: main/Components: main contrib non-free/g' /etc/apt/sources.list.d/debian.sources; \
+    elif [ -f /etc/apt/sources.list ]; then \
+        sed -i -e 's/ main$/ main contrib non-free/g' /etc/apt/sources.list; \
+    fi; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
         gcc \
         libssl-dev \
         lftp \
@@ -20,15 +25,13 @@ RUN sed -i -e's/ main/ main contrib non-free/g' /etc/apt/sources.list && \
         curl \
         libnss-wrapper \
         libxml2-dev libxslt-dev libffi-dev \
-    && apt-get clean
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 # Fix for patoolib
 # See: https://github.com/wummel/patool/issues/90
 RUN ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so
 
 # Install Poetry
-RUN curl -s https://bootstrap.pypa.io/get-pip.py -o get-pip.py && \
-    python get-pip.py --force-reinstall && \
-    rm get-pip.py
 RUN pip3 install poetry
 RUN poetry config virtualenvs.create false
 
@@ -39,24 +42,26 @@ ENV LANG=C.UTF-8
 RUN mkdir -p /app
 COPY src/python/pyproject.toml /app/python/
 COPY src/python/poetry.lock /app/python/
-RUN cd /app/python && poetry install --no-dev
+RUN cd /app/python && poetry install --only main
 
 
 # Creates environment for Python dev
-FROM seedsync_run_python_env as seedsync_run_python_devenv
+FROM seedsync_run_python_env AS seedsync_run_python_devenv
 RUN cd /app/python && poetry install
 
 
 # Installs Seedsync python code
-FROM seedsync_run_python_env as seedsync_run_python
+FROM seedsync_run_python_env AS seedsync_run_python
 RUN mkdir -p /app
 COPY src/python /app/python
+RUN chmod -R a+rX /app/python
 
 
 # Full Seedsync docker image
-FROM ${STAGING_REGISTRY}/seedsync/build/angular/export:${STAGING_VERSION} as seedsync_build_angular_export
-FROM ${STAGING_REGISTRY}/seedsync/build/scanfs/export:${STAGING_VERSION} as seedsync_build_scanfs_export
-FROM seedsync_run_python as seedsync_run
+FROM ${STAGING_REGISTRY}/seedsync/build/angular/export:${STAGING_VERSION} AS seedsync_build_angular_export
+FROM ${STAGING_REGISTRY}/seedsync/build/scanfs/export:${STAGING_VERSION} AS seedsync_build_scanfs_export
+FROM seedsync_run_python AS seedsync_run
+LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular_export /html /app/html
 COPY --from=seedsync_build_scanfs_export /scanfs /app/scanfs
 COPY src/docker/build/docker-image/setup_default_config.sh /scripts/
@@ -67,11 +72,12 @@ RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking no\nUserKnownHostsFile /d
 # SSH as any user fix
 # https://stackoverflow.com/a/57531352
 COPY src/docker/build/docker-image/run_as_user /usr/local/bin/
-RUN chmod a+x /usr/local/bin/run_as_user
+RUN chmod 755 /usr/local/bin/run_as_user
 COPY src/docker/build/docker-image/ssh /usr/local/sbin
-RUN chmod a+x /usr/local/sbin/ssh
+RUN chmod 755 /usr/local/sbin/ssh
 COPY src/docker/build/docker-image/scp /usr/local/sbin
-RUN chmod a+x /usr/local/sbin/scp
+RUN chmod 755 /usr/local/sbin/scp
+RUN chmod 755 /scripts/setup_default_config.sh
 
 
 # Create non-root user and directories under that user

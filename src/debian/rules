@@ -14,4 +14,5 @@ override_dh_auto_install:
 	cp -rf seedsync $(DESTROOT)/usr/lib/
 
 override_dh_shlibdeps:
-	dh_shlibdeps -l$(CURDIR)/seedsync
+	# PyInstaller bundles the executable dependencies, so shared-library
+	# resolution against the host build image is not meaningful here.
