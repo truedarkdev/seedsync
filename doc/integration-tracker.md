@@ -439,13 +439,13 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/angular/compose.yml build` (passed), `make tests-python` (failed before the touched Dockerfile layer because the existing `seedsync_run_python_devenv` image currently errors during `poetry install` with `ImportError: cannot import name 'atomic_open' from requests.utils`)
+- tests run: `docker compose -f src/docker/test/angular/compose.yml build` (passed), `make run-tests-angular` (reached Karma startup, then failed because the current Angular test container still lacks a usable Chrome binary), `make tests-python` (failed before the touched Dockerfile layer because the existing `seedsync_run_python_devenv` image currently errors during `poetry install` with `ImportError: cannot import name 'atomic_open' from requests.utils`)
 - manual checks: reviewed adapted diffs against `8c4edb2`, `721e694`, and `05bc17a`; extracted the current deb artifact and checked bundled `seedsync`/`scanfs` binaries for GLIBC symbol strings before deciding not to take the newer GLIBC-floor documentation and CI-matrix reductions
 - status: partially verified
 
 Notes:
 - The Angular/browser fixes were adapted onto the repo's legacy `.angular-cli.json`/Angular 4 layout rather than importing thejuran's newer workspace structure wholesale
-- The Angular test-image build still emits Debian stretch repository 404 warnings from the inherited base image, but the touched Dockerfile path built successfully after installing `wget` and `gnupg`
+- The Angular test-image build still emits Debian stretch repository 404 warnings from the inherited base image, and the runtime test path still needs a separate Chrome-binary fix even though the touched Dockerfile path built successfully after installing `wget` and `gnupg`
 
 ### rapidcopy
 
