@@ -327,75 +327,80 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `17b3d7b8aa74e5a5d73f4223fef3521695c3f29d`
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Reviewed in this pass: `origin/master..thejuran/master` (Subject 4 filtered)
+- Last reviewed upstream commit (inclusive): `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Resume from next: next commit after `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted `a27e231` and `0fffbdf`: removed obsolete `dh-systemd` usage, raised the debhelper baseline, and stopped trying to derive host shared-library dependencies for the PyInstaller-built Debian package in local Subject 4 packaging updates
+- adapted `9759b76`, `ef283cc`, and `f2b4889`: modernized the deb build image so the PyInstaller stage still builds on current bases and ensured `scanfs` plus the Angular bundle land under the bundled `_internal` runtime layout expected by the packaged binary
+- adapted parts of `11b0944`, `7adbd5f`, `c83efbc`, `c32649c`, and `21bb73c`: fixed Docker build compatibility on current bases by creating the Angular output directory, making apt source edits work on modern slim images, using the image's bundled `pip` for Poetry, switching to `poetry install --only main`, normalizing `FROM ... AS` casing, and adding an OCI source label in the runtime image
+- adapted `777917a` as a packaging prerequisite: enabled `skipLibCheck` in `src/angular/tsconfig.json` so the legacy Angular build remains runnable inside the current Docker packaging flow
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `c94d626`, `a8a6eba`, and other GLIBC/older-host compatibility follow-ups were reviewed here but belong primarily to Subject 5, where runtime compatibility choices will be handled explicitly
 
 Skipped:
-- none
+- `5ea6f8e`: skipped the self-contained runtime-image rewrite because the smaller conservative fix was to keep the existing staging/export workflow and only repair the broken packaging steps
+- thejuran's broader cgroup, ARM64, and CI/publish refinements in the packaging surface were skipped here because they are better handled under Subjects 5 and the later verification milestone rather than mixed into this packaging pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `make deb`; `docker build -f src/docker/build/deb/Dockerfile --target seedsync_build_angular_export -t localtest/seedsync/build/angular/export:s4 .`; `docker build -f src/docker/build/deb/Dockerfile --target seedsync_build_scanfs_export -t localtest/seedsync/build/scanfs/export:s4 .`; `docker build -f src/docker/build/docker-image/Dockerfile --target seedsync_run --build-arg STAGING_REGISTRY=localtest --build-arg STAGING_VERSION=s4 -t seedsync:s4 .`
+- manual checks: `git diff --check` on the touched packaging files; inspected `setup_default_config.sh` after normalizing CRLF line endings; ran `docker run --rm --entrypoint sh seedsync:s4 -lc 'id ... python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs --exit'` to confirm runtime file permissions, generated config ownership, and startup behavior
+- status: verified for the integrated batch; runtime smoke check reaches SeedSync startup and then exits with `AppError: Config is incomplete`, which matches the placeholder default configuration rather than a packaging failure
 
 Notes:
-- none
+- This pass intentionally repaired the existing Debian and Docker packaging flow instead of taking the larger thejuran runtime-image redesign. The image now builds on current Docker bases, preserves the repo's staging/export structure, and keeps the remaining runtime-compatibility decisions for Subject 5.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `17b3d7b8aa74e5a5d73f4223fef3521695c3f29d`
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Reviewed in this pass: `origin/master..rapidcopy/master` (Subject 4 filtered)
+- Last reviewed upstream commit (inclusive): `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Resume from next: next commit after `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted `207b75e` and `2e175c0`: ensured the runtime image fixes file modes for `/scripts/setup_default_config.sh` and the copied `/app/python` tree so the non-root container can execute the packaged startup path reliably
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- rapidcopy's Poetry- and Python-version uplift in packaging overlaps with the already completed Subject 3 dependency/tooling baseline work and the Subject 5 compatibility decisions still to come
 
 Skipped:
-- none
+- rapidcopy's top-level `Dockerfile`, compose, rename, publication, and rebranding changes were skipped because this repo remains a conservative SeedSync integration fork rather than adopting the rapidcopy container/product identity
+- broader rapidcopy packaging changes tied to Python 3.11, new publication paths, and different runtime defaults were skipped because they are larger workflow choices than this subject needed
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: reused the local Subject 4 packaging verification above; the integrated rapidcopy-derived permission fixes are exercised by the successful runtime image build and in-container smoke check
+- manual checks: compared rapidcopy's packaging surface against the current base and took only the portable permission corrections
+- status: verified for the integrated batch and reviewed for the skipped items
 
 Notes:
-- none
+- Rapidcopy had a few clean container-permission fixes that fit this fork well. The rest of its packaging surface was bundled with repo-specific naming and publication choices, so those were consciously left out.
 
 ## Subject 5 - Compatibility And Platform Support
 
