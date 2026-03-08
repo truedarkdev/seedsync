@@ -1054,12 +1054,13 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `git diff --check` on the touched Subject 12 files
+- tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Angular test run blocked because `src/angular/node_modules` is missing and `ng` is unavailable in this workspace
+- status: partially verified; Dockerized Angular suite passed with 188 tests after fixing persisted-filter default handling
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
+- follow-up fix for persisted-filter null defaults is pending local commit
 - this pass intentionally landed the conservative files-toolbar slice before larger file-list interaction work
 
 ### rapidcopy
@@ -1097,12 +1098,13 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `git diff --check` on the touched Subject 12 files
+- tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Angular test run blocked because `src/angular/node_modules` is missing and `ng` is unavailable in this workspace
+- status: partially verified; Dockerized Angular suite passed with 188 tests after fixing persisted-filter default handling
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
+- follow-up fix for persisted-filter null defaults is pending local commit
 - the larger file-list interaction and action clusters remain intentionally pending
 
 ## Subject 13 - SSH And Remote Command Handling
