@@ -24,3 +24,33 @@ pyinstaller = "*"
 testfixtures = "*"
 webtest = "*"
 pytest = "^6.2.1"
+pytest-timeout = "^2.3.1"
+pytest-cov = "^7.0.0"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+timeout = 60
+cache_dir = "/tmp/.pytest_cache"
+filterwarnings = [
+    "ignore:'cgi' is deprecated:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "docs/*",
+]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.",
+    "pass",
+]
+
+[tool.coverage.html]
+directory = "htmlcov"
