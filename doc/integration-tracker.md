@@ -406,52 +406,59 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `0c03c18`
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Reviewed in this pass: `0c03c18..a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Last reviewed upstream commit (inclusive): `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Resume from next: new commits after `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- New upstream since last pass: none at review time
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `8c4edb2` adapted locally in this pass: replaced `css-element-queries`/`ResizeSensor` with native `ResizeObserver` in the legacy Angular shell, without dragging in thejuran's newer Angular workspace layout or Bootstrap changes
+- `721e694` adapted locally in this pass: took the Safari toolbar color-bleed fix for sticky header rendering
+- `05bc17a` adapted locally in this pass: applied the Debian 12 test-image compatibility fixes to `src/docker/test/angular/Dockerfile` and `src/docker/test/python/Dockerfile`
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `da6a4c6` and `9d72249`: larger Python 3.11 and lockfile changes belong to Subject 3 and were already reviewed there
+- `246c063`: the GitHub API CSP allowlist is not needed in the current base because `src/python/web/web_app.py` does not set a CSP header today; the broader frontend/script-side implications are addressed by adapting `8c4edb2` instead
+- `e5416c5`, `b5cf1d2`, `87d2d14`, `55e5823`, `984b8a1`, `e7aece9`, `f65a996`, and `5e2cc8e`: cgroup v2/systemd and staged E2E host-model work is better handled during `Verification Milestone A` than mixed into this compatibility pass
 
 Skipped:
-- none
+- `246c063` jQuery-removal portion: skipped because the current Angular 4/Bootstrap 4 shell still consumes jQuery-based scripts, so removing it here would mix compatibility work with a broader frontend behavior change
+- `0e6370e`: skipped because loosening CSP with `script-src 'unsafe-inline'` is a security tradeoff that does not belong in this compatibility-only pass
+- `c94d626`, `996ae6a`, `a8a6eba`, `4cbdaa5`, and `2ae5173`: skipped because the current Python 3.8 packaging path did not reproduce the newer Python 3.11 GLIBC floor those commits were compensating for, and the existing built deb artifacts in this repo did not show the claimed raised GLIBC requirement
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `docker compose -f src/docker/test/angular/compose.yml build` (passed), `make tests-python` (failed before the touched Dockerfile layer because the existing `seedsync_run_python_devenv` image currently errors during `poetry install` with `ImportError: cannot import name 'atomic_open' from requests.utils`)
+- manual checks: reviewed adapted diffs against `8c4edb2`, `721e694`, and `05bc17a`; extracted the current deb artifact and checked bundled `seedsync`/`scanfs` binaries for GLIBC symbol strings before deciding not to take the newer GLIBC-floor documentation and CI-matrix reductions
+- status: partially verified
 
 Notes:
-- none
+- The Angular/browser fixes were adapted onto the repo's legacy `.angular-cli.json`/Angular 4 layout rather than importing thejuran's newer workspace structure wholesale
+- The Angular test-image build still emits Debian stretch repository 404 warnings from the inherited base image, but the touched Dockerfile path built successfully after installing `wget` and `gnupg`
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` @ `0c03c18`
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Reviewed in this pass: `0c03c18..c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Last reviewed upstream commit (inclusive): `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- Resume from next: new commits after `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269`
+- New upstream since last pass: none at review time
+- Pass date: 2026-03-08
 
 Integrated:
 - none
@@ -460,21 +467,28 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `5db8f34`, `c1e079a`, `3ad06ce`, `62e14e2`, `c487178`, and `2238a32`: LFTP parser/timeout/PTY hardening belongs primarily to Subject 14
+- `2614ae6` and `866921b`: validation batching and settle-delay work belongs with the validation/scanning/controller subjects rather than platform compatibility alone
+- `5d5a90a` and `aeb27fa`: scanfs pickle/JSON compatibility work belongs to Subject 15 and also needs security review
+- `0b49f97`, `58c588b`, and `a33981b`: network-mount and Docker-path validation work belongs to the packaging/config/settings subjects
+- `696866c` and `5df693d`: Playwright migration and backend-aware E2E gating belong to Subject 2 and `Verification Milestone A`
+- `7f22141` and `e4814be`: Angular 18 migration and frontend compatibility notes belong to the broader frontend modernization subjects, not this conservative compatibility pass
 
 Skipped:
-- none
+- `cb55471`: not taken in Subject 5 because the connection-cap safety check is more appropriately decided with the LFTP/config behavior work in later subjects, where the user-facing cap and accompanying settings guidance can be reviewed together
+- `0c73e23`: not taken because changing the default process umask to `002` is a user-visible permission-policy change, not a no-drama platform fix
+- `4fca389`: not taken because this repo's current packaging path already differs substantially from rapidcopy's top-level Dockerfile flow, so the packaging baseline should continue to be handled through Subject 4 plus milestone verification instead of cross-importing a different build graph here
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: none specific to rapidcopy-only candidate imports; this fork's Subject 5 review in this pass was classification-only
+- manual checks: reviewed candidate clusters against current base and mapped them either to later subjects or to explicit skip reasons so Subject 5 does not retain normal pending items
+- status: review-only
 
 Notes:
-- none
+- Rapidcopy currently carries many good fixes, but most compatibility-adjacent items in the reviewed range are tightly coupled to later subject areas rather than being clean Subject 5 imports on their own
 
 ## Subject 6 - Security And Hardening
 
