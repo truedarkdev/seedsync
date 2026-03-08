@@ -861,75 +861,78 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: 0bca4c1
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: a8561cd
+- Reviewed in this pass: origin/master..thejuran/master (subject-relevant config/settings backend files)
+- Last reviewed upstream commit (inclusive): a8561cd
+- Resume from next: new relevant commits after a8561cd
+- New upstream since last pass: none recorded at pass close
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `19f697d` adapted `bb283e6` to replace `distutils.util.strtobool` in `src/python/common/config.py` with a local Python 3.12-safe helper and added focused unit coverage.
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `0a4a410`, `9048377` config-response redaction additions belong with Subject 11 API/config exposure follow-up and Subject 6 hardening reconciliation rather than this backend-only pass.
+- `6e680df`, `850f500`, `a92af56` add new config-adjacent API/auth surface and should be reviewed with Subject 11 and security-sensitive web/API work, not folded into Subject 10.
 
 Skipped:
-- none
+- `7242704`, `312f460`, `d12305e`, `24a9698`, `e053b96` were not taken in this pass because they introduce broader Sonarr/Radarr/AutoDelete config schema that is tightly coupled to larger feature chains not yet accepted here.
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `cd src/python && poetry run pytest -q tests/unittests/test_common/test_config.py`
+- manual checks: reviewed `common/config.py` against the adapted upstream slices to keep the patch limited to parser compatibility only
+- status: verified for integrated batch
 
 Notes:
-- none
+- `Verification Milestone A` controller config failures were rechecked during Subject 10 scoping; they were not directly solved by the isolated thejuran config commits and remain classified under later backend/controller work.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: 0bca4c1
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: 6ce7c19
+- Reviewed in this pass: origin/master..rapidcopy/master (subject-relevant config/settings backend files)
+- Last reviewed upstream commit (inclusive): 6ce7c19
+- Resume from next: new relevant commits after 6ce7c19
+- New upstream since last pass: none recorded at pass close
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `19f697d` adapted `cb55471` to cap `Config.Lftp.num_max_total_connections` at `32` with a clear config error and focused unit coverage.
+- `4056a53` adapted `4516bd5` into `src/python/seedsync.py` so `persist()` only backs up and rewrites `settings.cfg` when the rendered config content actually changes.
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `9f91d1c` adds API-key auth and broader web contract changes that belong with Subject 6/Subject 11, not this backend-config-only pass.
+- mixed test/config fragments from `fc57113` and `ee0718a` that support validation/files feature work belong with their primary subjects rather than being imported standalone here.
 
 Skipped:
-- none
+- `4acc00b` backup-on-save rotation changes were skipped because they change user-visible backup policy and are partly coupled to larger path-pair work outside this subject.
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `cd src/python && poetry run pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_seedsync.py`
+- manual checks: reviewed the adapted persist path against `rapidcopy` `4516bd5` to keep behavior limited to write/no-write gating without bringing in broader backup-policy changes
+- status: verified for integrated batches
 
 Notes:
-- none
+- Subject 10 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining config-adjacent upstream work was either classified under later subjects or consciously skipped for coupling/user-facing policy reasons.
 
 ## Subject 11 - Model, Serialization, And Web API
 
