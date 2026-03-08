@@ -4,13 +4,22 @@ import configparser
 from typing import Dict
 from io import StringIO
 import collections
-from distutils.util import strtobool
 from abc import ABC
 from typing import Type, TypeVar, Callable, Any
 
 from .error import AppError
 from .persist import Persist, PersistError
 from .types import overrides
+
+
+def _strtobool(value: str) -> int:
+    """Local replacement for distutils.util.strtobool removed in Python 3.12."""
+    lower = value.lower()
+    if lower in ('y', 'yes', 't', 'true', 'on', '1'):
+        return 1
+    if lower in ('n', 'no', 'f', 'false', 'off', '0'):
+        return 0
+    raise ValueError("Invalid truth value: {!r}".format(value))
 
 
 class ConfigError(AppError):
@@ -54,7 +63,7 @@ class Converters:
                 cls.__name__, name
             ))
         try:
-            val = bool(strtobool(value))
+            val = bool(_strtobool(value))
         except ValueError:
             raise ConfigError("Bad config: {}.{} ({}) must be a boolean value".format(
                 cls.__name__, name, value
@@ -82,6 +91,20 @@ class Checkers:
                 cls.__name__, name, value
             ))
         return value
+
+    @staticmethod
+    def int_non_negative_max(max_val: int) -> Callable:
+        def _checker(cls: T, name: str, value: int) -> int:
+            if value < 0:
+                raise ConfigError("Bad config: {}.{} ({}) must be zero or greater".format(
+                    cls.__name__, name, value
+                ))
+            if value > max_val:
+                raise ConfigError("Bad config: {}.{} ({}) must not exceed {} (FD_SETSIZE limit)".format(
+                    cls.__name__, name, value, max_val
+                ))
+            return value
+        return _checker
 
     @staticmethod
     def int_positive(cls: T, name: str, value: int) -> int:
@@ -244,7 +267,9 @@ class Config(Persist):
         num_max_connections_per_dir_file = PROP("num_max_connections_per_dir_file",
                                                 Checkers.int_positive,
                                                 Converters.int)
-        num_max_total_connections = PROP("num_max_total_connections", Checkers.int_non_negative, Converters.int)
+        num_max_total_connections = PROP("num_max_total_connections",
+                                         Checkers.int_non_negative_max(32),
+                                         Converters.int)
         use_temp_file = PROP("use_temp_file", Checkers.null, Converters.bool)
 
         def __init__(self):

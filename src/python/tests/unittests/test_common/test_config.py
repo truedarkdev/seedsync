@@ -44,6 +44,10 @@ class TestConverters(unittest.TestCase):
             Converters.bool(TestConverters, "bad", "-3.14")
         self.assertEqual("Bad config: TestConverters.bad (-3.14) must be a boolean value", str(e.exception))
 
+    def test_bool_accepts_distutils_compat_values(self):
+        self.assertEqual(True, Converters.bool(None, "", "yes"))
+        self.assertEqual(False, Converters.bool(None, "", "off"))
+
 
 class DummyInnerConfig(InnerConfig):
     c_prop1 = InnerConfig._create_property("prop1", Checkers.null, Converters.null)
@@ -276,6 +280,7 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_connections_per_dir_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_connections_per_dir_file", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "-1")
+        self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "33")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
 
