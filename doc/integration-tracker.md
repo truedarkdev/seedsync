@@ -621,72 +621,79 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `07d5716`
+- Source branch: `thejuran/master`
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: subject-filtered review of `origin/master..thejuran/master`
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: `a8561cd..thejuran/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted from `thejuran` `67179ea`: stop `AppComponent` route-event subscriptions from accumulating by moving them under a `takeUntil`/`destroy$` lifecycle cleanup
+- adapted from `thejuran` `b1b7ec9`: stop long-lived `SettingsPage` and `AutoQueuePage` subscriptions from leaking across page teardown by adding the same `takeUntil` cleanup pattern
+- adapted from `thejuran` `fdafd54`: refresh the About page to point users at the maintained fork and issue tracker while keeping the existing SeedSync presentation style
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `8c4edb2`: the current base already uses a local `ResizeObserver` compatibility fix in `AppComponent`, so the CSP-safe resize-observer part of thejuran's later shared-shell work was already present here
+- the current base already uses `ngx-modialog` for destructive-action confirmation flows, so replacing the modal stack is not required to keep Subject 7 stable
 
 Skipped:
-- none
+- `12a05c8`: the ASCII-art About page redesign is more opinionated than this fork's conservative UI direction
+- `8271bd6`, `9365743`, `31889ad`, `52b72a6`, and `fdb2b7f`: the newer `ConfirmModalService` stack and related modal hardening were not taken because this base does not use that modal implementation yet, so importing it here would turn a focused shared-UI pass into a broader modal-framework swap
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `git diff --check -- src/angular/src/app/pages/main/app.component.ts src/angular/src/app/pages/settings/settings-page.component.ts src/angular/src/app/pages/autoqueue/autoqueue-page.component.ts src/angular/src/app/pages/about/about-page.component.html src/angular/src/app/pages/about/about-page.component.scss`; `make run-tests-angular` (passed, 183 tests)
+- manual checks: confirmed the About page stays visually aligned with the existing SeedSync shell while updating the repository links to the maintained fork
+- status: verified
 
 Notes:
 - `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those here together with Subject 10 config validation work instead of reopening the milestone.
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `07d5716`
+- Source branch: `rapidcopy/master`
+- Fork tip seen at pass start: `c65ddf6`
+- Reviewed in this pass: subject-filtered review of `origin/master..rapidcopy/master`
+- Last reviewed upstream commit (inclusive): `c65ddf6`
+- Resume from next: `c65ddf6..rapidcopy/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- no direct imports; the low-risk subscription cleanup and conservative About-page refresh taken from thejuran cover the strongest compatible shared-UI wins for the current base
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `129d919`: scroll-to-top routing behavior is already present in the current base, and Subject 7's `AppComponent` cleanup keeps that existing behavior healthy instead of re-importing it
+- the modal-confirmation intent behind `a8c1b80` and `13fdce1` is already covered by the current base's `ngx-modialog` delete confirmations
 
 Skipped:
-- none
+- `797ebfa`: restart confirmation and mixed UI tweaks were not taken because the compatible shared-component portion is either already covered or belongs with Subject 8 settings behavior rather than this conservative shared-UI pass
+- `e6530cb`: modal text-overflow tweaks were not taken separately because the current modal stack differs and the issue was not reproducible enough to justify a broad modal restyle
+- `08d714e`, `6d59994`, `fb4e7db`, and `936ae4b`: rebrand, theming, and self-update work is outside this subject's conservative shared-component scope
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: same local verification batch as the thejuran entry for this pass
+- manual checks: compared rapidcopy's shared-UI changes against the current base and kept the lower-controversy subset that improves lifecycle hygiene without pulling in rebrand, theme, or modal-stack churn
+- status: verified
 
 Notes:
 - `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those here together with Subject 10 config validation work instead of reopening the milestone.
