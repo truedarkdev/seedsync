@@ -40,18 +40,15 @@ class Sshcp:
 
     def __run_command(self,
                       command: str,
-                      flags: str,
-                      args: str) -> bytes:
+                      flags: list,
+                      args: list) -> bytes:
 
-        command_args = [
-            command,
-            flags
-        ]
+        command_args = [command]
+        command_args += flags
 
         # Common flags
         command_args += [
-            "-o", "StrictHostKeyChecking=no",  # ignore host key changes
-            "-o", "UserKnownHostsFile=/dev/null",  # ignore known hosts file
+            "-o", "StrictHostKeyChecking=accept-new",  # accept new keys, reject changed ones
             "-o", "LogLevel=error",  # suppress warnings
         ]
 
@@ -64,21 +61,25 @@ class Sshcp:
                 "-o", "PubkeyAuthentication=no"  # don't use key authentication
             ]
 
-        command_args.append(args)
+        command_args += args
 
-        command = " ".join(command_args)
-        self.logger.debug("Command: {}".format(command))
+        self.logger.debug("Command: {}".format(command_args))
 
         start_time = time.time()
-        sp = pexpect.spawn(command)
+        sp = pexpect.spawn(command_args[0], command_args[1:])
         try:
             if self.__password is not None:
                 i = sp.expect([
-                    'password: ',  # i=0, all's good
+                    r'(?i)password:\s*',  # i=0, all's good
                     pexpect.EOF,  # i=1, unknown error
                     'lost connection',  # i=2, connection refused
                     'Could not resolve hostname',  # i=3, bad hostname
                     'Connection refused',  # i=4, connection refused
+                    'Name or service not known',  # i=5, bad hostname
+                    'No route to host',  # i=6, bad host
+                    'Connection timed out',  # i=7, connection timeout
+                    'REMOTE HOST IDENTIFICATION HAS CHANGED',  # i=8, possible MITM
+                    'Permission denied',  # i=9, auth rejected before/at prompt
                 ])
                 if i > 0:
                     before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
@@ -89,22 +90,33 @@ class Sshcp:
                     if sp.before.decode().strip():
                         error_msg += " - " + sp.before.decode().strip()
                     raise SshcpError(error_msg)
-                elif i == 3:
+                elif i in {3, 5}:
                     raise SshcpError("Bad hostname: {}".format(self.__host))
-                elif i in {2, 4}:
+                elif i in {2, 4, 6, 7}:
                     error_msg = "Connection refused by server"
                     if sp.before.decode().strip():
                         error_msg += " - " + sp.before.decode().strip()
                     raise SshcpError(error_msg)
+                elif i == 8:
+                    raise SshcpError(
+                        "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
+                    )
+                elif i == 9:
+                    raise SshcpError("Incorrect password")
                 sp.sendline(self.__password)
 
             i = sp.expect(
                 [
                     pexpect.EOF,  # i=0, all's good
-                    'password: ',  # i=1, wrong password
+                    r'(?i)password:\s*',  # i=1, wrong password
                     'lost connection',  # i=2, connection refused
                     'Could not resolve hostname',  # i=3, bad hostname
                     'Connection refused',  # i=4, connection refused
+                    'Name or service not known',  # i=5, bad hostname
+                    'No route to host',  # i=6, bad host
+                    'Connection timed out',  # i=7, connection timeout
+                    'REMOTE HOST IDENTIFICATION HAS CHANGED',  # i=8, possible MITM
+                    'Permission denied',  # i=9, wrong password on newer SSH
                 ],
                 timeout=self.__TIMEOUT_SECS
             )
@@ -114,13 +126,19 @@ class Sshcp:
                 self.logger.warning("Command failed: '{} - {}'".format(before, after))
             if i == 1:
                 raise SshcpError("Incorrect password")
-            elif i == 3:
+            elif i in {3, 5}:
                 raise SshcpError("Bad hostname: {}".format(self.__host))
-            elif i in {2, 4}:
+            elif i in {2, 4, 6, 7}:
                 error_msg = "Connection refused by server"
                 if sp.before.decode().strip():
                     error_msg += " - " + sp.before.decode().strip()
                 raise SshcpError(error_msg)
+            elif i == 8:
+                raise SshcpError(
+                    "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
+                )
+            elif i == 9:
+                raise SshcpError("Incorrect password")
 
         except pexpect.exceptions.TIMEOUT:
             self.logger.exception("Timed out")
@@ -148,16 +166,8 @@ class Sshcp:
         if not command:
             raise ValueError("Command cannot be empty")
 
-        # escape the command
         if "'" in command and '"' in command:
-            # I don't know how to handle this yet...
             raise ValueError("Command cannot contain both single and double quotes")
-        elif '"' in command:
-            # double quote in command, cover with single quotes
-            command = "'{}'".format(command)
-        else:
-            # no double quote in command, cover with double quotes
-            command = '"{}"'.format(command)
 
         flags = [
             "-p", str(self.__port),  # port
@@ -168,8 +178,8 @@ class Sshcp:
         ]
         return self.__run_command(
             command="ssh",
-            flags=" ".join(flags),
-            args=" ".join(args)
+            flags=flags,
+            args=args
         )
 
     def copy(self, local_path: str, remote_path: str):
@@ -194,6 +204,6 @@ class Sshcp:
         ]
         self.__run_command(
             command="scp",
-            flags=" ".join(flags),
-            args=" ".join(args)
+            flags=flags,
+            args=args
         )

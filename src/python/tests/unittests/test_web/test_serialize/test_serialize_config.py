@@ -20,6 +20,7 @@ class TestSerializeConfig(unittest.TestCase):
         config = Config()
         config.lftp.remote_address = "server.remote.com"
         config.lftp.remote_username = "user-on-remote-server"
+        config.lftp.remote_password = "secret123"
         config.lftp.remote_port = 3456
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.local_path = "/local/server/path"
@@ -34,6 +35,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertIn("lftp", out_dict)
         self.assertEqual("server.remote.com", out_dict["lftp"]["remote_address"])
         self.assertEqual("user-on-remote-server", out_dict["lftp"]["remote_username"])
+        self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual(3456, out_dict["lftp"]["remote_port"])
         self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
         self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
@@ -43,6 +45,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(2, out_dict["lftp"]["num_max_connections_per_root_file"])
         self.assertEqual(3, out_dict["lftp"]["num_max_connections_per_dir_file"])
         self.assertEqual(4, out_dict["lftp"]["num_max_total_connections"])
+        self.assertNotIn("secret123", out)
 
     def test_section_controller(self):
         config = Config()
