@@ -1062,7 +1062,22 @@ Verification:
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
 - persisted-filter null-default follow-up committed in `8bf456b`
-- current local batch intentionally lands only conservative desktop header sorting before larger file-list interaction work
+- conservative desktop header sorting committed in `f85bad2`
+- next recommended batch: start the bulk-actions cluster, but split it conservatively instead of importing `df868bc`, `f9dac34`, `3262cd2`, and `4533679` wholesale
+- recommended bulk-actions sub-batches:
+  - batch 1: backend/API foundation plus conservative UI wiring for checkbox selection, header select-all, clear-selection banner, bulk actions bar, bulk-command service, filter/sort clearing selection, and delete confirmations adapted onto the existing ngx-modialog pattern
+  - batch 2: bulk-selection UX polish such as keyboard shortcuts, shift-click range selection, and progress feedback
+  - batch 3: only-if-needed hardening follow-up such as selection-state races or additional pruning behavior if validation shows it is necessary on this base
+- recommended first bulk-actions files to inspect/touch:
+  - frontend: `src/angular/src/app/app.module.ts`, `src/angular/src/app/common/localization.ts`, `src/angular/src/app/pages/files/file-list.component.*`, `src/angular/src/app/pages/files/file.component.*`, `src/angular/src/app/services/files/view-file.service.ts`, new `src/angular/src/app/services/files/file-selection.service.ts`, new `src/angular/src/app/services/server/bulk-command.service.ts`, new selection banner and bulk actions bar components under `src/angular/src/app/pages/files/`
+  - backend: `src/python/web/handler/controller.py`, `src/python/web/web_app.py`
+- recommended bulk-actions verification:
+  - `git diff --check`
+  - `make run-tests-python`
+  - `make run-tests-angular`
+  - new Python handler tests for bulk endpoint validation, partial failure, dedupe/order preservation, and summary behavior
+  - new Angular unit tests for selection state, bulk-command service, and basic bulk-selection/action flows
+- bulk actions will still not finish Subject 12 by itself; pagination, local-only/file-metadata work, and remaining file-list interaction work will remain after that batch
 
 ### rapidcopy
 
@@ -1108,6 +1123,8 @@ Notes:
 - first Subject 12 implementation batch committed in `f38666c`
 - persisted-filter null-default follow-up committed in `8bf456b`
 - the conservative sortable-header slice is now committed while the larger file-list interaction and action clusters remain intentionally pending
+- next recommended cross-fork resume point is still the thejuran bulk-actions cluster, because it is the largest remaining Subject 12 user-value batch and now has explicit split guidance above
+- rapidcopy-specific follow-up after bulk actions should revisit pagination in `ee0718a`, local-only/file-row metadata in `b62970a`, `671a0c3`, and `797ebfa`, and path-pair dashboard work in `778d1d8` and `a6a1189`
 
 ## Subject 13 - SSH And Remote Command Handling
 
