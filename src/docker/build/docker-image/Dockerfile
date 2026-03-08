@@ -72,10 +72,13 @@ RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking no\nUserKnownHostsFile /d
 # SSH as any user fix
 # https://stackoverflow.com/a/57531352
 COPY src/docker/build/docker-image/run_as_user /usr/local/bin/
+RUN sed -i 's/\r$//' /scripts/setup_default_config.sh /usr/local/bin/run_as_user
 RUN chmod 755 /usr/local/bin/run_as_user
 COPY src/docker/build/docker-image/ssh /usr/local/sbin
+RUN sed -i 's/\r$//' /usr/local/sbin/ssh
 RUN chmod 755 /usr/local/sbin/ssh
 COPY src/docker/build/docker-image/scp /usr/local/sbin
+RUN sed -i 's/\r$//' /usr/local/sbin/scp
 RUN chmod 755 /usr/local/sbin/scp
 RUN chmod 755 /scripts/setup_default_config.sh
 
