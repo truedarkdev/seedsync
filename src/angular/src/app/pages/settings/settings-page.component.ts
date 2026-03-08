@@ -1,5 +1,7 @@
-import {ChangeDetectionStrategy, Component, OnInit} from "@angular/core";
+import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable} from "rxjs/Observable";
+import {Subject} from "rxjs/Subject";
+import "rxjs/add/operator/takeUntil";
 
 import {LoggerService} from "../../services/utils/logger.service";
 import {ConfigService} from "../../services/settings/config.service";
@@ -23,7 +25,7 @@ import {StreamServiceRegistry} from "../../services/base/stream-service.registry
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 
-export class SettingsPageComponent implements OnInit {
+export class SettingsPageComponent implements OnInit, OnDestroy {
     public OPTIONS_CONTEXT_SERVER = OPTIONS_CONTEXT_SERVER;
     public OPTIONS_CONTEXT_DISCOVERY = OPTIONS_CONTEXT_DISCOVERY;
     public OPTIONS_CONTEXT_CONNECTIONS = OPTIONS_CONTEXT_CONNECTIONS;
@@ -36,6 +38,7 @@ export class SettingsPageComponent implements OnInit {
     public commandsEnabled: boolean;
 
     private _connectedService: ConnectedService;
+    private _destroy$: Subject<void> = new Subject<void>();
 
     private _configRestartNotif: Notification;
     private _badValueNotifs: Map<string, Notification>;
@@ -57,7 +60,7 @@ export class SettingsPageComponent implements OnInit {
 
     // noinspection JSUnusedGlobalSymbols
     ngOnInit() {
-        this._connectedService.connected.subscribe({
+        this._connectedService.connected.takeUntil(this._destroy$).subscribe({
             next: (connected: boolean) => {
                 if (!connected) {
                     // Server went down, hide the config restart notification
@@ -68,6 +71,11 @@ export class SettingsPageComponent implements OnInit {
                 this.commandsEnabled = connected;
             }
         });
+    }
+
+    ngOnDestroy() {
+        this._destroy$.next();
+        this._destroy$.complete();
     }
 
     onSetConfig(section: string, option: string, value: any) {

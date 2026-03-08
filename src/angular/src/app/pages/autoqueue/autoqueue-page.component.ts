@@ -1,5 +1,7 @@
-import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnInit} from "@angular/core";
+import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable} from "rxjs/Observable";
+import {Subject} from "rxjs/Subject";
+import "rxjs/add/operator/takeUntil";
 
 import * as Immutable from "immutable";
 
@@ -21,7 +23,7 @@ import {ConfigService} from "../../services/settings/config.service";
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 
-export class AutoQueuePageComponent implements OnInit {
+export class AutoQueuePageComponent implements OnInit, OnDestroy {
 
     public patterns: Observable<Immutable.List<AutoQueuePattern>>;
     public newPattern: string;
@@ -33,6 +35,7 @@ export class AutoQueuePageComponent implements OnInit {
     public patternsOnly: boolean;
 
     private _connectedService: ConnectedService;
+    private _destroy$: Subject<void> = new Subject<void>();
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private _autoqueueService: AutoQueueService,
@@ -49,7 +52,7 @@ export class AutoQueuePageComponent implements OnInit {
 
     // noinspection JSUnusedGlobalSymbols
     ngOnInit() {
-        this._connectedService.connected.subscribe({
+        this._connectedService.connected.takeUntil(this._destroy$).subscribe({
             next: (connected: boolean) => {
                 this.connected = connected;
                 if (!this.connected) {
@@ -59,7 +62,7 @@ export class AutoQueuePageComponent implements OnInit {
             }
         });
 
-        this._configService.config.subscribe({
+        this._configService.config.takeUntil(this._destroy$).subscribe({
             next: config => {
                 if(config != null) {
                     this.enabled = config.autoqueue.enabled;
@@ -71,6 +74,11 @@ export class AutoQueuePageComponent implements OnInit {
                 this._changeDetector.detectChanges();
             }
         });
+    }
+
+    ngOnDestroy() {
+        this._destroy$.next();
+        this._destroy$.complete();
     }
 
     onAddPattern() {
