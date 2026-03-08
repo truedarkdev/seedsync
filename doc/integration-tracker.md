@@ -782,72 +782,77 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `befa59f`
+- Source branch: `thejuran/master`
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: subject-filtered review of `origin/master..thejuran/master`
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: `a8561cd..thejuran/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted from `thejuran` `eef4c32` and `1e8afe7`: move the logs subscription to a view-ready lifecycle, guard `ViewChild` access, and only auto-scroll when the logs page is actually visible
+- adapted from `thejuran` `8dd7bf4`: show a clear logs-page empty state while waiting for the service connection or the first log event
+- adapted from `thejuran` `a7122fc` and `b53fe7d`: harden `LogService` against malformed JSON log events and route parse failures through the existing Angular logger, with a unit test to keep the behavior stable
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `db1d26c`: the older scroll-button and sticky-marker logs improvements were already present in the current base before this pass
+- `0538f71`: the current `ReplaySubject`-based log stream already caches historical log records across page navigation
 
 Skipped:
-- none
+- `4933ba0`: the current logs stylesheet already uses aggressive line-breaking rules, so the older long-line layout fix did not add enough value to justify extra churn
+- `d857098`, `3f1d7d2`, `0f24cbf`, and related logs-theme restyles were left out because they are presentation-forward and better handled with broader UI/theming work than this conservative logs pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `git diff --check -- src/angular/src/app/common/localization.ts src/angular/src/app/services/logs/log.service.ts src/angular/src/app/pages/logs/logs-page.component.html src/angular/src/app/pages/logs/logs-page.component.scss src/angular/src/app/pages/logs/logs-page.component.ts src/angular/src/app/tests/unittests/services/logs/log.service.spec.ts`; `make run-tests-angular` (passed, 184 tests)
+- manual checks: confirmed the logs page no longer depends on `ViewChild` references before the view exists and now shows a clear waiting state instead of a blank page
+- status: verified
 
 Notes:
 - none
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
-- Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Integration base: `master` @ `befa59f`
+- Source branch: `rapidcopy/master`
+- Fork tip seen at pass start: `c65ddf6`
+- Reviewed in this pass: subject-filtered review of `origin/master..rapidcopy/master`
+- Last reviewed upstream commit (inclusive): `c65ddf6`
+- Resume from next: `c65ddf6..rapidcopy/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted from `rapidcopy` `d4e4b7e` selectively: cap the live logs DOM at 500 rendered records so long-running sessions do not keep growing the page without bound
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- the connection/waiting-state UX and malformed-log resilience from the rapidcopy-era logs work are covered by thejuran-derived adaptations already taken in this pass
 
 Skipped:
-- none
+- `2054b14`: log-file persistence and text-search UI are useful but substantially broaden the logs feature surface, so they were deferred in favor of the lower-risk stability and clarity fixes
+- the broader logs-related UI/theming changes from `4527bfe`, `fb4e7db`, and later modernization/rebrand commits were not taken here because they either belong to other subjects or are more opinionated than this conservative logs pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: same local verification batch as the thejuran entry for this pass
+- manual checks: confirmed the live logs view now evicts old rendered entries while preserving the existing stream/backscroll behavior users already expect
+- status: verified
 
 Notes:
 - none
