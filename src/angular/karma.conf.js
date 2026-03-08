@@ -36,11 +36,39 @@ module.exports = function (config) {
             ChromeHeadless: {
                 base: 'Chrome',
                 flags: [
-                    '--headless',
+                    '--headless=new',
                     '--disable-gpu',
-                    // Without a remote debugging port, Google Chrome exits immediately.
                     '--remote-debugging-port=9222',
-                    '--no-sandbox'
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-setuid-sandbox',
+                    '--disable-extensions',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--mute-audio',
+                    '--no-first-run',
+                    '--user-data-dir=/tmp/chrome-user-data',
+                    '--window-size=1920,1080'
+                ]
+            },
+            ChromeHeadlessCI: {
+                base: 'Chrome',
+                flags: [
+                    '--headless=new',
+                    '--disable-gpu',
+                    '--remote-debugging-port=9222',
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-setuid-sandbox',
+                    '--disable-extensions',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--mute-audio',
+                    '--no-first-run',
+                    '--user-data-dir=/tmp/chrome-user-data',
+                    '--window-size=1920,1080'
                 ]
             }
         },
