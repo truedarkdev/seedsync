@@ -9,6 +9,7 @@ RUN apt-get update && \
         rar
 
 ADD src/docker/test/python/entrypoint.sh /app/
+RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod 755 /app/entrypoint.sh
 
 # setup sshd
 RUN mkdir /var/run/sshd
