@@ -874,6 +874,7 @@ Notes:
 
 Integrated:
 - `19f697d` adapted `bb283e6` to replace `distutils.util.strtobool` in `src/python/common/config.py` with a local Python 3.12-safe helper and added focused unit coverage.
+- `ffd7415` followed up the Subject 10 review by tightening `num_max_total_connections` validation so `0` no longer bypasses the safety cap and extended the focused unit coverage.
 
 Pending:
 - none
@@ -889,8 +890,8 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `cd src/python && poetry run pytest -q tests/unittests/test_common/test_config.py`
-- manual checks: reviewed `common/config.py` against the adapted upstream slices to keep the patch limited to parser compatibility only
+- tests run: `cd src/python && poetry run pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_seedsync.py`
+- manual checks: reviewed `common/config.py` against the adapted upstream slices to keep the patch limited to parser compatibility only and rechecked the post-review fix so the connection-limit guard now matches current lftp semantics
 - status: verified for integrated batch
 
 Notes:
@@ -912,6 +913,7 @@ Notes:
 Integrated:
 - `19f697d` adapted `cb55471` to cap `Config.Lftp.num_max_total_connections` at `32` with a clear config error and focused unit coverage.
 - `4056a53` adapted `4516bd5` into `src/python/seedsync.py` so `persist()` only backs up and rewrites `settings.cfg` when the rendered config content actually changes.
+- `ffd7415` followed up the Subject 10 review by making the `persist()` write gate recover cleanly when `settings.cfg` is missing and by aligning the config cap with the current unlimited-on-`0` lftp behavior.
 
 Pending:
 - none
@@ -928,7 +930,7 @@ Maintainer decisions:
 
 Verification:
 - tests run: `cd src/python && poetry run pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_seedsync.py`
-- manual checks: reviewed the adapted persist path against `rapidcopy` `4516bd5` to keep behavior limited to write/no-write gating without bringing in broader backup-policy changes
+- manual checks: reviewed the adapted persist path against `rapidcopy` `4516bd5` to keep behavior limited to write/no-write gating without bringing in broader backup-policy changes, then re-reviewed the missing-file path after the independent reviewer caught the regression
 - status: verified for integrated batches
 
 Notes:
