@@ -31,7 +31,7 @@ https://docs.docker.com/compose/install/
 
 ## Fetch code
 ```bash
-git clone git@gitlab.com:ipsingh06/seedsync.git
+git clone https://github.com/truedarkdev/seedsync.git
 cd seedsync
 ```
 
@@ -154,7 +154,7 @@ Preview will be served at  [http://localhost:8000](http://localhost:8000)
 
 ```bash
 poetry run mkdocs gh-deploy
-git push github gh-pages
+git push origin gh-pages
 ```
 
 
@@ -240,7 +240,7 @@ By default images are pulled from `localhost:5000`. To test image from a registr
 For example:
 
 ```bash
-make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=arm64 STAGING_REGISTRY=ipsingh06
+make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=arm64 STAGING_REGISTRY=ghcr.io/truedarkdev
 ```
 
 
@@ -284,8 +284,8 @@ This manual method is deprecated in favour of the Github Actions based CI.
 ### Docker image upload to Dockerhub
 
 ```bash
-make docker-image-release RELEASE_VERSION=<version> RELEASE_REGISTRY=ipsingh06
-make docker-image-release RELEASE_VERSION=latest RELEASE_REGISTRY=ipsingh06
+make docker-image-release RELEASE_VERSION=<version> RELEASE_REGISTRY=<registry namespace>
+make docker-image-release RELEASE_VERSION=latest RELEASE_REGISTRY=<registry namespace>
 ```
 
 

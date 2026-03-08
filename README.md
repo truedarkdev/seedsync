@@ -2,25 +2,17 @@
     <img src="https://user-images.githubusercontent.com/12875506/85908858-c637a100-b7cb-11ea-8ab3-75c0c0ddf756.png" alt="SeedSync" />
 </p>
 
+> This repository is a maintained integration fork of [ipsingh06/seedsync](https://github.com/ipsingh06/seedsync).
 
 <p align="center">
-  <!--<a href="https://travis-ci.com/ipsingh06/seedsync">
-    <img src="https://img.shields.io/travis/com/ipsingh06/seedsync" alt="Build">
-  </a>-->
-  <a href="https://github.com/ipsingh06/seedsync">
-    <img src="https://img.shields.io/github/stars/ipsingh06/seedsync" alt="Stars">
+  <a href="https://github.com/truedarkdev/seedsync">
+    <img src="https://img.shields.io/github/stars/truedarkdev/seedsync" alt="Stars">
   </a>
-  <a href="https://hub.docker.com/r/ipsingh06/seedsync">
-    <img src="https://img.shields.io/docker/pulls/ipsingh06/seedsync" alt="Downloads">
+  <a href="https://github.com/truedarkdev/seedsync/releases/latest">
+    <img src="https://img.shields.io/github/v/release/truedarkdev/seedsync" alt="Release">
   </a>
-  <a href="https://hub.docker.com/r/ipsingh06/seedsync">
-    <img src="https://img.shields.io/docker/v/ipsingh06/seedsync?color=blue" alt="Version">
-  </a>
-  <a href="https://hub.docker.com/r/ipsingh06/seedsync">
-    <img src="https://img.shields.io/docker/image-size/ipsingh06/seedsync/latest?style=flat" alt="Size">
-  </a>
-  <a href="https://github.com/ipsingh06/seedsync/blob/master/LICENSE.txt">
-    <img src="https://img.shields.io/github/license/ipsingh06/seedsync" alt="License">
+  <a href="https://github.com/truedarkdev/seedsync/blob/master/LICENSE.txt">
+    <img src="https://img.shields.io/github/license/truedarkdev/seedsync" alt="License">
   </a>
 </p>
 
@@ -50,12 +42,17 @@ All you need are the SSH credentials for the remote server.
 * Linux
 * Raspberry Pi (v2, v3 and v4)
 * Windows (via Docker)
-* MacOS (via Docker)
+* macOS (via Docker)
 
 
 ## Installation and Usage
 
-Please refer to the [documentation](https://ipsingh06.github.io/seedsync/).
+Please refer to the documentation in this repository:
+
+* [Installation Guide](src/python/docs/install.md)
+* [Usage Guide](src/python/docs/usage.md)
+* [FAQ](src/python/docs/faq.md)
+* [Latest Releases](https://github.com/truedarkdev/seedsync/releases/latest)
 
 
 ## Report an Issue
@@ -76,8 +73,8 @@ on environment setup and the build process.
 ## License
 
 SeedSync is distributed under Apache License Version 2.0.
-See [License.txt](https://github.com/ipsingh06/seedsync/blob/master/LICENSE.txt) for more information.
+See [License.txt](https://github.com/truedarkdev/seedsync/blob/master/LICENSE.txt) for more information.
 
 
 
-![](https://user-images.githubusercontent.com/12875506/37031587-3a5df834-20f4-11e8-98a0-e42ee764f2ea.png)
+![SeedSync Dashboard](https://user-images.githubusercontent.com/12875506/37031587-3a5df834-20f4-11e8-98a0-e42ee764f2ea.png)
