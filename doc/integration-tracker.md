@@ -1023,75 +1023,87 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: f38666c
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: a8561cd
+- Reviewed in this pass: e839ad8..thejuran/master (subject-relevant files page, file options, file list, and file service commits)
+- Last reviewed upstream commit (inclusive): a8561cd
+- Resume from next: a8561cd
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `f38666c` adapted `1ecea11`, `c630cf5`, and `821c730` for persisted files toolbar filters and live status counts in the existing file-options UI
 
 Pending:
-- none
+- bulk actions cluster from `df868bc`, `f9dac34`, `3262cd2`, and `4533679`
+- file-list interaction cluster from `2a016f9` and `fd5b0ac`
+- optional file-page metadata cluster from `13d8e96`, `5c3526f`, and `b98b68b`
 
 Covered elsewhere:
-- none
+- Angular and dependency modernization chain belongs to Subject 3
+- security and broad web/API work belongs to Subjects 6 and 11
 
 Skipped:
-- none
+- visual restyle/theme churn is out of scope for this pass
+- validation-state and broader frontend modernization chains stay deferred to later subject work
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
+- tests run: `git diff --check` on the touched Subject 12 files
 - manual checks: none
-- status: not verified yet
+- status: partially verified; Angular test run blocked because `src/angular/node_modules` is missing and `ng` is unavailable in this workspace
 
 Notes:
-- none
+- first Subject 12 implementation batch committed in `f38666c`
+- this pass intentionally landed the conservative files-toolbar slice before larger file-list interaction work
 
 ### rapidcopy
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: f38666c
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: 6ce7c19
+- Reviewed in this pass: e839ad8..rapidcopy/master (subject-relevant files page, file list, and file service commits)
+- Last reviewed upstream commit (inclusive): 6ce7c19
+- Resume from next: 6ce7c19
+- New upstream since last pass: none
+- Pass date: 2026-03-08
 
 Integrated:
-- none
+- `f38666c` adapted the low-risk dropdown compatibility portion of `323e3ed`
 
 Pending:
-- none
+- sortable-header and extended sort cluster from `f1fc34c`
+- pagination and larger file-list UX cluster from `ee0718a`
+- queue-prioritize cluster from `8d6b436`
+- local-only status and file-row metadata cluster from `b62970a`, `671a0c3`, and `797ebfa`
+- path-pair dashboard cluster from `778d1d8` and `a6a1189`
 
 Covered elsewhere:
-- none
+- broad Angular 18 modernization chain belongs to Subject 3
+- multi path-pair support belongs to Subjects 10 and 11
 
 Skipped:
-- none
+- chunk-validation feature chain in `227b5a3` stays deferred to later backend-heavy subjects
+- dark-mode and broader visual-system changes stay out of scope for this pass
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
+- tests run: `git diff --check` on the touched Subject 12 files
 - manual checks: none
-- status: not verified yet
+- status: partially verified; Angular test run blocked because `src/angular/node_modules` is missing and `ng` is unavailable in this workspace
 
 Notes:
-- none
+- first Subject 12 implementation batch committed in `f38666c`
+- the larger file-list interaction and action clusters remain intentionally pending
 
 ## Subject 13 - SSH And Remote Command Handling
 
