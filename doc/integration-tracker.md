@@ -569,7 +569,7 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those as likely Subject 10/18 follow-up when backend config/controller validation work is under review.
 
 ### rapidcopy
 
@@ -605,7 +605,7 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those as likely Subject 10/18 follow-up when backend config/controller validation work is under review.
 
 ## Subject 7 - About, Modal, And Shared UI Components
 
@@ -643,7 +643,7 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those here together with Subject 10 config validation work instead of reopening the milestone.
 
 ### rapidcopy
 
@@ -679,7 +679,7 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those here together with Subject 10 config validation work instead of reopening the milestone.
 
 ## Subject 8 - Settings UI
 
