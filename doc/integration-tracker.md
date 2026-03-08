@@ -492,6 +492,87 @@ Notes:
 
 ## Subject 6 - Security And Hardening
 
+### thejuran
+
+- State: reviewed
+- High-risk: yes
+- Integration base: `master` @ `549c378`
+- Source branch: `thejuran/master`
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: subject-filtered review of `origin/master..thejuran/master`
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: `a8561cd..thejuran/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
+
+Integrated:
+- adapted from `thejuran` `f6643db`: stop tracking the committed staging private key, ignore future private-key filenames, and generate a fresh stage-image SSH keypair at build time instead of copying a committed secret into the image
+- adapted from `thejuran` `e34ba5e`: harden `Sshcp` to pass argument lists directly to `pexpect.spawn`, accept new host keys while rejecting changed ones, and preserve usable bad-host/bad-port/wrong-password behavior across newer SSH prompt variants
+- adapted from `thejuran` `492944f`: shell-quote remote delete paths before issuing `rm -rf` over SSH
+- adapted from `thejuran` `0a4a410`, `b9a3220`, and `9048377`: redact `lftp.remote_password` from config API serialization and scrub password-like values from SSE log messages and tracebacks
+
+Pending:
+- none
+
+Covered elsewhere:
+- `246c063` and `8c4edb2`: CSP-violation cleanup tied to later Angular/runtime changes; revisit with the broader web/UI subject work instead of forcing partial CSP behavior into the legacy frontend now
+- `108018f` and `abef04a`: replacing pickle-based remote scan serialization belongs with the broader scan/remote-scanner behavior work in later backend subjects
+
+Skipped:
+- `a92af56`: webhook HMAC authentication is not applicable to the current base because the webhook feature set is not present here yet
+- `6e680df`: SSRF protection for arr-style test-connection endpoints is not applicable to the current base because those endpoints are not present yet
+- `8271bd6` and `9365743`: confirm-modal XSS hardening is not applicable because the current base does not yet contain `ConfirmModalService`
+- `4c485d9` and `0e6370e`: broad response-header/CSP changes were not taken in this pass because the useful low-risk hardening was already captured elsewhere, while the CSP policy tradeoffs need to be evaluated together with later web/API work
+
+Maintainer decisions:
+- none
+
+Verification:
+- tests run: `python3 -m py_compile src/python/web/serialize/serialize_config.py src/python/web/serialize/serialize_log_record.py src/python/controller/delete/delete_process.py src/python/ssh/sshcp.py src/python/tests/unittests/test_web/test_serialize/test_serialize_config.py src/python/tests/unittests/test_web/test_serialize/test_serialize_log_record.py src/python/tests/unittests/test_ssh/test_sshcp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -v tests/unittests/test_web/test_serialize/test_serialize_config.py tests/unittests/test_web/test_serialize/test_serialize_log_record.py tests/unittests/test_ssh/test_sshcp.py` (37 passed); `docker build -f src/docker/stage/deb/Dockerfile -t seedsync/test/stage-deb-security .`
+- manual checks: confirmed the stage image now generates its SSH keypair during build and no longer depends on the committed private key file
+- status: verified
+
+Notes:
+- This pass intentionally kept Subject 6 to low-controversy hardening. It avoided introducing a new API auth contract or broad CSP restrictions while still closing the most obvious secret-handling and SSH-safety gaps.
+
+### rapidcopy
+
+- State: reviewed
+- High-risk: yes
+- Integration base: `master` @ `549c378`
+- Source branch: `rapidcopy/master`
+- Fork tip seen at pass start: `c65ddf6`
+- Reviewed in this pass: subject-filtered review of `origin/master..rapidcopy/master`
+- Last reviewed upstream commit (inclusive): `c65ddf6`
+- Resume from next: `c65ddf6..rapidcopy/master`
+- New upstream since last pass: none at pass end
+- Pass date: 2026-03-08
+
+Integrated:
+- adapted from `rapidcopy` `32acba6` and `78a3fde` selectively: keep the security wins that fit the current base without taking the broader auth/CSRF contract changes, namely safer SSH argument handling/host-key behavior, password redaction, private-key hygiene, and command quoting
+
+Pending:
+- none
+
+Covered elsewhere:
+- `bb539a5` and `de8b602`: private-key hygiene is covered by the local adaptation of thejuran's committed-key removal plus the `.gitignore` update in this pass
+- the password-redaction and shell-command-safety portions of `32acba6` and `78a3fde` are covered by the local/thejuran-adapted changes integrated in this pass
+
+Skipped:
+- `9f91d1c`: API-key authentication layer was not taken because it introduces a user-facing auth contract, browser-side key storage, and SSE auth behavior that should be evaluated with broader web/API changes instead of as a standalone hardening import
+- the remaining `9e1aeea`, `32acba6`, and `78a3fde` items around CSP, CSRF/origin enforcement, input caps, path-pair validation, and pickle removal were not taken here because they either belong to later subject areas or require broader deployment/model review than this conservative hardening pass
+
+Maintainer decisions:
+- none
+
+Verification:
+- tests run: same local verification batch as the thejuran entry for this pass
+- manual checks: compared rapidcopy's harder auth/CSRF posture against current base and chose the lower-controversy subset that strengthens security without changing the repo's current access model
+- status: verified
+
+Notes:
+- Rapidcopy contains a larger, more opinionated security program. This pass deliberately took only the compatible hardening ideas and left the control-plane contract changes for later subject review if they become desirable.
+
 ## Verification Milestone A - Tooling, Packaging, And Compatibility Validation
 
 ### local validation
@@ -535,77 +616,6 @@ Notes:
 - This milestone completed its main purpose: Python and Angular verification are now runnable in the current local/CI container model instead of failing on missing tooling, missing browser binaries, or broken Poetry bootstraps.
 - The remaining Python issues are no longer environment blockers. They are real test or application failures and should be handled under the relevant later code subjects rather than by more packaging/tooling churn.
 
-### thejuran
-
-- State: not started
-- High-risk: no
-- Integration base: n/a
-- Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
-
-Integrated:
-- none
-
-Pending:
-- none
-
-Covered elsewhere:
-- none
-
-Skipped:
-- none
-
-Maintainer decisions:
-- none
-
-Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
-
-Notes:
-- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those as likely Subject 10/18 follow-up when backend config/controller validation work is under review.
-
-### rapidcopy
-
-- State: not started
-- High-risk: no
-- Integration base: n/a
-- Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
-
-Integrated:
-- none
-
-Pending:
-- none
-
-Covered elsewhere:
-- none
-
-Skipped:
-- none
-
-Maintainer decisions:
-- none
-
-Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
-
-Notes:
-- `Verification Milestone A` exposed real Python failures in `tests/integration/test_controller/test_controller.py` around bad remote config validation, including `test_bad_config_remote_address_raises_exception`, `test_bad_config_remote_path_to_scan_script_raises_exception`, and `test_bad_config_remote_username_raises_exception`. Revisit those as likely Subject 10/18 follow-up when backend config/controller validation work is under review.
 
 ## Subject 7 - About, Modal, And Shared UI Components
 
