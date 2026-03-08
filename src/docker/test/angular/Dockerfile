@@ -1,8 +1,10 @@
 FROM seedsync/build/angular/env as seedsync_test_angular
 
-RUN apt-get update
-RUN wget -nv -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
-    dpkg -i /tmp/chrome.deb; apt-get -fy install > /dev/null
+# node:20-slim does not include the tools needed to fetch the Chrome package.
+RUN apt-get update && \
+    apt-get install -y wget gnupg && \
+    wget -nv -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb && \
+    dpkg -i /tmp/chrome.deb || apt-get -fy install
 
 COPY \
     src/angular/tsconfig.json \

@@ -3,9 +3,7 @@ FROM seedsync/run/python/devenv as seedsync_test_python
 RUN ls -l /app/python
 
 # Install dependencies
-RUN apt-get install -y software-properties-common && \
-    apt-add-repository non-free && \
-    apt-get update && \
+RUN apt-get update && \
     apt-get install -y \
         openssh-server \
         rar
