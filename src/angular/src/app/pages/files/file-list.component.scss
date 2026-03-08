@@ -42,4 +42,19 @@
         color: #fff;
         background-color: #000;
     }
+
+    #header .sortable {
+        cursor: pointer;
+        user-select: none;
+    }
+
+    #header .sortable.active {
+        background-color: #222;
+    }
+
+    #header .sort-indicator {
+        display: inline-block;
+        min-width: 10px;
+        margin-left: 4px;
+    }
 }

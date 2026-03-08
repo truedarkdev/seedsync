@@ -1,10 +1,50 @@
 <div id="file-list">
-    <div id="header">
-        <div class="name">Filename</div>
-        <div class="status">Status</div>
-        <div class="speed">Speed</div>
-        <div class="eta">ETA</div>
-        <div class="size">Size</div>
+    <div id="header" *ngIf="options | async as currentOptions">
+        <div class="name sortable"
+             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.NAME_ASC, SortMethod.NAME_DESC)"
+             (click)="onSort(currentOptions.sortMethod, SortMethod.NAME_ASC, SortMethod.NAME_DESC)">
+            Filename
+            <span class="sort-indicator"
+                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.NAME_ASC, SortMethod.NAME_DESC)">
+                {{isSortDescending(currentOptions.sortMethod, SortMethod.NAME_DESC) ? "v" : "^"}}
+            </span>
+        </div>
+        <div class="status sortable"
+             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)"
+             (click)="onSort(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)">
+            Status
+            <span class="sort-indicator"
+                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)">
+                {{isSortDescending(currentOptions.sortMethod, SortMethod.STATUS_DESC) ? "v" : "^"}}
+            </span>
+        </div>
+        <div class="speed sortable"
+             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.SPEED_ASC, SortMethod.SPEED_DESC)"
+             (click)="onSort(currentOptions.sortMethod, SortMethod.SPEED_ASC, SortMethod.SPEED_DESC)">
+            Speed
+            <span class="sort-indicator"
+                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.SPEED_ASC, SortMethod.SPEED_DESC)">
+                {{isSortDescending(currentOptions.sortMethod, SortMethod.SPEED_DESC) ? "v" : "^"}}
+            </span>
+        </div>
+        <div class="eta sortable"
+             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.ETA_ASC, SortMethod.ETA_DESC)"
+             (click)="onSort(currentOptions.sortMethod, SortMethod.ETA_ASC, SortMethod.ETA_DESC)">
+            ETA
+            <span class="sort-indicator"
+                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.ETA_ASC, SortMethod.ETA_DESC)">
+                {{isSortDescending(currentOptions.sortMethod, SortMethod.ETA_DESC) ? "v" : "^"}}
+            </span>
+        </div>
+        <div class="size sortable"
+             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.SIZE_ASC, SortMethod.SIZE_DESC)"
+             (click)="onSort(currentOptions.sortMethod, SortMethod.SIZE_ASC, SortMethod.SIZE_DESC)">
+            Size
+            <span class="sort-indicator"
+                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.SIZE_ASC, SortMethod.SIZE_DESC)">
+                {{isSortDescending(currentOptions.sortMethod, SortMethod.SIZE_DESC) ? "v" : "^"}}
+            </span>
+        </div>
     </div>
     <div *ngFor="let file of files | async; trackBy: identify">
         <app-file
