@@ -1036,10 +1036,11 @@ Notes:
 
 Integrated:
 - `f38666c` adapted `1ecea11`, `c630cf5`, and `821c730` for persisted files toolbar filters and live status counts in the existing file-options UI
+- `f85bad2` adapted the conservative sortable-header slice of rapidcopy `f1fc34c` onto the existing files list with persisted frontend sort methods for name, status, size, speed, and eta
 
 Pending:
 - bulk actions cluster from `df868bc`, `f9dac34`, `3262cd2`, and `4533679`
-- file-list interaction cluster from `2a016f9` and `fd5b0ac`
+- remaining file-list interaction cluster from `2a016f9` and `fd5b0ac`, excluding the conservative sortable-header portion landed in the current local batch
 - optional file-page metadata cluster from `13d8e96`, `5c3526f`, and `b98b68b`
 
 Covered elsewhere:
@@ -1056,12 +1057,12 @@ Maintainer decisions:
 Verification:
 - tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Dockerized Angular suite passed with 188 tests after fixing persisted-filter default handling
+- status: partially verified; Dockerized Angular suite passed with 195 tests after the persisted-filter follow-up and sortable-header batch
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
-- follow-up fix for persisted-filter null defaults is pending local commit
-- this pass intentionally landed the conservative files-toolbar slice before larger file-list interaction work
+- persisted-filter null-default follow-up committed in `8bf456b`
+- current local batch intentionally lands only conservative desktop header sorting before larger file-list interaction work
 
 ### rapidcopy
 
@@ -1078,9 +1079,10 @@ Notes:
 
 Integrated:
 - `f38666c` adapted the low-risk dropdown compatibility portion of `323e3ed`
+- `f85bad2` adapted the conservative sortable-header and extended sort-method portion of `f1fc34c` onto the existing files list without pulling in pagination or action-cluster changes
 
 Pending:
-- sortable-header and extended sort cluster from `f1fc34c`
+- any residual file-list interaction pieces from `f1fc34c` beyond the conservative sortable-header sorting landed in the current local batch
 - pagination and larger file-list UX cluster from `ee0718a`
 - queue-prioritize cluster from `8d6b436`
 - local-only status and file-row metadata cluster from `b62970a`, `671a0c3`, and `797ebfa`
@@ -1100,12 +1102,12 @@ Maintainer decisions:
 Verification:
 - tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Dockerized Angular suite passed with 188 tests after fixing persisted-filter default handling
+- status: partially verified; Dockerized Angular suite passed with 195 tests after the persisted-filter follow-up and sortable-header batch
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
-- follow-up fix for persisted-filter null defaults is pending local commit
-- the larger file-list interaction and action clusters remain intentionally pending
+- persisted-filter null-default follow-up committed in `8bf456b`
+- the conservative sortable-header slice is now committed while the larger file-list interaction and action clusters remain intentionally pending
 
 ## Subject 13 - SSH And Remote Command Handling
 
