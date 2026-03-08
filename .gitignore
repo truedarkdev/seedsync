@@ -8,3 +8,7 @@ src/python/site
 htmlcov/
 .coverage
 AGENTS.md
+
+# SSH private keys
+id_rsa
+*.pem

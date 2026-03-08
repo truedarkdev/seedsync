@@ -159,6 +159,45 @@ class TestSerializeLogRecord(unittest.TestCase):
         data = json.loads(out["data"])
         self.assertEqual("my logger msg", data["message"])
 
+    def test_record_message_redacts_password_like_values(self):
+        serialize = SerializeLogRecord()
+        logger = logging.getLogger()
+        record = logger.makeRecord(
+            name=None,
+            level=None,
+            fn=None,
+            lno=None,
+            msg="running lftp -u seedbox,secretpass and remote_password=hunter2",
+            args=None,
+            exc_info=None,
+            func=None,
+            sinfo=None
+        )
+        out = parse_stream(serialize.record(record))
+        data = json.loads(out["data"])
+        self.assertEqual(
+            "running lftp -u seedbox,**REDACTED** and remote_password=**REDACTED**",
+            data["message"]
+        )
+
+    def test_record_message_uses_get_message(self):
+        serialize = SerializeLogRecord()
+        logger = logging.getLogger()
+        record = logger.makeRecord(
+            name=None,
+            level=None,
+            fn=None,
+            lno=None,
+            msg="password=%s",
+            args=("secretpass",),
+            exc_info=None,
+            func=None,
+            sinfo=None
+        )
+        out = parse_stream(serialize.record(record))
+        data = json.loads(out["data"])
+        self.assertEqual("password=**REDACTED**", data["message"])
+
     def test_record_exception_text(self):
         serialize = SerializeLogRecord()
         logger = logging.getLogger()
@@ -211,3 +250,25 @@ class TestSerializeLogRecord(unittest.TestCase):
         out = parse_stream(serialize.record(record))
         data = json.loads(out["data"])
         self.assertEqual(None, data["exc_tb"])
+
+    def test_record_exception_text_redacts_password_like_values(self):
+        serialize = SerializeLogRecord()
+        logger = logging.getLogger()
+        record = logger.makeRecord(
+            name=None,
+            level=None,
+            fn=None,
+            lno=None,
+            msg=None,
+            args=None,
+            exc_info=None,
+            func=None,
+            sinfo=None
+        )
+        record.exc_text = "command failed: -u seedbox,secretpass password: hunter2"
+        out = parse_stream(serialize.record(record))
+        data = json.loads(out["data"])
+        self.assertEqual(
+            "command failed: -u seedbox,**REDACTED** password: **REDACTED**",
+            data["exc_tb"]
+        )
