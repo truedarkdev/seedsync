@@ -113,4 +113,22 @@ describe("Testing log service", () => {
         expect(count).toBe(4);
         expect(Immutable.is(latestRecord, LogRecord.fromJson(data1))).toBe(true);
     }));
+
+    it("should ignore malformed log events", fakeAsync(() => {
+        let count = 0;
+
+        logService.logs.subscribe({
+            next: () => {
+                count++;
+            }
+        });
+
+        spyOn(console, "error");
+
+        logService.notifyEvent("log-record", "{broken json");
+        tick();
+
+        expect(count).toBe(0);
+        expect(console.error).toHaveBeenCalled();
+    }));
 });

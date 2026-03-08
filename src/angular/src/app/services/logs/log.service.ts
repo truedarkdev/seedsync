@@ -4,6 +4,7 @@ import {ReplaySubject} from "rxjs/ReplaySubject";
 
 import {BaseStreamService} from "../base/base-stream.service";
 import {LogRecord} from "./log-record";
+import {LoggerService} from "../utils/logger.service";
 
 
 @Injectable()
@@ -11,7 +12,7 @@ export class LogService extends BaseStreamService {
 
     private _logs: ReplaySubject<LogRecord> = new ReplaySubject();
 
-    constructor() {
+    constructor(private _logger: LoggerService) {
         super();
         this.registerEventName("log-record");
     }
@@ -25,7 +26,11 @@ export class LogService extends BaseStreamService {
     }
 
     protected onEvent(eventName: string, data: string) {
-        this._logs.next(LogRecord.fromJson(JSON.parse(data)));
+        try {
+            this._logs.next(LogRecord.fromJson(JSON.parse(data)));
+        } catch (error) {
+            this._logger.error("Failed to parse log event:", error);
+        }
     }
 
     protected onConnected() {
