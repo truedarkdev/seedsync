@@ -30,9 +30,9 @@ export class ViewFileOptionsService {
             this._storage.get(StorageKeys.VIEW_OPTION_SORT_METHOD) ||
                 ViewFileOptions.SortMethod.STATUS;
         const selectedStatusFilter: ViewFile.Status =
-            this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER);
+            this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) || null;
         const nameFilter: string =
-            this._storage.get(StorageKeys.VIEW_OPTION_NAME_FILTER);
+            this._storage.get(StorageKeys.VIEW_OPTION_NAME_FILTER) || null;
         const pinFilter: boolean =
             this._storage.get(StorageKeys.VIEW_OPTION_PIN) || false;
 
