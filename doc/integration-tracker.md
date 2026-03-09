@@ -1271,9 +1271,9 @@ Integrated:
 - adapted `2238a32`, `3ad06ce`, and `c1e079a` as the first Subject 14 batch to widen the LFTP PTY, skip wrapped `jobs -v` queue fragments safely, and return partial parser results instead of crashing on malformed queue/job output
 - adapted `62e14e2` with thejuran-style controller containment from `7897c8e` and `9e84b9e` as the second Subject 14 batch so non-fatal LFTP/parser failures log warnings or fail callbacks instead of crashing controller processing
 - adapted `5db8f34` as the third Subject 14 batch to raise the LFTP prompt timeout from 3 seconds to 30 seconds and demote routine timeout noise from exception to debug logging
+- adapted `c487178` as the fifth Subject 14 batch to translate unexpected `pexpect` EOFs inside `__run_command()` into `LftpError` so terminated `lftp` sessions follow the existing non-fatal controller containment path
 
 Pending:
-- `c487178` remains pending as a possible narrow EOF-to-`LftpError` follow-up in `lftp.py`
 - `8d6b436` queue prioritization is transfer-relevant but deferred because it expands queue semantics and API/UI surface
 - `6ce7c19` staging-directory and interrupted-download auto-resume is deferred until after the smaller stability batches
 - validation-heavy transfer work in `e038c21`, `866921b`, `dda1cb2`, `30809bf`, `2614ae6`, `d20b84d`, `4cd7fc1`, `157d003`, `227b5a3`, and `d0662ca` remains pending for later Subject 14 scoping
@@ -1292,9 +1292,9 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python3 -m pytest /src/tests/unittests/test_controller/test_controller.py`
-- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, tightened the wrapped-queue handling so the parser hardening does not regress quoted-path coverage, kept the controller containment batch scoped to warning/callback handling rather than broader EOF semantics, and chose the conservative rapidcopy-style 30 second timeout instead of thejuran's broader 180 second wait
-- status: parser-hardening, controller-containment, and timeout-tuning batches verified
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python3 -m pytest /src/tests/unittests/test_controller/test_controller.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`
+- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, tightened the wrapped-queue handling so the parser hardening does not regress quoted-path coverage, kept the controller containment batch scoped to warning/callback handling rather than broader EOF semantics, chose the conservative rapidcopy-style 30 second timeout instead of thejuran's broader 180 second wait, and then adapted the narrow EOF-to-`LftpError` handling only in `lftp.py` without taking the upstream settings/default-connection changes
+- status: parser-hardening, controller-containment, timeout-tuning, and EOF-containment batches verified
 
 Notes:
 - start with the parser-hardening batch, then verify focused LFTP tests before moving to timeout tuning or controller containment
