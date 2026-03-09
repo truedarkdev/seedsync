@@ -1805,6 +1805,7 @@ Notes:
 Integrated:
 - `07da49b` adapted the configuration and scanner foundation from `6ce7c19` so staging paths are supported in config/defaults and `LocalScanner` can merge staged in-progress files with the final local directory without surfacing the nested `incomplete` directory as a user file
 - `e20cac4` adapted the controller/runtime portion of `6ce7c19` so LFTP downloads and active scans use staging paths, completed downloads move into the final local directory only after completion, and interrupted staged transfers are re-queued safely after the first successful remote scan in both single-path and path-pair modes
+- `f2acdcf` followed up the staged-transfer recovery path so files explicitly stopped by the user are not re-queued on restart, including duplicate visible names across different path pairs
 
 Pending:
 - none
@@ -1824,11 +1825,11 @@ Verification:
 - tests run:
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_controller/test_scan/test_local_scanner.py tests/unittests/test_controller/test_delete_process.py`
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py`
-- manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; kept the staging-path safety core, adapted it to the repo's current path-pair-aware controller API, and left rapidcopy's broader validation and control-plane work out of this subject
-- status: verified; the focused config/scanner/delete suite passed with `23 passed` and the focused controller suite passed with `16 passed`
+- manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; kept the staging-path safety core, adapted it to the repo's current path-pair-aware controller API, added the explicit-stop recovery guard required by existing stopped-file persistence semantics, and left rapidcopy's broader validation and control-plane work out of this subject
+- status: verified; the focused config/scanner/delete suite passed with `23 passed` and the focused controller suite passed with `18 passed`
 
 Notes:
-- rapidcopy supplied the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion, with the adaptation kept path-pair-safe for the current local base
+- rapidcopy supplied the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion, with the adaptation kept path-pair-safe for the current local base and aligned with the repo's existing explicit-stop semantics
 
 ## Subject 21 - Cross-Cutting UX Or Workflow Conflicts
 
