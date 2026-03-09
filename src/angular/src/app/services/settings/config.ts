@@ -51,7 +51,7 @@ const DefaultLftp: ILftp = {
     num_max_connections_per_dir_file: null,
     num_max_total_connections: null,
     use_temp_file: null,
-    rate_limit: null,
+    rate_limit: "0",
 };
 const LftpRecord = Record(DefaultLftp);
 
