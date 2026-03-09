@@ -2,7 +2,9 @@
 
 from collections import namedtuple
 from enum import Enum
-from typing import List, Tuple
+from typing import List, Optional, Tuple
+
+from model import ModelFile
 
 
 class LftpJobStatus:
@@ -33,12 +35,23 @@ class LftpJobStatus:
         """
         pass
 
-    def __init__(self, job_id: int, job_type: Type, state: State, name: str, flags: str):
+    def __init__(self,
+                 job_id: int,
+                 job_type: Type,
+                 state: State,
+                 name: str,
+                 flags: str,
+                 remote_path: Optional[str] = None,
+                 local_path: Optional[str] = None):
         self.__id = job_id
         self.__type = job_type
         self.__state = state
         self.__name = name
         self.__flags = flags
+        self.__remote_path = remote_path.strip() if remote_path is not None else None
+        self.__local_path = local_path.strip() if local_path is not None else None
+        self.__path_pair_id = None
+        self.__path_pair_name = None
         self.__total_transfer_state = LftpJobStatus.TransferState(None, None, None, None, None)
         # dict of active file transfer states, maps filename to their transfer state
         # there's no hierarchical info for now
@@ -55,6 +68,34 @@ class LftpJobStatus:
 
     @property
     def name(self) -> str: return self.__name
+
+    @property
+    def remote_path(self) -> Optional[str]: return self.__remote_path
+
+    @property
+    def local_path(self) -> Optional[str]: return self.__local_path
+
+    @property
+    def path_pair_id(self) -> Optional[str]: return self.__path_pair_id
+
+    @path_pair_id.setter
+    def path_pair_id(self, path_pair_id: Optional[str]):
+        if path_pair_id is not None and type(path_pair_id) != str:
+            raise TypeError
+        self.__path_pair_id = path_pair_id
+
+    @property
+    def path_pair_name(self) -> Optional[str]: return self.__path_pair_name
+
+    @path_pair_name.setter
+    def path_pair_name(self, path_pair_name: Optional[str]):
+        if path_pair_name is not None and type(path_pair_name) != str:
+            raise TypeError
+        self.__path_pair_name = path_pair_name
+
+    @property
+    def file_id(self) -> str:
+        return ModelFile.build_file_id(self.__name, self.__path_pair_id)
 
     @property
     def total_transfer_state(self) -> TransferState:
@@ -79,7 +120,15 @@ class LftpJobStatus:
         return list(zip(self.__active_files_state.keys(), self.__active_files_state.values()))
 
     def __eq__(self, other):
-        return self.__dict__ == other.__dict__
+        ignored = {
+            "_LftpJobStatus__remote_path",
+            "_LftpJobStatus__local_path",
+            "_LftpJobStatus__path_pair_id",
+            "_LftpJobStatus__path_pair_name",
+        }
+        self_dict = {k: v for k, v in self.__dict__.items() if k not in ignored}
+        other_dict = {k: v for k, v in other.__dict__.items() if k not in ignored}
+        return self_dict == other_dict
 
     def __str__(self):
         return str(self.__dict__)

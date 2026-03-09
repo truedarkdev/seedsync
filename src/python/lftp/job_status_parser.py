@@ -238,7 +238,9 @@ class LftpJobStatusParser:
                                        job_type=type_,
                                        state=LftpJobStatus.State.RUNNING,
                                        name=name,
-                                       flags=flags)
+                                       flags=flags,
+                                       remote_path=result.group("remote"),
+                                       local_path=result.group("local"))
                 if result_at:
                     if result.group("remote") != result_at.group("name"):
                         raise ValueError("Mismatch between pget names '{}' vs '{}'".format(
@@ -306,7 +308,9 @@ class LftpJobStatusParser:
                                        job_type=type_,
                                        state=LftpJobStatus.State.RUNNING,
                                        name=name,
-                                       flags=flags)
+                                       flags=flags,
+                                       remote_path=result.group("remote"),
+                                       local_path=result.group("local"))
                 size_local = LftpJobStatusParser._size_to_bytes(result.group("szlocal"))
                 size_remote = LftpJobStatusParser._size_to_bytes(result.group("szremote"))
                 percent_local = int(result.group("pctlocal"))
@@ -344,7 +348,9 @@ class LftpJobStatusParser:
                                        job_type=type_,
                                        state=LftpJobStatus.State.RUNNING,
                                        name=name,
-                                       flags=flags)
+                                       flags=flags,
+                                       remote_path=result.group("remote"),
+                                       local_path=result.group("local"))
                 jobs.append(status)
                 prev_job = status
                 # Continue the outer loop
@@ -584,7 +590,9 @@ class LftpJobStatusParser:
                                                job_type=type_,
                                                state=LftpJobStatus.State.QUEUED,
                                                name=name,
-                                               flags=flags)
+                                               flags=flags,
+                                               remote_path=result.group("remote"),
+                                               local_path=result.group("local"))
                         queue.append(status)
                     elif re.match("^cd\s.*$", line):
                         # 'cd' line after pget, ignore

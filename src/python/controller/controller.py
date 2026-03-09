@@ -8,7 +8,15 @@ from enum import Enum
 import copy
 
 # my libs
-from .scan import ScannerProcess, ActiveScanner, LocalScanner, RemoteScanner
+from .scan import (
+    ScannerProcess,
+    ActiveScanner,
+    LocalScanner,
+    RemoteScanner,
+    MultiPathActiveScanner,
+    MultiPathLocalScanner,
+    MultiPathRemoteScanner,
+)
 from .extract import ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
 from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants
@@ -120,21 +128,54 @@ class Controller:
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
         self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
 
+        enabled_path_pairs = []
+        if self.__context.path_pair_manager is not None:
+            enabled_path_pairs = self.__context.path_pair_manager.get_enabled_pairs()
+        self.__path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
+        if enabled_path_pairs:
+            self.__lftp.set_path_pairs(enabled_path_pairs)
+
         # Setup the scanners and scanner processes
-        self.__active_scanner = ActiveScanner(self.__context.config.lftp.local_path)
-        self.__local_scanner = LocalScanner(
-            local_path=self.__context.config.lftp.local_path,
-            use_temp_file=self.__context.config.lftp.use_temp_file
-        )
-        self.__remote_scanner = RemoteScanner(
-            remote_address=self.__context.config.lftp.remote_address,
-            remote_username=self.__context.config.lftp.remote_username,
-            remote_password=self.__password,
-            remote_port=self.__context.config.lftp.remote_port,
-            remote_path_to_scan=self.__context.config.lftp.remote_path,
-            local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
-            remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
-        )
+        if enabled_path_pairs:
+            self.__active_scanner = MultiPathActiveScanner({
+                pair.id: pair.local_path for pair in enabled_path_pairs
+            })
+            self.__local_scanner = MultiPathLocalScanner([
+                LocalScanner(
+                    local_path=pair.local_path,
+                    use_temp_file=self.__context.config.lftp.use_temp_file,
+                    path_pair_id=pair.id,
+                    path_pair_name=pair.name
+                ) for pair in enabled_path_pairs
+            ])
+            self.__remote_scanner = MultiPathRemoteScanner([
+                RemoteScanner(
+                    remote_address=self.__context.config.lftp.remote_address,
+                    remote_username=self.__context.config.lftp.remote_username,
+                    remote_password=self.__password,
+                    remote_port=self.__context.config.lftp.remote_port,
+                    remote_path_to_scan=pair.remote_path,
+                    local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
+                    remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script,
+                    path_pair_id=pair.id,
+                    path_pair_name=pair.name
+                ) for pair in enabled_path_pairs
+            ])
+        else:
+            self.__active_scanner = ActiveScanner(self.__context.config.lftp.local_path)
+            self.__local_scanner = LocalScanner(
+                local_path=self.__context.config.lftp.local_path,
+                use_temp_file=self.__context.config.lftp.use_temp_file
+            )
+            self.__remote_scanner = RemoteScanner(
+                remote_address=self.__context.config.lftp.remote_address,
+                remote_username=self.__context.config.lftp.remote_username,
+                remote_password=self.__password,
+                remote_port=self.__context.config.lftp.remote_port,
+                remote_path_to_scan=self.__context.config.lftp.remote_path,
+                local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
+                remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
+            )
 
         self.__active_scan_process = ScannerProcess(
             scanner=self.__active_scanner,
@@ -281,9 +322,22 @@ class Controller:
 
     def __get_model_files(self) -> List[ModelFile]:
         model_files = []
-        for filename in self.__model.get_file_names():
-            model_files.append(copy.deepcopy(self.__model.get_file(filename)))
+        get_ids = getattr(self.__model, "get_file_ids", None)
+        identifiers = get_ids() if callable(get_ids) else self.__model.get_file_names()
+        for identifier in identifiers:
+            model_files.append(copy.deepcopy(self.__model.get_file(identifier)))
         return model_files
+
+    def __get_path_pair(self, path_pair_id: str):
+        if not path_pair_id:
+            return None
+        return getattr(self, "_Controller__path_pairs_by_id", {}).get(path_pair_id)
+
+    def __set_active_scanner_files(self, active_files):
+        if isinstance(self.__active_scanner, MultiPathActiveScanner):
+            self.__active_scanner.set_active_files(active_files)
+        else:
+            self.__active_scanner.set_active_files([name for name, _, _ in active_files])
 
     def __update_model(self):
         # Grab the latest scan results
@@ -307,15 +361,17 @@ class Controller:
         # Update list of active file names
         if lftp_statuses is not None:
             self.__active_downloading_file_names = [
-                s.name for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
+                (s.name, s.path_pair_id, s.path_pair_name)
+                for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
             ]
         if latest_extract_statuses is not None:
             self.__active_extracting_file_names = [
-                s.name for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
+                (s.name, None, None)
+                for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
             ]
 
         # Update the active scanner's state
-        self.__active_scanner.set_active_files(
+        self.__set_active_scanner_files(
             self.__active_downloading_file_names + self.__active_extracting_file_names
         )
 
@@ -350,7 +406,7 @@ class Controller:
                 if diff.change == ModelDiff.Change.ADDED:
                     self.__model.add_file(diff.new_file)
                 elif diff.change == ModelDiff.Change.REMOVED:
-                    self.__model.remove_file(diff.old_file.name)
+                    self.__model.remove_file(diff.old_file.file_id)
                 elif diff.change == ModelDiff.Change.UPDATED:
                     self.__model.update_file(diff.new_file)
 
@@ -369,18 +425,25 @@ class Controller:
                         diff.old_file.state != ModelFile.State.DOWNLOADED:
                     downloaded = True
                 if downloaded:
-                    self.__persist.downloaded_file_names.add(diff.new_file.name)
+                    self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                     self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
 
             # Prune the extracted files list of any files that were deleted locally
             # This prevents these files from going to EXTRACTED state if they are re-downloaded
             remove_extracted_file_names = set()
-            existing_file_names = self.__model.get_file_names()
+            existing_file_ids = self.__model.get_file_ids()
             for extracted_file_name in self.__persist.extracted_file_names:
-                if extracted_file_name in existing_file_names:
+                if extracted_file_name in existing_file_ids:
                     file = self.__model.get_file(extracted_file_name)
                     if file.state == ModelFile.State.DELETED:
                         # Deleted locally, remove
+                        remove_extracted_file_names.add(extracted_file_name)
+                elif extracted_file_name in self.__model.get_file_names():
+                    try:
+                        file = self.__model.get_file(extracted_file_name)
+                    except ModelError:
+                        continue
+                    if file.state == ModelFile.State.DELETED:
                         remove_extracted_file_names.add(extracted_file_name)
                 else:
                     # Not in the model at all
@@ -422,7 +485,13 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename))
                     continue
                 try:
-                    self.__lftp.queue(file.name, file.is_dir)
+                    path_pair = self.__get_path_pair(file.path_pair_id)
+                    self.__lftp.queue(
+                        file.name,
+                        file.is_dir,
+                        remote_base_dir_path=path_pair.remote_path if path_pair else None,
+                        local_base_dir_path=path_pair.local_path if path_pair else None
+                    )
                 except LftpError as e:
                     _notify_failure(command, "Lftp error: ".format(str(e)))
                     continue
@@ -432,7 +501,18 @@ class Controller:
                     _notify_failure(command, "File '{}' is not Queued or Downloading".format(command.filename))
                     continue
                 try:
-                    self.__lftp.kill(file.name)
+                    path_pair = self.__get_path_pair(file.path_pair_id)
+                    remote_path = None
+                    local_path = None
+                    if path_pair is not None:
+                        remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
+                        local_path = path_pair.local_path
+                    self.__lftp.kill(
+                        file.name,
+                        path_pair_id=file.path_pair_id,
+                        remote_path=remote_path,
+                        local_path=local_path
+                    )
                 except (LftpError, LftpJobStatusParserError) as e:
                     _notify_failure(command, "Lftp error: ".format(str(e)))
                     continue
@@ -469,7 +549,8 @@ class Controller:
                     continue
                 else:
                     process = DeleteLocalProcess(
-                        local_path=self.__context.config.lftp.local_path,
+                        local_path=path_pair.local_path if (path_pair := self.__get_path_pair(file.path_pair_id))
+                        else self.__context.config.lftp.local_path,
                         file_name=file.name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)
@@ -501,7 +582,8 @@ class Controller:
                         remote_username=self.__context.config.lftp.remote_username,
                         remote_password=self.__password,
                         remote_port=self.__context.config.lftp.remote_port,
-                        remote_path=self.__context.config.lftp.remote_path,
+                        remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
+                        else self.__context.config.lftp.remote_path,
                         file_name=file.name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)

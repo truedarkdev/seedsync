@@ -56,6 +56,22 @@ class TestLftpJobStatus(unittest.TestCase):
                                flags="")
         self.assertEqual("bye", status.name)
 
+    def test_file_id_uses_path_pair_identity(self):
+        status = LftpJobStatus(job_id=-1,
+                               job_type=LftpJobStatus.Type.MIRROR,
+                               state=LftpJobStatus.State.QUEUED,
+                               name="dup",
+                               flags="",
+                               remote_path="/remote/movies/dup",
+                               local_path="/local/movies")
+        status.path_pair_id = "movies"
+        status.path_pair_name = "Movies"
+
+        self.assertEqual("[\"movies\",\"dup\"]", status.file_id)
+        self.assertEqual("/remote/movies/dup", status.remote_path)
+        self.assertEqual("/local/movies", status.local_path)
+        self.assertEqual("Movies", status.path_pair_name)
+
     def test_total_transfer_state(self):
         status = LftpJobStatus(job_id=-1,
                                job_type=LftpJobStatus.Type.MIRROR,

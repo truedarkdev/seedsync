@@ -1360,12 +1360,11 @@ Integrated:
 - adapted a narrow `d143638` groundwork slice to add path-pair metadata fields on `SystemFile` and `ModelFile`, helper multi-path scanner classes, and model serialization support without enabling controller/runtime multi-path behavior yet
 - added a follow-up backend identity groundwork slice after `b403384` so `Model`, `ModelDiff`, and `ModelBuilder` can represent duplicate top-level names across different path pairs safely before command/runtime wiring begins
 - added an additive command-identity contract batch so web handlers, Angular model/view plumbing, bulk selection, and bulk requests can carry hidden `file_id` values while preserving current display names and legacy unambiguous filename routes
+- adapted the backend/runtime portion of `d143638`, `1690826`, and `981d707` so controller scan wiring, active download scanning, lftp job identity, and per-path-pair queue/stop/delete handling are now safe for duplicate top-level names across enabled path pairs
 
 Pending:
-- the remaining `d143638` work still needs to land in smaller batches for controller/runtime multi-path enablement, active-scan routing, and the later settings/API surfaces needed to configure new scan roots
-- `1690826` adds `MultiPathActiveScanner` so active download scanning follows the correct path pair instead of always using the first local root
-- `981d707` adds focused unit coverage for `MultiPathActiveScanner`
 - `9d58f10` adds integration coverage for multi-path controller scanning
+- the minimal duplicate-root UI disambiguation follow-up still needs to land so files from different path pairs remain distinguishable in the Angular files list
 - the path-pair follow-ups `a33981b` and `58c588b` should be reconsidered with the multi-path batch because they refine validation and Docker-path behavior for the new path-pair model
 
 Covered elsewhere:
@@ -1380,14 +1379,15 @@ Skipped:
 - `9e1aeea` and `32acba6` are tracked out of Subject 15 because their scanner-adjacent pieces belong primarily to Subject 6 security hardening rather than scan-behavior integration
 - `0b49f97` is out of scope for Subject 15 because network mount support is broader settings/runtime infrastructure, not scanner correctness
 - `79f7cab` is out of scope for Subject 15 because it is a validation-process file plus mixed follow-up bundle, not a bounded scanning change
+- the settings/API portion of `d143638` is reclassified out of Subject 15 because path-pair persistence already exists locally and the remaining subject-critical work is runtime consumption plus focused tests, not CRUD settings surfaces
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: `python3 -m py_compile src/python/common/path_pair.py src/python/common/context.py src/python/common/__init__.py src/python/seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python - <<'PY' ... PathPairManager migration smoke test ... PY`
-- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, separated validation-heavy or network-mount work out of this scanning subject, smoke-tested `PathPairManager` load plus legacy-config migration in the docker test container, and then narrowed the next backend batch to additive model/file identity groundwork after review rejected earlier runtime enablement as unsafe
-- status: foundation batch verified except for an existing `tests/unittests/test_seedsync.py::TestSeedsync::test_default_config` failure on `Lftp.rate_limit` default initialization that is outside this batch's file scope
+- tests run: `python3 -m py_compile src/python/common/path_pair.py src/python/common/context.py src/python/common/__init__.py src/python/seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python - <<'PY' ... PathPairManager migration smoke test ... PY`; `python3 -m py_compile src/python/controller/controller.py src/python/controller/model_builder.py src/python/controller/scan/__init__.py src/python/controller/scan/multi_path_active_scanner.py src/python/lftp/job_status.py src/python/lftp/job_status_parser.py src/python/lftp/lftp.py src/python/tests/unittests/test_controller/test_controller.py src/python/tests/unittests/test_controller/test_scan/test_multi_path_active_scanner.py src/python/tests/unittests/test_lftp/test_job_status.py src/python/tests/unittests/test_lftp/test_job_status_parser.py src/python/tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_scan/test_multi_path_active_scanner.py tests/unittests/test_lftp/test_job_status.py tests/unittests/test_lftp/test_job_status_parser.py tests/unittests/test_lftp/test_lftp.py`
+- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, separated validation-heavy or network-mount work out of this scanning subject, smoke-tested `PathPairManager` load plus legacy-config migration in the docker test container, narrowed the next backend batch to additive model/file identity groundwork after review rejected earlier runtime enablement as unsafe, and then verified the backend runtime follow-up against the worker patch before recording it
+- status: foundation batch verified except for an existing `tests/unittests/test_seedsync.py::TestSeedsync::test_default_config` failure on `Lftp.rate_limit` default initialization that is outside this batch's file scope; the later backend runtime/path-pair follow-up passed the targeted unit suite with `97 passed`
 
 Notes:
 - the main remaining Subject 15 work is the multi-path/path-pair scanning stack; it is broad but coherent and should land in multiple small commits rather than one large import
@@ -1395,6 +1395,7 @@ Notes:
 - a broader runtime-enablement attempt was intentionally rejected after review because duplicate top-level names across path pairs still collide in model/controller identity; this follow-up batch keeps only metadata and helper groundwork, with no controller/runtime behavior change
 - the current backend identity slice is intended to keep duplicate-name handling additive and internal for now: model storage, diffing, and SSE identity become path-pair-aware before command contracts or controller runtime behavior change
 - this command-contract follow-up keeps the visible filename UI unchanged for now; the hidden `file_id` path is threaded through services and handlers first, while duplicate-name rendering nuances in the existing template remain deferred until the broader multi-path runtime/UI enablement batch
+- settings/API CRUD work for path pairs is not treated as a Subject 15 blocker here because path-pair persistence is already loaded at startup; the remaining subject-critical work is runtime consumption plus focused tests and UI disambiguation
 
 ## Subject 16 - Auto Queue
 
