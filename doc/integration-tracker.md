@@ -1212,75 +1212,90 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: `7f3afd2`
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 14 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 14 candidate after `a8561cd`
+- New upstream since last pass: none recorded at pass time
+- Pass date: 2026-03-09
 
 Integrated:
 - none
 
 Pending:
-- none
+- `bdcc287` is a candidate for the LFTP timeout tuning batch, but the conservative implementation is likely a smaller local adaptation closer to rapidcopy's 30 second timeout than thejuran's 180 second timeout
+- `7897c8e` and `9e84b9e` are candidates for controller-side containment of `LftpJobStatusParserError`
+- `65dc7fe` and `5b52854` are candidates for transfer-state correctness follow-up work around downloaded/import status handling
+- `b632b05` and `c52554b` are candidates for later monitoring and downloaded-state retention hardening after the low-risk parser/controller stability work lands
+- `c539ed9` is a larger transfer-focused controller refactor candidate that should stay split from the initial conservative fixes
+- `a50a6ec` is already partly covered by Subject 12's mutation-method alignment and should be reviewed as a narrow transfer-adjacent follow-up rather than imported wholesale
+- the auto-queue restart/re-queue cluster in `1048d87`, `3b98bd8`, `9e290af`, `f5d4d24`, and `e775d8f` remains pending for later Subject 14 triage
 
 Covered elsewhere:
-- none
+- the handler-method portion of `a50a6ec` is already covered by Subject 12 commit `515437c`
 
 Skipped:
-- none
+- `4c381e4` is classified out of the first Subject 14 pass because it is broad controller command refactoring rather than a bounded transfer/LFTP fix
+- noisy early auto-queue/download-state commits `b9c0612` and `f3af3fb` should be adapted manually if needed rather than cherry-picked with their mixed artifact churn
 
 Maintainer decisions:
 - none
 
 Verification:
 - tests run: none
-- manual checks: none
+- manual checks: reviewed thejuran transfer/LFTP candidates and split them into low-risk parser/controller fixes versus broader controller and auto-queue follow-up work
 - status: not verified yet
 
 Notes:
-- none
+- first implementation batch should stay limited to `lftp.py`, `job_status_parser.py`, and focused parser tests before broader transfer behavior work is attempted
 
 ### rapidcopy
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: `7f3afd2`
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 14 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 14 candidate after `6ce7c19`
+- New upstream since last pass: none recorded at pass time
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- adapted `2238a32`, `3ad06ce`, and `c1e079a` as the first Subject 14 batch to widen the LFTP PTY, skip wrapped `jobs -v` queue fragments safely, and return partial parser results instead of crashing on malformed queue/job output
 
 Pending:
-- none
+- `5db8f34` is the preferred timeout-tuning follow-up after parser hardening
+- `62e14e2` and `c487178` are selected for the next controller/LFTP failure-containment batch
+- `8d6b436` queue prioritization is transfer-relevant but deferred because it expands queue semantics and API/UI surface
+- `6ce7c19` staging-directory and interrupted-download auto-resume is deferred until after the smaller stability batches
+- validation-heavy transfer work in `e038c21`, `866921b`, `dda1cb2`, `30809bf`, `2614ae6`, `d20b84d`, `4cd7fc1`, `157d003`, `227b5a3`, and `d0662ca` remains pending for later Subject 14 scoping
+- `7f22141` download rate limiting remains pending for later Subject 14 scoping
+- `207caf5` is a small settings/help-text consistency candidate once the backend stability batches are landed
 
 Covered elsewhere:
-- none
+- the connection-cap backend limit associated with `cb55471` is already enforced in current `Config`; only the user-facing settings copy remains to review later
+- parser-related older rapidcopy fixes in `0063f8b`, `ec6c48a`, `bc523d7`, `01430ca`, `481e040`, `902eb15`, `3c21ca3`, and `24e54ff` should be revisited after the first parser batch to avoid over-importing overlapping hardening all at once
 
 Skipped:
-- none
+- `d143638` multi-path source/destination pairs is classified out of the initial Subject 14 pass because it is broader path-plumbing work, not a bounded transfer/LFTP fix
+- `6d59994` rebrand and unrelated modernization churn are out of scope for Subject 14
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`
+- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, and tightened the wrapped-queue handling so the new parser hardening does not regress quoted-path parser coverage
+- status: first parser-hardening batch verified
 
 Notes:
-- none
+- start with the parser-hardening batch, then verify focused LFTP tests before moving to timeout tuning or controller containment
 
 ## Subject 15 - Scanning
 

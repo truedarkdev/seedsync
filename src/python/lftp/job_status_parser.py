@@ -87,11 +87,15 @@ class LftpJobStatusParser:
         lines = list(lines)
         try:
             statuses += self.__parse_queue(lines)
+        except ValueError as e:
+            self.logger.warning("LftpJobStateParser skipping bad queue output: {}".format(str(e)))
+            self.logger.debug("Bad status output:\n{}".format(output))
+            return statuses
+        try:
             statuses += self.__parse_jobs(lines)
         except ValueError as e:
-            self.logger.error("LftpJobStateParser error: {}".format(str(e)))
-            self.logger.error("Status:\n{}".format(output))
-            raise LftpJobStatusParserError("Error parsing lftp job status")
+            self.logger.warning("LftpJobStateParser skipping bad job output: {}".format(str(e)))
+            self.logger.debug("Bad status output:\n{}".format(output))
         return statuses
 
     @staticmethod
@@ -432,6 +436,12 @@ class LftpJobStatusParser:
                 # Continue the outer loop
                 continue
 
+            if prev_job and (
+                    line.startswith("Getting file list") or
+                    line.startswith("cd ")
+            ):
+                continue
+
             # Search for but ignore "\chunk" line
             result = chunk_header_m.search(line)
             if result:
@@ -534,6 +544,19 @@ class LftpJobStatusParser:
                         # header line
                         lines.pop(0)
 
+                        if "jobs -v" in line:
+                            logging.getLogger("LftpJobStatusParser").warning(
+                                "Failed to parse queue line, skipping: {}".format(line)
+                            )
+                            while lines and not (
+                                re.match("^\d+\.", lines[0]) or
+                                re.match("^cd\s.*$", lines[0]) or
+                                re.match(r"^\[\d+\]", lines[0]) or
+                                queue_done_m.match(lines[0])
+                            ):
+                                lines.pop(0)
+                            continue
+
                         result_pget = queue_pget_m.match(line)
                         result_mirror = queue_mirror_m.match(line)
                         if result_pget:
@@ -543,7 +566,17 @@ class LftpJobStatusParser:
                             type_ = LftpJobStatus.Type.MIRROR
                             result = result_mirror
                         else:
-                            raise ValueError("Failed to parse queue line: {}".format(line))
+                            logging.getLogger("LftpJobStatusParser").warning(
+                                "Failed to parse queue line, skipping: {}".format(line)
+                            )
+                            while lines and not (
+                                re.match("^\d+\.", lines[0]) or
+                                re.match("^cd\s.*$", lines[0]) or
+                                re.match(r"^\[\d+\]", lines[0]) or
+                                queue_done_m.match(lines[0])
+                            ):
+                                lines.pop(0)
+                            continue
                         id_ = int(result.group("id"))
                         name = os.path.basename(os.path.normpath(result.group("remote")))
                         flags = result.group("flags")
