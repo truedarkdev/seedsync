@@ -44,6 +44,8 @@ class ModelFile:
         self.__update_timestamp = datetime.now()
         self.__children = []  # children files
         self.__parent = None  # direct predecessor
+        self.__path_pair_id = None
+        self.__path_pair_name = None
 
     def __eq__(self, other):
         # disregard in comparisons:
@@ -242,3 +244,23 @@ class ModelFile:
     @property
     def parent(self) -> Optional["ModelFile"]:
         return self.__parent
+
+    @property
+    def path_pair_id(self) -> Optional[str]:
+        return self.__path_pair_id
+
+    @path_pair_id.setter
+    def path_pair_id(self, path_pair_id: Optional[str]):
+        if path_pair_id is not None and type(path_pair_id) != str:
+            raise TypeError
+        self.__path_pair_id = path_pair_id
+
+    @property
+    def path_pair_name(self) -> Optional[str]:
+        return self.__path_pair_name
+
+    @path_pair_name.setter
+    def path_pair_name(self, path_pair_name: Optional[str]):
+        if path_pair_name is not None and type(path_pair_name) != str:
+            raise TypeError
+        self.__path_pair_name = path_pair_name
