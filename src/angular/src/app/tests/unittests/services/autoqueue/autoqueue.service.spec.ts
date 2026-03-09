@@ -461,4 +461,30 @@ describe("Testing autoqueue service", () => {
         expect(actualCount).toBe(1);
         httpMock.verify();
     }));
+
+    it("should tolerate stale remove state when pattern is already gone before response", fakeAsync(() => {
+        httpMock.expectOne("/server/autoqueue/get").flush([
+            new AutoQueuePattern({pattern: "one"}),
+            new AutoQueuePattern({pattern: "two"})
+        ]);
+
+        aqService.remove("one").subscribe(DoNothing);
+        (<any>aqService)._patterns.next(Immutable.List([
+            new AutoQueuePattern({pattern: "two"})
+        ]));
+        httpMock.expectOne("/server/autoqueue/remove/one").flush("{}");
+
+        let latestPatterns = null;
+        aqService.patterns.subscribe({
+            next: patterns => {
+                latestPatterns = patterns;
+            }
+        });
+
+        tick();
+
+        expect(latestPatterns.size).toBe(1);
+        expect(Immutable.is(latestPatterns.get(0), new AutoQueuePattern({pattern: "two"}))).toBe(true);
+        httpMock.verify();
+    }));
 });

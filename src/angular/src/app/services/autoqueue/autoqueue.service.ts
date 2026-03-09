@@ -107,9 +107,11 @@ export class AutoQueueService extends BaseWebService {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const patterns = this._patterns.getValue();
-                        const finalIndex = currentPatterns.findIndex(pat => pat.pattern === pattern);
-                        const newPatterns = patterns.remove(finalIndex);
-                        this._patterns.next(newPatterns);
+                        const finalIndex = patterns.findIndex(pat => pat.pattern === pattern);
+                        if (finalIndex >= 0) {
+                            const newPatterns = patterns.remove(finalIndex);
+                            this._patterns.next(newPatterns);
+                        }
                     }
                 }
             });
