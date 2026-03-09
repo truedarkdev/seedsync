@@ -1224,10 +1224,10 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
-- none
+- adapted `65dc7fe` as the fourth Subject 14 batch to avoid mutating the persisted downloaded-file set during `clear()`, guard downloaded/deleted checks when no downloaded set is loaded, and only mark remote directories as `DOWNLOADED` when they contain remote leaf files and all such leaves are downloaded
 
 Pending:
-- `65dc7fe` and `5b52854` are candidates for transfer-state correctness follow-up work around downloaded/import status handling
+- `5b52854` remains pending only as a possible future import-status follow-up if this branch later gains import tracking state to attach it to
 - `b632b05` and `c52554b` are candidates for later monitoring and downloaded-state retention hardening after the low-risk parser/controller stability work lands
 - `c539ed9` is a larger transfer-focused controller refactor candidate that should stay split from the initial conservative fixes
 - `a50a6ec` is already partly covered by Subject 12's mutation-method alignment and should be reviewed as a narrow transfer-adjacent follow-up rather than imported wholesale
@@ -1237,6 +1237,7 @@ Covered elsewhere:
 - the timeout aspect of `bdcc287` is intentionally covered by the smaller local `30s` adaptation of rapidcopy `5db8f34` instead of taking thejuran's broader `180s` value
 - the handler-method portion of `a50a6ec` is already covered by Subject 12 commit `515437c`
 - adapted equivalents of `7897c8e` and `9e84b9e` land in the local controller-containment batch for Subject 14
+- the import-status portion of `5b52854` does not apply on this branch because the current base has no `import_status` model field, imported-file persistence, or Sonarr/import-tracking path to extend yet
 
 Skipped:
 - `4c381e4` is classified out of the first Subject 14 pass because it is broad controller command refactoring rather than a bounded transfer/LFTP fix
@@ -1246,9 +1247,9 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: reviewed thejuran transfer/LFTP candidates and split them into low-risk parser/controller fixes versus broader controller and auto-queue follow-up work
-- status: not verified yet
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests python -m pytest -v tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_default_remote_dir_without_remote_leaf_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_clear_does_not_mutate_downloaded_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_state tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_full tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial_extra`
+- manual checks: reviewed thejuran transfer/LFTP candidates, kept only the transfer-state correctness subset from `65dc7fe`, and left the `5b52854` import-status work out because the required import-tracking model does not exist on this branch
+- status: transfer-state correctness batch verified
 
 Notes:
 - first implementation batch should stay limited to `lftp.py`, `job_status_parser.py`, and focused parser tests before broader transfer behavior work is attempted

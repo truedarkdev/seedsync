@@ -866,6 +866,29 @@ class TestModelBuilder(unittest.TestCase):
         m_aca = m_ac.get_children()[0]
         self.assertEqual(ModelFile.State.DEFAULT, m_aca.state)
 
+    def test_build_children_state_default_remote_dir_without_remote_leaf_files(self):
+        """Remote directories without remote files should not be marked downloaded"""
+        r_a = SystemFile("a", 0, True)
+        r_aa = SystemFile("aa", 0, True)
+        r_a.add_child(r_aa)
+
+        l_a = SystemFile("a", 100, True)
+        l_aa = SystemFile("aa", 100, True)
+        l_a.add_child(l_aa)
+        l_aaa = SystemFile("aaa", 100, False)  # local only leaf
+        l_aa.add_child(l_aaa)
+
+        self.model_builder.set_remote_files([r_a])
+        self.model_builder.set_local_files([l_a])
+
+        model = self.model_builder.build_model()
+        m_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.DEFAULT, m_a.state)
+        m_aa = m_a.get_children()[0]
+        self.assertEqual(ModelFile.State.DEFAULT, m_aa.state)
+        m_aaa = m_aa.get_children()[0]
+        self.assertEqual(ModelFile.State.DEFAULT, m_aaa.state)
+
     def test_build_children_state_queued(self):
         r_a = SystemFile("a", 0, True)
         r_aa = SystemFile("aa", 0, True)
@@ -1419,6 +1442,14 @@ class TestModelBuilder(unittest.TestCase):
         # Invalidate on different
         self.model_builder.set_downloaded_files({"a", "c"})
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_clear_does_not_mutate_downloaded_files(self):
+        downloaded_files = {"a", "b"}
+
+        self.model_builder.set_downloaded_files(downloaded_files)
+        self.model_builder.clear()
+
+        self.assertEqual({"a", "b"}, downloaded_files)
 
     def test_rebuild_on_extract_statuses(self):
         self.assertTrue(self.model_builder.has_changes())
