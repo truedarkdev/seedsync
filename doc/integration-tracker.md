@@ -1418,25 +1418,27 @@ Integrated:
 - adapted `3b98bd8` and `a1b467e` as `907e1ee` so auto-queue now separates new files from modified files, treats remote discovery (`None -> value`) differently from true remote updates, and uses hidden `file_id` command identity to stay safe with Subject 15 path-pair duplicates
 - adapted `9e290af` and `f5d4d24` as `a0f86f5` so explicit STOP and DELETE_LOCAL actions persist across restarts via `stopped_file_names`, manual QUEUE clears that stopped state again, and the persist format remains backward-compatible when older controller state lacks the new key
 - adapted `2323761` as `555d1d1` so `Model` and `AutoQueuePersist` listener notification uses copy-under-lock handling instead of iterating a listener list that may be modified concurrently
+- adapted `7631bfb` as `6a30ae4` so `AutoQueueService.remove()` re-reads the live pattern list before removing an item and safely no-ops if the target pattern is already gone when the response returns
 
 Pending:
 - none
 
 Covered elsewhere:
-- `88d96a1` appears to overlap with existing handler semantics work already landed in `d0b9195`; re-check only if later autoqueue-specific API tests show a remaining gap
+- `88d96a1` overlaps with existing handler semantics work already landed in `d0b9195`
 - `e775d8f` is already satisfied locally because current `ModelBuilder` marks missing-but-previously-downloaded files as `DELETED` using `file_id`-aware persisted state, so they no longer pass the auto-queue `DEFAULT`-state filter
-- the small lifecycle/stale-index cleanup pair `b1b7ec9` and `7631bfb` is already effectively covered locally: the AutoQueue page already unsubscribes with `takeUntil`, and `AutoQueueService.remove()` already re-reads the live pattern list before removing an item instead of trusting a stale pre-request index
+- `b1b7ec9` is already effectively covered locally because the AutoQueue page already unsubscribes with `takeUntil`, so its lifecycle fix was not needed as a separate Subject 16 batch
 
 Skipped:
 - `b9c0612` is not needed in this branch because its bug depends on thejuran's bounded LRU downloaded tracker; local `downloaded_file_names` remains an unbounded set, so there is no equivalent eviction path to harden here
+- the shared stream reconnect timer cleanup portion of `7631bfb` is tracked out of Subject 16 because it belongs to shared stream infrastructure rather than auto-queue feature behavior
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_controller_persist.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py tests/unittests/test_model/test_model.py tests/unittests/test_model/test_diff.py`
-- manual checks: reviewed thejuran auto-queue runtime, controller persist, and test candidates against current local Subject 15 `file_id` / path-pair-aware controller state; confirmed the most important gap was restart/requeue correctness, then reviewed the landed `907e1ee`, `a0f86f5`, and `555d1d1` batches against the upstream clusters and re-checked the remaining `e775d8f`, `b9c0612`, `b1b7ec9`, and `7631bfb` candidates against current local behavior
-- status: Subject 16 backend/runtime and listener-hardening batches landed; the focused suites passed with `67 passed` and `77 passed`
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_controller_persist.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py tests/unittests/test_model/test_model.py tests/unittests/test_model/test_diff.py`; `make run-tests-angular`
+- manual checks: reviewed thejuran auto-queue runtime, controller persist, and test candidates against current local Subject 15 `file_id` / path-pair-aware controller state; confirmed the most important gap was restart/requeue correctness, then reviewed the landed `907e1ee`, `a0f86f5`, `555d1d1`, and `6a30ae4` batches against the upstream clusters, re-checked the remaining `e775d8f`, `b9c0612`, and `b1b7ec9` candidates against current local behavior, and used `git diff --ignore-cr-at-eol` to separate the Angular stale-index fix from workspace CRLF noise
+- status: Subject 16 backend/runtime, listener hardening, and Angular stale-index handling landed; the focused suites passed with `53 passed`, `67 passed`, and `77 passed`, and Angular passed with `211 tests completed`
 
 Notes:
 - thejuran carries the substantive Subject 16 runtime fixes in this pass; the local adaptation was made `file_id`-safe because Subject 15 made duplicate visible filenames valid across path pairs while `AutoQueue` previously deduplicated by visible name
