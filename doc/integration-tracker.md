@@ -1572,52 +1572,64 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`335d7df`)
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 18 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 18 candidate after `a8561cd`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- `988fed0` adapted from `d2e4bef` to guard `ModelBuilder` ETA estimation when `remote_size` is still `None`
+- `f0f62ba` adapted from `cbec564` and `4f58c8f` to use exception-safe model locking in controller access/update paths and include caught LFTP error text in queue/stop failures
+- `257d064` adapted from `88d96a1` to propagate controller command failure status codes through the web callback path so single-file command endpoints can return `404`, `409`, or `500`
+- `2410a7d` adapted from the `ControllerJob` test slice of `e9ac251` without taking the broader refactor-coupled controller unit suite
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `7897c8e` and `9e84b9e` were already adapted in Subject 14's controller-containment batch
+- `65dc7fe` downloaded-state/model-builder correctness was already adapted in Subject 14
+- `3b98bd8`, `a1b467e`, `9e290af`, `f5d4d24`, `e775d8f`, and related auto-queue restart/requeue fixes were already handled in Subject 16
+- the handler-method portion of `a50a6ec` was already handled in Subject 12; this pass only took the later callback/status-code slice from `88d96a1`
 
 Skipped:
-- none
+- `48f9a68`, `8daf221`, `5b52854`, `6420549`, `cd8d78a`, `4a83863`, `5210436`, `f5e5487`, `b356607`, and `c8f01c5` were left out because they depend on import/webhook/auto-delete feature surfaces that do not exist in current base and would broaden this conservative pass beyond core controller fixes
+- `4c381e4`, `1bd91fc`, `2f914d4`, `2bc18bd`, `c539ed9`, `57f460b`, `2323761`, `b632b05`, and the remaining `c52554b` work were skipped because they are larger refactors or infrastructure redesigns rather than bounded controller correctness fixes for this pass
+- the main `494ff3d` and `e9ac251` controller unit-suite expansions were skipped because they target thejuran's later manager/refactor architecture rather than the current local controller shape
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_model_builder.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_model_builder.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py tests/integration/test_web/test_handler/test_controller.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller_job.py`
+- manual checks: reviewed worker diffs with `git diff --ignore-cr-at-eol`, re-checked prior tracker deferrals so the status-code slice only covered the controller callback path from `88d96a1`, and confirmed the existing remote-scan error surfacing from rapidcopy `de964a1` is already present locally
+- status: verified; the targeted controller/model suite passed with `50 passed`, then `59 passed`, the controller + handler status-code checks passed with `26 passed`, and `ControllerJob` lifecycle coverage passed with `3 passed`
 
 Notes:
-- none
+- Subject 18 stayed deliberately narrow in this pass: controller/model crash proofing, exception-safe locking, callback status-code propagation, and a small `ControllerJob` test follow-up landed, while feature-heavy import/webhook, validation, workflow, and refactor work was consciously left out
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`335d7df`)
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 18 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 18 candidate after `6ce7c19`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
@@ -1626,21 +1638,31 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `d143638`, `1690826`, `981d707`, and `9d58f10` were already adapted in Subject 15's path-pair and multi-path controller work
+- `62e14e2` was already adapted in Subject 14's controller/LFTP containment batch
+- the rate-limit portion of `7f22141` was already adapted in Subject 14
+- `de964a1` remote scan error surfacing is already present locally in current status/controller/serialize code
 
 Skipped:
-- none
+- `8d6b436` and `6ce7c19` change queue or transfer workflow semantics and are better considered with broader workflow/transfer subjects, not this conservative controller pass
+- the validation stack in `227b5a3`, `866921b`, `d0662ca`, `dda1cb2`, `30809bf`, `e038c21`, `25145f6`, `2614ae6`, `4cd7fc1`, `d20b84d`, and `4527bfe` was skipped because it is a large feature surface spanning backend, settings, UI, and packaging rather than a conservative controller-core fix
+- `1bccd13`, `f2d906e`, `52b9ebd`, and `5d5a90a` stay with scanning or remote-scanner compatibility rather than this controller pass
+- `93e10ab`, `5df693d`, `d87f403`, `1131714`, `d458abd`, `677be93`, `561bf5a`, and `a9320fd` are modernization, CI, or cleanup-only for this subject
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_model_builder.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_model_builder.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py tests/integration/test_web/test_handler/test_controller.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller_job.py`
+- manual checks: compared rapidcopy controller candidates against the now-finished local Subject 18 batches, confirmed that the useful error/status surfacing is already present locally, and kept the validation and workflow-changing features out of this conservative pass
+- status: verified; the rapidcopy-reviewed controller candidates were either already covered by earlier subjects or consciously skipped for subject-specific reasons while the final local Subject 18 verification passed
 
 Notes:
-- none
+- rapidcopy did not supply additional conservative controller-core work beyond items already present locally or better classified under other subjects
 
 ## Subject 19 - Dashboard And Main Layout UI
 
