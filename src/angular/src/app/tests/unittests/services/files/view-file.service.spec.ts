@@ -11,6 +11,7 @@ import {MockModelFileService} from "../../../mocks/mock-model-file.service";
 import {ModelFile} from "../../../../services/files/model-file";
 import {ViewFile} from "../../../../services/files/view-file";
 import {ViewFileFilterCriteria} from "../../../../services/files/view-file.service";
+import {FileSelectionService} from "../../../../services/files/file-selection.service";
 
 
 describe("Testing view file service", () => {
@@ -21,6 +22,7 @@ describe("Testing view file service", () => {
         TestBed.configureTestingModule({
             providers: [
                 ViewFileService,
+                FileSelectionService,
                 LoggerService,
                 ConnectedService,
                 {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry}
@@ -749,6 +751,32 @@ describe("Testing view file service", () => {
         expect(viewFilesMap.has("blueman")).toBe(true);
     }));
 
+    it("should clear bulk selection when filter criteria changes", fakeAsync(() => {
+        class TestCriteria implements ViewFileFilterCriteria {
+            meetsCriteria(viewFile: ViewFile): boolean {
+                return viewFile.status === ViewFile.Status.QUEUED;
+            }
+        }
+
+        const fileSelectionService = TestBed.get(FileSelectionService);
+        const one = new ViewFile({name: "one"});
+        const two = new ViewFile({name: "two"});
+
+        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([one, two]));
+        fileSelectionService.toggle(one);
+        fileSelectionService.toggle(two);
+
+        let selectedNames = Immutable.Set<string>();
+        fileSelectionService.selectedNames.subscribe(value => selectedNames = value);
+        tick();
+        expect(selectedNames.size).toBe(2);
+
+        viewService.setFilterCriteria(new TestCriteria());
+        tick();
+
+        expect(selectedNames.size).toBe(0);
+    }));
+
     it("should resend filtered files on criteria change", fakeAsync(() => {
         class TestCriteria implements ViewFileFilterCriteria {
             constructor(public flag: boolean) {}
@@ -917,5 +945,24 @@ describe("Testing view file service", () => {
         expect(viewFiles.get(5).name).toBe("flower");
         expect(viewFiles.get(6).name).toBe("blueman");
         expect(viewFiles.get(7).name).toBe("aaaa");
+    }));
+
+    it("should clear bulk selection when comparator changes", fakeAsync(() => {
+        const fileSelectionService = TestBed.get(FileSelectionService);
+        const one = new ViewFile({name: "one"});
+        const two = new ViewFile({name: "two"});
+
+        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([one, two]));
+        fileSelectionService.toggle(one);
+
+        let selectedNames = Immutable.Set<string>();
+        fileSelectionService.selectedNames.subscribe(value => selectedNames = value);
+        tick();
+        expect(selectedNames.toArray()).toEqual(["one"]);
+
+        viewService.setComparator((a: ViewFile, b: ViewFile) => a.name.localeCompare(b.name));
+        tick();
+
+        expect(selectedNames.size).toBe(0);
     }));
 });
