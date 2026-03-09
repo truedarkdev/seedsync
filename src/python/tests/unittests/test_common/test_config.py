@@ -230,7 +230,8 @@ class TestConfig(unittest.TestCase):
             "num_max_connections_per_dir_file": "6",
             "num_max_total_connections": "7",
             "use_temp_file": "True",
-            "rate_limit": "1M"
+            "rate_limit": "1M",
+            "staging_path": "/path/on/local/server/incomplete"
         }
         lftp = Config.Lftp.from_dict(good_dict)
         self.assertEqual("remote.server.com", lftp.remote_address)
@@ -248,6 +249,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(7, lftp.num_max_total_connections)
         self.assertEqual(True, lftp.use_temp_file)
         self.assertEqual("1M", lftp.rate_limit)
+        self.assertEqual("/path/on/local/server/incomplete", lftp.staging_path)
 
         self.check_common(Config.Lftp,
                           good_dict,
@@ -286,6 +288,29 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "33")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
+
+    def test_lftp_backfills_missing_staging_path(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("", lftp.staging_path)
 
     def test_controller(self):
         good_dict = {
@@ -390,6 +415,7 @@ class TestConfig(unittest.TestCase):
         num_max_total_connections=7
         use_temp_file=False
         rate_limit=500K
+        staging_path=/path/on/local/server/incomplete
 
         [Controller]
         interval_ms_remote_scan=30000
@@ -427,6 +453,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(7, config.lftp.num_max_total_connections)
         self.assertEqual(False, config.lftp.use_temp_file)
         self.assertEqual("500K", config.lftp.rate_limit)
+        self.assertEqual("/path/on/local/server/incomplete", config.lftp.staging_path)
 
         self.assertEqual(30000, config.controller.interval_ms_remote_scan)
         self.assertEqual(10000, config.controller.interval_ms_local_scan)
@@ -474,6 +501,7 @@ class TestConfig(unittest.TestCase):
         config.lftp.num_max_connections_per_dir_file = 3
         config.lftp.num_max_total_connections = 4
         config.lftp.use_temp_file = True
+        config.lftp.staging_path = "/local/server/path/incomplete"
         config.controller.interval_ms_remote_scan = 1234
         config.controller.interval_ms_local_scan = 5678
         config.controller.interval_ms_downloading_scan = 9012
@@ -509,6 +537,7 @@ class TestConfig(unittest.TestCase):
         num_max_total_connections = 4
         use_temp_file = True
         rate_limit = None
+        staging_path = /local/server/path/incomplete
 
         [Controller]
         interval_ms_remote_scan = 1234

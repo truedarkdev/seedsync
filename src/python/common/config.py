@@ -272,6 +272,7 @@ class Config(Persist):
                                          Converters.int)
         use_temp_file = PROP("use_temp_file", Checkers.null, Converters.bool)
         rate_limit = PROP("rate_limit", Checkers.null, Converters.null)
+        staging_path = PROP("staging_path", Checkers.null, Converters.null)
 
         def __init__(self):
             super().__init__()
@@ -290,6 +291,14 @@ class Config(Persist):
             self.num_max_total_connections = None
             self.use_temp_file = None
             self.rate_limit = None
+            self.staging_path = None
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "staging_path" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["staging_path"] = ""
+            return super().from_dict(config_dict)
 
     class Controller(IC):
         interval_ms_remote_scan = PROP("interval_ms_remote_scan", Checkers.int_positive, Converters.int)
