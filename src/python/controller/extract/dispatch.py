@@ -93,12 +93,12 @@ class ExtractDispatch:
         self.__worker.join()
 
     def add_listener(self, listener: ExtractListener):
-        self.__listeners_lock.acquire()
-        self.__listeners.append(listener)
-        self.__listeners_lock.release()
+        with self.__listeners_lock:
+            self.__listeners.append(listener)
 
     def status(self) -> List[ExtractStatus]:
-        tasks = list(self.__task_queue.queue)
+        with self.__task_queue.mutex:
+            tasks = list(self.__task_queue.queue)
         statuses = []
         for task in tasks:
             status = ExtractStatus(name=task.root_name,
@@ -110,11 +110,7 @@ class ExtractDispatch:
     def extract(self, model_file: ModelFile):
         self.logger.debug("Received extract for {}".format(model_file.name))
 
-        for task in self.__task_queue.queue:
-            if task.root_name == model_file.name:
-                self.logger.info("Ignoring extract for {}, already exists".format(model_file.name))
-                return
-
+        # Build the task before taking the queue mutex.
         # noinspection PyProtectedMember
         task = ExtractDispatch._Task(model_file.name, model_file.is_dir)
 
@@ -138,10 +134,7 @@ class ExtractDispatch:
             # Coalesce extractions
             ExtractDispatch.__coalesce_extractions(task)
 
-            # Verify that there was at least one archive file
-            if len(task.archive_paths) > 0:
-                self.__task_queue.put(task)
-            else:
+            if len(task.archive_paths) == 0:
                 raise ExtractDispatchError(
                     "Directory does not contain any archives: {}".format(model_file.name)
                 )
@@ -154,17 +147,27 @@ class ExtractDispatch:
                 raise ExtractDispatchError("File is not an archive: {}".format(model_file.name))
             task.add_archive(archive_path=archive_full_path,
                              out_dir_path=self.__out_dir_path)
-            self.__task_queue.put(task)
+
+        with self.__task_queue.mutex:
+            for queued_task in self.__task_queue.queue:
+                if queued_task.root_name == model_file.name:
+                    self.logger.info("Ignoring extract for {}, already exists".format(model_file.name))
+                    return
+            self.__task_queue.queue.append(task)
+            self.__task_queue.not_empty.notify()
 
     def __worker(self):
         self.logger.debug("Started worker thread")
 
         while not self.__worker_shutdown.is_set():
-            # Try to grab next task
-            # Do another check for shutdown
-            while len(self.__task_queue.queue) > 0 and not self.__worker_shutdown.is_set():
-                # peek the task
-                task = self.__task_queue.queue[0]
+            with self.__task_queue.mutex:
+                has_tasks = len(self.__task_queue.queue) > 0
+
+            while has_tasks and not self.__worker_shutdown.is_set():
+                with self.__task_queue.mutex:
+                    if len(self.__task_queue.queue) == 0:
+                        break
+                    task = self.__task_queue.queue[0]
 
                 # We have a task, extract archives one by one
                 completed = True
@@ -187,17 +190,21 @@ class ExtractDispatch:
                     self.logger.exception("Caught an extraction error")
                     completed = False
                 finally:
-                    # pop the task
-                    self.__task_queue.get(block=False)
+                    try:
+                        self.__task_queue.get(block=False)
+                    except queue.Empty:
+                        pass
 
-                # Send notification to listeners
-                self.__listeners_lock.acquire()
-                for listener in self.__listeners:
+                with self.__listeners_lock:
+                    listeners_snapshot = list(self.__listeners)
+                for listener in listeners_snapshot:
                     if completed:
                         listener.extract_completed(task.root_name, task.root_is_dir)
                     else:
                         listener.extract_failed(task.root_name, task.root_is_dir)
-                self.__listeners_lock.release()
+
+                with self.__task_queue.mutex:
+                    has_tasks = len(self.__task_queue.queue) > 0
 
             time.sleep(ExtractDispatch.__WORKER_SLEEP_INTERVAL_IN_SECS)
 
