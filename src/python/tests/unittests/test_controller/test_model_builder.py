@@ -522,6 +522,15 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(None, model.get_file("a").eta)
 
+        # remote size unavailable
+        self.model_builder.clear()
+        s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        s.total_transfer_state = LftpJobStatus.TransferState(None, None, None, 100, None)
+        self.model_builder.set_lftp_statuses([s])
+        self.model_builder.set_local_files([SystemFile("a", 1000, False)])
+        model = self.model_builder.build_model()
+        self.assertEqual(None, model.get_file("a").eta)
+
         # finished
         self.model_builder.clear()
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
