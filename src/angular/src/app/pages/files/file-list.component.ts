@@ -1,13 +1,16 @@
-import {Component, ChangeDetectionStrategy} from "@angular/core";
+import {Component, ChangeDetectionStrategy, OnDestroy} from "@angular/core";
 import {Observable} from "rxjs/Observable";
+import {Subscription} from "rxjs/Subscription";
 
 import {List} from "immutable";
+import * as Immutable from "immutable";
 
 import {ViewFileService} from "../../services/files/view-file.service";
 import {ViewFile} from "../../services/files/view-file";
 import {LoggerService} from "../../services/utils/logger.service";
 import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ViewFileOptionsService} from "../../services/files/view-file-options.service";
+import {FileSelectionService} from "../../services/files/file-selection.service";
 
 @Component({
     selector: "app-file-list",
@@ -17,25 +20,28 @@ import {ViewFileOptionsService} from "../../services/files/view-file-options.ser
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 
-export class FileListComponent {
+export class FileListComponent implements OnDestroy {
     public files: Observable<List<ViewFile>>;
+    public selectedNames: Observable<Immutable.Set<string>>;
+    public selectedFiles: Observable<List<ViewFile>>;
+    public areAllVisibleSelected: Observable<boolean>;
     public identify = FileListComponent.identify;
     public options: Observable<ViewFileOptions>;
     public SortMethod = ViewFileOptions.SortMethod;
+    private _filesSubscription: Subscription;
 
     constructor(private _logger: LoggerService,
                 private viewFileService: ViewFileService,
-                private viewFileOptionsService: ViewFileOptionsService) {
+                private viewFileOptionsService: ViewFileOptionsService,
+                private fileSelectionService: FileSelectionService) {
         this.files = viewFileService.filteredFiles;
+        this.selectedNames = fileSelectionService.selectedNames;
+        this.selectedFiles = fileSelectionService.selectedFiles;
+        this.areAllVisibleSelected = fileSelectionService.areAllVisibleSelected;
         this.options = this.viewFileOptionsService.options;
+        this._filesSubscription = this.files.subscribe(files => this.fileSelectionService.setVisibleFiles(files));
     }
 
-    // noinspection JSUnusedLocalSymbols
-    /**
-     * Used for trackBy in ngFor
-     * @param index
-     * @param item
-     */
     static identify(index: number, item: ViewFile): string {
         return item.name;
     }
@@ -46,6 +52,18 @@ export class FileListComponent {
         } else {
             this.viewFileService.setSelected(file);
         }
+    }
+
+    ngOnDestroy(): void {
+        this._filesSubscription.unsubscribe();
+    }
+
+    onSelectionToggle(file: ViewFile): void {
+        this.fileSelectionService.toggle(file);
+    }
+
+    onToggleAllVisible(checked: boolean): void {
+        this.fileSelectionService.setAllVisibleSelected(checked);
     }
 
     onSort(currentSortMethod: ViewFileOptions.SortMethod,

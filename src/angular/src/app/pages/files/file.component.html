@@ -1,5 +1,12 @@
-<div class="file" [class.selected]="file.isSelected" #fileElement>
+<div class="file" [class.selected]="file.isSelected || isBulkSelected" #fileElement>
     <div class="content">
+        <div class="select">
+            <input type="checkbox"
+                   appClickStopPropagation
+                   [checked]="isBulkSelected"
+                   (click)="$event.stopPropagation()"
+                   (change)="onToggleSelection(file)" />
+        </div>
         <div class="status">
             <img src="assets/icons/default-remote.svg" id="default-remote"
                  *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize > 0" />
@@ -86,7 +93,7 @@
     </div>
 
     <!-- actions div, visible on selection -->
-    <div class="actions">
+    <div class="actions" *ngIf="showActions">
         <div class="button" appClickStopPropagation
              [attr.disabled]="isQueueable() ? null : true"
              (click)="!isQueueable() || onQueue(file)"

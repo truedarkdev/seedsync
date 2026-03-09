@@ -44,6 +44,9 @@ import {ViewFileSortService} from "./services/files/view-file-sort.service";
 import {DomService} from "./services/utils/dom.service";
 import {StorageServiceModule} from "angular-webstorage-service";
 import {VersionCheckService} from "./services/utils/version-check.service";
+import {BulkActionsBarComponent} from "./pages/files/bulk-actions-bar.component";
+import {FileSelectionService} from "./services/files/file-selection.service";
+import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
 
 @NgModule({
     declarations: [
@@ -54,6 +57,7 @@ import {VersionCheckService} from "./services/utils/version-check.service";
         AppComponent,
         FileListComponent,
         FileComponent,
+        BulkActionsBarComponent,
         FileOptionsComponent,
         FilesPageComponent,
         HeaderComponent,
@@ -83,6 +87,7 @@ import {VersionCheckService} from "./services/utils/version-check.service";
         ViewFileFilterService,
         ViewFileSortService,
         ViewFileOptionsService,
+        FileSelectionService,
         DomService,
         VersionCheckService,
 
@@ -97,6 +102,7 @@ import {VersionCheckService} from "./services/utils/version-check.service";
         AutoQueueServiceProvider,
         ConfigServiceProvider,
         ServerCommandServiceProvider,
+        BulkCommandServiceProvider,
 
         // Initialize services not tied to any components
         {

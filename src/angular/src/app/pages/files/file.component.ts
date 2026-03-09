@@ -32,12 +32,15 @@ export class FileComponent implements OnChanges {
 
     @Input() file: ViewFile;
     @Input() options: ViewFileOptions;
+    @Input() isBulkSelected = false;
+    @Input() showActions = true;
 
     @Output() queueEvent = new EventEmitter<ViewFile>();
     @Output() stopEvent = new EventEmitter<ViewFile>();
     @Output() extractEvent = new EventEmitter<ViewFile>();
     @Output() deleteLocalEvent = new EventEmitter<ViewFile>();
     @Output() deleteRemoteEvent = new EventEmitter<ViewFile>();
+    @Output() toggleSelectionEvent = new EventEmitter<ViewFile>();
 
     // Indicates an active action on-going
     activeAction: FileAction = null;
@@ -139,6 +142,10 @@ export class FileComponent implements OnChanges {
                 this.deleteRemoteEvent.emit(file);
             }
         );
+    }
+
+    onToggleSelection(file: ViewFile) {
+        this.toggleSelectionEvent.emit(file);
     }
 
     // Source: https://stackoverflow.com/a/7557433

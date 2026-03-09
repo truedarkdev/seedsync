@@ -31,6 +31,22 @@ export class Localization {
         public static readonly DELETE_REMOTE_MESSAGE =
             (name: string) => `Are you sure you want to delete <b>${name}</b> from the remote server?`
 
+        public static readonly DELETE_LOCAL_BULK_TITLE = "Delete Local Files";
+        public static readonly DELETE_LOCAL_BULK_MESSAGE =
+            (names: string[]) => Localization.Modal.BULK_DELETE_MESSAGE(names, "local server")
+
+        public static readonly DELETE_REMOTE_BULK_TITLE = "Delete Remote Files";
+        public static readonly DELETE_REMOTE_BULK_MESSAGE =
+            (names: string[]) => Localization.Modal.BULK_DELETE_MESSAGE(names, "remote server")
+
+        private static readonly BULK_DELETE_MESSAGE = (names: string[], location: string) => {
+            const listedNames = names.slice(0, 5).map(name => `<li><b>${name}</b></li>`).join("");
+            const remainingCount = names.length - Math.min(names.length, 5);
+            const remainingText = remainingCount > 0 ? `<br />And ${remainingCount} more file(s).` : "";
+            return `Are you sure you want to delete ${names.length} selected file(s) from the ${location}?` +
+                `<ul>${listedNames}</ul>${remainingText}`;
+        }
+
         public static readonly RESTART_TITLE = "Restart SeedSync";
         public static readonly RESTART_MESSAGE =
             "Are you sure you want to restart the server?<br /><br />" +

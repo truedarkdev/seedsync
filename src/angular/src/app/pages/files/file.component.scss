@@ -25,8 +25,9 @@
 }
 
 /* width */
+.content .select   {width: 40px; min-width: 40px;}
 .content .status   {width: 100px; min-width: 100px;}
-.content .name     {flex-grow: 1; flex-basis: calc(100% - 100px);}
+.content .name     {flex-grow: 1; flex-basis: calc(100% - 140px);}
 .content .speed    {width: 100px; min-width: 100px;}
 /* .content .eta is hidden on mobile */
 .content .size     {flex-grow: 1;}
@@ -38,6 +39,16 @@
     vertical-align: top;
 }
 .content .name {text-align: left;}
+.content .select {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    input {
+        width: 16px;
+        height: 16px;
+    }
+}
 
 /* Name */
 .content .name {
@@ -216,6 +227,7 @@
 
     /* width */
     /* NOTE: make sure this is in-sync with "#file-list #header" */
+    .content .select    {width: 40px; min-width: 40px;}
     .content .status    {width: 100px; min-width: 100px;}
     .content .name      {flex-grow: 1;}
     .content .speed     {width: 100px; min-width: 100px;}
@@ -230,11 +242,12 @@
     }
 
     /* Re-order columns */
-    .content .status {order: 2;}
-    .content .name {order: 1;}
-    .content .speed {order: 3;}
-    .content .eta {order: 4;}
-    .content .size {order: 5;}
+    .content .select {order: 1;}
+    .content .name {order: 2;}
+    .content .status {order: 3;}
+    .content .speed {order: 4;}
+    .content .eta {order: 5;}
+    .content .size {order: 6;}
 
     /* Hide the inner eta, show outer eta */
     .content .eta {display: inline;}

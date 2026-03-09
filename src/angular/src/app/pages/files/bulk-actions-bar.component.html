@@ -1,0 +1,9 @@
+<div class="bulk-actions" *ngIf="selectedFiles && selectedFiles.size > 0">
+    <span class="selection-count">{{selectedFiles.size}} selected</span>
+    <button type="button" class="btn btn-secondary btn-sm" (click)="clearSelection()">Clear</button>
+    <button type="button" class="btn btn-primary btn-sm" [disabled]="!isQueueable()" (click)="queue()">Queue</button>
+    <button type="button" class="btn btn-primary btn-sm" [disabled]="!isStoppable()" (click)="stop()">Stop</button>
+    <button type="button" class="btn btn-primary btn-sm" [disabled]="!isExtractable()" (click)="extract()">Extract</button>
+    <button type="button" class="btn btn-danger btn-sm" [disabled]="!isLocallyDeletable()" (click)="deleteLocal()">Delete Local</button>
+    <button type="button" class="btn btn-danger btn-sm" [disabled]="!isRemotelyDeletable()" (click)="deleteRemote()">Delete Remote</button>
+</div>
