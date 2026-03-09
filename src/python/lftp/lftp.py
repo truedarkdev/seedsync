@@ -2,8 +2,9 @@
 
 import logging
 import re
+import os
 from functools import wraps
-from typing import Callable, Union, List, Optional
+from typing import Callable, Union, List, Optional, Dict
 
 # 3rd party libs
 import pexpect
@@ -57,6 +58,7 @@ class Lftp:
         self.__job_status_parser = LftpJobStatusParser()
         self.__timeout = 30  # in seconds
         self.__consecutive_status_errors = 0
+        self.__path_pairs_by_id: Dict[str, Dict[str, str]] = {}
 
         self.__log_command_output = False
         self.__pending_error = None
@@ -106,6 +108,15 @@ class Lftp:
 
     def set_base_local_dir_path(self, base_local_dir_path: str):
         self.__base_local_dir_path = base_local_dir_path
+
+    def set_path_pairs(self, path_pairs):
+        self.__path_pairs_by_id = {
+            pair.id: {
+                "name": pair.name,
+                "remote_path": pair.remote_path,
+                "local_path": pair.local_path
+            } for pair in path_pairs
+        }
 
     def raise_pending_error(self):
         """
@@ -336,9 +347,59 @@ class Lftp:
                 statuses = []
             else:
                 raise
+        self.__annotate_status_path_pairs(statuses)
         return statuses
 
-    def queue(self, name: str, is_dir: bool):
+    def __annotate_status_path_pairs(self, statuses: List[LftpJobStatus]):
+        if not self.__path_pairs_by_id:
+            return
+        sorted_pairs = sorted(
+            self.__path_pairs_by_id.items(),
+            key=lambda item: max(len(item[1]["remote_path"]), len(item[1]["local_path"])),
+            reverse=True
+        )
+        for status in statuses:
+            match = next((
+                (pair_id, pair) for pair_id, pair in sorted_pairs
+                if self.__status_matches_paths(
+                    status,
+                    pair["remote_path"],
+                    pair["local_path"]
+                )
+            ), None)
+            if match is None:
+                continue
+            pair_id, pair = match
+            status.path_pair_id = pair_id
+            status.path_pair_name = pair["name"]
+
+    @staticmethod
+    def __path_is_within(path: Optional[str], root: str) -> bool:
+        if path is None:
+            return False
+        normalized_path = Lftp.__normalize_path(path)
+        normalized_root = Lftp.__normalize_path(root)
+        try:
+            common = os.path.commonpath([normalized_path, normalized_root])
+        except ValueError:
+            return False
+        return common == normalized_root
+
+    @staticmethod
+    def __normalize_path(path: str) -> str:
+        return os.path.normpath(path)
+
+    @staticmethod
+    def __status_matches_paths(status: LftpJobStatus, remote_root: str, local_root: str) -> bool:
+        remote_matches = Lftp.__path_is_within(status.remote_path, remote_root)
+        local_matches = Lftp.__path_is_within(status.local_path, local_root)
+        return remote_matches or local_matches
+
+    def queue(self,
+              name: str,
+              is_dir: bool,
+              remote_base_dir_path: Optional[str] = None,
+              local_base_dir_path: Optional[str] = None):
         """
         Queues a job for download
         This method may cause an exception to be generated in a later method call:
@@ -352,20 +413,27 @@ class Lftp:
         def escape(s: str) -> str:
             return s.replace("'", "\\'").replace("\"", "\\\"")
 
+        remote_dir = remote_base_dir_path if remote_base_dir_path is not None else self.__base_remote_dir_path
+        local_dir = local_base_dir_path if local_base_dir_path is not None else self.__base_local_dir_path
+
         command = " ".join([
             "queue",
             "'",
             "pget" if not is_dir else "mirror",
             "-c",
-            "\"{remote_dir}/{filename}\"".format(remote_dir=escape(self.__base_remote_dir_path),
+            "\"{remote_dir}/{filename}\"".format(remote_dir=escape(remote_dir),
                                                  filename=escape(name)),
             "-o" if not is_dir else "",
-            "\"{local_dir}/\"".format(local_dir=escape(self.__base_local_dir_path)),
+            "\"{local_dir}/\"".format(local_dir=escape(local_dir)),
             "'"
         ])
         self.__run_command(command)
 
-    def kill(self, name: str) -> bool:
+    def kill(self,
+             name: str,
+             path_pair_id: Optional[str] = None,
+             remote_path: Optional[str] = None,
+             local_path: Optional[str] = None) -> bool:
         """
         Kill a queued or running job
         :param name:
@@ -374,9 +442,22 @@ class Lftp:
         # look for this name in the status list
         job_to_kill = None
         for status in self.status():
-            if status.name == name:
-                job_to_kill = status
-                break
+            if status.name != name:
+                continue
+            if remote_path is not None and (
+                status.remote_path is None or
+                self.__normalize_path(status.remote_path) != self.__normalize_path(remote_path)
+            ):
+                continue
+            if local_path is not None and (
+                status.local_path is None or
+                self.__normalize_path(status.local_path) != self.__normalize_path(local_path)
+            ):
+                continue
+            if remote_path is None and local_path is None and path_pair_id is not None and status.path_pair_id != path_pair_id:
+                continue
+            job_to_kill = status
+            break
         if job_to_kill is None:
             self.logger.debug("Kill failed to find job '{}'".format(name))
             return False

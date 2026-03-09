@@ -77,7 +77,7 @@ class ModelBuilder:
 
     def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]):
         prev_lftp_statuses = self.__lftp_statuses
-        self.__lftp_statuses = {file.name: file for file in lftp_statuses}
+        self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
         # Invalidate the cache
         if self.__lftp_statuses != prev_lftp_statuses:
             self.__cached_model = None
@@ -126,11 +126,10 @@ class ModelBuilder:
         model = Model()
         model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
         all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
-        source_names = {file.name for file in self.__local_files.values()}
-        source_names.update(file.name for file in self.__remote_files.values())
-        for status_name in self.__lftp_statuses.keys():
-            if status_name not in source_names:
-                all_file_ids.add(status_name)
+        source_file_ids = set(self.__local_files.keys()).union(self.__remote_files.keys())
+        for status_file_id in self.__lftp_statuses.keys():
+            if status_file_id not in source_file_ids:
+                all_file_ids.add(status_file_id)
 
         for file_id in all_file_ids:
             remote = self.__remote_files.get(file_id, None)
@@ -204,9 +203,9 @@ class ModelBuilder:
 
             model_file = ModelFile(name, is_dir)
             path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
-                local.path_pair_id if local else None
+                local.path_pair_id if local else status.path_pair_id if status else None
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
-                local.path_pair_name if local else None
+                local.path_pair_name if local else status.path_pair_name if status else None
             self.__apply_path_pair_metadata(model_file, path_pair_id, path_pair_name)
             # set the file state
             # for now we only set to Queued or Downloading

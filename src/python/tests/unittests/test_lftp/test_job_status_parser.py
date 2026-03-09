@@ -389,6 +389,27 @@ class TestLftpJobStatusParser(unittest.TestCase):
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
         self.assertEqual(golden_jobs, statuses_jobs)
 
+    def test_statuses_preserve_remote_and_local_paths(self):
+        output = """
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is stopped.
+        Commands queued:
+         1. mirror -c /remote/movies/dup /local/movies/
+         2. mirror -c /remote/tv/dup /local/tv/
+        [2] mirror -c /remote/tv/dup /local/tv/  -- 35k/394k (8%) 10.8 KiB/s
+        """
+        parser = LftpJobStatusParser()
+
+        statuses = parser.parse(output)
+
+        self.assertEqual("/remote/movies/dup", statuses[0].remote_path)
+        self.assertEqual("/local/movies/", statuses[0].local_path)
+        self.assertEqual("/remote/tv/dup", statuses[1].remote_path)
+        self.assertEqual("/local/tv/", statuses[1].local_path)
+        self.assertEqual("/remote/tv/dup", statuses[2].remote_path)
+        self.assertEqual("/local/tv/", statuses[2].local_path)
+
     def test_queue_and_jobs_3(self):
         """Queued items, parallel jobs running, 'cd' line in queued pget"""
         output = """

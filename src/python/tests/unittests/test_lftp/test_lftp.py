@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
 import timeout_decorator
 
@@ -88,6 +89,86 @@ class TestLftp(unittest.TestCase):
     def tearDownClass(cls):
         # Cleanup
         shutil.rmtree(TestLftp.temp_dir)
+
+    @staticmethod
+    def _build_test_lftp():
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__path_pairs_by_id = {}
+        lftp._Lftp__base_remote_dir_path = "/remote/default"
+        lftp._Lftp__base_local_dir_path = "/local/default"
+        lftp._Lftp__run_command = MagicMock(return_value="")
+        return lftp
+
+    def test_queue_uses_override_paths(self):
+        lftp = self._build_test_lftp()
+
+        lftp.queue("dup", False, remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies")
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '"
+        )
+
+    def test_kill_matches_duplicate_names_by_remote_path(self):
+        lftp = self._build_test_lftp()
+        status_movies = LftpJobStatus(
+            job_id=7,
+            job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup",
+            flags="-c",
+            remote_path="/remote/movies/dup",
+            local_path="/local/movies/"
+        )
+        status_movies.path_pair_id = "movies"
+        status_tv = LftpJobStatus(
+            job_id=9,
+            job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup",
+            flags="-c",
+            remote_path="/remote/tv/dup",
+            local_path="/local/tv/"
+        )
+        status_tv.path_pair_id = "tv"
+        lftp.status = MagicMock(return_value=[status_movies, status_tv])
+
+        killed = lftp.kill("dup", path_pair_id="tv", remote_path="/remote/tv/dup", local_path="/local/tv")
+
+        self.assertTrue(killed)
+        lftp._Lftp__run_command.assert_called_once_with("kill 9")
+
+    def test_status_annotates_path_pairs_from_job_paths(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__path_pairs_by_id = {
+            "movies": {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies"
+            },
+            "tv": {
+                "name": "TV",
+                "remote_path": "/remote/tv",
+                "local_path": "/local/tv"
+            }
+        }
+        status = LftpJobStatus(
+            job_id=5,
+            job_type=LftpJobStatus.Type.MIRROR,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup",
+            flags="-c",
+            remote_path="/remote/tv/dup",
+            local_path="/local/tv/"
+        )
+        lftp._Lftp__job_status_parser.parse.return_value = [status]
+
+        statuses = lftp.status()
+
+        self.assertEqual("tv", statuses[0].path_pair_id)
+        self.assertEqual("TV", statuses[0].path_pair_name)
 
     def setUp(self):
         # Delete and recreate the local dir
