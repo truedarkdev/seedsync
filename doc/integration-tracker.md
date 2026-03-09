@@ -1212,7 +1212,7 @@ Notes:
 
 ### thejuran
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: `7f3afd2`
 - Source branch: thejuran/master
@@ -1228,11 +1228,7 @@ Integrated:
 - adapted the `lftp.py` portion of `c52554b` as the sixth Subject 14 batch to guard debug logging when `pexpect.after` is `None`, avoiding secondary `AttributeError` crashes in timeout/error paths
 
 Pending:
-- `5b52854` remains pending only as a possible future import-status follow-up if this branch later gains import tracking state to attach it to
-- `b632b05` and `c52554b` are candidates for later monitoring and downloaded-state retention hardening after the low-risk parser/controller stability work lands
-- `c539ed9` is a larger transfer-focused controller refactor candidate that should stay split from the initial conservative fixes
-- `a50a6ec` is already partly covered by Subject 12's mutation-method alignment and should be reviewed as a narrow transfer-adjacent follow-up rather than imported wholesale
-- the auto-queue restart/re-queue cluster in `1048d87`, `3b98bd8`, `9e290af`, `f5d4d24`, and `e775d8f` remains pending for later Subject 14 triage
+- none
 
 Covered elsewhere:
 - the timeout aspect of `bdcc287` is intentionally covered by the smaller local `30s` adaptation of rapidcopy `5db8f34` instead of taking thejuran's broader `180s` value
@@ -1244,6 +1240,10 @@ Covered elsewhere:
 Skipped:
 - `4c381e4` is classified out of the first Subject 14 pass because it is broad controller command refactoring rather than a bounded transfer/LFTP fix
 - noisy early auto-queue/download-state commits `b9c0612` and `f3af3fb` should be adapted manually if needed rather than cherry-picked with their mixed artifact churn
+- the remaining memory-monitor, bounded-queue, and bounded-set persistence work from `b632b05` and `c52554b` is skipped in this conservative Subject 14 pass because it is a broader backend memory-management redesign that touches stream delivery, controller persistence, and new infrastructure beyond the transfer/LFTP hardening already landed
+- `c539ed9` is skipped because it is a larger transfer/controller refactor rather than a bounded reliability fix
+- the non-handler portions of `a50a6ec` are skipped because they mix broader controller contract changes into an area already partly covered by Subject 12's HTTP-method alignment
+- the auto-queue restart and re-queue cluster in `1048d87`, `3b98bd8`, `9e290af`, `f5d4d24`, and `e775d8f` is skipped because it changes queue workflow behavior more than LFTP reliability and is not needed for the conservative transfer hardening goal of this pass
 
 Maintainer decisions:
 - none
@@ -1258,7 +1258,7 @@ Notes:
 
 ### rapidcopy
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: `7f3afd2`
 - Source branch: rapidcopy/master
@@ -1274,29 +1274,31 @@ Integrated:
 - adapted `62e14e2` with thejuran-style controller containment from `7897c8e` and `9e84b9e` as the second Subject 14 batch so non-fatal LFTP/parser failures log warnings or fail callbacks instead of crashing controller processing
 - adapted `5db8f34` as the third Subject 14 batch to raise the LFTP prompt timeout from 3 seconds to 30 seconds and demote routine timeout noise from exception to debug logging
 - adapted `c487178` as the fifth Subject 14 batch to translate unexpected `pexpect` EOFs inside `__run_command()` into `LftpError` so terminated `lftp` sessions follow the existing non-fatal controller containment path
+- adapted the download-rate-limit portion of `7f22141` as a later Subject 14 batch so users can set LFTP `net:limit-rate` through the existing config and settings UI without taking the upstream Angular 18 and Docker modernization churn
 
 Pending:
-- `8d6b436` queue prioritization is transfer-relevant but deferred because it expands queue semantics and API/UI surface
-- `6ce7c19` staging-directory and interrupted-download auto-resume is deferred until after the smaller stability batches
-- validation-heavy transfer work in `e038c21`, `866921b`, `dda1cb2`, `30809bf`, `2614ae6`, `d20b84d`, `4cd7fc1`, `157d003`, `227b5a3`, and `d0662ca` remains pending for later Subject 14 scoping
-- `7f22141` download rate limiting remains pending for later Subject 14 scoping
-- `207caf5` is a small settings/help-text consistency candidate once the backend stability batches are landed
+- none
 
 Covered elsewhere:
 - the connection-cap backend limit associated with `cb55471` is already enforced in current `Config`; only the user-facing settings copy remains to review later
 - parser-related older rapidcopy fixes in `0063f8b`, `ec6c48a`, `bc523d7`, `01430ca`, `481e040`, `902eb15`, `3c21ca3`, and `24e54ff` should be revisited after the first parser batch to avoid over-importing overlapping hardening all at once
+- the Angular 18 compatibility, test-mock modernization, and Docker build changes bundled into `7f22141` belong to earlier compatibility/tooling subjects rather than this transfer/LFTP pass
 
 Skipped:
 - `d143638` multi-path source/destination pairs is classified out of the initial Subject 14 pass because it is broader path-plumbing work, not a bounded transfer/LFTP fix
 - `6d59994` rebrand and unrelated modernization churn are out of scope for Subject 14
+- `8d6b436` is skipped because queue prioritization expands queue semantics and API/UI behavior beyond the conservative transfer/LFTP reliability scope
+- `6ce7c19` is skipped because staging directories and interrupted-download auto-resume change transfer workflow semantics and on-disk behavior rather than just hardening the existing LFTP path
+- validation-heavy transfer work in `e038c21`, `866921b`, `dda1cb2`, `30809bf`, `2614ae6`, `d20b84d`, `4cd7fc1`, `157d003`, `227b5a3`, and `d0662ca` is skipped because it bundles broader contract and behavior changes rather than isolated low-risk fixes
+- `207caf5` is skipped because the current settings text already warns that values above 32 are not recommended and that 0 means no limit, so the extra FD-limit rationale does not justify a separate wording-only import here
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python3 -m pytest /src/tests/unittests/test_controller/test_controller.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`
-- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, tightened the wrapped-queue handling so the parser hardening does not regress quoted-path coverage, kept the controller containment batch scoped to warning/callback handling rather than broader EOF semantics, chose the conservative rapidcopy-style 30 second timeout instead of thejuran's broader 180 second wait, and then adapted the narrow EOF-to-`LftpError` handling only in `lftp.py` without taking the upstream settings/default-connection changes
-- status: parser-hardening, controller-containment, timeout-tuning, and EOF-containment batches verified
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python3 -m pytest /src/tests/unittests/test_controller/test_controller.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_controller/test_controller.py`; `make run-tests-angular`
+- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, tightened the wrapped-queue handling so the parser hardening does not regress quoted-path coverage, kept the controller containment batch scoped to warning/callback handling rather than broader EOF semantics, chose the conservative rapidcopy-style 30 second timeout instead of thejuran's broader 180 second wait, adapted the narrow EOF-to-`LftpError` handling only in `lftp.py` without taking the upstream settings/default-connection changes, and then extracted only the download-rate-limit feature from `7f22141` while leaving its unrelated Angular 18 and Docker modernization out of Subject 14
+- status: parser-hardening, controller-containment, timeout-tuning, EOF-containment, and rate-limit batches verified
 
 Notes:
 - start with the parser-hardening batch, then verify focused LFTP tests before moving to timeout tuning or controller containment

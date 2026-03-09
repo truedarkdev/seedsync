@@ -229,7 +229,8 @@ class TestConfig(unittest.TestCase):
             "num_max_connections_per_root_file": "4",
             "num_max_connections_per_dir_file": "6",
             "num_max_total_connections": "7",
-            "use_temp_file": "True"
+            "use_temp_file": "True",
+            "rate_limit": "1M"
         }
         lftp = Config.Lftp.from_dict(good_dict)
         self.assertEqual("remote.server.com", lftp.remote_address)
@@ -246,6 +247,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(6, lftp.num_max_connections_per_dir_file)
         self.assertEqual(7, lftp.num_max_total_connections)
         self.assertEqual(True, lftp.use_temp_file)
+        self.assertEqual("1M", lftp.rate_limit)
 
         self.check_common(Config.Lftp,
                           good_dict,
@@ -387,6 +389,7 @@ class TestConfig(unittest.TestCase):
         num_max_connections_per_dir_file=5
         num_max_total_connections=7
         use_temp_file=False
+        rate_limit=500K
 
         [Controller]
         interval_ms_remote_scan=30000
@@ -423,6 +426,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(5, config.lftp.num_max_connections_per_dir_file)
         self.assertEqual(7, config.lftp.num_max_total_connections)
         self.assertEqual(False, config.lftp.use_temp_file)
+        self.assertEqual("500K", config.lftp.rate_limit)
 
         self.assertEqual(30000, config.controller.interval_ms_remote_scan)
         self.assertEqual(10000, config.controller.interval_ms_local_scan)
@@ -504,6 +508,7 @@ class TestConfig(unittest.TestCase):
         num_max_connections_per_dir_file = 3
         num_max_total_connections = 4
         use_temp_file = True
+        rate_limit = None
 
         [Controller]
         interval_ms_remote_scan = 1234

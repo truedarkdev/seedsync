@@ -139,6 +139,13 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
             valuePath: ["lftp", "use_temp_file"],
             description: "Unfinished and downloading files will be named *.lftp"
         },
+        {
+            type: OptionType.Text,
+            label: "Download Rate Limit",
+            valuePath: ["lftp", "rate_limit"],
+            description: "Limit download speed. Use 0 for unlimited, or values like 1M or 500K.\n" +
+                         "(net:limit-rate)"
+        },
     ]
 };
 

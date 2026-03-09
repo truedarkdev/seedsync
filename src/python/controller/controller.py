@@ -115,6 +115,8 @@ class Controller:
         self.__lftp.num_connections_per_dir_file = self.__context.config.lftp.num_max_connections_per_dir_file
         self.__lftp.num_max_total_connections = self.__context.config.lftp.num_max_total_connections
         self.__lftp.use_temp_file = self.__context.config.lftp.use_temp_file
+        if self.__context.config.lftp.rate_limit:
+            self.__lftp.rate_limit = self.__context.config.lftp.rate_limit
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
         self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
 
