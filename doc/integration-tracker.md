@@ -1023,7 +1023,7 @@ Notes:
 
 ### thejuran
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: f38666c
 - Source branch: thejuran/master
@@ -1037,51 +1037,46 @@ Notes:
 Integrated:
 - `f38666c` adapted `1ecea11`, `c630cf5`, and `821c730` for persisted files toolbar filters and live status counts in the existing file-options UI
 - `f85bad2` adapted the conservative sortable-header slice of rapidcopy `f1fc34c` onto the existing files list with persisted frontend sort methods for name, status, size, speed, and eta
+- `df4f2bd` adapted thejuran `df868bc`: add backend bulk command route/helpers plus focused Python handler coverage
+- `9c3ad4a` adapted thejuran `df868bc`: add frontend bulk-command transport and POST payload support
+- `d97633a` adapted thejuran `df868bc`: wire conservative checkbox selection and bulk actions into the existing files page
+- `462a475` adapted thejuran `df868bc`: add Angular unit coverage for bulk selection, bulk command transport, and selection-clearing behavior
+- `515437c` adapted thejuran `714dcaf` and prerequisite behavior from `a50a6ec`: align single-file Angular command clients with the POST/DELETE mutation contract required by the integrated bulk-actions work
+- `e0b235e` adapted rapidcopy `2a016f9` / `fd5b0ac`: guard the selected-row auto-scroll lifecycle path so the file-row ViewChild is not dereferenced before it exists
 
 Pending:
-- bulk actions cluster from `df868bc`, `f9dac34`, `3262cd2`, and `4533679`
-- remaining file-list interaction cluster from `2a016f9` and `fd5b0ac`, excluding the conservative sortable-header portion landed in the current local batch
-- optional file-page metadata cluster from `13d8e96`, `5c3526f`, and `b98b68b`
+- none
 
 Covered elsewhere:
 - Angular and dependency modernization chain belongs to Subject 3
 - security and broad web/API work belongs to Subjects 6 and 11
+- any residual file-list interaction churn from `2a016f9` and `fd5b0ac` beyond the landed ViewChild lifecycle guard is too small and optional to keep this subject open after the lifecycle guard landed in `e0b235e`
+- thejuran `f9dac34`, `3262cd2`, and `4533679` remain optional follow-up UX and hardening work beyond the conservative bulk-actions import landed for Subject 12
 
 Skipped:
 - visual restyle/theme churn is out of scope for this pass
 - validation-state and broader frontend modernization chains stay deferred to later subject work
+- optional file-page metadata and import-polish cluster from `13d8e96`, `5c3526f`, and `b98b68b` stays out of this conservative Subject 12 close-out
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_web/test_handler/test_controller.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_model_builder.py`; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Dockerized Angular suite passed with 195 tests after the persisted-filter follow-up and sortable-header batch
+- status: partially verified; focused Python handler tests passed and Dockerized Angular suite passed with 206 tests after the bulk-actions and local-only batches
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
 - persisted-filter null-default follow-up committed in `8bf456b`
 - conservative desktop header sorting committed in `f85bad2`
-- next recommended batch: start the bulk-actions cluster, but split it conservatively instead of importing `df868bc`, `f9dac34`, `3262cd2`, and `4533679` wholesale
-- recommended bulk-actions sub-batches:
-  - batch 1: backend/API foundation plus conservative UI wiring for checkbox selection, header select-all, clear-selection banner, bulk actions bar, bulk-command service, filter/sort clearing selection, and delete confirmations adapted onto the existing ngx-modialog pattern
-  - batch 2: bulk-selection UX polish such as keyboard shortcuts, shift-click range selection, and progress feedback
-  - batch 3: only-if-needed hardening follow-up such as selection-state races or additional pruning behavior if validation shows it is necessary on this base
-- recommended first bulk-actions files to inspect/touch:
-  - frontend: `src/angular/src/app/app.module.ts`, `src/angular/src/app/common/localization.ts`, `src/angular/src/app/pages/files/file-list.component.*`, `src/angular/src/app/pages/files/file.component.*`, `src/angular/src/app/services/files/view-file.service.ts`, new `src/angular/src/app/services/files/file-selection.service.ts`, new `src/angular/src/app/services/server/bulk-command.service.ts`, new selection banner and bulk actions bar components under `src/angular/src/app/pages/files/`
-  - backend: `src/python/web/handler/controller.py`, `src/python/web/web_app.py`
-- recommended bulk-actions verification:
-  - `git diff --check`
-  - `make run-tests-python`
-  - `make run-tests-angular`
-  - new Python handler tests for bulk endpoint validation, partial failure, dedupe/order preservation, and summary behavior
-  - new Angular unit tests for selection state, bulk-command service, and basic bulk-selection/action flows
-- bulk actions will still not finish Subject 12 by itself; pagination, local-only/file-metadata work, and remaining file-list interaction work will remain after that batch
+- the bulk-actions cluster is now integrated in five provenance-preserving local commits instead of one large patch
+- the integrated local batches intentionally stop short of thejuran `f9dac34`, `3262cd2`, and `4533679`; keyboard shortcuts, range selection, progress feedback, and later hardening remain optional follow-up work rather than forced imports
+- remaining Subject 12 value is now concentrated in optional rapidcopy file-row polish rather than the earlier bulk-actions foundation
 
 ### rapidcopy
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: f38666c
 - Source branch: rapidcopy/master
@@ -1095,36 +1090,39 @@ Notes:
 Integrated:
 - `f38666c` adapted the low-risk dropdown compatibility portion of `323e3ed`
 - `f85bad2` adapted the conservative sortable-header and extended sort-method portion of `f1fc34c` onto the existing files list without pulling in pagination or action-cluster changes
+- bulk-actions outcome is now covered elsewhere by the five local/thejuran-based batches in `df4f2bd`, `9c3ad4a`, `d97633a`, `462a475`, and `515437c`
+- `e0b235e` adapted the low-risk lifecycle-safety portion of `2a016f9` / `fd5b0ac` so selected-row auto-scroll waits for the file-row element to exist
+- `4ae0103` adapted `b62970a`: preserve the downloaded state and file-row hinting for local-only files that have lost their remote counterpart
+- `847b3f1` adapted the files-page pagination slice of `ee0718a` without bringing over the unrelated test-config changes from that upstream commit
 
 Pending:
-- any residual file-list interaction pieces from `f1fc34c` beyond the conservative sortable-header sorting landed in the current local batch
-- pagination and larger file-list UX cluster from `ee0718a`
-- queue-prioritize cluster from `8d6b436`
-- local-only status and file-row metadata cluster from `b62970a`, `671a0c3`, and `797ebfa`
-- path-pair dashboard cluster from `778d1d8` and `a6a1189`
+- none
 
 Covered elsewhere:
 - broad Angular 18 modernization chain belongs to Subject 3
 - multi path-pair support belongs to Subjects 10 and 11
+- any residual file-list interaction pieces from `f1fc34c` beyond the conservative sortable-header import are too small and optional to keep Subject 12 open after `f85bad2` and `847b3f1`
+- path-pair dashboard cluster from `778d1d8` and `a6a1189` belongs to Subjects 10 and 11
+- queue-prioritize cluster from `8d6b436` belongs with transfer and command semantics work rather than this files-page subject
 
 Skipped:
 - chunk-validation feature chain in `227b5a3` stays deferred to later backend-heavy subjects
 - dark-mode and broader visual-system changes stay out of scope for this pass
+- optional file-row UX polish from `671a0c3` and `797ebfa` stays deferred after the conservative pagination, lifecycle, and local-only batches
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: `git diff --check` on the touched Subject 12 files; `make run-tests-angular`
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_web/test_handler/test_controller.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_model_builder.py`; `make run-tests-angular`
 - manual checks: none
-- status: partially verified; Dockerized Angular suite passed with 195 tests after the persisted-filter follow-up and sortable-header batch
+- status: partially verified; focused Python handler tests passed and Dockerized Angular suite passed with 206 tests after the bulk-actions and local-only batches
 
 Notes:
 - first Subject 12 implementation batch committed in `f38666c`
 - persisted-filter null-default follow-up committed in `8bf456b`
-- the conservative sortable-header slice is now committed while the larger file-list interaction and action clusters remain intentionally pending
-- next recommended cross-fork resume point is still the thejuran bulk-actions cluster, because it is the largest remaining Subject 12 user-value batch and now has explicit split guidance above
-- rapidcopy-specific follow-up after bulk actions should revisit pagination in `ee0718a`, local-only/file-row metadata in `b62970a`, `671a0c3`, and `797ebfa`, and path-pair dashboard work in `778d1d8` and `a6a1189`
+- the conservative sortable-header slice, lifecycle guard, local-only state fix, and pagination controls are now committed in separate provenance-preserving batches
+- rapidcopy-specific follow-up beyond this conservative close-out is optional file-row polish rather than required Subject 12 functionality
 
 ## Subject 13 - SSH And Remote Command Handling
 
