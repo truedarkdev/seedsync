@@ -35,6 +35,7 @@ interface ILftp {
     num_max_total_connections: number;
     use_temp_file: boolean;
     rate_limit: string;
+    staging_path: string;
 }
 const DefaultLftp: ILftp = {
     remote_address: null,
@@ -52,6 +53,7 @@ const DefaultLftp: ILftp = {
     num_max_total_connections: null,
     use_temp_file: null,
     rate_limit: "0",
+    staging_path: "",
 };
 const LftpRecord = Record(DefaultLftp);
 
