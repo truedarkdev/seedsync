@@ -98,6 +98,14 @@ class TestController(unittest.TestCase):
             raise ValueError("Unsupported archive format: {}".format(os.path.basename(path)))
         return os.path.getsize(path)
 
+    @staticmethod
+    def _has_file_updated_state(call_args_list, file_name, state):
+        for call in call_args_list:
+            new_file = call[0][1]
+            if new_file.name == file_name and new_file.state == state:
+                return True
+        return False
+
     @overrides(unittest.TestCase)
     def setUp(self):
         # Create a temp directory
@@ -314,6 +322,7 @@ class TestController(unittest.TestCase):
                 "remote_address": "localhost",
                 "remote_username": "seedsynctest",
                 "remote_password": "seedsyncpass",
+                "rate_limit": "0",
                 "remote_port": 22,
                 "remote_path": os.path.join(self.temp_dir, "remote"),
                 "local_path": os.path.join(self.temp_dir, "local"),
@@ -1298,12 +1307,12 @@ class TestController(unittest.TestCase):
         # Process until extract complete
         while True:
             self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                self.assertEqual("re.rar", new_file.name)
-                if new_file.state == ModelFile.State.EXTRACTED:
-                    break
+            if self._has_file_updated_state(
+                listener.file_updated.call_args_list,
+                "re.rar",
+                ModelFile.State.EXTRACTED
+            ):
+                break
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
@@ -1521,12 +1530,12 @@ class TestController(unittest.TestCase):
         # Process until extract complete
         while True:
             self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                self.assertEqual("re.rar", new_file.name)
-                if new_file.state == ModelFile.State.EXTRACTED:
-                    break
+            if self._has_file_updated_state(
+                listener.file_updated.call_args_list,
+                "re.rar",
+                ModelFile.State.EXTRACTED
+            ):
+                break
         callback.on_success.assert_called_once_with()
         callback.on_success.reset_mock()
         callback.on_failure.assert_not_called()

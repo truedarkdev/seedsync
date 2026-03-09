@@ -6,7 +6,12 @@ RUN ls -l /app/python
 RUN apt-get update && \
     apt-get install -y \
         openssh-server \
+        p7zip \
+        p7zip-full \
+        p7zip-rar \
         rar
+
+RUN ln -sf /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so
 
 ADD src/docker/test/python/entrypoint.sh /app/
 RUN sed -i 's/\r$//' /app/entrypoint.sh && chmod 755 /app/entrypoint.sh
