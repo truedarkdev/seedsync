@@ -1442,7 +1442,7 @@ Verification:
 
 Notes:
 - thejuran carries the substantive Subject 16 runtime fixes in this pass; the local adaptation was made `file_id`-safe because Subject 15 made duplicate visible filenames valid across path pairs while `AutoQueue` previously deduplicated by visible name
-- Subject 16 is complete for this pass: both forks were reviewed, the substantive thejuran runtime fixes landed in three small commits, and the remaining reviewed candidates were either covered elsewhere or consciously skipped with repo-specific reasons
+- Subject 16 is complete for this pass: both forks were reviewed, the substantive thejuran runtime fixes landed in four backend commits plus one narrow Angular follow-up, and the remaining reviewed candidates were either covered elsewhere or consciously skipped with repo-specific reasons
 
 ### rapidcopy
 
@@ -1488,75 +1488,85 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`c9e17d3`)
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 17 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 17 candidate after `a8561cd`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- `08743df` adapted from `1aae411` to stabilize extract integration coverage without adding checked-in archive fixtures; it makes extract archive creation synchronous, aligns the Python test image with RAR codec support, and fixes the focused re-extract assertions to search callback history instead of only the most recent update
+- `37c3a06` adapted from `784e1ff`, `713825d`, and `5e2a62c` to make `ExtractDispatch` queue/listener handling thread-safe and add focused dispatcher race coverage
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- the older extraction feature stack already exists in current base history, so no new import was needed for `542f0b5`, `d9bdf89`, `46f930e`, `1c5fa63`, `44f113f`, `3ad020c`, `ca8d70d`, `a01579e`, `ff1e79d`, `fd4e0fc`, `aa9ca32`, `0dc6454`, `7aa2684`, and `05c3de1`
+- `747cb82` runtime RAR support was already covered by the current Docker image, and the remaining test-image alignment landed locally in `08743df`
 
 Skipped:
-- none
+- `84f6473` skips an extract overwrite assertion instead of fixing behavior; the focused extract suite passed after the stable-test fixes, so reducing coverage was not necessary
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml build`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_extract/test_dispatch.py tests/unittests/test_controller/test_extract/test_extract_process.py tests/integration/test_controller/test_extract/test_extract.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_file tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory_multilevel tests/integration/test_controller/test_controller.py::TestController::test_command_extract_local_directory tests/integration/test_controller/test_controller.py::TestController::test_command_reextract_after_extracting_remote_file tests/integration/test_controller/test_controller.py::TestController::test_command_extract_remote_only_fails tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory_to_separate_path`
+- manual checks: reviewed the committed diffs with `git diff --ignore-cr-at-eol` because raw stats in this Windows-backed workspace were inflated by line-ending churn
+- status: verified; the extract-focused suite passed with `46 passed`, and the focused controller extract nodes passed with `7 passed`
 
 Notes:
-- none
+- Subject 17 is complete for this pass: thejuran supplied the substantive reliability fixes, while the older extraction feature history was already present in the current base and only needed selective stabilization plus dispatcher hardening
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`c9e17d3`)
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 17 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 17 candidate after `6ce7c19`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- `08743df` takes the stable-test intent from `fc57113` for extraction coverage, but keeps runtime-generated archives instead of adding checked-in binary RAR fixtures and leaves the broader validation/UI changes out of Subject 17
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `40165b0` broken RAR runtime support was already covered by the current Docker image with non-free apt sources, `p7zip-rar`, and the `Rar29.so` codec alias
 
 Skipped:
-- none
+- `32acba6` post-extraction path-walk detection was reviewed but not integrated because it only catches some escaped outputs after extraction and would overstate protection if presented as full zip-slip prevention; its `path_pairs` local-path restriction is also outside this base and outside Subject 17 scope
+- `79f7cab` validation process work belongs to validation/download integrity rather than extraction handling
+- `d87f403`, `561bf5a`, `677be93`, and `1131714` were style/refactor-only for this subject
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml build`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_extract/test_dispatch.py tests/unittests/test_controller/test_extract/test_extract_process.py tests/integration/test_controller/test_extract/test_extract.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_file tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory_multilevel tests/integration/test_controller/test_controller.py::TestController::test_command_extract_local_directory tests/integration/test_controller/test_controller.py::TestController::test_command_reextract_after_extracting_remote_file tests/integration/test_controller/test_controller.py::TestController::test_command_extract_remote_only_fails tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_directory_to_separate_path`
+- manual checks: security review concluded that the `32acba6` extract-side hardening is only partial post-extraction detection and should not be represented as full zip-slip protection in this pass
+- status: verified; the rapidcopy-reviewed extraction candidates were either accounted for by existing local behavior, adapted test stabilization, or consciously skipped with subject-specific reasons
 
 Notes:
-- none
+- rapidcopy contributed a useful testing direction for Subject 17, but its extraction-safety commit mixed a limited post-extraction check with out-of-scope path-pair policy, so this pass kept the narrower stable-test value and left the broader hardening out
 
 ## Subject 18 - Core Controller
 
