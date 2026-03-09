@@ -1228,7 +1228,6 @@ Integrated:
 
 Pending:
 - `bdcc287` is a candidate for the LFTP timeout tuning batch, but the conservative implementation is likely a smaller local adaptation closer to rapidcopy's 30 second timeout than thejuran's 180 second timeout
-- `7897c8e` and `9e84b9e` are candidates for controller-side containment of `LftpJobStatusParserError`
 - `65dc7fe` and `5b52854` are candidates for transfer-state correctness follow-up work around downloaded/import status handling
 - `b632b05` and `c52554b` are candidates for later monitoring and downloaded-state retention hardening after the low-risk parser/controller stability work lands
 - `c539ed9` is a larger transfer-focused controller refactor candidate that should stay split from the initial conservative fixes
@@ -1237,6 +1236,7 @@ Pending:
 
 Covered elsewhere:
 - the handler-method portion of `a50a6ec` is already covered by Subject 12 commit `515437c`
+- adapted equivalents of `7897c8e` and `9e84b9e` land in the local controller-containment batch for Subject 14
 
 Skipped:
 - `4c381e4` is classified out of the first Subject 14 pass because it is broad controller command refactoring rather than a bounded transfer/LFTP fix
@@ -1268,10 +1268,11 @@ Notes:
 
 Integrated:
 - adapted `2238a32`, `3ad06ce`, and `c1e079a` as the first Subject 14 batch to widen the LFTP PTY, skip wrapped `jobs -v` queue fragments safely, and return partial parser results instead of crashing on malformed queue/job output
+- adapted `62e14e2` with thejuran-style controller containment from `7897c8e` and `9e84b9e` as the second Subject 14 batch so non-fatal LFTP/parser failures log warnings or fail callbacks instead of crashing controller processing
 
 Pending:
 - `5db8f34` is the preferred timeout-tuning follow-up after parser hardening
-- `62e14e2` and `c487178` are selected for the next controller/LFTP failure-containment batch
+- `c487178` remains pending as a possible narrow EOF-to-`LftpError` follow-up in `lftp.py`
 - `8d6b436` queue prioritization is transfer-relevant but deferred because it expands queue semantics and API/UI surface
 - `6ce7c19` staging-directory and interrupted-download auto-resume is deferred until after the smaller stability batches
 - validation-heavy transfer work in `e038c21`, `866921b`, `dda1cb2`, `30809bf`, `2614ae6`, `d20b84d`, `4cd7fc1`, `157d003`, `227b5a3`, and `d0662ca` remains pending for later Subject 14 scoping
@@ -1290,9 +1291,9 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`
-- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, and tightened the wrapped-queue handling so the new parser hardening does not regress quoted-path parser coverage
-- status: first parser-hardening batch verified
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_job_status_parser.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python3 -m pytest /src/tests/unittests/test_controller/test_controller.py`
+- manual checks: reviewed rapidcopy transfer/LFTP candidates, normalized worker line endings, tightened the wrapped-queue handling so the parser hardening does not regress quoted-path coverage, and kept the controller containment batch scoped to warning/callback handling rather than broader EOF semantics
+- status: parser-hardening and controller-containment batches verified
 
 Notes:
 - start with the parser-hardening batch, then verify focused LFTP tests before moving to timeout tuning or controller containment
