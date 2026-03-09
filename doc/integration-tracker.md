@@ -1358,9 +1358,10 @@ Notes:
 
 Integrated:
 - adapted a narrow `d143638` groundwork slice to add path-pair metadata fields on `SystemFile` and `ModelFile`, helper multi-path scanner classes, and model serialization support without enabling controller/runtime multi-path behavior yet
+- added a follow-up backend identity groundwork slice after `b403384` so `Model`, `ModelDiff`, and `ModelBuilder` can represent duplicate top-level names across different path pairs safely before command/runtime wiring begins
 
 Pending:
-- the remaining `d143638` work still needs to land in smaller batches for controller/runtime identity work, safe command/path routing, and the later settings/API surfaces needed to configure new scan roots
+- the remaining `d143638` work still needs to land in smaller batches for controller/runtime command identity, safe command/path routing, and the later settings/API surfaces needed to configure new scan roots
 - `1690826` adds `MultiPathActiveScanner` so active download scanning follows the correct path pair instead of always using the first local root
 - `981d707` adds focused unit coverage for `MultiPathActiveScanner`
 - `9d58f10` adds integration coverage for multi-path controller scanning
@@ -1384,13 +1385,14 @@ Maintainer decisions:
 
 Verification:
 - tests run: `python3 -m py_compile src/python/common/path_pair.py src/python/common/context.py src/python/common/__init__.py src/python/seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python - <<'PY' ... PathPairManager migration smoke test ... PY`
-- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, separated validation-heavy or network-mount work out of this scanning subject, and smoke-tested `PathPairManager` load plus legacy-config migration in the docker test container
+- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, separated validation-heavy or network-mount work out of this scanning subject, smoke-tested `PathPairManager` load plus legacy-config migration in the docker test container, and then narrowed the next backend batch to additive model/file identity groundwork after review rejected earlier runtime enablement as unsafe
 - status: foundation batch verified except for an existing `tests/unittests/test_seedsync.py::TestSeedsync::test_default_config` failure on `Lftp.rate_limit` default initialization that is outside this batch's file scope
 
 Notes:
 - the main remaining Subject 15 work is the multi-path/path-pair scanning stack; it is broad but coherent and should land in multiple small commits rather than one large import
 - the first implementation batch is the path-pair persistence, migration, and context foundation adapted from `d143638`; later Subject 15 batches will add controller/scanner behavior, active-scan routing, and tests on top
 - a broader runtime-enablement attempt was intentionally rejected after review because duplicate top-level names across path pairs still collide in model/controller identity; this follow-up batch keeps only metadata and helper groundwork, with no controller/runtime behavior change
+- the current backend identity slice is intended to keep duplicate-name handling additive and internal for now: model storage, diffing, and SSE identity become path-pair-aware before command contracts or controller runtime behavior change
 
 ## Subject 16 - Auto Queue
 

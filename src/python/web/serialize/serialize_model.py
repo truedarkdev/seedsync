@@ -58,6 +58,7 @@ class SerializeModel(Serialize):
     __KEY_FILE_REMOTE_CREATED_TIMESTAMP = "remote_created_timestamp"
     __KEY_FILE_REMOTE_MODIFIED_TIMESTAMP = "remote_modified_timestamp"
     __KEY_FILE_FULL_PATH = "full_path"
+    __KEY_FILE_ID = "file_id"
     __KEY_FILE_PATH_PAIR_ID = "path_pair_id"
     __KEY_FILE_PATH_PAIR_NAME = "path_pair_name"
     __KEY_FILE_CHILDREN = "children"
@@ -82,6 +83,7 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_REMOTE_MODIFIED_TIMESTAMP] = \
             str(model_file.remote_modified_timestamp.timestamp()) if model_file.remote_modified_timestamp else None
         json_dict[SerializeModel.__KEY_FILE_FULL_PATH] = model_file.full_path
+        json_dict[SerializeModel.__KEY_FILE_ID] = model_file.file_id
         json_dict[SerializeModel.__KEY_FILE_PATH_PAIR_ID] = model_file.path_pair_id
         json_dict[SerializeModel.__KEY_FILE_PATH_PAIR_NAME] = model_file.path_pair_name
         json_dict[SerializeModel.__KEY_FILE_CHILDREN] = list()

@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import os
 import sys
 import unittest
 from unittest.mock import patch
@@ -1491,3 +1492,56 @@ class TestModelBuilder(unittest.TestCase):
         # Invalidate on different
         self.model_builder.set_extracted_files({"a", "c"})
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_build_duplicate_root_names_by_path_pair(self):
+        remote_movies = SystemFile("dup", 10, False)
+        remote_movies.path_pair_id = "movies"
+        remote_movies.path_pair_name = "Movies"
+        remote_tv = SystemFile("dup", 20, False)
+        remote_tv.path_pair_id = "tv"
+        remote_tv.path_pair_name = "TV"
+
+        self.model_builder.set_remote_files([remote_movies, remote_tv])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual(
+            {
+                ModelFile.build_file_id("dup", "movies"),
+                ModelFile.build_file_id("dup", "tv"),
+            },
+            model.get_file_ids()
+        )
+        with self.assertRaises(ModelError):
+            model.get_file("dup")
+        self.assertEqual(
+            "movies",
+            model.get_file(ModelFile.build_file_id("dup", "movies")).path_pair_id
+        )
+        self.assertEqual(
+            "tv",
+            model.get_file(ModelFile.build_file_id("dup", "tv")).path_pair_id
+        )
+
+    def test_build_children_inherit_path_pair_metadata(self):
+        remote_root = SystemFile("dup", 10, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("child", 10, False)
+        remote_root.add_child(remote_child)
+
+        self.model_builder.set_remote_files([remote_root])
+
+        model = self.model_builder.build_model()
+        built_root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        built_child = built_root.get_children()[0]
+
+        self.assertEqual("movies", built_root.path_pair_id)
+        self.assertEqual("Movies", built_root.path_pair_name)
+        self.assertEqual("movies", built_child.path_pair_id)
+        self.assertEqual("Movies", built_child.path_pair_name)
+        self.assertEqual(
+            ModelFile.build_file_id(os.path.join("dup", "child"), "movies"),
+            built_child.file_id
+        )

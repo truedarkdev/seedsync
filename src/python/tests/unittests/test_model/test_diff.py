@@ -115,3 +115,21 @@ class TestModelDiffUtil(unittest.TestCase):
         updated = [d for d in diffs if d.change == ModelDiff.Change.UPDATED]
         self.assertEqual(1, len(updated))
         self.assertEqual(ModelDiff(ModelDiff.Change.UPDATED, c1, c2), updated[0])
+
+    def test_added_duplicate_names_with_different_file_ids(self):
+        model_before = Model()
+        model_after = Model()
+        movies = ModelFile("a", False)
+        movies.path_pair_id = "movies"
+        tv = ModelFile("a", False)
+        tv.path_pair_id = "tv"
+        model_after.add_file(movies)
+        model_after.add_file(tv)
+
+        diffs = ModelDiffUtil.diff_models(model_before, model_after)
+
+        self.assertEqual(2, len(diffs))
+        added_ids = {
+            diff.new_file.file_id for diff in diffs if diff.change == ModelDiff.Change.ADDED
+        }
+        self.assertEqual({movies.file_id, tv.file_id}, added_ids)

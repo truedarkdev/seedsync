@@ -2,7 +2,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Set
+from typing import Dict, Set
 
 # my libs
 from common import AppError
@@ -55,7 +55,8 @@ class Model:
     """
     def __init__(self):
         self.logger = logging.getLogger("Model")
-        self.__files = {}  # name->LftpFile
+        self.__files_by_id: Dict[str, ModelFile] = {}
+        self.__file_ids_by_name: Dict[str, Set[str]] = {}
         self.__listeners = []
 
     def set_base_logger(self, base_logger: logging.Logger):
@@ -90,11 +91,25 @@ class Model:
         :return:
         """
         self.logger.debug("LftpModel: Adding file '{}'".format(file.name))
-        if file.name in self.__files:
+        file_id = file.file_id
+        if file_id in self.__files_by_id:
             raise ModelError("File already exists in the model")
-        self.__files[file.name] = file
+        self.__files_by_id[file_id] = file
+        if file.name not in self.__file_ids_by_name:
+            self.__file_ids_by_name[file.name] = set()
+        self.__file_ids_by_name[file.name].add(file_id)
         for listener in self.__listeners:
-            listener.file_added(self.__files[file.name])
+            listener.file_added(self.__files_by_id[file_id])
+
+    def __resolve_file_id(self, identifier: str) -> str:
+        if identifier in self.__files_by_id:
+            return identifier
+        matching_ids = self.__file_ids_by_name.get(identifier)
+        if not matching_ids:
+            raise ModelError("File does not exist in the model")
+        if len(matching_ids) > 1:
+            raise ModelError("File lookup is ambiguous in the model")
+        return next(iter(matching_ids))
 
     def remove_file(self, filename: str):
         """
@@ -103,10 +118,12 @@ class Model:
         :return:
         """
         self.logger.debug("LftpModel: Removing file '{}'".format(filename))
-        if filename not in self.__files:
-            raise ModelError("File does not exist in the model")
-        file = self.__files[filename]
-        del self.__files[filename]
+        file_id = self.__resolve_file_id(filename)
+        file = self.__files_by_id[file_id]
+        del self.__files_by_id[file_id]
+        self.__file_ids_by_name[file.name].remove(file_id)
+        if not self.__file_ids_by_name[file.name]:
+            del self.__file_ids_by_name[file.name]
         for listener in self.__listeners:
             listener.file_removed(file)
 
@@ -117,11 +134,12 @@ class Model:
         :return:
         """
         self.logger.debug("LftpModel: Updating file '{}'".format(file.name))
-        if file.name not in self.__files:
+        file_id = file.file_id
+        if file_id not in self.__files_by_id:
             raise ModelError("File does not exist in the model")
-        old_file = self.__files[file.name]
+        old_file = self.__files_by_id[file_id]
         new_file = file
-        self.__files[file.name] = new_file
+        self.__files_by_id[file_id] = new_file
         for listener in self.__listeners:
             listener.file_updated(old_file, new_file)
 
@@ -131,9 +149,10 @@ class Model:
         :param name:
         :return:
         """
-        if name not in self.__files:
-            raise ModelError("File does not exist in the model")
-        return self.__files[name]
+        return self.__files_by_id[self.__resolve_file_id(name)]
 
     def get_file_names(self) -> Set[str]:
-        return set(self.__files.keys())
+        return set(self.__file_ids_by_name.keys())
+
+    def get_file_ids(self) -> Set[str]:
+        return set(self.__files_by_id.keys())
