@@ -1128,75 +1128,83 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: `4d8e22d`
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 13 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 13 candidate after `a8561cd`
+- New upstream since last pass: none recorded at pass time
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- `bb283e6` is already covered in current master through earlier compatibility updates to config and SSH handling
+- SSH host-key hardening from `e34ba5e` is already covered elsewhere by the current `sshcp.py` and Docker SSH defaults
+- delete-process shell escaping from `492944f` is already covered elsewhere in current master
 
 Pending:
-- none
+- adapt `abef04a` into a conservative local batch that migrates the managed remote scan transport from pickle to JSON end-to-end
+- decide verification outcome for the lingering Bottle/WebApp regression context from `a1deb23` after the Subject 13 transport batch lands
 
 Covered elsewhere:
-- none
+- the SSH expect-pattern expansion portion of `a1deb23` is already present in current `src/python/ssh/sshcp.py`
 
 Skipped:
-- none
+- `a92af56` stays out of Subject 13 because webhook HMAC authentication belongs under web/auth security work
+- the `src/python/web/web_app.py` private-attribute rename portion of `a1deb23` is classified out of Subject 13 as web-app/runtime behavior rather than SSH and remote-command handling
 
 Maintainer decisions:
 - none
 
 Verification:
 - tests run: none
-- manual checks: none
+- manual checks: compared thejuran Subject 13 candidates against current master and confirmed the remaining protocol gap is the remote scan pickle pipeline
 - status: not verified yet
 
 Notes:
-- none
+- current `scan_fs.py` still emits pickle, so the Subject 13 transport batch should update both the emitted format and `remote_scanner.py` together rather than taking a parser-only change
 
 ### rapidcopy
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: `4d8e22d`
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 13 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 13 candidate after `6ce7c19`
+- New upstream since last pass: none recorded at pass time
+- Pass date: 2026-03-09
 
 Integrated:
-- none
+- recoverable/non-recoverable remote scanner handling from `1bccd13`, `f2d906e`, and `52b9ebd` is already covered in current master
+- descriptive SSH errors from `9ed00ca` are already covered in current `sshcp.py`
+- Docker SSH wrapper fixes from `d3acc00`, `eec50ec`, and `33d0dae` are already covered elsewhere in current master
 
 Pending:
-- none
+- review whether any rapidcopy-side compatibility help is still needed after the planned clean JSON transport migration for Subject 13
 
 Covered elsewhere:
-- none
+- none beyond the integrated equivalents listed above
 
 Skipped:
-- none
+- `5d5a90a` pickle fallback is not selected for the main Subject 13 batch because this repo manages the remote scanfs install and can migrate both ends of the protocol together
+- `cb55471` and `207caf5` move to the transfers/config subject because they change LFTP connection limits rather than SSH and remote-command handling
+- broader rapidcopy security/auth and path-pair work in `9f91d1c`, `78a3fde`, `32acba6`, `9e1aeea`, `d143638`, and related UI/config commits stays out of this conservative Subject 13 pass
 
 Maintainer decisions:
 - none
 
 Verification:
 - tests run: none
-- manual checks: none
+- manual checks: compared rapidcopy Subject 13 candidates against current master and against thejuran protocol plan to separate true transport work from later transfers/config and security subjects
 - status: not verified yet
 
 Notes:
-- none
+- rapidcopy's most relevant Subject 13-only input is the legacy pickle fallback idea, but the conservative plan is to prefer a clean managed protocol migration first and revisit fallback only if verification exposes a compatibility gap
 
 ## Subject 14 - Transfers And LFTP
 
