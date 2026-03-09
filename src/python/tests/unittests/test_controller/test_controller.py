@@ -1,6 +1,6 @@
 import unittest
 from queue import Queue
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from controller import Controller
@@ -22,6 +22,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__persist = MagicMock()
         self.controller._Controller__persist.downloaded_file_names = set()
         self.controller._Controller__persist.extracted_file_names = set()
+        self.controller._Controller__persist.stopped_file_names = set()
         self.controller._Controller__model = MagicMock()
         self.controller._Controller__model_builder = MagicMock()
         self.controller._Controller__model_builder.has_changes.return_value = False
@@ -153,3 +154,41 @@ class TestController(unittest.TestCase):
             remote_path="/remote/movies/dup",
             local_path="/local/movies"
         )
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_queue_clears_stopped_file_identity(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_delete_local_tracks_stopped_file_identity(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)

@@ -20,6 +20,7 @@ class TestControllerPersist(unittest.TestCase):
         golden_extracted = {"fi\"ve", "si@x", "se\\ven", "ei-ght"}
         self.assertEqual(golden_downloaded, persist.downloaded_file_names)
         self.assertEqual(golden_extracted, persist.extracted_file_names)
+        self.assertEqual(set(), persist.stopped_file_names)
 
     def test_to_str(self):
         persist = ControllerPersist()
@@ -31,11 +32,14 @@ class TestControllerPersist(unittest.TestCase):
         persist.extracted_file_names.add("si@x")
         persist.extracted_file_names.add("se\\ven")
         persist.extracted_file_names.add("ei-ght")
+        persist.stopped_file_names.add("stopped-one")
         dct = json.loads(persist.to_str())
         self.assertTrue("downloaded" in dct)
         self.assertEqual({"one", "two", "th ree", "fo.ur"}, set(dct["downloaded"]))
         self.assertTrue("extracted" in dct)
         self.assertEqual({"fi\"ve", "si@x", "se\\ven", "ei-ght"}, set(dct["extracted"]))
+        self.assertTrue("stopped" in dct)
+        self.assertEqual({"stopped-one"}, set(dct["stopped"]))
 
     def test_to_and_from_str(self):
         persist = ControllerPersist()
@@ -47,6 +51,7 @@ class TestControllerPersist(unittest.TestCase):
         persist.extracted_file_names.add("si@x")
         persist.extracted_file_names.add("se\\ven")
         persist.extracted_file_names.add("ei-ght")
+        persist.stopped_file_names.add("stopped-one")
 
         persist_actual = ControllerPersist.from_str(persist.to_str())
         self.assertEqual(
@@ -56,6 +61,10 @@ class TestControllerPersist(unittest.TestCase):
         self.assertEqual(
             persist.extracted_file_names,
             persist_actual.extracted_file_names
+        )
+        self.assertEqual(
+            persist.stopped_file_names,
+            persist_actual.stopped_file_names
         )
 
     def test_persist_read_error(self):

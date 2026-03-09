@@ -13,10 +13,12 @@ class ControllerPersist(Persist):
     # Keys
     __KEY_DOWNLOADED_FILE_NAMES = "downloaded"
     __KEY_EXTRACTED_FILE_NAMES = "extracted"
+    __KEY_STOPPED_FILE_NAMES = "stopped"
 
     def __init__(self):
         self.downloaded_file_names = set()
         self.extracted_file_names = set()
+        self.stopped_file_names = set()
 
     @classmethod
     @overrides(Persist)
@@ -26,6 +28,7 @@ class ControllerPersist(Persist):
             dct = json.loads(content)
             persist.downloaded_file_names = set(dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES])
             persist.extracted_file_names = set(dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES])
+            persist.stopped_file_names = set(dct.get(ControllerPersist.__KEY_STOPPED_FILE_NAMES, []))
             return persist
         except (json.decoder.JSONDecodeError, KeyError) as e:
             raise PersistError("Error parsing AutoQueuePersist - {}: {}".format(
@@ -37,4 +40,5 @@ class ControllerPersist(Persist):
         dct = dict()
         dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES] = list(self.downloaded_file_names)
         dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES] = list(self.extracted_file_names)
+        dct[ControllerPersist.__KEY_STOPPED_FILE_NAMES] = list(self.stopped_file_names)
         return json.dumps(dct, indent=Constants.JSON_PRETTY_PRINT_INDENT)

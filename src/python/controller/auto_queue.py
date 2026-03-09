@@ -222,7 +222,11 @@ class AutoQueue:
         }
         for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
             files_to_queue_dict[file.file_id] = (file, pattern)
-        files_to_queue = list(files_to_queue_dict.values())
+        files_to_queue = [
+            (file, pattern)
+            for file, pattern in files_to_queue_dict.values()
+            if not self.__controller.is_file_stopped(file.file_id)
+        ]
 
         ###
         # Extract
