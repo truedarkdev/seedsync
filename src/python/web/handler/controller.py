@@ -23,11 +23,13 @@ class WebResponseActionCallback(Controller.Command.ICallback):
         self.__event = Event()
         self.success = None
         self.error = None
+        self.error_code = 400
 
     @overrides(Controller.Command.ICallback)
-    def on_failure(self, error: str):
+    def on_failure(self, error: str, error_code: int = 400):
         self.success = False
         self.error = error
+        self.error_code = error_code
         self.__event.set()
 
     @overrides(Controller.Command.ICallback)
@@ -121,7 +123,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Queued file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=400)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
     def __handle_action_stop(self, file_name: str):
         """
@@ -144,7 +146,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Stopped file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=400)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
     def __handle_action_extract(self, file_name: str):
         """
@@ -167,7 +169,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested extraction for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=400)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
     def __handle_action_delete_local(self, file_name: str):
         """
@@ -190,7 +192,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested local delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=400)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
     def __handle_action_delete_remote(self, file_name: str):
         """
@@ -213,7 +215,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested remote delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=400)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
     def __handle_action_bulk(self, action: str):
         command_action = self.__get_action(action)
