@@ -91,4 +91,55 @@ describe("Testing rest service", () => {
         expect(subscriberIndex).toBe(1);
         httpMock.verify();
     }));
+
+    it("should send http POST on post", fakeAsync(() => {
+        let subscriberIndex = 0;
+        restService.post("/server/request").subscribe({
+            next: reaction => {
+                subscriberIndex++;
+                expect(reaction.success).toBe(true);
+            }
+        });
+        const request = httpMock.expectOne("/server/request");
+        expect(request.request.method).toBe("POST");
+        request.flush("success");
+
+        expect(subscriberIndex).toBe(1);
+        httpMock.verify();
+    }));
+
+    it("should send http DELETE on delete", fakeAsync(() => {
+        let subscriberIndex = 0;
+        restService.delete("/server/request").subscribe({
+            next: reaction => {
+                subscriberIndex++;
+                expect(reaction.success).toBe(true);
+            }
+        });
+        const request = httpMock.expectOne("/server/request");
+        expect(request.request.method).toBe("DELETE");
+        request.flush("success");
+
+        expect(subscriberIndex).toBe(1);
+        httpMock.verify();
+    }));
+
+    it("should send http POST on sendPostRequest", fakeAsync(() => {
+        let subscriberIndex = 0;
+        restService.sendPostRequest("/server/request", {files: ["one", "two"]}).subscribe({
+            next: reaction => {
+                subscriberIndex++;
+                expect(reaction.success).toBe(true);
+                expect(reaction.data).toBe("posted");
+            }
+        });
+
+        const request = httpMock.expectOne("/server/request");
+        expect(request.request.method).toBe("POST");
+        expect(request.request.body).toEqual({files: ["one", "two"]});
+        request.flush("posted");
+
+        expect(subscriberIndex).toBe(1);
+        httpMock.verify();
+    }));
 });
