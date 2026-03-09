@@ -185,20 +185,44 @@ class AutoQueue:
         ###
         # Queue
         ###
-        queue_candidate_files = []
+        new_files_to_queue = self.__filter_candidates(
+            candidates=self.__model_listener.new_files,
+            accept=lambda f: (
+                f.remote_size is not None and
+                f.state == ModelFile.State.DEFAULT and
+                (f.local_size is None or f.local_size == 0)
+            )
+        )
 
-        # Candidate all new files
-        queue_candidate_files += self.__model_listener.new_files
-
-        # Candidate modified files where the remote size changed
+        modified_candidates_actual_update = []
+        modified_candidates_remote_discovery = []
         for old_file, new_file in self.__model_listener.modified_files:
             if old_file.remote_size != new_file.remote_size:
-                queue_candidate_files.append(new_file)
+                if old_file.remote_size is not None:
+                    modified_candidates_actual_update.append(new_file)
+                else:
+                    modified_candidates_remote_discovery.append(new_file)
 
-        files_to_queue = self.__filter_candidates(
-            candidates=queue_candidate_files,
+        modified_files_actual_update = self.__filter_candidates(
+            candidates=modified_candidates_actual_update,
             accept=lambda f: f.remote_size is not None and f.state == ModelFile.State.DEFAULT
         )
+
+        modified_files_remote_discovery = self.__filter_candidates(
+            candidates=modified_candidates_remote_discovery,
+            accept=lambda f: (
+                f.remote_size is not None and
+                f.state == ModelFile.State.DEFAULT and
+                (f.local_size is None or f.local_size == 0)
+            )
+        )
+
+        files_to_queue_dict = {
+            file.file_id: (file, pattern) for file, pattern in new_files_to_queue
+        }
+        for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
+            files_to_queue_dict[file.file_id] = (file, pattern)
+        files_to_queue = list(files_to_queue_dict.values())
 
         ###
         # Extract
@@ -233,21 +257,21 @@ class AutoQueue:
         ###
 
         # Send the queue commands
-        for filename, pattern in files_to_queue:
+        for file, pattern in files_to_queue:
             self.logger.info(
-                "Auto queueing '{}'".format(filename) +
+                "Auto queueing '{}'".format(file.name) +
                 (" for pattern '{}'".format(pattern.pattern) if pattern else "")
             )
-            command = Controller.Command(Controller.Command.Action.QUEUE, filename)
+            command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
             self.__controller.queue_command(command)
 
         # Send the extract commands
-        for filename, pattern in files_to_extract:
+        for file, pattern in files_to_extract:
             self.logger.info(
-                "Auto extracting '{}'".format(filename) +
+                "Auto extracting '{}'".format(file.name) +
                 (" for pattern '{}'".format(pattern.pattern) if pattern else "")
             )
-            command = Controller.Command(Controller.Command.Action.EXTRACT, filename)
+            command = Controller.Command(Controller.Command.Action.EXTRACT, file.file_id)
             self.__controller.queue_command(command)
 
         # Clear the processed files
@@ -258,7 +282,7 @@ class AutoQueue:
 
     def __filter_candidates(self,
                             candidates: List[ModelFile],
-                            accept: Callable[[ModelFile], bool]) -> List[Tuple[str, AutoQueuePattern]]:
+                            accept: Callable[[ModelFile], bool]) -> List[Tuple[ModelFile, AutoQueuePattern]]:
         """
         Given a list of candidate files, filter out those that match the accept criteria
         Also takes into consideration new patterns that were added
@@ -278,10 +302,10 @@ class AutoQueue:
             if self.__patterns_only:
                 for pattern in self.__persist.patterns:
                     if accept(file) and self.__match(pattern, file):
-                        files_matched[file.name] = pattern
+                        files_matched[file.file_id] = (file, pattern)
                         break
             elif accept(file):
-                files_matched[file.name] = None
+                files_matched[file.file_id] = (file, None)
 
         # Step 2: run new pattern through all the files
         if self.__persist_listener.new_patterns:
@@ -289,9 +313,9 @@ class AutoQueue:
             for new_pattern in self.__persist_listener.new_patterns:
                 for file in model_files:
                     if accept(file) and self.__match(new_pattern, file):
-                        files_matched[file.name] = new_pattern
+                        files_matched[file.file_id] = (file, new_pattern)
 
-        return list(zip(files_matched.keys(), files_matched.values()))
+        return list(files_matched.values())
 
     @staticmethod
     def __match(pattern: AutoQueuePattern, file: ModelFile) -> bool:
