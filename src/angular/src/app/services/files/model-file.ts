@@ -5,6 +5,7 @@ import {Record, Set} from "immutable";
  * Note: Naming convention matches that used in the JSON
  */
 interface IModelFile {
+    file_id: string;
     name: string;
     is_dir: boolean;
     local_size: number;
@@ -23,6 +24,7 @@ interface IModelFile {
 
 // Boiler plate code to set up an immutable class
 const DefaultModelFile: IModelFile = {
+    file_id: null,
     name: null,
     is_dir: null,
     local_size: null,
@@ -47,6 +49,7 @@ const ModelFileRecord = Record(DefaultModelFile);
  *                      -immutable-js-js
  */
 export class ModelFile extends ModelFileRecord implements IModelFile {
+    file_id: string;
     name: string;
     is_dir: boolean;
     local_size: number;

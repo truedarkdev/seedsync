@@ -5,6 +5,11 @@ import {BaseWebService} from "../base/base-web.service";
 import {StreamServiceRegistry} from "../base/stream-service.registry";
 import {RestService, WebReaction} from "../utils/rest.service";
 
+export interface BulkCommandFile {
+    file_id: string;
+    name: string;
+}
+
 @Injectable()
 export class BulkCommandService extends BaseWebService {
     private readonly BULK_COMMAND_URL = "/server/command/bulk";
@@ -14,24 +19,24 @@ export class BulkCommandService extends BaseWebService {
         super(_streamServiceProvider);
     }
 
-    public queue(fileNames: string[]): Observable<WebReaction> {
-        return this.sendBulkCommand("queue", fileNames);
+    public queue(files: BulkCommandFile[]): Observable<WebReaction> {
+        return this.sendBulkCommand("queue", files);
     }
 
-    public stop(fileNames: string[]): Observable<WebReaction> {
-        return this.sendBulkCommand("stop", fileNames);
+    public stop(files: BulkCommandFile[]): Observable<WebReaction> {
+        return this.sendBulkCommand("stop", files);
     }
 
-    public extract(fileNames: string[]): Observable<WebReaction> {
-        return this.sendBulkCommand("extract", fileNames);
+    public extract(files: BulkCommandFile[]): Observable<WebReaction> {
+        return this.sendBulkCommand("extract", files);
     }
 
-    public deleteLocal(fileNames: string[]): Observable<WebReaction> {
-        return this.sendBulkCommand("delete_local", fileNames);
+    public deleteLocal(files: BulkCommandFile[]): Observable<WebReaction> {
+        return this.sendBulkCommand("delete_local", files);
     }
 
-    public deleteRemote(fileNames: string[]): Observable<WebReaction> {
-        return this.sendBulkCommand("delete_remote", fileNames);
+    public deleteRemote(files: BulkCommandFile[]): Observable<WebReaction> {
+        return this.sendBulkCommand("delete_remote", files);
     }
 
     protected onConnected() {
@@ -42,9 +47,9 @@ export class BulkCommandService extends BaseWebService {
         // Nothing to do
     }
 
-    private sendBulkCommand(action: string, fileNames: string[]): Observable<WebReaction> {
+    private sendBulkCommand(action: string, files: BulkCommandFile[]): Observable<WebReaction> {
         return this._restService.sendPostRequest(this.BULK_COMMAND_URL + "/" + action, {
-            filenames: fileNames
+            files: files
         });
     }
 }

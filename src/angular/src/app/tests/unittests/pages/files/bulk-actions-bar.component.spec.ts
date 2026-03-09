@@ -71,6 +71,7 @@ describe("Testing bulk actions bar component", () => {
 
     function createViewFile(props): ViewFile {
         return new ViewFile({
+            fileId: props.fileId,
             name: props.name,
             isArchive: props.isArchive,
             isQueueable: props.isQueueable,
@@ -84,6 +85,7 @@ describe("Testing bulk actions bar component", () => {
     it("should disable queue when any selected file is not queueable", () => {
         component.selectedFiles = Immutable.List<ViewFile>([
             createViewFile({
+                fileId: "[\"movies\",\"one\"]",
                 name: "one",
                 isArchive: false,
                 isQueueable: true,
@@ -93,6 +95,7 @@ describe("Testing bulk actions bar component", () => {
                 isRemotelyDeletable: true
             }),
             createViewFile({
+                fileId: "[\"tv\",\"two\"]",
                 name: "two",
                 isArchive: false,
                 isQueueable: false,
@@ -109,6 +112,7 @@ describe("Testing bulk actions bar component", () => {
     it("should send all selected names for bulk delete local after confirmation", async () => {
         component.selectedFiles = Immutable.List<ViewFile>([
             createViewFile({
+                fileId: "[\"movies\",\"one\"]",
                 name: "one",
                 isArchive: false,
                 isQueueable: true,
@@ -118,6 +122,7 @@ describe("Testing bulk actions bar component", () => {
                 isRemotelyDeletable: true
             }),
             createViewFile({
+                fileId: "[\"tv\",\"two\"]",
                 name: "two",
                 isArchive: false,
                 isQueueable: true,
@@ -132,6 +137,9 @@ describe("Testing bulk actions bar component", () => {
         await Promise.resolve();
         await Promise.resolve();
 
-        expect(bulkCommandService.deleteLocal).toHaveBeenCalledWith(["one", "two"]);
+        expect(bulkCommandService.deleteLocal).toHaveBeenCalledWith([
+            {file_id: "[\"movies\",\"one\"]", name: "one"},
+            {file_id: "[\"tv\",\"two\"]", name: "two"}
+        ]);
     });
 });

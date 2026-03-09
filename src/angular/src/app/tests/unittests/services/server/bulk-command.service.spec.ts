@@ -42,7 +42,10 @@ describe("Testing bulk command service", () => {
     it("should send a POST bulk queue command", () => {
         let count = 0;
 
-        commandService.queue(["test1", "test2"]).subscribe({
+        commandService.queue([
+            {file_id: "[\"movies\",\"test1\"]", name: "test1"},
+            {file_id: "[\"tv\",\"test2\"]", name: "test2"}
+        ]).subscribe({
             next: reaction => {
                 count++;
                 expect(reaction.success).toBe(true);
@@ -51,7 +54,10 @@ describe("Testing bulk command service", () => {
 
         const request = httpMock.expectOne("/server/command/bulk/queue");
         expect(request.request.method).toBe("POST");
-        expect(request.request.body).toEqual({filenames: ["test1", "test2"]});
+        expect(request.request.body).toEqual({files: [
+            {file_id: "[\"movies\",\"test1\"]", name: "test1"},
+            {file_id: "[\"tv\",\"test2\"]", name: "test2"}
+        ]});
         request.flush("{}");
 
         expect(count).toBe(1);

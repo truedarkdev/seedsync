@@ -19,8 +19,9 @@ describe("Testing file selection service", () => {
         fileSelectionService = TestBed.get(FileSelectionService);
     });
 
-    function createViewFile(name: string): ViewFile {
+    function createViewFile(name: string, fileId: string = null): ViewFile {
         return new ViewFile({
+            fileId: fileId,
             name: name,
             isArchive: false,
             isQueueable: true,
@@ -67,5 +68,34 @@ describe("Testing file selection service", () => {
 
         expect(selectedFiles.size).toBe(1);
         expect(selectedFiles.get(0).name).toBe("two");
+    });
+
+    it("should keep duplicate names independently selected by file id", () => {
+        const movies = createViewFile("dup", "[\"movies\",\"dup\"]");
+        const tv = createViewFile("dup", "[\"tv\",\"dup\"]");
+        let selectedFiles = Immutable.List<ViewFile>();
+        let selectedFileIds = Immutable.Set<string>();
+
+        fileSelectionService.selectedFiles.subscribe(value => selectedFiles = value);
+        fileSelectionService.selectedFileIds.subscribe(value => selectedFileIds = value);
+
+        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([movies, tv]));
+        fileSelectionService.toggle(movies);
+
+        expect(selectedFiles.size).toBe(1);
+        expect(selectedFiles.get(0).fileId).toBe("[\"movies\",\"dup\"]");
+        expect(selectedFileIds.toArray()).toEqual(["[\"movies\",\"dup\"]"]);
+
+        fileSelectionService.toggle(tv);
+
+        expect(selectedFiles.size).toBe(2);
+        expect(selectedFiles.map(file => file.fileId).toArray().sort()).toEqual([
+            "[\"movies\",\"dup\"]",
+            "[\"tv\",\"dup\"]"
+        ]);
+        expect(selectedFileIds.toArray().sort()).toEqual([
+            "[\"movies\",\"dup\"]",
+            "[\"tv\",\"dup\"]"
+        ]);
     });
 });

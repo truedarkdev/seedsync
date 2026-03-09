@@ -14,8 +14,8 @@ import {RestService, WebReaction} from "../utils/rest.service";
  * ModelFileService class provides the store for model files
  * It implements the observable service pattern to push updates
  * as they become available.
- * The model is stored as an Immutable Map of name=>ModelFiles. Hence, the
- * ModelFiles have no defined order. The name key allows more efficient
+ * The model is stored as an Immutable Map of file identity=>ModelFiles. Hence, the
+ * ModelFiles have no defined order. The identity key allows more efficient
  * lookup and model diffing.
  * Reference: http://blog.angular-university.io/how-to-build-angular2
  *            -apps-using-rxjs-observable-data-services-pitfalls-to-avoid
@@ -43,6 +43,19 @@ export class ModelFileService extends BaseStreamService {
         return this._files.asObservable();
     }
 
+    private static getFileKey(file: ModelFile): string {
+        return file.file_id || file.name;
+    }
+
+    private static buildCommandUrl(action: string, file: ModelFile): string {
+        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
+        let url: string = "/server/command/" + action + "/" + fileNameEncoded;
+        if (file.file_id) {
+            url += "?file_id=" + encodeURIComponent(file.file_id);
+        }
+        return url;
+    }
+
     /**
      * Queue a file for download
      * @param {ModelFile} file
@@ -50,9 +63,7 @@ export class ModelFileService extends BaseStreamService {
      */
     public queue(file: ModelFile): Observable<WebReaction> {
         this._logger.debug("Queue model file: " + file.name);
-        // Double-encode the value
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        const url: string = "/server/command/queue/" + fileNameEncoded;
+        const url: string = ModelFileService.buildCommandUrl("queue", file);
         return this._restService.post(url);
     }
 
@@ -63,9 +74,7 @@ export class ModelFileService extends BaseStreamService {
      */
     public stop(file: ModelFile): Observable<WebReaction> {
         this._logger.debug("Stop model file: " + file.name);
-        // Double-encode the value
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        const url: string = "/server/command/stop/" + fileNameEncoded;
+        const url: string = ModelFileService.buildCommandUrl("stop", file);
         return this._restService.post(url);
     }
 
@@ -76,9 +85,7 @@ export class ModelFileService extends BaseStreamService {
      */
     public extract(file: ModelFile): Observable<WebReaction> {
         this._logger.debug("Extract model file: " + file.name);
-        // Double-encode the value
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        const url: string = "/server/command/extract/" + fileNameEncoded;
+        const url: string = ModelFileService.buildCommandUrl("extract", file);
         return this._restService.post(url);
     }
 
@@ -89,9 +96,7 @@ export class ModelFileService extends BaseStreamService {
      */
     public deleteLocal(file: ModelFile): Observable<WebReaction> {
         this._logger.debug("Delete locally model file: " + file.name);
-        // Double-encode the value
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        const url: string = "/server/command/delete_local/" + fileNameEncoded;
+        const url: string = ModelFileService.buildCommandUrl("delete_local", file);
         return this._restService.delete(url);
     }
 
@@ -102,9 +107,7 @@ export class ModelFileService extends BaseStreamService {
      */
     public deleteRemote(file: ModelFile): Observable<WebReaction> {
         this._logger.debug("Delete remotely model file: " + file.name);
-        // Double-encode the value
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        const url: string = "/server/command/delete_remote/" + fileNameEncoded;
+        const url: string = ModelFileService.buildCommandUrl("delete_remote", file);
         return this._restService.delete(url);
     }
 
@@ -147,7 +150,9 @@ export class ModelFileService extends BaseStreamService {
 
             // Replace the entire model
             t0 = performance.now();
-            const newMap = Immutable.Map<string, ModelFile>(newFiles.map(value => ([value.name, value])));
+            const newMap = Immutable.Map<string, ModelFile>(
+                newFiles.map(value => ([ModelFileService.getFileKey(value), value]))
+            );
             t1 = performance.now();
             this._logger.debug("ModelFile map creation took", (t1 - t0).toFixed(0), "ms");
 
@@ -158,10 +163,11 @@ export class ModelFileService extends BaseStreamService {
             // Only new file is relevant
             const parsed: {new_file: any} = JSON.parse(data);
             const file = ModelFile.fromJson(parsed.new_file);
-            if (this._files.getValue().has(file.name)) {
-                this._logger.error("ModelFile named " + file.name + " already exists");
+            const fileKey = ModelFileService.getFileKey(file);
+            if (this._files.getValue().has(fileKey)) {
+                this._logger.error("ModelFile identity " + fileKey + " already exists");
             } else {
-                this._files.next(this._files.getValue().set(file.name, file));
+                this._files.next(this._files.getValue().set(fileKey, file));
                 this._logger.debug("Added file: %O", file.toJS());
             }
         } else if (name === this.EVENT_REMOVED) {
@@ -169,22 +175,24 @@ export class ModelFileService extends BaseStreamService {
             // Only old file is relevant
             const parsed: {old_file: any} = JSON.parse(data);
             const file = ModelFile.fromJson(parsed.old_file);
-            if (this._files.getValue().has(file.name)) {
-                this._files.next(this._files.getValue().remove(file.name));
+            const fileKey = ModelFileService.getFileKey(file);
+            if (this._files.getValue().has(fileKey)) {
+                this._files.next(this._files.getValue().remove(fileKey));
                 this._logger.debug("Removed file: %O", file.toJS());
             } else {
-                this._logger.error("Failed to find ModelFile named " + file.name);
+                this._logger.error("Failed to find ModelFile identity " + fileKey);
             }
         } else if (name === this.EVENT_UPDATED) {
             // Updated event received old and new ModelFiles
             // We will only use the new one here
             const parsed: {new_file: any} = JSON.parse(data);
             const file = ModelFile.fromJson(parsed.new_file);
-            if (this._files.getValue().has(file.name)) {
-                this._files.next(this._files.getValue().set(file.name, file));
+            const fileKey = ModelFileService.getFileKey(file);
+            if (this._files.getValue().has(fileKey)) {
+                this._files.next(this._files.getValue().set(fileKey, file));
                 this._logger.debug("Updated file: %O", file.toJS());
             } else {
-                this._logger.error("Failed to find ModelFile named " + file.name);
+                this._logger.error("Failed to find ModelFile identity " + fileKey);
             }
         } else {
             this._logger.error("Unrecognized event:", name);

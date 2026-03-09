@@ -22,7 +22,7 @@ import {FileSelectionService} from "../../services/files/file-selection.service"
 
 export class FileListComponent implements OnInit, OnDestroy {
     public files: Observable<List<ViewFile>>;
-    public selectedNames: Observable<Immutable.Set<string>>;
+    public selectedFileIds: Observable<Immutable.Set<string>>;
     public selectedFiles: Observable<List<ViewFile>>;
     public areAllVisibleSelected: Observable<boolean>;
     public identify = FileListComponent.identify;
@@ -42,7 +42,7 @@ export class FileListComponent implements OnInit, OnDestroy {
                 private fileSelectionService: FileSelectionService,
                 private _changeDetector: ChangeDetectorRef) {
         this.files = viewFileService.filteredFiles;
-        this.selectedNames = fileSelectionService.selectedNames;
+        this.selectedFileIds = fileSelectionService.selectedFileIds;
         this.selectedFiles = fileSelectionService.selectedFiles;
         this.areAllVisibleSelected = fileSelectionService.areAllVisibleSelected;
         this.options = this.viewFileOptionsService.options;
@@ -71,7 +71,7 @@ export class FileListComponent implements OnInit, OnDestroy {
     }
 
     static identify(index: number, item: ViewFile): string {
-        return item.name;
+        return item.fileId || item.name;
     }
 
     onSelect(file: ViewFile): void {
