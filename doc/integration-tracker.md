@@ -1668,16 +1668,16 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`7641d16`)
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 19 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 19 candidate after `a8561cd`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
@@ -1686,10 +1686,13 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `8c4edb2` and `67179ea` are already present locally in `AppComponent` through the existing `ResizeObserver` header sizing and `takeUntil` cleanup path
+- `721e694` Safari toolbar tint protection is already present locally in `app.component.scss`
 
 Skipped:
-- none
+- the icon-rail series in `f64325e`, `9dd1d79`, and `7015357` was skipped for this conservative pass because it is a deliberate desktop layout redesign rather than a narrow dashboard or main-layout fix
+- `a32dfad` and `96f7d86` were skipped because the sidebar version footer and prompt-indicator styling depend on the icon-rail redesign and duplicate version information already shown on the About page
+- `6bf18e7` was skipped because it introduces a separate toast-container UI path and broader notification architecture that is not present in the current base
 
 Maintainer decisions:
 - none
@@ -1700,32 +1703,35 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- thejuran's Subject 19 candidates were either already covered locally or broadened into optional layout or notification redesign work that did not fit this conservative pass
 
 ### rapidcopy
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: master (`7641d16`)
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 19 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 19 candidate after `6ce7c19`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
 
 Pending:
-- none
+- `a33981b` sidebar restart feedback is pending as a narrow local adaptation onto the current `NotificationService` and `RestService` behavior without taking the broader settings or validation work from that rapidcopy commit
 
 Covered elsewhere:
-- none
+- `757da15` remote-server-error notification handling is already present locally in `header.component.ts`
+- `5a195f2` unicode dashboard e2e expectations are already present locally
 
 Skipped:
-- none
+- `fb4e7db` was skipped because the dark-mode toggle and theme system span multiple pages and shared services, making it a broader optional UI feature rather than a conservative main-layout fix
+- `93e10ab` was skipped because it is a broad modernization and compatibility batch with main-layout overlap, not a narrow Subject 19 change
+- `08d714e` and `6d59994` were skipped because they are branding changes that conflict with the repo's maintained SeedSync identity
 
 Maintainer decisions:
 - none
@@ -1736,7 +1742,7 @@ Verification:
 - status: not verified yet
 
 Notes:
-- none
+- rapidcopy supplied one narrow main-layout improvement worth adapting locally; the rest of the reviewed layout-adjacent work was either already present or intentionally broader than this pass
 
 ## Subject 20 - Cleanup, Deletion, And File Safety
 
