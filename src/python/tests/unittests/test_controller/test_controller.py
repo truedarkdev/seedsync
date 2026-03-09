@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from controller import Controller
 from controller.scan import MultiPathActiveScanner
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
-from model import ModelFile
+from model import ModelError, ModelFile
 
 
 class TestController(unittest.TestCase):
@@ -82,7 +82,35 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__process_commands()
 
-        callback.on_failure.assert_called_once_with("Lftp error: bad status")
+        callback.on_failure.assert_called_once_with("Lftp error: bad status", 500)
+        callback.on_success.assert_not_called()
+
+    def test_process_commands_reports_not_found_as_404(self):
+        self.controller._Controller__model.get_file.side_effect = ModelError("missing")
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("File 'example' not found", 404)
+        callback.on_success.assert_not_called()
+
+    def test_process_commands_reports_wrong_state_as_409(self):
+        file = ModelFile("example", False)
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.STOP, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("File 'example' is not Queued or Downloading", 409)
         callback.on_success.assert_not_called()
 
     def test_propagate_exceptions_ignores_pending_lftp_errors(self):

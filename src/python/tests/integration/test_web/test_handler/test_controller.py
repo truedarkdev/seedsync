@@ -297,6 +297,39 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertIn("1 succeeded, 1 failed", response.text)
         self.assertIn("'test2': bad file", response.text)
 
+    def test_queue_propagates_not_found_status_code(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_failure("missing", 404)
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post("/server/command/queue/test1", expect_errors=True)
+
+        self.assertEqual(404, response.status_code)
+        self.assertEqual("missing", response.text)
+
+    def test_stop_propagates_conflict_status_code(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_failure("wrong state", 409)
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post("/server/command/stop/test1", expect_errors=True)
+
+        self.assertEqual(409, response.status_code)
+        self.assertEqual("wrong state", response.text)
+
+    def test_extract_propagates_internal_error_status_code(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_failure("backend failure", 500)
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post("/server/command/extract/test1", expect_errors=True)
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual("backend failure", response.text)
+
     def test_bulk_rejects_unknown_action(self):
         response = self.test_app.post_json(
             "/server/command/bulk/not_real",

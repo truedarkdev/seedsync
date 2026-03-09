@@ -59,7 +59,7 @@ class Controller:
                 pass
 
             @abstractmethod
-            def on_failure(self, error: str):
+            def on_failure(self, error: str, error_code: int = 400):
                 """Called on action failure"""
                 pass
 
@@ -452,10 +452,10 @@ class Controller:
             self.__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
 
     def __process_commands(self):
-        def _notify_failure(_command: Controller.Command, _msg: str):
+        def _notify_failure(_command: Controller.Command, _msg: str, _error_code: int = 400):
             self.logger.warning("Command failed. {}".format(_msg))
             for _callback in _command.callbacks:
-                _callback.on_failure(_msg)
+                _callback.on_failure(_msg, _error_code)
 
         while not self.__command_queue.empty():
             command = self.__command_queue.get()
@@ -463,12 +463,12 @@ class Controller:
             try:
                 file = self.__model.get_file(command.filename)
             except ModelError:
-                _notify_failure(command, "File '{}' not found".format(command.filename))
+                _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                 continue
 
             if command.action == Controller.Command.Action.QUEUE:
                 if file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename))
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
                     continue
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
@@ -480,12 +480,16 @@ class Controller:
                     )
                     self.__persist.stopped_file_names.discard(file.file_id)
                 except LftpError as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)))
+                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
                     continue
 
             elif command.action == Controller.Command.Action.STOP:
                 if file.state not in (ModelFile.State.DOWNLOADING, ModelFile.State.QUEUED):
-                    _notify_failure(command, "File '{}' is not Queued or Downloading".format(command.filename))
+                    _notify_failure(
+                        command,
+                        "File '{}' is not Queued or Downloading".format(command.filename),
+                        409
+                    )
                     continue
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
@@ -502,7 +506,7 @@ class Controller:
                     )
                     self.__persist.stopped_file_names.add(file.file_id)
                 except (LftpError, LftpJobStatusParserError) as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)))
+                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
                     continue
 
             elif command.action == Controller.Command.Action.EXTRACT:
@@ -512,12 +516,16 @@ class Controller:
                         ModelFile.State.DOWNLOADED,
                         ModelFile.State.EXTRACTED
                 ):
-                    _notify_failure(command, "File '{}' in state {} cannot be extracted".format(
-                        command.filename, str(file.state)
-                    ))
+                    _notify_failure(
+                        command,
+                        "File '{}' in state {} cannot be extracted".format(
+                            command.filename, str(file.state)
+                        ),
+                        409
+                    )
                     continue
                 elif file.local_size is None:
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename))
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
                     self.__extract_process.extract(file)
@@ -528,12 +536,16 @@ class Controller:
                     ModelFile.State.DOWNLOADED,
                     ModelFile.State.EXTRACTED
                 ):
-                    _notify_failure(command, "Local file '{}' cannot be deleted in state {}".format(
-                        command.filename, str(file.state)
-                    ))
+                    _notify_failure(
+                        command,
+                        "Local file '{}' cannot be deleted in state {}".format(
+                            command.filename, str(file.state)
+                        ),
+                        409
+                    )
                     continue
                 elif file.local_size is None:
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename))
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
                     process = DeleteLocalProcess(
@@ -558,12 +570,16 @@ class Controller:
                     ModelFile.State.EXTRACTED,
                     ModelFile.State.DELETED
                 ):
-                    _notify_failure(command, "Remote file '{}' cannot be deleted in state {}".format(
-                        command.filename, str(file.state)
-                    ))
+                    _notify_failure(
+                        command,
+                        "Remote file '{}' cannot be deleted in state {}".format(
+                            command.filename, str(file.state)
+                        ),
+                        409
+                    )
                     continue
                 elif file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename))
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
                     continue
                 else:
                     process = DeleteRemoteProcess(
