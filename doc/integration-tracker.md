@@ -1750,7 +1750,7 @@ Notes:
 
 ### thejuran
 
-- State: in progress
+- State: reviewed
 - High-risk: yes
 - Integration base: master (`2f6dc01`)
 - Source branch: thejuran/master
@@ -1762,10 +1762,10 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
-- none
+- `4606c90` adapted the focused test intent from `492944f` into the current local test layout so `DeleteRemoteProcess` shell quoting and `DeleteLocalProcess` directory cleanup behavior are explicitly covered under the existing backend runtime
 
 Pending:
-- adapt the focused test intent from `492944f` into the current local test layout so the existing `DeleteRemoteProcess` shell-quoting safety is explicitly covered
+- none
 
 Covered elsewhere:
 - `ae151c8` and `81702da` are already present locally through the current controller delete actions, web-handler wiring, stronger HTTP-method semantics, and `file_id`/path-pair-aware command routing
@@ -1781,16 +1781,17 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none yet in this pass
-- manual checks: compared thejuran delete-path commits against current `Controller`, delete-process, and web-handler code; confirmed that the runtime safety behavior is already present locally and reduced the remaining thejuran work to an optional targeted coverage adaptation
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_delete_process.py`
+- manual checks: compared thejuran delete-path commits against current `Controller`, delete-process, and web-handler code; confirmed that the runtime safety behavior is already present locally and then closed the remaining gap with focused delete-process coverage in the current test layout
+- status: verified; the focused delete-process suite passed with `4 passed`
 
 Notes:
-- thejuran's direct delete-command work is already present locally; the only remaining compatible follow-up is narrow test coverage for the current delete-process shell-quoting behavior
+- thejuran's direct delete-command work was already present locally; this pass only needed the narrow coverage follow-up for the current delete-process safety behavior
 
 ### rapidcopy
 
-- State: in progress
+- State: reviewed
 - High-risk: yes
 - Integration base: master (`2f6dc01`)
 - Source branch: rapidcopy/master
@@ -1802,10 +1803,11 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
-- none
+- `07da49b` adapted the configuration and scanner foundation from `6ce7c19` so staging paths are supported in config/defaults and `LocalScanner` can merge staged in-progress files with the final local directory without surfacing the nested `incomplete` directory as a user file
+- `e20cac4` adapted the controller/runtime portion of `6ce7c19` so LFTP downloads and active scans use staging paths, completed downloads move into the final local directory only after completion, and interrupted staged transfers are re-queued safely after the first successful remote scan in both single-path and path-pair modes
 
 Pending:
-- adapt `6ce7c19` into small local batches so downloads can use a staging path, completed files move into the final local directory only after completion, and leftover `.lftp` temp files can be resumed safely after restart
+- none
 
 Covered elsewhere:
 - `677be93` is cleanup-only and offers no functional delete or file-safety change over current local code
@@ -1819,12 +1821,14 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none yet in this pass
-- manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; confirmed the staging/incomplete-download idea is not present locally and that the useful part can be adapted without importing rapidcopy's broader validation stack
-- status: not verified yet
+- tests run:
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_controller/test_scan/test_local_scanner.py tests/unittests/test_controller/test_delete_process.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py`
+- manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; kept the staging-path safety core, adapted it to the repo's current path-pair-aware controller API, and left rapidcopy's broader validation and control-plane work out of this subject
+- status: verified; the focused config/scanner/delete suite passed with `23 passed` and the focused controller suite passed with `16 passed`
 
 Notes:
-- rapidcopy supplies the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion
+- rapidcopy supplied the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion, with the adaptation kept path-pair-safe for the current local base
 
 ## Subject 21 - Cross-Cutting UX Or Workflow Conflicts
 
