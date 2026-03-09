@@ -1415,11 +1415,10 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
-- none
+- adapted `3b98bd8` and `a1b467e` as `907e1ee` so auto-queue now separates new files from modified files, treats remote discovery (`None -> value`) differently from true remote updates, and uses hidden `file_id` command identity to stay safe with Subject 15 path-pair duplicates
+- adapted `9e290af` and `f5d4d24` as `a0f86f5` so explicit STOP and DELETE_LOCAL actions persist across restarts via `stopped_file_names`, manual QUEUE clears that stopped state again, and the persist format remains backward-compatible when older controller state lacks the new key
 
 Pending:
-- adapt the restart/requeue correctness cluster from `3b98bd8` and `a1b467e` so auto-queue does not restart STOPPED partial files on startup or on remote-discovery updates; local adaptation must keep Subject 15 `file_id` / path-pair identity instead of collapsing duplicate visible names
-- adapt the stopped-file tracking slice from `9e290af` and `f5d4d24` so explicit STOP and DELETE_LOCAL actions persistently suppress auto-queue restart until a user re-queues the file; local adaptation should track hidden file identity rather than filename
 - review `2323761` for a narrow listener thread-safety hardening slice after the core restart/stopped-file fixes land
 - review the small UI/service lifecycle cleanup pair `b1b7ec9` and `7631bfb` after the backend behavior work is stable
 - re-check whether `e775d8f` is already satisfied locally by current `file_id`-aware downloaded tracking plus DELETED-state model building, or whether an additional auto-queue guard is still needed
@@ -1435,12 +1434,12 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: reviewed thejuran auto-queue runtime, controller persist, and test candidates against current local Subject 15 `file_id` / path-pair-aware controller state; confirmed the most important gap is restart/requeue correctness rather than handler semantics
-- status: review in progress; implementation not landed yet
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_auto_queue.py tests/unittests/test_controller/test_controller.py tests/unittests/test_controller/test_controller_persist.py`
+- manual checks: reviewed thejuran auto-queue runtime, controller persist, and test candidates against current local Subject 15 `file_id` / path-pair-aware controller state; confirmed the most important gap was restart/requeue correctness, then reviewed the landed `907e1ee` and `a0f86f5` batches against the upstream clusters before recording them here
+- status: first backend runtime/persist batches landed and the focused unit suite passed with `67 passed`; later Subject 16 follow-ups remain pending
 
 Notes:
-- thejuran carries the substantive Subject 16 runtime fixes in this pass; the first local adaptation needs to be `file_id`-safe because Subject 15 made duplicate visible filenames valid across path pairs while `AutoQueue` still deduplicates by visible name
+- thejuran carries the substantive Subject 16 runtime fixes in this pass; the first local adaptation was made `file_id`-safe because Subject 15 made duplicate visible filenames valid across path pairs while `AutoQueue` previously deduplicated by visible name
 
 ### rapidcopy
 
