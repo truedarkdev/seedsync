@@ -26,7 +26,7 @@ class ModelBuilder:
         self.__local_files = dict()
         self.__remote_files = dict()
         self.__lftp_statuses = dict()
-        self.__downloaded_files = set()
+        self.__downloaded_files = None
         self.__extract_statuses = dict()
         self.__extracted_files = set()
         self.__cached_model = None
@@ -88,7 +88,7 @@ class ModelBuilder:
         self.__local_files.clear()
         self.__remote_files.clear()
         self.__lftp_statuses.clear()
-        self.__downloaded_files.clear()
+        self.__downloaded_files = None
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
         self.__cached_model = None
@@ -282,6 +282,7 @@ class ModelBuilder:
                 elif not model_file.is_dir and \
                         model_file.local_size is not None and \
                         model_file.remote_size is None and \
+                        self.__downloaded_files is not None and \
                         model_file.name in self.__downloaded_files:
                     # keep previously-downloaded local-only files recognizable
                     model_file.state = ModelFile.State.DOWNLOADED
@@ -289,23 +290,26 @@ class ModelBuilder:
                     # root is a directory that also exists remotely
                     # check all the children
                     all_downloaded = True
+                    has_downloadable_children = False
                     frontier = []
                     frontier += model_file.get_children()
                     while frontier:
                         _child_file = frontier.pop(0)
                         if not _child_file.is_dir and \
-                                _child_file.remote_size is not None and \
-                                _child_file.state != ModelFile.State.DOWNLOADED:
-                            all_downloaded = False
-                            break
+                                _child_file.remote_size is not None:
+                            has_downloadable_children = True
+                            if _child_file.state != ModelFile.State.DOWNLOADED:
+                                all_downloaded = False
+                                break
                         frontier += _child_file.get_children()
-                    if all_downloaded:
+                    if has_downloadable_children and all_downloaded:
                         model_file.state = ModelFile.State.DOWNLOADED
 
             # next we determine if root was Deleted
             # root is Deleted if it does not exist locally, but was downloaded in the past
             if model_file.state == ModelFile.State.DEFAULT and \
                     model_file.local_size is None and \
+                    self.__downloaded_files is not None and \
                     model_file.name in self.__downloaded_files:
                 model_file.state = ModelFile.State.DELETED
 
