@@ -90,6 +90,12 @@ class WebApp(bottle.Bottle):
     def add_handler(self, path: str, handler: Callable):
         self.get(path)(handler)
 
+    def add_post_handler(self, path: str, handler: Callable):
+        self.post(path)(handler)
+
+    def add_delete_handler(self, path: str, handler: Callable):
+        self.delete(path)(handler)
+
     def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs):
         self.__streaming_handlers.append((handler, kwargs))
 
