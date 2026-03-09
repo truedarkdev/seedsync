@@ -1825,8 +1825,10 @@ Verification:
 - tests run:
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_common/test_config.py tests/unittests/test_controller/test_scan/test_local_scanner.py tests/unittests/test_controller/test_delete_process.py`
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller_multi_path.py`
+  - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller.py::TestController::test_command_queue_file tests/integration/test_controller/test_controller.py::TestController::test_command_queue_directory tests/integration/test_controller/test_controller.py::TestController::test_persist_downloaded tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_file`
 - manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; kept the staging-path safety core, adapted it to the repo's current path-pair-aware controller API, added the explicit-stop recovery guard required by existing stopped-file persistence semantics, and left rapidcopy's broader validation and control-plane work out of this subject
-- status: verified; the focused config/scanner/delete suite passed with `23 passed` and the focused controller suite passed with `18 passed`
+- status: verified; the focused config/scanner/delete suite passed with `23 passed`, the focused controller suite passed with `18 passed`, the multi-path integration suite passed with `2 passed`, and the targeted single-path controller integration selection passed with `4 passed`
 
 Notes:
 - rapidcopy supplied the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion, with the adaptation kept path-pair-safe for the current local base and aligned with the repo's existing explicit-stop semantics
