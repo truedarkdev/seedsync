@@ -80,6 +80,11 @@ export class ViewFileService {
     private _filesSubject: BehaviorSubject<Immutable.List<ViewFile>> = new BehaviorSubject(this._files);
     private _filteredFilesSubject: BehaviorSubject<Immutable.List<ViewFile>> = new BehaviorSubject(this._files);
     private _indices: Map<string, number> = new Map<string, number>();
+    private _pageSize = 50;
+    private _currentPage = 0;
+    private _totalFilteredCountSubject: BehaviorSubject<number> = new BehaviorSubject(0);
+    private _pageSizeSubject: BehaviorSubject<number> = new BehaviorSubject(this._pageSize);
+    private _currentPageSubject: BehaviorSubject<number> = new BehaviorSubject(this._currentPage);
 
     private _prevModelFiles: Immutable.Map<string, ModelFile> = Immutable.Map<string, ModelFile>();
 
@@ -194,6 +199,49 @@ export class ViewFileService {
 
     get filteredFiles(): Observable<Immutable.List<ViewFile>> {
         return this._filteredFilesSubject.asObservable();
+    }
+
+    get totalFilteredCount(): Observable<number> {
+        return this._totalFilteredCountSubject.asObservable();
+    }
+
+    get pageSize(): Observable<number> {
+        return this._pageSizeSubject.asObservable();
+    }
+
+    get currentPage(): Observable<number> {
+        return this._currentPageSubject.asObservable();
+    }
+
+    public setPageSize(size: number): void {
+        this._pageSize = size;
+        this._currentPage = 0;
+        this._pageSizeSubject.next(size);
+        this._currentPageSubject.next(this._currentPage);
+        this.pushViewFiles();
+    }
+
+    public setPage(page: number): void {
+        this._currentPage = page;
+        this._currentPageSubject.next(this._currentPage);
+        this.pushViewFiles();
+    }
+
+    public nextPage(): void {
+        const totalPages = Math.ceil(this._totalFilteredCountSubject.getValue() / this._pageSize);
+        if (this._currentPage < totalPages - 1) {
+            this._currentPage++;
+            this._currentPageSubject.next(this._currentPage);
+            this.pushViewFiles();
+        }
+    }
+
+    public prevPage(): void {
+        if (this._currentPage > 0) {
+            this._currentPage--;
+            this._currentPageSubject.next(this._currentPage);
+            this.pushViewFiles();
+        }
     }
 
     /**
@@ -475,6 +523,19 @@ export class ViewFileService {
                 this._files.filter(f => this._filterCriteria.meetsCriteria(f))
             );
         }
-        this._filteredFilesSubject.next(filteredFiles);
+
+        const totalCount = filteredFiles.size;
+        this._totalFilteredCountSubject.next(totalCount);
+
+        const totalPages = this._pageSize > 0 ? Math.ceil(totalCount / this._pageSize) : 1;
+        if (this._currentPage >= totalPages) {
+            this._currentPage = Math.max(0, totalPages - 1);
+            this._currentPageSubject.next(this._currentPage);
+        }
+
+        const start = this._currentPage * this._pageSize;
+        const end = start + this._pageSize;
+        const pagedFiles = filteredFiles.slice(start, end).toList();
+        this._filteredFilesSubject.next(pagedFiles);
     }
 }
