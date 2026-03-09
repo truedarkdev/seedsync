@@ -11,6 +11,7 @@ import {ViewFile} from "./view-file";
 import {MOCK_MODEL_FILES} from "./mock-model-files";
 import {StreamServiceRegistry} from "../base/stream-service.registry";
 import {WebReaction} from "../utils/rest.service";
+import {FileSelectionService} from "./file-selection.service";
 
 
 /**
@@ -86,7 +87,8 @@ export class ViewFileService {
     private _sortComparator: ViewFileComparator = null;
 
     constructor(private _logger: LoggerService,
-                private _streamServiceRegistry: StreamServiceRegistry) {
+                private _streamServiceRegistry: StreamServiceRegistry,
+                private _fileSelectionService: FileSelectionService) {
         this.modelFileService = _streamServiceRegistry.modelFileService;
         const _viewFileService = this;
 
@@ -310,6 +312,7 @@ export class ViewFileService {
      */
     public setFilterCriteria(criteria: ViewFileFilterCriteria) {
         this._filterCriteria = criteria;
+        this._fileSelectionService.clear();
         this.pushViewFiles();
     }
 
@@ -319,6 +322,7 @@ export class ViewFileService {
      */
     public setComparator(comparator: ViewFileComparator) {
         this._sortComparator = comparator;
+        this._fileSelectionService.clear();
 
         // Re-sort and regenerate index cache
         this._logger.debug("Re-sorting view files");

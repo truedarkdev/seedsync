@@ -22,6 +22,7 @@
 
     /* width */
     /* NOTE: make sure this is in-sync with ".file .content" */
+    #header .select-all  {width: 40px; min-width: 40px;}
     #header .status     {width: 100px; min-width: 100px;}
     #header .name       {flex-grow: 1;}
     #header .speed      {width: 100px; min-width: 100px;}
@@ -56,5 +57,11 @@
         display: inline-block;
         min-width: 10px;
         margin-left: 4px;
+    }
+
+    #header .select-all {
+        display: flex;
+        align-items: center;
+        justify-content: center;
     }
 }

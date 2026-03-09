@@ -1,5 +1,12 @@
-<div id="file-list">
+<div id="file-list" *ngIf="files | async as currentFiles">
+    <app-bulk-actions-bar [selectedFiles]="selectedFiles | async"></app-bulk-actions-bar>
     <div id="header" *ngIf="options | async as currentOptions">
+        <div class="select-all">
+            <input type="checkbox"
+                   [checked]="areAllVisibleSelected | async"
+                   (click)="$event.stopPropagation()"
+                   (change)="onToggleAllVisible($event.target.checked)" />
+        </div>
         <div class="name sortable"
              [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.NAME_ASC, SortMethod.NAME_DESC)"
              (click)="onSort(currentOptions.sortMethod, SortMethod.NAME_ASC, SortMethod.NAME_DESC)">
@@ -46,11 +53,14 @@
             </span>
         </div>
     </div>
-    <div *ngFor="let file of files | async; trackBy: identify">
+    <div *ngFor="let file of currentFiles; trackBy: identify">
         <app-file
             [file]="file"
             [options]="options"
+            [isBulkSelected]="(selectedNames | async)?.has(file.name)"
+            [showActions]="file.isSelected"
             (click)="onSelect(file)"
+            (toggleSelectionEvent)="onSelectionToggle($event)"
             (queueEvent)="onQueue($event)"
             (stopEvent)="onStop($event)"
             (extractEvent)="onExtract($event)"
