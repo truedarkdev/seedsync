@@ -473,6 +473,8 @@ export class ViewFileService {
 
         return new ViewFile({
             fileId: modelFile.file_id,
+            pathPairId: modelFile.path_pair_id,
+            pathPairName: modelFile.path_pair_name,
             name: modelFile.name,
             isDir: modelFile.is_dir,
             localSize: localSize,

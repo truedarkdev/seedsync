@@ -6,6 +6,8 @@ import {Record, Set} from "immutable";
  */
 interface IModelFile {
     file_id: string;
+    path_pair_id: string;
+    path_pair_name: string;
     name: string;
     is_dir: boolean;
     local_size: number;
@@ -25,6 +27,8 @@ interface IModelFile {
 // Boiler plate code to set up an immutable class
 const DefaultModelFile: IModelFile = {
     file_id: null,
+    path_pair_id: null,
+    path_pair_name: null,
     name: null,
     is_dir: null,
     local_size: null,
@@ -50,6 +54,8 @@ const ModelFileRecord = Record(DefaultModelFile);
  */
 export class ModelFile extends ModelFileRecord implements IModelFile {
     file_id: string;
+    path_pair_id: string;
+    path_pair_name: string;
     name: string;
     is_dir: boolean;
     local_size: number;

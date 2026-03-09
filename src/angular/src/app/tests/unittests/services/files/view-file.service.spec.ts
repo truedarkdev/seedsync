@@ -72,6 +72,8 @@ describe("Testing view file service", () => {
         let model = Immutable.Map<string, ModelFile>();
         model = model.set("a", new ModelFile({
             file_id: "[\"movies\",\"a\"]",
+            path_pair_id: "movies",
+            path_pair_name: "Movies",
             name: "a",
             is_dir: true,
             local_size: 0,
@@ -95,6 +97,8 @@ describe("Testing view file service", () => {
                 expect(list.size).toBe(1);
                 let file = list.get(0);
                 expect(file.fileId).toBe("[\"movies\",\"a\"]");
+                expect(file.pathPairId).toBe("movies");
+                expect(file.pathPairName).toBe("Movies");
                 expect(file.name).toBe("a");
                 expect(file.isDir).toBe(true);
                 expect(file.localSize).toBe(0);
@@ -573,10 +577,14 @@ describe("Testing view file service", () => {
         let model = Immutable.Map<string, ModelFile>();
         model = model.set("[\"movies\",\"dup\"]", new ModelFile({
             file_id: "[\"movies\",\"dup\"]",
+            path_pair_id: "movies",
+            path_pair_name: "Movies",
             name: "dup"
         }));
         model = model.set("[\"tv\",\"dup\"]", new ModelFile({
             file_id: "[\"tv\",\"dup\"]",
+            path_pair_id: "tv",
+            path_pair_name: "TV",
             name: "dup"
         }));
 
@@ -595,6 +603,8 @@ describe("Testing view file service", () => {
         expect(viewFileList.get(0).isSelected).toBe(false);
         expect(viewFileList.get(1).isSelected).toBe(true);
         expect(viewFileList.get(1).fileId).toBe("[\"tv\",\"dup\"]");
+        expect(viewFileList.get(0).pathPairName).toBe("Movies");
+        expect(viewFileList.get(1).pathPairName).toBe("TV");
     }));
 
     it("should should correctly set ViewFile isLocallyDeletable", fakeAsync(() => {
