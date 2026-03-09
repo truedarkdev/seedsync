@@ -55,7 +55,7 @@ class Lftp:
         self.logger = logging.getLogger("Lftp")
         self.__expect_pattern = "lftp {}@{}:.*>".format(self.__user, self.__address)
         self.__job_status_parser = LftpJobStatusParser()
-        self.__timeout = 3  # in seconds
+        self.__timeout = 30  # in seconds
         self.__consecutive_status_errors = 0
 
         self.__log_command_output = False
@@ -127,7 +127,7 @@ class Lftp:
         try:
             self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
         except pexpect.exceptions.TIMEOUT:
-            self.logger.exception("Lftp timeout exception")
+            self.logger.debug("Lftp timeout exception")
             pass
         finally:
             out = self.__process.before.decode('utf8', 'replace')
@@ -147,7 +147,7 @@ class Lftp:
             try:
                 self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
             except pexpect.exceptions.TIMEOUT:
-                self.logger.exception("Lftp timeout exception")
+                self.logger.debug("Lftp timeout exception")
                 pass
             finally:
                 out = self.__process.before.decode('utf8', 'replace')
