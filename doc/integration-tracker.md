@@ -1750,75 +1750,81 @@ Notes:
 
 ### thejuran
 
-- State: not started
-- High-risk: no
-- Integration base: n/a
+- State: in progress
+- High-risk: yes
+- Integration base: master (`2f6dc01`)
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for delete, cleanup, and file-safety paths
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 20 candidate after `a8561cd`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
 
 Pending:
-- none
+- adapt the focused test intent from `492944f` into the current local test layout so the existing `DeleteRemoteProcess` shell-quoting safety is explicitly covered
 
 Covered elsewhere:
-- none
+- `ae151c8` and `81702da` are already present locally through the current controller delete actions, web-handler wiring, stronger HTTP-method semantics, and `file_id`/path-pair-aware command routing
+- `f8c00fc` and `492944f` are already present locally in runtime behavior because `DeleteRemoteProcess` now uses `shlex.quote`
+- `fa9ba6f` is already present locally because local directory deletion already uses `shutil.rmtree(..., ignore_errors=True)`
+- `f3af3fb` is already covered by current local behavior because this base no longer prunes `downloaded_file_names`, so externally deleted files stay tracked and are not re-downloaded automatically
 
 Skipped:
-- none
+- `c8f01c5`, `a4faeef`, `6420549`, `5b52854`, `b98b68b`, `50cb979`, `13d8e96`, `cd8d78a`, `4a83863`, `5210436`, and related import/webhook or auto-delete work were skipped for this subject because the current base does not carry thejuran's Sonarr/Webhook import architecture and a partial import would broaden this conservative pass beyond deletion safety
+- `b9c0612`, `e775d8f`, and `f5e5487` were classified under prior auto-queue/controller subjects and are already handled or intentionally resolved elsewhere in current master
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
+- tests run: none yet in this pass
+- manual checks: compared thejuran delete-path commits against current `Controller`, delete-process, and web-handler code; confirmed that the runtime safety behavior is already present locally and reduced the remaining thejuran work to an optional targeted coverage adaptation
 - status: not verified yet
 
 Notes:
-- none
+- thejuran's direct delete-command work is already present locally; the only remaining compatible follow-up is narrow test coverage for the current delete-process shell-quoting behavior
 
 ### rapidcopy
 
-- State: not started
-- High-risk: no
-- Integration base: n/a
+- State: in progress
+- High-risk: yes
+- Integration base: master (`2f6dc01`)
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for delete, cleanup, and file-safety paths
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 20 candidate after `6ce7c19`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
 
 Pending:
-- none
+- adapt `6ce7c19` into small local batches so downloads can use a staging path, completed files move into the final local directory only after completion, and leftover `.lftp` temp files can be resumed safely after restart
 
 Covered elsewhere:
-- none
+- `677be93` is cleanup-only and offers no functional delete or file-safety change over current local code
 
 Skipped:
-- none
+- `d20b84d` was skipped because it depends on rapidcopy's validation-process architecture, which is not present in the current base
+- `0c73e23` was skipped because it is a permissions note rather than a direct cleanup, deletion, or file-safety change for this base
+- the broader security/UI/config portions bundled around `32acba6`, `78a3fde`, `227b5a3`, `866921b`, `d0662ca`, `dda1cb2`, `30809bf`, `e038c21`, `25145f6`, `4cd7fc1`, and related validation or control-plane work are intentionally left to their primary subjects instead of being half-merged here
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
+- tests run: none yet in this pass
+- manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; confirmed the staging/incomplete-download idea is not present locally and that the useful part can be adapted without importing rapidcopy's broader validation stack
 - status: not verified yet
 
 Notes:
-- none
+- rapidcopy supplies the main new Subject 20 feature in this pass: staging/incomplete-download handling to keep partial files out of the final downloads directory until completion
 
 ## Subject 21 - Cross-Cutting UX Or Workflow Conflicts
 
