@@ -297,6 +297,7 @@ class ModelBuilder:
                     model_file.eta is None and \
                     model_file.downloading_speed is not None and \
                     model_file.downloading_speed > 0 and \
+                    model_file.remote_size is not None and \
                     model_file.transferred_size is not None:
                 # First-order estimate
                 remaining_size = max(model_file.remote_size - model_file.transferred_size, 0)
