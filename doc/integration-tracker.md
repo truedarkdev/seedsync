@@ -1668,7 +1668,7 @@ Notes:
 
 ### thejuran
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: master (`7641d16`)
 - Source branch: thejuran/master
@@ -1698,16 +1698,17 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `make run-tests-angular`
+- manual checks: confirmed the useful `ResizeObserver`, subscription-cleanup, remote-error notification, unicode e2e, and Safari toolbar-tint fixes from thejuran's dashboard or main-layout area are already present locally and kept the remaining icon-rail and toast-container redesign work out of this conservative pass
+- status: verified; the Angular suite passed with `211 tests completed`
 
 Notes:
 - thejuran's Subject 19 candidates were either already covered locally or broadened into optional layout or notification redesign work that did not fit this conservative pass
 
 ### rapidcopy
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: master (`7641d16`)
 - Source branch: rapidcopy/master
@@ -1719,10 +1720,10 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
-- none
+- `bc32e6b` adapted from `a33981b` to add sidebar restart progress, success, and failure feedback using the current `NotificationService` and the existing `WebReaction` flow without taking rapidcopy's broader settings and validation changes
 
 Pending:
-- `a33981b` sidebar restart feedback is pending as a narrow local adaptation onto the current `NotificationService` and `RestService` behavior without taking the broader settings or validation work from that rapidcopy commit
+- none
 
 Covered elsewhere:
 - `757da15` remote-server-error notification handling is already present locally in `header.component.ts`
@@ -1737,12 +1738,13 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `make run-tests-angular`
+- manual checks: reviewed the rapidcopy sidebar idea against the local `RestService` implementation, confirmed restart still returns an immediate backend success response, and isolated a legacy Karma harness failure triggered by an attempted new sidebar component spec before keeping the runtime change and full-suite verification
+- status: verified; the Angular suite passed with `211 tests completed`
 
 Notes:
-- rapidcopy supplied one narrow main-layout improvement worth adapting locally; the rest of the reviewed layout-adjacent work was either already present or intentionally broader than this pass
+- rapidcopy supplied one narrow main-layout improvement worth adapting locally; the rest of the reviewed layout-adjacent work was either already present or intentionally broader than this pass, so Subject 19 closes as a small review-state commit plus one focused sidebar feedback batch
 
 ## Subject 20 - Cleanup, Deletion, And File Safety
 
