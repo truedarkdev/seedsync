@@ -1225,6 +1225,7 @@ Notes:
 
 Integrated:
 - adapted `65dc7fe` as the fourth Subject 14 batch to avoid mutating the persisted downloaded-file set during `clear()`, guard downloaded/deleted checks when no downloaded set is loaded, and only mark remote directories as `DOWNLOADED` when they contain remote leaf files and all such leaves are downloaded
+- adapted the `lftp.py` portion of `c52554b` as the sixth Subject 14 batch to guard debug logging when `pexpect.after` is `None`, avoiding secondary `AttributeError` crashes in timeout/error paths
 
 Pending:
 - `5b52854` remains pending only as a possible future import-status follow-up if this branch later gains import tracking state to attach it to
@@ -1238,6 +1239,7 @@ Covered elsewhere:
 - the handler-method portion of `a50a6ec` is already covered by Subject 12 commit `515437c`
 - adapted equivalents of `7897c8e` and `9e84b9e` land in the local controller-containment batch for Subject 14
 - the import-status portion of `5b52854` does not apply on this branch because the current base has no `import_status` model field, imported-file persistence, or Sonarr/import-tracking path to extend yet
+- the `lftp.py` `pexpect.after is None` guard from `c52554b` is integrated as its own narrow Subject 14 hardening batch; the rest of `c52554b` remains broader bounded-set persistence work
 
 Skipped:
 - `4c381e4` is classified out of the first Subject 14 pass because it is broad controller command refactoring rather than a bounded transfer/LFTP fix
@@ -1247,9 +1249,9 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests python -m pytest -v tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_default_remote_dir_without_remote_leaf_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_clear_does_not_mutate_downloaded_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_state tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_full tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial_extra`
-- manual checks: reviewed thejuran transfer/LFTP candidates, kept only the transfer-state correctness subset from `65dc7fe`, and left the `5b52854` import-status work out because the required import-tracking model does not exist on this branch
-- status: transfer-state correctness batch verified
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests python -m pytest -v tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_default_remote_dir_without_remote_leaf_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_clear_does_not_mutate_downloaded_files tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_state tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_full tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial tests/unittests/test_controller/test_model_builder.py::TestModelBuilder::test_build_children_state_downloaded_partial_extra`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_lftp/test_lftp.py`
+- manual checks: reviewed thejuran transfer/LFTP candidates, kept only the transfer-state correctness subset from `65dc7fe`, left the `5b52854` import-status work out because the required import-tracking model does not exist on this branch, and then extracted only the `lftp.py` `pexpect.after is None` guard from `c52554b` instead of taking the broader bounded-set and memory-monitor work
+- status: transfer-state correctness and `pexpect.after` hardening batches verified
 
 Notes:
 - first implementation batch should stay limited to `lftp.py`, `job_status_parser.py`, and focused parser tests before broader transfer behavior work is attempted
