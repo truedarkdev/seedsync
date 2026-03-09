@@ -308,7 +308,7 @@ describe("Testing model file service", () => {
         tick(4000);
     }));
 
-    it("should send a GET on queue command", fakeAsync(() => {
+    it("should send a POST on queue command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -331,7 +331,9 @@ describe("Testing model file service", () => {
                 count++;
             }
         });
-        httpMock.expectOne("/server/command/queue/File.One").flush("done");
+        const request = httpMock.expectOne("/server/command/queue/File.One");
+        expect(request.request.method).toBe("POST");
+        request.flush("done");
 
         tick();
         expect(count).toBe(1);
@@ -339,7 +341,7 @@ describe("Testing model file service", () => {
     }));
 
 
-    it("should send correct GET requests on queue command", fakeAsync(() => {
+    it("should send correct POST requests on queue command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -351,7 +353,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/queue/test").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/queue/test" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test space",
@@ -359,7 +361,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/queue/test%2520space").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/queue/test%2520space" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test/slash",
@@ -367,7 +369,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/queue/test%252Fslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/queue/test%252Fslash" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test\"doublequote",
@@ -375,7 +377,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/queue/test%2522doublequote").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/queue/test%2522doublequote" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "/test/leadingslash",
@@ -383,10 +385,10 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/queue/%252Ftest%252Fleadingslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/queue/%252Ftest%252Fleadingslash" && req.method === "POST").flush("done");
     }));
 
-    it("should send a GET on stop command", fakeAsync(() => {
+    it("should send a POST on stop command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -409,14 +411,16 @@ describe("Testing model file service", () => {
                 count++;
             }
         });
-        httpMock.expectOne("/server/command/stop/File.One").flush("done");
+        const request = httpMock.expectOne("/server/command/stop/File.One");
+        expect(request.request.method).toBe("POST");
+        request.flush("done");
 
         tick();
         expect(count).toBe(1);
         httpMock.verify();
     }));
 
-    it("should send correct GET requests on stop command", fakeAsync(() => {
+    it("should send correct POST requests on stop command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -428,7 +432,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.stop(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/stop/test").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/stop/test" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test space",
@@ -436,7 +440,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.stop(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/stop/test%2520space").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/stop/test%2520space" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test/slash",
@@ -444,7 +448,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.stop(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/stop/test%252Fslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/stop/test%252Fslash" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test\"doublequote",
@@ -452,7 +456,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.stop(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/stop/test%2522doublequote").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/stop/test%2522doublequote" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "/test/leadingslash",
@@ -460,10 +464,10 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.stop(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/stop/%252Ftest%252Fleadingslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/stop/%252Ftest%252Fleadingslash" && req.method === "POST").flush("done");
     }));
 
-    it("should send a GET on extract command", fakeAsync(() => {
+    it("should send a POST on extract command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -486,14 +490,16 @@ describe("Testing model file service", () => {
                 count++;
             }
         });
-        httpMock.expectOne("/server/command/extract/File.One").flush("done");
+        const request = httpMock.expectOne("/server/command/extract/File.One");
+        expect(request.request.method).toBe("POST");
+        request.flush("done");
 
         tick();
         expect(count).toBe(1);
         httpMock.verify();
     }));
 
-    it("should send correct GET requests on extract command", fakeAsync(() => {
+    it("should send correct POST requests on extract command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -505,7 +511,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.extract(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/extract/test").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/extract/test" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test space",
@@ -513,7 +519,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.extract(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/extract/test%2520space").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/extract/test%2520space" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test/slash",
@@ -521,7 +527,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.extract(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/extract/test%252Fslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/extract/test%252Fslash" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "test\"doublequote",
@@ -529,7 +535,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.extract(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/extract/test%2522doublequote").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/extract/test%2522doublequote" && req.method === "POST").flush("done");
 
         modelFile = new ModelFile({
             name: "/test/leadingslash",
@@ -537,10 +543,10 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.extract(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/extract/%252Ftest%252Fleadingslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/extract/%252Ftest%252Fleadingslash" && req.method === "POST").flush("done");
     }));
 
-    it("should send a GET on delete local command", fakeAsync(() => {
+    it("should send a DELETE on delete local command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -563,14 +569,16 @@ describe("Testing model file service", () => {
                 count++;
             }
         });
-        httpMock.expectOne("/server/command/delete_local/File.One").flush("done");
+        const request = httpMock.expectOne("/server/command/delete_local/File.One");
+        expect(request.request.method).toBe("DELETE");
+        request.flush("done");
 
         tick();
         expect(count).toBe(1);
         httpMock.verify();
     }));
 
-    it("should send correct GET requests on delete local command", fakeAsync(() => {
+    it("should send correct DELETE requests on delete local command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -582,7 +590,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteLocal(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_local/test").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_local/test" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test space",
@@ -590,7 +598,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteLocal(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_local/test%2520space").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_local/test%2520space" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test/slash",
@@ -598,7 +606,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteLocal(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_local/test%252Fslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_local/test%252Fslash" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test\"doublequote",
@@ -606,7 +614,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteLocal(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_local/test%2522doublequote").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_local/test%2522doublequote" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "/test/leadingslash",
@@ -614,10 +622,10 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteLocal(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_local/%252Ftest%252Fleadingslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_local/%252Ftest%252Fleadingslash" && req.method === "DELETE").flush("done");
     }));
 
-    it("should send a GET on delete remote command", fakeAsync(() => {
+    it("should send a DELETE on delete remote command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -640,14 +648,16 @@ describe("Testing model file service", () => {
                 count++;
             }
         });
-        httpMock.expectOne("/server/command/delete_remote/File.One").flush("done");
+        const request = httpMock.expectOne("/server/command/delete_remote/File.One");
+        expect(request.request.method).toBe("DELETE");
+        request.flush("done");
 
         tick();
         expect(count).toBe(1);
         httpMock.verify();
     }));
 
-    it("should send correct GET requests on delete remote command", fakeAsync(() => {
+    it("should send correct DELETE requests on delete remote command", fakeAsync(() => {
         // Connect the service
         modelFileService.notifyConnected();
 
@@ -659,7 +669,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_remote/test").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_remote/test" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test space",
@@ -667,7 +677,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_remote/test%2520space").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_remote/test%2520space" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test/slash",
@@ -675,7 +685,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_remote/test%252Fslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_remote/test%252Fslash" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "test\"doublequote",
@@ -683,7 +693,7 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_remote/test%2522doublequote").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_remote/test%2522doublequote" && req.method === "DELETE").flush("done");
 
         modelFile = new ModelFile({
             name: "/test/leadingslash",
@@ -691,6 +701,6 @@ describe("Testing model file service", () => {
             children: Immutable.Set<ModelFile>()
         });
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
-        httpMock.expectOne("/server/command/delete_remote/%252Ftest%252Fleadingslash").flush("done");
+        httpMock.expectOne(req => req.url === "/server/command/delete_remote/%252Ftest%252Fleadingslash" && req.method === "DELETE").flush("done");
     }));
 });

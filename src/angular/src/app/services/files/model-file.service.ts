@@ -53,7 +53,7 @@ export class ModelFileService extends BaseStreamService {
         // Double-encode the value
         const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
         const url: string = "/server/command/queue/" + fileNameEncoded;
-        return this._restService.sendRequest(url);
+        return this._restService.post(url);
     }
 
     /**
@@ -66,7 +66,7 @@ export class ModelFileService extends BaseStreamService {
         // Double-encode the value
         const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
         const url: string = "/server/command/stop/" + fileNameEncoded;
-        return this._restService.sendRequest(url);
+        return this._restService.post(url);
     }
 
     /**
@@ -79,7 +79,7 @@ export class ModelFileService extends BaseStreamService {
         // Double-encode the value
         const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
         const url: string = "/server/command/extract/" + fileNameEncoded;
-        return this._restService.sendRequest(url);
+        return this._restService.post(url);
     }
 
     /**
@@ -92,7 +92,7 @@ export class ModelFileService extends BaseStreamService {
         // Double-encode the value
         const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
         const url: string = "/server/command/delete_local/" + fileNameEncoded;
-        return this._restService.sendRequest(url);
+        return this._restService.delete(url);
     }
 
     /**
@@ -105,7 +105,7 @@ export class ModelFileService extends BaseStreamService {
         // Double-encode the value
         const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
         const url: string = "/server/command/delete_remote/" + fileNameEncoded;
-        return this._restService.sendRequest(url);
+        return this._restService.delete(url);
     }
 
     protected onEvent(eventName: string, data: string) {
