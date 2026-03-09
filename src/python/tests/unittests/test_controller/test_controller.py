@@ -82,7 +82,7 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__process_commands()
 
-        callback.on_failure.assert_called_once_with("Lftp error: ")
+        callback.on_failure.assert_called_once_with("Lftp error: bad status")
         callback.on_success.assert_not_called()
 
     def test_propagate_exceptions_ignores_pending_lftp_errors(self):
