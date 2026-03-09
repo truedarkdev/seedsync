@@ -112,6 +112,10 @@ export class ViewFileService {
         }
     }
 
+    private static getViewFileKey(file: ViewFile): string {
+        return file.fileId || file.name;
+    }
+
     private buildViewFromModelFiles(modelFiles: Immutable.Map<string, ModelFile>) {
         this._logger.debug("Received next model files");
 
@@ -162,14 +166,14 @@ export class ViewFileService {
                 reSort = true;
                 const viewFile = ViewFileService.createViewFile(modelFiles.get(name));
                 newViewFiles = newViewFiles.push(viewFile);
-                this._indices.set(name, newViewFiles.size - 1);
+                this._indices.set(ViewFileService.getViewFileKey(viewFile), newViewFiles.size - 1);
             }
         );
         // Do the removes (no re-sort required)
         removedNames.forEach(
             name => {
                 updateIndices = true;
-                const index = newViewFiles.findIndex(value => value.name === name);
+                const index = newViewFiles.findIndex(value => ViewFileService.getViewFileKey(value) === name);
                 newViewFiles = newViewFiles.remove(index);
                 this._indices.delete(name);
             }
@@ -183,7 +187,7 @@ export class ViewFileService {
         if (updateIndices) {
             this._indices.clear();
             newViewFiles.forEach(
-                (value, index) => this._indices.set(value.name, index)
+                (value, index) => this._indices.set(ViewFileService.getViewFileKey(value), index)
             );
         }
 
@@ -262,15 +266,18 @@ export class ViewFileService {
             let unSelectViewFile = viewFiles.get(unSelectIndex);
 
             // Do nothing if file is already selected
-            if (unSelectViewFile.name === file.name) { return; }
+            if (ViewFileService.getViewFileKey(unSelectViewFile) === ViewFileService.getViewFileKey(file)) {
+                return;
+            }
 
             unSelectViewFile = new ViewFile(unSelectViewFile.set("isSelected", false));
             viewFiles = viewFiles.set(unSelectIndex, unSelectViewFile);
         }
 
         // Set the new selected file
-        if (this._indices.has(file.name)) {
-            const index = this._indices.get(file.name);
+        const fileKey = ViewFileService.getViewFileKey(file);
+        if (this._indices.has(fileKey)) {
+            const index = this._indices.get(fileKey);
             let viewFile = viewFiles.get(index);
             viewFile = new ViewFile(viewFile.set("isSelected", true));
             viewFiles = viewFiles.set(index, viewFile);
@@ -381,7 +388,7 @@ export class ViewFileService {
         this._files = newViewFiles;
         this._indices.clear();
         newViewFiles.forEach(
-            (value, index) => this._indices.set(value.name, index)
+            (value, index) => this._indices.set(ViewFileService.getViewFileKey(value), index)
         );
 
         this.pushViewFiles();
@@ -465,6 +472,7 @@ export class ViewFileService {
                                     && remoteSize > 0;
 
         return new ViewFile({
+            fileId: modelFile.file_id,
             name: modelFile.name,
             isDir: modelFile.is_dir,
             localSize: localSize,
@@ -498,12 +506,13 @@ export class ViewFileService {
                          action: (file: ModelFile) => Observable<WebReaction>)
             : Observable<WebReaction> {
         return Observable.create(observer => {
-            if (!this._prevModelFiles.has(file.name)) {
+            const fileKey = file.fileId || file.name;
+            if (!this._prevModelFiles.has(fileKey)) {
                 // File not found, exit early
                 this._logger.error("File to queue not found: " + file.name);
                 observer.next(new WebReaction(false, null, `File '${file.name}' not found`));
             } else {
-                const modelFile = this._prevModelFiles.get(file.name);
+                const modelFile = this._prevModelFiles.get(fileKey);
                 action(modelFile).subscribe(reaction => {
                     this._logger.debug("Received model reaction: %O", reaction);
                     observer.next(reaction);

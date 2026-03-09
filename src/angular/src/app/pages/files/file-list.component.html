@@ -57,7 +57,7 @@
         <app-file
             [file]="file"
             [options]="options"
-            [isBulkSelected]="(selectedNames | async)?.has(file.name)"
+            [isBulkSelected]="(selectedFileIds | async)?.has(file.fileId || file.name)"
             [showActions]="file.isSelected"
             (click)="onSelect(file)"
             (toggleSelectionEvent)="onSelectionToggle($event)"

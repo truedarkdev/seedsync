@@ -8,6 +8,18 @@ from controller import Controller
 
 
 class TestControllerHandler(BaseTestWebApp):
+    def setUp(self):
+        super().setUp()
+        self.controller.get_model_files = MagicMock(return_value=[])
+
+    @staticmethod
+    def __model_file(name: str, file_id: str, path_pair_id: str = None):
+        file = MagicMock()
+        file.name = name
+        file.file_id = file_id
+        file.path_pair_id = path_pair_id
+        return file
+
     def test_queue(self):
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_success()
@@ -204,6 +216,62 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual("test1", seen_commands[0].filename)
         self.assertEqual("test2", seen_commands[1].filename)
 
+    def test_queue_accepts_additive_file_identity(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+        self.controller.queue_command = MagicMock()
+        self.controller.queue_command.side_effect = side_effect
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", "[\"movies\",\"dup\"]", "movies"),
+            self.__model_file("dup", "[\"tv\",\"dup\"]", "tv")
+        ]
+
+        response = self.test_app.post("/server/command/queue/dup?file_id=%5B%22tv%22%2C%22dup%22%5D")
+
+        self.assertEqual(200, response.status_code)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("[\"tv\",\"dup\"]", command.filename)
+
+    def test_queue_rejects_ambiguous_filename_without_identity(self):
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", "[\"movies\",\"dup\"]", "movies"),
+            self.__model_file("dup", "[\"tv\",\"dup\"]", "tv")
+        ]
+
+        response = self.test_app.post("/server/command/queue/dup", expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("ambiguous", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_bulk_queue_accepts_file_identity_objects(self):
+        seen_commands = []
+
+        def side_effect(cmd: Controller.Command):
+            seen_commands.append(cmd)
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock()
+        self.controller.queue_command.side_effect = side_effect
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", "[\"movies\",\"dup\"]", "movies"),
+            self.__model_file("dup", "[\"tv\",\"dup\"]", "tv")
+        ]
+
+        response = self.test_app.post_json("/server/command/bulk/queue", {
+            "files": [
+                {"name": "dup", "file_id": "[\"movies\",\"dup\"]"},
+                {"name": "dup", "file_id": "[\"tv\",\"dup\"]"},
+                {"name": "dup", "file_id": "[\"movies\",\"dup\"]"}
+            ]
+        })
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(2, len(seen_commands))
+        self.assertEqual("[\"movies\",\"dup\"]", seen_commands[0].filename)
+        self.assertEqual("[\"tv\",\"dup\"]", seen_commands[1].filename)
+
     def test_bulk_queue_partial_failure_returns_summary(self):
         call_count = 0
 
@@ -247,4 +315,4 @@ class TestControllerHandler(BaseTestWebApp):
         )
 
         self.assertEqual(400, response.status_code)
-        self.assertIn("non-empty 'filenames' list", response.text)
+        self.assertIn("non-empty 'files' or 'filenames' list", response.text)

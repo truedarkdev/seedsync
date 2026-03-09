@@ -5,6 +5,7 @@ import {Modal} from "ngx-modialog/plugins/bootstrap";
 
 import {ViewFile} from "../../services/files/view-file";
 import {BulkCommandService} from "../../services/server/bulk-command.service";
+import {BulkCommandFile} from "../../services/server/bulk-command.service";
 import {LoggerService} from "../../services/utils/logger.service";
 import {FileSelectionService} from "../../services/files/file-selection.service";
 import {Localization} from "../../common/localization";
@@ -28,6 +29,13 @@ export class BulkActionsBarComponent {
         this.fileSelectionService.clear();
     }
 
+    private getSelectedCommandFiles(): BulkCommandFile[] {
+        return this.selectedFiles.map(file => ({
+            file_id: file.fileId,
+            name: file.name
+        })).toArray();
+    }
+
     public isQueueable(): boolean {
         return this.selectedFiles.size > 0 && this.selectedFiles.every(file => file.isQueueable);
     }
@@ -36,7 +44,7 @@ export class BulkActionsBarComponent {
         if (!this.isQueueable()) {
             return;
         }
-        this.send(this.bulkCommandService.queue(this.selectedFiles.map(file => file.name).toArray()));
+        this.send(this.bulkCommandService.queue(this.getSelectedCommandFiles()));
     }
 
     public isStoppable(): boolean {
@@ -47,7 +55,7 @@ export class BulkActionsBarComponent {
         if (!this.isStoppable()) {
             return;
         }
-        this.send(this.bulkCommandService.stop(this.selectedFiles.map(file => file.name).toArray()));
+        this.send(this.bulkCommandService.stop(this.getSelectedCommandFiles()));
     }
 
     public isExtractable(): boolean {
@@ -59,7 +67,7 @@ export class BulkActionsBarComponent {
         if (!this.isExtractable()) {
             return;
         }
-        this.send(this.bulkCommandService.extract(this.selectedFiles.map(file => file.name).toArray()));
+        this.send(this.bulkCommandService.extract(this.getSelectedCommandFiles()));
     }
 
     public isLocallyDeletable(): boolean {
@@ -74,7 +82,7 @@ export class BulkActionsBarComponent {
         this.showDeleteConfirmation(
             Localization.Modal.DELETE_LOCAL_BULK_TITLE,
             Localization.Modal.DELETE_LOCAL_BULK_MESSAGE(fileNames),
-            () => this.send(this.bulkCommandService.deleteLocal(fileNames))
+            () => this.send(this.bulkCommandService.deleteLocal(this.getSelectedCommandFiles()))
         );
     }
 
@@ -90,7 +98,7 @@ export class BulkActionsBarComponent {
         this.showDeleteConfirmation(
             Localization.Modal.DELETE_REMOTE_BULK_TITLE,
             Localization.Modal.DELETE_REMOTE_BULK_MESSAGE(fileNames),
-            () => this.send(this.bulkCommandService.deleteRemote(fileNames))
+            () => this.send(this.bulkCommandService.deleteRemote(this.getSelectedCommandFiles()))
         );
     }
 

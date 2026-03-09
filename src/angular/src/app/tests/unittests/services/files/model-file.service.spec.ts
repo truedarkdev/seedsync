@@ -90,6 +90,31 @@ describe("Testing model file service", () => {
         expect(Immutable.is(latestModel.get("File.One"), expectedModelFiles[0])).toBe(true);
     }));
 
+    it("should key parsed model files by file_id when present", fakeAsync(() => {
+        let latestModel: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe({
+            next: modelFiles => latestModel = modelFiles
+        });
+        tick();
+
+        modelFileService.notifyEvent("model-init", JSON.stringify([{
+            file_id: "[\"movies\",\"File.One\"]",
+            name: "File.One",
+            is_dir: false,
+            local_size: 1234,
+            remote_size: 4567,
+            state: "default",
+            downloading_speed: 99,
+            eta: 54,
+            full_path: "/full/path/to/file.one",
+            children: []
+        }]));
+        tick();
+
+        expect(latestModel.has("[\"movies\",\"File.One\"]")).toBe(true);
+        expect(latestModel.get("[\"movies\",\"File.One\"]").file_id).toBe("[\"movies\",\"File.One\"]");
+    }));
+
     it("should send correct model on an added event", fakeAsync(() => {
         let initialModelFiles = [
             {
@@ -386,6 +411,23 @@ describe("Testing model file service", () => {
         });
         modelFileService.queue(modelFile).subscribe(DoNothing);
         httpMock.expectOne(req => req.url === "/server/command/queue/%252Ftest%252Fleadingslash" && req.method === "POST").flush("done");
+    }));
+
+    it("should append file_id query parameter on queue command when present", fakeAsync(() => {
+        modelFileService.notifyConnected();
+
+        const modelFile = new ModelFile({
+            file_id: "[\"movies\",\"File.One\"]",
+            name: "File.One",
+            state: ModelFile.State.DEFAULT,
+            children: Immutable.Set<ModelFile>()
+        });
+
+        modelFileService.queue(modelFile).subscribe(DoNothing);
+        httpMock.expectOne(req =>
+            req.urlWithParams === "/server/command/queue/File.One?file_id=%5B%22movies%22%2C%22File.One%22%5D"
+            && req.method === "POST"
+        ).flush("done");
     }));
 
     it("should send a POST on stop command", fakeAsync(() => {

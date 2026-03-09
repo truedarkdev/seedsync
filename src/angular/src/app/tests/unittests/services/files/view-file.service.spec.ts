@@ -71,6 +71,7 @@ describe("Testing view file service", () => {
     it("should correctly populate ViewFile props from a ModelFile", fakeAsync(() => {
         let model = Immutable.Map<string, ModelFile>();
         model = model.set("a", new ModelFile({
+            file_id: "[\"movies\",\"a\"]",
             name: "a",
             is_dir: true,
             local_size: 0,
@@ -93,6 +94,7 @@ describe("Testing view file service", () => {
             next: list => {
                 expect(list.size).toBe(1);
                 let file = list.get(0);
+                expect(file.fileId).toBe("[\"movies\",\"a\"]");
                 expect(file.name).toBe("a");
                 expect(file.isDir).toBe(true);
                 expect(file.localSize).toBe(0);
@@ -565,6 +567,34 @@ describe("Testing view file service", () => {
         viewService.unsetSelected();
         tick();
         expect(count).toBe(7);
+    }));
+
+    it("should select duplicate display names by file id", fakeAsync(() => {
+        let model = Immutable.Map<string, ModelFile>();
+        model = model.set("[\"movies\",\"dup\"]", new ModelFile({
+            file_id: "[\"movies\",\"dup\"]",
+            name: "dup"
+        }));
+        model = model.set("[\"tv\",\"dup\"]", new ModelFile({
+            file_id: "[\"tv\",\"dup\"]",
+            name: "dup"
+        }));
+
+        mockModelService._files.next(model);
+        tick();
+
+        let viewFileList;
+        viewService.files.subscribe({
+            next: list => viewFileList = list
+        });
+        tick();
+
+        viewService.setSelected(viewFileList.get(1));
+        tick();
+
+        expect(viewFileList.get(0).isSelected).toBe(false);
+        expect(viewFileList.get(1).isSelected).toBe(true);
+        expect(viewFileList.get(1).fileId).toBe("[\"tv\",\"dup\"]");
     }));
 
     it("should should correctly set ViewFile isLocallyDeletable", fakeAsync(() => {
