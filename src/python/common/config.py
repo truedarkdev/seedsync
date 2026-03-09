@@ -271,6 +271,7 @@ class Config(Persist):
                                          Checkers.int_non_negative_max(32),
                                          Converters.int)
         use_temp_file = PROP("use_temp_file", Checkers.null, Converters.bool)
+        rate_limit = PROP("rate_limit", Checkers.null, Converters.null)
 
         def __init__(self):
             super().__init__()
@@ -288,6 +289,7 @@ class Config(Persist):
             self.num_max_connections_per_dir_file = None
             self.num_max_total_connections = None
             self.use_temp_file = None
+            self.rate_limit = None
 
     class Controller(IC):
         interval_ms_remote_scan = PROP("interval_ms_remote_scan", Checkers.int_positive, Converters.int)
