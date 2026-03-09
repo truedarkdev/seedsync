@@ -310,6 +310,7 @@ class TestAutoQueue(unittest.TestCase):
 
         self.controller.get_model_files.side_effect = get_model
         self.controller.get_model_files_and_add_listener.side_effect = get_model_and_capture_listener
+        self.controller.is_file_stopped.return_value = False
 
     def test_matching_new_files_are_queued(self):
         persist = AutoQueuePersist()
@@ -735,6 +736,31 @@ class TestAutoQueue(unittest.TestCase):
         commands = [calls[i][0][0] for i in range(2)]
         self.assertEqual(set([Controller.Command.Action.QUEUE] * 2), {c.action for c in commands})
         self.assertEqual({file_one.file_id, file_two.file_id}, {c.filename for c in commands})
+
+    def test_explicitly_stopped_file_is_not_auto_queued(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        stopped_file = ModelFile("Release", True)
+        stopped_file.remote_size = 100
+        stopped_file.path_pair_id = "tv"
+
+        queued_file = ModelFile("Release", True)
+        queued_file.remote_size = 100
+        queued_file.path_pair_id = "movies"
+
+        self.controller.is_file_stopped.side_effect = lambda file_id: file_id == stopped_file.file_id
+
+        self.model_listener.file_added(stopped_file)
+        self.model_listener.file_added(queued_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual(queued_file.file_id, command.filename)
 
     def test_new_matching_pattern_queues_existing_files(self):
         persist = AutoQueuePersist()

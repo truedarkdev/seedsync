@@ -272,6 +272,9 @@ class Controller:
         self.__model_lock.release()
         return model_files
 
+    def is_file_stopped(self, filename: str) -> bool:
+        return filename in self.__persist.stopped_file_names
+
     def add_model_listener(self, listener: IModelListener):
         """
         Adds a listener to the controller's model
@@ -492,6 +495,7 @@ class Controller:
                         remote_base_dir_path=path_pair.remote_path if path_pair else None,
                         local_base_dir_path=path_pair.local_path if path_pair else None
                     )
+                    self.__persist.stopped_file_names.discard(file.file_id)
                 except LftpError as e:
                     _notify_failure(command, "Lftp error: ".format(str(e)))
                     continue
@@ -513,6 +517,7 @@ class Controller:
                         remote_path=remote_path,
                         local_path=local_path
                     )
+                    self.__persist.stopped_file_names.add(file.file_id)
                 except (LftpError, LftpJobStatusParserError) as e:
                     _notify_failure(command, "Lftp error: ".format(str(e)))
                     continue
@@ -561,6 +566,7 @@ class Controller:
                     )
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
+                    self.__persist.stopped_file_names.add(file.file_id)
 
             elif command.action == Controller.Command.Action.DELETE_REMOTE:
                 if file.state not in (
