@@ -279,6 +279,12 @@ class ModelBuilder:
                         model_file.local_size >= model_file.remote_size:
                     # root is a finished single file
                     model_file.state = ModelFile.State.DOWNLOADED
+                elif not model_file.is_dir and \
+                        model_file.local_size is not None and \
+                        model_file.remote_size is None and \
+                        model_file.name in self.__downloaded_files:
+                    # keep previously-downloaded local-only files recognizable
+                    model_file.state = ModelFile.State.DOWNLOADED
                 elif model_file.is_dir and model_file.remote_size is not None:
                     # root is a directory that also exists remotely
                     # check all the children

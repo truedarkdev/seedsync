@@ -217,6 +217,13 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
 
+        # Downloaded - local only after the remote file disappeared
+        self.model_builder.clear()
+        self.model_builder.set_local_files([SystemFile("a", 100, False)])
+        self.model_builder.set_downloaded_files({"a"})
+        model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
+
         # Downloaded
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])
