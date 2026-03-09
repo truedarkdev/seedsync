@@ -461,7 +461,7 @@ Notes:
 - Pass date: 2026-03-08
 
 Integrated:
-- none
+- adapted the path-pair persistence, legacy-config migration, and `Context` startup plumbing portion of `d143638` as the first Subject 15 implementation batch
 
 Pending:
 - none
@@ -1360,7 +1360,7 @@ Integrated:
 - none
 
 Pending:
-- `d143638` adds the multi-path/path-pair scanning foundation, including path-pair persistence and CRUD, multi-path local/remote scanner aggregation, model plumbing, controller queue/delete path overrides, and settings/API surfaces required to configure the new scan roots
+- the remaining `d143638` work still needs to land in smaller batches for multi-path local/remote scanner aggregation, model plumbing, controller queue/delete path overrides, and the later settings/API surfaces needed to configure new scan roots
 - `1690826` adds `MultiPathActiveScanner` so active download scanning follows the correct path pair instead of always using the first local root
 - `981d707` adds focused unit coverage for `MultiPathActiveScanner`
 - `9d58f10` adds integration coverage for multi-path controller scanning
@@ -1383,37 +1383,37 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, and separated validation-heavy or network-mount work out of this scanning subject
-- status: review only; no new code landed
+- tests run: `python3 -m py_compile src/python/common/path_pair.py src/python/common/context.py src/python/common/__init__.py src/python/seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_seedsync.py`; `docker compose -f src/docker/test/python/compose.yml run --rm tests python - <<'PY' ... PathPairManager migration smoke test ... PY`
+- manual checks: reviewed rapidcopy scanner and path-pair candidates against current master, confirmed the JSON-only remote scan protocol is already present locally, confirmed the legacy pickle fallback was later removed upstream as a security hardening step, separated validation-heavy or network-mount work out of this scanning subject, and smoke-tested `PathPairManager` load plus legacy-config migration in the docker test container
+- status: foundation batch verified except for an existing `tests/unittests/test_seedsync.py::TestSeedsync::test_default_config` failure on `Lftp.rate_limit` default initialization that is outside this batch's file scope
 
 Notes:
 - the main remaining Subject 15 work is the multi-path/path-pair scanning stack; it is broad but coherent and should land in multiple small commits rather than one large import
+- the first implementation batch is the path-pair persistence, migration, and context foundation adapted from `d143638`; later Subject 15 batches will add controller/scanner behavior, active-scan routing, and tests on top
 
 ## Subject 16 - Auto Queue
 
 ### thejuran
 
-- State: reviewed
+- State: not started
 - High-risk: no
-- Integration base: `dc7de7f`
+- Integration base: n/a
 - Source branch: thejuran/master
- - Fork tip seen at pass start: `a8561cd`
- - Reviewed in this pass: `origin/master..a8561cd` for Subject 15 files and related commits
- - Last reviewed upstream commit (inclusive): `a8561cd`
- - Resume from next: next thejuran Subject 15 candidate after `a8561cd`
- - New upstream since last pass: none recorded at pass time
- - Pass date: 2026-03-09
+- Fork tip seen at pass start: n/a
+- Reviewed in this pass: n/a
+- Last reviewed upstream commit (inclusive): n/a
+- Resume from next: n/a
+- New upstream since last pass: n/a
+- Pass date: n/a
 
 Integrated:
-- legacy remote scanfs auto-install from `de7dde0` is already present in current master
-- scanner error-classification hardening from `06dd9fd` is already present in current master
+- none
 
 Pending:
 - none
 
 Covered elsewhere:
-- `108018f` and `abef04a` are already covered by the local Subject 13 JSON migration commits `0c88994` and `5ad98ce`
+- none
 
 Skipped:
 - none
@@ -1423,53 +1423,47 @@ Maintainer decisions:
 
 Verification:
 - tests run: none
-- manual checks: compared thejuran scan transport and scanner-error commits against current `scan_fs.py`, `remote_scanner.py`, and the Subject 13 ledger to confirm the remaining transport work is already accounted for
-- status: review-only; no new verification needed yet
+- manual checks: none
+- status: not verified yet
 
 Notes:
-- no fresh thejuran implementation batch is needed for the opening Subject 15 pass; the remaining substantive scan work is on the rapidcopy side
+- none
 
 ### rapidcopy
 
-- State: in progress
-- High-risk: yes
-- Integration base: `dc7de7f`
+- State: not started
+- High-risk: no
+- Integration base: n/a
 - Source branch: rapidcopy/master
- - Fork tip seen at pass start: `6ce7c19`
- - Reviewed in this pass: `origin/master..6ce7c19` for Subject 15 files and related commits
- - Last reviewed upstream commit (inclusive): `6ce7c19`
- - Resume from next: next rapidcopy Subject 15 candidate after `6ce7c19`
- - New upstream since last pass: none recorded at pass time
- - Pass date: 2026-03-09
+- Fork tip seen at pass start: n/a
+- Reviewed in this pass: n/a
+- Last reviewed upstream commit (inclusive): n/a
+- Resume from next: n/a
+- New upstream since last pass: n/a
+- Pass date: n/a
 
 Integrated:
-- older scanfs path handling from `6f4e2ac` is already present in current master
-- remote scanner error-reporting and recoverable/non-recoverable error handling from `de964a1`, `1bccd13`, `f2d906e`, `20a2ade`, `24e54ff`, and `52b9ebd` are already present in current master or covered by earlier local equivalents
+- none
 
 Pending:
-- `d143638` remains the main Subject 15 feature candidate, but it must be split into smaller batches instead of imported as one mixed commit
-- `1690826` is a follow-up Subject 15 batch for active-scan routing once the multi-path scanner foundation from `d143638` lands
-- `981d707` and `9d58f10` remain the Subject 15 test batches for the multi-path scanner stack after the runtime work lands
+- none
 
 Covered elsewhere:
-- `aeb27fa` is already covered by the local Subject 13 JSON migration commit `0c88994`
+- none
 
 Skipped:
-- `5d5a90a` stays out because this repo deliberately keeps the managed remote scanner transport JSON-only; reintroducing a pickle fallback would weaken the current trust boundary for little practical compatibility value
-- `2614ae6` is classified to later validation/controller work rather than Subject 15 because the current base does not yet carry the rapidcopy checksum-validation module it patches
-- broad security bundles `9e1aeea` and `32acba6` stay out of Subject 15 because they mix web, extraction, mount, and control-plane hardening beyond the scanner-specific scope of this pass
+- none
 
 Maintainer decisions:
 - none
 
 Verification:
 - tests run: none
-- manual checks: compared rapidcopy scan candidates against current `remote_scanner.py`, `scan_fs.py`, and scanner history; confirmed the old pickle fallback is neither needed for the managed install path nor acceptable for this fork's security posture; decomposed the multi-path scan feature into reviewable implementation batches before starting code work
-- status: review complete; implementation pending
+- manual checks: none
+- status: not verified yet
 
 Notes:
-- the remaining real Subject 15 work is the rapidcopy multi-path scanner stack, not the older transport compatibility patches
-- the first planned implementation batch is the backend multi-path domain and scanner foundation adapted from `d143638`, with the settings/API surface held for a later split
+- none
 
 ## Subject 17 - Extraction And Archive Handling
 

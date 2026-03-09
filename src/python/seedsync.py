@@ -16,6 +16,7 @@ import platform
 from common import ServiceExit, Context, Constants, Config, Args, AppError
 from common import ServiceRestart
 from common import Localization, Status, ConfigError, Persist, PersistError
+from common import PathPairManager
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
 from web import WebAppJob, WebAppBuilder
 
@@ -83,12 +84,21 @@ class Seedsync:
         # Create status
         status = Status()
 
+        # Initialize path pairs for later multi-path support.
+        path_pair_manager = PathPairManager(args.config_dir)
+        path_pair_manager.load()
+        if path_pair_manager.migrate_from_config(
+                remote_path=config.lftp.remote_path,
+                local_path=config.lftp.local_path):
+            logger.info("Migrated legacy path config to path pairs")
+
         # Create context
         self.context = Context(logger=logger,
                                web_access_logger=web_access_logger,
                                config=config,
                                args=ctx_args,
-                               status=status)
+                               status=status,
+                               path_pair_manager=path_pair_manager)
 
         # Register the signal handlers
         signal.signal(signal.SIGTERM, self.signal)

@@ -3,9 +3,11 @@
 import logging
 import copy
 import collections
+from typing import Optional
 
 # my libs
 from .config import Config
+from .path_pair import PathPairManager
 from .status import Status
 
 
@@ -39,7 +41,8 @@ class Context:
                  web_access_logger: logging.Logger,
                  config: Config,
                  args: Args,
-                 status: Status):
+                 status: Status,
+                 path_pair_manager: Optional[PathPairManager] = None):
         """
         Primary constructor to construct the top-level context
         """
@@ -49,6 +52,7 @@ class Context:
         self.config = config
         self.args = args
         self.status = status
+        self.path_pair_manager = path_pair_manager
 
     def create_child_context(self, context_name: str) -> "Context":
         child_context = copy.copy(self)
