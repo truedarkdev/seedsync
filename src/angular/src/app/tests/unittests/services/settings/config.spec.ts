@@ -25,7 +25,8 @@ describe("Testing config record initialization", () => {
                 num_max_connections_per_dir_file: 4,
                 num_max_total_connections: 32,
                 use_temp_file: true,
-                rate_limit: "1M"
+                rate_limit: "1M",
+                staging_path: "/some/local/path/incomplete"
             },
             controller: {
                 interval_ms_remote_scan: 30000,
@@ -64,6 +65,7 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.num_max_total_connections).toBe(32);
         expect(config.lftp.use_temp_file).toBe(true);
         expect(config.lftp.rate_limit).toBe("1M");
+        expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
         expect(config.controller.interval_ms_remote_scan).toBe(30000);
         expect(config.controller.interval_ms_local_scan).toBe(10000);
         expect(config.controller.interval_ms_downloading_scan).toBe(1000);

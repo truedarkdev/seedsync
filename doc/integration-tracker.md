@@ -1806,6 +1806,7 @@ Integrated:
 - `07da49b` adapted the configuration and scanner foundation from `6ce7c19` so staging paths are supported in config/defaults and `LocalScanner` can merge staged in-progress files with the final local directory without surfacing the nested `incomplete` directory as a user file
 - `e20cac4` adapted the controller/runtime portion of `6ce7c19` so LFTP downloads and active scans use staging paths, completed downloads move into the final local directory only after completion, and interrupted staged transfers are re-queued safely after the first successful remote scan in both single-path and path-pair modes
 - `f2acdcf` followed up the staged-transfer recovery path so files explicitly stopped by the user are not re-queued on restart, including duplicate visible names across different path pairs
+- local follow-up commit exposes `lftp.staging_path` in the current Angular settings UI and config record so the already integrated staging-path runtime can be configured from the existing settings page, with focused Angular settings tests updated accordingly
 
 Pending:
 - none
@@ -1827,6 +1828,7 @@ Verification:
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_controller.py`
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller_multi_path.py`
   - `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/integration/test_controller/test_controller.py::TestController::test_command_queue_file tests/integration/test_controller/test_controller.py::TestController::test_command_queue_directory tests/integration/test_controller/test_controller.py::TestController::test_persist_downloaded tests/integration/test_controller/test_controller.py::TestController::test_command_extract_after_downloading_remote_file`
+  - `make run-tests-angular`
 - manual checks: inspected `6ce7c19` against the current local controller, scanner, config, and settings layout; kept the staging-path safety core, adapted it to the repo's current path-pair-aware controller API, added the explicit-stop recovery guard required by existing stopped-file persistence semantics, and left rapidcopy's broader validation and control-plane work out of this subject
 - status: verified; the focused config/scanner/delete suite passed with `23 passed`, the focused controller suite passed with `18 passed`, the multi-path integration suite passed with `2 passed`, and the targeted single-path controller integration selection passed with `4 passed`
 

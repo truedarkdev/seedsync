@@ -146,6 +146,12 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
             description: "Limit download speed. Use 0 for unlimited, or values like 1M or 500K.\n" +
                          "(net:limit-rate)"
         },
+        {
+            type: OptionType.Text,
+            label: "Staging Directory",
+            valuePath: ["lftp", "staging_path"],
+            description: "Optional directory for in-progress downloads. Leave empty to use the Local Directory plus /incomplete."
+        },
     ]
 };
 
