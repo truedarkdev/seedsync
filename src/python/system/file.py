@@ -22,6 +22,8 @@ class SystemFile:
         self.__timestamp_created = time_created
         self.__timestamp_modified = time_modified
         self.__children = []
+        self.__path_pair_id = None
+        self.__path_pair_name = None
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -47,6 +49,24 @@ class SystemFile:
     @property
     def children(self) -> List["SystemFile"]: return self.__children
 
+    @property
+    def path_pair_id(self) -> str: return self.__path_pair_id
+
+    @path_pair_id.setter
+    def path_pair_id(self, path_pair_id: str):
+        if path_pair_id is not None and type(path_pair_id) != str:
+            raise TypeError
+        self.__path_pair_id = path_pair_id
+
+    @property
+    def path_pair_name(self) -> str: return self.__path_pair_name
+
+    @path_pair_name.setter
+    def path_pair_name(self, path_pair_name: str):
+        if path_pair_name is not None and type(path_pair_name) != str:
+            raise TypeError
+        self.__path_pair_name = path_pair_name
+
     def add_child(self, file: "SystemFile"):
         if not self.__is_dir:
             raise TypeError("Cannot add children to a file")
@@ -62,6 +82,10 @@ class SystemFile:
             d["time_created"] = self.__timestamp_created.isoformat()
         if self.__timestamp_modified is not None:
             d["time_modified"] = self.__timestamp_modified.isoformat()
+        if self.__path_pair_id is not None:
+            d["path_pair_id"] = self.__path_pair_id
+        if self.__path_pair_name is not None:
+            d["path_pair_name"] = self.__path_pair_name
         if self.__children:
             d["children"] = [child.to_dict() for child in self.__children]
         return d
@@ -81,6 +105,8 @@ class SystemFile:
             time_created=time_created,
             time_modified=time_modified,
         )
+        system_file.path_pair_id = data.get("path_pair_id")
+        system_file.path_pair_name = data.get("path_pair_name")
         for child_data in data.get("children", []):
             system_file.add_child(cls.from_dict(child_data))
         return system_file
