@@ -154,6 +154,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
         }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
 
         command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
         self.controller.queue_command(command)
@@ -175,6 +178,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
         }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
 
         command = Controller.Command(Controller.Command.Action.STOP, file.file_id)
         self.controller.queue_command(command)
@@ -185,7 +191,7 @@ class TestController(unittest.TestCase):
             "dup",
             path_pair_id="movies",
             remote_path="/remote/movies/dup",
-            local_path="/local/movies"
+            local_path="/local/movies/incomplete"
         )
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
@@ -225,6 +231,12 @@ class TestController(unittest.TestCase):
             self.controller._Controller__process_commands()
 
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+
+    def test_build_staging_path_prefers_explicit_single_path_override(self):
+        self.assertEqual(
+            "/custom/staging",
+            self.controller._Controller__build_staging_path("/local", "/custom/staging")
+        )
 
     @patch("controller.controller.shutil.move")
     @patch("controller.controller.os.path.exists", return_value=True)
@@ -282,6 +294,42 @@ class TestController(unittest.TestCase):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
         self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_recover_interrupted_downloads_skips_stopped_file_for_matching_path_pair_only(self):
+        stopped_file_id = ModelFile.build_file_id("dup.mkv", "movies")
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__persist.stopped_file_names = {stopped_file_id}
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies"),
+            "tv": SimpleNamespace(remote_path="/remote/tv", local_path="/local/tv")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete",
+            "tv": "/local/tv/incomplete"
+        }
+
+        remote_files = [
+            SimpleNamespace(name="dup.mkv", path_pair_id="movies"),
+            SimpleNamespace(name="dup.mkv", path_pair_id="tv")
+        ]
+
+        def listdir_side_effect(path):
+            if path == "/local/movies/incomplete":
+                return ["dup.mkv.lftp"]
+            if path == "/local/tv/incomplete":
+                return ["dup.mkv.lftp"]
+            raise AssertionError(path)
+
+        with patch("controller.controller.os.listdir", side_effect=listdir_side_effect), \
+                patch("controller.controller.os.path.isdir", return_value=False):
+            self.controller._Controller__recover_interrupted_downloads(remote_files)
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "dup.mkv",
+            False,
+            remote_base_dir_path="/remote/tv",
+            local_base_dir_path="/local/tv/incomplete"
+        )
 
     def test_recover_interrupted_downloads_queues_path_pair_directory(self):
         self.controller._Controller__persist.downloaded_file_names = set()

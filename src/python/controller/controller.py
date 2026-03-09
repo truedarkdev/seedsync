@@ -359,6 +359,10 @@ class Controller:
         file_id = ModelFile.build_file_id(name, path_pair_id)
         return file_id in self.__persist.downloaded_file_names or name in self.__persist.downloaded_file_names
 
+    def __is_explicitly_stopped(self, name: str, path_pair_id: str = None) -> bool:
+        file_id = ModelFile.build_file_id(name, path_pair_id)
+        return file_id in self.__persist.stopped_file_names or name in self.__persist.stopped_file_names
+
     def __get_staging_path(self, path_pair_id: str = None) -> str:
         if path_pair_id:
             path_pair = self.__get_path_pair(path_pair_id)
@@ -435,7 +439,9 @@ class Controller:
                 else:
                     continue
 
-                if file_name not in remote_names or self.__is_previously_downloaded(file_name, path_pair_id):
+                if file_name not in remote_names or \
+                        self.__is_previously_downloaded(file_name, path_pair_id) or \
+                        self.__is_explicitly_stopped(file_name, path_pair_id):
                     continue
 
                 path_pair = self.__get_path_pair(path_pair_id)
