@@ -1128,7 +1128,7 @@ Notes:
 
 ### thejuran
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: `4d8e22d`
 - Source branch: thejuran/master
@@ -1140,13 +1140,14 @@ Notes:
 - Pass date: 2026-03-09
 
 Integrated:
+- adapted `108018f` in `0c88994` to switch the managed `scan_fs` payload and `SystemFile` transport helpers from pickle to JSON
+- adapted `abef04a` in `5ad98ce` to decode remote scan results from JSON and update the focused remote-scanner tests
 - `bb283e6` is already covered in current master through earlier compatibility updates to config and SSH handling
 - SSH host-key hardening from `e34ba5e` is already covered elsewhere by the current `sshcp.py` and Docker SSH defaults
 - delete-process shell escaping from `492944f` is already covered elsewhere in current master
 
 Pending:
-- adapt `abef04a` into a conservative local batch that migrates the managed remote scan transport from pickle to JSON end-to-end
-- decide verification outcome for the lingering Bottle/WebApp regression context from `a1deb23` after the Subject 13 transport batch lands
+- none
 
 Covered elsewhere:
 - the SSH expect-pattern expansion portion of `a1deb23` is already present in current `src/python/ssh/sshcp.py`
@@ -1159,16 +1160,16 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: compared thejuran Subject 13 candidates against current master and confirmed the remaining protocol gap is the remote scan pickle pipeline
-- status: not verified yet
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_scan/test_remote_scanner.py`
+- manual checks: verified `0c88994` and `5ad98ce` match the intended JSON producer/consumer contract in `SystemFile`, `scan_fs.py`, and `remote_scanner.py`
+- status: focused verification passed
 
 Notes:
-- current `scan_fs.py` still emits pickle, so the Subject 13 transport batch should update both the emitted format and `remote_scanner.py` together rather than taking a parser-only change
+- the managed first-run install path recopies the local `scanfs` artifact when the remote copy differs, so the clean JSON-only migration does not need the rapidcopy pickle fallback in normal operation
 
 ### rapidcopy
 
-- State: in progress
+- State: reviewed
 - High-risk: no
 - Integration base: `4d8e22d`
 - Source branch: rapidcopy/master
@@ -1183,9 +1184,10 @@ Integrated:
 - recoverable/non-recoverable remote scanner handling from `1bccd13`, `f2d906e`, and `52b9ebd` is already covered in current master
 - descriptive SSH errors from `9ed00ca` are already covered in current `sshcp.py`
 - Docker SSH wrapper fixes from `d3acc00`, `eec50ec`, and `33d0dae` are already covered elsewhere in current master
+- the remote scan transport concern is satisfied by the local JSON migration commits `0c88994` and `5ad98ce`
 
 Pending:
-- review whether any rapidcopy-side compatibility help is still needed after the planned clean JSON transport migration for Subject 13
+- none
 
 Covered elsewhere:
 - none beyond the integrated equivalents listed above
@@ -1199,12 +1201,12 @@ Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: compared rapidcopy Subject 13 candidates against current master and against thejuran protocol plan to separate true transport work from later transfers/config and security subjects
-- status: not verified yet
+- tests run: `docker compose -f src/docker/test/python/compose.yml run --rm tests pytest -q tests/unittests/test_controller/test_scan/test_remote_scanner.py`
+- manual checks: confirmed the managed `scanfs` install path keeps the producer and consumer sides aligned, so rapidcopy's fallback is unnecessary for the conservative Subject 13 close-out
+- status: focused verification passed
 
 Notes:
-- rapidcopy's most relevant Subject 13-only input is the legacy pickle fallback idea, but the conservative plan is to prefer a clean managed protocol migration first and revisit fallback only if verification exposes a compatibility gap
+- rapidcopy's most relevant Subject 13-only input was the legacy pickle fallback idea, but verification did not expose a compatibility gap after the managed JSON migration
 
 ## Subject 14 - Transfers And LFTP
 
