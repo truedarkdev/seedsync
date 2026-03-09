@@ -1403,25 +1403,30 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: in progress
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` (`4dc96ac`)
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `a8561cd`
+- Reviewed in this pass: `origin/master..a8561cd` for Subject 16 files and related commits
+- Last reviewed upstream commit (inclusive): `a8561cd`
+- Resume from next: next thejuran Subject 16 candidate after `a8561cd`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
 
 Pending:
-- none
+- adapt the restart/requeue correctness cluster from `3b98bd8` and `a1b467e` so auto-queue does not restart STOPPED partial files on startup or on remote-discovery updates; local adaptation must keep Subject 15 `file_id` / path-pair identity instead of collapsing duplicate visible names
+- adapt the stopped-file tracking slice from `9e290af` and `f5d4d24` so explicit STOP and DELETE_LOCAL actions persistently suppress auto-queue restart until a user re-queues the file; local adaptation should track hidden file identity rather than filename
+- review `2323761` for a narrow listener thread-safety hardening slice after the core restart/stopped-file fixes land
+- review the small UI/service lifecycle cleanup pair `b1b7ec9` and `7631bfb` after the backend behavior work is stable
+- re-check whether `e775d8f` is already satisfied locally by current `file_id`-aware downloaded tracking plus DELETED-state model building, or whether an additional auto-queue guard is still needed
+- re-check whether `b9c0612` still matters locally now that this branch uses an unbounded downloaded set rather than thejuran's bounded LRU tracking
 
 Covered elsewhere:
-- none
+- `88d96a1` appears to overlap with existing handler semantics work already landed in `d0b9195`; re-check only if later autoqueue-specific API tests show a remaining gap
 
 Skipped:
 - none
@@ -1431,24 +1436,24 @@ Maintainer decisions:
 
 Verification:
 - tests run: none
-- manual checks: none
-- status: not verified yet
+- manual checks: reviewed thejuran auto-queue runtime, controller persist, and test candidates against current local Subject 15 `file_id` / path-pair-aware controller state; confirmed the most important gap is restart/requeue correctness rather than handler semantics
+- status: review in progress; implementation not landed yet
 
 Notes:
-- none
+- thejuran carries the substantive Subject 16 runtime fixes in this pass; the first local adaptation needs to be `file_id`-safe because Subject 15 made duplicate visible filenames valid across path pairs while `AutoQueue` still deduplicates by visible name
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: `master` (`4dc96ac`)
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: `6ce7c19`
+- Reviewed in this pass: `origin/master..6ce7c19` for Subject 16 files and related commits
+- Last reviewed upstream commit (inclusive): `6ce7c19`
+- Resume from next: next rapidcopy Subject 16 candidate after `6ce7c19`
+- New upstream since last pass: none recorded
+- Pass date: 2026-03-09
 
 Integrated:
 - none
@@ -1460,18 +1465,22 @@ Covered elsewhere:
 - none
 
 Skipped:
-- none
+- the auto-queue-touched security hardening cluster `9f91d1c`, `32acba6`, `78a3fde`, and `9e1aeea` is tracked primarily under Subject 6 rather than Subject 16
+- the mechanical cleanup cluster `d87f403`, `1131714`, `677be93`, and `94c0172` is not selected for this conservative pass because it is mostly style/type churn without bounded auto-queue behavior value
+- the Angular modernization cluster `93e10ab`, `e0985b2`, and `5e8bf5e` is not selected for this conservative pass because it is framework-era cleanup rather than a narrow auto-queue fix
+- the Playwright additions `5df693d`, `696866c`, `2ed36f2`, and `1700fcc` are verification assets that can be revisited later under test/e2e work, not core Subject 16 behavior blockers
+- `6d2627e` is a small integration-test maintenance follow-up that can be revisited after the main thejuran backend fixes if later handler verification shows a real gap
 
 Maintainer decisions:
 - none
 
 Verification:
 - tests run: none
-- manual checks: none
-- status: not verified yet
+- manual checks: reviewed rapidcopy auto-queue commit surface against the current local backend and found no substantial new runtime semantics beyond the thejuran restart/requeue work; the relevant rapidcopy items in this range are mostly hardening, cleanup, modernization, or secondary verification assets
+- status: review only; no new code landed
 
 Notes:
-- none
+- rapidcopy is low-coverage for core Subject 16 behavior in this pass; the real implementation work is expected to come from thejuran with local adaptation for current `file_id` identity
 
 ## Subject 17 - Extraction And Archive Handling
 
