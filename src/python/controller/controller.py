@@ -6,6 +6,8 @@ from threading import Lock
 from queue import Queue
 from enum import Enum
 import copy
+import os
+import shutil
 
 # my libs
 from .scan import (
@@ -19,7 +21,7 @@ from .scan import (
 )
 from .extract import ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
-from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants
+from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from .controller_persist import ControllerPersist
@@ -108,6 +110,12 @@ class Controller:
         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
+        self.__staging_path = self.__build_staging_path(
+            self.__context.config.lftp.local_path,
+            self.__context.config.lftp.staging_path
+        )
+        self.__path_pair_staging_paths = {}
+
         # Lftp
         self.__lftp = Lftp(address=self.__context.config.lftp.remote_address,
                            port=self.__context.config.lftp.remote_port,
@@ -115,7 +123,7 @@ class Controller:
                            password=self.__password)
         self.__lftp.set_base_logger(self.logger)
         self.__lftp.set_base_remote_dir_path(self.__context.config.lftp.remote_path)
-        self.__lftp.set_base_local_dir_path(self.__context.config.lftp.local_path)
+        self.__lftp.set_base_local_dir_path(self.__staging_path)
         # Configure Lftp
         self.__lftp.num_parallel_jobs = self.__context.config.lftp.num_max_parallel_downloads
         self.__lftp.num_parallel_files = self.__context.config.lftp.num_max_parallel_files_per_download
@@ -133,17 +141,31 @@ class Controller:
             enabled_path_pairs = self.__context.path_pair_manager.get_enabled_pairs()
         self.__path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
         if enabled_path_pairs:
-            self.__lftp.set_path_pairs(enabled_path_pairs)
+            self.__lftp.set_path_pairs([
+                PathPair(
+                    remote_path=pair.remote_path,
+                    local_path=self.__build_staging_path(pair.local_path),
+                    name=pair.name,
+                    id=pair.id,
+                    enabled=pair.enabled,
+                    auto_queue=pair.auto_queue
+                )
+                for pair in enabled_path_pairs
+            ])
 
         # Setup the scanners and scanner processes
         if enabled_path_pairs:
+            for pair in enabled_path_pairs:
+                pair_staging_path = self.__build_staging_path(pair.local_path)
+                self.__path_pair_staging_paths[pair.id] = pair_staging_path
             self.__active_scanner = MultiPathActiveScanner({
-                pair.id: pair.local_path for pair in enabled_path_pairs
+                pair.id: self.__path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
             })
             self.__local_scanner = MultiPathLocalScanner([
                 LocalScanner(
                     local_path=pair.local_path,
                     use_temp_file=self.__context.config.lftp.use_temp_file,
+                    staging_path=self.__path_pair_staging_paths[pair.id],
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
@@ -162,10 +184,11 @@ class Controller:
                 ) for pair in enabled_path_pairs
             ])
         else:
-            self.__active_scanner = ActiveScanner(self.__context.config.lftp.local_path)
+            self.__active_scanner = ActiveScanner(self.__staging_path)
             self.__local_scanner = LocalScanner(
                 local_path=self.__context.config.lftp.local_path,
-                use_temp_file=self.__context.config.lftp.use_temp_file
+                use_temp_file=self.__context.config.lftp.use_temp_file,
+                staging_path=self.__staging_path
             )
             self.__remote_scanner = RemoteScanner(
                 remote_address=self.__context.config.lftp.remote_address,
@@ -214,6 +237,7 @@ class Controller:
 
         # Keep track of active command processes
         self.__active_command_processes = []
+        self.__startup_recovery_done = False
 
         self.__started = False
 
@@ -224,6 +248,9 @@ class Controller:
         :return:
         """
         self.logger.debug("Starting controller")
+        os.makedirs(self.__staging_path, exist_ok=True)
+        for staging_path in self.__path_pair_staging_paths.values():
+            os.makedirs(staging_path, exist_ok=True)
         self.__active_scan_process.start()
         self.__local_scan_process.start()
         self.__remote_scan_process.start()
@@ -324,6 +351,110 @@ class Controller:
             return None
         return getattr(self, "_Controller__path_pairs_by_id", {}).get(path_pair_id)
 
+    @staticmethod
+    def __build_staging_path(local_path: str, staging_path: str = None) -> str:
+        return staging_path or os.path.join(local_path, "incomplete")
+
+    def __is_previously_downloaded(self, name: str, path_pair_id: str = None) -> bool:
+        file_id = ModelFile.build_file_id(name, path_pair_id)
+        return file_id in self.__persist.downloaded_file_names or name in self.__persist.downloaded_file_names
+
+    def __get_staging_path(self, path_pair_id: str = None) -> str:
+        if path_pair_id:
+            path_pair = self.__get_path_pair(path_pair_id)
+            if path_pair is not None:
+                return self.__path_pair_staging_paths.get(path_pair_id, self.__build_staging_path(path_pair.local_path))
+            return self.__path_pair_staging_paths.get(path_pair_id)
+        return self.__staging_path
+
+    def __move_from_staging(self, name: str, path_pair_id: str = None):
+        if path_pair_id:
+            staging_path = self.__get_staging_path(path_pair_id)
+            path_pair = self.__get_path_pair(path_pair_id)
+            final_path = path_pair.local_path if path_pair is not None else None
+        else:
+            staging_path = self.__staging_path
+            final_path = self.__context.config.lftp.local_path
+
+        if not staging_path or not final_path:
+            return
+
+        src = os.path.join(staging_path, name)
+        dst = os.path.join(final_path, name)
+        if not os.path.exists(src):
+            return
+        if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+            return
+
+        try:
+            shutil.move(src, dst)
+            self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
+            self.__local_scan_process.force_scan()
+        except OSError as error:
+            self.logger.warning(
+                "Failed to move '%s' from staging '%s' to '%s': %s",
+                name,
+                staging_path,
+                final_path,
+                error
+            )
+
+    def __recover_interrupted_downloads(self, remote_files):
+        self.__startup_recovery_done = True
+        suffix = Constants.LFTP_TEMP_FILE_SUFFIX
+        remote_names_by_pair = {}
+        for remote_file in remote_files:
+            remote_names_by_pair.setdefault(getattr(remote_file, "path_pair_id", None), set()).add(remote_file.name)
+
+        staging_roots = self.__path_pair_staging_paths or {None: self.__staging_path}
+        for path_pair_id, staging_path in staging_roots.items():
+            try:
+                staging_entries = os.listdir(staging_path)
+            except OSError as error:
+                self.logger.warning("Failed to inspect staging path '%s': %s", staging_path, error)
+                continue
+
+            remote_names = remote_names_by_pair.get(path_pair_id, set())
+            for entry in staging_entries:
+                entry_path = os.path.join(staging_path, entry)
+                if entry.endswith(suffix):
+                    file_name = entry[:-len(suffix)]
+                    is_dir = False
+                elif os.path.isdir(entry_path):
+                    try:
+                        has_temp_children = any(
+                            child.endswith(suffix)
+                            for child in os.listdir(entry_path)
+                        )
+                    except OSError:
+                        continue
+                    if not has_temp_children:
+                        continue
+                    file_name = entry
+                    is_dir = True
+                else:
+                    continue
+
+                if file_name not in remote_names or self.__is_previously_downloaded(file_name, path_pair_id):
+                    continue
+
+                path_pair = self.__get_path_pair(path_pair_id)
+                try:
+                    self.__lftp.queue(
+                        file_name,
+                        is_dir,
+                        remote_base_dir_path=path_pair.remote_path if path_pair is not None else None,
+                        local_base_dir_path=staging_path
+                    )
+                    self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
+                except LftpError as error:
+                    self.logger.warning(
+                        "Failed to recover interrupted download '%s' from '%s': %s",
+                        file_name,
+                        staging_path,
+                        error
+                    )
+
     def __set_active_scanner_files(self, active_files):
         if isinstance(self.__active_scanner, MultiPathActiveScanner):
             self.__active_scanner.set_active_files(active_files)
@@ -416,6 +547,7 @@ class Controller:
                     if downloaded:
                         self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                        self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
 
                 # Prune the extracted files list of any files that were deleted locally
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded
@@ -448,6 +580,8 @@ class Controller:
             self.__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
             self.__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed
             self.__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
+            if not latest_remote_scan.failed and not self.__startup_recovery_done:
+                self.__recover_interrupted_downloads(latest_remote_scan.files)
         if latest_local_scan is not None:
             self.__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
 
@@ -476,7 +610,7 @@ class Controller:
                         file.name,
                         file.is_dir,
                         remote_base_dir_path=path_pair.remote_path if path_pair else None,
-                        local_base_dir_path=path_pair.local_path if path_pair else None
+                        local_base_dir_path=self.__get_staging_path(file.path_pair_id if path_pair else None)
                     )
                     self.__persist.stopped_file_names.discard(file.file_id)
                 except LftpError as e:
@@ -497,7 +631,7 @@ class Controller:
                     local_path = None
                     if path_pair is not None:
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
-                        local_path = path_pair.local_path
+                        local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
                     self.__lftp.kill(
                         file.name,
                         path_pair_id=file.path_pair_id,
