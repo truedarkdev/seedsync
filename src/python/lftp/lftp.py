@@ -129,6 +129,11 @@ class Lftp:
         except pexpect.exceptions.TIMEOUT:
             self.logger.debug("Lftp timeout exception")
             pass
+        except pexpect.exceptions.EOF:
+            self.logger.error("Lftp process died unexpectedly (EOF)")
+            raise LftpError("Lftp process terminated: {}".format(
+                self.__process.before.decode("utf8", "replace").strip()
+            ))
         finally:
             out = self.__process.before.decode('utf8', 'replace')
             out = out.strip()  # remove any CRs
@@ -149,6 +154,9 @@ class Lftp:
             except pexpect.exceptions.TIMEOUT:
                 self.logger.debug("Lftp timeout exception")
                 pass
+            except pexpect.exceptions.EOF:
+                self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
+                raise LftpError("Lftp process terminated during error recovery")
             finally:
                 out = self.__process.before.decode('utf8', 'replace')
                 out = out.strip()  # remove any CRs
