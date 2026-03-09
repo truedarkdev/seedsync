@@ -946,8 +946,33 @@ class TestLftpJobStatusParser(unittest.TestCase):
         bad string uh oh
         """
         parser = LftpJobStatusParser()
-        with self.assertRaises(LftpJobStatusParserError):
-            parser.parse(output)
+        with self.assertLogs("LftpJobStatusParser", level="WARNING") as captured_logs:
+            statuses = parser.parse(output)
+        self.assertTrue(any("skipping bad job output" in message for message in captured_logs.output))
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(LftpJobStatus.State.QUEUED, statuses[0].state)
+        self.assertEqual("rc", statuses[0].name)
+
+    def test_queue_pty_line_wrap_skips_bad_queue_line(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)  -- 4.59 MiB/s\n"
+            "\tsftp://someone:@localhost/home/someone\n"
+            "\tNow executing: [7] mirror -c /remote/a /local/ -- 3.6G/20G (17%) 4.59 MiB/s\n"
+            "\tCommands queued:\n"
+            "\t 1.  mirror -c \"/remote/short\"  \"/local/\"\n"
+            "\t 2.  mirror -c \"/remote/www.UIndejobs -v\n"
+            "x.org    -    Alias S03E14 MULTi 1080p WEB-DL DD5 1 H 264-KiNGS\"  \"/local/\"\n"
+            " [7] mirror -c /remote/a /local/  -- 3.6G/20G (17%) 4.59 MiB/s\n"
+            "\tGetting file list (0) [Receiving data]\n"
+        )
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+        self.assertEqual(2, len(statuses))
+        self.assertEqual(LftpJobStatus.State.QUEUED, statuses[0].state)
+        self.assertEqual("short", statuses[0].name)
+        self.assertEqual(LftpJobStatus.State.RUNNING, statuses[1].state)
+        self.assertEqual("a", statuses[1].name)
 
     def test_jobs_special_char_1(self):
         # Apostrophe/single quote
