@@ -84,6 +84,30 @@ class TestLftpModel(unittest.TestCase):
         self.model.add_file(ModelFile("d", False))
         self.assertEqual({"a", "c", "d"}, self.model.get_file_names())
 
+    def test_get_file_ids(self):
+        self.assertEqual(set(), self.model.get_file_ids())
+        file_a = ModelFile("a", False)
+        self.model.add_file(file_a)
+        self.assertEqual({file_a.file_id}, self.model.get_file_ids())
+
+    def test_duplicate_names_can_coexist_by_file_id(self):
+        file_a_movies = ModelFile("a", False)
+        file_a_movies.path_pair_id = "movies"
+        file_a_tv = ModelFile("a", False)
+        file_a_tv.path_pair_id = "tv"
+        self.model.add_file(file_a_movies)
+        self.model.add_file(file_a_tv)
+
+        self.assertEqual({"a"}, self.model.get_file_names())
+        self.assertEqual(
+            {file_a_movies.file_id, file_a_tv.file_id},
+            self.model.get_file_ids()
+        )
+        self.assertEqual(file_a_movies, self.model.get_file(file_a_movies.file_id))
+        self.assertEqual(file_a_tv, self.model.get_file(file_a_tv.file_id))
+        with self.assertRaises(ModelError):
+            self.model.get_file("a")
+
     def test_add_listener(self):
         listener = DummyModelListener()
         self.model.add_listener(listener)

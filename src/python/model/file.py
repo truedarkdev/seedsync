@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
+import json
 from typing import Optional, List
 import copy
 import os
@@ -227,6 +228,16 @@ class ModelFile:
         if self.__parent:
             return os.path.join(self.__parent.full_path, self.name)
         return self.name
+
+    @staticmethod
+    def build_file_id(full_path: str, path_pair_id: Optional[str]) -> str:
+        if path_pair_id is None:
+            return full_path
+        return json.dumps([path_pair_id, full_path], separators=(",", ":"))
+
+    @property
+    def file_id(self) -> str:
+        return ModelFile.build_file_id(self.full_path, self.path_pair_id)
 
     def add_child(self, child_file: "ModelFile"):
         if not self.is_dir:

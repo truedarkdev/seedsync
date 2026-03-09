@@ -34,24 +34,43 @@ class ModelBuilder:
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("ModelBuilder")
 
+    @staticmethod
+    def __root_file_id(name: str, path_pair_id: Optional[str]) -> str:
+        return ModelFile.build_file_id(name, path_pair_id)
+
+    @staticmethod
+    def __model_file_matches_persisted_name(model_file: ModelFile, persisted_names: Optional[Set[str]]) -> bool:
+        if persisted_names is None:
+            return False
+        return model_file.file_id in persisted_names or model_file.name in persisted_names
+
+    @staticmethod
+    def __apply_path_pair_metadata(model_file: ModelFile, path_pair_id: Optional[str], path_pair_name: Optional[str]):
+        model_file.path_pair_id = path_pair_id
+        model_file.path_pair_name = path_pair_name
+
     def set_active_files(self, active_files: List[SystemFile]):
         # Update the local file state with this latest information
         for file in active_files:
-            self.__local_files[file.name] = file
+            self.__local_files[self.__root_file_id(file.name, file.path_pair_id)] = file
         # Invalidate the cache
         if len(active_files) > 0:
             self.__cached_model = None
 
     def set_local_files(self, local_files: List[SystemFile]):
         prev_local_files = self.__local_files
-        self.__local_files = {file.name: file for file in local_files}
+        self.__local_files = {
+            self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
+        }
         # Invalidate the cache
         if self.__local_files != prev_local_files:
             self.__cached_model = None
 
     def set_remote_files(self, remote_files: List[SystemFile]):
         prev_remote_files = self.__remote_files
-        self.__remote_files = {file.name: file for file in remote_files}
+        self.__remote_files = {
+            self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
+        }
         # Invalidate the cache
         if self.__remote_files != prev_remote_files:
             self.__cached_model = None
@@ -106,13 +125,18 @@ class ModelBuilder:
 
         model = Model()
         model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
-        all_file_names = set().union(self.__local_files.keys(),
-                                     self.__remote_files.keys(),
-                                     self.__lftp_statuses.keys())
-        for name in all_file_names:
-            remote = self.__remote_files.get(name, None)
-            local = self.__local_files.get(name, None)
-            status = self.__lftp_statuses.get(name, None)
+        all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
+        source_names = {file.name for file in self.__local_files.values()}
+        source_names.update(file.name for file in self.__remote_files.values())
+        for status_name in self.__lftp_statuses.keys():
+            if status_name not in source_names:
+                all_file_ids.add(status_name)
+
+        for file_id in all_file_ids:
+            remote = self.__remote_files.get(file_id, None)
+            local = self.__local_files.get(file_id, None)
+            status = self.__lftp_statuses.get(file_id, None)
+            name = remote.name if remote else local.name if local else file_id
 
             if remote is None and local is None and status is None:
                 # this should never happen, but just in case
@@ -179,6 +203,11 @@ class ModelBuilder:
                         _model_file.remote_modified_timestamp = _remote.timestamp_modified
 
             model_file = ModelFile(name, is_dir)
+            path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
+                local.path_pair_id if local else None
+            path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
+                local.path_pair_name if local else None
+            self.__apply_path_pair_metadata(model_file, path_pair_id, path_pair_name)
             # set the file state
             # for now we only set to Queued or Downloading
             # later after all children are built, we can set to Downloaded after performing a check
@@ -216,6 +245,11 @@ class ModelBuilder:
                        (_local_child and _is_dir != _local_child.is_dir):
                         raise ModelError("Mismatch in is_dir between child sources")
                     _child_model_file = ModelFile(_child_name, _is_dir)
+                    self.__apply_path_pair_metadata(
+                        _child_model_file,
+                        _model_file.path_pair_id,
+                        _model_file.path_pair_name
+                    )
 
                     # add it to the parent right away so we can access the full path
                     _model_file.add_child(_child_model_file)
@@ -282,8 +316,7 @@ class ModelBuilder:
                 elif not model_file.is_dir and \
                         model_file.local_size is not None and \
                         model_file.remote_size is None and \
-                        self.__downloaded_files is not None and \
-                        model_file.name in self.__downloaded_files:
+                        self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
                     # keep previously-downloaded local-only files recognizable
                     model_file.state = ModelFile.State.DOWNLOADED
                 elif model_file.is_dir and model_file.remote_size is not None:
@@ -309,8 +342,7 @@ class ModelBuilder:
             # root is Deleted if it does not exist locally, but was downloaded in the past
             if model_file.state == ModelFile.State.DEFAULT and \
                     model_file.local_size is None and \
-                    self.__downloaded_files is not None and \
-                    model_file.name in self.__downloaded_files:
+                    self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
                 model_file.state = ModelFile.State.DELETED
 
             # next we check if root is Extracting
@@ -343,7 +375,8 @@ class ModelBuilder:
             # Note: Default files aren't marked extracted because they can still be queued
             #       for download, and it doesn't make sense to queue after extracting
             #       If a Default file is extracted, it will return back to the Default state
-            if model_file.name in self.__extracted_files and model_file.state == ModelFile.State.DOWNLOADED:
+            if self.__model_file_matches_persisted_name(model_file, self.__extracted_files) and \
+                    model_file.state == ModelFile.State.DOWNLOADED:
                     model_file.state = ModelFile.State.EXTRACTED
 
             model.add_file(model_file)
