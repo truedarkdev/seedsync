@@ -64,6 +64,26 @@
     .text {
         display: flex;
         flex-direction: column;
+        min-width: 0;
+
+        .title {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .path-pair-label {
+            display: inline-block;
+            padding: 1px 6px;
+            border-radius: 999px;
+            background-color: rgba(255, 255, 255, 0.12);
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            color: darkgray;
+            font-size: 75%;
+            line-height: 1.4;
+            word-break: normal;
+        }
 
         .details {
             display: flex;
