@@ -4,6 +4,7 @@ import json
 from abc import ABC, abstractmethod
 from typing import Set, List, Callable, Tuple
 import fnmatch
+from threading import Lock
 
 from common import overrides, Constants, Context, Persist, PersistError, Serializable
 from model import IModelListener, ModelFile
@@ -61,6 +62,7 @@ class AutoQueuePersist(Persist):
     def __init__(self):
         self.__patterns = []
         self.__listeners = []
+        self.__listeners_lock = Lock()
 
     @property
     def patterns(self) -> Set[AutoQueuePattern]:
@@ -73,17 +75,22 @@ class AutoQueuePersist(Persist):
 
         if pattern not in self.__patterns:
             self.__patterns.append(pattern)
-            for listener in self.__listeners:
+            with self.__listeners_lock:
+                listeners = list(self.__listeners)
+            for listener in listeners:
                 listener.pattern_added(pattern)
 
     def remove_pattern(self, pattern: AutoQueuePattern):
         if pattern in self.__patterns:
             self.__patterns.remove(pattern)
-            for listener in self.__listeners:
+            with self.__listeners_lock:
+                listeners = list(self.__listeners)
+            for listener in listeners:
                 listener.pattern_removed(pattern)
 
     def add_listener(self, listener: IAutoQueuePersistListener):
-        self.__listeners.append(listener)
+        with self.__listeners_lock:
+            self.__listeners.append(listener)
 
     @classmethod
     @overrides(Persist)
