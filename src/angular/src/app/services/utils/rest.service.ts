@@ -32,14 +32,9 @@ export class RestService {
                 private _http: HttpClient) {
     }
 
-    /**
-     * Send backend a request and generate a WebReaction response
-     * @param {string} url
-     * @returns {Observable<WebReaction>}
-     */
-    public sendRequest(url: string): Observable<WebReaction> {
+    private createReaction(request: Observable<string>, url: string): Observable<WebReaction> {
         return Observable.create(observer => {
-            this._http.get(url, {responseType: "text"})
+            request
                 .subscribe(
                 data => {
                     this._logger.debug("%s http response: %s", url, data);
@@ -63,25 +58,24 @@ export class RestService {
         // More info: https://blog.thoughtram.io/angular/2016/06/16/cold-vs-hot-observables.html
     }
 
+    /**
+     * Send backend a GET request and generate a WebReaction response
+     * @param {string} url
+     * @returns {Observable<WebReaction>}
+     */
+    public sendRequest(url: string): Observable<WebReaction> {
+        return this.createReaction(this._http.get(url, {responseType: "text"}), url);
+    }
+
+    public post(url: string): Observable<WebReaction> {
+        return this.createReaction(this._http.post(url, null, {responseType: "text"}), url);
+    }
+
+    public delete(url: string): Observable<WebReaction> {
+        return this.createReaction(this._http.delete(url, {responseType: "text"}), url);
+    }
+
     public sendPostRequest(url: string, payload: object): Observable<WebReaction> {
-        return Observable.create(observer => {
-            this._http.post(url, payload, {responseType: "text"})
-                .subscribe(
-                data => {
-                    this._logger.debug("%s http response: %s", url, data);
-                    observer.next(new WebReaction(true, data, null));
-                },
-                (err: HttpErrorResponse) => {
-                    let errorMessage = null;
-                    this._logger.debug("%s error: %O", url, err);
-                    if (err.error instanceof Event) {
-                        errorMessage = err.error.type;
-                    } else {
-                        errorMessage = err.error;
-                    }
-                    observer.next(new WebReaction(false, null, errorMessage));
-                }
-            );
-        }).shareReplay(1);
+        return this.createReaction(this._http.post(url, payload, {responseType: "text"}), url);
     }
 }
