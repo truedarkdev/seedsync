@@ -17,6 +17,7 @@ import {
 } from "./options-list";
 import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
+import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
 
 @Component({
     selector: "app-settings-page",
@@ -49,7 +50,8 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                 private _configService: ConfigService,
                 private _notifService: NotificationService,
                 private _commandService: ServerCommandService,
-                private _modal: Modal) {
+                private _modal: Modal,
+                private _modalAccessibility: ModalAccessibilityService) {
         this._connectedService = _streamServiceRegistry.connectedService;
         this.config = _configService.config;
         this.commandsEnabled = false;
@@ -126,7 +128,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
             .body(Localization.Modal.RESTART_MESSAGE)
             .open();
 
-        dialogRef.then(dRef => {
+        this._modalAccessibility.enhance(dialogRef).then(dRef => {
             dRef.result.then(
                 () => {
                     this._commandService.restart().subscribe({

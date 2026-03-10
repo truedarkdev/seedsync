@@ -10,6 +10,7 @@ import {LoggerService} from "../../services/utils/logger.service";
 import {FileSelectionService} from "../../services/files/file-selection.service";
 import {Localization} from "../../common/localization";
 import {WebReaction} from "../../services/utils/rest.service";
+import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
 
 @Component({
     selector: "app-bulk-actions-bar",
@@ -23,7 +24,8 @@ export class BulkActionsBarComponent {
     constructor(private bulkCommandService: BulkCommandService,
                 private fileSelectionService: FileSelectionService,
                 private logger: LoggerService,
-                private modal: Modal) {}
+                private modal: Modal,
+                private modalAccessibility: ModalAccessibilityService) {}
 
     public clearSelection() {
         this.fileSelectionService.clear();
@@ -125,7 +127,7 @@ export class BulkActionsBarComponent {
             .body(message)
             .open();
 
-        dialogRef.then(dRef => {
+        this.modalAccessibility.enhance(dialogRef).then(dRef => {
             dRef.result.then(
                 () => { callback(); },
                 () => { return; }

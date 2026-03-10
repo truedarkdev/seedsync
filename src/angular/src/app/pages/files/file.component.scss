@@ -253,7 +253,7 @@
     /* NOTE: make sure this is in-sync with "#file-list #header" */
     .content .select    {width: 40px; min-width: 40px;}
     .content .status    {width: 100px; min-width: 100px;}
-    .content .name      {flex-grow: 1;}
+    .content .name      {flex-grow: 1; flex-basis: 0; min-width: 120px;}
     .content .speed     {width: 100px; min-width: 100px;}
     .content .eta       {width: 100px; min-width: 100px;}
     .content .size      {width: 30%; min-width: 30%;}
