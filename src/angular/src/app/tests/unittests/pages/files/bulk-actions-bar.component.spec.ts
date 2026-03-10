@@ -12,6 +12,7 @@ import {LoggerService} from "../../../../services/utils/logger.service";
 import {Observable} from "rxjs/Observable";
 import "rxjs/add/observable/of";
 import {WebReaction} from "../../../../services/utils/rest.service";
+import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
 
 
 class MockDialogBuilder {
@@ -58,6 +59,7 @@ describe("Testing bulk actions bar component", () => {
             ],
             providers: [
                 LoggerService,
+                ModalAccessibilityService,
                 {provide: Modal, useClass: MockModal},
                 {provide: BulkCommandService, useClass: MockBulkCommandService},
                 {provide: FileSelectionService, useClass: MockFileSelectionService}

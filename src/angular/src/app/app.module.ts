@@ -47,6 +47,7 @@ import {VersionCheckService} from "./services/utils/version-check.service";
 import {BulkActionsBarComponent} from "./pages/files/bulk-actions-bar.component";
 import {FileSelectionService} from "./services/files/file-selection.service";
 import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
+import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
 
 @NgModule({
     declarations: [
@@ -90,6 +91,7 @@ import {BulkCommandServiceProvider} from "./services/server/bulk-command.service
         FileSelectionService,
         DomService,
         VersionCheckService,
+        ModalAccessibilityService,
 
         // Stream services
         StreamDispatchService,

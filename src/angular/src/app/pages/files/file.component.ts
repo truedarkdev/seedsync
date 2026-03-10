@@ -8,6 +8,7 @@ import {Modal} from "ngx-modialog/plugins/bootstrap";
 import {ViewFile} from "../../services/files/view-file";
 import {Localization} from "../../common/localization";
 import {ViewFileOptions} from "../../services/files/view-file-options";
+import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
 
 @Component({
     selector: "app-file",
@@ -45,7 +46,8 @@ export class FileComponent implements OnChanges {
     // Indicates an active action on-going
     activeAction: FileAction = null;
 
-    constructor(private modal: Modal) {}
+    constructor(private modal: Modal,
+                private modalAccessibility: ModalAccessibilityService) {}
 
     ngOnChanges(changes: SimpleChanges): void {
         // Check for status changes
@@ -75,7 +77,7 @@ export class FileComponent implements OnChanges {
             .body(message)
             .open();
 
-        dialogRef.then( dRef => {
+        this.modalAccessibility.enhance(dialogRef).then( dRef => {
            dRef.result.then(
                () => { callback(); },
                () => { return; }
