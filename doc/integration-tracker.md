@@ -24,6 +24,7 @@ This file is for moving state. The durable rules live in `AGENTS.md`.
 - Normal pending integration work stays here.
 - Unresolved maintainer questions should also be recorded in `Pending Maintainer Decisions` in `AGENTS.md`.
 - Keep this file summary-level. If a subject gets dense, move detailed notes into `doc/integration-notes/S<subject-number>-<fork>.md` and link to them here.
+- For Subject 21 and future user-facing conflict passes, record each meaningful candidate or conflict with its value classification, faithfulness grade against original SeedSync, scope, gateability, chosen action (`default`, `optional`, `adapt`, or `reject`), and whether maintainer input was needed.
 
 ## Entry Template
 
@@ -66,6 +67,21 @@ Verification:
 Notes:
 - <anything important for resuming later, including cross-subject references>
 ```
+
+For Subject 21 and similar user-facing conflict subjects, add a short evaluation block under `Notes` or in linked subject notes for each meaningful candidate:
+
+```md
+- Candidate: <short name>
+  - Value: <classification>
+  - Faithfulness: <A|B|C|D|F>
+  - Scope: <local|sectional|global>
+  - Gateability: <cleanly isolatable|somewhat messy|not cleanly isolatable>
+  - Action: <default|optional|adapt|reject>
+  - Maintainer input: yes | no
+  - Rationale: <short note>
+```
+
+After individual Subject 21 evaluations, record a brief cumulative default-drift review stating whether the default experience still feels recognizably like original SeedSync and whether any changes were demoted from default to optional or rejected because of drift.
 
 `Resume from next` is the next starting point for review work after the recorded pass. It should normally be the first unreviewed commit after the inclusive `Last reviewed upstream commit`.
 
@@ -1839,52 +1855,89 @@ Notes:
 
 ### thejuran
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master @ 242f1345199ef377100dcbdba167a750e1938c85
 - Source branch: thejuran/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: a8561cdc318460de32de082e3cf33f6b6a0093cb
+- Reviewed in this pass: origin/master..thejuran/master (Subject 21 filtered)
+- Last reviewed upstream commit (inclusive): a8561cdc318460de32de082e3cf33f6b6a0093cb
+- Resume from next: none at current tip
+- New upstream since last pass: none
+- Pass date: 2026-03-10
 
 Integrated:
-- none
+- adapted from `0b26f0ad` and `a48763dd` -> working tree: guard the dashboard filename column against medium-width squeeze without importing thejuran's broader timestamp and terminal-style layout changes
+- adapted from `9365743d`, `31889adf`, and `52b72a6c` -> working tree: add keyboard focus trapping and focus restoration to the existing `ngx-modialog` confirm flow through a local modal accessibility helper instead of importing thejuran's custom modal service
 
 Pending:
 - none
 
 Covered elsewhere:
-- none
+- `821c730b` and `c630cf5c` style status-count affordances are already present locally in the current file-options filter UI
+- current master already carries the light-theme default shell and original SeedSync status iconography, so Subject 21 does not need a compensating re-import from thejuran to preserve identity
 
 Skipped:
-- none
+- `ef728cc2`, `6865ea03`, `29e7d5d0`, `42d75b03`, `0bdeef59`, `b7fdff1a`, `d8570982`, and `12a05c86` are not being taken as defaults because the terminal presentation suite is weakly faithful to original SeedSync and would change the product's visual identity
+- `72699bdf`, `93f1a0f6`, and `b9c232c7` were rejected because the dashboard status-dot, ASCII-progress, and ghost-button restyle is flavor rather than a faithful default improvement
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `make run-tests-angular`
+- manual checks: reviewed the surviving thejuran Subject 21 UI diffs against current master, kept the original SeedSync default shell and status presentation, adapted the medium-width filename readability fix, and adapted focus trap / focus restoration onto the existing confirm modal path
+- status: partially verified; Angular suite passed with `211 tests completed`
 
 Notes:
-- none
+- evaluation details: [S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
+- Candidate: dashboard filename width guard
+  - Value: accessibility / readability / clarity improvement
+  - Faithfulness: A
+  - Scope: local
+  - Gateability: cleanly isolatable
+  - Action: default
+  - Maintainer input: no
+  - Rationale: keeps filenames readable on medium-width dashboards without changing the default SeedSync layout model
+- Candidate: terminal presentation suite
+  - Value: mostly taste / style / flavor
+  - Faithfulness: D
+  - Scope: global
+  - Gateability: somewhat messy
+  - Action: reject for now; defer to future visualization-settings subject
+  - Maintainer input: yes
+  - Rationale: the maintainer wants broader theming and visualization settings later, but only after the default stays clearly SeedSync-faithful; this suite should be revisited as part of a dedicated optional visual-mode project, not Subject 21
+- Candidate: status-dot / ASCII-progress / ghost-button dashboard visuals
+  - Value: mostly taste / style / flavor
+  - Faithfulness: D
+  - Scope: sectional
+  - Gateability: cleanly isolatable
+  - Action: reject
+  - Maintainer input: no
+  - Rationale: replaces original SeedSync dashboard styling with fork personality rather than faithful refinement
+- Candidate: confirm modal accessibility hardening
+  - Value: correctness / bug fix
+  - Faithfulness: B
+  - Scope: sectional
+  - Gateability: somewhat messy
+  - Action: adapt
+  - Maintainer input: no
+  - Rationale: Subject 21 keeps the current modal stack and adapts only the missing focus trap and focus restoration behavior
+- deferred future work: see [S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md) for the planned follow-up on global theming and visualization settings after the faithful default baseline is complete
 
 ### rapidcopy
 
-- State: not started
+- State: reviewed
 - High-risk: no
-- Integration base: n/a
+- Integration base: master @ 242f1345199ef377100dcbdba167a750e1938c85
 - Source branch: rapidcopy/master
-- Fork tip seen at pass start: n/a
-- Reviewed in this pass: n/a
-- Last reviewed upstream commit (inclusive): n/a
-- Resume from next: n/a
-- New upstream since last pass: n/a
-- Pass date: n/a
+- Fork tip seen at pass start: c300b72f808772b00cc977ccceaa23f3c373ce33
+- Reviewed in this pass: origin/master..rapidcopy/master (Subject 21 filtered)
+- Last reviewed upstream commit (inclusive): c300b72f808772b00cc977ccceaa23f3c373ce33
+- Resume from next: none at current tip
+- New upstream since last pass: none
+- Pass date: 2026-03-10
 
 Integrated:
 - none
@@ -1893,18 +1946,51 @@ Pending:
 - none
 
 Covered elsewhere:
-- none
+- `ee0718ab`, `f1fc34ca`, `ea4ae40f`, `821c730b`, and `c630cf5c` are already present locally through the current dashboard pagination, sorting, bulk-selection, and status-count work
+- `d4e4b7e0` is already covered in the current logs page by the existing live-record cap; the remaining rapidcopy behavior assumes a log search/filter model that current master does not carry
+- `d1436386`, `0b49f975`, `fc571139`, `936ae4b2`, and `9f91d1c4` belong to their primary feature or backend subjects rather than Subject 21
 
 Skipped:
-- none
+- `08d714e6` and `6d59994d` were rejected because RapidCopy branding would replace SeedSync identity rather than preserving it as the default
+- rapidcopy's theme toggle and dark-mode surface are not being taken as defaults because they create a new global settings model and change product presentation precedent
 
 Maintainer decisions:
 - none
 
 Verification:
-- tests run: none
-- manual checks: none
-- status: not verified yet
+- tests run:
+  - `make run-tests-angular`
+- manual checks: reviewed the surviving rapidcopy Subject 21 UX deltas against current master, confirmed the dashboard pagination/sorting/bulk-selection/status-count work is already present locally, and isolated the remaining global theme system as a separate product-direction choice
+- status: partially verified; Angular suite passed with `211 tests completed`
 
 Notes:
-- none
+- evaluation details: [S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
+- Candidate: theme toggle and light/dark theme system
+  - Value: useful enhancement
+  - Faithfulness: C
+  - Scope: global
+  - Gateability: cleanly isolatable
+  - Action: reject for now; defer to future visualization-settings subject
+  - Maintainer input: yes
+  - Rationale: the maintainer wants a theme-selection mechanism later, but only after the faithful SeedSync default is firmly in place; rapidcopy's theme system should be revisited as part of that later coherent settings project
+- Candidate: dashboard pagination, sorting, bulk selection, and status counts
+  - Value: useful enhancement
+  - Faithfulness: A
+  - Scope: sectional
+  - Gateability: cleanly isolatable
+  - Action: covered elsewhere
+  - Maintainer input: no
+  - Rationale: these dashboard workflow improvements are already present locally
+- Candidate: rebrand assets and RapidCopy naming
+  - Value: mostly taste / style / flavor
+  - Faithfulness: F
+  - Scope: global
+  - Gateability: cleanly isolatable
+  - Action: reject
+  - Maintainer input: no
+  - Rationale: replacing SeedSync branding is outside this fork's product direction
+
+Cumulative default-drift review:
+- current defaults still feel recognizably like SeedSync
+- no previously landed default changes were demoted in this pass
+- future theme and visualization work is intentionally deferred until after the faithful default baseline; see [S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
