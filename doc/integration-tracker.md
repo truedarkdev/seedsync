@@ -102,16 +102,29 @@ Audit workflow:
 - process commits oldest to newest
 - keep a per-commit disposition even when several commits later map to one follow-up task
 - do not implement missed work during the audit by default; convert it into a specific follow-up integration task or explicit subject reopen
+- after each audit run, update the workflow prompt/templates if the run exposed a repeatable lesson or failure mode; record durable prompt-shape learnings in the tracked audit docs before continuing
+- after each audit run, explicitly evaluate whether `explorer-fast` showed good judgment on that commit or cluster of commits; note whether it was appropriately calibrated, over-escalating to `reviewer`, under-escalating obvious risks, or misclassifying likely dispositions
+- once an autonomous audit wave has started, do not pause at a tidy checkpoint or mini-summary just because a batch finished; continue through the planned wave until it is complete or a real reviewer-worthy or maintainer-worthy exception appears
+- batch boundary rule: finish the current planned batch autonomously, then stop and produce a full batch report before starting the next batch
+- the batch report should include: commits processed, disposition summary, reviewer count, any maintainer-relevant exceptions, and whether workflow/prompt improvements are needed
+- after each finished batch, wait for explicit maintainer confirmation of the next batch and its size before continuing
+- persist the last maintainer-approved audit batch size in the audit ledger and inherit that same size on the next resume unless the maintainer explicitly changes it
 - when committing audit-only ledger or tracker state, use an `audit` label such as `docs(audit): ...` instead of reusing a completed `subjectNN` label
 
 Per-commit subagent workflow:
 - first use `explorer-fast` triage for each commit, or `explorer` if `explorer-fast` is unavailable
 - require triage output to include: likely subject, triage outcome, confidence, evidence type, and whether `reviewer` is needed
+- when the evidence type is `direct local match`, require the explorer to cite the matching local commit hash explicitly in the rationale instead of only referring to nearby parity or surrounding work
+- for docs-only commits that are not backed by an exact local commit match, require the agent to cite the exact current local command, sentence, or section that covers the upstream intent; if it cannot do that concretely, escalate to `reviewer`
 - confidence values: `high`, `medium`, `low`
 - evidence types: `direct local match`, `tracker match`, `behavioral inference`, `unclear`
+- the orchestrator should judge the triage quality, not just consume it; compare the explorer result against local evidence and any later reviewer outcome, and tighten or relax the prompt if the explorer is drifting toward blanket escalation or unwarranted confidence
+- when repeated `explorer-fast` runs on a low-risk audit stretch keep producing high-confidence `direct local match` results with explicit local commit hashes and those matches hold up under spot checks, the orchestrator may switch to light-touch confirmation instead of re-deriving every match manually
+- when the maintainer asks for a low-context audit mode, the orchestrator should depend more on subagent evidence, do less manual reconstruction, and escalate suspicious or weakly supported cases to `reviewer` instead of investigating them deeply by hand
 - the orchestrator may close a commit directly only when the triage outcome is `already integrated likely`, `covered elsewhere likely`, or `likely intentional skip`, confidence is `high`, and the evidence is concrete
 - otherwise escalate that single commit to `reviewer`
 - `reviewer` checks whether the commit is truly already covered, only partially covered, intentionally skipped, or should become a follow-up task
+- keep reviewer prompts narrower than explorer prompts: give the reviewer one upstream commit, the triage result, the concrete local evidence already found, and a small fixed output schema instead of asking it to rediscover broad repo context from scratch
 - for `covered elsewhere` closures, require `reviewer` whenever the evidence is only `behavioral inference` or the mapped integration subject is high-risk
 
 Fork-audit completion rule:
