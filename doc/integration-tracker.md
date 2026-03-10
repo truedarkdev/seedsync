@@ -87,6 +87,53 @@ After individual Subject 21 evaluations, record a brief cumulative default-drift
 
 `New upstream since last pass` should normally stay `n/a` or `none` until a later refresh pass happens after fetching remotes.
 
+## Post-Integration Audit Ledger
+
+The post-integration audit uses a separate tracked ledger from the normal subject sections above.
+
+Audit document roles:
+- `AGENTS.md` is the canonical rulebook for the audit workflow, escalation thresholds, reviewer gates, row schema expectations, and exit criteria
+- `doc/post-integration-audit.md` is the active per-commit audit ledger
+- `doc/integration-tracker.md` records reopened subjects, resulting local integration work, and summary state after the audit finds a real gap
+
+Audit workflow:
+- work one fork at a time
+- inventory every fork-local upstream commit into the audit ledger before making dispositions
+- process commits oldest to newest
+- keep a per-commit disposition even when several commits later map to one follow-up task
+- do not implement missed work during the audit by default; convert it into a specific follow-up integration task or explicit subject reopen
+- when committing audit-only ledger or tracker state, use an `audit` label such as `docs(audit): ...` instead of reusing a completed `subjectNN` label
+
+Per-commit subagent workflow:
+- first use `explorer-fast` triage for each commit, or `explorer` if `explorer-fast` is unavailable
+- require triage output to include: likely subject, triage outcome, confidence, evidence type, and whether `reviewer` is needed
+- confidence values: `high`, `medium`, `low`
+- evidence types: `direct local match`, `tracker match`, `behavioral inference`, `unclear`
+- the orchestrator may close a commit directly only when the triage outcome is `already integrated likely`, `covered elsewhere likely`, or `likely intentional skip`, confidence is `high`, and the evidence is concrete
+- otherwise escalate that single commit to `reviewer`
+- `reviewer` checks whether the commit is truly already covered, only partially covered, intentionally skipped, or should become a follow-up task
+- for `covered elsewhere` closures, require `reviewer` whenever the evidence is only `behavioral inference` or the mapped integration subject is high-risk
+
+Fork-audit completion rule:
+- do not mark a fork audit `reviewed` until every commit in the recorded audit range exists in the ledger, every row has a final disposition, every unresolved row links to follow-up work, any row marked `partial` explains what is already present and what follow-up remains, and a short delta check confirms whether new upstream commits appeared after the recorded fork tip at audit start
+
+Recommended audit ledger fields:
+
+```md
+## <fork-name>
+
+- Audit base: <local branch @ commit>
+- Source branch: <fork branch>
+- Fork tip at audit start: <commit>
+- Inventory status: complete | partial
+- Audit state: not started | in progress | reviewed
+- Pass date: <YYYY-MM-DD>
+
+| Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| <hash> | <upstream subject> | <subject / milestone / unknown> | <already integrated likely / covered elsewhere likely / likely intentional skip / possible gap / unclear> | <high / medium / low> | <direct local match / tracker match / behavioral inference / unclear> | <yes / no> | <full / partial / none> | <already integrated / covered elsewhere / intentionally skipped / needs subject reopen / needs new integration task / maintainer decision needed> | <note or task link> |
+```
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
