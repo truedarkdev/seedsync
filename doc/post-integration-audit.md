@@ -23,6 +23,7 @@ Recommended process:
 8. after each audit run, note whether `explorer-fast` showed good judgment on the commit being reviewed, including whether it over-escalated, under-escalated, or misclassified the likely disposition
 9. if working inside a planned autonomous audit wave, do not stop at a natural checkpoint just to summarize progress; keep going until the wave is finished or a real reviewer/maintainer exception interrupts it
 10. when the planned batch is finished, stop there: summarize the full batch result, count how many reviewers were spawned, note any workflow improvements, and wait for maintainer confirmation of the next batch and its size before continuing
+11. record the maintainer-approved batch size in this ledger and treat it as sticky for later audit runs until the maintainer explicitly changes it; do not silently fall back to a smaller or ad hoc batch size on resume
 
 Reviewer gate:
 - use `explorer-fast` or `explorer` for first-pass triage
@@ -58,6 +59,7 @@ Fork tip at audit start: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
 Inventory status: `complete`
 Audit state: `in progress`
 Pass date: `2026-03-10`
+Maintainer-approved batch size: `27`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
