@@ -101,9 +101,11 @@ Audit document roles:
 Audit workflow:
 - work one fork at a time
 - while `rapidcopy` still has unfinished audit rows, resume `rapidcopy` first and do not switch to `thejuran` or another fork unless the maintainer explicitly changes the order
+- once a maintainer-approved audit batch has started, do not stop before the full batch is complete unless a real reviewer-worthy or maintainer-worthy exception blocks progress
 - inventory every fork-local upstream commit into the audit ledger before making dispositions
 - process commits oldest to newest
 - within the active fork, process first-pass triage in groups of the 3 oldest remaining commits, then continue with the next 3 oldest remaining commits until the batch is complete
+- after every 9 completed commits in a batch, treat that as a continue-check only: update your mental remaining count and keep going immediately unless the batch is actually complete
 - keep a per-commit disposition even when several commits later map to one follow-up task
 - do not implement missed work during the audit by default; convert it into a specific follow-up integration task or explicit subject reopen
 - after each audit run, update the workflow prompt/templates if the run exposed a repeatable lesson or failure mode; record durable prompt-shape learnings in the tracked audit docs before continuing
