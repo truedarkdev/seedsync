@@ -93,13 +93,17 @@ The post-integration audit uses a separate tracked ledger from the normal subjec
 
 Audit document roles:
 - `AGENTS.md` is the canonical rulebook for the audit workflow, escalation thresholds, reviewer gates, row schema expectations, and exit criteria
-- `doc/post-integration-audit.md` is the active per-commit audit ledger
+- `doc/post-integration-audit-rules.md` holds the audit workflow and rulebook
+- `doc/post-integration-audit-active.md` is the active per-commit audit ledger for unfinished rows
+- `doc/post-integration-audit.md` is the audit landing page and archive index
 - `doc/integration-tracker.md` records reopened subjects, resulting local integration work, and summary state after the audit finds a real gap
 
 Audit workflow:
 - work one fork at a time
+- while `rapidcopy` still has unfinished audit rows, resume `rapidcopy` first and do not switch to `thejuran` or another fork unless the maintainer explicitly changes the order
 - inventory every fork-local upstream commit into the audit ledger before making dispositions
 - process commits oldest to newest
+- within the active fork, process first-pass triage in groups of the 3 oldest remaining commits, then continue with the next 3 oldest remaining commits until the batch is complete
 - keep a per-commit disposition even when several commits later map to one follow-up task
 - do not implement missed work during the audit by default; convert it into a specific follow-up integration task or explicit subject reopen
 - after each audit run, update the workflow prompt/templates if the run exposed a repeatable lesson or failure mode; record durable prompt-shape learnings in the tracked audit docs before continuing
@@ -113,6 +117,7 @@ Audit workflow:
 
 Per-commit subagent workflow:
 - first use `explorer-fast` triage for each commit, or `explorer` if `explorer-fast` is unavailable
+- submit first-pass triage work oldest-first, with at most the 3 oldest remaining commits in flight at once unless the maintainer explicitly changes that limit
 - require triage output to include: likely subject, triage outcome, confidence, evidence type, and whether `reviewer` is needed
 - when the evidence type is `direct local match`, require the explorer to cite the matching local commit hash explicitly in the rationale instead of only referring to nearby parity or surrounding work
 - for docs-only commits that are not backed by an exact local commit match, require the agent to cite the exact current local command, sentence, or section that covers the upstream intent; if it cannot do that concretely, escalate to `reviewer`
