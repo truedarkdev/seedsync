@@ -81,7 +81,21 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
         this._destroy$.complete();
     }
 
+    public isPatternEditingEnabled(): boolean {
+        return this.connected && this.enabled && this.patternsOnly;
+    }
+
+    public canAddPattern(): boolean {
+        return this.isPatternEditingEnabled() &&
+            this.newPattern != null &&
+            this.newPattern.trim().length > 0;
+    }
+
     onAddPattern() {
+        if (!this.canAddPattern()) {
+            return;
+        }
+
         this._autoqueueService.add(this.newPattern).subscribe({
             next: reaction => {
                 if (reaction.success) {
@@ -101,6 +115,10 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
     }
 
     onRemovePattern(pattern: AutoQueuePattern) {
+        if (!this.isPatternEditingEnabled() || pattern == null) {
+            return;
+        }
+
         this._autoqueueService.remove(pattern.pattern).subscribe({
             next: reaction => {
                 if (reaction.success) {

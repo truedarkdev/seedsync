@@ -8,7 +8,7 @@
     }
 
     #controls {
-        &[disabled] {
+        &.disabled {
             opacity: .65;
         }
 
@@ -57,7 +57,7 @@
                     background-color: darkred;
                 }
 
-                &[disabled] {
+                &.disabled {
                     opacity: .65;
                     background-color: red;
                 }
@@ -73,7 +73,7 @@
                     background-color: darkgreen;
                 }
 
-                &[disabled] {
+                &.disabled {
                     opacity: .65;
                     background-color: green;
                 }

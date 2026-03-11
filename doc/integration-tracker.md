@@ -1382,6 +1382,7 @@ Notes:
 - the conservative sortable-header slice, lifecycle guard, local-only state fix, and pagination controls are now committed in separate provenance-preserving batches
 - rapidcopy-specific follow-up beyond this conservative close-out is optional file-row polish rather than required Subject 12 functionality
 - the `2026-03-11` audit reopen for the files-page dropdown migration lane and selected-actions visibility pair is now resolved by the local follow-up batch that added close-on-scroll dropdown handling, conservative menu anchoring refinements, and an internal file-list viewport that keeps the bulk-actions bar visible without touching the dirtier page shell files
+- the subsequent post-audit hardening tail from rapidcopy `15aee39` is now resolved by a local follow-up batch that added files-row action guard checks plus AutoQueue disabled-state enforcement in the UI layer without touching the dirtier files page shell
 
 ## Subject 13 - SSH And Remote Command Handling
 
@@ -1743,6 +1744,7 @@ Verification:
 
 Notes:
 - rapidcopy is low-coverage for core Subject 16 behavior in this pass; the real implementation work is expected to come from thejuran with local adaptation for current `file_id` identity
+- post-audit follow-up `PB-024` is complete as of `2026-03-11`: the remaining rapidcopy disabled-state hardening from `15aee39` now lands in a local Angular UI batch that guards AutoQueue add/remove/Enter flows when patterns are disabled and adds defense-in-depth guard checks for single-file actions
 
 ## Subject 17 - Extraction And Archive Handling
 
