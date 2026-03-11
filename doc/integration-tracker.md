@@ -239,6 +239,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, `14`, `19`, and `18`, dominated by the deferred Angular replatforming chain plus the still-open ARM/stage-deb verification path
 - Workflow learnings: when a long upgrade ladder is already clearly outside the current legacy stack, keep each row tied to the same modernization workstream instead of inventing new per-commit rationales; for large “review-previous-context” merge commits, anchor the row to the still-missing file clusters and call out the already-covered slices explicitly so the reopen count does not imply zero uptake
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `ef7765619d5dd13a9c8e73149d51a51b6f366e02` through `e289470c37e8241676ba2271dbb8b2d61e2102e3`
+- Disposition summary: `1` already integrated, `1` covered elsewhere, `15` intentionally skipped, `10` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `2`
+- Reopened subjects: Subjects `2`, `3`, `11`, `12`, `14`, `18`, and `19`, centered on concrete memory-hygiene fixes, OpenSSH 9.x test compatibility, and a few still-missing backend/tooling hardening slices hiding inside a mostly planning-heavy run
+- Workflow learnings: when a batch mixes real fixes with many modernization and publication plan commits, classify the planning documents as intentional skips early so the actual reopen work stays legible; when one upstream session commit bundles an already-adapted fix with separate missing hardening work, record it as partial reopen rather than double-counting the already-landed slice
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
