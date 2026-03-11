@@ -702,12 +702,12 @@ Source branch: `rapidcopy/master`
 Fork tip at audit start: `c300b72f808772b00cc977ccceaa23f3c373ce33`
 Inventory status: `complete`
 Audit state: `in progress`
-Pass date: `2026-03-10`
+Pass date: `2026-03-11`
 Audit order note: `Resume rapidcopy first until all rapidcopy rows are closed; then move to the next fork unless the maintainer changes the order.`
 Parallel triage note: `Within each batch, process the 3 oldest remaining rapidcopy commits in parallel, then continue with the next 3 oldest remaining commits.`
 Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. 9 completed commits is only a continue-check reminder, not a stopping point.`
 
-Open rows in this file: `180 / 224 remaining`
+Open rows in this file: `153 / 224 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -738,33 +738,6 @@ Open rows in this file: `180 / 224 remaining`
 | `5c33ac27a932e6604ad714bb8f0c0704bbb15405` | Updated dev readme | Subject 1 - Documentation And Maintainer Notes | already integrated likely | high | direct local match | no | full | already integrated | Exact local match exists in `b4bf9e65`; current `doc/DeveloperReadme.md` still carries the same reordered release checklist with `Deploy documentation to github` inserted before the build/test/upload steps. |
 | `b8d0536f58f5e9e57a011689b538603546367343` | docs: added requirements blurb | Subject 1 - Documentation And Maintainer Notes | already integrated likely | high | direct local match | no | full | already integrated | Exact local match exists in `33f4e4f4`; current `src/python/docs/install.md` still contains the same requirements preface and remote-server requirements bullets at the top of the install page. |
 | `e4ea3f4afeb4333ef3464d09858ad6def3ea6ad9` | Py: Adds poetry config | Subject 3 - Dependencies And Build Tooling | covered elsewhere likely | high | tracker match | no | full | covered elsewhere | The repo already uses Poetry through the newer `src/python/pyproject.toml` and `src/python/poetry.lock`, but with later Subject 3 adaptation for the current Python 3.8 baseline (`package-mode = false`, refreshed lock, and tooling alignment in `d7954f9`) rather than this early bootstrap file verbatim. |
-| `29352de21a10cfe3395ab14a5cfb8ff3cc645745` | Py: improves lftp test error reporting | unknown | unprocessed | — | — | — | — | — | — |
-| `24e54ffa86b570151996cafebe61cd05691a9403` | Py: sanitizes non-utf8 chars at scan boundaries | unknown | unprocessed | — | — | — | — | — | — |
-| `6d2627e9eb2e3ee1e46aafa111a2bd70c7bc8acd` | Py: minor fixes to web handler tests | unknown | unprocessed | — | — | — | — | — | — |
-| `b1d5782ca457c98bbabae45c8787e2ae556bf8b9` | Docs: switches pipenv -> poetry | unknown | unprocessed | — | — | — | — | — | — |
-| `1513a919a4e9c1fd7dd123618a727a72f542c41e` | Py: switches from green -> pytest | unknown | unprocessed | — | — | — | — | — | — |
-| `37aa0a34d92e7cd49eebfae8b416152d2f29419b` | Py: removes pipenv files | unknown | unprocessed | — | — | — | — | — | — |
-| `d37afa736e04b622e39aeadcae6b40189dc1d47e` | Updated build system to use poetry | unknown | unprocessed | — | — | — | — | — | — |
-| `9b2945f78cdadd52efa915762fa293cae359aaf2` | Adds sample Github Actions workflow | unknown | unprocessed | — | — | — | — | — | — |
-| `a5266554c33d23c4ea20bf47b74b76c6ed6bbd8a` | Make: consolidates env vars names to be consistent | unknown | unprocessed | — | — | — | — | — | — |
-| `af628be2f43ed1a5fd6e8d8842d043e0da4c8267` | Make: Further consolidates REGISTRY env var | unknown | unprocessed | — | — | — | — | — | — |
-| `a3b71cbdd399660fd6a47ae49071a5cb3e50ddf0` | Make: makes staging registry configurable | unknown | unprocessed | — | — | — | — | — | — |
-| `0173ef2cdba30616bdae67c6c9de011f708c6a87` | Make: makes version configurable during build | unknown | unprocessed | — | — | — | — | — | — |
-| `c6f04193cd731f042499316d74768b22c1b2c496` | Adds buildx driver opts for all GA jobs | unknown | unprocessed | — | — | — | — | — | — |
-| `cbda9b40e5a1a6df89378686986d9fb1d2a57675` | Fixes staging registry var in staging compose | unknown | unprocessed | — | — | — | — | — | — |
-| `c70d948ea696a5018101be14999e353255afa48c` | GA: adds full workflow for master branch | unknown | unprocessed | — | — | — | — | — | — |
-| `3ab429dde46f9f8b5f2622be970e5035a8671e8f` | Make: Adds build cache for final docker image | unknown | unprocessed | — | — | — | — | — | — |
-| `dba0deaa2a64fbad3bacda6264a161fd73cd58bd` | Make: enables caching for intermediate images | unknown | unprocessed | — | — | — | — | — | — |
-| `bd6b9c4f58656e99f59dfa60129e0794f7ace8e4` | GA: Adds deb and docker image release jobs | unknown | unprocessed | — | — | — | — | — | — |
-| `bb1fad869eba72cc8b797e5a5a31ea8a6233148d` | Make: Renames SEEDSYNC_VERSION -> STAGING_VERSION | unknown | unprocessed | — | — | — | — | — | — |
-| `032ec606b8ce8706430690155825842fccc6dc96` | Make: Separates staging and release versions | unknown | unprocessed | — | — | — | — | — | — |
-| `ccda64ce7bcc5225bdc5fe08c205ae411bbf8283` | Reduce docker image size by half by via slim | unknown | unprocessed | — | — | — | — | — | — |
-| `7206940bf8ef72e5e1ecd6be7edb175254cf6419` | Removes travis config | unknown | unprocessed | — | — | — | — | — | — |
-| `f097e93bb746b31e1e5f1bdc2493ca0307749ce9` | Removes unrar from release, adds rar to unittests | unknown | unprocessed | — | — | — | — | — | — |
-| `cf67f504c978c10e8a4e477b7c065a39ac0d5bd9` | Updates DevReadme with new release instructions | unknown | unprocessed | — | — | — | — | — | — |
-| `e1a156db02acdaf17895452815bfb95d023279e1` | Changelist for Release v0.8.5 | unknown | unprocessed | — | — | — | — | — | — |
-| `40165b0355a3b1d2ba9689ffcba75770bf0fc7f5` | Fixes broken rar extraction. | unknown | unprocessed | — | — | — | — | — | — |
-| `302a447b5e4f1cea288686dd5507ba2a18a66c1b` | Changelist for Release v0.8.6 | unknown | unprocessed | — | — | — | — | — | — |
 | `ba93749b4a5cf0a7a6d97fc059765a9759f19c18` | Update README.md | unknown | unprocessed | — | — | — | — | — | — |
 | `ce8d4e973bfda1bee5084531aca19f9894edc584` | Add comprehensive codebase analysis by Claude Sonnet 3.5 | unknown | unprocessed | — | — | — | — | — | — |
 | `3178f754906060804f5bcad1a708db6877c20820` | Add comprehensive codebase analysis by Claude 4 | unknown | unprocessed | — | — | — | — | — | — |
