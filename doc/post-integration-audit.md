@@ -13,7 +13,7 @@ Open archive files only when you need completed audit history or proof for alrea
 | Fork | Total rows | Unfinished | Finished archived | Frozen tip at audit start | Active file |
 | --- | --- | --- | --- | --- | --- |
 | `thejuran` | `672` | `672` | `0` | `a8561cdc318460de32de082e3cf33f6b6a0093cb` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
-| `rapidcopy` | `224` | `72` | `71` | `c300b72f808772b00cc977ccceaa23f3c373ce33` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
+| `rapidcopy` | `224` | `72` | `152` | `c300b72f808772b00cc977ccceaa23f3c373ce33` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
 
 ## Archive Files
 
@@ -21,6 +21,8 @@ Open archive files only when you need completed audit history or proof for alrea
 | --- | --- | --- | --- |
 | `rapidcopy` | `001` | `44` | [post-integration-audit-archive/rapidcopy-001.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/rapidcopy-001.md) |
 | `rapidcopy` | `002` | `27` | [post-integration-audit-archive/rapidcopy-002.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/rapidcopy-002.md) |
+| `rapidcopy` | `003` | `50` | [post-integration-audit-archive/rapidcopy-003.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/rapidcopy-003.md) |
+| `rapidcopy` | `004` | `31` | [post-integration-audit-archive/rapidcopy-004.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/rapidcopy-004.md) |
 
 ## Structure Rules
 
