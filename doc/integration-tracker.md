@@ -157,6 +157,11 @@ Recommended audit ledger fields:
 
 ## Post-Integration Audit Follow-Up Summary
 
+Post-audit consolidation task:
+- after the full post-integration audit closes, build a deduplicated reopen matrix before implementation work begins
+- group reopen rows by workstream, owning subject, affected files, and shared upstream commit cluster
+- use that matrix to drive implementation ordering and to map each finished follow-up back to every audit row it closes
+
 - Pass date: `2026-03-11`
 - Active fork: `rapidcopy`
 - Batch size completed this pass: `15`
