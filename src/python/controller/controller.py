@@ -403,6 +403,21 @@ class Controller:
                 error
             )
 
+    def __get_delete_local_path(self, file: ModelFile) -> str:
+        path_pair = self.__get_path_pair(file.path_pair_id)
+        final_path = path_pair.local_path if path_pair is not None else self.__context.config.lftp.local_path
+        staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
+        final_target = os.path.join(final_path, file.name)
+
+        if os.path.exists(final_target) or not staging_path:
+            return final_path
+
+        staging_target = os.path.join(staging_path, file.name)
+        if os.path.exists(staging_target):
+            return staging_path
+
+        return final_path
+
     def __recover_interrupted_downloads(self, remote_files):
         self.__startup_recovery_done = True
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
@@ -689,8 +704,7 @@ class Controller:
                     continue
                 else:
                     process = DeleteLocalProcess(
-                        local_path=path_pair.local_path if (path_pair := self.__get_path_pair(file.path_pair_id))
-                        else self.__context.config.lftp.local_path,
+                        local_path=self.__get_delete_local_path(file),
                         file_name=file.name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)
