@@ -110,6 +110,16 @@ class SystemScanner:
             )
         )
 
+    @staticmethod
+    def __get_created_time(stat_result) -> datetime:
+        try:
+            return datetime.fromtimestamp(stat_result.st_birthtime)
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            try:
+                return datetime.fromtimestamp(stat_result.st_ctime)
+            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+                return None
+
     def __create_system_file(self, entry) -> SystemFile:
         """
         Creates a system file from a DirEntry.
@@ -124,16 +134,13 @@ class SystemScanner:
         Returns:
             The SystemFile object
         """
+        entry_stat = entry.stat()
         if entry.is_dir():
             sub_children = self.__create_children(entry.path)
             name = entry.name.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
             size = sum(sub_child.size for sub_child in sub_children)
-            time_created = None
-            try:
-                time_created = datetime.fromtimestamp(entry.stat().st_birthtime)
-            except AttributeError:
-                pass
-            time_modified = datetime.fromtimestamp(entry.stat().st_mtime)
+            time_created = SystemScanner.__get_created_time(entry_stat)
+            time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
             sys_file = SystemFile(name,
                                   size,
                                   True,
@@ -142,7 +149,7 @@ class SystemScanner:
             for sub_child in sub_children:
                 sys_file.add_child(sub_child)
         else:
-            file_size = entry.stat().st_size
+            file_size = entry_stat.st_size
             # Check if it's a partial lftp file, and if so, use the lftp
             # status to get the real file size
             lftp_status_file_path = entry.path + SystemScanner.__LFTP_STATUS_FILE_SUFFIX
@@ -155,12 +162,8 @@ class SystemScanner:
                     file_name != self.__lftp_temp_file_suffix and \
                     file_name.endswith(self.__lftp_temp_file_suffix):
                 file_name = file_name[:-len(self.__lftp_temp_file_suffix)]
-            time_created = None
-            try:
-                time_created = datetime.fromtimestamp(entry.stat().st_birthtime)
-            except AttributeError:
-                pass
-            time_modified = datetime.fromtimestamp(entry.stat().st_mtime)
+            time_created = SystemScanner.__get_created_time(entry_stat)
+            time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
             sys_file = SystemFile(file_name,
                                   file_size,
                                   False,
