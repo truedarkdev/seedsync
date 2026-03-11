@@ -302,6 +302,15 @@ Thejuran audit status:
 - Reopened subjects: Subject `15`, for the still-missing Linux `st_ctime` fallback in `scanner.py` plus its companion integration-test patch (`569622eb`, `7d85e6ae`) that was hidden inside an otherwise skipped file-metadata/theme-heavy run
 - Workflow learnings: when a mostly skipped UX or milestone-heavy lane still touches shared backend timestamp fields, re-check the underlying runtime files before inheriting the surrounding skip rationale; docs, archive, and active-ledger totals should continue to be recalculated from the actual row counts after each 108-row wave instead of assuming the requested batch size implies the archive split
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `108`
+- Commits processed: `e5989061518771a04fbf84723027840e3bc602de` through `f5e54875456eceb84ac70dece6275a0486022527`
+- Disposition summary: `5` already integrated, `1` covered elsewhere, `101` intentionally skipped, `1` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `4`
+- Reopened subjects: Subjects `4` and `13`, for the still-missing Docker runtime SSH-config half of `e34ba5e`; local `sshcp.py` already matches the stricter host-key policy, but `src/docker/build/docker-image/Dockerfile` still writes `StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null` into the production image.
+- Workflow learnings: in long milestone-heavy audit stretches, classify roadmap and docs bookkeeping early so the real runtime/security rows stand out; when a commit spans both Python SSH behavior and Docker image defaults, verify the production image config separately before closing it as fully covered elsewhere.
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
@@ -560,7 +569,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `17b3d7b8aa74e5a5d73f4223fef3521695c3f29d`
 - Source branch: thejuran/master
@@ -578,7 +587,7 @@ Integrated:
 - adapted `777917a` as a packaging prerequisite: enabled `skipLibCheck` in `src/angular/tsconfig.json` so the legacy Angular build remains runnable inside the current Docker packaging flow
 
 Pending:
-- none
+- Audit reopen: `e34ba5e` is only partially covered; while the production stage/deb key handling from `f6643db` is already integrated, `src/docker/build/docker-image/Dockerfile` still writes insecure SSH defaults (`StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null`) into the runtime image and should be aligned with the stricter host-key policy already present in `src/python/ssh/sshcp.py`.
 
 Covered elsewhere:
 - `c94d626`, `a8a6eba`, and other GLIBC/older-host compatibility follow-ups were reviewed here but belong primarily to Subject 5, where runtime compatibility choices will be handled explicitly
@@ -639,7 +648,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `0c03c18`
 - Source branch: thejuran/master
@@ -727,7 +736,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: yes
 - Integration base: `master` @ `549c378`
 - Source branch: `thejuran/master`
@@ -1363,7 +1372,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `4d8e22d`
 - Source branch: thejuran/master
@@ -1378,11 +1387,11 @@ Integrated:
 - adapted `108018f` in `0c88994` to switch the managed `scan_fs` payload and `SystemFile` transport helpers from pickle to JSON
 - adapted `abef04a` in `5ad98ce` to decode remote scan results from JSON and update the focused remote-scanner tests
 - `bb283e6` is already covered in current master through earlier compatibility updates to config and SSH handling
-- SSH host-key hardening from `e34ba5e` is already covered elsewhere by the current `sshcp.py` and Docker SSH defaults
+- the `sshcp.py` runtime half of `e34ba5e` is already covered elsewhere by current master
 - delete-process shell escaping from `492944f` is already covered elsewhere in current master
 
 Pending:
-- none
+- Audit reopen: `e34ba5e` is only partially covered; `src/python/ssh/sshcp.py` already enforces the stricter host-key behavior, but `src/docker/build/docker-image/Dockerfile` still injects insecure SSH defaults (`StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null`) into the production image.
 
 Covered elsewhere:
 - the SSH expect-pattern expansion portion of `a1deb23` is already present in current `src/python/ssh/sshcp.py`
