@@ -232,6 +232,62 @@ class TestController(unittest.TestCase):
 
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
+    @patch("controller.controller.os.path.exists")
+    def test_process_commands_delete_local_prefers_staging_path_until_move(self, exists):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        exists.side_effect = lambda path: path == "/local/movies/incomplete/dup"
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_called_once_with(
+            local_path="/local/movies/incomplete",
+            file_name="dup"
+        )
+
+    @patch("controller.controller.os.path.exists")
+    def test_process_commands_delete_local_keeps_final_path_once_moved(self, exists):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        exists.side_effect = lambda path: path == "/local/movies/dup"
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_called_once_with(
+            local_path="/local/movies",
+            file_name="dup"
+        )
+
     def test_build_staging_path_prefers_explicit_single_path_override(self):
         self.assertEqual(
             "/custom/staging",
