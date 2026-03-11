@@ -45,9 +45,9 @@ export class ConfigService extends BaseWebService {
      * @returns {WebReaction}
      */
     public set(section: string, option: string, value: any): Observable<WebReaction> {
-        const valueStr: string = value;
+        const valueStr: string = String(value);
         const currentConfig = this._config.getValue();
-        if (!currentConfig.has(section) || !currentConfig.get(section).has(option)) {
+        if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
             return Observable.create(observer => {
                 observer.next(new WebReaction(false, null, `Config has no option named ${section}.${option}`));
             });

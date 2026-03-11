@@ -5,9 +5,10 @@ import sys
 import copy
 import tempfile
 import os
+import shutil
 from unittest.mock import MagicMock, patch
 
-from common import overrides, Config
+from common import overrides, Config, PathPairManager, PathPair
 from seedsync import Seedsync
 
 
@@ -149,28 +150,44 @@ class TestSeedsync(unittest.TestCase):
         config.lftp.remote_path = "value"
         config.lftp.local_path = "value"
         config.lftp.remote_path_to_scan_script = "value"
-        self.assertFalse(Seedsync._detect_incomplete_config(config))
+        self.assertEqual([], Seedsync._detect_incomplete_config(config))
 
         # Test incomplete configs
         config.lftp.remote_address = incomplete_value
-        self.assertTrue(Seedsync._detect_incomplete_config(config))
+        self.assertEqual(["Lftp.remote_address"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_address = "value"
 
         config.lftp.remote_username = incomplete_value
-        self.assertTrue(Seedsync._detect_incomplete_config(config))
+        self.assertEqual(["Lftp.remote_username"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_username = "value"
 
         config.lftp.remote_path = incomplete_value
-        self.assertTrue(Seedsync._detect_incomplete_config(config))
+        self.assertEqual(["Lftp.remote_path"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_path = "value"
 
         config.lftp.local_path = incomplete_value
-        self.assertTrue(Seedsync._detect_incomplete_config(config))
+        self.assertEqual(["Lftp.local_path"], Seedsync._detect_incomplete_config(config))
         config.lftp.local_path = "value"
 
         config.lftp.remote_path_to_scan_script = incomplete_value
-        self.assertTrue(Seedsync._detect_incomplete_config(config))
+        self.assertEqual(["Lftp.remote_path_to_scan_script"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_path_to_scan_script = "value"
+
+    def test_detect_incomplete_config_skips_legacy_paths_when_path_pairs_exist(self):
+        config = Seedsync._create_default_config()
+        config.lftp.remote_address = "value"
+        config.lftp.remote_password = "value"
+        config.lftp.remote_username = "value"
+        config.lftp.remote_path_to_scan_script = "value"
+
+        manager = PathPairManager(tempfile.mkdtemp(prefix="test_path_pairs"))
+        try:
+            manager.load()
+            manager.add_pair(PathPair(name="Movies", remote_path="/remote/movies", local_path="/downloads/movies"))
+
+            self.assertEqual([], Seedsync._detect_incomplete_config(config, manager))
+        finally:
+            shutil.rmtree(manager._config_dir)
 
     def test_persist_does_not_rewrite_unchanged_config(self):
         config = Seedsync._create_default_config()
