@@ -230,6 +230,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `4`, `5`, `11`, `14`, and `18`, still concentrated around the stage/deb systemd-cgroups packaging path, the GLIBC/ARM verification lane, and a remaining WebApp Bottle compatibility gap
 - Workflow learnings: when a broad upstream debug session interleaves real fixes with temporary diagnostics, archive the debug-only commits as intentional skips instead of reopening noise; when an upstream workaround is later rolled back, close the transient step against the rollback even if the surrounding workstream still needs reopening
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `b4fb9465ab46a0cb21c7ba2f1bc17b0b4c7f98f1` through `ac81004f23a546fd22f99baae39d817afbbaed7c`
+- Disposition summary: `1` already integrated, `2` covered elsewhere, `6` intentionally skipped, `18` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `1`
+- Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, `14`, `19`, and `18`, dominated by the deferred Angular replatforming chain plus the still-open ARM/stage-deb verification path
+- Workflow learnings: when a long upgrade ladder is already clearly outside the current legacy stack, keep each row tied to the same modernization workstream instead of inventing new per-commit rationales; for large “review-previous-context” merge commits, anchor the row to the still-missing file clusters and call out the already-covered slices explicitly so the reopen count does not imply zero uptake
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran

@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `564 / 672 remaining`
+Open rows in this file: `537 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `b4fb9465ab46a0cb21c7ba2f1bc17b0b4c7f98f1` | Fix Docker ARM E2E: pre-build remote container for target platform | unknown | unprocessed | — | — | — | — | — | — |
-| `0ac447026442c5f181ea2c845025f1f0e4c6bff3` | Exclude arm64 from Docker e2e tests - too slow under QEMU | unknown | unprocessed | — | — | — | — | — | — |
-| `49e8d61c652e557d1c2b0324c8b01b24ae885f40` | Merge pull request #36 from Jules1651/claude/review-previous-context-AI8Oj | unknown | unprocessed | — | — | — | — | — | — |
-| `58ef287b6153397c68233ae1efe5980463ac45ac` | Add files via upload | unknown | unprocessed | — | — | — | — | — | — |
-| `655b6b2990c909b99ee0f9faf5b45e641f728af3` | Add ChromeHeadlessCI custom launcher for CI environment compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `162d98c2ebedcca0e40c354801659884f7f8699d` | Merge pull request #38 from Jules1651/claude/fix-angular-tests-Tmji1 | unknown | unprocessed | — | — | — | — | — | — |
-| `416713e8cddf0c937e673bfc75c9022cc9b1d247` | Replace deprecated release actions with GitHub CLI (#48) | unknown | unprocessed | — | — | — | — | — | — |
-| `48ff14b526b248d686b0459e0979ce6944c05385` | Add memory leak prevention to core file services (#50) | unknown | unprocessed | — | — | — | — | — | — |
-| `1efe46634d1fb8ec16df7011fb2890eed328de84` | Update RxJS imports in file services to use direct module paths (#51) | unknown | unprocessed | — | — | — | — | — | — |
-| `4c381e498f4def1d02cdd7da0a8b9fbf2a1790cb` | Refactor Controller.__process_commands() into specialized handlers (#52) | unknown | unprocessed | — | — | — | — | — | — |
-| `942d4651f91192cb98535c34f8f3e29b794e8c8a` | Refactor JobStatusParser with factory pattern and extracted components (#53) | unknown | unprocessed | — | — | — | — | — | — |
-| `7ba443baaf9713c7a8a0756c583e33dc0a1bcb8e` | Enable stricter TypeScript/ESLint rules and fix any type usage (#56) | unknown | unprocessed | — | — | — | — | — | — |
-| `bc454eb73cbcfec0bff85d032f69a03cfb9b7ff9` | Delete logs_55588916360.zip | unknown | unprocessed | — | — | — | — | — | — |
-| `cde6bbe9e525f2d70318c7b9363cb91bc3a427f2` | Upgrade Angular from v4.2.4 to v5.2.11 (Chunk 8.1) (#57) | unknown | unprocessed | — | — | — | — | — | — |
-| `805de78a559228c96eb7a9e5511502fcf4c3acbf` | Upgrade Angular from v5.2.11 to v6.1.10 (Chunk 8.2) (#58) | unknown | unprocessed | — | — | — | — | — | — |
-| `cee7689fe8d710c5139e7d5e87887845614111e2` | Fix Chrome Headless test disconnections by removing busy-wait loops (#60) | unknown | unprocessed | — | — | — | — | — | — |
-| `b7325d108fd052f60f8090b5f9a63587549e5198` | Upgrade Angular from v7.2.16 to v8.2.14 (Chunk 8.4) (#61) | unknown | unprocessed | — | — | — | — | — | — |
-| `9a974e1b99595f394babcc1ed636d9fe2237ddff` | Upgrade Angular from v8.2.14 to v9.1.13 (Chunk 8.5) (#62) | unknown | unprocessed | — | — | — | — | — | — |
-| `3130b2ceb28a2acd91f77b1c1624c98ee7ead83e` | Upgrade Angular from v9.1.13 to v10.2.5 (Chunk 8.6) (#63) | unknown | unprocessed | — | — | — | — | — | — |
-| `dace8a3c7c9128599f2e40b3d5adef79d626a130` | Rename CLAUDE.MD to CLAUDE.md | unknown | unprocessed | — | — | — | — | — | — |
-| `9dc14f99b0a2e588df204da2858e12da5b07dca5` | Claude/angular 9 to 10 upgrade qn qxw (#64) | unknown | unprocessed | — | — | — | — | — | — |
-| `56e9f092aea90ebec4aa8e317ef831438b2516b4` | Claude/angular 9 to 10 upgrade qn qxw (#67) | unknown | unprocessed | — | — | — | — | — | — |
-| `5fdae7852c37632f126b2f297fab6106f4b0f9c3` | Upgrade Angular from v11.2.14 to v12.2.17 (Chunk 8.8) (#68) | unknown | unprocessed | — | — | — | — | — | — |
-| `b91337a7246c93ea69c0f23727c846de05d5d3bb` | Claude/angular 11 to 12 upgrade f a7ph (#70) | unknown | unprocessed | — | — | — | — | — | — |
-| `7661944d5472c4ad559da0fe8f7bb8476766dca2` | Upgrade Angular from v13.4.0 to v16.2.12 (Chunk 8.9) (#71) | unknown | unprocessed | — | — | — | — | — | — |
-| `f2eb4ee4fcbdf640a85b34636fee37e96edb104d` | Upgrade Angular from v16.2.12 to v19.2.18 (Chunk 9) (#72) | unknown | unprocessed | — | — | — | — | — | — |
-| `ac81004f23a546fd22f99baae39d817afbbaed7c` | Angular 19 optional improvements: standalone, SCSS @use, ESLint 9 (#73) | unknown | unprocessed | — | — | — | — | — | — |
 | `ef7765619d5dd13a9c8e73149d51a51b6f366e02` | Fix npm peer dependency conflicts to allow install without --legacy-peer-deps (#74) | unknown | unprocessed | — | — | — | — | — | — |
 | `c1a4a2f88c467dc93b2e6e98a1b22c273b55f87a` | Claude/review first section a yyt d (#75) | unknown | unprocessed | — | — | — | — | — | — |
 | `b632b05799921219fb613a83b66d7b7fd8a03e8f` | Fix backend memory leaks: job status, event queue, and monitoring (#76) | unknown | unprocessed | — | — | — | — | — | — |
