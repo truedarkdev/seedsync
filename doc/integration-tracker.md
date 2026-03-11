@@ -175,7 +175,6 @@ Reopened subjects:
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
-- Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
 
 Intentional audit closures worth remembering:
@@ -1087,6 +1086,7 @@ Notes:
 
 Integrated:
 - adapted from `rapidcopy` `d4e4b7e` selectively: cap the live logs DOM at 500 rendered records so long-running sessions do not keep growing the page without bound
+- adapted the user-facing logs search half of `2054b14` as `working tree`: add a logs-page text filter with focused page-level coverage while leaving rapidcopy's broader log-file persistence and feature-surface expansion out of this conservative pass
 
 Pending:
 - none
@@ -1095,7 +1095,7 @@ Covered elsewhere:
 - the connection/waiting-state UX and malformed-log resilience from the rapidcopy-era logs work are covered by thejuran-derived adaptations already taken in this pass
 
 Skipped:
-- `2054b14`: log-file persistence and text-search UI are useful but substantially broaden the logs feature surface, so they were deferred in favor of the lower-risk stability and clarity fixes
+- the log-file persistence half of `2054b14` remains deferred because it broadens the logs feature surface beyond this conservative UI follow-up
 - the broader logs-related UI/theming changes from `4527bfe`, `fb4e7db`, and later modernization/rebrand commits were not taken here because they either belong to other subjects or are more opinionated than this conservative logs pass
 
 Maintainer decisions:
