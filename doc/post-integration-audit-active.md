@@ -694,35 +694,3 @@ Open rows in this file: `672 / 672 remaining`
 | `6a8024da060a68fe4dd8b25c15a67750094916c2` | chore: add todo for e2e CSP violation detection | unknown | unprocessed | — | — | — | — | — | — |
 | `0e6370eae00cd01353b014f9b2b34d3581103e37` | fix: add unsafe-inline to script-src CSP for inline event handler compatibility | unknown | unprocessed | — | — | — | — | — | — |
 | `a8561cdc318460de32de082e3cf33f6b6a0093cb` | chore: bump version to 3.1.2 | unknown | unprocessed | — | — | — | — | — | — |
-
-## rapidcopy
-
-Audit base: `origin/master @ ff2a1039935beccbbf7ec76134b41d2e91137742`
-Source branch: `rapidcopy/master`
-Fork tip at audit start: `c300b72f808772b00cc977ccceaa23f3c373ce33`
-Inventory status: `complete`
-Audit state: `in progress`
-Pass date: `2026-03-11`
-Audit order note: `Resume rapidcopy first until all rapidcopy rows are closed; then move to the next fork unless the maintainer changes the order.`
-Parallel triage note: `Within each batch, process the 3 oldest remaining rapidcopy commits in parallel, then continue with the next 3 oldest remaining commits.`
-Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. After each finished 3-commit triage group, write those completed rows into this ledger before starting the next 3. 9 completed commits is only a continue-check reminder, not a stopping point.`
-
-Open rows in this file: `15 / 224 remaining`
-
-| Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `2e175c0cb0ff6d5f56af3d9f2dd9d4833dc941e1` | fix: ensure Python source files are world-readable after COPY | unknown | unprocessed | — | — | — | — | — | — |
-| `d4e4b7e0c467c87dc527a6fad30fc11c39dea060` | Fix logs page lockup: cap live DOM and default to INFO level | unknown | unprocessed | — | — | — | — | — | — |
-| `ee0718ab6633cfc00d2b822bb4a658fde8f43226` | Add dashboard pagination and fix test_config for deleted_age_off_secs | unknown | unprocessed | — | — | — | — | — | — |
-| `3ad06ceae2056a18873a7fd7d966987fd88dd58b` | fix: handle malformed lftp queue lines gracefully to prevent controller crash | unknown | unprocessed | — | — | — | — | — | — |
-| `c1e079af7712ab1b51b3ca346383db91af6f4952` | fix: make LftpJobStatusParser resilient - skip bad output instead of crashing | unknown | unprocessed | — | — | — | — | — | — |
-| `5db8f3435087ca93e03c7d66b3d48bdd447d37d0` | fix: increase pexpect timeout to 30s and demote timeout log to DEBUG | unknown | unprocessed | — | — | — | — | — | — |
-| `62e14e23af040f3b59eae30ecd6190182e408826` | fix: catch LftpError from raise_pending_error to prevent controller crash | unknown | unprocessed | — | — | — | — | — | — |
-| `8d6b436862d634f08f76b5061e04f69fef88146f` | feat: add prioritize to move a queued file to the front of the download queue | unknown | unprocessed | — | — | — | — | — | — |
-| `c4871787f264bfb186659a6c61c5d6fe7ed34212` | fix: catch pexpect EOF to prevent lftp process crash from killing controller | unknown | unprocessed | — | — | — | — | — | — |
-| `cb554718f7525cf02a1b2c3560c661d89ecf6d5b` | fix: cap num_max_total_connections at 32 to prevent FD_SETSIZE crash | unknown | unprocessed | — | — | — | — | — | — |
-| `207caf5f92258d42b75841a3aca21713f40286ba` | feat: update settings UI to document 32-connection cap on Max Total Connections | unknown | unprocessed | — | — | — | — | — | — |
-| `0c73e2374481b4ac4b1f3796237e02ac7d72a2fa` | Fix file permissions: set process umask 002 so downloads get 664/775 | unknown | unprocessed | — | — | — | — | — | — |
-| `c65ddf6e01c6ee9ed4e21bf3c84bf29398f48269` | Merge pull request #3 from ppastur/fix/scanfs-glibc-compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `6ce7c197746e0fad2655662b82f041221e760787` | feat: staging directory + interrupted-download auto-resume | unknown | unprocessed | — | — | — | — | — | — |
-| `c300b72f808772b00cc977ccceaa23f3c373ce33` | Fix DELETE_LOCAL to fall back to staging path when file not in local_path | unknown | unprocessed | — | — | — | — | — | — |

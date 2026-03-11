@@ -159,11 +159,12 @@ Recommended audit ledger fields:
 
 - Pass date: `2026-03-11`
 - Active fork: `rapidcopy`
-- Batch size completed this pass: `30`
+- Batch size completed this pass: `15`
 
 Reopened subjects:
 - Subjects `8`, `10`, and `11`: reopen together for the deferred path-pair settings/API/config cluster surfaced by `d1436386`, `a33981b5`, `58ead058`, and `88ffbd00`, including path-pair CRUD/UI, path-pair-aware config validation, and Angular config-schema/null-handling fixes.
 - Subjects `10` and `11`: reopen for the missing path-pair dashboard/stats cluster from `778d1d8c` plus its dependent tests in `64afa027` and `bc8348c8`.
+- Subject `20`: reopen for `c300b72f`, because the current staging-path integration still leaves `DELETE_LOCAL` pointed at the final local path instead of falling back to the staging path when the file has not been moved yet.
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
@@ -184,6 +185,9 @@ Audit workflow learnings:
 - Explorer-first triage should check whether a commit only touches a stack already marked as intentionally deferred or already assigned to an open follow-up task before proposing a new task; during this batch, derivative Playwright and validation commits initially over-escalated until they were reconciled against the existing deferral/follow-up ledger.
 - Reviewer subagents should stay read-only during audit waves; have reviewers return evidence only, keep ledger edits in the main thread, and use `worker` only for intentional implementation tasks.
 - Recount the exact row span before archiving and summary updates; this batch rolled 30 rapidcopy rows into one wave, so the archive chunk and status totals needed a post-archive count check instead of assuming the requested wave size.
+
+Rapidcopy audit status:
+- `rapidcopy` is now fully closed through frozen tip `c300b72f808772b00cc977ccceaa23f3c373ce33`; the next audit fork is `thejuran` once the maintainer confirms the next batch.
 
 ## Subject 1 - Documentation And Maintainer Notes
 
@@ -1923,7 +1927,7 @@ Integrated:
 - local follow-up commit exposes `lftp.staging_path` in the current Angular settings UI and config record so the already integrated staging-path runtime can be configured from the existing settings page, with focused Angular settings tests updated accordingly
 
 Pending:
-- none
+- `c300b72f`: reopen Subject 20 to make `DELETE_LOCAL` fall back to the staging path when the file has not yet moved into the final local path.
 
 Covered elsewhere:
 - `677be93` is cleanup-only and offers no functional delete or file-safety change over current local code
