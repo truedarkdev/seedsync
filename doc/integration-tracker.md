@@ -161,6 +161,8 @@ Post-audit consolidation task:
 - after the full post-integration audit closes, build a deduplicated reopen matrix before implementation work begins
 - group reopen rows by workstream, owning subject, affected files, and shared upstream commit cluster
 - use that matrix to drive implementation ordering and to map each finished follow-up back to every audit row it closes
+- Phase A raw matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-a.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-a.md)
+  - scope: every `needs subject reopen` audit row was mapped to at least one raw missing-feature bucket, with merge commits allowed in multiple buckets when a single row covered multiple still-missing slices
 
 - Pass date: `2026-03-11`
 - Active fork: `thejuran`
