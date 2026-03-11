@@ -275,6 +275,15 @@ Thejuran audit status:
 - Reopened subjects: none
 - Workflow learnings: when an upstream milestone is almost entirely planning plus default-UI restyle scaffolding, classify the docs and styling commits as intentional skips early so one covered compatibility fix does not make the batch look noisier than it is; when the local tree already solves a compatibility issue through a different Docker/test-image path, record that row as covered elsewhere without inheriting the rest of the skipped redesign lane
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `5ec43a23c3120aac36765b5f06cb47abfefba060` through `721e694fcf63e6f06e12a610962b2c9a313795eb`
+- Disposition summary: `0` already integrated, `6` covered elsewhere, `20` intentionally skipped, `1` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `0`
+- Reopened subjects: Subjects `12` and `16`, with the only real remaining gap in this run being one mixed cleanup commit whose defensive UI-handler guards are still absent locally while the AutoQueue requeue and Safari toolbar fixes are already covered
+- Workflow learnings: when a mixed “code review cleanup” commit bundles optional styling churn with a small defensive hardening slice, reopen only the missing hardening piece instead of treating the whole restyle batch as unresolved; when upstream adds todo documents for bugs that are already fixed locally, classify those rows as covered elsewhere so the ledger stays tied to behavior rather than planning artifacts
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
