@@ -179,7 +179,6 @@ New integration tasks:
 - Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
 - Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
-- Runtime SSH directory ignore hardening: `de8b602b` shows that current `.gitignore` still lacks an explicit `ssh/` entry even though key filenames are ignored; handle this as a small Subject 4 packaging/hygiene follow-up.
 
 Intentional audit closures worth remembering:
 - RapidCopy identity changes (`08d714e6`, `ebe416f8`) remain rejected under the existing SeedSync-default branding rule.
@@ -632,6 +631,7 @@ Notes:
 Integrated:
 - adapted `207b75e` and `2e175c0`: ensured the runtime image fixes file modes for `/scripts/setup_default_config.sh` and the copied `/app/python` tree so the non-root container can execute the packaged startup path reliably, while also normalizing copied helper scripts defensively for CRLF-prone Windows-backed checkouts
 - adapted `50502647`: excluded `.ruff_cache` and `.mypy_cache` from the Dockerfile-specific build contexts used by the deb and runtime image packaging flows, matching this repo's per-Dockerfile ignore setup instead of introducing a new root `.dockerignore`
+- adapted `de8b602b`: added an explicit `ssh/` ignore rule alongside the existing private-key patterns so runtime SSH artifacts under the repo-root ssh directory stay out of the worktree
 
 Pending:
 - none
