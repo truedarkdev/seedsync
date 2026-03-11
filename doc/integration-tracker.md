@@ -212,6 +212,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, and `13`, centered on the deferred Python 3.11 / Node 20 Angular test-tooling chain, the PyInstaller GLIBC mitigation path, and a remaining partial WebApp/OpenSSH test-hardening gap
 - Workflow learnings: when a merge commit mixes one already-integrated fix with one still-missing branch, keep the final row partial and reopen the owning subjects instead of inheriting only the “covered elsewhere” parent; for test-only commits, compare both unit and integration suites before closing a row as fully covered
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `84f64738a1589f4939afb022cd1b456d7063d692` through `e5416c59858c986bb2b81ae6035e337fbf95b78c`
+- Disposition summary: `1` already integrated, `9` covered elsewhere, `4` intentionally skipped, `13` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `2`
+- Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, `13`, and `17`, concentrated around extraction/webtest reliability skips, the deferred Node 20 / libsass / build-tooling chain, and the still-missing Docker systemd/cgroups compatibility fixes for stage/deb E2E coverage
+- Workflow learnings: when upstream temporarily adds then later removes a workaround, close the temporary step against the later rollback instead of inflating reopen counts; when local packaging covers the same dependency need through a different Dockerfile topology, use reviewer confirmation before calling the row fully covered elsewhere
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran

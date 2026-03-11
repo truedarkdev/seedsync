@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `618 / 672 remaining`
+Open rows in this file: `591 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `84f64738a1589f4939afb022cd1b456d7063d692` | Skip test_extract_archive_overwrites_existing test | unknown | unprocessed | — | — | — | — | — | — |
-| `20a3e0134ac69929cda17d6748450a6c1eef8657` | Skip WebApp streaming tests that timeout with webtest | unknown | unprocessed | — | — | — | — | — | — |
-| `b75da034c3985181afed1b5d39e79165e997dca1` | Add 'connection closed' to SSH test error assertions | unknown | unprocessed | — | — | — | — | — | — |
-| `068bb9dda0a014ce024b800b736da229e3d6c7fd` | Merge pull request #28 from Jules1651/claude/fix-angular-test-failure-XvPoC | unknown | unprocessed | — | — | — | — | — | — |
-| `50a8ce3af858f5daf16421c4b55f1445fe76b532` | Update setup_seedsync.sh | unknown | unprocessed | — | — | — | — | — | — |
-| `443fdcba574d3261a2f34b70988b91bd1e5f17e8` | Update setup_seedsync.sh | unknown | unprocessed | — | — | — | — | — | — |
-| `631a50fe1df2492f79a96a1d1052a1e0310e4175` | Update Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
-| `ad81dd9346839fbd8143b10f49776158b4c4e4f6` | Replace node-sass with sass (dart-sass) to fix build warnings | unknown | unprocessed | — | — | — | — | — | — |
-| `a1f23761ef208353ff546dc3f8580bd304bf1455` | Revert "Replace node-sass with sass (dart-sass) to fix build warnings" | unknown | unprocessed | — | — | — | — | — | — |
-| `b9cfb0fbf1c784569bf6ca4775ac437693e9a093` | Fix libsass build warnings by suppressing C++ compiler warnings | unknown | unprocessed | — | — | — | — | — | — |
-| `2bea28e09832705c0e17d5876aea391ad65f1848` | Update deprecated GitHub Actions to latest versions | unknown | unprocessed | — | — | — | — | — | — |
-| `a27e231956a0d5f13cfd4dd3b0573f717fe12e56` | Remove dh-systemd from Build-Depends | unknown | unprocessed | — | — | — | — | — | — |
-| `0fffbdf1b7a96ab65b059c3610ea2c92d1107046` | Skip dh_shlibdeps for PyInstaller-built executables | unknown | unprocessed | — | — | — | — | — | — |
-| `8a661e284e855e9b893d1751913931a57d347d30` | Use lowercase repository name for GHCR | unknown | unprocessed | — | — | — | — | — | — |
-| `9759b76d1a4513bb427f29b0c3641d1106e5fbf9` | Add gcc and libffi-dev to Python build environment | unknown | unprocessed | — | — | — | — | — | — |
-| `984b8a1525ef80b109663a8b75f1f7e2d0454b83` | Fix e2e tests for cgroups v2 (GitHub Actions Ubuntu 24.04) | unknown | unprocessed | — | — | — | — | — | — |
-| `55e582332eb4ebc31f487d553ad437def762cf30` | Remove invalid cgroup: host from compose.yml | unknown | unprocessed | — | — | — | — | — | — |
-| `c83efbcb6ed8387c86a7621741a090698fb98e41` | Install Poetry via pip instead of installer script | unknown | unprocessed | — | — | — | — | — | — |
-| `558411badf857516199529284583d869ca9da1ac` | Mask systemd-resolved in e2e test containers | unknown | unprocessed | — | — | — | — | — | — |
-| `e15601a82c5613cda1bbf8813cda0bff430a542b` | Add build-essential to docker-image build environment | unknown | unprocessed | — | — | — | — | — | — |
-| `3eefa631509926d4999f37872f418043e4baa37d` | Add build-essential to pyinstaller build stage | unknown | unprocessed | — | — | — | — | — | — |
-| `c112737b4e7aaad2604b55e41ae58cea5660f9b9` | Add Python and build tools to Angular build stage | unknown | unprocessed | — | — | — | — | — | — |
-| `9526eb9292843eac5b239ae231e3c399d24d394e` | Add zlib1g-dev for PyInstaller bootloader compilation | unknown | unprocessed | — | — | — | — | — | — |
-| `bd3a63b9bc56feefbcdba2ded932673cf25b2dab` | Ensure /etc/resolv.conf is a regular file in e2e containers | unknown | unprocessed | — | — | — | — | — | — |
-| `49474ba3780e6ff6b11279ad3e19814e7e92bcc8` | Remove resolv.conf modification from e2e container Dockerfiles | unknown | unprocessed | — | — | — | — | — | — |
-| `f278379b6a69bf70d2031731fe177d5fdfff443d` | Fix CMD format in stage/deb Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
-| `e5416c59858c986bb2b81ae6035e337fbf95b78c` | Add cgroups v2 support for systemd in Docker containers | unknown | unprocessed | — | — | — | — | — | — |
 | `7e7289e4ee2ab15364b82c01840e6553987dcc03` | Update compose files to use compose spec format | unknown | unprocessed | — | — | — | — | — | — |
 | `0e228818abde8249fe414b1563814e7f8716ce68` | Remove unsupported cgroup attribute from compose file | unknown | unprocessed | — | — | — | — | — | — |
 | `b5cf1d2a037634b3a872cfd31834d06dcd1c5266` | Add cgroup: host for cgroups v2 systemd support | unknown | unprocessed | — | — | — | — | — | — |
