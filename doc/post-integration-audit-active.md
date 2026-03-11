@@ -15,40 +15,13 @@ Source branch: `thejuran/master`
 Fork tip at audit start: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
 Inventory status: `complete`
 Audit state: `in progress`
-Pass date: `2026-03-10`
+Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `672 / 672 remaining`
+Open rows in this file: `645 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `bdcc28746933ce5b41c6789e2104c3977780caa8` | Increase lftp timeout from 3 to 180 seconds | unknown | unprocessed | — | — | — | — | — | — |
-| `81b307cad52617168bab2768a7fd95c8f5960439` | Merge pull request #1 from Jules1651/claude/increase-lftp-timeout-QieKs | unknown | unprocessed | — | — | — | — | — | — |
-| `7adbd5f516d96483f6fdcb27a303f52be7677774` | Fix Dockerfile for modern Python 3.11-slim base image | unknown | unprocessed | — | — | — | — | — | — |
-| `7042028e8a8c7a570656a98d53fa46af240f379b` | Update poetry.lock for Python 3.11 and fix deprecated syntax | unknown | unprocessed | — | — | — | — | — | — |
-| `9a25b36d94236c339939b04fe96fb19eb193903c` | Update all dependencies for Python 3.11 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `ccc3f9c62fd34291d9a2bf5eaec484fce6353fdb` | Merge pull request #2 from Jules1651/claude/audit-dockerfile-dependencies-iLt4o | unknown | unprocessed | — | — | — | — | — | — |
-| `7f2de6841927c945f8496a9294939def11fba697` | Fix Poetry package-mode configuration | unknown | unprocessed | — | — | — | — | — | — |
-| `0d0037d19d4583548f388c379d7799b8a9ecdce4` | Add pytest pythonpath configuration | unknown | unprocessed | — | — | — | — | — | — |
-| `461fa45757cd05e61be965c4d3413dfad6f656c8` | Merge pull request #3 from Jules1651/claude/fix-poetry-config-TPLzN | unknown | unprocessed | — | — | — | — | — | — |
-| `5ea6f8e4e246257055517817a847a64268e325fa` | Make docker-image Dockerfile self-contained | unknown | unprocessed | — | — | — | — | — | — |
-| `21fe17d6edc4c8d2295f2b28e3fe5d2232c1ef56` | Merge pull request #4 from Jules1651/claude/fix-dockerfile-staging-registry-ubDd8 | unknown | unprocessed | — | — | — | — | — | — |
-| `11b0944d53590a675d6607c70bb6ac0d436830f8` | Fix Docker Angular build by creating /build directory | unknown | unprocessed | — | — | — | — | — | — |
-| `74f20dc737b4d1f79bb60978d012dc79bf8739c6` | Merge pull request #5 from Jules1651/claude/fix-docker-dist-directory-g8Td5 | unknown | unprocessed | — | — | — | — | — | — |
-| `777917ad43f1b9c78767312ceac3674b087357d4` | Add skipLibCheck to fix @types/eventsource conflict | unknown | unprocessed | — | — | — | — | — | — |
-| `1979e311324cbaaeed600dcb92e43ab46b3d8a8c` | Merge pull request #6 from Jules1651/claude/fix-eventsource-types-n451I | unknown | unprocessed | — | — | — | — | — | — |
-| `ee190111c7782640f05b7b0b6b60797ff08e1197` | Add CLAUDE.MD with project documentation for Claude Code | unknown | unprocessed | — | — | — | — | — | — |
-| `4f19ec6aef10b6f14eaf20db297a3cd2333001bd` | Phase 1: Update infrastructure dependencies | unknown | unprocessed | — | — | — | — | — | — |
-| `1336c07e3046629a342c8a4d65c12d73211a50af` | Merge pull request #7 from Jules1651/claude/update-claude-md-LfeJh | unknown | unprocessed | — | — | — | — | — | — |
-| `a3a9bdf601c750a588016d9ce0ccd5ab1c6c4df7` | Fix npm install for Node 20 with legacy Angular 4.x | unknown | unprocessed | — | — | — | — | — | — |
-| `fc9ca7be2ff2ce0efb0079772d643fe0a946cc86` | Merge pull request #8 from Jules1651/claude/update-claude-md-LfeJh | unknown | unprocessed | — | — | — | — | — | — |
-| `0b26dcf6b8debd9857aae789cf8c3023e8393ea0` | Fix node-sass version for Node 20 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `a5da13c80bf8d70ee8ab8ea88a0feec4fa20605d` | Merge pull request #9 from Jules1651/claude/update-claude-md-LfeJh | unknown | unprocessed | — | — | — | — | — | — |
-| `9d72249416c5616fb8f51e175d038fdb3e161201` | Fix Python version constraint and regenerate poetry.lock | unknown | unprocessed | — | — | — | — | — | — |
-| `6a4e77c35c112244ee00758a446a9c564e47c385` | Merge pull request #10 from Jules1651/claude/update-claude-md-LfeJh | unknown | unprocessed | — | — | — | — | — | — |
-| `996ae6a551ae28b302d49444af69a1258e1eac0d` | Fix GLIBC compatibility by using Ubuntu 20.04 for PyInstaller build | unknown | unprocessed | — | — | — | — | — | — |
-| `950d9fc79d5f06a2cc0d7b88aa89e10fbf869103` | Merge pull request #11 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
-| `c94d626afe857f6072ba6eb9a7fc891d993b5485` | Fix GLIBC compatibility in docker-image Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
 | `04b1f81ec0ec565cc8d773d57e9f4c05bfa68d64` | Merge pull request #12 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
 | `a8a6ebaa605aba2a29098cf278bd052f3e3118a8` | Use manylinux_2_28 for PyInstaller builds to fix GLIBC compatibility | unknown | unprocessed | — | — | — | — | — | — |
 | `31b68ec981dc800b0c85abd7a053c39645c86103` | Merge pull request #13 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
