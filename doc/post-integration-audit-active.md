@@ -707,37 +707,10 @@ Audit order note: `Resume rapidcopy first until all rapidcopy rows are closed; t
 Parallel triage note: `Within each batch, process the 3 oldest remaining rapidcopy commits in parallel, then continue with the next 3 oldest remaining commits.`
 Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. After each finished 3-commit triage group, write those completed rows into this ledger before starting the next 3. 9 completed commits is only a continue-check reminder, not a stopping point.`
 
-Open rows in this file: `72 / 224 remaining`
+Open rows in this file: `45 / 224 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `2ed36f269e6456476c79a4418442c08619d7dfd2` | fix: resolve Playwright test stability issues with WebSocket-based app | unknown | unprocessed | — | — | — | — | — | — |
-| `4c1cc1678f1456142a1f75d82dec9a813671dc20` | fix: use /server/config/get for backend availability checks | unknown | unprocessed | — | — | — | — | — | — |
-| `5d5a90a099b5ecdafe844f5a1f17c19861ed012c` | fix: add pickle fallback to remote_scanner for legacy scanfs binaries | unknown | unprocessed | — | — | — | — | — | — |
-| `5d3e1e85636def6c5abc91a91a5381adc807b5bf` | fix: add VALIDATING state to model serialization | unknown | unprocessed | — | — | — | — | — | — |
-| `4fdda8c59f8af46bdf09fc287a70922d93ce389e` | docs: add comprehensive testing state documentation | unknown | unprocessed | — | — | — | — | — | — |
-| `4527bfecead67af92e73e83f0b74636256db3e7b` | fix: resolve UI bugs and validation infinite loop | unknown | unprocessed | — | — | — | — | — | — |
-| `aeb27fa17044290df17ad718cbf4781243bf03bf` | fix: use JSON output in scanfs and add missing model states | unknown | unprocessed | — | — | — | — | — | — |
-| `7663db93ba870176236cfbfbaa0f8668496267a2` | fix: update favicon to match new RapidCopy logo | unknown | unprocessed | — | — | — | — | — | — |
-| `2614ae61c5924889c77e1cc89abbd1dae0b801f0` | fix: batch remote checksum commands to prevent ARG_MAX overflow | unknown | unprocessed | — | — | — | — | — | — |
-| `1700fcc9aacd6216c07a739b15555ffe7184b113` | test: add comprehensive UI tests for all pages | unknown | unprocessed | — | — | — | — | — | — |
-| `be7c52e01fbf83867dc2508a444f7ac406844a32` | fix: correct Restart button test to check sidebar link | unknown | unprocessed | — | — | — | — | — | — |
-| `25145f67dd72514f714366b9b2228d5788d7d786` | config: increase default validation chunk size from 10MB to 50MB | unknown | unprocessed | — | — | — | — | — | — |
-| `c392a29a1559c116d7e610767cb98dd11f43cd80` | docs: rewrite README with comprehensive feature documentation | unknown | unprocessed | — | — | — | — | — | — |
-| `9f4cbb15bac48b66cb0a84cdbc9a9a1439938f49` | docs: add Docker Hub publishing to-do | unknown | unprocessed | — | — | — | — | — | — |
-| `d20b84d3b799e0a9a291fadf755dbcd24d43f081` | fix: prevent validation status leak and ensure proper cleanup | unknown | unprocessed | — | — | — | — | — | — |
-| `4cd7fc1da6a2130047e65109caac271568b2a91c` | fix: preserve validation states across model rebuilds | unknown | unprocessed | — | — | — | — | — | — |
-| `b62970aef970c121a2373b9ee74ca9330828f4bc` | fix: show status for local-only files missing remote counterpart | unknown | unprocessed | — | — | — | — | — | — |
-| `d0662cab2b152f600b2af7b90345197b83eeb9e7` | feat: switch validation from MD5 to xxHash (xxh128) for ~20x speedup | unknown | unprocessed | — | — | — | — | — | — |
-| `323e3edf31e38e3b7cec2273b54dfae65a029e51` | fix: use ng-bootstrap directives for dropdowns and Bootstrap 5 data attributes | unknown | unprocessed | — | — | — | — | — | — |
-| `f1fc34caf11125a2a6f94be5260dade1122f5a89` | feat: add clickable column headers for sorting on the dashboard | unknown | unprocessed | — | — | — | — | — | — |
-| `d9c69750c195915cde988a592b40679effa96f15` | fix: add validation states to status sort priority map | unknown | unprocessed | — | — | — | — | — | — |
-| `e158fe2a88c57ab29607a34904cfeae1fc0487df` | config: update docker-compose.yml with production volume mounts | unknown | unprocessed | — | — | — | — | — | — |
-| `58af9ee80588740b05a766d6ade57d1f06ce7823` | fix: resolve invalid escape sequence warnings in test_job_status_parser | unknown | unprocessed | — | — | — | — | — | — |
-| `bd93c7711ddc4de91216bdbb1146b167ee7aea39` | docs: update AGENTS.md with build environment and pending work | unknown | unprocessed | — | — | — | — | — | — |
-| `394a921c714d77fc9e873ceb177de53bb128f4d4` | config: switch git remote to SSH and update AGENTS.md | unknown | unprocessed | — | — | — | — | — | — |
-| `ab075718e3cb3fb7bca18fd347c2d10f2ae98d97` | chore: update poetry.lock to latest dependency versions | unknown | unprocessed | — | — | — | — | — | — |
-| `dda1cb2eda952922887a50932010515832fdfaa9` | feat: implement inline validation (validate_after_chunk) | unknown | unprocessed | — | — | — | — | — | — |
 | `96bcf0ba3ea979de004c2f62eda9bd1afe41c873` | docs: update AGENTS.md — mark inline validation done, refresh todo list | unknown | unprocessed | — | — | — | — | — | — |
 | `30809bf2bcf006ece17742661d030495a52378bb` | feat: wire inline validation to LFTP partial re-downloads for corrupt chunks | unknown | unprocessed | — | — | — | — | — | — |
 | `73b25b7facfdf9567dc688de7628242b69373cef` | docs: update AGENTS.md — mark corrupt chunk re-download complete | unknown | unprocessed | — | — | — | — | — | — |

@@ -42,6 +42,7 @@ Reviewer gate:
 - do not treat `explorer-fast` as automatically correct; compare its output against the orchestrator's local evidence and the eventual reviewer result so the prompt can be recalibrated if it starts routing too many or too few commits to review
 - when an explorer claims `direct local match`, it should name the matching local commit hash explicitly so the orchestrator can confirm quickly without reconstructing the match from surrounding context
 - for docs-only commits without an exact local commit match, the agent should cite the exact current local command, sentence, or section that already covers the upstream intent; if it cannot point to that concrete live-doc evidence, send the commit to `reviewer`
+- before proposing `needs subject reopen` or `needs new integration task`, first check whether the commit only modifies a stack already recorded as intentionally skipped or already assigned to an open follow-up task; derivative commits in those stacks should normally close as `likely intentional skip` or `covered elsewhere` instead of duplicating the parent task
 - after a repeated run of accurate high-confidence `direct local match` results on a similar low-risk stretch, the orchestrator may use spot checks and light-touch confirmation instead of fully reconstructing every match by hand
 - in a maintainer-directed low-context audit mode, prefer subagent-led evidence gathering and send anything suspicious, under-supported, or oddly classified to `reviewer` instead of expanding the orchestrator's own manual investigation
 

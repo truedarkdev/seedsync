@@ -169,11 +169,15 @@ New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
 - Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
+- LFTP parser test SyntaxWarning cleanup: `58af9ee8` is still missing locally, and `python3 -m py_compile src/python/tests/unittests/test_lftp/test_job_status_parser.py` still emits invalid-escape warnings that should be handled as a small Subject 14 follow-up instead of being buried inside broader dependency churn.
 
 Intentional audit closures worth remembering:
 - RapidCopy identity changes (`08d714e6`, `ebe416f8`) remain rejected under the existing SeedSync-default branding rule.
 - Theme-system and Playwright-replatforming commits in this batch (`fb4e7db4`, `5c02e93b`, `696866cd`, `5df693d7`, related QA docs) stay intentionally deferred rather than treated as missed conservative integrations.
 - Self-update via external update server (`936ae4b2`) stays intentionally skipped as a broader product/workflow feature, not an audit miss.
+
+Audit workflow learnings:
+- Explorer-first triage should check whether a commit only touches a stack already marked as intentionally deferred or already assigned to an open follow-up task before proposing a new task; during this batch, derivative Playwright and validation commits initially over-escalated until they were reconciled against the existing deferral/follow-up ledger.
 
 ## Subject 1 - Documentation And Maintainer Notes
 
