@@ -128,6 +128,7 @@ Audit coverage baseline:
 - Commits:
   - `2ae51736a47e993de71e8660fe7e39b5b2e2c78a`
   - `4cbdaa549f20e6bd572a8ddc7da93cb5870c59d9`
+  - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### RAF-010 - E2E dashboard and AutoQueue stability fixes
 - Subjects: `2`
@@ -148,6 +149,7 @@ Audit coverage baseline:
   - `9392653b597c519b9b825ec508ef9464e025999a`
   - `f01806802f833451d072042958ca7e3c535b67e9`
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
+  - `5fdae7852c37632f126b2f297fab6106f4b0f9c3`
 
 ### RAF-012 - Bottle/WebApp `_stop_flag` attribute compatibility
 - Subjects: `11`, `13`
