@@ -707,40 +707,10 @@ Audit order note: `Resume rapidcopy first until all rapidcopy rows are closed; t
 Parallel triage note: `Within each batch, process the 3 oldest remaining rapidcopy commits in parallel, then continue with the next 3 oldest remaining commits.`
 Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. After each finished 3-commit triage group, write those completed rows into this ledger before starting the next 3. 9 completed commits is only a continue-check reminder, not a stopping point.`
 
-Open rows in this file: `45 / 224 remaining`
+Open rows in this file: `15 / 224 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `96bcf0ba3ea979de004c2f62eda9bd1afe41c873` | docs: update AGENTS.md — mark inline validation done, refresh todo list | unknown | unprocessed | — | — | — | — | — | — |
-| `30809bf2bcf006ece17742661d030495a52378bb` | feat: wire inline validation to LFTP partial re-downloads for corrupt chunks | unknown | unprocessed | — | — | — | — | — | — |
-| `73b25b7facfdf9567dc688de7628242b69373cef` | docs: update AGENTS.md — mark corrupt chunk re-download complete | unknown | unprocessed | — | — | — | — | — | — |
-| `50502647e6649c617af0e9bdac1f8471ff5fd804` | chore: add .ruff_cache and .mypy_cache to .dockerignore | unknown | unprocessed | — | — | — | — | — | — |
-| `157d003d6b20dc5a7c531784b30a37ab82aadab9` | fix: pget_range - run directly instead of via queue, drop -c flag | unknown | unprocessed | — | — | — | — | — | — |
-| `92587f3b96c6c932fc42faf6e04a704ca5540b4d` | docs: update AGENTS.md — session wrap-up notes | unknown | unprocessed | — | — | — | — | — | — |
-| `14adf8b97c38137294b9fbd177cb44e8ac142934` | Fix checkbox alignment, download percentages, and update MODERNIZATION-PLAN | unknown | unprocessed | — | — | — | — | — | — |
-| `e038c213ed074e2d5f2fb5844cc120d0f4c6bd82` | Fix download speed: validate after download completes, not during | unknown | unprocessed | — | — | — | — | — | — |
-| `797ebfaac2f306d62ae02be14c5143c84c0a1555` | UI improvements: percentage cap, button tooltips, restart confirmation | unknown | unprocessed | — | — | — | — | — | — |
-| `20ebcbcb72331a02362f595383cbff6def6e3303` | Fix checkbox alignment by replacing Bootstrap form-check with plain flex label | unknown | unprocessed | — | — | — | — | — | — |
-| `4acc00b0334e8851f94604e6fc290d75e8ba9e7f` | Add config backup-on-save and document correct docker run command | unknown | unprocessed | — | — | — | — | — | — |
-| `2054b14925026e8d84645f598d71832f2b409b77` | feat: log file persistence + UI text search | unknown | unprocessed | — | — | — | — | — | — |
-| `fc5711398081c0e313d9e4276488bc71816dbf48` | Tasks 4, 5, 7: validation settings UI, RAR fixtures, unit test fixes | unknown | unprocessed | — | — | — | — | — | — |
-| `a6a11892954ef66deae95fbf9a2b066138e355ba` | Fix path pair stats: progress %/bytes overcounting | unknown | unprocessed | — | — | — | — | — | — |
-| `de8b602b3d08955a7d721d03e93201fcbb59f561` | chore: add ssh/ to .gitignore to prevent committing runtime SSH keys | unknown | unprocessed | — | — | — | — | — | — |
-| `79f7cabf12cddfa90b3d5484f0eb8a88a1b609d9` | feat: validation settings UI, RAR fixtures, unit test fixes, stats fix | unknown | unprocessed | — | — | — | — | — | — |
-| `b5373c9bcaffacca167694a513d45b4978923bad` | docs: add Docker Hub badge, update image references, replace To-Do with Docker Hub section | unknown | unprocessed | — | — | — | — | — | — |
-| `9e1aeead4907840106250e29249ffac7e81f0f19` | security: apply trivial hardening fixes (T1-T7) | unknown | unprocessed | — | — | — | — | — | — |
-| `32acba61010215c7adb0ccf8a8eaa3afc29cc2ca` | security: apply easy-tier hardening fixes (E1-E6) | unknown | unprocessed | — | — | — | — | — | — |
-| `78a3fdea5db2784e7bb4fe675ab901e124033b00` | security: apply moderate-tier hardening fixes (M1-M3) | unknown | unprocessed | — | — | — | — | — | — |
-| `9f91d1c41fb9a76e6ae393663ce7fce6e6f02b63` | security: H1 - API key authentication layer | unknown | unprocessed | — | — | — | — | — | — |
-| `b6986e1296efab645f066f0f57883ce299e6ecef` | fix: add api_key to IWeb interface in Angular config model | unknown | unprocessed | — | — | — | — | — | — |
-| `1661b935411f30b2eab97b3badcc9a115eba0402` | fix: restore LFTP queue command format and add api_key to Angular config model | unknown | unprocessed | — | — | — | — | — | — |
-| `ea4ae40f41a32e2a539bc32b8257fb744dc57551` | feat: multi-select and bulk file operations on dashboard | unknown | unprocessed | — | — | — | — | — | — |
-| `2238a326037bbf5a106b452a5bdf4a7b238bb0fa` | fix: set PTY width to 10000 cols to prevent LFTP line-wrapping crash | unknown | unprocessed | — | — | — | — | — | — |
-| `4516bd5392c5bf116fddbba98ff0a360e0278089` | fix: only backup settings.cfg when content has changed | unknown | unprocessed | — | — | — | — | — | — |
-| `866921b6929e8c9134cca25d5c03341bf5e75da7` | Add settle_delay_secs to eliminate OS page-cache false positives in validation | unknown | unprocessed | — | — | — | — | — | — |
-| `e2f17945a86002e18a530eea1400c3d1cab04b2b` | Add settle_delay_secs to rapidcopy.py default config | unknown | unprocessed | — | — | — | — | — | — |
-| `4fca389709ff228c72d70f3c04ee7679b8f74fba` | fix: build scanfs against Debian Bullseye (GLIBC 2.31) for Ubuntu 22.04 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `207b75e34e1add2a543c74a424ca907c69b60c6c` | fix: add read+execute permission on setup_default_config.sh | unknown | unprocessed | — | — | — | — | — | — |
 | `2e175c0cb0ff6d5f56af3d9f2dd9d4833dc941e1` | fix: ensure Python source files are world-readable after COPY | unknown | unprocessed | — | — | — | — | — | — |
 | `d4e4b7e0c467c87dc527a6fad30fc11c39dea060` | Fix logs page lockup: cap live DOM and default to INFO level | unknown | unprocessed | — | — | — | — | — | — |
 | `ee0718ab6633cfc00d2b822bb4a658fde8f43226` | Add dashboard pagination and fix test_config for deleted_age_off_secs | unknown | unprocessed | — | — | — | — | — | — |
