@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `591 / 672 remaining`
+Open rows in this file: `564 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `7e7289e4ee2ab15364b82c01840e6553987dcc03` | Update compose files to use compose spec format | unknown | unprocessed | — | — | — | — | — | — |
-| `0e228818abde8249fe414b1563814e7f8716ce68` | Remove unsupported cgroup attribute from compose file | unknown | unprocessed | — | — | — | — | — | — |
-| `b5cf1d2a037634b3a872cfd31834d06dcd1c5266` | Add cgroup: host for cgroups v2 systemd support | unknown | unprocessed | — | — | — | — | — | — |
-| `87d2d141f9683493406e854bc6739590a5acbaad` | Configure Docker daemon with cgroupns=host for e2e tests | unknown | unprocessed | — | — | — | — | — | — |
-| `99e6d9e361bb52092e2462ba2705226101c01bc7` | Fix network-online.target blocking seedsync service start | unknown | unprocessed | — | — | — | — | — | — |
-| `f65a996907872d846b1da1d0269839f819c94bbb` | Fix stage/deb Dockerfile to match ubuntu-systemd base images | unknown | unprocessed | — | — | — | — | — | — |
-| `5e2cc8e63bb124041e4199b3f8e5d885eecac705` | Fix multiple e2e test issues found in thorough review | unknown | unprocessed | — | — | — | — | — | — |
-| `f25353f0dfd1ba8054597cfce221080cb7350692` | Use /sbin/init instead of /lib/systemd/systemd in stage/deb | unknown | unprocessed | — | — | — | — | — | — |
-| `f4b496b8f02a61dda01e2ba123969f6528831a1c` | Merge cgroupns config with existing Docker daemon.json | unknown | unprocessed | — | — | — | — | — | — |
-| `601c7df394830b9b429da51ab84efd0617ed496b` | Add debug output to entrypoint to diagnose e2e test failures | unknown | unprocessed | — | — | — | — | — | — |
-| `e7aece98b07cf8dc6e8938ac9c401deaada9fead` | Disable systemd mode for E2E tests - run seedsync directly | unknown | unprocessed | — | — | — | — | — | — |
-| `fde8158dc5a738f57f48d3688cee6f51530fddb6` | Remove systemctl enable from install script (not using systemd) | unknown | unprocessed | — | — | — | — | — | — |
-| `d1694dd1e5c10156ffde88b3667c80c420c1b335` | Fix entrypoint to run seedsync as user 'user' with correct HOME | unknown | unprocessed | — | — | — | — | — | — |
-| `c1a1a5ed177f26e7f6bcb2095d6f6700a4452b65` | Add comprehensive debugging output to E2E test entrypoint | unknown | unprocessed | — | — | — | — | — | — |
-| `a782f7e75826573c47be1bfc0b76e5357fa23e6e` | Fix myapp container log capture to use OS-specific container names | unknown | unprocessed | — | — | — | — | — | — |
-| `f2b4889765a4cb53475b3a452577fd5024a8bc4c` | Fix scanfs path in deb build - copy to _internal directory | unknown | unprocessed | — | — | — | — | — | — |
-| `0cb32280056fcfdad740dc34d8e505e961dc4740` | Fix Bottle _stop_flag attribute conflict in web_app.py | unknown | unprocessed | — | — | — | — | — | — |
-| `2ae51736a47e993de71e8660fe7e39b5b2e2c78a` | Update deb E2E test matrix for GLIBC 2.29+ compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `4cbdaa549f20e6bd572a8ddc7da93cb5870c59d9` | Update Makefile and docs for GLIBC 2.29+ requirement | unknown | unprocessed | — | — | — | — | — | — |
-| `ef283ccf187c2fd6ede23df98c96747f2e8579f3` | Fix HTML path in deb build - copy to _internal/html | unknown | unprocessed | — | — | — | — | — | — |
-| `8fac10e480cbb283a3be3f1e452f8f776a46c69f` | Fix E2E test failures for autoqueue and dashboard tests | unknown | unprocessed | — | — | — | — | — | — |
-| `7897c8ea7c4e85aaf59beaf53fd095604d813f3c` | Catch LftpJobStatusParserError in controller to prevent server crash | unknown | unprocessed | — | — | — | — | — | — |
-| `9e84b9e54d3284a90fb9864b4612fb1ded3f3914` | Handle LftpJobStatusParserError in kill command | unknown | unprocessed | — | — | — | — | — | — |
-| `b4c393ef9f3b78c82e1246b79d0d98ae0070531a` | Fix E2E test: trim whitespace from extracted text content | unknown | unprocessed | — | — | — | — | — | — |
-| `3f7af5c79aaff746c595b37097e84cbbd61e84e9` | Fix Docker ARM E2E tests: match remote container architecture | unknown | unprocessed | — | — | — | — | — | — |
-| `2e2a60e030d40ca33c6da4795c2b86d5c604f2b8` | Remove redundant platforms build key from compose.yml | unknown | unprocessed | — | — | — | — | — | — |
-| `c73205b19c707ac74da18513a0e56ec0d5fcbebb` | Set DOCKER_DEFAULT_PLATFORM for cross-architecture builds | unknown | unprocessed | — | — | — | — | — | — |
 | `b4fb9465ab46a0cb21c7ba2f1bc17b0b4c7f98f1` | Fix Docker ARM E2E: pre-build remote container for target platform | unknown | unprocessed | — | — | — | — | — | — |
 | `0ac447026442c5f181ea2c845025f1f0e4c6bff3` | Exclude arm64 from Docker e2e tests - too slow under QEMU | unknown | unprocessed | — | — | — | — | — | — |
 | `49e8d61c652e557d1c2b0324c8b01b24ae885f40` | Merge pull request #36 from Jules1651/claude/review-previous-context-AI8Oj | unknown | unprocessed | — | — | — | — | — | — |
