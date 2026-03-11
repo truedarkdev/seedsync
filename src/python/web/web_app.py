@@ -93,6 +93,9 @@ class WebApp(bottle.Bottle):
     def add_post_handler(self, path: str, handler: Callable):
         self.post(path)(handler)
 
+    def add_put_handler(self, path: str, handler: Callable):
+        self.put(path)(handler)
+
     def add_delete_handler(self, path: str, handler: Callable):
         self.delete(path)(handler)
 

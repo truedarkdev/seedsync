@@ -4,10 +4,12 @@ import unittest
 from unittest.mock import MagicMock
 import logging
 import sys
+import shutil
+import tempfile
 
 from webtest import TestApp
 
-from common import overrides, Status, Config
+from common import overrides, Status, Config, PathPairManager
 from controller import AutoQueuePersist
 from web import WebAppBuilder
 
@@ -21,6 +23,7 @@ class BaseTestWebApp(unittest.TestCase):
     def setUp(self):
         self.context = MagicMock()
         self.controller = MagicMock()
+        self.temp_dir = tempfile.mkdtemp(prefix="test_web_app")
 
         # Mock the base logger
         logger = logging.getLogger()
@@ -39,6 +42,8 @@ class BaseTestWebApp(unittest.TestCase):
 
         # Real config
         self.context.config = Config()
+        self.context.path_pair_manager = PathPairManager(self.temp_dir)
+        self.context.path_pair_manager.load()
 
         # Real auto-queue persist
         self.auto_queue_persist = AutoQueuePersist()
@@ -58,6 +63,10 @@ class BaseTestWebApp(unittest.TestCase):
                                              self.auto_queue_persist)
         self.web_app = self.web_app_builder.build()
         self.test_app = TestApp(self.web_app)
+
+    @overrides(unittest.TestCase)
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
 
 
 class TestWebApp(BaseTestWebApp):

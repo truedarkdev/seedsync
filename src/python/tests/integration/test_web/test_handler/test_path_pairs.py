@@ -1,0 +1,128 @@
+# Copyright 2026, SeedSync Contributors, All rights reserved.
+
+import json
+
+from tests.integration.test_web.test_web_app import BaseTestWebApp
+
+
+class TestPathPairsHandler(BaseTestWebApp):
+    def test_get_all_initially_empty(self):
+        response = self.test_app.get("/server/path-pairs")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual({"success": True, "data": []}, json.loads(response.text))
+
+    def test_create_and_get_one(self):
+        response = self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies",
+            "enabled": True,
+            "auto_queue": False
+        })
+
+        self.assertEqual(200, response.status_int)
+        created = json.loads(response.text)["data"]
+        self.assertEqual("Movies", created["name"])
+        self.assertEqual("/remote/movies", created["remote_path"])
+        self.assertEqual("/local/movies", created["local_path"])
+        self.assertEqual(False, created["auto_queue"])
+
+        fetched = self.test_app.get("/server/path-pairs/{}".format(created["id"]))
+        self.assertEqual(200, fetched.status_int)
+        self.assertEqual(created, json.loads(fetched.text)["data"])
+
+    def test_create_requires_remote_and_local_paths(self):
+        response = self.test_app.post_json(
+            "/server/path-pairs",
+            {"name": "Invalid"},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_int)
+        self.assertEqual(
+            "remote_path and local_path are required",
+            json.loads(response.text)["error"]
+        )
+
+    def test_create_rejects_wrong_field_types(self):
+        response = self.test_app.post_json(
+            "/server/path-pairs",
+            {"name": "Invalid", "remote_path": 123, "local_path": []},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_int)
+        self.assertEqual(
+            "Path pair 'Invalid': remote_path must be a string",
+            json.loads(response.text)["error"]
+        )
+
+    def test_create_rejects_invalid_json(self):
+        response = self.test_app.post(
+            "/server/path-pairs",
+            "{bad json",
+            content_type="application/json",
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_int)
+        self.assertIn("Invalid JSON:", json.loads(response.text)["error"])
+
+    def test_update_existing_pair(self):
+        created = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies"
+        }).text)["data"]
+
+        response = self.test_app.put_json("/server/path-pairs/{}".format(created["id"]), {
+            "name": "Films",
+            "enabled": False
+        })
+
+        self.assertEqual(200, response.status_int)
+        updated = json.loads(response.text)["data"]
+        self.assertEqual("Films", updated["name"])
+        self.assertEqual(False, updated["enabled"])
+        self.assertEqual("/remote/movies", updated["remote_path"])
+        self.assertEqual("/local/movies", updated["local_path"])
+
+    def test_delete_existing_pair(self):
+        created = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies"
+        }).text)["data"]
+
+        response = self.test_app.delete("/server/path-pairs/{}".format(created["id"]))
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual(created["id"], json.loads(response.text)["data"]["deleted"])
+        self.assertEqual([], self.context.path_pair_manager.get_all_pairs())
+
+    def test_reorder_pairs(self):
+        first = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies"
+        }).text)["data"]
+        second = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "TV",
+            "remote_path": "/remote/tv",
+            "local_path": "/local/tv"
+        }).text)["data"]
+
+        response = self.test_app.post_json("/server/path-pairs/reorder", {
+            "order": [second["id"], first["id"]]
+        })
+
+        self.assertEqual(200, response.status_int)
+        data = json.loads(response.text)["data"]
+        self.assertEqual([second["id"], first["id"]], [pair["id"] for pair in data])
+
+    def test_get_missing_pair_returns_404(self):
+        response = self.test_app.get("/server/path-pairs/missing", expect_errors=True)
+
+        self.assertEqual(404, response.status_int)
+        self.assertEqual(False, json.loads(response.text)["success"])
