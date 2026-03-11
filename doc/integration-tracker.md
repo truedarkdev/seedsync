@@ -163,7 +163,7 @@ Post-audit consolidation task:
 - use that matrix to drive implementation ordering and to map each finished follow-up back to every audit row it closes
 
 - Pass date: `2026-03-11`
-- Active fork: `rapidcopy`
+- Active fork: `thejuran`
 - Batch size completed this pass: `15`
 
 Reopened subjects:
@@ -292,6 +292,15 @@ Thejuran audit status:
 - Reviewer count: `6`
 - Reopened subjects: Subjects `2` and `12`, centered on the still-missing files-page dropdown/actions-visibility lane (`da35b7eb`, `b3011297`, `778ec702`, `6ce80863`, `ebe0cd69`) plus the missing common-module test coverage slice (`91fa0101`, `5e39fdeb` and their Phase 16 planning rows)
 - Workflow learnings: docs-only milestone summary rows can still legitimately map to `needs subject reopen` when they summarize a concrete missing implementation cluster, so do not auto-skip them purely because they live under `.planning`; archive and landing-page totals should be derived from the actual row counts on disk rather than inherited summary numbers, since the pre-existing `thejuran-007` chunk already contained `28` rows instead of the stale `27` shown on the landing page
+
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `108`
+- Commits processed: `03869bcec77c791d7ca77276f0654b9d226ad3c1` through `0eeef6cfae686625b4c1a148caa985d41680d497`
+- Disposition summary: `1` already integrated, `1` covered elsewhere, `104` intentionally skipped, `2` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `0`
+- Reopened subjects: Subject `15`, for the still-missing Linux `st_ctime` fallback in `scanner.py` plus its companion integration-test patch (`569622eb`, `7d85e6ae`) that was hidden inside an otherwise skipped file-metadata/theme-heavy run
+- Workflow learnings: when a mostly skipped UX or milestone-heavy lane still touches shared backend timestamp fields, re-check the underlying runtime files before inheriting the surrounding skip rationale; docs, archive, and active-ledger totals should continue to be recalculated from the actual row counts after each 108-row wave instead of assuming the requested batch size implies the archive split
 
 ## Subject 1 - Documentation And Maintainer Notes
 
@@ -471,7 +480,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `19fb3ec3dd56c9f40afb331e2f461c3fd98cc18c`
 - Source branch: thejuran/master
@@ -486,7 +495,7 @@ Integrated:
 - adapted `7f2de68`, `45ee834`, `a4356d4`, and `56463ad`: added `package-mode = false`, aligned `pytest`, `pytest-timeout`, and `pytest-cov` with the current Python 3.8 toolchain, regenerated `src/python/poetry.lock`, and switched the Makefile to `docker compose` in local commit `d7954f9`
 
 Pending:
-- none
+- Audit reopen: `569622eb` and `7d85e6ae` exposed a still-missing Linux created-timestamp fallback in `src/python/system/scanner.py`, where local `st_birthtime` failures still drop to `None` instead of using `st_ctime`; reopen Subject 15 with the companion integration-test update from the same lane.
 
 Covered elsewhere:
 - `0d0037d`: pytest `pythonpath` configuration already integrated in Subject 2 via `8c7be91`
@@ -1567,7 +1576,7 @@ Verification:
 - status: review only; no new code landed
 
 Notes:
-- this pass found no remaining thejuran-specific Subject 15 implementation gap beyond behavior already integrated under Subject 13 or existing base history
+- this pass found no remaining thejuran-specific Subject 15 implementation gap beyond behavior already integrated under Subject 13 or existing base history, until the post-integration audit later surfaced the missing Linux `st_ctime` fallback and companion test follow-up from `569622eb` / `7d85e6ae`
 
 ### rapidcopy
 
