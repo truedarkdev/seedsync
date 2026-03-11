@@ -257,6 +257,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `4`, `5`, `8`, `9`, `10`, `11`, and `18`, dominated by the deferred ARM64 publish/test lane plus a concrete SSE/log-stream hardening cluster and one remaining checkbox-config serialization bug
 - Workflow learnings: when a fork iterates on the same bug across several small commits, collapse the row proof onto the final local behavior instead of treating each intermediate upstream step as a unique gap; when an upstream mixed commit contains legacy-harness-irrelevant tests plus a real backend gap, record the irrelevant harness slice explicitly so the reopen row stays tied to the actionable code
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `a07a754554e4428a600b694c6ee769b69aaf287f` through `b2ad44eeeb3eb04e674e6dfaccc094e0c317e541`
+- Disposition summary: `0` already integrated, `5` covered elsewhere, `18` intentionally skipped, `4` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `0`
+- Reopened subjects: Subjects `2`, `4`, `6`, `11`, and `12`, with the real remaining work concentrated in the deferred Docker publish workflow and the still-missing bulk-endpoint performance/security hardening slices
+- Workflow learnings: when a later upstream subject note explicitly marks UX follow-ups as optional, keep those rows as intentional skips instead of reopening the whole feature area; when a broad feature foundation already landed locally, treat later hardening commits separately from the optional UI/perf layers so the reopen matrix stays deduplicable
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
