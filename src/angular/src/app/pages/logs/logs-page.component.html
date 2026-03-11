@@ -1,4 +1,13 @@
 <div id="logs">
+    <div class="logs-filter">
+        <input id="logs-filter-input"
+               type="search"
+               class="form-control"
+               [value]="searchQuery"
+               placeholder="Filter logs"
+               (input)="onSearchQueryChange($event.target.value)">
+    </div>
+
     <!--suppress HtmlUnknownAttribute -->
     <ng-template #templateRecord let-record="record">
         <p class="record"

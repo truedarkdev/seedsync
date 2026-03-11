@@ -28,6 +28,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     private static readonly MAX_LIVE_RECORDS = 500;
 
     public headerHeight: Observable<number>;
+    public searchQuery = "";
 
     @ViewChild("templateRecord") templateRecord;
 
@@ -44,6 +45,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     private _logService: LogService;
     private _connectedService: ConnectedService;
+    private _records: LogRecord[] = [];
     private _viewInitialized = false;
     private _destroy$: Subject<void> = new Subject<void>();
 
@@ -101,6 +103,11 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
         this.refreshScrollButtonVisibility();
     }
 
+    onSearchQueryChange(value: string) {
+        this.searchQuery = value || "";
+        this.renderRecords(false);
+    }
+
     private insertRecord(record: LogRecord) {
         if (!this.container || !this.templateRecord || !this.logTail) {
             return;
@@ -109,16 +116,43 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
         // Scroll down if the log is visible and already scrolled to the bottom
         const scrollToBottom = this._elementRef.nativeElement.offsetParent != null &&
             LogsPageComponent.isElementInViewport(this.logTail.nativeElement);
-        this.container.createEmbeddedView(this.templateRecord, {record: record});
-        while (this.container.length > LogsPageComponent.MAX_LIVE_RECORDS) {
-            this.container.remove(0);
+        this._records.push(record);
+        while (this._records.length > LogsPageComponent.MAX_LIVE_RECORDS) {
+            this._records.shift();
         }
+        this.renderRecords(scrollToBottom);
+    }
+
+    private renderRecords(scrollToBottom: boolean) {
+        if (!this.container || !this.templateRecord) {
+            return;
+        }
+
+        this.container.clear();
+        this.filteredRecords.forEach(record => {
+            this.container.createEmbeddedView(this.templateRecord, {record: record});
+        });
         this._changeDetector.detectChanges();
 
         if (scrollToBottom) {
             this.scrollToBottom();
         }
         this.refreshScrollButtonVisibility();
+    }
+
+    private get filteredRecords(): LogRecord[] {
+        const query = this.searchQuery.trim().toLowerCase();
+        if (!query) {
+            return this._records;
+        }
+
+        return this._records.filter(record => {
+            return [
+                record.loggerName,
+                record.message,
+                record.exceptionTraceback
+            ].some(value => (value || "").toLowerCase().indexOf(query) !== -1);
+        });
     }
 
     private refreshScrollButtonVisibility() {
