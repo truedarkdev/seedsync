@@ -705,7 +705,7 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Audit order note: `Resume rapidcopy first until all rapidcopy rows are closed; then move to the next fork unless the maintainer changes the order.`
 Parallel triage note: `Within each batch, process the 3 oldest remaining rapidcopy commits in parallel, then continue with the next 3 oldest remaining commits.`
-Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. 9 completed commits is only a continue-check reminder, not a stopping point.`
+Batch completion note: `Do not stop before the full maintainer-approved batch is done unless a real reviewer/maintainer exception blocks progress. After each finished 3-commit triage group, write those completed rows into this ledger before starting the next 3. 9 completed commits is only a continue-check reminder, not a stopping point.`
 
 Open rows in this file: `153 / 224 remaining`
 

@@ -105,6 +105,7 @@ Audit workflow:
 - inventory every fork-local upstream commit into the audit ledger before making dispositions
 - process commits oldest to newest
 - within the active fork, process first-pass triage in groups of the 3 oldest remaining commits, then continue with the next 3 oldest remaining commits until the batch is complete
+- after each finished 3-commit triage group, immediately write those completed rows into `doc/post-integration-audit-active.md` before starting the next 3 commits; do not rely on memory to carry finished dispositions across groups
 - after every 9 completed commits in a batch, treat that as a continue-check only: update your mental remaining count and keep going immediately unless the batch is actually complete
 - keep a per-commit disposition even when several commits later map to one follow-up task
 - do not implement missed work during the audit by default; convert it into a specific follow-up integration task or explicit subject reopen

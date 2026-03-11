@@ -26,10 +26,12 @@ Recommended process:
 9. after each audit run, note whether `explorer-fast` showed good judgment on the commit being reviewed, including whether it over-escalated, under-escalated, or misclassified the likely disposition
 10. if working inside a planned autonomous audit wave, do not stop at a natural checkpoint just to summarize progress; keep going until the wave is finished or a real reviewer/maintainer exception interrupts it
 11. once a maintainer-approved batch has started, you are not allowed to stop before the full batch is done unless a real reviewer-worthy or maintainer-worthy exception blocks further progress
-12. 9 completed commits inside a batch is only a progress reminder, never a stopping point; after every 9 commits, explicitly confirm the remaining batch count and continue immediately
-13. when the planned batch is finished, stop there: summarize the full batch result, count how many reviewers were spawned, note any workflow improvements, and wait for maintainer confirmation of the next batch and its size before continuing
-14. record the maintainer-approved batch size in this ledger and treat it as sticky for later audit runs until the maintainer explicitly changes it; do not silently fall back to a smaller or ad hoc batch size on resume
-15. unless the maintainer explicitly changes it, process the 3 oldest remaining upstream commits in parallel for first-pass triage, then move to the next 3 oldest remaining commits; this concurrency cap is separate from the maintained audit batch size
+12. after each finished triage group, write the completed rows into `doc/post-integration-audit-active.md` immediately before starting the next group; do not keep completed row dispositions only in working memory or subagent output while continuing through the batch
+13. unless the maintainer explicitly changes the triage group size, a finished triage group means the current 3-oldest parallel commit set; if only part of that set is resolved, finish the remaining commit(s) or record the blocking exception in the ledger before moving on
+14. 9 completed commits inside a batch is only a progress reminder, never a stopping point; after every 9 commits, explicitly confirm the remaining batch count and continue immediately
+15. when the planned batch is finished, stop there: summarize the full batch result, count how many reviewers were spawned, note any workflow improvements, and wait for maintainer confirmation of the next batch and its size before continuing
+16. record the maintainer-approved batch size in this ledger and treat it as sticky for later audit runs until the maintainer explicitly changes it; do not silently fall back to a smaller or ad hoc batch size on resume
+17. unless the maintainer explicitly changes it, process the 3 oldest remaining upstream commits in parallel for first-pass triage, then move to the next 3 oldest remaining commits; this concurrency cap is separate from the maintained audit batch size
 
 Reviewer gate:
 - use `explorer-fast` or `explorer` for first-pass triage
