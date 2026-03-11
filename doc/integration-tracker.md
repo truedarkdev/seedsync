@@ -163,6 +163,8 @@ Post-audit consolidation task:
 - use that matrix to drive implementation ordering and to map each finished follow-up back to every audit row it closes
 - Phase A raw matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-a.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-a.md)
   - scope: every `needs subject reopen` audit row was mapped to at least one raw missing-feature bucket, with merge commits allowed in multiple buckets when a single row covered multiple still-missing slices
+- Phase B deduplicated execution matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-b.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-b.md)
+  - scope: merged only the narrow Phase A buckets that shared implementation scope cleanly, preserved broader modernization and partially covered lanes as separate tasks, and recorded dependencies for one-by-one execution
 
 - Pass date: `2026-03-11`
 - Active fork: `thejuran`
