@@ -24,6 +24,9 @@ class BaseTestWebApp(unittest.TestCase):
         self.context = MagicMock()
         self.controller = MagicMock()
         self.temp_dir = tempfile.mkdtemp(prefix="test_web_app")
+        with open("{}/index.html".format(self.temp_dir), "w") as html_file:
+            html_file.write("<html></html>")
+        self.context.args.html_path = self.temp_dir
 
         # Mock the base logger
         logger = logging.getLogger()
@@ -72,3 +75,11 @@ class BaseTestWebApp(unittest.TestCase):
 class TestWebApp(BaseTestWebApp):
     def test_process(self):
         self.web_app.process()
+
+    def test_index_sets_connect_src_csp_header(self):
+        response = self.test_app.get("/")
+
+        self.assertEqual(
+            "connect-src 'self' https://api.github.com",
+            response.headers["Content-Security-Policy"]
+        )

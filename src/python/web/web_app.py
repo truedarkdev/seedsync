@@ -57,6 +57,7 @@ class WebApp(bottle.Bottle):
     Web app implementation
     """
     _STREAM_POLL_INTERVAL_IN_MS = 100
+    _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
 
     def __init__(self, context: Context, controller: Controller):
         super().__init__()
@@ -130,7 +131,9 @@ class WebApp(bottle.Bottle):
         :param file_path:
         :return:
         """
-        return static_file(file_path, root=self.__html_path)
+        response = static_file(file_path, root=self.__html_path)
+        response.set_header("Content-Security-Policy", self._CONTENT_SECURITY_POLICY)
+        return response
 
     def __web_stream(self):
         # Initialize all the handlers
