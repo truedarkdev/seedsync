@@ -159,7 +159,7 @@ Recommended audit ledger fields:
 
 - Pass date: `2026-03-11`
 - Active fork: `rapidcopy`
-- Batch size completed this pass: `27`
+- Batch size completed this pass: `30`
 
 Reopened subjects:
 - Subjects `8`, `10`, and `11`: reopen together for the deferred path-pair settings/API/config cluster surfaced by `d1436386`, `a33981b5`, `58ead058`, and `88ffbd00`, including path-pair CRUD/UI, path-pair-aware config validation, and Angular config-schema/null-handling fixes.
@@ -167,8 +167,12 @@ Reopened subjects:
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
+- Docker cache-ignore hygiene: `50502647` adds `.ruff_cache` and `.mypy_cache` exclusions for Docker build contexts; current `master` uses Dockerfile-specific ignore files instead of a root `.dockerignore`, but those files still do not exclude the cache directories, so handle this as a small Subject 4 packaging follow-up.
+- File progress percentage edge cases: `14adf8b9` fixes rounded percentages and the `0%`-when-both-sizes-are-zero case in `view-file.service`; current `master` still uses `Math.trunc` and still shows `100%` when `remoteSize` is unknown, so handle this as a small Subject 12 files-UI follow-up without importing the accompanying modernization-plan bookkeeping.
+- Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
 - Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
+- Runtime SSH directory ignore hardening: `de8b602b` shows that current `.gitignore` still lacks an explicit `ssh/` entry even though key filenames are ignored; handle this as a small Subject 4 packaging/hygiene follow-up.
 - LFTP parser test SyntaxWarning cleanup: `58af9ee8` is still missing locally, and `python3 -m py_compile src/python/tests/unittests/test_lftp/test_job_status_parser.py` still emits invalid-escape warnings that should be handled as a small Subject 14 follow-up instead of being buried inside broader dependency churn.
 
 Intentional audit closures worth remembering:
@@ -178,6 +182,8 @@ Intentional audit closures worth remembering:
 
 Audit workflow learnings:
 - Explorer-first triage should check whether a commit only touches a stack already marked as intentionally deferred or already assigned to an open follow-up task before proposing a new task; during this batch, derivative Playwright and validation commits initially over-escalated until they were reconciled against the existing deferral/follow-up ledger.
+- Reviewer subagents should stay read-only during audit waves; have reviewers return evidence only, keep ledger edits in the main thread, and use `worker` only for intentional implementation tasks.
+- Recount the exact row span before archiving and summary updates; this batch rolled 30 rapidcopy rows into one wave, so the archive chunk and status totals needed a post-archive count check instead of assuming the requested wave size.
 
 ## Subject 1 - Documentation And Maintainer Notes
 
