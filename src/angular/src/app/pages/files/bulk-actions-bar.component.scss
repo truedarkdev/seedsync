@@ -1,0 +1,21 @@
+@import '../../common/common';
+
+:host {
+    display: block;
+}
+
+.bulk-actions {
+    align-items: center;
+    background-color: $header-color;
+    border-bottom: 1px solid $primary-dark-color;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px;
+}
+
+.selection-count {
+    color: white;
+    font-weight: 600;
+    margin-right: 4px;
+}

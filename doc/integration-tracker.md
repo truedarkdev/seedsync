@@ -1351,6 +1351,7 @@ Integrated:
 - `e0b235e` adapted the low-risk lifecycle-safety portion of `2a016f9` / `fd5b0ac` so selected-row auto-scroll waits for the file-row element to exist
 - `4ae0103` adapted `b62970a`: preserve the downloaded state and file-row hinting for local-only files that have lost their remote counterpart
 - `847b3f1` adapted the files-page pagination slice of `ee0718a` without bringing over the unrelated test-config changes from that upstream commit
+- local follow-up commit adapted the files-page dropdown migration and selected-actions visibility lane from `da35b7eb`, `b3011297`, `6ce80863`, and `ebe0cd69`, while treating `778ec702` as planning-only context rather than a code import
 
 Pending:
 - none
@@ -1380,6 +1381,7 @@ Notes:
 - persisted-filter null-default follow-up committed in `8bf456b`
 - the conservative sortable-header slice, lifecycle guard, local-only state fix, and pagination controls are now committed in separate provenance-preserving batches
 - rapidcopy-specific follow-up beyond this conservative close-out is optional file-row polish rather than required Subject 12 functionality
+- the `2026-03-11` audit reopen for the files-page dropdown migration lane and selected-actions visibility pair is now resolved by the local follow-up batch that added close-on-scroll dropdown handling, conservative menu anchoring refinements, and an internal file-list viewport that keeps the bulk-actions bar visible without touching the dirtier page shell files
 
 ## Subject 13 - SSH And Remote Command Handling
 

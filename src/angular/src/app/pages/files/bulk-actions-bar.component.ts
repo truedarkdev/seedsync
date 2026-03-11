@@ -16,6 +16,7 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
     selector: "app-bulk-actions-bar",
     providers: [],
     templateUrl: "./bulk-actions-bar.component.html",
+    styleUrls: ["./bulk-actions-bar.component.scss"],
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class BulkActionsBarComponent {

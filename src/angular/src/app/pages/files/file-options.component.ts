@@ -1,4 +1,4 @@
-import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnInit} from "@angular/core";
+import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable} from "rxjs/Observable";
 
 import * as Immutable from "immutable";
@@ -17,7 +17,7 @@ import {DomService} from "../../services/utils/dom.service";
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 
-export class FileOptionsComponent implements OnInit {
+export class FileOptionsComponent implements OnInit, OnDestroy {
     public ViewFile = ViewFile;
     public ViewFileOptions = ViewFileOptions;
 
@@ -34,6 +34,7 @@ export class FileOptionsComponent implements OnInit {
     public headerHeight: Observable<number>;
 
     private _latestOptions: ViewFileOptions;
+    private readonly _windowScrollListener = () => this.closeOpenDropdowns();
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private viewFileOptionsService: ViewFileOptionsService,
@@ -69,6 +70,12 @@ export class FileOptionsComponent implements OnInit {
 
         // Keep the latest options for toggle behaviour implementation
         this.viewFileOptionsService.options.subscribe(options => this._latestOptions = options);
+
+        window.addEventListener("scroll", this._windowScrollListener, true);
+    }
+
+    ngOnDestroy() {
+        window.removeEventListener("scroll", this._windowScrollListener, true);
     }
 
     onFilterByName(name: string) {
@@ -102,6 +109,23 @@ export class FileOptionsComponent implements OnInit {
     public isStatusDisabled(status: ViewFile.Status) {
         return !this.isStatusAvailable(status) &&
             (!this._latestOptions || this._latestOptions.selectedStatusFilter !== status);
+    }
+
+    private closeOpenDropdowns() {
+        const fileOptions = document.getElementById("file-options");
+        if (fileOptions == null) {
+            return;
+        }
+
+        Array.from(fileOptions.querySelectorAll(".dropdown"))
+            .forEach(dropdown => dropdown.classList.remove("show", "open"));
+        Array.from(fileOptions.querySelectorAll(".dropdown-menu"))
+            .forEach(menu => menu.classList.remove("show"));
+        Array.from(fileOptions.querySelectorAll(".dropdown-toggle"))
+            .forEach(button => {
+                button.classList.remove("show");
+                button.setAttribute("aria-expanded", "false");
+            });
     }
 
     private static getStatusCount(files: Immutable.List<ViewFile>, status: ViewFile.Status) {
