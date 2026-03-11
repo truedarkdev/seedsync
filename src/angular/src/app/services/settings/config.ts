@@ -10,9 +10,11 @@ import {Record} from "immutable";
  */
 interface IGeneral {
     debug: boolean;
+    verbose: boolean;
 }
 const DefaultGeneral: IGeneral = {
-    debug: null
+    debug: null,
+    verbose: null
 };
 const GeneralRecord = Record(DefaultGeneral);
 
@@ -135,11 +137,19 @@ export class Config extends ConfigRecord implements IConfig {
     constructor(props) {
         // Create immutable members
         super({
-            general: GeneralRecord(props.general),
-            lftp: LftpRecord(props.lftp),
-            controller: ControllerRecord(props.controller),
-            web: WebRecord(props.web),
-            autoqueue: AutoQueueRecord(props.autoqueue)
+            general: GeneralRecord((props && props.general) || {}),
+            lftp: LftpRecord((props && props.lftp) || {}),
+            controller: ControllerRecord((props && props.controller) || {}),
+            web: WebRecord((props && props.web) || {}),
+            autoqueue: AutoQueueRecord((props && props.autoqueue) || {})
         });
+    }
+
+    getValue(section: string, option: string): any {
+        const sectionRecord = this.get(section as any);
+        if (sectionRecord && typeof sectionRecord.get === "function") {
+            return sectionRecord.get(option);
+        }
+        return null;
     }
 }

@@ -8,7 +8,8 @@ describe("Testing config record initialization", () => {
     beforeEach(() => {
         const configJson = {
             general: {
-                debug: true
+                debug: true,
+                verbose: false
             },
             lftp: {
                 remote_address: "remote.server.com",
@@ -50,6 +51,7 @@ describe("Testing config record initialization", () => {
 
     it("should initialize with correct values", () => {
         expect(config.general.debug).toBe(true);
+        expect(config.general.verbose).toBe(false);
         expect(config.lftp.remote_address).toBe("remote.server.com");
         expect(config.lftp.remote_username).toBe("some.user");
         expect(config.lftp.remote_password).toBe("my.password");
@@ -87,5 +89,15 @@ describe("Testing config record initialization", () => {
         expect(config.controller instanceof Immutable.Record).toBe(true);
         expect(config.web instanceof Immutable.Record).toBe(true);
         expect(config.autoqueue instanceof Immutable.Record).toBe(true);
+    });
+
+    it("should allow missing sections and null-safe value lookup", () => {
+        const partialConfig = new Config({general: {debug: true}});
+
+        expect(partialConfig.general.debug).toBe(true);
+        expect(partialConfig.getValue("general", "debug")).toBe(true);
+        expect(partialConfig.getValue("general", "verbose")).toBe(null);
+        expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
+        expect(partialConfig.getValue("missing", "value")).toBe(null);
     });
 });

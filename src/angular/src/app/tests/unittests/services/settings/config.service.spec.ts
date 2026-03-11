@@ -53,7 +53,8 @@ describe("Testing config service", () => {
     it("should parse config json correctly", () => {
         const configJson = {
             general: {
-                debug: true
+                debug: true,
+                verbose: false
             },
             lftp: {
                 remote_address: "remote.server.com",
@@ -90,6 +91,7 @@ describe("Testing config service", () => {
         configService.config.subscribe({
             next: config => {
                 expect(config.general.debug).toBe(true);
+                expect(config.general.verbose).toBe(false);
                 expect(config.lftp.remote_address).toBe("remote.server.com");
                 expect(config.lftp.remote_username).toBe("some.user");
                 expect(config.lftp.remote_password).toBe("my.password");
@@ -200,6 +202,18 @@ describe("Testing config service", () => {
         httpMock.expectOne("/server/config/set/general/debug/true").flush("{}");
 
         expect(configSubscriberIndex).toBe(1);
+        httpMock.verify();
+    });
+
+    it("should stringify checkbox values before sending config updates", () => {
+        httpMock.expectOne("/server/config/get").flush({general: {debug: false}});
+
+        configService.set("general", "debug", true).subscribe(DoNothing);
+        httpMock.expectOne("/server/config/set/general/debug/true").flush("{}");
+
+        configService.set("general", "debug", false).subscribe(DoNothing);
+        httpMock.expectOne("/server/config/set/general/debug/false").flush("{}");
+
         httpMock.verify();
     });
 

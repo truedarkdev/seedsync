@@ -4,6 +4,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from common import PathPair, PathPairError, PathPairManager
 
@@ -63,3 +64,15 @@ class TestPathPairManager(unittest.TestCase):
 
         with self.assertRaises(PathPairError):
             PathPair(name="Invalid", remote_path="/remote", local_path=[]).validate()
+
+    @patch("common.path_pair.is_running_in_docker", return_value=True)
+    def test_validate_returns_docker_warning_for_non_downloads_path(self, _):
+        warnings = PathPair(
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/media/movies"
+        ).validate()
+
+        self.assertEqual(1, len(warnings))
+        self.assertIn("/media/movies", warnings[0])
+        self.assertIn("/downloads", warnings[0])

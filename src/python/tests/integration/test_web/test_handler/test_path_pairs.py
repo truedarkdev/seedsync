@@ -1,6 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import json
+from unittest.mock import patch
 
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
@@ -87,6 +88,19 @@ class TestPathPairsHandler(BaseTestWebApp):
         self.assertEqual(False, updated["enabled"])
         self.assertEqual("/remote/movies", updated["remote_path"])
         self.assertEqual("/local/movies", updated["local_path"])
+
+    def test_create_returns_validation_warnings(self):
+        with patch("common.path_pair.is_running_in_docker", return_value=True):
+            response = self.test_app.post_json("/server/path-pairs", {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/media/movies"
+            })
+
+        self.assertEqual(200, response.status_int)
+        payload = json.loads(response.text)
+        self.assertEqual(1, len(payload["warnings"]))
+        self.assertIn("/media/movies", payload["warnings"][0])
 
     def test_delete_existing_pair(self):
         created = json.loads(self.test_app.post_json("/server/path-pairs", {

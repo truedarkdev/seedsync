@@ -17,6 +17,19 @@ class PathPairError(AppError):
     pass
 
 
+DOCKER_DOWNLOADS_BASE = "/downloads"
+
+
+def is_running_in_docker() -> bool:
+    if os.path.exists("/.dockerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", "r", encoding="utf-8") as handle:
+            return "docker" in handle.read()
+    except OSError:
+        return False
+
+
 @dataclass
 class PathPair:
     """
@@ -33,7 +46,7 @@ class PathPair:
         if not self.name:
             self.name = os.path.basename(self.remote_path.rstrip("/")) or "Default"
 
-    def validate(self):
+    def validate(self) -> List[str]:
         if type(self.remote_path) != str:
             raise PathPairError("Path pair '{}': remote_path must be a string".format(self.name))
         if not self.remote_path.strip():
@@ -46,6 +59,18 @@ class PathPair:
             raise PathPairError("Path pair '{}': id must be a string".format(self.name))
         if not self.id:
             raise PathPairError("Path pair '{}': id cannot be empty".format(self.name))
+        warnings = []
+        if is_running_in_docker():
+            local_path = os.path.normpath(self.local_path)
+            downloads_base = os.path.normpath(DOCKER_DOWNLOADS_BASE)
+            if not (local_path == downloads_base or local_path.startswith(downloads_base + os.sep)):
+                warnings.append(
+                    "Path pair '{}': Local path '{}' is not under '{}'. In Docker, local paths "
+                    "should be subdirectories of '{}'.".format(
+                        self.name, self.local_path, DOCKER_DOWNLOADS_BASE, DOCKER_DOWNLOADS_BASE
+                    )
+                )
+        return warnings
 
 
 @dataclass
@@ -66,17 +91,18 @@ class PathPairCollection:
         return None
 
     def add_pair(self, pair: PathPair):
-        pair.validate()
+        warnings = pair.validate()
         if self.get_pair_by_id(pair.id):
             raise PathPairError("Path pair with id '{}' already exists".format(pair.id))
         self.path_pairs.append(pair)
+        return warnings
 
     def update_pair(self, pair: PathPair):
-        pair.validate()
+        warnings = pair.validate()
         for index, existing in enumerate(self.path_pairs):
             if existing.id == pair.id:
                 self.path_pairs[index] = pair
-                return
+                return warnings
         raise PathPairError("Path pair with id '{}' not found".format(pair.id))
 
     def remove_pair(self, pair_id: str):
@@ -151,12 +177,14 @@ class PathPairManager:
         return self.collection.get_pair_by_id(pair_id)
 
     def add_pair(self, pair: PathPair):
-        self.collection.add_pair(pair)
+        warnings = self.collection.add_pair(pair)
         self.save()
+        return warnings
 
     def update_pair(self, pair: PathPair):
-        self.collection.update_pair(pair)
+        warnings = self.collection.update_pair(pair)
         self.save()
+        return warnings
 
     def remove_pair(self, pair_id: str):
         self.collection.remove_pair(pair_id)

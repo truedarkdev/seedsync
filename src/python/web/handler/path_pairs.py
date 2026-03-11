@@ -64,8 +64,8 @@ class PathPairsHandler(IHandler):
                 enabled=data.get("enabled", True),
                 auto_queue=data.get("auto_queue", True)
             )
-            self.__path_pair_manager.add_pair(pair)
-            return self.__json_response({"success": True, "data": asdict(pair)})
+            warnings = self.__path_pair_manager.add_pair(pair)
+            return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
         except PathPairError as exc:
@@ -91,8 +91,8 @@ class PathPairsHandler(IHandler):
                 enabled=data.get("enabled", existing.enabled),
                 auto_queue=data.get("auto_queue", existing.auto_queue)
             )
-            self.__path_pair_manager.update_pair(pair)
-            return self.__json_response({"success": True, "data": asdict(pair)})
+            warnings = self.__path_pair_manager.update_pair(pair)
+            return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
         except PathPairError as exc:
