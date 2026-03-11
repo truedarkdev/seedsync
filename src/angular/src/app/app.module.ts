@@ -27,6 +27,7 @@ import {SettingsPageComponent} from "./pages/settings/settings-page.component";
 import {ServerStatusService} from "./services/server/server-status.service";
 import {ConfigServiceProvider} from "./services/settings/config.service";
 import {OptionComponent} from "./pages/settings/option.component";
+import {PathPairsComponent} from "./pages/settings/path-pairs.component";
 import {NotificationService} from "./services/utils/notification.service";
 import {ServerCommandServiceProvider} from "./services/server/server-command.service";
 import {AutoQueuePageComponent} from "./pages/autoqueue/autoqueue-page.component";
@@ -45,9 +46,11 @@ import {DomService} from "./services/utils/dom.service";
 import {StorageServiceModule} from "angular-webstorage-service";
 import {VersionCheckService} from "./services/utils/version-check.service";
 import {BulkActionsBarComponent} from "./pages/files/bulk-actions-bar.component";
+import {PathPairStatsComponent} from "./pages/files/path-pair-stats.component";
 import {FileSelectionService} from "./services/files/file-selection.service";
 import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
 import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
+import {PathPairServiceProvider} from "./services/settings/path-pair.service";
 
 @NgModule({
     declarations: [
@@ -59,12 +62,14 @@ import {ModalAccessibilityService} from "./services/utils/modal-accessibility.se
         FileListComponent,
         FileComponent,
         BulkActionsBarComponent,
+        PathPairStatsComponent,
         FileOptionsComponent,
         FilesPageComponent,
         HeaderComponent,
         SidebarComponent,
         SettingsPageComponent,
         OptionComponent,
+        PathPairsComponent,
         AutoQueuePageComponent,
         LogsPageComponent,
         AboutPageComponent
@@ -103,6 +108,7 @@ import {ModalAccessibilityService} from "./services/utils/modal-accessibility.se
 
         AutoQueueServiceProvider,
         ConfigServiceProvider,
+        PathPairServiceProvider,
         ServerCommandServiceProvider,
         BulkCommandServiceProvider,
 
