@@ -171,8 +171,6 @@ Post-audit consolidation task:
 - Batch size completed this pass: `15`
 
 Reopened subjects:
-- Subjects `8`, `10`, and `11`: reopen together for the deferred path-pair settings/API/config cluster surfaced by `d1436386`, `a33981b5`, `58ead058`, and `88ffbd00`, including path-pair CRUD/UI, path-pair-aware config validation, and Angular config-schema/null-handling fixes.
-- Subjects `10` and `11`: reopen for the missing path-pair dashboard/stats cluster from `778d1d8c` plus its dependent tests in `64afa027` and `bc8348c8`.
 - Subject `20`: reopen for `c300b72f`, because the current staging-path integration still leaves `DELETE_LOCAL` pointed at the final local path instead of falling back to the staging path when the file has not been moved yet.
 
 New integration tasks:
@@ -1190,7 +1188,7 @@ Verification:
 
 Notes:
 - Subject 10 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining config-adjacent upstream work was either classified under later subjects or consciously skipped for coupling/user-facing policy reasons.
-- post-audit follow-up on `2026-03-11` started `PB-011` with the backend path-pair CRUD/API slice adapted from `d1436386`: `PathPairManager` now supports update/delete/reorder persistence, `WebAppBuilder` exposes `/server/path-pairs`, and focused Python unit/integration coverage verifies the new handler contract while the Angular settings UI, schema/null-handling, and dashboard stats portions remain pending in the same follow-up family
+- post-audit follow-up `PB-011` is complete as of `2026-03-11`: `ac8b6447` landed the backend `/server/path-pairs` CRUD/reorder API adapted from `d1436386`, `f4a62a75` hardened the path-pair settings/config contract and Angular null-safe config handling from `a33981b5`, `58ead058`, and `88ffbd00`, and the final Angular completion batch finished the path-pair CRUD/settings UI plus the dashboard stats/tests cluster from `778d1d8c`, `64afa027`, and `bc8348c8`; verification passed with `make run-tests-angular` (`227 tests completed`) and the focused Python web/config suite (`47 passed`)
 
 ## Subject 11 - Model, Serialization, And Web API
 
@@ -1274,7 +1272,7 @@ Verification:
 
 Notes:
 - Subject 11 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining upstream work in this area was either integrated, consciously skipped, or classified under other subjects.
-- post-audit follow-up on `2026-03-11` started `PB-011` with the missing path-pair web API surface from `d1436386`, adding the conservative backend-only `/server/path-pairs` CRUD/reorder handler plus focused integration coverage before any Angular CRUD or dashboard/stats work
+- post-audit follow-up `PB-011` is complete as of `2026-03-11`: the missing path-pair web/config surface from `d1436386`, `a33981b5`, `58ead058`, `88ffbd00`, `778d1d8c`, `64afa027`, and `bc8348c8` now lands across `ac8b6447`, `f4a62a75`, and the final Angular completion batch, covering backend CRUD/reorder APIs, path-pair-aware config validation, Angular path-pair settings CRUD, and dashboard stats/test coverage without reopening broader validation or security lanes
 
 ## Subject 12 - Files Page And File Operations UI
 
