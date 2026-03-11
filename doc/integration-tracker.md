@@ -307,7 +307,7 @@ Thejuran audit status:
 - Commits processed: `e5989061518771a04fbf84723027840e3bc602de` through `f5e54875456eceb84ac70dece6275a0486022527`
 - Disposition summary: `5` already integrated, `1` covered elsewhere, `101` intentionally skipped, `1` need subject reopen, `0` need new integration task, `0` maintainer decisions
 - Reviewer count: `4`
-- Reopened subjects: Subjects `4` and `13`, for the still-missing Docker runtime SSH-config half of `e34ba5e`; local `sshcp.py` already matches the stricter host-key policy, but `src/docker/build/docker-image/Dockerfile` still writes `StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null` into the production image.
+- Reopened subjects: Subject `13`, for the still-missing Docker runtime SSH-config half of `e34ba5e` before the later packaging-side host-key follow-up landed; local `sshcp.py` already matched the stricter host-key policy first, and the runtime image now uses `StrictHostKeyChecking accept-new` instead of disabling host-key checks globally.
 - Workflow learnings: in long milestone-heavy audit stretches, classify roadmap and docs bookkeeping early so the real runtime/security rows stand out; when a commit spans both Python SSH behavior and Docker image defaults, verify the production image config separately before closing it as fully covered elsewhere.
 
 Thejuran audit status:
@@ -592,9 +592,10 @@ Integrated:
 - adapted `9759b76`, `ef283cc`, and `f2b4889`: modernized the deb build image so the PyInstaller stage still builds on current bases and ensured `scanfs` plus the Angular bundle land under the bundled `_internal` runtime layout expected by the packaged binary
 - adapted parts of `11b0944`, `7adbd5f`, `c83efbc`, `c32649c`, and `21bb73c`: fixed Docker build compatibility on current bases by creating the Angular output directory, making apt source edits work on modern slim images, using the image's bundled `pip` for Poetry, switching to `poetry install --only main`, normalizing `FROM ... AS` casing, normalizing copied helper-script line endings inside the image, and adding an OCI source label in the runtime image
 - adapted `777917a` as a packaging prerequisite: enabled `skipLibCheck` in `src/angular/tsconfig.json` so the legacy Angular build remains runnable inside the current Docker packaging flow
+- adapted the docker-image packaging half of `e34ba5e`: runtime images now write `StrictHostKeyChecking accept-new` into `/root/.ssh/config` instead of globally disabling host-key verification and discarding known-hosts state
 
 Pending:
-- Audit reopen: `e34ba5e` is only partially covered; while the production stage/deb key handling from `f6643db` is already integrated, `src/docker/build/docker-image/Dockerfile` still writes insecure SSH defaults (`StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null`) into the runtime image and should be aligned with the stricter host-key policy already present in `src/python/ssh/sshcp.py`.
+- none
 
 Covered elsewhere:
 - `c94d626`, `a8a6eba`, and other GLIBC/older-host compatibility follow-ups were reviewed here but belong primarily to Subject 5, where runtime compatibility choices will be handled explicitly
@@ -1406,7 +1407,7 @@ Integrated:
 - delete-process shell escaping from `492944f` is already covered elsewhere in current master
 
 Pending:
-- Audit reopen: `e34ba5e` is only partially covered; `src/python/ssh/sshcp.py` already enforces the stricter host-key behavior, but `src/docker/build/docker-image/Dockerfile` still injects insecure SSH defaults (`StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null`) into the production image.
+- none
 
 Covered elsewhere:
 - the SSH expect-pattern expansion portion of `a1deb23` is already present in current `src/python/ssh/sshcp.py`
