@@ -189,6 +189,15 @@ Audit workflow learnings:
 Rapidcopy audit status:
 - `rapidcopy` is now fully closed through frozen tip `c300b72f808772b00cc977ccceaa23f3c373ce33`; the next audit fork is `thejuran` once the maintainer confirms the next batch.
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `bdcc28746933ce5b41c6789e2104c3977780caa8` through `c94d626afe857f6072ba6eb9a7fc891d993b5485`
+- Disposition summary: `5` already integrated, `3` covered elsewhere, `1` intentionally skipped, `18` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `5`
+- Reopened subjects: Subjects `3`, `4`, `5`, and `14`, concentrated around the deferred Python 3.11 / Node 20 modernization chain, self-contained Docker packaging path, and GLIBC compatibility follow-ups
+- Workflow learnings: keep merge-commit triage anchored to the effective file scope before inheriting every parent concern, and treat structurally different local packaging paths as reviewer-worthy whenever the upstream fix is compatibility-sensitive
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
