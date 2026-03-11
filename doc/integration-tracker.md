@@ -762,9 +762,10 @@ Integrated:
 - adapted from `thejuran` `e34ba5e`: harden `Sshcp` to pass argument lists directly to `pexpect.spawn`, accept new host keys while rejecting changed ones, and preserve usable bad-host/bad-port/wrong-password behavior across newer SSH prompt variants
 - adapted from `thejuran` `492944f`: shell-quote remote delete paths before issuing `rm -rf` over SSH
 - adapted from `thejuran` `0a4a410`, `b9a3220`, and `9048377`: redact `lftp.remote_password` from config API serialization and scrub password-like values from SSE log messages and tracebacks
+- adapted from `thejuran` `246c0639`: add a narrow app-level `Content-Security-Policy` with `connect-src 'self' https://api.github.com` so the existing frontend GitHub release version check remains allowed without importing broader CSP changes
 
 Pending:
-- Audit reopen: `246c0639` is now only partially resolved. Current `src/python/web/web_app.py` emits a CSP header with `connect-src 'self'`, but `src/angular/src/app/services/utils/version-check.service.ts` still calls the GitHub releases API, so re-check the narrow `connect-src https://api.github.com` allowlist without importing thejuran's unrelated jQuery-removal/build assumptions.
+- none
 
 Covered elsewhere:
 - `8c4edb2`: the `ResizeObserver`/ResizeSensor portion of thejuran's CSP cleanup is already present locally in `AppComponent`
