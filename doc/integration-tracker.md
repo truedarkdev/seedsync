@@ -175,7 +175,6 @@ Reopened subjects:
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
-- File progress percentage edge cases: `14adf8b9` fixes rounded percentages and the `0%`-when-both-sizes-are-zero case in `view-file.service`; current `master` still uses `Math.trunc` and still shows `100%` when `remoteSize` is unknown, so handle this as a small Subject 12 files-UI follow-up without importing the accompanying modernization-plan bookkeeping.
 - Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
 - Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
@@ -1383,6 +1382,7 @@ Notes:
 - rapidcopy-specific follow-up beyond this conservative close-out is optional file-row polish rather than required Subject 12 functionality
 - the `2026-03-11` audit reopen for the files-page dropdown migration lane and selected-actions visibility pair is now resolved by the local follow-up batch that added close-on-scroll dropdown handling, conservative menu anchoring refinements, and an internal file-list viewport that keeps the bulk-actions bar visible without touching the dirtier page shell files
 - the subsequent post-audit hardening tail from rapidcopy `15aee39` is now resolved by a local follow-up batch that added files-row action guard checks plus AutoQueue disabled-state enforcement in the UI layer without touching the dirtier files page shell
+- the later rapidcopy follow-up from `14adf8b9` is now resolved by a local `view-file.service` adjustment that rounds download percentages and reports `0%` when remote size is unknown or both sizes are zero
 
 ## Subject 13 - SSH And Remote Command Handling
 
