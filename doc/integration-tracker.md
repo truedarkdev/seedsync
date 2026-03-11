@@ -248,6 +248,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `3`, `11`, `12`, `14`, `18`, and `19`, centered on concrete memory-hygiene fixes, OpenSSH 9.x test compatibility, and a few still-missing backend/tooling hardening slices hiding inside a mostly planning-heavy run
 - Workflow learnings: when a batch mixes real fixes with many modernization and publication plan commits, classify the planning documents as intentional skips early so the actual reopen work stays legible; when one upstream session commit bundles an already-adapted fix with separate missing hardening work, record it as partial reopen rather than double-counting the already-landed slice
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `8fbf770ba497744be4d6f41aa182225788cf459e` through `f5d4d240a973a0a7e8e143f75a067a5115bd0969`
+- Disposition summary: `1` already integrated, `12` covered elsewhere, `3` intentionally skipped, `11` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `0`
+- Reopened subjects: Subjects `2`, `4`, `5`, `8`, `9`, `10`, `11`, and `18`, dominated by the deferred ARM64 publish/test lane plus a concrete SSE/log-stream hardening cluster and one remaining checkbox-config serialization bug
+- Workflow learnings: when a fork iterates on the same bug across several small commits, collapse the row proof onto the final local behavior instead of treating each intermediate upstream step as a unique gap; when an upstream mixed commit contains legacy-harness-irrelevant tests plus a real backend gap, record the irrelevant harness slice explicitly so the reopen row stays tied to the actionable code
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran

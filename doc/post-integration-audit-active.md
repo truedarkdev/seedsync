@@ -18,38 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `510 / 672 remaining`
+Open rows in this file: `483 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `8fbf770ba497744be4d6f41aa182225788cf459e` | Add GitHub templates and security policy (Session 6) (#103) | unknown | unprocessed | — | — | — | — | — | — |
-| `f01806802f833451d072042958ca7e3c535b67e9` | Claude/publication plan session 6 vs dja (#104) | unknown | unprocessed | — | — | — | — | — | — |
-| `9392653b597c519b9b825ec508ef9464e025999a` | Add full ARM64 CI/CD support with native runners (#105) | unknown | unprocessed | — | — | — | — | — | — |
-| `5208aab2b00e9d6c6740107cf764b3342ba33007` | Add releases and versioning documentation to CLAUDE.md (#107) | unknown | unprocessed | — | — | — | — | — | — |
-| `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5` | Fix checkbox settings not saving (boolean to string conversion) (#108) | unknown | unprocessed | — | — | — | — | — | — |
-| `fdafd54d0d8ad69eec877ba4336ca46ce2e28777` | Update About page to mirror repository information (#109) | unknown | unprocessed | — | — | — | — | — | — |
-| `1ecea11303913ba349a9503204dd07c98ba21ff0` | Persist dashboard status filter selection to localStorage (#110) | unknown | unprocessed | — | — | — | — | — | — |
-| `7a88f02b0f7eb83786e3d4e8dc70dbf5b4780d4d` | Fix logs page hang caused by unsafe lock management (#111) | unknown | unprocessed | — | — | — | — | — | — |
-| `12f2a68792419bf2b781576b38115567096aee08` | Fix idle SSE connection not auto-reconnecting (#112) | unknown | unprocessed | — | — | — | — | — | — |
-| `3b98bd8f8b49cd8dc39456d20e9dd9a35eff73ee` | Fix auto-queue re-queuing STOPPED files on startup (#113) | unknown | unprocessed | — | — | — | — | — | — |
-| `fd9c25fd318de6181cf8e5f53f1c806868ec28f9` | Add GitHub Actions workflow for Docker image publishing | unknown | unprocessed | — | — | — | — | — | — |
-| `cbec5640d5d45d862a1d455de01e3d573426ac54` | Claude/fix logs seedsync hang 7d kcz (#114) | unknown | unprocessed | — | — | — | — | — | — |
-| `321e74291d90da38755b921ea4fd20c084d1b641` | Claude/fix autoqueue button bco of (#115) | unknown | unprocessed | — | — | — | — | — | — |
-| `701ba9279643569f8f807881b8a9efbb7e6df995` | Claude/fix remote files requeue jpi j2 (#116) | unknown | unprocessed | — | — | — | — | — | — |
-| `c0aa56b9b9e5d6aeb3c0efa6e0a8d90b98461d4d` | Claude/fix logs seedsync hang 7d kcz (#117) | unknown | unprocessed | — | — | — | — | — | — |
-| `1048d87b9f896d72df95d54343bed429e5759373` | Claude/fix remote files requeue jpi j2 (#118) | unknown | unprocessed | — | — | — | — | — | — |
-| `284d843d842d66da5e96e4765565494642be72b0` | Claude/fix logs seedsync hang 7d kcz (#119) | unknown | unprocessed | — | — | — | — | — | — |
-| `33c01698b33448942ced2dea299de3362c1ca21e` | Claude/fix logs seedsync hang 7d kcz (#120) | unknown | unprocessed | — | — | — | — | — | — |
-| `33cc1cf0480adaaa2c50cf1cf6c0f7ffb6be71e8` | Add delay between SSE events to prevent connection flooding (#121) | unknown | unprocessed | — | — | — | — | — | — |
-| `cd8c770bdcf9d4684404eda316ce8c87857eaade` | Add server-side heartbeat ping for SSE connection keepalive (#122) | unknown | unprocessed | — | — | — | — | — | — |
-| `eef4c325c3c83dc61cb889b756cee905821ca199` | Fix logs page blank issue caused by ViewChild timing (#123) | unknown | unprocessed | — | — | — | — | — | — |
-| `71e18003aed594606732f8819b0e30ad54b76c26` | Claude/fix logs seedsync hang 7d kcz (#124) | unknown | unprocessed | — | — | — | — | — | — |
-| `8dd7bf4eeede21899cc1ea2f641ec84b5997a1e2` | Add status indicator to logs page when no logs displayed (#125) | unknown | unprocessed | — | — | — | — | — | — |
-| `8a200219d68bfbe9ea7f1f01605162c2569a203d` | Claude/fix remote files requeue jpi j2 (#126) | unknown | unprocessed | — | — | — | — | — | — |
-| `a1b467e8f030e56b10412b2c1a725413ab49b5c9` | Claude/fix autoqueue restart 3 pyyw (#127) | unknown | unprocessed | — | — | — | — | — | — |
-| `d7d356b87cc43350812e3316106e13b5707f8eb1` | Claude/bulk file actions dxsg e (#130) | unknown | unprocessed | — | — | — | — | — | — |
-| `9e290af82776a4c2615dff6fb851694beacb26fd` | Claude/fix autoqueue restart 3 pyyw (#128) | unknown | unprocessed | — | — | — | — | — | — |
-| `f5d4d240a973a0a7e8e143f75a067a5115bd0969` | Claude/fix autoqueue restart 3 pyyw (#131) | unknown | unprocessed | — | — | — | — | — | — |
 | `a07a754554e4428a600b694c6ee769b69aaf287f` | Claude/add uat plan p fje9 (#132) | unknown | unprocessed | — | — | — | — | — | — |
 | `bbf1310881fd5181d68da2614b9b4f02378365c2` | Add GitHub Actions workflow for Docker image publishing | unknown | unprocessed | — | — | — | — | — | — |
 | `5d7c50abca299a6f7ba368fb4f950d29606bb609` | Delete .github/workflows/docker-publish | unknown | unprocessed | — | — | — | — | — | — |
