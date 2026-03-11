@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `483 / 672 remaining`
+Open rows in this file: `456 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `a07a754554e4428a600b694c6ee769b69aaf287f` | Claude/add uat plan p fje9 (#132) | unknown | unprocessed | — | — | — | — | — | — |
-| `bbf1310881fd5181d68da2614b9b4f02378365c2` | Add GitHub Actions workflow for Docker image publishing | unknown | unprocessed | — | — | — | — | — | — |
-| `5d7c50abca299a6f7ba368fb4f950d29606bb609` | Delete .github/workflows/docker-publish | unknown | unprocessed | — | — | — | — | — | — |
-| `21bb73c1e35b50cda8982a37590d3535e37eccb2` | Add image source label to Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
-| `2ce3852afaea41560ef7a67b132c0174d62c09ff` | Enhance GitHub Pages documentation site (#133) | unknown | unprocessed | — | — | — | — | — | — |
-| `df868bc7d3eead05363b897fa278508e0747bc3a` | Add bulk command API endpoint for multi-file actions (#141) | unknown | unprocessed | — | — | — | — | — | — |
-| `890c6dedb19762c603aec848d7a572649aa10ef9` | Add UI styling unification action plan (#142) | unknown | unprocessed | — | — | — | — | — | — |
-| `043de1e690bd05732421413800dd48e7f2af7bb8` | Claude/optimize selection performance 8 lt6 q (#143) | unknown | unprocessed | — | — | — | — | — | — |
-| `5c7bfc853588aa5885b4bca2e68fe0c102eadfbd` | Optimize bulk endpoint with parallel command processing (#144) | unknown | unprocessed | — | — | — | — | — | — |
-| `a4cbdc6bc850eb5de08380d99e2ed9b67d409a6b` | Fix critical security issues in bulk endpoint (#146) | unknown | unprocessed | — | — | — | — | — | — |
-| `6e4c40a47d99136940d80f69e165d1e8b7a16bf1` | Add Session 14: Virtual scrolling plan for checkbox performance (#147) | unknown | unprocessed | — | — | — | — | — | — |
-| `53bccd73bbfebc9b31ffc5725fa12ac8e73b59c6` | Implement virtual scrolling for checkbox performance (Session 14) (#148) | unknown | unprocessed | — | — | — | — | — | — |
-| `345a322952f3e870bccc42740cb61b8e3a53b0ee` | Re-enable CDK virtual scrolling for select-all performance (#149) | unknown | unprocessed | — | — | — | — | — | — |
-| `f9dac34a11b0d1af0f0096661406819d28b63d2f` | Claude/bulk file actions session 16 ibn c6 (#151) | unknown | unprocessed | — | — | — | — | — | — |
-| `2a016f9f96788b47f1140ddd4e98612c4c39c4e0` | Move file action buttons into selected row and fix UI issues | unknown | unprocessed | — | — | — | — | — | — |
-| `fd5b0ac27ea4a5286bc6b8ad4db1cc1aba694a9b` | Fix virtual scrolling and improve UX in file component (Session 17) | unknown | unprocessed | — | — | — | — | — | — |
-| `3262cd2566fb47a1eb797027fa73f0541ba83ae8` | Fix race conditions and memory leak in bulk selection (Session 18) | unknown | unprocessed | — | — | — | — | — | — |
-| `4533679f0a0193f19bd8bf083bec3229e9d617fd` | Complete bulk actions critical fixes (Phases 2-5) | unknown | unprocessed | — | — | — | — | — | — |
-| `7297af2890b4ee0ffc4f637e08f50ae9e28f8462` | Fix critical code review issues and add comprehensive test coverage | unknown | unprocessed | — | — | — | — | — | — |
-| `ea8efbb57a6449898cfbeb4063be840c84fb3ab1` | docs: map existing codebase | unknown | unprocessed | — | — | — | — | — | — |
-| `8c1214c8c0ccd22973da35844bab5354dbf75f10` | docs: initialize project | unknown | unprocessed | — | — | — | — | — | — |
-| `16ccb3e5c36756d7023bcb42e48284e3a0f9d386` | chore: add project config | unknown | unprocessed | — | — | — | — | — | — |
-| `335e77c329928bc60d59fb2a07b79a6c83c8fe4d` | docs: research Bootstrap 5 SCSS styling patterns | unknown | unprocessed | — | — | — | — | — | — |
-| `44e78f8063a8aaa459347172418e5606e8a13cc1` | docs: define v1 requirements | unknown | unprocessed | — | — | — | — | — | — |
-| `14d5fe39148a25c3b83692385fed2d2dc3c5c3bf` | docs: create roadmap (5 phases) | unknown | unprocessed | — | — | — | — | — | — |
-| `502342c312d2339a74058046f7959c113db531dd` | docs(01): capture phase context | unknown | unprocessed | — | — | — | — | — | — |
-| `b2ad44eeeb3eb04e674e6dfaccc094e0c317e541` | Remove tests for intentionally removed Select all matching feature (#152) | unknown | unprocessed | — | — | — | — | — | — |
 | `42c51ee64f77d7a43ca3cf05220af4043d51f7f4` | docs(phase-1): research Bootstrap SCSS setup domain | unknown | unprocessed | — | — | — | — | — | — |
 | `f501f95e7cd140d09ec54a66c905ae4e8d58ca41` | docs(01): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
 | `4bfdea3366bcb2d2a40f70d44930a0f6b7b692be` | feat(01-01): create Bootstrap SCSS infrastructure files | unknown | unprocessed | — | — | — | — | — | — |
