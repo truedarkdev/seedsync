@@ -284,11 +284,20 @@ Thejuran audit status:
 - Reopened subjects: Subjects `12` and `16`, with the only real remaining gap in this run being one mixed cleanup commit whose defensive UI-handler guards are still absent locally while the AutoQueue requeue and Safari toolbar fixes are already covered
 - Workflow learnings: when a mixed “code review cleanup” commit bundles optional styling churn with a small defensive hardening slice, reopen only the missing hardening piece instead of treating the whole restyle batch as unresolved; when upstream adds todo documents for bugs that are already fixed locally, classify those rows as covered elsewhere so the ledger stays tied to behavior rather than planning artifacts
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `108`
+- Commits processed: `08d7a5fb2eab4ee911321a7d47f88d11992884f5` through `e9ac2514904821bfaef1e191e258a72706c125de`
+- Disposition summary: `6` already integrated, `18` covered elsewhere, `73` intentionally skipped, `11` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `6`
+- Reopened subjects: Subjects `2` and `12`, centered on the still-missing files-page dropdown/actions-visibility lane (`da35b7eb`, `b3011297`, `778ec702`, `6ce80863`, `ebe0cd69`) plus the missing common-module test coverage slice (`91fa0101`, `5e39fdeb` and their Phase 16 planning rows)
+- Workflow learnings: docs-only milestone summary rows can still legitimately map to `needs subject reopen` when they summarize a concrete missing implementation cluster, so do not auto-skip them purely because they live under `.planning`; archive and landing-page totals should be derived from the actual row counts on disk rather than inherited summary numbers, since the pre-existing `thejuran-007` chunk already contained `28` rows instead of the stale `27` shown on the landing page
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: master @ 38455d4f7fbb902a781f59d2cc93d3824ae231e9
 - Source branch: thejuran/master
@@ -305,7 +314,8 @@ Integrated:
 - local documentation corrections: update MkDocs repo metadata and fix developer guide repository, docs deployment, and registry examples for this fork
 
 Pending:
-- none
+- Audit reopen: `b3011297` and `778ec702` show the files-page toolbar still lacks the upstream dropdown migration lane, including the concrete close-on-scroll fix in `file-options.component.ts`; re-check adjacent `da35b7eb` and `9d275fd4` within the same reopen for the conservative import boundary.
+- Audit reopen: `6ce80863` and `ebe0cd69` exposed a second files-page visibility gap around keeping the selected-actions bar visible while browsing long lists; evaluate the local `bulk-actions-bar` equivalent together with any needed internal scroll-container changes.
 
 Covered elsewhere:
 - `77b7ee1`: README screenshot update covered by the adapted README refresh in this pass
@@ -375,7 +385,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: master @ 9792f9806466ff91fd47ad5216b62bc2c5c466ac
 - Source branch: thejuran/master
@@ -392,7 +402,7 @@ Integrated:
 - adapted from `2bea28e` plus repo-neutral portions of later workflow refreshes -> `8c7be91`: update deprecated GitHub Actions versions and switch GHCR CI logins to `GITHUB_TOKEN`
 
 Pending:
-- none
+- Audit reopen: `91fa0101` and `5e39fdeb` exposed a missing common-module unit-test slice (`test_constants.py`, `test_error.py`, `test_localization.py`, `test_context.py`, `test_types.py`) that was never dispositioned during the original Subject 2 pass; keep the related Phase 16 planning rows tied to the same reopen.
 
 Covered elsewhere:
 - thejuran workflow and docker publish refinements such as `bbf1310`, `fd9c25f`, `eab6146`, and `a0b0e5f`: current pass took the safe action-version and GHCR-auth portions only; broader publishing behavior is better handled under packaging and install
@@ -414,6 +424,7 @@ Verification:
 
 Notes:
 - A targeted `python3 -m pytest tests/integration/test_web/test_handler/test_controller.py -q` attempt failed in this shell because local Python dependencies such as `tblib` are not installed outside the project environment.
+- Audit on `2026-03-11` reopened Subject 2 for the missing common-module unit-test slice from `91fa0101` and `5e39fdeb`; the later web-handler coverage cluster stayed covered by `d0b9195`, while the large controller-suite expansion remains intentionally skipped.
 
 ### rapidcopy
 
@@ -1286,6 +1297,8 @@ Notes:
 - the bulk-actions cluster is now integrated in five provenance-preserving local commits instead of one large patch
 - the integrated local batches intentionally stop short of thejuran `f9dac34`, `3262cd2`, and `4533679`; keyboard shortcuts, range selection, progress feedback, and later hardening remain optional follow-up work rather than forced imports
 - remaining Subject 12 value is now concentrated in optional rapidcopy file-row polish rather than the earlier bulk-actions foundation
+- audit on `2026-03-11` reopened Subject 12 for the files-page dropdown migration lane after reviewer confirmation that `b3011297`'s close-on-scroll fix is still missing locally and `778ec702` summarizes the same missed cluster
+- the same `2026-03-11` audit wave also reopened Subject 12 for the later selected-actions visibility pair `6ce80863` and `ebe0cd69`, which are not covered by the current sticky file-options toolbar
 
 ### rapidcopy
 
