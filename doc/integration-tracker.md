@@ -512,7 +512,6 @@ Integrated:
 - adapted `7f2de68`, `45ee834`, `a4356d4`, and `56463ad`: added `package-mode = false`, aligned `pytest`, `pytest-timeout`, and `pytest-cov` with the current Python 3.8 toolchain, regenerated `src/python/poetry.lock`, and switched the Makefile to `docker compose` in local commit `d7954f9`
 
 Pending:
-- Audit reopen: `569622eb` and `7d85e6ae` exposed a still-missing Linux created-timestamp fallback in `src/python/system/scanner.py`, where local `st_birthtime` failures still drop to `None` instead of using `st_ctime`; reopen Subject 15 with the companion integration-test update from the same lane.
 
 Covered elsewhere:
 - `0d0037d`: pytest `pythonpath` configuration already integrated in Subject 2 via `8c7be91`
@@ -1624,6 +1623,7 @@ Integrated:
 - adapted the backend/runtime portion of `d143638`, `1690826`, and `981d707` so controller scan wiring, active download scanning, lftp job identity, and per-path-pair queue/stop/delete handling are now safe for duplicate top-level names across enabled path pairs
 - adapted `9d58f10` into a standalone local integration module so multi-path controller scanning, queueing, and delete operations are verified without touching the dirty legacy integration test file
 - added a local Angular follow-up so `path_pair_name` reaches `ViewFile` and the files list renders a small source label, keeping duplicate top-level names distinguishable after multi-path runtime enablement
+- adapted `569622eb` as a narrow Linux compatibility follow-up so `SystemScanner` falls back to `st_ctime` when `st_birthtime` is unavailable and scanner unit coverage now locks that fallback in place without importing the broader companion churn from `7d85e6ae`
 
 Pending:
 - none

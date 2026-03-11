@@ -629,6 +629,54 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual(datetime(2018, 11, 9, 21, 40, 18), a.timestamp_modified)
         self.assertEqual(datetime(2018, 11, 9, 21, 40, 17), c.timestamp_modified)
 
+    def test_scan_created_time_falls_back_to_ctime_when_birthtime_missing(self):
+        class FakeStat:
+            st_ctime = datetime(2018, 11, 9, 21, 40, 17).timestamp()
+            st_mtime = datetime(2018, 11, 9, 21, 40, 18).timestamp()
+            st_size = 321
+
+        class FakeEntry:
+            name = "c"
+            path = os.path.join(TestSystemScanner.temp_dir, "c")
+
+            @staticmethod
+            def is_dir():
+                return False
+
+            @staticmethod
+            def stat():
+                return FakeStat()
+
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        file = scanner._SystemScanner__create_system_file(FakeEntry())
+
+        self.assertEqual(datetime(2018, 11, 9, 21, 40, 17), file.timestamp_created)
+        self.assertEqual(datetime(2018, 11, 9, 21, 40, 18), file.timestamp_modified)
+
+    def test_scan_created_time_prefers_birthtime_when_available(self):
+        class FakeStat:
+            st_birthtime = datetime(2018, 11, 9, 21, 40, 17).timestamp()
+            st_ctime = datetime(2018, 11, 9, 21, 40, 16).timestamp()
+            st_mtime = datetime(2018, 11, 9, 21, 40, 18).timestamp()
+            st_size = 321
+
+        class FakeEntry:
+            name = "c"
+            path = os.path.join(TestSystemScanner.temp_dir, "c")
+
+            @staticmethod
+            def is_dir():
+                return False
+
+            @staticmethod
+            def stat():
+                return FakeStat()
+
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        file = scanner._SystemScanner__create_system_file(FakeEntry())
+
+        self.assertEqual(datetime(2018, 11, 9, 21, 40, 17), file.timestamp_created)
+
     def test_scan_file_with_unicode_chars(self):
         tempdir = TestSystemScanner.temp_dir
         # déģķ [dir]
