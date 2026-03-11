@@ -101,6 +101,7 @@
     <div class="actions" *ngIf="showActions">
         <div class="button" appClickStopPropagation
              [attr.disabled]="isQueueable() ? null : true"
+             [class.disabled]="!isQueueable()"
              (click)="!isQueueable() || onQueue(file)"
              [class.loading]="activeAction == FileAction.QUEUE">
             <div class="loader"></div>
@@ -109,6 +110,7 @@
         </div>
         <div class="button" appClickStopPropagation
              [attr.disabled]="isStoppable() ? null : true"
+             [class.disabled]="!isStoppable()"
              (click)="!isStoppable() || onStop(file)"
              [class.loading]="activeAction == FileAction.STOP">
             <div class="loader"></div>
@@ -117,6 +119,7 @@
         </div>
         <div class="button" appClickStopPropagation
              [attr.disabled]="isExtractable() ? null : true"
+             [class.disabled]="!isExtractable()"
              (click)="!isExtractable() || onExtract(file)"
              [class.loading]="activeAction == FileAction.EXTRACT">
             <div class="loader"></div>
@@ -125,6 +128,7 @@
         </div>
         <div class="button" appClickStopPropagation
              [attr.disabled]="isLocallyDeletable() ? null : true"
+             [class.disabled]="!isLocallyDeletable()"
              (click)="!isLocallyDeletable() || onDeleteLocal(file)"
              [class.loading]="activeAction == FileAction.DELETE_LOCAL">
             <div class="loader"></div>
@@ -133,6 +137,7 @@
         </div>
         <div class="button" appClickStopPropagation
              [attr.disabled]="isRemotelyDeletable() ? null : true"
+             [class.disabled]="!isRemotelyDeletable()"
              (click)="!isRemotelyDeletable() || onDeleteRemote(file)"
              [class.loading]="activeAction == FileAction.DELETE_REMOTE">
             <div class="loader"></div>

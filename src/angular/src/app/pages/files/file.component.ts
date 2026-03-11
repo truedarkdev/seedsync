@@ -50,6 +50,10 @@ export class FileComponent implements OnChanges {
                 private modalAccessibility: ModalAccessibilityService) {}
 
     ngOnChanges(changes: SimpleChanges): void {
+        if (changes.file == null) {
+            return;
+        }
+
         // Check for status changes
         const oldFile: ViewFile = changes.file.previousValue;
         const newFile: ViewFile = changes.file.currentValue;
@@ -86,44 +90,63 @@ export class FileComponent implements OnChanges {
     }
 
     isQueueable() {
-        return this.activeAction == null && this.file.isQueueable;
+        return this.activeAction == null && this.file != null && this.file.isQueueable;
     }
 
     isStoppable() {
-        return this.activeAction == null && this.file.isStoppable;
+        return this.activeAction == null && this.file != null && this.file.isStoppable;
     }
 
     isExtractable() {
-        return this.activeAction == null && this.file.isExtractable && this.file.isArchive;
+        return this.activeAction == null &&
+            this.file != null &&
+            this.file.isExtractable &&
+            this.file.isArchive;
     }
 
     isLocallyDeletable() {
-        return this.activeAction == null && this.file.isLocallyDeletable;
+        return this.activeAction == null && this.file != null && this.file.isLocallyDeletable;
     }
 
     isRemotelyDeletable() {
-        return this.activeAction == null && this.file.isRemotelyDeletable;
+        return this.activeAction == null && this.file != null && this.file.isRemotelyDeletable;
     }
 
     onQueue(file: ViewFile) {
+        if (!this.isQueueable() || file == null) {
+            return;
+        }
+
         this.activeAction = FileAction.QUEUE;
         // Pass to parent component
         this.queueEvent.emit(file);
     }
 
     onStop(file: ViewFile) {
+        if (!this.isStoppable() || file == null) {
+            return;
+        }
+
         this.activeAction = FileAction.STOP;
         // Pass to parent component
         this.stopEvent.emit(file);
     }
 
     onExtract(file: ViewFile) {
+        if (!this.isExtractable() || file == null) {
+            return;
+        }
+
         this.activeAction = FileAction.EXTRACT;
         // Pass to parent component
         this.extractEvent.emit(file);
     }
 
     onDeleteLocal(file: ViewFile) {
+        if (!this.isLocallyDeletable() || file == null) {
+            return;
+        }
+
         this.showDeleteConfirmation(
             Localization.Modal.DELETE_LOCAL_TITLE,
             Localization.Modal.DELETE_LOCAL_MESSAGE(file.name),
@@ -136,6 +159,10 @@ export class FileComponent implements OnChanges {
     }
 
     onDeleteRemote(file: ViewFile) {
+        if (!this.isRemotelyDeletable() || file == null) {
+            return;
+        }
+
         this.showDeleteConfirmation(
             Localization.Modal.DELETE_REMOTE_TITLE,
             Localization.Modal.DELETE_REMOTE_MESSAGE(file.name),
@@ -148,7 +175,9 @@ export class FileComponent implements OnChanges {
     }
 
     onToggleSelection(file: ViewFile) {
-        this.toggleSelectionEvent.emit(file);
+        if (file != null) {
+            this.toggleSelectionEvent.emit(file);
+        }
     }
 
     // Source: https://stackoverflow.com/a/7557433
