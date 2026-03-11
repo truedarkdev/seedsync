@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `645 / 672 remaining`
+Open rows in this file: `618 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `04b1f81ec0ec565cc8d773d57e9f4c05bfa68d64` | Merge pull request #12 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
-| `a8a6ebaa605aba2a29098cf278bd052f3e3118a8` | Use manylinux_2_28 for PyInstaller builds to fix GLIBC compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `31b68ec981dc800b0c85abd7a053c39645c86103` | Merge pull request #13 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
-| `da6a4c6f74a33f9de0a11af16ce0ee453f302897` | Switch to python:3.11-slim-bullseye for PyInstaller builds | unknown | unprocessed | — | — | — | — | — | — |
-| `7909e693454c45cfe2119cdad190ca62ca4f096d` | Merge pull request #14 from Jules1651/claude/fix-python-library-error-T5i55 | unknown | unprocessed | — | — | — | — | — | — |
-| `36123cda271c9d3dceb282058b505ff14e418c3d` | Phase 2: Modernize test tooling | unknown | unprocessed | — | — | — | — | — | — |
-| `9a9d10dc49dee0e4df8c48c1606403188a4e9a2d` | Fix dependency compatibility for Angular 4.x | unknown | unprocessed | — | — | — | — | — | — |
-| `05bc17a3f6c2eb0f6d551602a408fb16b29da18c` | Fix test Dockerfiles for Debian 12 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `96296468a27d31ec826670d4c26cf118d0e51bff` | Merge pull request #15 from Jules1651/claude/start-phase-2-YXy2p | unknown | unprocessed | — | — | — | — | — | — |
-| `c32649c208286c3b6dcb41a1273cb30335ada582` | Fix Dockerfile linting: use uppercase AS in FROM statements | unknown | unprocessed | — | — | — | — | — | — |
-| `45ee8347c954536dbdde1cc0304df9320bf5668e` | Use 'docker compose' instead of 'docker-compose' in Makefile | unknown | unprocessed | — | — | — | — | — | — |
-| `19bfb50ea97f60361522a860645dfd24fcdf8465` | Merge master: resolve e2e Dockerfile conflict with uppercase AS | unknown | unprocessed | — | — | — | — | — | — |
-| `f3dfabd0205fb4ffef38acff19d79804d9ec7a34` | Remove tslint.json from Angular test Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
-| `96ba53b4c196dde795111a0a1f50c280785d6156` | Fix Python test Dockerfile: use mkdir -p for /var/run/sshd | unknown | unprocessed | — | — | — | — | — | — |
-| `f38ae7e40953970666b61b20ef05ed54da454423` | Fix Chrome headless flags for newer Chrome versions | unknown | unprocessed | — | — | — | — | — | — |
-| `562955a424912265a6e816f53a50ce07859931ca` | Merge pull request #16 from Jules1651/claude/fix-unit-tests-1hU5b | unknown | unprocessed | — | — | — | — | — | — |
-| `6a695ac555d46fa6193909657c322a621fb2a7fe` | Replace karma-mocha-reporter with karma-spec-reporter for Node 20 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `d8fcb08fa46bd1acb9b9d3b4b4ba4f1e0e8d0029` | Downgrade Node.js to v16 for Angular CLI 1.3 Karma test compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `ff2f07551cc37fdf3636332b10710e5dc1711747` | Upgrade Karma to v6.x for Node 20 compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `1c8fa8a41d2b0a06e1a6b26553bd5b0d245714c6` | Pin type definitions and Jasmine to TypeScript 2.4.x compatible versions | unknown | unprocessed | — | — | — | — | — | — |
-| `85cb4e0b1a2c63fd20b9d1b6ec39ae23e8007ffd` | Force exact @types versions in Docker build for TypeScript 2.4.x compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `79c98be844f6826247f02411e5b093d61257fae6` | Use older @types/node@8.0.0 for TypeScript 2.4.x compatibility | unknown | unprocessed | — | — | — | — | — | — |
-| `a4356d4e7ca5cbaa9567287f29b82b11113dc502` | Add pytest-timeout to prevent hanging tests | unknown | unprocessed | — | — | — | — | — | — |
-| `a1deb233c837c7172cd391924ba334d39ad42ad2` | Fix SSH error handling and WebApp attribute conflict for Python tests | unknown | unprocessed | — | — | — | — | — | — |
-| `77df923608aa0a8cd20f1838eccb43233f8e4223` | Make SSH/Controller test assertions more flexible for newer OpenSSH | unknown | unprocessed | — | — | — | — | — | — |
-| `1aae41116d6f99478c2b4fabda3b6d06a9bef7aa` | Fix RAR extraction and extract filename tests | unknown | unprocessed | — | — | — | — | — | — |
-| `28a8b22351762d5785e7157ae4a57df09239b16f` | Make SSH/SCP test assertions more permissive for various SSH versions | unknown | unprocessed | — | — | — | — | — | — |
 | `84f64738a1589f4939afb022cd1b456d7063d692` | Skip test_extract_archive_overwrites_existing test | unknown | unprocessed | — | — | — | — | — | — |
 | `20a3e0134ac69929cda17d6748450a6c1eef8657` | Skip WebApp streaming tests that timeout with webtest | unknown | unprocessed | — | — | — | — | — | — |
 | `b75da034c3985181afed1b5d39e79165e997dca1` | Add 'connection closed' to SSH test error assertions | unknown | unprocessed | — | — | — | — | — | — |
