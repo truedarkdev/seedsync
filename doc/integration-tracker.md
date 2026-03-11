@@ -155,6 +155,26 @@ Recommended audit ledger fields:
 | <hash> | <upstream subject> | <subject / milestone / unknown> | <already integrated likely / covered elsewhere likely / likely intentional skip / possible gap / unclear> | <high / medium / low> | <direct local match / tracker match / behavioral inference / unclear> | <yes / no> | <full / partial / none> | <already integrated / covered elsewhere / intentionally skipped / needs subject reopen / needs new integration task / maintainer decision needed> | <note or task link> |
 ```
 
+## Post-Integration Audit Follow-Up Summary
+
+- Pass date: `2026-03-11`
+- Active fork: `rapidcopy`
+- Batch size completed this pass: `27`
+
+Reopened subjects:
+- Subjects `8`, `10`, and `11`: reopen together for the deferred path-pair settings/API/config cluster surfaced by `d1436386`, `a33981b5`, `58ead058`, and `88ffbd00`, including path-pair CRUD/UI, path-pair-aware config validation, and Angular config-schema/null-handling fixes.
+- Subjects `10` and `11`: reopen for the missing path-pair dashboard/stats cluster from `778d1d8c` plus its dependent tests in `64afa027` and `bc8348c8`.
+
+New integration tasks:
+- Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
+- Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
+- Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
+
+Intentional audit closures worth remembering:
+- RapidCopy identity changes (`08d714e6`, `ebe416f8`) remain rejected under the existing SeedSync-default branding rule.
+- Theme-system and Playwright-replatforming commits in this batch (`fb4e7db4`, `5c02e93b`, `696866cd`, `5df693d7`, related QA docs) stay intentionally deferred rather than treated as missed conservative integrations.
+- Self-update via external update server (`936ae4b2`) stays intentionally skipped as a broader product/workflow feature, not an audit miss.
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
