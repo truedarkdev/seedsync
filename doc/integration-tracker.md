@@ -221,6 +221,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, `13`, and `17`, concentrated around extraction/webtest reliability skips, the deferred Node 20 / libsass / build-tooling chain, and the still-missing Docker systemd/cgroups compatibility fixes for stage/deb E2E coverage
 - Workflow learnings: when upstream temporarily adds then later removes a workaround, close the temporary step against the later rollback instead of inflating reopen counts; when local packaging covers the same dependency need through a different Dockerfile topology, use reviewer confirmation before calling the row fully covered elsewhere
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `7e7289e4ee2ab15364b82c01840e6553987dcc03` through `c73205b19c707ac74da18513a0e56ec0d5fcbebb`
+- Disposition summary: `4` already integrated, `3` covered elsewhere, `7` intentionally skipped, `13` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `1`
+- Reopened subjects: Subjects `2`, `4`, `5`, `11`, `14`, and `18`, still concentrated around the stage/deb systemd-cgroups packaging path, the GLIBC/ARM verification lane, and a remaining WebApp Bottle compatibility gap
+- Workflow learnings: when a broad upstream debug session interleaves real fixes with temporary diagnostics, archive the debug-only commits as intentional skips instead of reopening noise; when an upstream workaround is later rolled back, close the transient step against the rollback even if the surrounding workstream still needs reopening
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
