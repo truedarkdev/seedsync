@@ -12,7 +12,7 @@ Open archive files only when you need completed audit history or proof for alrea
 
 | Fork | Total rows | Unfinished | Finished archived | Frozen tip at audit start | Active file |
 | --- | --- | --- | --- | --- | --- |
-| `thejuran` | `672` | `537` | `135` | `a8561cdc318460de32de082e3cf33f6b6a0093cb` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
+| `thejuran` | `672` | `510` | `162` | `a8561cdc318460de32de082e3cf33f6b6a0093cb` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
 | `rapidcopy` | `224` | `0` | `224` | `c300b72f808772b00cc977ccceaa23f3c373ce33` | [post-integration-audit-active.md](/mnt/c/Git/seedsync/doc/post-integration-audit-active.md) |
 
 ## Archive Files
@@ -31,6 +31,7 @@ Open archive files only when you need completed audit history or proof for alrea
 | `thejuran` | `003` | `27` | [post-integration-audit-archive/thejuran-003.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/thejuran-003.md) |
 | `thejuran` | `004` | `27` | [post-integration-audit-archive/thejuran-004.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/thejuran-004.md) |
 | `thejuran` | `005` | `27` | [post-integration-audit-archive/thejuran-005.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/thejuran-005.md) |
+| `thejuran` | `006` | `27` | [post-integration-audit-archive/thejuran-006.md](/mnt/c/Git/seedsync/doc/post-integration-audit-archive/thejuran-006.md) |
 
 ## Structure Rules
 

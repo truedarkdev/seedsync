@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `537 / 672 remaining`
+Open rows in this file: `510 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `ef7765619d5dd13a9c8e73149d51a51b6f366e02` | Fix npm peer dependency conflicts to allow install without --legacy-peer-deps (#74) | unknown | unprocessed | — | — | — | — | — | — |
-| `c1a4a2f88c467dc93b2e6e98a1b22c273b55f87a` | Claude/review first section a yyt d (#75) | unknown | unprocessed | — | — | — | — | — | — |
-| `b632b05799921219fb613a83b66d7b7fd8a03e8f` | Fix backend memory leaks: job status, event queue, and monitoring (#76) | unknown | unprocessed | — | — | — | — | — | — |
-| `017c920c6070b3dd5934822bbed057e639a4eb6a` | Add comprehensive legacy codebase analysis and modernization report (#77) | unknown | unprocessed | — | — | — | — | — | — |
-| `01bffd87afc2512122cff538acefadc9f9d81784` | Add modernization action plan with 15 Claude Code-optimized sessions (#78) | unknown | unprocessed | — | — | — | — | — | — |
-| `4f58c8f172e90cd64ed6ab1051353a3d914f0f50` | Fix format string bugs (Session 1: Quick Wins) (#79) | unknown | unprocessed | — | — | — | — | — | — |
-| `2323761d7ff1bf6bcd67f1ef8b955ae6aa54ba18` | Add thread safety to Model and AutoQueuePersist listeners (Session 4) (#80) | unknown | unprocessed | — | — | — | — | — | — |
-| `b32eb93c83ad85cfa9aaefb8ec3242815d84223a` | Fix Angular memory leaks in BaseWebService (Session 5) (#82) | unknown | unprocessed | — | — | — | — | — | — |
-| `aaeddbf8f3448cc93d6ce980ce4617dcbbb9e3ae` | Fix Angular memory leaks in FileOptionsComponent (Session 6) (#83) | unknown | unprocessed | — | — | — | — | — | — |
-| `812f8a9049e8bfee83901464cdd346f5e6a76d57` | Fix Angular memory leaks in ViewFileFilterService, ViewFileSortService, VersionCheckService (Session 7) (#84) | unknown | unprocessed | — | — | — | — | — | — |
-| `57f460b601e0b6b39e9f78551320b5c60609989e` | Replace deep copy with freeze-on-add immutability pattern (Session 8) (#85) | unknown | unprocessed | — | — | — | — | — | — |
-| `c52554b3863cf6e90b34a127061f8085c95944ca` | Implement bounded collections with LRU eviction for downloaded/extrac… (#86) | unknown | unprocessed | — | — | — | — | — | — |
-| `2969ae11d21b9a2beb9eae2143ecc9cde1e07d58` | Add Session 16: Frontend Dependency Modernization (#87) | unknown | unprocessed | — | — | — | — | — | — |
-| `be70feb8bf417d54e44f3d96b69f5896f37f748c` | Claude/review modernization plan y jk ep (#88) | unknown | unprocessed | — | — | — | — | — | — |
-| `e0c2fabf282b95d5637043f4c2440878ca938de3` | Complete Session 10: Queue drain and SSE polling review (#89) | unknown | unprocessed | — | — | — | — | — | — |
-| `88d96a1642bcf5274fecb1452c20b259dd0cf90d` | Improve HTTP status codes for REST semantics (Session 11) (#90) | unknown | unprocessed | — | — | — | — | — | — |
-| `2f914d4cb68638de2e1ff93c7f531e79a870d22d` | Refactor build_model() from 249 lines to 28 lines (Session 12) (#91) | unknown | unprocessed | — | — | — | — | — | — |
-| `1bd91fc1eb79fd542516dde92861899f97b559e0` | Refactor __update_model() from 137 lines to 36 lines (Session 13) (#92) | unknown | unprocessed | — | — | — | — | — | — |
-| `2bc18bd83ab129368f2652da0a44c89930732851` | Extract ScanManager from Controller (Session 14) (#93) | unknown | unprocessed | — | — | — | — | — | — |
-| `56ea03260a654f0f215d245e9db2c07183bac137` | Add publication plan for fork release under thejuran (#94) | unknown | unprocessed | — | — | — | — | — | — |
-| `c539ed97cdfad838bf28735d86f0c4be47611ce8` | Extract LftpManager and FileOperationManager from Controller (Session… (#95) | unknown | unprocessed | — | — | — | — | — | — |
-| `5706eafbc2693da115f536d799c1bfb6e05bfc7f` | Upgrade Bootstrap 4→5 and modernize frontend dependencies (Session 16) (#96) | unknown | unprocessed | — | — | — | — | — | — |
-| `f56d78ac98272b8cee4e47a09b1fea79d0e6a3af` | Fix CI/CD warnings and security vulnerabilities (Session 17) (#97) | unknown | unprocessed | — | — | — | — | — | — |
-| `c71fc801054033ea4570741e74401928a62258de` | Update CLAUDE.md to reflect modernization changes (#98) | unknown | unprocessed | — | — | — | — | — | — |
-| `3ffaa4d1d709bb57bc859bfcea83ef5ab0b7895c` | Claude/plan project publication g5 rr o (#99) | unknown | unprocessed | — | — | — | — | — | — |
-| `d11b3f3788f78fbda60b03c0ec419058561f6788` | Fix SSH password test failure on OpenSSH 9.x (#101) | unknown | unprocessed | — | — | — | — | — | — |
-| `e289470c37e8241676ba2271dbb8b2d61e2102e3` | Add ACKNOWLEDGMENTS.md to credit original author (#102) | unknown | unprocessed | — | — | — | — | — | — |
 | `8fbf770ba497744be4d6f41aa182225788cf459e` | Add GitHub templates and security policy (Session 6) (#103) | unknown | unprocessed | — | — | — | — | — | — |
 | `f01806802f833451d072042958ca7e3c535b67e9` | Claude/publication plan session 6 vs dja (#104) | unknown | unprocessed | — | — | — | — | — | — |
 | `9392653b597c519b9b825ec508ef9464e025999a` | Add full ARM64 CI/CD support with native runners (#105) | unknown | unprocessed | — | — | — | — | — | — |
