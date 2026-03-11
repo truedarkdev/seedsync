@@ -134,7 +134,13 @@ Recommended future task shape:
 Fork material to revisit in that future task:
 - rapidcopy light/dark theme system: `58ead058`, `fb4e7db4`
   - adds a global `ThemeService`, persists a `theme-preference`, follows system color preference on first load, applies `data-theme` on the document root, and exposes a sidebar light/dark toggle
+- rapidcopy theme infrastructure and UI follow-ons: `ad35d2e5`, `7e4157ba`, `ce373a2b`, `528e845b`, `facb52b4`
+  - builds out the broader reusable theme lane around `ThemeService`, including first-load FOUC prevention, registration/bootstrap wiring, and focused Settings-page toggle coverage
+- thejuran earlier dark-mode styling lane: `9a32aa9f`, `88d6258e`, `3f1d7d2e`, `31e2aae5`
+  - captures the pre-terminal overhaul theme-aware CSS-variable migration, dropdown dark-mode cleanup, and later action-bar/sidebar dark-mode polish that could inform a less opinionated optional theme system
 - thejuran terminal presentation suite: `ef728cc2`, `6865ea03`, `29e7d5d0`, `42d75b03`, `0bdeef59`, `b7fdff1a`, `d8570982`, `12a05c86`
   - adds a more opinionated terminal-style visual language across shell, dashboard, settings, logs, and about page
+- thejuran terminal-overhaul roadmap envelope: `3d2a3a2e` through `cf0a5fcb`
+  - marks the bounded milestone range for the full v3.0 Terminal UI Overhaul, including the later phase docs and polish commits that were intentionally skipped as a coherent flavor lane rather than forgotten piecemeal
 - thejuran shell flavor details: `f64325e3`, `9dd1d796`, `a32dfad7`, `70153570`
   - adds icon-rail/sidebar shell presentation changes that should only be reconsidered inside a coherent visual-mode project
