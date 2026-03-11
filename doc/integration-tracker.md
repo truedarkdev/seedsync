@@ -266,6 +266,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `2`, `4`, `6`, `11`, and `12`, with the real remaining work concentrated in the deferred Docker publish workflow and the still-missing bulk-endpoint performance/security hardening slices
 - Workflow learnings: when a later upstream subject note explicitly marks UX follow-ups as optional, keep those rows as intentional skips instead of reopening the whole feature area; when a broad feature foundation already landed locally, treat later hardening commits separately from the optional UI/perf layers so the reopen matrix stays deduplicable
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `42c51ee64f77d7a43ca3cf05220af4043d51f7f4` through `884642733b9ba6a63a635813928b78cd9f0c69c2`
+- Disposition summary: `0` already integrated, `1` covered elsewhere, `26` intentionally skipped, `0` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `0`
+- Reopened subjects: none
+- Workflow learnings: when an upstream milestone is almost entirely planning plus default-UI restyle scaffolding, classify the docs and styling commits as intentional skips early so one covered compatibility fix does not make the batch look noisier than it is; when the local tree already solves a compatibility issue through a different Docker/test-image path, record that row as covered elsewhere without inheriting the rest of the skipped redesign lane
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran

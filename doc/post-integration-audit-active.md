@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `456 / 672 remaining`
+Open rows in this file: `429 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `42c51ee64f77d7a43ca3cf05220af4043d51f7f4` | docs(phase-1): research Bootstrap SCSS setup domain | unknown | unprocessed | — | — | — | — | — | — |
-| `f501f95e7cd140d09ec54a66c905ae4e8d58ca41` | docs(01): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
-| `4bfdea3366bcb2d2a40f70d44930a0f6b7b692be` | feat(01-01): create Bootstrap SCSS infrastructure files | unknown | unprocessed | — | — | — | — | — | — |
-| `eed016f1bb4705200a01df35d4991e3660e6b37f` | feat(01-01): update styles.scss with Bootstrap SCSS imports | unknown | unprocessed | — | — | — | — | — | — |
-| `698bb09ded4a22c2e40632d9771d0047cb48e2d2` | feat(01-01): update angular.json build configuration | unknown | unprocessed | — | — | — | — | — | — |
-| `e981c6bf1663819d669a5b522fdf5b8206aa5234` | fix(01-01): add ARM64 support using Chromium in test Dockerfile | unknown | unprocessed | — | — | — | — | — | — |
-| `8155866072c0b8d91a089894ba29e3a6575a9325` | docs(01-01): complete Bootstrap SCSS setup plan | unknown | unprocessed | — | — | — | — | — | — |
-| `165e4b6a07affdafec188189ecac5b40989f3f84` | docs(01): complete Bootstrap SCSS Setup phase | unknown | unprocessed | — | — | — | — | — | — |
-| `3a6fd457ca3077189e887a149c85196db7962651` | docs(2): research phase domain | unknown | unprocessed | — | — | — | — | — | — |
-| `c32ea8a6fc554ad8dfc226865bbbb517e61b576b` | docs(02): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
-| `34f7a90dcfb8a7dabfe89f751c29c077b4cf856e` | feat(02-01): define Bootstrap theme color overrides | unknown | unprocessed | — | — | — | — | — | — |
-| `af6fd073c3a121eaa07862db150bceeb3fc7bd1f` | refactor(02-01): update _common.scss to use Bootstrap shade-color function | unknown | unprocessed | — | — | — | — | — | — |
-| `d25046c9e3842a36c73f273a9e899e621d756b55` | docs(02-01): complete Color Variable Consolidation plan | unknown | unprocessed | — | — | — | — | — | — |
-| `d9dc461fee50eef0b6f78b5e31f5b335474468e7` | feat(02-02): migrate autoqueue to Bootstrap semantic colors | unknown | unprocessed | — | — | — | — | — | — |
-| `0f24cbf51e7fc34eee374484aee339dee65c4681` | feat(02-02): migrate logs page to Bootstrap alert variables | unknown | unprocessed | — | — | — | — | — | — |
-| `1fc116c52c78997def06481bcbc2b2e2ea5b50cf` | feat(02-02): migrate option and file-list to Bootstrap variables | unknown | unprocessed | — | — | — | — | — | — |
-| `406ba687c41cc78360eebe00805c1131dc92c57a` | docs(02-02): complete component color migration plan | unknown | unprocessed | — | — | — | — | — | — |
-| `ee6a1487cc0c1f5eef7e972c15e42afa3533d13c` | docs(phase-2): complete Color Variable Consolidation phase | unknown | unprocessed | — | — | — | — | — | — |
-| `7a45c9773b4073075ee1b98ce70fe9ed5b72fd8e` | docs(03): capture phase context | unknown | unprocessed | — | — | — | — | — | — |
-| `daffbc6303e36da5fe3254c81575986cdafc8738` | docs(03): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
-| `d42bb3992078bf4394f0ade03657eea2ee84c295` | feat(03-01): migrate selection banner to secondary colors | unknown | unprocessed | — | — | — | — | — | — |
-| `8349898576b11ae0f1bc398494e75bf37de18876` | feat(03-01): add hover transition to file rows | unknown | unprocessed | — | — | — | — | — | — |
-| `51a18350a644d867a16991408edd1406f5d23ab3` | docs(03-01): complete selection color unification plan | unknown | unprocessed | — | — | — | — | — | — |
-| `b1b96d6d1e7e842a08ba22eee5769ccc40a8beb5` | docs(03): add phase research | unknown | unprocessed | — | — | — | — | — | — |
-| `042e53efb95475c655c83be5a41789d20ed37f22` | docs(03): complete selection-color-unification phase | unknown | unprocessed | — | — | — | — | — | — |
-| `be318d5460ff9a2ae2572d0ac209913c6efaa836` | docs(04): capture phase context | unknown | unprocessed | — | — | — | — | — | — |
-| `884642733b9ba6a63a635813928b78cd9f0c69c2` | docs(04): research phase domain | unknown | unprocessed | — | — | — | — | — | — |
 | `5ec43a23c3120aac36765b5f06cb47abfefba060` | docs(04): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
 | `cedd39b48fddda3eb32cedb6b351fe75e736cc0a` | feat(04-01): migrate file-actions-bar button variants and sizing | unknown | unprocessed | — | — | — | — | — | — |
 | `8ccde77ed85a23a9f0ee254411eba2b040697b4a` | feat(04-01): migrate bulk-actions-bar button variants and sizing | unknown | unprocessed | — | — | — | — | — | — |
