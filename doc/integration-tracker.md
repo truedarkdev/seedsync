@@ -1190,6 +1190,7 @@ Verification:
 
 Notes:
 - Subject 10 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining config-adjacent upstream work was either classified under later subjects or consciously skipped for coupling/user-facing policy reasons.
+- post-audit follow-up on `2026-03-11` started `PB-011` with the backend path-pair CRUD/API slice adapted from `d1436386`: `PathPairManager` now supports update/delete/reorder persistence, `WebAppBuilder` exposes `/server/path-pairs`, and focused Python unit/integration coverage verifies the new handler contract while the Angular settings UI, schema/null-handling, and dashboard stats portions remain pending in the same follow-up family
 
 ## Subject 11 - Model, Serialization, And Web API
 
@@ -1273,6 +1274,7 @@ Verification:
 
 Notes:
 - Subject 11 is complete for the currently reviewed `thejuran` and `rapidcopy` ranges; remaining upstream work in this area was either integrated, consciously skipped, or classified under other subjects.
+- post-audit follow-up on `2026-03-11` started `PB-011` with the missing path-pair web API surface from `d1436386`, adding the conservative backend-only `/server/path-pairs` CRUD/reorder handler plus focused integration coverage before any Angular CRUD or dashboard/stats work
 
 ## Subject 12 - Files Page And File Operations UI
 

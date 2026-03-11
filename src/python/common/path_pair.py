@@ -34,10 +34,16 @@ class PathPair:
             self.name = os.path.basename(self.remote_path.rstrip("/")) or "Default"
 
     def validate(self):
-        if not self.remote_path or not self.remote_path.strip():
+        if type(self.remote_path) != str:
+            raise PathPairError("Path pair '{}': remote_path must be a string".format(self.name))
+        if not self.remote_path.strip():
             raise PathPairError("Path pair '{}': remote_path cannot be empty".format(self.name))
-        if not self.local_path or not self.local_path.strip():
+        if type(self.local_path) != str:
+            raise PathPairError("Path pair '{}': local_path must be a string".format(self.name))
+        if not self.local_path.strip():
             raise PathPairError("Path pair '{}': local_path cannot be empty".format(self.name))
+        if type(self.id) != str:
+            raise PathPairError("Path pair '{}': id must be a string".format(self.name))
         if not self.id:
             raise PathPairError("Path pair '{}': id cannot be empty".format(self.name))
 
@@ -64,6 +70,29 @@ class PathPairCollection:
         if self.get_pair_by_id(pair.id):
             raise PathPairError("Path pair with id '{}' already exists".format(pair.id))
         self.path_pairs.append(pair)
+
+    def update_pair(self, pair: PathPair):
+        pair.validate()
+        for index, existing in enumerate(self.path_pairs):
+            if existing.id == pair.id:
+                self.path_pairs[index] = pair
+                return
+        raise PathPairError("Path pair with id '{}' not found".format(pair.id))
+
+    def remove_pair(self, pair_id: str):
+        for index, pair in enumerate(self.path_pairs):
+            if pair.id == pair_id:
+                del self.path_pairs[index]
+                return
+        raise PathPairError("Path pair with id '{}' not found".format(pair_id))
+
+    def reorder_pairs(self, pair_ids: List[str]):
+        existing_ids = [pair.id for pair in self.path_pairs]
+        if sorted(pair_ids) != sorted(existing_ids):
+            raise PathPairError("Reorder list must contain all existing path pair IDs")
+
+        pairs_by_id = {pair.id: pair for pair in self.path_pairs}
+        self.path_pairs = [pairs_by_id[pair_id] for pair_id in pair_ids]
 
 
 class PathPairManager:
@@ -123,6 +152,18 @@ class PathPairManager:
 
     def add_pair(self, pair: PathPair):
         self.collection.add_pair(pair)
+        self.save()
+
+    def update_pair(self, pair: PathPair):
+        self.collection.update_pair(pair)
+        self.save()
+
+    def remove_pair(self, pair_id: str):
+        self.collection.remove_pair(pair_id)
+        self.save()
+
+    def reorder_pairs(self, pair_ids: List[str]):
+        self.collection.reorder_pairs(pair_ids)
         self.save()
 
     def from_str(self, content: str) -> PathPairCollection:
