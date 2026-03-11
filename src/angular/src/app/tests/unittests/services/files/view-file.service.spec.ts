@@ -234,10 +234,13 @@ describe("Testing view file service", () => {
         // Test vectors of local size, remote size, percentage
         let testVectors = [
             [0, 10, 0],
+            [1, 3, 33],
+            [2, 3, 67],
             [5, 10, 50],
             [10, 10, 100],
             [null, 10, 0],
-            [10, null, 100]
+            [10, null, 0],
+            [0, 0, 0]
         ];
 
         let count = -1;
