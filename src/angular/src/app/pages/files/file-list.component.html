@@ -53,20 +53,22 @@
             </span>
         </div>
     </div>
-    <div *ngFor="let file of currentFiles; trackBy: identify">
-        <app-file
-            [file]="file"
-            [options]="options"
-            [isBulkSelected]="(selectedFileIds | async)?.has(file.fileId || file.name)"
-            [showActions]="file.isSelected"
-            (click)="onSelect(file)"
-            (toggleSelectionEvent)="onSelectionToggle($event)"
-            (queueEvent)="onQueue($event)"
-            (stopEvent)="onStop($event)"
-            (extractEvent)="onExtract($event)"
-            (deleteLocalEvent)="onDeleteLocal($event)"
-            (deleteRemoteEvent)="onDeleteRemote($event)">
-        </app-file>
+    <div id="list-viewport">
+        <div *ngFor="let file of currentFiles; trackBy: identify">
+            <app-file
+                [file]="file"
+                [options]="options"
+                [isBulkSelected]="(selectedFileIds | async)?.has(file.fileId || file.name)"
+                [showActions]="file.isSelected"
+                (click)="onSelect(file)"
+                (toggleSelectionEvent)="onSelectionToggle($event)"
+                (queueEvent)="onQueue($event)"
+                (stopEvent)="onStop($event)"
+                (extractEvent)="onExtract($event)"
+                (deleteLocalEvent)="onDeleteLocal($event)"
+                (deleteRemoteEvent)="onDeleteRemote($event)">
+            </app-file>
+        </div>
     </div>
 </div>
 <div id="pagination-bar" *ngIf="totalCount > 0">

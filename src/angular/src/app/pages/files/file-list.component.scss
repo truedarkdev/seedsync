@@ -1,17 +1,32 @@
 @import '../../common/common';
 
+#file-list {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+app-bulk-actions-bar {
+    display: block;
+}
+
+#list-viewport {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
 #file-list #header {
     display: none;
 }
 
 /* striped rows */
-#file-list > div:nth-child(even){
+#list-viewport > div:nth-child(even){
     background-color: $primary-lighter-color;
 }
 
 /* list separator */
-#file-list > div {border-bottom: 1px solid #ddd;}
-#file-list > div:last-child{border-bottom: none;}
+#list-viewport > div {border-bottom: 1px solid #ddd;}
+#list-viewport > div:last-child{border-bottom: none;}
 
 /* Pagination bar */
 #pagination-bar {
@@ -53,6 +68,11 @@
 
 /* Medium and large screens */
 @media only screen and (min-width: $medium-min-width) {
+    #list-viewport {
+        max-height: calc(100vh - 260px);
+        overflow-y: auto;
+    }
+
     #file-list #header {
         display: flex;
     }

@@ -59,7 +59,7 @@
                 </div>
             </div>
         </button>
-        <div class="dropdown-menu">
+        <div class="dropdown-menu" data-bs-theme="dark">
             <div class="dropdown-item"
                  [class.active]="(options | async)?.selectedStatusFilter == null"
                  (click)="onFilterByStatus(null)">
@@ -181,7 +181,7 @@
                 </div>
             </div>
         </button>
-        <div class="dropdown-menu">
+        <div class="dropdown-menu dropdown-menu-end" data-bs-theme="dark">
             <div class="dropdown-item"
                  [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.STATUS"
                  (click)="onSort(ViewFileOptions.SortMethod.STATUS)">
