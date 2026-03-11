@@ -171,7 +171,7 @@ Post-audit consolidation task:
 - Batch size completed this pass: `15`
 
 Reopened subjects:
-- Subject `20`: reopen for `c300b72f`, because the current staging-path integration still leaves `DELETE_LOCAL` pointed at the final local path instead of falling back to the staging path when the file has not been moved yet.
+- none
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
