@@ -175,7 +175,6 @@ Reopened subjects:
 
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
-- Docker cache-ignore hygiene: `50502647` adds `.ruff_cache` and `.mypy_cache` exclusions for Docker build contexts; current `master` uses Dockerfile-specific ignore files instead of a root `.dockerignore`, but those files still do not exclude the cache directories, so handle this as a small Subject 4 packaging follow-up.
 - File progress percentage edge cases: `14adf8b9` fixes rounded percentages and the `0%`-when-both-sizes-are-zero case in `view-file.service`; current `master` still uses `Math.trunc` and still shows `100%` when `remoteSize` is unknown, so handle this as a small Subject 12 files-UI follow-up without importing the accompanying modernization-plan bookkeeping.
 - Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
 - Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
@@ -632,6 +631,7 @@ Notes:
 
 Integrated:
 - adapted `207b75e` and `2e175c0`: ensured the runtime image fixes file modes for `/scripts/setup_default_config.sh` and the copied `/app/python` tree so the non-root container can execute the packaged startup path reliably, while also normalizing copied helper scripts defensively for CRLF-prone Windows-backed checkouts
+- adapted `50502647`: excluded `.ruff_cache` and `.mypy_cache` from the Dockerfile-specific build contexts used by the deb and runtime image packaging flows, matching this repo's per-Dockerfile ignore setup instead of introducing a new root `.dockerignore`
 
 Pending:
 - none

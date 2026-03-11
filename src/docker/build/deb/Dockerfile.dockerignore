@@ -7,3 +7,5 @@
 build
 src/angular/dist
 src/python/build
+.ruff_cache
+.mypy_cache
