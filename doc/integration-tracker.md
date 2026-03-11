@@ -198,6 +198,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `3`, `4`, `5`, and `14`, concentrated around the deferred Python 3.11 / Node 20 modernization chain, self-contained Docker packaging path, and GLIBC compatibility follow-ups
 - Workflow learnings: keep merge-commit triage anchored to the effective file scope before inheriting every parent concern, and treat structurally different local packaging paths as reviewer-worthy whenever the upstream fix is compatibility-sensitive
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `27`
+- Commits processed: `04b1f81ec0ec565cc8d773d57e9f4c05bfa68d64` through `28a8b22351762d5785e7157ae4a57df09239b16f`
+- Disposition summary: `3` already integrated, `5` covered elsewhere, `0` intentionally skipped, `19` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `19`
+- Reopened subjects: Subjects `2`, `3`, `4`, `5`, `11`, and `13`, centered on the deferred Python 3.11 / Node 20 Angular test-tooling chain, the PyInstaller GLIBC mitigation path, and a remaining partial WebApp/OpenSSH test-hardening gap
+- Workflow learnings: when a merge commit mixes one already-integrated fix with one still-missing branch, keep the final row partial and reopen the owning subjects instead of inheriting only the “covered elsewhere” parent; for test-only commits, compare both unit and integration suites before closing a row as fully covered
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
