@@ -311,6 +311,15 @@ Thejuran audit status:
 - Reopened subjects: Subjects `4` and `13`, for the still-missing Docker runtime SSH-config half of `e34ba5e`; local `sshcp.py` already matches the stricter host-key policy, but `src/docker/build/docker-image/Dockerfile` still writes `StrictHostKeyChecking no` plus `UserKnownHostsFile /dev/null` into the production image.
 - Workflow learnings: in long milestone-heavy audit stretches, classify roadmap and docs bookkeeping early so the real runtime/security rows stand out; when a commit spans both Python SSH behavior and Docker image defaults, verify the production image config separately before closing it as fully covered elsewhere.
 
+Thejuran audit status:
+- Pass date: `2026-03-11`
+- Batch size completed this pass: `77`
+- Commits processed: `713825d930552dd30814a6daaf90194c871f0a44` through `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Disposition summary: `0` already integrated, `20` covered elsewhere, `50` intentionally skipped, `7` need subject reopen, `0` need new integration task, `0` maintainer decisions
+- Reviewer count: `1`
+- Reopened subjects: Subjects `6`, `11`, and `14`. Subject `6` still needs the narrow GitHub API CSP allowlist half of `246c0639`; Subject `11` still misses the single-file action timeout and shared SSE crash-hardening cluster from `05a00038`, `e736b693`, `a7122fc1`, `7631bfba`, and `d9ed3f99`; Subject `14` still misses the busy-poll/TIMEOUT hardening slice from `a53869ee`.
+- Workflow learnings: when late milestone cleanup commits bundle already-landed UX adaptations with a still-missing shared stream/runtime guard, reopen only the surviving runtime slice instead of inheriting the whole milestone; when current master has since gained a CSP header, re-check earlier CSP-related skip assumptions against the live header plus the actual frontend callers before closing the row.
+
 ## Subject 1 - Documentation And Maintainer Notes
 
 ### thejuran
@@ -754,17 +763,17 @@ Integrated:
 - adapted from `thejuran` `0a4a410`, `b9a3220`, and `9048377`: redact `lftp.remote_password` from config API serialization and scrub password-like values from SSE log messages and tracebacks
 
 Pending:
-- none
+- Audit reopen: `246c0639` is now only partially resolved. Current `src/python/web/web_app.py` emits a CSP header with `connect-src 'self'`, but `src/angular/src/app/services/utils/version-check.service.ts` still calls the GitHub releases API, so re-check the narrow `connect-src https://api.github.com` allowlist without importing thejuran's unrelated jQuery-removal/build assumptions.
 
 Covered elsewhere:
-- `246c063` and `8c4edb2`: CSP-violation cleanup tied to later Angular/runtime changes; revisit with the broader web/UI subject work instead of forcing partial CSP behavior into the legacy frontend now
+- `8c4edb2`: the `ResizeObserver`/ResizeSensor portion of thejuran's CSP cleanup is already present locally in `AppComponent`
 - `108018f` and `abef04a`: replacing pickle-based remote scan serialization belongs with the broader scan/remote-scanner behavior work in later backend subjects
 
 Skipped:
 - `a92af56`: webhook HMAC authentication is not applicable to the current base because the webhook feature set is not present here yet
 - `6e680df`: SSRF protection for arr-style test-connection endpoints is not applicable to the current base because those endpoints are not present yet
 - `8271bd6` and `9365743`: confirm-modal XSS hardening is not applicable because the current base does not yet contain `ConfirmModalService`
-- `4c485d9` and `0e6370e`: broad response-header/CSP changes were not taken in this pass because the useful low-risk hardening was already captured elsewhere, while the CSP policy tradeoffs need to be evaluated together with later web/API work
+- `4c485d9` and `0e6370e`: broad response-header/CSP changes were not taken in this pass because the narrower GitHub-allowlist gap can be handled without loosening `script-src` or importing the broader upstream CSP tradeoffs
 
 Maintainer decisions:
 - none
@@ -863,7 +872,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `07d5716`
 - Source branch: `thejuran/master`
@@ -880,7 +889,7 @@ Integrated:
 - adapted from `thejuran` `fdafd54`: refresh the About page to point users at the maintained fork and issue tracker while keeping the existing SeedSync presentation style
 
 Pending:
-- none
+- Audit reopen: `05a00038`, `e736b693`, `a7122fc1`, `7631bfba`, and `d9ed3f99` expose a still-missing web/SSE hardening lane. Single-file command endpoints in `src/python/web/handler/controller.py` still wait indefinitely; `src/angular/src/app/services/base/stream-service.registry.ts` still lacks the unknown-event guard and reconnect-timer cleanup; `src/angular/src/app/services/files/model-file.service.ts` and `src/angular/src/app/services/server/server-status.service.ts` still parse SSE payloads without the upstream try/catch guards. Keep the `LogService` slice from `a7122fc1` and the AutoQueue stale-index slice from `7631bfba` closed as already covered.
 
 Covered elsewhere:
 - `8c4edb2`: the current base already uses a local `ResizeObserver` compatibility fix in `AppComponent`, so the CSP-safe resize-observer part of thejuran's later shared-shell work was already present here
@@ -944,7 +953,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `394d834`
 - Source branch: `thejuran/master`
@@ -959,7 +968,7 @@ Integrated:
 - none
 
 Pending:
-- none
+- Audit reopen: `05a00038`, `e736b693`, `a7122fc1`, `7631bfba`, and `d9ed3f99` expose a still-missing web/SSE hardening lane. Single-file command endpoints in `src/python/web/handler/controller.py` still wait indefinitely; `src/angular/src/app/services/base/stream-service.registry.ts` still lacks the unknown-event guard and reconnect-timer cleanup; `src/angular/src/app/services/files/model-file.service.ts` and `src/angular/src/app/services/server/server-status.service.ts` still parse SSE payloads without the upstream try/catch guards. Keep the `LogService` slice from `a7122fc1` and the AutoQueue stale-index slice from `7631bfba` closed as already covered.
 
 Covered elsewhere:
 - `b1b7ec9`: the settings-page subscription cleanup was already integrated in Subject 7
@@ -1024,7 +1033,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `master` @ `befa59f`
 - Source branch: `thejuran/master`
@@ -1041,7 +1050,7 @@ Integrated:
 - adapted from `thejuran` `a7122fc` and `b53fe7d`: harden `LogService` against malformed JSON log events and route parse failures through the existing Angular logger, with a unit test to keep the behavior stable
 
 Pending:
-- none
+- Audit reopen: `a53869ee` is still missing locally. `src/python/common/app_process.py` busy-spins during `terminate()`, and `src/python/lftp/lftp.py` still logs `pexpect.TIMEOUT` only at debug level; re-check the narrow process/LFTP observability slice without importing broader milestone scaffolding.
 
 Covered elsewhere:
 - `db1d26c`: the older scroll-button and sticky-marker logs improvements were already present in the current base before this pass
@@ -1182,7 +1191,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: 25c99a4
 - Source branch: thejuran/master
@@ -1198,7 +1207,7 @@ Integrated:
 - `d0b9195` adapted current-architecture handler and stream unit coverage from `1896c58`, `637ab8e`, and `074630c` into focused tests for config, auto-queue, server, status, model-stream, and status-stream behavior.
 
 Pending:
-- none
+- Audit reopen: `05a00038`, `e736b693`, `a7122fc1`, `7631bfba`, and `d9ed3f99` expose a still-missing web/SSE hardening lane. Single-file command endpoints in `src/python/web/handler/controller.py` still wait indefinitely; `src/angular/src/app/services/base/stream-service.registry.ts` still lacks the unknown-event guard and reconnect-timer cleanup; `src/angular/src/app/services/files/model-file.service.ts` and `src/angular/src/app/services/server/server-status.service.ts` still parse SSE payloads without the upstream try/catch guards. Keep the `LogService` slice from `a7122fc1` and the AutoQueue stale-index slice from `7631bfba` closed as already covered.
 
 Covered elsewhere:
 - `bb283e6` was already integrated in Subject 10 via `19f697d`.
@@ -1206,7 +1215,7 @@ Covered elsewhere:
 
 Skipped:
 - `88d96a1` controller-side callback status propagation was skipped in this pass because it overlaps controller command behavior and belongs with later Subject 18 review.
-- `a50a6ec` and `05a0003` were skipped because the POST/DELETE mutation routing and endpoint-timeout wrappers depend on a broader newer controller/web contract than this branch currently carries.
+- `a50a6ec` non-handler cleanup was skipped because current master already took the POST/DELETE mutation contract through Subject 12, while the remaining rate-limiter/type-annotation pieces are broader controller cleanup rather than this subject's narrow API gap.
 - `0cb3228` was skipped because the current pinned Bottle `0.12.19` path does not reproduce the `_stop_flag` attribute conflict; revisit only if Bottle is upgraded later.
 - `4c485d9` and `6e680df` remain classified under Subject 6 because they are primarily security-hardening changes rather than low-risk API semantics.
 - `df868bc`, `5c7bfc8`, `a4cbdc6`, `4533679`, and `7297af2` remain classified under Subject 12 because they are bulk file-operation API work coupled to files-page behavior.
@@ -1265,7 +1274,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: f38666c
 - Source branch: thejuran/master
@@ -1287,7 +1296,7 @@ Integrated:
 - `e0b235e` adapted rapidcopy `2a016f9` / `fd5b0ac`: guard the selected-row auto-scroll lifecycle path so the file-row ViewChild is not dereferenced before it exists
 
 Pending:
-- none
+- Audit reopen: `a53869ee` is still missing locally. `src/python/common/app_process.py` busy-spins during `terminate()`, and `src/python/lftp/lftp.py` still logs `pexpect.TIMEOUT` only at debug level; re-check the narrow process/LFTP observability slice without importing broader milestone scaffolding.
 
 Covered elsewhere:
 - Angular and dependency modernization chain belongs to Subject 3
@@ -1456,7 +1465,7 @@ Notes:
 
 ### thejuran
 
-- State: reviewed
+- State: needs refresh
 - High-risk: no
 - Integration base: `7f3afd2`
 - Source branch: thejuran/master
@@ -1472,7 +1481,7 @@ Integrated:
 - adapted the `lftp.py` portion of `c52554b` as the sixth Subject 14 batch to guard debug logging when `pexpect.after` is `None`, avoiding secondary `AttributeError` crashes in timeout/error paths
 
 Pending:
-- none
+- Audit reopen: `a53869ee` is still missing locally. `src/python/common/app_process.py` busy-spins during `terminate()`, and `src/python/lftp/lftp.py` still logs `pexpect.TIMEOUT` only at debug level; re-check the narrow process/LFTP observability slice without importing broader milestone scaffolding.
 
 Covered elsewhere:
 - the timeout aspect of `bdcc287` is intentionally covered by the smaller local `30s` adaptation of rapidcopy `5db8f34` instead of taking thejuran's broader `180s` value
