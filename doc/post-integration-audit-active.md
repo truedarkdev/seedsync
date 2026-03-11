@@ -18,37 +18,10 @@ Audit state: `in progress`
 Pass date: `2026-03-11`
 Maintainer-approved batch size: `27`
 
-Open rows in this file: `429 / 672 remaining`
+Open rows in this file: `402 / 672 remaining`
 
 | Commit | Upstream commit subject | Mapped integration subject | Triage outcome | Confidence | Evidence | Reviewer needed | Coverage | Final disposition | Follow-up / proof |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `5ec43a23c3120aac36765b5f06cb47abfefba060` | docs(04): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
-| `cedd39b48fddda3eb32cedb6b351fe75e736cc0a` | feat(04-01): migrate file-actions-bar button variants and sizing | unknown | unprocessed | — | — | — | — | — | — |
-| `8ccde77ed85a23a9f0ee254411eba2b040697b4a` | feat(04-01): migrate bulk-actions-bar button variants and sizing | unknown | unprocessed | — | — | — | — | — | — |
-| `f857cac373a0f8e1ae130eb39c28e5ede2d726a4` | feat(04-02): migrate hidden .actions to Bootstrap buttons | unknown | unprocessed | — | — | — | — | — | — |
-| `0887499449160a865c581e5be924be06c7423066` | docs(04-01): complete file actions button standardization plan | unknown | unprocessed | — | — | — | — | — | — |
-| `1d6aa0137901d4e2be87e5bdb82f7fd73bcb9ad8` | docs(04-02): complete hidden actions Bootstrap migration plan | unknown | unprocessed | — | — | — | — | — | — |
-| `fb41449f2b7b2f6eb7de74ae1b8efd1ada68f6fb` | docs(04): complete Button Standardization - File Actions phase | unknown | unprocessed | — | — | — | — | — | — |
-| `a3e38e14c993c78fe4bbf6455e35dae6307f7ed3` | docs(05): research phase domain | unknown | unprocessed | — | — | — | — | — | — |
-| `55ace99c493112429f9245f0ba85bd7138a19c06` | docs(05): create phase plan | unknown | unprocessed | — | — | — | — | — | — |
-| `dc6efbd3383c2c2a98068d641f14e9d86def742e` | feat(05-01): migrate Settings Restart button to Bootstrap | unknown | unprocessed | — | — | — | — | — | — |
-| `cb7b1aea6b291563aeac70b1e2fab3c9f0231a42` | feat(05-01): migrate AutoQueue add/remove buttons to Bootstrap | unknown | unprocessed | — | — | — | — | — | — |
-| `f60085423eb68730910016445607c9ace5a15bdb` | docs(05-01): complete Settings and AutoQueue button standardization plan | unknown | unprocessed | — | — | — | — | — | — |
-| `69332ad39058a2c6156dfd8bd116ea1304136b6b` | refactor(05-02): remove @extend %button from Logs page SCSS | unknown | unprocessed | — | — | — | — | — | — |
-| `509dae3e9664a849286c22dff6c0b99782a9b09e` | refactor(05-02): remove %button placeholder from _common.scss | unknown | unprocessed | — | — | — | — | — | — |
-| `61d6bc1c493b7202299a5a2bf3db56c65bbd6ef8` | docs(05-02): complete button placeholder cleanup plan | unknown | unprocessed | — | — | — | — | — | — |
-| `310a9e15654bf70def980f9afe3a20fedc52a658` | docs(phase-5): complete Button Standardization - Other Pages phase | unknown | unprocessed | — | — | — | — | — | — |
-| `4090f00b3500a56798eaa02b6e34e634d252f278` | chore: complete v1.0 Unify UI Styling milestone | unknown | unprocessed | — | — | — | — | — | — |
-| `15aee39be6869941200bbeee04c0e4cd35d5b31f` | fix: address code review issues from v1.0 milestone | unknown | unprocessed | — | — | — | — | — | — |
-| `2033297bba95a5e236cdcab2ff04e43e64d8f352` | merge: resolve conflicts with origin/master | unknown | unprocessed | — | — | — | — | — | — |
-| `641ea852d2870ff0d0a9f1e8821642d6a4f5ef71` | fix(e2e): update autoqueue selectors for Bootstrap buttons | unknown | unprocessed | — | — | — | — | — | — |
-| `524df5335396f655f82a61283a6839faae935b7c` | Merge pull request #153 from thejuran/claude/unify-ui-styling-gsd | unknown | unprocessed | — | — | — | — | — | — |
-| `e775d8f85030858273264ee8cf83498a28c80b3e` | fix: prevent AutoQueue from re-queueing already-downloaded files | unknown | unprocessed | — | — | — | — | — | — |
-| `fa1e6e8177fa3c756517be294493b06e91886e0e` | test: add mock for is_file_downloaded in AutoQueue tests | unknown | unprocessed | — | — | — | — | — | — |
-| `10cf823993466773d3f4856dc3bb6d724eae7d23` | Merge pull request #154 from thejuran/claude/unify-ui-styling-gsd | unknown | unprocessed | — | — | — | — | — | — |
-| `debde0c1da57aacf92e44aa4e558a9c74c6a88fe` | docs: capture todo - Fix Safari URL bar color bleed | unknown | unprocessed | — | — | — | — | — | — |
-| `ed56490514942ebb148fa985a4d8a732b5ea81e5` | docs: capture todo - Fix AutoQueue re-queueing already-downloaded files | unknown | unprocessed | — | — | — | — | — | — |
-| `721e694fcf63e6f06e12a610962b2c9a313795eb` | fix: prevent Safari 26+ toolbar color bleed from alert banners | unknown | unprocessed | — | — | — | — | — | — |
 | `08d7a5fb2eab4ee911321a7d47f88d11992884f5` | docs: mark Safari color bleed todo as done | unknown | unprocessed | — | — | — | — | — | — |
 | `bd81180bc7b9b8ec5cf49a2f09519b9de01b19fb` | docs: mark AutoQueue todo as done (already implemented) | unknown | unprocessed | — | — | — | — | — | — |
 | `aa0ae75d654aca5169f929a567c7091ec12208dd` | docs: start milestone v1.1 Dropdown & Form Migration | unknown | unprocessed | — | — | — | — | — | — |
