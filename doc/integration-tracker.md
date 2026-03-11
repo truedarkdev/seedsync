@@ -176,7 +176,6 @@ Reopened subjects:
 New integration tasks:
 - Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
 - Logs UI text search: `2054b149` mixes already-present on-disk log persistence with a still-missing logs-page search/filter surface; handle the missing user-facing search half as a small Subject 9 follow-up rather than reopening backend logging.
-- Multi-path user docs refresh: `5d2edbe4` exposed that current docs still do not describe the shipped path-pair workflow and files-list source labels; handle as a small docs-only follow-up without importing dark-mode material.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
 
 Intentional audit closures worth remembering:
@@ -380,6 +379,7 @@ Notes:
 
 Integrated:
 - no direct rapidcopy cherry-picks in this pass
+- adapted docs-only parts of `5d2edbe` -> `working tree`: refresh `src/python/docs/usage.md` so it explains the shipped path-pair workflow, files-list source labels, and path-pair stats card without importing unrelated RapidCopy theming/docs churn
 
 Pending:
 - none
