@@ -26,6 +26,10 @@ class MockViewFileOptionsService {
         return this._options.asObservable();
     }
 
+    public emitOptions(options: ViewFileOptions) {
+        this._options.next(options);
+    }
+
     public setNameFilter() {}
     public setSelectedStatusFilter() {}
     public setSortMethod() {}
@@ -39,6 +43,10 @@ class MockViewFileService {
     get files() {
         return this._files.asObservable();
     }
+
+    public emitFiles(files: Immutable.List<ViewFile>) {
+        this._files.next(files);
+    }
 }
 
 class MockDomService {
@@ -51,6 +59,9 @@ class MockDomService {
 
 describe("Testing file options component", () => {
     let fixture: ComponentFixture<FileOptionsComponent>;
+    let component: FileOptionsComponent;
+    let viewFileOptionsService: MockViewFileOptionsService;
+    let viewFileService: MockViewFileService;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -67,6 +78,9 @@ describe("Testing file options component", () => {
         });
 
         fixture = TestBed.createComponent(FileOptionsComponent);
+        component = fixture.componentInstance;
+        viewFileOptionsService = TestBed.get(ViewFileOptionsService) as any;
+        viewFileService = TestBed.get(ViewFileService) as any;
         fixture.detectChanges();
     });
 
@@ -91,5 +105,38 @@ describe("Testing file options component", () => {
         expect(menu.classList.contains("show")).toBe(false);
         expect(button.classList.contains("show")).toBe(false);
         expect(button.getAttribute("aria-expanded")).toBe("false");
+    });
+
+    it("should stop reacting to file and option updates after destroy", () => {
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.QUEUED})
+        ]));
+        viewFileOptionsService.emitOptions(new ViewFileOptions({
+            showDetails: false,
+            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            selectedStatusFilter: null,
+            nameFilter: null,
+            pinFilter: false
+        }));
+
+        expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(1);
+        expect((component as any)._latestOptions.showDetails).toBe(false);
+
+        fixture.destroy();
+
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.QUEUED}),
+            new ViewFile({status: ViewFile.Status.QUEUED})
+        ]));
+        viewFileOptionsService.emitOptions(new ViewFileOptions({
+            showDetails: true,
+            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            selectedStatusFilter: null,
+            nameFilter: null,
+            pinFilter: false
+        }));
+
+        expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(1);
+        expect((component as any)._latestOptions.showDetails).toBe(false);
     });
 });

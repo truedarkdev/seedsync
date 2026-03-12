@@ -1,6 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from threading import Event
+from threading import BoundedSemaphore, Event
 from urllib.parse import unquote
 
 import bottle
@@ -43,9 +43,12 @@ class WebResponseActionCallback(Controller.Command.ICallback):
 
 class ControllerHandler(IHandler):
     _ACTION_TIMEOUT = 30.0
+    _MAX_BULK_ITEMS = 100
+    _MAX_CONCURRENT_BULK_REQUESTS = 1
 
     def __init__(self, controller: Controller):
         self.__controller = controller
+        self.__bulk_request_limiter = BoundedSemaphore(self._MAX_CONCURRENT_BULK_REQUESTS)
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -291,6 +294,11 @@ class ControllerHandler(IHandler):
         ordered_commands = []
         seen_identifiers = set()
         if isinstance(file_entries, list) and len(file_entries) > 0:
+            if len(file_entries) > self._MAX_BULK_ITEMS:
+                return HTTPResponse(
+                    body="Bulk command exceeds maximum of {} items".format(self._MAX_BULK_ITEMS),
+                    status=413
+                )
             for file_entry in file_entries:
                 if not isinstance(file_entry, dict):
                     return HTTPResponse(body="Bulk command files must be objects", status=400)
@@ -311,6 +319,11 @@ class ControllerHandler(IHandler):
                     ordered_commands.append((file_name, identifier))
                     seen_identifiers.add(identifier)
         elif isinstance(filenames, list) and len(filenames) > 0:
+            if len(filenames) > self._MAX_BULK_ITEMS:
+                return HTTPResponse(
+                    body="Bulk command exceeds maximum of {} items".format(self._MAX_BULK_ITEMS),
+                    status=413
+                )
             for file_name in filenames:
                 if not isinstance(file_name, str) or file_name == "":
                     return HTTPResponse(body="Bulk command filenames must be non-empty strings", status=400)
@@ -326,27 +339,33 @@ class ControllerHandler(IHandler):
                 status=400
             )
 
-        failures = []
-        success_count = 0
-        for display_name, identifier in ordered_commands:
-            callback, completed = self.__execute_action(
-                command_action,
-                identifier,
-                timeout=self._ACTION_TIMEOUT
-            )
-            if not completed:
-                failures.append("'{}': Operation timed out".format(display_name))
-            elif callback.success:
-                success_count += 1
-            else:
-                failures.append("'{}': {}".format(display_name, callback.error))
+        if not self.__bulk_request_limiter.acquire(blocking=False):
+            return HTTPResponse(body="Bulk request already in progress", status=429)
 
-        body = "Bulk {} completed: {} succeeded, {} failed".format(
-            action.replace("_", " "),
-            success_count,
-            len(failures)
-        )
-        if failures:
-            body += ". " + "; ".join(failures)
-            return HTTPResponse(body=body, status=400)
-        return HTTPResponse(body=body)
+        try:
+            failures = []
+            success_count = 0
+            for display_name, identifier in ordered_commands:
+                callback, completed = self.__execute_action(
+                    command_action,
+                    identifier,
+                    timeout=self._ACTION_TIMEOUT
+                )
+                if not completed:
+                    failures.append("'{}': Operation timed out".format(display_name))
+                elif callback.success:
+                    success_count += 1
+                else:
+                    failures.append("'{}': {}".format(display_name, callback.error))
+
+            body = "Bulk {} completed: {} succeeded, {} failed".format(
+                action.replace("_", " "),
+                success_count,
+                len(failures)
+            )
+            if failures:
+                body += ". " + "; ".join(failures)
+                return HTTPResponse(body=body, status=400)
+            return HTTPResponse(body=body)
+        finally:
+            self.__bulk_request_limiter.release()
