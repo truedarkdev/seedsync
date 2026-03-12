@@ -483,6 +483,7 @@ Verification:
 Notes:
 - A targeted `python3 -m pytest tests/integration/test_web/test_handler/test_controller.py -q` attempt failed in this shell because local Python dependencies such as `tblib` are not installed outside the project environment.
 - Audit on `2026-03-11` reopened Subject 2 for the common-module unit-test slice from `91fa0101` and `5e39fdeb`; that test gap is now covered locally, the upstream skip-policy lane was resolved by passing Docker verification without adopting the skip decorators, the later web-handler coverage cluster stayed covered by `d0b9195`, and the large controller-suite expansion remains intentionally skipped.
+- Dirty-worktree triage on `2026-03-12` showed the apparent 168-file modified tree was mostly CRLF/EOL churn. `git diff --ignore-cr-at-eol --shortstat` reduced the substantive unstaged set to six files: `src/angular/package.json`, `src/angular/karma.conf.js`, `src/angular/src/app/tests/unittests/services/files/view-file-filter.service.spec.ts`, `src/angular/src/app/tests/unittests/services/files/view-file-sort.service.spec.ts`, `src/docker/build/deb/Dockerfile`, and `src/docker/test/angular/Dockerfile`. Those real edits align with the PB-003 Angular/Karma/Node20 compatibility lane; future agents should stage only those files if recovering that unfinished slice and treat the wider dirty tree as EOL churn unless intentionally doing line-ending cleanup.
 
 ### rapidcopy
 
