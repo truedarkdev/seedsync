@@ -74,7 +74,7 @@ Inputs used:
   - `068bb9dda0a014ce024b800b736da229e3d6c7fd`
 
 ### PB-004 - Angular framework and RxJS modernization chain
-- Status: conditional future follow-up only - the broad Angular/RxJS modernization chain is intentionally deferred for this conservative integration fork now that PB-003 restored a stable Angular 4 + Node 20 compatibility baseline.
+- Status: closed - the broad Angular/RxJS modernization chain is intentionally deferred for this conservative integration fork now that PB-003 restored a stable Angular 4 + Node 20 compatibility baseline.
 - RAF buckets: `RAF-007`
 - Why this stays separate: this is a broader Angular replatforming lane, not a required compatibility fix for the current fork baseline.
 - Closure note: sampled dirty Angular files reduce to whitespace/EOL churn under `git diff -w`, and no coherent semantic modernization or workspace/dependency migration batch is staged locally.
@@ -191,7 +191,7 @@ Inputs used:
   - `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5`
 
 ### PB-012 - WebApp `_stop_flag` compatibility
-- Status: conditional future follow-up only - there is still no active implementation gap evidenced after the PB-001 Bottle `0.12.25` refresh, so revisit this only if a real `_stop_flag` regression appears.
+- Status: closed - there is still no active implementation gap evidenced after the PB-001 Bottle `0.12.25` refresh.
 - RAF buckets: `RAF-012`
 - Why this stays separate: it is a narrow Bottle/WebApp runtime compatibility slice.
 - Dependencies: none
