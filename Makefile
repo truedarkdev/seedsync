@@ -22,7 +22,7 @@ DEB_GLIBC_MAX:=2.31
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image verify-deb-glibc clean coverage-python
+.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc clean coverage-python
 
 all: deb docker-image
 
@@ -100,6 +100,12 @@ verify-deb-glibc:
 		echo "${red}ERROR: Expected exactly one .deb artifact in ${BUILDDIR}, found $${#deb_files[@]}${reset}"; exit 1; \
 	fi; \
 	${SOURCEDIR}/docker/test/verify_glibc.sh "$${deb_files[0]}" ${DEB_GLIBC_MAX}
+
+verify-scanfs-glibc:
+	@if [[ ! -f "${BUILDDIR}/scanfs" ]]; then \
+		echo "${red}ERROR: scanfs artifact not found at ${BUILDDIR}/scanfs${reset}"; exit 1; \
+	fi
+	${SOURCEDIR}/docker/test/verify_glibc.sh "${BUILDDIR}/scanfs" ${DEB_GLIBC_MAX}
 
 tests-python:
 	# python run

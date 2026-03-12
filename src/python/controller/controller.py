@@ -22,6 +22,7 @@ from .scan import (
 from .extract import ExtractProcess, ExtractStatus
 from .validate import ValidateProcess
 from .model_builder import ModelBuilder
+from .memory_monitor import ControllerMemoryMonitor
 from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -250,6 +251,7 @@ class Controller:
         # Keep track of active command processes
         self.__active_command_processes = []
         self.__startup_recovery_done = False
+        self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
 
         self.__started = False
 
@@ -283,6 +285,7 @@ class Controller:
         self.__cleanup_commands()
         self.__process_commands()
         self.__update_model()
+        self.__log_memory_usage()
 
     def exit(self):
         self.logger.debug("Exiting controller")
@@ -818,6 +821,24 @@ class Controller:
                 self.__validate_process.clear(file.file_id)
             for callback in command.callbacks:
                 callback.on_success()
+
+    def __log_memory_usage(self):
+        with self.__model_lock:
+            get_ids = getattr(self.__model, "get_file_ids", None)
+            if callable(get_ids):
+                model_file_count = len(get_ids())
+            else:
+                model_file_count = len(self.__model.get_file_names())
+
+        self.__memory_monitor.log_if_due(
+            model_file_count=model_file_count,
+            downloaded_file_count=len(self.__persist.downloaded_file_names),
+            extracted_file_count=len(self.__persist.extracted_file_names),
+            stopped_file_count=len(self.__persist.stopped_file_names),
+            active_download_count=len(self.__active_downloading_file_names),
+            active_extract_count=len(self.__active_extracting_file_names),
+            active_command_count=len(self.__active_command_processes)
+        )
 
     def __propagate_exceptions(self):
         """
