@@ -39,7 +39,12 @@ ADD src/docker/stage/deb/install_seedsync.sh /scripts/
 ADD src/docker/stage/deb/expect_seedsync.exp /scripts/
 ADD src/docker/stage/deb/entrypoint.sh /scripts/
 
+# Normalize scripts copied from the Windows-backed checkout before executing
+# them inside the Linux container.
+RUN sed -i 's/\r$//' /scripts/install_seedsync.sh /scripts/expect_seedsync.exp /scripts/entrypoint.sh && \
+    chmod +x /scripts/install_seedsync.sh /scripts/entrypoint.sh
+
 ENTRYPOINT ["/scripts/entrypoint.sh"]
-CMD ["/lib/systemd/systemd --log-target=journal 3>&1"]
+CMD ["/bin/bash", "-c", "exec /lib/systemd/systemd --log-target=journal 3>&1"]
 
 EXPOSE 8800

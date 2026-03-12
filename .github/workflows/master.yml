@@ -70,8 +70,14 @@ jobs:
       - name: Build deb package
         run: make deb
 
+      - name: Build scanfs artifact
+        run: make scanfs
+
       - name: Verify deb GLIBC floor
         run: make verify-deb-glibc
+
+      - name: Verify bundled scanfs GLIBC floor
+        run: make verify-scanfs-glibc
 
       # Upload package
       - name: Publish artifact

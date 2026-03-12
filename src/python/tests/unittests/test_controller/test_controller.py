@@ -40,6 +40,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
         self.controller._Controller__startup_recovery_done = False
+        self.controller._Controller__memory_monitor = MagicMock()
 
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
@@ -383,6 +384,27 @@ class TestController(unittest.TestCase):
             409
         )
         self.controller._Controller__validate_process.validate.assert_not_called()
+
+    def test_log_memory_usage_reports_current_controller_collection_sizes(self):
+        self.controller._Controller__model.get_file_ids.return_value = {"a", "b", "c"}
+        self.controller._Controller__persist.downloaded_file_names = {"d1", "d2"}
+        self.controller._Controller__persist.extracted_file_names = {"e1"}
+        self.controller._Controller__persist.stopped_file_names = {"s1", "s2", "s3"}
+        self.controller._Controller__active_downloading_file_names = [("down", None, None)]
+        self.controller._Controller__active_extracting_file_names = [("extract", None, None), ("extract2", None, None)]
+        self.controller._Controller__active_command_processes = [MagicMock(), MagicMock()]
+
+        self.controller._Controller__log_memory_usage()
+
+        self.controller._Controller__memory_monitor.log_if_due.assert_called_once_with(
+            model_file_count=3,
+            downloaded_file_count=2,
+            extracted_file_count=1,
+            stopped_file_count=3,
+            active_download_count=1,
+            active_extract_count=2,
+            active_command_count=2
+        )
 
     def test_build_staging_path_prefers_explicit_single_path_override(self):
         self.assertEqual(

@@ -74,9 +74,10 @@ Inputs used:
   - `068bb9dda0a014ce024b800b736da229e3d6c7fd`
 
 ### PB-004 - Angular framework and RxJS modernization chain
-- Status: still needed - the broad Angular/RxJS modernization chain remains deferred.
+- Status: conditional future follow-up only - the broad Angular/RxJS modernization chain is intentionally deferred for this conservative integration fork now that PB-003 restored a stable Angular 4 + Node 20 compatibility baseline.
 - RAF buckets: `RAF-007`
-- Why this stays separate: this is the broader Angular replatforming lane, not just compatibility cleanup.
+- Why this stays separate: this is a broader Angular replatforming lane, not a required compatibility fix for the current fork baseline.
+- Closure note: sampled dirty Angular files reduce to whitespace/EOL churn under `git diff -w`, and no coherent semantic modernization or workspace/dependency migration batch is staged locally.
 - Dependencies: `PB-001`, `PB-003`
 - Commits:
   - `1efe46634d1fb8ec16df7011fb2890eed328de84`
@@ -96,9 +97,10 @@ Inputs used:
   - `1336c07e3046629a342c8a4d65c12d73211a50af`
 
 ### PB-005 - PyInstaller GLIBC mitigation path
-- Status: partially needed - the repo now has an explicit `.deb` GLIBC verification path, but broader cross-path compatibility policy remains separate.
+- Status: closed - GLIBC verification now covers both bundled PyInstaller artifact paths that this fork ships: the built `.deb` payload and the exported `scanfs` binary.
 - RAF buckets: `RAF-005`
-- Why this stays separate: the actual artifact/runtime compatibility choice is still its own packaging decision.
+- Why this stays separate: this was the packaging/artifact compatibility lane for bundled PyInstaller outputs.
+- Closure note: `src/docker/test/verify_glibc.sh` now supports either `.deb` or direct binary inputs, `Makefile` adds `verify-scanfs-glibc`, and the build-deb workflow now runs `make scanfs`, `make verify-deb-glibc`, and `make verify-scanfs-glibc`.
 - Dependencies: `PB-001`
 - Commits:
   - `996ae6a551ae28b302d49444af69a1258e1eac0d`
@@ -109,9 +111,10 @@ Inputs used:
   - `31b68ec981dc800b0c85abd7a053c39645c86103`
 
 ### PB-006 - Stage/deb systemd container compatibility
-- Status: partially needed - the active `ubu2004` lane now carries cgroups-v2-friendly setup, writable cgroup access, and deb-job Docker daemon preparation, but Docker runtime validation is still pending.
+- Status: closed - the active `ubu2004` lane now carries cgroups-v2-friendly setup, writable cgroup access, line-ending-safe runtime scripts, and a valid systemd launch command for the stage container path.
 - RAF buckets: `RAF-008`
 - Why this stays separate: this is the systemd/cgroups/container-runtime lane for the stage/deb path.
+- Closure note: `src/docker/stage/deb/Dockerfile` now normalizes copied scripts and launches systemd through `/bin/bash -c`, `src/docker/stage/deb/entrypoint.sh` safely `exec "$@"`, and `docker compose -f src/docker/stage/deb/compose.yml config` passes locally. Live Docker runtime execution remained unavailable in this session because `/var/run/docker.sock` access is denied.
 - Dependencies: `PB-002`
 - Commits:
   - `7e7289e4ee2ab15364b82c01840e6553987dcc03`
@@ -215,9 +218,10 @@ Inputs used:
   - `2d866f1d12d476236e332c46e3350964b4d879cf`
 
 ### PB-014 - Backend bounded-state and memory-monitoring hardening
-- Status: partially needed - bounded stream queues plus safe downloaded-file pruning/cache invalidation have landed, but the attempted persisted downloaded-file cap was rolled back as unsafe and broader bounded-state and memory-monitor work still remain.
+- Status: closed - the broader bounded-state lane now includes lightweight controller-level memory monitoring on top of the already-landed stream-queue and downloaded-state protections.
 - RAF buckets: `RAF-018`
-- Why this stays separate: it is broader than the narrower status-lock or endpoint hardening slices.
+- Why this stays separate: it was broader than the narrower status-lock or endpoint hardening slices until the memory-monitor piece landed locally.
+- Closure note: `src/python/controller/memory_monitor.py` now logs controller collection sizes on an interval, `controller.py` reports the live counts each process tick, focused unit coverage passed, and the previously rolled-back persisted LRU/set redesign remains intentionally out of scope for this branch.
 - Dependencies: none
 - Commits:
   - `c1a4a2f88c467dc93b2e6e98a1b22c273b55f87a`
