@@ -97,10 +97,9 @@ class Status(BaseStatus):
             self.status = status
 
         def notify(self, name: str):
-            self.status._listeners_lock.acquire()
-            for listener in self.status._listeners:
-                listener.notify()
-            self.status._listeners_lock.release()
+            with self.status._listeners_lock:
+                for listener in self.status._listeners:
+                    listener.notify()
 
     # ----- Start of component definition -----
     class ServerStatus(StatusComponent):
@@ -151,16 +150,14 @@ class Status(BaseStatus):
         return copy
 
     def add_listener(self, listener: IStatusListener):
-        self._listeners_lock.acquire()
-        if listener not in self._listeners:
-            self._listeners.append(listener)
-        self._listeners_lock.release()
+        with self._listeners_lock:
+            if listener not in self._listeners:
+                self._listeners.append(listener)
 
     def remove_listener(self, listener: IStatusListener):
-        self._listeners_lock.acquire()
-        if listener in self._listeners:
-            self._listeners.remove(listener)
-        self._listeners_lock.release()
+        with self._listeners_lock:
+            if listener in self._listeners:
+                self._listeners.remove(listener)
 
     def __create_component(self, comp_cls: Type[T]) -> T:
         """Create a component and register our listener with it"""
