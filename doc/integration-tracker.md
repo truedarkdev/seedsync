@@ -165,7 +165,7 @@ Post-audit consolidation task:
   - scope: every `needs subject reopen` audit row was mapped to at least one raw missing-feature bucket, with merge commits allowed in multiple buckets when a single row covered multiple still-missing slices
 - Phase B deduplicated execution matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-b.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-b.md)
   - scope: merged only the narrow Phase A buckets that shared implementation scope cleanly, preserved broader modernization and partially covered lanes as separate tasks, and recorded dependencies for one-by-one execution
-  - status note: the matrix remains the canonical Phase B task list; several PB tasks are still open or partial, and there are no additional post-audit tasks beyond that matrix plus the small follow-ups called out below
+  - status note: the matrix remains the canonical Phase B task list; all PB tasks are closed except conditional future follow-ups PB-004 and PB-012, and there are no additional post-audit tasks beyond that matrix plus the small follow-ups called out below
 
 Canonical PB status ledger:
 
