@@ -7,6 +7,11 @@ RUN apt-get update && apt-get install -y systemd
 
 ENV container docker
 
+VOLUME [ "/sys/fs/cgroup" ]
+
+RUN mkdir -p /etc/systemd/system && \
+    ln -sf /dev/null /etc/systemd/system/systemd-resolved.service
+
 # Don't start any optional services except for the few we need.
 RUN find /etc/systemd/system \
          /lib/systemd/system \

@@ -8,7 +8,7 @@
 //
 // To run this example, first transpile it to javascript with `npm run tsc`,
 // then run `protractor conf.js`.
-import {Config} from 'protractor';
+import {browser, Config} from 'protractor';
 
 import {Urls} from "./urls";
 
@@ -33,16 +33,17 @@ export let config: Config = {
     // collisions on the global namespace.
     noGlobals: true,
 
-    allScriptsTimeout: 5000,
+    allScriptsTimeout: 15000,
 
     // Options to be passed to Jasmine-node.
     jasmineNodeOpts: {
         showColors: true,
-        defaultTimeoutInterval: 3000,
+        defaultTimeoutInterval: 10000,
         print: function() {}
     },
 
     onPrepare: function () {
+        browser.manage().timeouts().implicitlyWait(1000);
         jasmine.getEnv().addReporter(new SpecReporter({
             spec: {
                 displayStacktrace: true

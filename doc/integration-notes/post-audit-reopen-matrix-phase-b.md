@@ -96,7 +96,7 @@ Inputs used:
   - `1336c07e3046629a342c8a4d65c12d73211a50af`
 
 ### PB-005 - PyInstaller GLIBC mitigation path
-- Status: partially needed - deb-side mitigation appears partial, but the cross-path GLIBC policy remains unresolved.
+- Status: partially needed - the repo now has an explicit `.deb` GLIBC verification path, but broader cross-path compatibility policy remains separate.
 - RAF buckets: `RAF-005`
 - Why this stays separate: the actual artifact/runtime compatibility choice is still its own packaging decision.
 - Dependencies: `PB-001`
@@ -109,7 +109,7 @@ Inputs used:
   - `31b68ec981dc800b0c85abd7a053c39645c86103`
 
 ### PB-006 - Stage/deb systemd container compatibility
-- Status: still needed - stage/deb systemd+cgroup container compatibility is still missing.
+- Status: partially needed - the active `ubu2004` lane now carries cgroups-v2-friendly setup, writable cgroup access, and deb-job Docker daemon preparation, but Docker runtime validation is still pending.
 - RAF buckets: `RAF-008`
 - Why this stays separate: this is the systemd/cgroups/container-runtime lane for the stage/deb path.
 - Dependencies: `PB-002`
@@ -137,7 +137,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-008 - Legacy E2E dashboard and AutoQueue stability
-- Status: still needed - the E2E dashboard/AutoQueue reliability slice is still missing.
+- Status: closed - startup/configure waits, legacy Protractor/Jasmine timeouts, and low-risk dashboard/AutoQueue page-object normalization are now in place.
 - RAF buckets: `RAF-010`
 - Why this stays separate: these are app-specific E2E reliability fixes on the current legacy suite.
 - Dependencies: `PB-003`, `PB-006`
@@ -147,7 +147,7 @@ Inputs used:
   - `50a8ce3af858f5daf16421c4b55f1445fe76b532`
 
 ### PB-009 - ARM and cross-architecture CI/E2E support
-- Status: partially needed - partial cross-arch groundwork exists, but platform wiring and the ARM64 lane are incomplete.
+- Status: closed - a shared arch-to-platform mapping now drives the Docker-image E2E pull/Compose path so the current ARM/cross-arch wiring stays aligned.
 - RAF buckets: `RAF-011`
 - Why this stays separate: architecture support can move on a different schedule than GLIBC policy or publish automation.
 - Dependencies: `PB-006`
@@ -162,7 +162,7 @@ Inputs used:
   - `5fdae7852c37632f126b2f297fab6106f4b0f9c3`
 
 ### PB-010 - Release and docker publish workflow modernization
-- Status: partially needed - release/publish workflow exists, but deprecated release actions and docker-publish modernization remain.
+- Status: closed - the tag publish flow now uses maintained `gh release` commands for release creation and `.deb` asset upload instead of deprecated actions.
 - RAF buckets: `RAF-017`
 - Why this stays separate: the remaining work is publication automation, not packaging-path replacement.
 - Dependencies: `PB-002`, `PB-009`

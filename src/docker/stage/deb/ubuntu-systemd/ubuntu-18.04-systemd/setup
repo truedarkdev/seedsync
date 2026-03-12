@@ -1,7 +1,9 @@
 #!/bin/sh
 set -eu
 
-if nsenter --mount=/host/proc/1/ns/mnt -- mount | grep /sys/fs/cgroup/systemd >/dev/null 2>&1; then
+if [ -f /host/sys/fs/cgroup/cgroup.controllers ]; then
+  echo 'Detected cgroups v2 on the Docker host; no legacy /sys/fs/cgroup/systemd mount is required.'
+elif nsenter --mount=/host/proc/1/ns/mnt -- mount | grep /sys/fs/cgroup/systemd >/dev/null 2>&1; then
   echo 'The systemd cgroup hierarchy is already mounted at /sys/fs/cgroup/systemd.'
 else
   if [ -d /host/sys/fs/cgroup/systemd ]; then
