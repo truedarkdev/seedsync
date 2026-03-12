@@ -5,6 +5,7 @@ services:
     image: seedsync/stage/deb
     container_name: seedsync_stage_deb
     privileged: true
+    cgroup: host
     build:
       context: ../../../..
       dockerfile: src/docker/stage/deb/Dockerfile
