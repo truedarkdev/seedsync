@@ -45,9 +45,10 @@ Inputs used:
   - `74f20dc737b4d1f79bb60978d012dc79bf8739c6`
 
 ### PB-003 - Angular build and test-stack compatibility
-- Status: partially needed - some compatibility groundwork landed, but the main Node/Angular/Karma modernization remains.
+- Status: closed - the shared Angular build/test path now uses a modern Node 20 base, Node-20-compatible Sass/Karma tooling, and a current Chromium test image path while keeping Angular 4.x app/framework dependencies unchanged.
 - RAF buckets: `RAF-004`, `RAF-006`
 - Why this is one task: both buckets belong to the same narrower Node/Angular compatibility lane around native dependency builds, Karma, and Docker test-image behavior.
+- Closure note: main-session Docker verification passed after pinning the resolved Node 20 toolchain in `src/angular/package-lock.json`, and the code changes stay scoped to compatibility rather than PB-004 framework modernization.
 - Dependencies: `PB-001`
 - Commits:
   - `a3a9bdf601c750a588016d9ce0ccd5ab1c6c4df7`
@@ -125,7 +126,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-007 - Deb E2E GLIBC floor and Ubuntu policy
-- Status: still needed - Ubuntu/GLIBC policy docs and CI still reflect the older floor.
+- Status: closed - active workflow, Makefile policy messaging, and developer docs now align on the Ubuntu 20.04+ / GLIBC 2.29+ deb E2E floor.
 - RAF buckets: `RAF-009`
 - Why this stays separate: this is the policy/docs/workflow reflection of the GLIBC floor, and should follow the actual mitigation choice.
 - Dependencies: `PB-005`
@@ -197,7 +198,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-013 - Test reliability skips and common-module coverage
-- Status: partially needed - missing common-module tests remain, and the skip-policy piece is still undecided.
+- Status: closed - the missing common-module tests have landed locally, and the upstream skip decorators were intentionally not adopted because the targeted tests pass in the supported Docker Python harness.
 - RAF buckets: `RAF-013`, `RAF-033`
 - Why this is one task: both buckets are test-only reopen work rather than runtime behavior, and they can be executed as one verification-focused lane.
 - Dependencies: `PB-008` is a helpful stability baseline
@@ -293,9 +294,10 @@ Inputs used:
   - `246c0639d4a7c7aeb0c1ddcbb4ef0947d32f6882`
 
 ### PB-022 - LFTP timeout and terminate-loop hardening
-- Status: still needed - LFTP terminate-loop and timeout observability hardening remain.
+- Status: closed - `AppProcess.terminate()` now uses a short sleep-based poll before forced termination, and both `lftp.py` `pexpect.TIMEOUT` handlers log at warning level with focused unit coverage.
 - RAF buckets: `RAF-032`
 - Why this stays separate: it is a focused process-control/observability fix.
+- Closure note: local proof exists in `src/python/tests/unittests/test_common/test_app_process.py` and `src/python/tests/unittests/test_lftp/test_lftp.py`.
 - Dependencies: none
 - Commits:
   - `a53869eee59348cb727541099d399692f38a5df9`
