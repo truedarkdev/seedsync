@@ -148,6 +148,12 @@ export class FileListComponent implements OnInit, OnDestroy {
         });
     }
 
+    onValidate(file: ViewFile) {
+        this.viewFileService.validate(file).subscribe(data => {
+            this._logger.info(data);
+        });
+    }
+
     onPageSizeChange(newSize: number): void {
         this.pageSize = newSize;
         localStorage.setItem("dashboard_page_size", String(newSize));

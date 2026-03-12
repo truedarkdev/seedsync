@@ -131,10 +131,16 @@ class TestSerializeModel(unittest.TestCase):
         f.state = ModelFile.State.EXTRACTING
         g = ModelFile("g", False)
         g.state = ModelFile.State.EXTRACTED
-        files = [a, b, c, d, e, f, g]
+        h = ModelFile("h", False)
+        h.state = ModelFile.State.VALIDATING
+        i = ModelFile("i", False)
+        i.state = ModelFile.State.VALIDATED
+        j = ModelFile("j", False)
+        j.state = ModelFile.State.CORRUPT
+        files = [a, b, c, d, e, f, g, h, i, j]
         out = parse_stream(serialize.model(files))
         data = json.loads(out["data"])
-        self.assertEqual(7, len(data))
+        self.assertEqual(10, len(data))
         self.assertEqual("default", data[0]["state"])
         self.assertEqual("downloading", data[1]["state"])
         self.assertEqual("queued", data[2]["state"])
@@ -142,6 +148,23 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual("deleted", data[4]["state"])
         self.assertEqual("extracting", data[5]["state"])
         self.assertEqual("extracted", data[6]["state"])
+        self.assertEqual("validating", data[7]["state"])
+        self.assertEqual("validated", data[8]["state"])
+        self.assertEqual("corrupt", data[9]["state"])
+
+    def test_validation_fields(self):
+        serialize = SerializeModel()
+        file = ModelFile("a", False)
+        file.validation_progress = 42
+        file.validation_error = "Checksum mismatch"
+        file.corrupt_chunks = [1, 3]
+
+        out = parse_stream(serialize.model([file]))
+        data = json.loads(out["data"])
+
+        self.assertEqual(42, data[0]["validation_progress"])
+        self.assertEqual("Checksum mismatch", data[0]["validation_error"])
+        self.assertEqual([1, 3], data[0]["corrupt_chunks"])
 
     def test_remote_size(self):
         serialize = SerializeModel()

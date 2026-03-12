@@ -195,6 +195,17 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
         self.assertEqual("value\"with\"doublequote", command.filename)
 
+    def test_validate(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+        self.controller.queue_command = MagicMock()
+        self.controller.queue_command.side_effect = side_effect
+
+        print(self.test_app.post("/server/command/validate/test1"))
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.VALIDATE, command.action)
+        self.assertEqual("test1", command.filename)
+
     def test_bulk_queue_preserves_order_and_deduplicates(self):
         seen_commands = []
 

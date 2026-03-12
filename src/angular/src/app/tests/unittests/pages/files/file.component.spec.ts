@@ -20,7 +20,8 @@ function createViewFile(props): ViewFile {
         isStoppable: props.isStoppable || false,
         isExtractable: props.isExtractable || false,
         isLocallyDeletable: props.isLocallyDeletable || false,
-        isRemotelyDeletable: props.isRemotelyDeletable || false
+        isRemotelyDeletable: props.isRemotelyDeletable || false,
+        isValidatable: props.isValidatable || false
     });
 }
 
@@ -42,6 +43,7 @@ describe("Testing file component", () => {
         expect(component.isExtractable()).toBe(false);
         expect(component.isLocallyDeletable()).toBe(false);
         expect(component.isRemotelyDeletable()).toBe(false);
+        expect(component.isValidatable()).toBe(false);
     });
 
     it("should not emit queue when the file is not queueable", () => {
@@ -86,5 +88,25 @@ describe("Testing file component", () => {
 
         expect(component.activeAction).toBe(FileAction.QUEUE);
         expect(queueSpy).toHaveBeenCalledWith(component.file);
+    });
+
+    it("should not emit validate when the file is not validatable", () => {
+        const validateSpy = spyOn(component.validateEvent, "emit");
+        component.file = createViewFile({isValidatable: false});
+
+        component.onValidate(component.file);
+
+        expect(component.activeAction).toBe(null);
+        expect(validateSpy).not.toHaveBeenCalled();
+    });
+
+    it("should set the active action when validating a validatable file", () => {
+        const validateSpy = spyOn(component.validateEvent, "emit");
+        component.file = createViewFile({isValidatable: true});
+
+        component.onValidate(component.file);
+
+        expect(component.activeAction).toBe(FileAction.VALIDATE);
+        expect(validateSpy).toHaveBeenCalledWith(component.file);
     });
 });

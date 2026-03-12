@@ -50,6 +50,7 @@ class ControllerHandler(IHandler):
         web_app.add_post_handler("/server/command/queue/<file_name>", self.__handle_action_queue)
         web_app.add_post_handler("/server/command/stop/<file_name>", self.__handle_action_stop)
         web_app.add_post_handler("/server/command/extract/<file_name>", self.__handle_action_extract)
+        web_app.add_post_handler("/server/command/validate/<file_name>", self.__handle_action_validate)
         web_app.add_delete_handler("/server/command/delete_local/<file_name>", self.__handle_action_delete_local)
         web_app.add_delete_handler("/server/command/delete_remote/<file_name>", self.__handle_action_delete_remote)
         web_app.add_post_handler("/server/command/bulk/<action>", self.__handle_action_bulk)
@@ -60,6 +61,7 @@ class ControllerHandler(IHandler):
             "queue": Controller.Command.Action.QUEUE,
             "stop": Controller.Command.Action.STOP,
             "extract": Controller.Command.Action.EXTRACT,
+            "validate": Controller.Command.Action.VALIDATE,
             "delete_local": Controller.Command.Action.DELETE_LOCAL,
             "delete_remote": Controller.Command.Action.DELETE_REMOTE
         }.get(action)
@@ -191,6 +193,29 @@ class ControllerHandler(IHandler):
         callback = self.__execute_action(Controller.Command.Action.DELETE_LOCAL, file_identifier)
         if callback.success:
             return HTTPResponse(body="Requested local delete for file '{}'".format(file_name))
+        else:
+            return HTTPResponse(body=callback.error, status=callback.error_code)
+
+    def __handle_action_validate(self, file_name: str):
+        """
+        Request a VALIDATE action
+        :param file_name:
+        :return:
+        """
+        # value is double encoded
+        file_name = unquote(file_name)
+
+        file_identifier, error_response = self.__resolve_command_identifier(
+            file_name,
+            bottle.request.query.get("file_id"),
+            bottle.request.query.get("path_pair_id")
+        )
+        if error_response:
+            return error_response
+
+        callback = self.__execute_action(Controller.Command.Action.VALIDATE, file_identifier)
+        if callback.success:
+            return HTTPResponse(body="Requested validation for file '{}'".format(file_name))
         else:
             return HTTPResponse(body=callback.error, status=callback.error_code)
 

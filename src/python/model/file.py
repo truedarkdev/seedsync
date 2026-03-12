@@ -25,6 +25,9 @@ class ModelFile:
         DELETED = 4
         EXTRACTING = 5
         EXTRACTED = 6
+        VALIDATING = 7
+        VALIDATED = 8
+        CORRUPT = 9
 
     def __init__(self, name: str, is_dir: bool):
         self.__name = name  # file or folder name
@@ -40,6 +43,9 @@ class ModelFile:
         self.__local_modified_timestamp = None
         self.__remote_created_timestamp = None
         self.__remote_modified_timestamp = None
+        self.__validation_progress = None
+        self.__validation_error = None
+        self.__corrupt_chunks = None
         # timestamp of the latest update
         # Note: timestamp is not part of equality operator
         self.__update_timestamp = datetime.now()
@@ -221,6 +227,44 @@ class ModelFile:
         if type(remote_modified_timestamp) != datetime:
             raise TypeError
         self.__remote_modified_timestamp = remote_modified_timestamp
+
+    @property
+    def validation_progress(self) -> Optional[int]:
+        return self.__validation_progress
+
+    @validation_progress.setter
+    def validation_progress(self, validation_progress: Optional[int]):
+        if type(validation_progress) == int:
+            if validation_progress < 0 or validation_progress > 100:
+                raise ValueError
+            self.__validation_progress = validation_progress
+        elif validation_progress is None:
+            self.__validation_progress = None
+        else:
+            raise TypeError
+
+    @property
+    def validation_error(self) -> Optional[str]:
+        return self.__validation_error
+
+    @validation_error.setter
+    def validation_error(self, validation_error: Optional[str]):
+        if validation_error is not None and type(validation_error) != str:
+            raise TypeError
+        self.__validation_error = validation_error
+
+    @property
+    def corrupt_chunks(self) -> Optional[List[int]]:
+        return None if self.__corrupt_chunks is None else copy.copy(self.__corrupt_chunks)
+
+    @corrupt_chunks.setter
+    def corrupt_chunks(self, corrupt_chunks: Optional[List[int]]):
+        if corrupt_chunks is None:
+            self.__corrupt_chunks = None
+            return
+        if type(corrupt_chunks) != list or not all(type(chunk) == int and chunk >= 0 for chunk in corrupt_chunks):
+            raise TypeError
+        self.__corrupt_chunks = copy.copy(corrupt_chunks)
 
     @property
     def full_path(self) -> str:

@@ -22,6 +22,9 @@ interface IModelFile {
     remote_created_timestamp: Date;
     remote_modified_timestamp: Date;
     children: Set<ModelFile>;
+    validation_progress: number;
+    validation_error: string;
+    corrupt_chunks: number[];
 }
 
 // Boiler plate code to set up an immutable class
@@ -42,7 +45,10 @@ const DefaultModelFile: IModelFile = {
     local_modified_timestamp: null,
     remote_created_timestamp: null,
     remote_modified_timestamp: null,
-    children: null
+    children: null,
+    validation_progress: null,
+    validation_error: null,
+    corrupt_chunks: null
 };
 const ModelFileRecord = Record(DefaultModelFile);
 
@@ -70,6 +76,9 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     remote_created_timestamp: Date;
     remote_modified_timestamp: Date;
     children: Set<ModelFile>;
+    validation_progress: number;
+    validation_error: string;
+    corrupt_chunks: number[];
 
     constructor(props) {
         super(props);
@@ -113,6 +122,9 @@ export module ModelFile {
         DOWNLOADED      = <any> "downloaded",
         DELETED         = <any> "deleted",
         EXTRACTING      = <any> "extracting",
-        EXTRACTED       = <any> "extracted"
+        EXTRACTED       = <any> "extracted",
+        VALIDATING      = <any> "validating",
+        VALIDATED       = <any> "validated",
+        CORRUPT         = <any> "corrupt"
     }
 }

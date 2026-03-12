@@ -174,10 +174,10 @@ Reopened subjects:
 - none
 
 New integration tasks:
-- Validation/download-integrity feature chain: `227b5a34` (download validation API/model/UI) remains absent and should be reviewed as a dedicated backend-heavy follow-up rather than folded into the audit.
 - Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
 
 Intentional audit closures worth remembering:
+- Validation/download-integrity follow-up `227b5a34` is now adapted conservatively in-tree: manual validation command/API/model/files-UI coverage landed without importing the broader inline repair or settings churn from upstream.
 - RapidCopy identity changes (`08d714e6`, `ebe416f8`) remain rejected under the existing SeedSync-default branding rule.
 - Theme-system and Playwright-replatforming commits in this batch (`fb4e7db4`, `5c02e93b`, `696866cd`, `5df693d7`, related QA docs) stay intentionally deferred rather than treated as missed conservative integrations.
 - Self-update via external update server (`936ae4b2`) stays intentionally skipped as a broader product/workflow feature, not an audit miss.
