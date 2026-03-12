@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from threading import Event, Thread
 from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
@@ -308,6 +309,114 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(2, call_count)
         self.assertIn("1 succeeded, 1 failed", response.text)
         self.assertIn("'test2': bad file", response.text)
+
+    def test_bulk_rejects_oversized_filenames_payload(self):
+        with patch.object(ControllerHandler, "_MAX_BULK_ITEMS", 2):
+            response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"filenames": ["test1", "test2", "test3"]},
+                expect_errors=True
+            )
+
+        self.assertEqual(413, response.status_code)
+        self.assertIn("maximum of 2 items", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_bulk_rejects_oversized_files_payload_and_allows_exact_boundary(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        with patch.object(ControllerHandler, "_MAX_BULK_ITEMS", 2):
+            oversized_response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"files": [{"name": "test1"}, {"name": "test2"}, {"name": "test3"}]},
+                expect_errors=True
+            )
+
+            boundary_response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"files": [{"name": "test1"}, {"name": "test2"}]}
+            )
+
+        self.assertEqual(413, oversized_response.status_code)
+        self.assertIn("maximum of 2 items", oversized_response.text)
+        self.assertEqual(200, boundary_response.status_code)
+        self.assertEqual("Bulk queue completed: 2 succeeded, 0 failed", boundary_response.text)
+        self.assertEqual(2, self.controller.queue_command.call_count)
+
+    def test_bulk_rejects_concurrent_bulk_request_when_limit_is_reached(self):
+        command_started = Event()
+        release_first_request = Event()
+        request_finished = Event()
+        responses = {}
+
+        def side_effect(cmd: Controller.Command):
+            command_started.set()
+            release_first_request.wait(timeout=1.0)
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        def issue_first_request():
+            try:
+                responses["first"] = self.test_app.post_json(
+                    "/server/command/bulk/queue",
+                    {"filenames": ["test1"]}
+                )
+            finally:
+                request_finished.set()
+
+        first_request_thread = Thread(target=issue_first_request)
+        first_request_thread.start()
+        self.assertTrue(command_started.wait(timeout=1.0))
+
+        second_response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"filenames": ["test2"]},
+            expect_errors=True
+        )
+
+        release_first_request.set()
+        first_request_thread.join(timeout=1.0)
+        self.assertTrue(request_finished.is_set())
+
+        self.assertEqual(429, second_response.status_code)
+        self.assertEqual("Bulk request already in progress", second_response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        self.assertEqual(200, responses["first"].status_code)
+
+    def test_bulk_queue_timeout_summary_is_preserved_after_limiter_release(self):
+        call_count = 0
+
+        def side_effect(cmd: Controller.Command):
+            nonlocal call_count
+            call_count += 1
+            if cmd.filename == "test2":
+                cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+            first_response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"filenames": ["test1", "test2"]},
+                expect_errors=True
+            )
+            second_response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"filenames": ["test3"]},
+                expect_errors=True
+            )
+
+        self.assertEqual(400, first_response.status_code)
+        self.assertIn("1 succeeded, 1 failed", first_response.text)
+        self.assertIn("'test1': Operation timed out", first_response.text)
+        self.assertEqual(400, second_response.status_code)
+        self.assertIn("0 succeeded, 1 failed", second_response.text)
+        self.assertIn("'test3': Operation timed out", second_response.text)
+        self.assertEqual(3, call_count)
 
     def test_bulk_queue_times_out_when_callback_never_completes(self):
         self.controller.queue_command = MagicMock()

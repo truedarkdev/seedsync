@@ -1,5 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable} from "rxjs/Observable";
+import {Subscription} from "rxjs/Subscription";
 
 import * as Immutable from "immutable";
 
@@ -34,6 +35,8 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
     public headerHeight: Observable<number>;
 
     private _latestOptions: ViewFileOptions;
+    private _filesSubscription: Subscription;
+    private _optionsSubscription: Subscription;
     private readonly _windowScrollListener = () => this.closeOpenDropdowns();
 
     constructor(private _changeDetector: ChangeDetectorRef,
@@ -46,7 +49,7 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
 
     ngOnInit() {
         // Use the unfiltered files so filter counts reflect the full file list.
-        this._viewFileService.files.subscribe(files => {
+        this._filesSubscription = this._viewFileService.files.subscribe(files => {
             this.statusCounts[ViewFile.Status.EXTRACTED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.EXTRACTED
             );
@@ -69,12 +72,18 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
         });
 
         // Keep the latest options for toggle behaviour implementation
-        this.viewFileOptionsService.options.subscribe(options => this._latestOptions = options);
+        this._optionsSubscription = this.viewFileOptionsService.options.subscribe(options => this._latestOptions = options);
 
         window.addEventListener("scroll", this._windowScrollListener, true);
     }
 
     ngOnDestroy() {
+        if (this._filesSubscription) {
+            this._filesSubscription.unsubscribe();
+        }
+        if (this._optionsSubscription) {
+            this._optionsSubscription.unsubscribe();
+        }
         window.removeEventListener("scroll", this._windowScrollListener, true);
     }
 
