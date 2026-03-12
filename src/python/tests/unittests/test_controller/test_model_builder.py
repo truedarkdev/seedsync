@@ -12,6 +12,7 @@ from lftp import LftpJobStatus
 from model import ModelError, ModelFile, Model
 from controller import ModelBuilder
 from controller.extract import ExtractStatus
+from controller.validate import ValidateStatus
 
 
 class TestModelBuilder(unittest.TestCase):
@@ -1501,6 +1502,47 @@ class TestModelBuilder(unittest.TestCase):
         # Invalidate on different
         self.model_builder.set_extracted_files({"a", "c"})
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_build_model_applies_validation_status(self):
+        self.model_builder.set_remote_files([SystemFile("a", 100, False)])
+        self.model_builder.set_local_files([SystemFile("a", 100, False)])
+        self.model_builder.set_validation_statuses([
+            ValidateStatus(
+                file_id="a",
+                state=ModelFile.State.VALIDATING,
+                progress=35,
+                error=None,
+                corrupt_chunks=None
+            )
+        ])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.VALIDATING, model.get_file("a").state)
+        self.assertEqual(35, model.get_file("a").validation_progress)
+
+    def test_build_model_preserves_validation_status_across_rebuilds(self):
+        self.model_builder.set_remote_files([SystemFile("a", 100, False)])
+        self.model_builder.set_local_files([SystemFile("a", 100, False)])
+        self.model_builder.set_validation_statuses([
+            ValidateStatus(
+                file_id="a",
+                state=ModelFile.State.VALIDATED,
+                progress=100,
+                error=None,
+                corrupt_chunks=None
+            )
+        ])
+
+        first_model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.VALIDATED, first_model.get_file("a").state)
+
+        updated_local = SystemFile("a", 100, False)
+        self.model_builder.set_local_files([updated_local])
+        rebuilt_model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.VALIDATED, rebuilt_model.get_file("a").state)
+        self.assertEqual(100, rebuilt_model.get_file("a").validation_progress)
 
     def test_build_duplicate_root_names_by_path_pair(self):
         remote_movies = SystemFile("dup", 10, False)

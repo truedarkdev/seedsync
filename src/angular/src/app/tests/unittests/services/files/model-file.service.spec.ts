@@ -44,6 +44,20 @@ describe("Testing model file service", () => {
         );
     });
 
+    it("should send validate requests to the validate command path", () => {
+        const file = new ModelFile({
+            file_id: "[\"movies\",\"File.One\"]",
+            name: "File.One"
+        });
+
+        modelFileService.validate(file).subscribe(DoNothing);
+
+        const request = httpMock.expectOne("/server/command/validate/File.One?file_id=%5B%22movies%22%2C%22File.One%22%5D");
+        expect(request.request.method).toBe("POST");
+        request.flush("ok");
+        httpMock.verify();
+    });
+
     it("should send correct model on an init event", fakeAsync(() => {
         let count = 0;
         let latestModel: Immutable.Map<string, ModelFile> = null;

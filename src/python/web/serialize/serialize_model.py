@@ -46,7 +46,10 @@ class SerializeModel(Serialize):
         ModelFile.State.DOWNLOADED: "downloaded",
         ModelFile.State.DELETED: "deleted",
         ModelFile.State.EXTRACTING: "extracting",
-        ModelFile.State.EXTRACTED: "extracted"
+        ModelFile.State.EXTRACTED: "extracted",
+        ModelFile.State.VALIDATING: "validating",
+        ModelFile.State.VALIDATED: "validated",
+        ModelFile.State.CORRUPT: "corrupt"
     }
     __KEY_FILE_REMOTE_SIZE = "remote_size"
     __KEY_FILE_LOCAL_SIZE = "local_size"
@@ -61,6 +64,9 @@ class SerializeModel(Serialize):
     __KEY_FILE_ID = "file_id"
     __KEY_FILE_PATH_PAIR_ID = "path_pair_id"
     __KEY_FILE_PATH_PAIR_NAME = "path_pair_name"
+    __KEY_FILE_VALIDATION_PROGRESS = "validation_progress"
+    __KEY_FILE_VALIDATION_ERROR = "validation_error"
+    __KEY_FILE_CORRUPT_CHUNKS = "corrupt_chunks"
     __KEY_FILE_CHILDREN = "children"
 
     @staticmethod
@@ -86,6 +92,9 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_ID] = model_file.file_id
         json_dict[SerializeModel.__KEY_FILE_PATH_PAIR_ID] = model_file.path_pair_id
         json_dict[SerializeModel.__KEY_FILE_PATH_PAIR_NAME] = model_file.path_pair_name
+        json_dict[SerializeModel.__KEY_FILE_VALIDATION_PROGRESS] = model_file.validation_progress
+        json_dict[SerializeModel.__KEY_FILE_VALIDATION_ERROR] = model_file.validation_error
+        json_dict[SerializeModel.__KEY_FILE_CORRUPT_CHUNKS] = model_file.corrupt_chunks
         json_dict[SerializeModel.__KEY_FILE_CHILDREN] = list()
         for child in model_file.get_children():
             json_dict[SerializeModel.__KEY_FILE_CHILDREN].append(SerializeModel.__model_file_to_json_dict(child))

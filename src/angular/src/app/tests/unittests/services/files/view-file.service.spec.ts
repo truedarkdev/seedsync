@@ -448,6 +448,65 @@ describe("Testing view file service", () => {
         expect(count).toBe(testVectors.length);
     }));
 
+    it("should map validation states and flags into the view model", fakeAsync(() => {
+        const testVectors: any[][][] = [
+            [[ModelFile.State.VALIDATING, 100, 100], [ViewFile.Status.VALIDATING, false]],
+            [[ModelFile.State.VALIDATED, 100, 100], [ViewFile.Status.VALIDATED, true]],
+            [[ModelFile.State.CORRUPT, 100, 100], [ViewFile.Status.CORRUPT, true]]
+        ];
+
+        let count = -1;
+        viewService.files.subscribe({
+            next: list => {
+                if (count >= 0) {
+                    const file = list.get(0);
+                    expect(file.status).toBe(testVectors[count][1][0]);
+                    expect(file.isValidatable).toBe(testVectors[count][1][1]);
+                }
+                count++;
+            }
+        });
+        tick();
+
+        for (const vector of testVectors) {
+            const model = Immutable.Map<string, ModelFile>().set("a", new ModelFile({
+                name: "a",
+                state: vector[0][0],
+                local_size: vector[0][1],
+                remote_size: vector[0][2],
+                validation_progress: 0.5,
+                validation_error: "checksum mismatch",
+                corrupt_chunks: [1]
+            }));
+            mockModelService._files.next(model);
+            tick();
+        }
+
+        expect(count).toBe(testVectors.length);
+    }));
+
+    it("should not mark stopped partial files as validatable", fakeAsync(() => {
+        let latestFile: ViewFile = null;
+        viewService.files.subscribe({
+            next: list => {
+                latestFile = list.get(0);
+            }
+        });
+        tick();
+
+        const model = Immutable.Map<string, ModelFile>().set("partial", new ModelFile({
+            name: "partial",
+            state: ModelFile.State.DEFAULT,
+            local_size: 50,
+            remote_size: 100
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        expect(latestFile.status).toBe(ViewFile.Status.STOPPED);
+        expect(latestFile.isValidatable).toBe(false);
+    }));
+
     // it("should sort view files by status then name", fakeAsync(() => {
     //     // Test vectors to create model file
     //     // name, ModelFile.State, local size, remote size

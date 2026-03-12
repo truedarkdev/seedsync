@@ -25,11 +25,15 @@ interface IViewFile {
     isExtractable: boolean;
     isLocallyDeletable: boolean;
     isRemotelyDeletable: boolean;
+    isValidatable: boolean;
     // timestamps
     localCreatedTimestamp: Date;
     localModifiedTimestamp: Date;
     remoteCreatedTimestamp: Date;
     remoteModifiedTimestamp: Date;
+    validationProgress: number;
+    validationError: string;
+    corruptChunks: number[];
 }
 
 // Boiler plate code to set up an immutable class
@@ -53,10 +57,14 @@ const DefaultViewFile: IViewFile = {
     isExtractable: null,
     isLocallyDeletable: null,
     isRemotelyDeletable: null,
+    isValidatable: null,
     localCreatedTimestamp: null,
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
-    remoteModifiedTimestamp: null
+    remoteModifiedTimestamp: null,
+    validationProgress: null,
+    validationError: null,
+    corruptChunks: null
 };
 const ViewFileRecord = Record(DefaultViewFile);
 
@@ -84,10 +92,14 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     isExtractable: boolean;
     isLocallyDeletable: boolean;
     isRemotelyDeletable: boolean;
+    isValidatable: boolean;
     localCreatedTimestamp: Date;
     localModifiedTimestamp: Date;
     remoteCreatedTimestamp: Date;
     remoteModifiedTimestamp: Date;
+    validationProgress: number;
+    validationError: string;
+    corruptChunks: number[];
 
     constructor(props) {
         super(props);
@@ -103,6 +115,9 @@ export module ViewFile {
         STOPPED         = <any> "stopped",
         DELETED         = <any> "deleted",
         EXTRACTING      = <any> "extracting",
-        EXTRACTED       = <any> "extracted"
+        EXTRACTED       = <any> "extracted",
+        VALIDATING      = <any> "validating",
+        VALIDATED       = <any> "validated",
+        CORRUPT         = <any> "corrupt"
     }
 }

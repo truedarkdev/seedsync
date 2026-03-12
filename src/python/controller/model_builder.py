@@ -10,6 +10,7 @@ from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
 from .extract import ExtractStatus, Extract
+from .validate import ValidateStatus
 
 
 class ModelBuilder:
@@ -29,6 +30,7 @@ class ModelBuilder:
         self.__downloaded_files = None
         self.__extract_statuses = dict()
         self.__extracted_files = set()
+        self.__validation_statuses = dict()
         self.__cached_model = None
 
     def set_base_logger(self, base_logger: logging.Logger):
@@ -103,6 +105,12 @@ class ModelBuilder:
         if self.__extracted_files != prev_extracted_files:
             self.__cached_model = None
 
+    def set_validation_statuses(self, validation_statuses: List[ValidateStatus]):
+        prev_validation_statuses = self.__validation_statuses
+        self.__validation_statuses = {status.file_id: status for status in validation_statuses}
+        if self.__validation_statuses != prev_validation_statuses:
+            self.__cached_model = None
+
     def clear(self):
         self.__local_files.clear()
         self.__remote_files.clear()
@@ -110,6 +118,7 @@ class ModelBuilder:
         self.__downloaded_files = None
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
+        self.__validation_statuses.clear()
         self.__cached_model = None
 
     def has_changes(self) -> bool:
@@ -378,6 +387,20 @@ class ModelBuilder:
             if self.__model_file_matches_persisted_name(model_file, self.__extracted_files) and \
                     model_file.state == ModelFile.State.DOWNLOADED:
                     model_file.state = ModelFile.State.EXTRACTED
+
+            validation_status = self.__validation_statuses.get(model_file.file_id)
+            if validation_status is not None and model_file.state in (
+                    ModelFile.State.DEFAULT,
+                    ModelFile.State.DOWNLOADED,
+                    ModelFile.State.EXTRACTED,
+                    ModelFile.State.VALIDATING,
+                    ModelFile.State.VALIDATED,
+                    ModelFile.State.CORRUPT
+            ) and model_file.local_size is not None and model_file.remote_size is not None:
+                model_file.state = validation_status.state
+                model_file.validation_progress = validation_status.progress
+                model_file.validation_error = validation_status.error
+                model_file.corrupt_chunks = validation_status.corrupt_chunks
 
             model.add_file(model_file)
 

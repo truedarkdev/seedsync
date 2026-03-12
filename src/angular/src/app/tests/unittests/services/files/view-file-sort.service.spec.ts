@@ -166,6 +166,26 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.DOWNLOADED})
         )).toBeLessThan(0);
         expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.CORRUPT}),
+            new ViewFile({status: ViewFile.Status.EXTRACTING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTING}),
+            new ViewFile({status: ViewFile.Status.VALIDATING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.VALIDATING}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTED}),
+            new ViewFile({status: ViewFile.Status.VALIDATED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.VALIDATED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DOWNLOADED}),
             new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeLessThan(0);
@@ -188,6 +208,34 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTED, name: "flower"}),
             new ViewFile({status: ViewFile.Status.EXTRACTED, name: "tofu"})
+        )).toBeLessThan(0);
+    }));
+
+    it("prioritizes validation statuses between their adjacent states", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.STATUS
+        }));
+        tick();
+
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.CORRUPT}),
+            new ViewFile({status: ViewFile.Status.EXTRACTING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTING}),
+            new ViewFile({status: ViewFile.Status.VALIDATING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.VALIDATING}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTED}),
+            new ViewFile({status: ViewFile.Status.VALIDATED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.VALIDATED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
         )).toBeLessThan(0);
     }));
 

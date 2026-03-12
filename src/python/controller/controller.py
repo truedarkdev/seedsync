@@ -20,6 +20,7 @@ from .scan import (
     MultiPathRemoteScanner,
 )
 from .extract import ExtractProcess, ExtractStatus
+from .validate import ValidateProcess
 from .model_builder import ModelBuilder
 from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
@@ -52,6 +53,7 @@ class Controller:
             EXTRACT = 2
             DELETE_LOCAL = 3
             DELETE_REMOTE = 4
+            VALIDATE = 5
 
         class ICallback(ABC):
             """Command callback interface"""
@@ -223,6 +225,15 @@ class Controller:
             out_dir_path=out_dir_path,
             local_path=self.__context.config.lftp.local_path
         )
+        self.__validate_process = ValidateProcess(
+            remote_address=self.__context.config.lftp.remote_address,
+            remote_username=self.__context.config.lftp.remote_username,
+            remote_password=self.__password,
+            remote_port=self.__context.config.lftp.remote_port,
+            local_path=self.__context.config.lftp.local_path,
+            remote_path=self.__context.config.lftp.remote_path,
+            path_pairs_by_id=self.__path_pairs_by_id
+        )
 
         # Setup multiprocess logging
         self.__mp_logger = MultiprocessingLogger(self.logger)
@@ -230,6 +241,7 @@ class Controller:
         self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
         self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
         self.__extract_process.set_multiprocessing_logger(self.__mp_logger)
+        self.__validate_process.set_multiprocessing_logger(self.__mp_logger)
 
         # Keep track of active files
         self.__active_downloading_file_names = []
@@ -255,6 +267,7 @@ class Controller:
         self.__local_scan_process.start()
         self.__remote_scan_process.start()
         self.__extract_process.start()
+        self.__validate_process.start()
         self.__mp_logger.start()
         self.__started = True
 
@@ -279,10 +292,12 @@ class Controller:
             self.__local_scan_process.terminate()
             self.__remote_scan_process.terminate()
             self.__extract_process.terminate()
+            self.__validate_process.terminate()
             self.__active_scan_process.join()
             self.__local_scan_process.join()
             self.__remote_scan_process.join()
             self.__extract_process.join()
+            self.__validate_process.join()
             self.__mp_logger.stop()
             self.__started = False
             self.logger.info("Exited controller")
@@ -497,6 +512,7 @@ class Controller:
 
         # Grab the latest extract results
         latest_extract_statuses = self.__extract_process.pop_latest_statuses()
+        latest_validation_statuses = self.__validate_process.pop_latest_statuses()
 
         # Grab the latest extracted file names
         latest_extracted_results = self.__extract_process.pop_completed()
@@ -529,6 +545,8 @@ class Controller:
             self.__model_builder.set_lftp_statuses(lftp_statuses)
         if latest_extract_statuses is not None:
             self.__model_builder.set_extract_statuses(latest_extract_statuses.statuses)
+        if latest_validation_statuses is not None:
+            self.__model_builder.set_validation_statuses(latest_validation_statuses.statuses)
         if latest_extracted_results:
             for result in latest_extracted_results:
                 self.__persist.extracted_file_names.add(result.name)
@@ -685,6 +703,30 @@ class Controller:
                 else:
                     self.__extract_process.extract(file)
 
+            elif command.action == Controller.Command.Action.VALIDATE:
+                if file.state not in (
+                    ModelFile.State.DOWNLOADED,
+                    ModelFile.State.EXTRACTED,
+                    ModelFile.State.VALIDATED,
+                    ModelFile.State.CORRUPT
+                ):
+                    _notify_failure(
+                        command,
+                        "File '{}' in state {} cannot be validated".format(
+                            command.filename, str(file.state)
+                        ),
+                        409
+                    )
+                    continue
+                elif file.local_size is None:
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
+                    continue
+                elif file.remote_size is None:
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
+                    continue
+                else:
+                    self.__validate_process.validate(file)
+
             elif command.action == Controller.Command.Action.DELETE_LOCAL:
                 if file.state not in (
                     ModelFile.State.DEFAULT,
@@ -716,6 +758,7 @@ class Controller:
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
                     self.__persist.stopped_file_names.add(file.file_id)
+                    self.__validate_process.clear(file.file_id)
 
             elif command.action == Controller.Command.Action.DELETE_REMOTE:
                 if file.state not in (
@@ -753,8 +796,14 @@ class Controller:
                     )
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
+                    self.__validate_process.clear(file.file_id)
 
             # If we get here, it was a success
+            if command.action in (
+                Controller.Command.Action.QUEUE,
+                Controller.Command.Action.STOP
+            ):
+                self.__validate_process.clear(file.file_id)
             for callback in command.callbacks:
                 callback.on_success()
 
@@ -772,6 +821,7 @@ class Controller:
         self.__remote_scan_process.propagate_exception()
         self.__mp_logger.propagate_exception()
         self.__extract_process.propagate_exception()
+        self.__validate_process.propagate_exception()
 
     def __cleanup_commands(self):
         """

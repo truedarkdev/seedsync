@@ -41,6 +41,7 @@ export class FileComponent implements OnChanges {
     @Output() extractEvent = new EventEmitter<ViewFile>();
     @Output() deleteLocalEvent = new EventEmitter<ViewFile>();
     @Output() deleteRemoteEvent = new EventEmitter<ViewFile>();
+    @Output() validateEvent = new EventEmitter<ViewFile>();
     @Output() toggleSelectionEvent = new EventEmitter<ViewFile>();
 
     // Indicates an active action on-going
@@ -112,6 +113,10 @@ export class FileComponent implements OnChanges {
         return this.activeAction == null && this.file != null && this.file.isRemotelyDeletable;
     }
 
+    isValidatable() {
+        return this.activeAction == null && this.file != null && this.file.isValidatable;
+    }
+
     onQueue(file: ViewFile) {
         if (!this.isQueueable() || file == null) {
             return;
@@ -174,6 +179,15 @@ export class FileComponent implements OnChanges {
         );
     }
 
+    onValidate(file: ViewFile) {
+        if (!this.isValidatable() || file == null) {
+            return;
+        }
+
+        this.activeAction = FileAction.VALIDATE;
+        this.validateEvent.emit(file);
+    }
+
     onToggleSelection(file: ViewFile) {
         if (file != null) {
             this.toggleSelectionEvent.emit(file);
@@ -197,5 +211,6 @@ export enum FileAction {
     STOP,
     EXTRACT,
     DELETE_LOCAL,
-    DELETE_REMOTE
+    DELETE_REMOTE,
+    VALIDATE
 }

@@ -35,6 +35,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process = MagicMock()
         self.controller._Controller__active_scanner = MagicMock()
         self.controller._Controller__extract_process = MagicMock()
+        self.controller._Controller__validate_process = MagicMock()
         self.controller._Controller__mp_logger = MagicMock()
         self.controller._Controller__staging_path = "/local/incomplete"
         self.controller._Controller__path_pairs_by_id = {}
@@ -129,6 +130,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__mp_logger.propagate_exception.assert_called_once_with()
         self.controller._Controller__extract_process.propagate_exception.assert_called_once_with()
+        self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
 
     def test_update_model_sets_multi_path_active_scan_entries(self):
         self.controller._Controller__active_scanner = MultiPathActiveScanner({})
@@ -287,6 +289,57 @@ class TestController(unittest.TestCase):
             local_path="/local/movies",
             file_name="dup"
         )
+
+    def test_process_commands_validate_queues_validation(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__validate_process.validate.assert_called_once_with(file)
+
+    def test_process_commands_validate_rejects_missing_remote_file(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = None
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("File 'dup' does not exist remotely", 404)
+        self.controller._Controller__validate_process.validate.assert_not_called()
+
+    def test_process_commands_validate_rejects_stopped_partial_file(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with(
+            "File 'dup' in state State.DEFAULT cannot be validated",
+            409
+        )
+        self.controller._Controller__validate_process.validate.assert_not_called()
 
     def test_build_staging_path_prefers_explicit_single_path_override(self):
         self.assertEqual(

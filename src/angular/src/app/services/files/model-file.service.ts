@@ -111,6 +111,17 @@ export class ModelFileService extends BaseStreamService {
         return this._restService.delete(url);
     }
 
+    /**
+     * Validate a file
+     * @param {ModelFile} file
+     * @returns {Observable<WebReaction>}
+     */
+    public validate(file: ModelFile): Observable<WebReaction> {
+        this._logger.debug("Validate model file: " + file.name);
+        const url: string = ModelFileService.buildCommandUrl("validate", file);
+        return this._restService.post(url);
+    }
+
     protected onEvent(eventName: string, data: string) {
         this.parseEvent(eventName, data);
     }
