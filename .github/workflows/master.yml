@@ -122,7 +122,7 @@ jobs:
     needs: [ build-deb ]
     strategy:
       matrix:
-        oscode: [ ubu1604, ubu1804, ubu2004 ]
+        oscode: [ ubu2004 ]
     steps:
       - name: Checkout
         uses: actions/checkout@v4

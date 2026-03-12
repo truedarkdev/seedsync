@@ -235,8 +235,8 @@ make run-tests-angular
 # E2E Tests
 # Docker image (arch=amd64,arm64,arm/v7)
 make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=<arch code>
-# Debian package (os=ubu1604,ubu1804,ubu2004)
-make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=<os code>
+# Debian package (active DEB e2e lane: `ubu2004`, using the Ubuntu 20.04 lane)
+make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=ubu2004
 ```
 
 By default images are pulled from `localhost:5000`. To test image from a registry other than the local, use `STAGING_REGISTRY=`.
