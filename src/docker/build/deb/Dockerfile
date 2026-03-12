@@ -31,7 +31,6 @@ RUN pyinstaller /python/seedsync.py \
     --workpath /build/work \
     --specpath /build \
     --additional-hooks-dir /pyinstaller_hooks/ \
-    --hidden-import="pkg_resources.py2_warn" \
     --hidden-import="six" \
     --hidden-import="six.moves" \
     --name seedsync

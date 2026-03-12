@@ -58,7 +58,7 @@ RUN set -eux; \
     fi; \
     apt-get update; \
     apt-get install -y --no-install-recommends \
-        gcc \
+        build-essential \
         libssl-dev \
         lftp \
         openssh-client \
