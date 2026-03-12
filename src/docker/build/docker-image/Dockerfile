@@ -93,8 +93,10 @@ RUN groupadd -g 1000 seedsync && \
     useradd -r -u 1000 -g seedsync seedsync
 RUN mkdir /config && \
     mkdir /downloads && \
+    mkdir /mounts && \
     chown seedsync:seedsync /config && \
-    chown seedsync:seedsync /downloads
+    chown seedsync:seedsync /downloads && \
+    chown seedsync:seedsync /mounts
 
 # Switch to non-root user
 USER seedsync
