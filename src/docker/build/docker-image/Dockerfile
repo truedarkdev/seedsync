@@ -1,5 +1,49 @@
-ARG STAGING_REGISTRY=localhost:5000
-ARG STAGING_VERSION=latest
+# Creates environment to build python binaries
+FROM python:3.11-slim-bullseye AS seedsync_build_pyinstaller_env
+RUN apt-get update && apt-get install -y \
+    binutils \
+    build-essential \
+    curl \
+    libffi-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip3 install "poetry==2.3.2"
+RUN poetry config virtualenvs.create false
+COPY src/python/pyproject.toml /app/python/
+COPY src/python/poetry.lock /app/python/
+WORKDIR /app/python
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+RUN poetry install
+
+
+# Builds scanfs with pyinstaller
+FROM seedsync_build_pyinstaller_env AS seedsync_build_scanfs
+COPY src/python /python
+RUN mkdir -p /build
+RUN pyinstaller /python/scan_fs.py \
+    -y \
+    --onefile \
+    -p /python \
+    --distpath /build/dist \
+    --workpath /build/work \
+    --specpath /build \
+    --name scanfs
+
+
+# Creates environment for angular
+FROM node:12.16 AS seedsync_build_angular_env
+COPY src/angular/package*.json /app/
+WORKDIR /app
+RUN npm install
+
+
+# Builds angular app into html
+FROM seedsync_build_angular_env AS seedsync_build_angular
+COPY src/angular /app
+WORKDIR /app
+RUN mkdir -p /build/dist
+RUN node_modules/@angular/cli/bin/ng build -prod --output-path /build/dist/
 
 # Creates environment to run Seedsync python code
 # Installs all python dependencies
@@ -62,12 +106,10 @@ RUN chmod -R a+rX /app/python
 
 
 # Full Seedsync docker image
-FROM ${STAGING_REGISTRY}/seedsync/build/angular/export:${STAGING_VERSION} AS seedsync_build_angular_export
-FROM ${STAGING_REGISTRY}/seedsync/build/scanfs/export:${STAGING_VERSION} AS seedsync_build_scanfs_export
 FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
-COPY --from=seedsync_build_angular_export /html /app/html
-COPY --from=seedsync_build_scanfs_export /scanfs /app/scanfs
+COPY --from=seedsync_build_angular /build/dist /app/html
+COPY --from=seedsync_build_scanfs /build/dist/scanfs /app/scanfs
 COPY src/docker/build/docker-image/setup_default_config.sh /scripts/
 
 # Accept new host keys on first connection while still rejecting changed keys.
