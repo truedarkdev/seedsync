@@ -3,7 +3,7 @@ ARG STAGING_VERSION=latest
 
 # Creates environment to run Seedsync python code
 # Installs all python dependencies
-FROM python:3.8-slim AS seedsync_run_python_env
+FROM python:3.11-slim-bullseye AS seedsync_run_python_env
 
 # Install dependencies
 RUN set -eux; \
@@ -31,9 +31,8 @@ RUN set -eux; \
 # See: https://github.com/wummel/patool/issues/90
 RUN ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so
 
-# Keep Poetry on a release line that still supports Python 3.8 and the
-# current package-mode-based dependency-only configuration.
-RUN pip3 install "poetry==1.8.5"
+# Keep Poetry pinned so the lockfile generation and image installs stay aligned.
+RUN pip3 install "poetry==2.3.2"
 RUN poetry config virtualenvs.create false
 
 ENV LC_ALL=C.UTF-8
@@ -50,7 +49,7 @@ RUN cd /app/python && poetry install --only main
 FROM seedsync_run_python_env AS seedsync_run_python_devenv
 # The main dependency install downgrades requests to the application's pinned
 # runtime version, so refresh Poetry before adding dev-only dependencies.
-RUN pip3 install --force-reinstall "poetry==1.8.5"
+RUN pip3 install --force-reinstall "poetry==2.3.2"
 RUN poetry config virtualenvs.create false
 RUN cd /app/python && poetry install
 

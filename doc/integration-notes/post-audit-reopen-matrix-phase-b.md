@@ -17,7 +17,7 @@ Inputs used:
 ## Final Execution Tasks
 
 ### PB-001 - Python 3.11 baseline and Poetry metadata refresh
-- Status: still needed - Python 3.11/Poetry baseline shift is still deferred, and the repo still pins Python 3.8.
+- Status: closed - the repo now targets Python `~3.11`, the Poetry metadata/lock were refreshed to Poetry `2.3.2`, and both docker build paths now use explicit `python:3.11-slim-bullseye` bases with main-session verification.
 - RAF buckets: `RAF-001`, `RAF-002`
 - Why this is one task: the lockfile and metadata work is part of the same deferred Python 3.11 baseline shift.
 - Dependencies: none
@@ -186,7 +186,7 @@ Inputs used:
   - `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5`
 
 ### PB-012 - WebApp `_stop_flag` compatibility
-- Status: matrix should be corrected - there is no active implementation gap under the current Bottle `0.12.19` pin; this should be reclassified as a conditional future follow-up to revisit only if the Bottle baseline changes.
+- Status: matrix should be corrected - there is still no active implementation gap evidenced after the PB-001 Bottle `0.12.25` refresh, so this remains a conditional future follow-up only if a real `_stop_flag` regression appears.
 - RAF buckets: `RAF-012`
 - Why this stays separate: it is a narrow Bottle/WebApp runtime compatibility slice.
 - Dependencies: none
