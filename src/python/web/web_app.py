@@ -57,6 +57,7 @@ class WebApp(bottle.Bottle):
     Web app implementation
     """
     _STREAM_POLL_INTERVAL_IN_MS = 100
+    _STREAM_EVENT_YIELD_INTERVAL_IN_MS = 10
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
 
     def __init__(self, context: Context, controller: Controller):
@@ -150,16 +151,16 @@ class WebApp(bottle.Bottle):
 
             # Get streaming values until the connection closes
             while not self.__stop:
+                emitted_value = False
                 for handler in handlers:
-                    # Process all values from this handler
-                    while True:
-                        value = handler.get_value()
-                        if value:
-                            yield value
-                        else:
-                            break
+                    value = handler.get_value()
+                    if value is not None:
+                        emitted_value = True
+                        yield value
+                        time.sleep(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
 
-                time.sleep(WebApp._STREAM_POLL_INTERVAL_IN_MS / 1000)
+                if not emitted_value:
+                    time.sleep(WebApp._STREAM_POLL_INTERVAL_IN_MS / 1000)
 
         finally:
             self.logger.debug("Stream connection stopped by {}".format(

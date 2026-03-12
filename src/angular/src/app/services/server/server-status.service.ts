@@ -5,6 +5,7 @@ import {BehaviorSubject} from "rxjs/Rx";
 import {Localization} from "../../common/localization";
 import {ServerStatus, ServerStatusJson} from "./server-status";
 import {BaseStreamService} from "../base/base-stream.service";
+import {LoggerService} from "../utils/logger.service";
 
 
 @Injectable()
@@ -18,7 +19,7 @@ export class ServerStatusService extends BaseStreamService {
             }
         }));
 
-    constructor() {
+    constructor(private _logger: LoggerService) {
         super();
         this.registerEventName("status");
     }
@@ -50,8 +51,12 @@ export class ServerStatusService extends BaseStreamService {
      * @param {string} data
      */
     private parseStatus(data: string) {
-        const statusJson: ServerStatusJson = JSON.parse(data);
-        const status = ServerStatus.fromJson(statusJson);
-        this._status.next(status);
+        try {
+            const statusJson: ServerStatusJson = JSON.parse(data);
+            const status = ServerStatus.fromJson(statusJson);
+            this._status.next(status);
+        } catch (error) {
+            this._logger.error("Failed to parse server status payload: %O", error);
+        }
     }
 }

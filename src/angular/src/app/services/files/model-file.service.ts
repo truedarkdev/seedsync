@@ -135,6 +135,15 @@ export class ModelFileService extends BaseStreamService {
         this._files.next(this._files.getValue().clear());
     }
 
+    private parseJsonSafe(data: string): any | null {
+        try {
+            return JSON.parse(data);
+        } catch (error) {
+            this._logger.error("Failed to parse model stream payload: %O", error);
+            return null;
+        }
+    }
+
     /**
      * Parse an event and update the file model
      * @param {string} name
@@ -147,63 +156,95 @@ export class ModelFileService extends BaseStreamService {
             let t1: number;
 
             t0 = performance.now();
-            const parsed: [any] = JSON.parse(data);
+            const parsed: [any] = this.parseJsonSafe(data);
+            if (parsed === null || !Array.isArray(parsed)) {
+                this._logger.error("Invalid model-init payload");
+                return;
+            }
             t1 = performance.now();
             this._logger.debug("Parsing took", (t1 - t0).toFixed(0), "ms");
 
-            t0 = performance.now();
-            const newFiles: ModelFile[] = [];
-            for (const file of parsed) {
-                newFiles.push(ModelFile.fromJson(file));
+            try {
+                t0 = performance.now();
+                const newFiles: ModelFile[] = [];
+                for (const file of parsed) {
+                    newFiles.push(ModelFile.fromJson(file));
+                }
+                t1 = performance.now();
+                this._logger.debug("ModelFile creation took", (t1 - t0).toFixed(0), "ms");
+
+                // Replace the entire model
+                t0 = performance.now();
+                const newMap = Immutable.Map<string, ModelFile>(
+                    newFiles.map(value => ([ModelFileService.getFileKey(value), value]))
+                );
+                t1 = performance.now();
+                this._logger.debug("ModelFile map creation took", (t1 - t0).toFixed(0), "ms");
+
+                this._files.next(newMap);
+                // this._logger.debug("New model: %O", this._files.getValue().toJS());
+            } catch (error) {
+                this._logger.error("Failed to handle model-init payload: %O", error);
             }
-            t1 = performance.now();
-            this._logger.debug("ModelFile creation took", (t1 - t0).toFixed(0), "ms");
-
-            // Replace the entire model
-            t0 = performance.now();
-            const newMap = Immutable.Map<string, ModelFile>(
-                newFiles.map(value => ([ModelFileService.getFileKey(value), value]))
-            );
-            t1 = performance.now();
-            this._logger.debug("ModelFile map creation took", (t1 - t0).toFixed(0), "ms");
-
-            this._files.next(newMap);
-            // this._logger.debug("New model: %O", this._files.getValue().toJS());
         } else if (name === this.EVENT_ADDED) {
             // Added event receives old and new ModelFiles
             // Only new file is relevant
-            const parsed: {new_file: any} = JSON.parse(data);
-            const file = ModelFile.fromJson(parsed.new_file);
-            const fileKey = ModelFileService.getFileKey(file);
-            if (this._files.getValue().has(fileKey)) {
-                this._logger.error("ModelFile identity " + fileKey + " already exists");
-            } else {
-                this._files.next(this._files.getValue().set(fileKey, file));
-                this._logger.debug("Added file: %O", file.toJS());
+            const parsed: {new_file: any} = this.parseJsonSafe(data);
+            if (parsed === null || !parsed.new_file) {
+                this._logger.error("Invalid model-added payload");
+                return;
+            }
+            try {
+                const file = ModelFile.fromJson(parsed.new_file);
+                const fileKey = ModelFileService.getFileKey(file);
+                if (this._files.getValue().has(fileKey)) {
+                    this._logger.error("ModelFile identity " + fileKey + " already exists");
+                } else {
+                    this._files.next(this._files.getValue().set(fileKey, file));
+                    this._logger.debug("Added file: %O", file.toJS());
+                }
+            } catch (error) {
+                this._logger.error("Failed to handle model-added payload: %O", error);
             }
         } else if (name === this.EVENT_REMOVED) {
             // Removed event receives old and new ModelFiles
             // Only old file is relevant
-            const parsed: {old_file: any} = JSON.parse(data);
-            const file = ModelFile.fromJson(parsed.old_file);
-            const fileKey = ModelFileService.getFileKey(file);
-            if (this._files.getValue().has(fileKey)) {
-                this._files.next(this._files.getValue().remove(fileKey));
-                this._logger.debug("Removed file: %O", file.toJS());
-            } else {
-                this._logger.error("Failed to find ModelFile identity " + fileKey);
+            const parsed: {old_file: any} = this.parseJsonSafe(data);
+            if (parsed === null || !parsed.old_file) {
+                this._logger.error("Invalid model-removed payload");
+                return;
+            }
+            try {
+                const file = ModelFile.fromJson(parsed.old_file);
+                const fileKey = ModelFileService.getFileKey(file);
+                if (this._files.getValue().has(fileKey)) {
+                    this._files.next(this._files.getValue().remove(fileKey));
+                    this._logger.debug("Removed file: %O", file.toJS());
+                } else {
+                    this._logger.error("Failed to find ModelFile identity " + fileKey);
+                }
+            } catch (error) {
+                this._logger.error("Failed to handle model-removed payload: %O", error);
             }
         } else if (name === this.EVENT_UPDATED) {
             // Updated event received old and new ModelFiles
             // We will only use the new one here
-            const parsed: {new_file: any} = JSON.parse(data);
-            const file = ModelFile.fromJson(parsed.new_file);
-            const fileKey = ModelFileService.getFileKey(file);
-            if (this._files.getValue().has(fileKey)) {
-                this._files.next(this._files.getValue().set(fileKey, file));
-                this._logger.debug("Updated file: %O", file.toJS());
-            } else {
-                this._logger.error("Failed to find ModelFile identity " + fileKey);
+            const parsed: {new_file: any} = this.parseJsonSafe(data);
+            if (parsed === null || !parsed.new_file) {
+                this._logger.error("Invalid model-updated payload");
+                return;
+            }
+            try {
+                const file = ModelFile.fromJson(parsed.new_file);
+                const fileKey = ModelFileService.getFileKey(file);
+                if (this._files.getValue().has(fileKey)) {
+                    this._files.next(this._files.getValue().set(fileKey, file));
+                    this._logger.debug("Updated file: %O", file.toJS());
+                } else {
+                    this._logger.error("Failed to find ModelFile identity " + fileKey);
+                }
+            } catch (error) {
+                this._logger.error("Failed to handle model-updated payload: %O", error);
             }
         } else {
             this._logger.error("Unrecognized event:", name);

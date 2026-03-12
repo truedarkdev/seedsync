@@ -30,7 +30,6 @@ describe("Testing model file service", () => {
         });
 
         httpMock = TestBed.get(HttpTestingController);
-
         modelFileService = TestBed.get(ModelFileService);
     });
 
@@ -345,6 +344,53 @@ describe("Testing model file service", () => {
         expect(latestModel.size).toBe(0);
 
         tick(4000);
+    }));
+
+    it("should ignore malformed init payloads", fakeAsync(() => {
+        spyOn(console, "error");
+        let count = 0;
+        let latestModel: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe({
+            next: modelFiles => {
+                count++;
+                latestModel = modelFiles;
+            }
+        });
+        tick();
+
+        expect(() => modelFileService.notifyEvent("model-init", "{bad json")).not.toThrow();
+        tick();
+
+        expect(count).toBe(1);
+        expect(latestModel.size).toBe(0);
+        expect(console.error).toHaveBeenCalled();
+    }));
+
+    it("should ignore malformed update payloads", fakeAsync(() => {
+        spyOn(console, "error");
+        modelFileService.notifyEvent("model-init", JSON.stringify([{
+            name: "File.One",
+            is_dir: false,
+            local_size: 1234,
+            remote_size: 4567,
+            state: "default",
+            downloading_speed: 99,
+            eta: 54,
+            full_path: "/full/path/to/file.one",
+            children: []
+        }]));
+
+        let latestModel: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe({
+            next: modelFiles => latestModel = modelFiles
+        });
+        tick();
+
+        expect(() => modelFileService.notifyEvent("model-updated", "{\"new_file\":null}")).not.toThrow();
+        tick();
+
+        expect(latestModel.size).toBe(1);
+        expect(console.error).toHaveBeenCalled();
     }));
 
     it("should send a POST on queue command", fakeAsync(() => {

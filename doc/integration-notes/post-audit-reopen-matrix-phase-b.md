@@ -188,7 +188,7 @@ Inputs used:
   - `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5`
 
 ### PB-012 - WebApp `_stop_flag` compatibility
-- Status: matrix should be corrected - there is still no active implementation gap evidenced after the PB-001 Bottle `0.12.25` refresh, so this remains a conditional future follow-up only if a real `_stop_flag` regression appears.
+- Status: conditional future follow-up only - there is still no active implementation gap evidenced after the PB-001 Bottle `0.12.25` refresh, so revisit this only if a real `_stop_flag` regression appears.
 - RAF buckets: `RAF-012`
 - Why this stays separate: it is a narrow Bottle/WebApp runtime compatibility slice.
 - Dependencies: none
@@ -215,7 +215,7 @@ Inputs used:
   - `2d866f1d12d476236e332c46e3350964b4d879cf`
 
 ### PB-014 - Backend bounded-state and memory-monitoring hardening
-- Status: partially needed - bounded stream queues have landed, but broader bounded-state and memory-monitor work remain.
+- Status: partially needed - bounded stream queues plus safe downloaded-file pruning/cache invalidation have landed, but the attempted persisted downloaded-file cap was rolled back as unsafe and broader bounded-state and memory-monitor work still remain.
 - RAF buckets: `RAF-018`
 - Why this stays separate: it is broader than the narrower status-lock or endpoint hardening slices.
 - Dependencies: none
@@ -255,7 +255,7 @@ Inputs used:
   - `7297af2890b4ee0ffc4f637e08f50ae9e28f8462`
 
 ### PB-018 - SSE server transport reliability
-- Status: still needed - SSE server heartbeat and fair-yield transport hardening remain.
+- Status: closed - the server stream now registers a heartbeat handler and uses one-event-per-handler fair yielding plus short per-event pacing so busy producers do not monopolize or flood the multiplexed SSE stream.
 - RAF buckets: `RAF-027`, `RAF-028`
 - Why this is one task: heartbeat/reconnect and fair-yield transport behavior are one server-side SSE execution unit.
 - Dependencies: `PB-015`
@@ -268,7 +268,7 @@ Inputs used:
   - `33cc1cf0480adaaa2c50cf1cf6c0f7ffb6be71e8`
 
 ### PB-019 - SSE client dispatch hardening
-- Status: partially needed - client-side SSE hardening is partial; unknown-event, reconnect, and payload guards remain.
+- Status: closed - the client-side SSE registry now guards orphaned events, avoids stacked reconnect attempts, and the remaining status/model payload parsing gaps are handled defensively.
 - RAF buckets: `RAF-029`
 - Why this stays separate: this is the client-side registry/timer/payload guard lane, not the server transport lane.
 - Dependencies: `PB-018`

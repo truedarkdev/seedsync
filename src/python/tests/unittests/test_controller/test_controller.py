@@ -1,4 +1,3 @@
-import os
 import unittest
 from queue import Queue
 from unittest.mock import MagicMock, patch
@@ -7,7 +6,7 @@ from types import SimpleNamespace
 from controller import Controller
 from controller.scan import MultiPathActiveScanner
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
-from model import ModelError, ModelFile
+from model import ModelDiff, ModelError, ModelFile
 
 
 class TestController(unittest.TestCase):
@@ -147,6 +146,50 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([
             ("dup", "movies", "Movies")
         ])
+
+    @patch("controller.controller.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_prunes_stale_downloaded_file_names(self, _):
+        self.controller._Controller__persist.downloaded_file_names = {"keep-id", "stale-id"}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
+        self.controller._Controller__model.get_file_names.return_value = {"keep"}
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({"keep-id"}, self.controller._Controller__persist.downloaded_file_names)
+        self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({"keep-id"})
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_keeps_downloaded_file_ids_when_new_download_completes(self, diff_models):
+        added_file = ModelFile("keep", False)
+        added_file.path_pair_id = "movies"
+        added_file.state = ModelFile.State.DOWNLOADED
+        added_file.file_id = "[\"movies\",\"keep\"]"
+
+        stale_a = "[\"movies\",\"a\"]"
+        stale_b = "[\"movies\",\"b\"]"
+        self.controller._Controller__persist.downloaded_file_names = {stale_a, stale_b}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = {
+            stale_a,
+            stale_b,
+            added_file.file_id
+        }
+        self.controller._Controller__model.get_file_names.return_value = {"a", "b", "keep"}
+        diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=added_file)]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(
+            {stale_a, stale_b, added_file.file_id},
+            self.controller._Controller__persist.downloaded_file_names
+        )
+        self.assertEqual(
+            {stale_a, stale_b, added_file.file_id},
+            self.controller._Controller__model_builder.set_downloaded_files.call_args_list[-1][0][0]
+        )
 
     def test_process_commands_queue_uses_path_pair_paths(self):
         file = ModelFile("dup", False)
