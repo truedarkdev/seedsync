@@ -9,28 +9,33 @@ module.exports = function (config) {
             require('karma-jasmine'),
             require('karma-chrome-launcher'),
             require('karma-jasmine-html-reporter'),
-            require('karma-coverage-istanbul-reporter'),
+            require('karma-coverage'),
             require('@angular/cli/plugins/karma'),
-            require('karma-mocha-reporter')
+            require('karma-spec-reporter')
         ],
         client: {
             clearContext: false, // leave Jasmine Spec Runner output visible in browser
             captureConsole: false
         },
-        coverageIstanbulReporter: {
-            reports: ['html', 'lcovonly'],
-            fixWebpackSourcePaths: true
+        coverageReporter: {
+            type: 'html',
+            dir: 'coverage/'
         },
         angularCli: {
             environment: 'dev'
         },
-        reporters: ['mocha', 'kjhtml'],
+        reporters: ['spec', 'kjhtml'],
         port: 9876,
         colors: true,
         logLevel: config.LOG_INFO,
         autoWatch: true,
         browsers: ['Chrome'],
         singleRun: false,
+        browserDisconnectTimeout: 30000,
+        browserDisconnectTolerance: 3,
+        browserNoActivityTimeout: 120000,
+        captureTimeout: 120000,
+        processKillTimeout: 10000,
 
         customLaunchers: {
             ChromeHeadless: {
@@ -71,9 +76,6 @@ module.exports = function (config) {
                     '--window-size=1920,1080'
                 ]
             }
-        },
-        mochaReporter: {
-            output: 'full'
         }
     });
 };

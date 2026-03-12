@@ -1,5 +1,5 @@
 # Creates environment to build python binaries
-FROM python:3.11-slim-bullseye AS seedsync_build_pyinstaller_env
+FROM python:3.12-slim-bullseye AS seedsync_build_pyinstaller_env
 RUN apt-get update && apt-get install -y \
     binutils \
     build-essential \
@@ -51,10 +51,15 @@ RUN	pyinstaller /python/scan_fs.py \
 
 
 # Creates environment for angular
-FROM node:12.16 AS seedsync_build_angular_env
+FROM node:20-bookworm-slim AS seedsync_build_angular_env
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    python3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY src/angular/package*.json /app/
 WORKDIR /app
-RUN npm install
+ENV NODE_OPTIONS=--openssl-legacy-provider
+RUN npm install --legacy-peer-deps
 
 # Builds angular app into html
 # Output is in /build/dist/
