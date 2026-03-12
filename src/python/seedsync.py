@@ -404,8 +404,8 @@ class Seedsync:
 
 
 if __name__ == "__main__":
-    if sys.hexversion < 0x03050000:
-        sys.exit("Python 3.5 or newer is required to run this program.")
+    if sys.hexversion < 0x030B0000 or sys.hexversion >= 0x030D0000:
+        sys.exit("Python 3.11 or 3.12 is required to run this program.")
 
     while True:
         try:
