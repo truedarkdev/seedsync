@@ -1462,6 +1462,18 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual({"a", "b"}, downloaded_files)
 
+    def test_rebuild_on_in_place_downloaded_file_mutation_after_reset(self):
+        downloaded_files = {"a", "b"}
+
+        self.model_builder.set_downloaded_files(downloaded_files)
+        self.model_builder.build_model()
+        self.assertFalse(self.model_builder.has_changes())
+
+        downloaded_files.add("c")
+        self.model_builder.set_downloaded_files(downloaded_files)
+
+        self.assertTrue(self.model_builder.has_changes())
+
     def test_rebuild_on_extract_statuses(self):
         self.assertTrue(self.model_builder.has_changes())
 

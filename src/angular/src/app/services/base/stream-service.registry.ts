@@ -1,5 +1,6 @@
 import {Injectable, NgZone} from "@angular/core";
 import {Observable} from "rxjs/Observable";
+import {Subscription} from "rxjs/Subscription";
 import EventSource = require("eventsource");
 
 import {ModelFileService} from "../files/model-file.service";
@@ -55,6 +56,8 @@ export class StreamDispatchService {
 
     private _eventNameToServiceMap: Map<string, IStreamService> = new Map();
     private _services: IStreamService[] = [];
+    private _retryTimeout: any = null;
+    private _streamSubscription: Subscription = null;
 
     constructor(private _logger: LoggerService,
                 private _zone: NgZone) {
@@ -80,7 +83,24 @@ export class StreamDispatchService {
         return service;
     }
 
+    private clearRetryTimeout() {
+        if (this._retryTimeout !== null) {
+            clearTimeout(this._retryTimeout);
+            this._retryTimeout = null;
+        }
+    }
+
+    private clearStreamSubscription() {
+        if (this._streamSubscription !== null) {
+            this._streamSubscription.unsubscribe();
+            this._streamSubscription = null;
+        }
+    }
+
     private createSseObserver() {
+        this.clearRetryTimeout();
+        this.clearStreamSubscription();
+
         const observable = Observable.create(observer => {
             const eventSource = EventSourceFactory.createEventSource(this.STREAM_URL);
             for (let eventName of Array.from(this._eventNameToServiceMap.keys())) {
@@ -96,6 +116,7 @@ export class StreamDispatchService {
             // noinspection JSUnusedLocalSymbols
             eventSource.onopen = event => {
                 this._logger.info("Connected to server stream");
+                this.clearRetryTimeout();
 
                 // Notify all services of connection
                 for (let service of this._services) {
@@ -105,19 +126,27 @@ export class StreamDispatchService {
                 }
             };
 
-            eventSource.onerror = x => observer.error(x);
+            eventSource.onerror = x => {
+                eventSource.close();
+                observer.error(x);
+            };
 
             return () => {
                 eventSource.close();
             };
         });
-        observable.subscribe({
+        this._streamSubscription = observable.subscribe({
             next: (x) => {
                 let eventName = x["event"];
                 let eventData = x["data"];
+                const service = this._eventNameToServiceMap.get(eventName);
+                if (!service) {
+                    this._logger.warn("Ignoring unregistered stream event:", eventName);
+                    return;
+                }
                 // this._logger.debug("Received event:", eventName);
                 this._zone.run(() => {
-                    this._eventNameToServiceMap.get(eventName).notifyEvent(eventName, eventData);
+                    service.notifyEvent(eventName, eventData);
                 });
             },
             error: err => {
@@ -130,7 +159,12 @@ export class StreamDispatchService {
                     });
                 }
 
-                setTimeout(() => { this.createSseObserver(); }, this.STREAM_RETRY_INTERVAL_MS);
+                if (this._retryTimeout === null) {
+                    this._retryTimeout = setTimeout(() => {
+                        this._retryTimeout = null;
+                        this.createSseObserver();
+                    }, this.STREAM_RETRY_INTERVAL_MS);
+                }
             }
         });
     }

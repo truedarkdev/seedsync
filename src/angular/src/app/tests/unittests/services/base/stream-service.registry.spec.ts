@@ -33,8 +33,8 @@ class MockStreamService implements IStreamService {
 
 describe("Testing stream dispatch service", () => {
     let dispatchService: StreamDispatchService;
-
     let mockEventSource: MockEventSource;
+    let eventSources: MockEventSource[];
     let mockService1: MockStreamService;
     let mockService2: MockStreamService;
 
@@ -46,9 +46,11 @@ describe("Testing stream dispatch service", () => {
             ]
         });
 
+        eventSources = [];
         spyOn(EventSourceFactory, "createEventSource").and.callFake(
             (url: string) => {
                 mockEventSource = createMockEventSource(url);
+                eventSources.push(mockEventSource);
                 return mockEventSource;
             }
         );
@@ -58,7 +60,6 @@ describe("Testing stream dispatch service", () => {
         spyOn(mockService2, "getEventNames").and.returnValue(['event2a', 'event2b']);
 
         dispatchService = TestBed.get(StreamDispatchService);
-
         dispatchService.registerService(mockService1);
         dispatchService.registerService(mockService2);
         dispatchService.onInit();
@@ -142,6 +143,33 @@ describe("Testing stream dispatch service", () => {
         expect(mockService1.connectedSeq).toEqual([false]);
         expect(mockService2.connectedSeq).toEqual([false]);
         tick(4000);
+    }));
+
+    it("should schedule only one reconnect timer for repeated errors", fakeAsync(() => {
+        mockEventSource.onerror(new Event("bad event"));
+        mockEventSource.onerror(new Event("bad event again"));
+        tick();
+
+        expect(mockService1.connectedSeq).toEqual([false]);
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(1);
+
+        tick(3000);
+
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(2);
+        expect(eventSources.length).toBe(2);
+    }));
+
+    it("should ignore events whose service registration is missing", fakeAsync(() => {
+        spyOn(console, "warn");
+        (<any>dispatchService)["_eventNameToServiceMap"].delete("event1a");
+
+        expect(() => {
+            mockEventSource.eventListeners.get("event1a")(<MessageEvent>{data: "data1a"});
+            tick();
+        }).not.toThrow();
+
+        expect(mockService1.eventList).toEqual([]);
+        expect(console.warn).toHaveBeenCalled();
     }));
 
     it("should send events after reconnect", fakeAsync(() => {

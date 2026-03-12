@@ -614,6 +614,18 @@ class Controller:
                     self.__persist.extracted_file_names.difference_update(remove_extracted_file_names)
                     self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
+                active_model_names = set(self.__model.get_file_names())
+                active_model_ids = set(self.__model.get_file_ids())
+                remove_downloaded_file_names = {
+                    downloaded_file_name
+                    for downloaded_file_name in self.__persist.downloaded_file_names
+                    if downloaded_file_name not in active_model_names and downloaded_file_name not in active_model_ids
+                }
+                if remove_downloaded_file_names:
+                    self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
+                    self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
+                self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+
         # Update the controller status
         if latest_remote_scan is not None:
             self.__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp

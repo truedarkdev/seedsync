@@ -107,4 +107,24 @@ describe("Testing server status service", () => {
         expect(latestStatus.server.up).toBe(false);
     }));
 
+    it("should ignore malformed status payloads", fakeAsync(() => {
+        spyOn(console, "error");
+        let count = 0;
+        let latestStatus: ServerStatus = null;
+        serverStatusService.status.subscribe({
+            next: status => {
+                count++;
+                latestStatus = status;
+            }
+        });
+        tick();
+
+        expect(() => serverStatusService.notifyEvent("status", "{bad json")).not.toThrow();
+        tick();
+
+        expect(count).toBe(1);
+        expect(latestStatus.server.up).toBe(false);
+        expect(console.error).toHaveBeenCalled();
+    }));
+
 });

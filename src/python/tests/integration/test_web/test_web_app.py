@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import logging
 import sys
 import shutil
@@ -12,6 +12,7 @@ from webtest import TestApp
 from common import overrides, Status, Config, PathPairManager
 from controller import AutoQueuePersist
 from web import WebAppBuilder
+from web.web_app import IStreamHandler, WebApp
 
 
 class BaseTestWebApp(unittest.TestCase):
@@ -83,3 +84,60 @@ class TestWebApp(BaseTestWebApp):
             "connect-src 'self' https://api.github.com",
             response.headers["Content-Security-Policy"]
         )
+
+    def test_stream_interleaves_one_event_per_handler(self):
+        class SequenceHandler(IStreamHandler):
+            def __init__(self, values):
+                self._values = list(values)
+
+            def setup(self):
+                pass
+
+            def get_value(self):
+                if not self._values:
+                    return None
+                return self._values.pop(0)
+
+            def cleanup(self):
+                pass
+
+        web_app = WebApp(self.context, self.controller)
+        web_app.add_streaming_handler(SequenceHandler, values=["a1\n", "a2\n"])
+        web_app.add_streaming_handler(SequenceHandler, values=["b1\n"])
+
+        stream = web_app._WebApp__web_stream()
+
+        self.assertEqual("a1\n", next(stream))
+        self.assertEqual("b1\n", next(stream))
+        self.assertEqual("a2\n", next(stream))
+
+        web_app.stop()
+        next(stream, None)
+
+    @patch("web.web_app.time.sleep")
+    def test_stream_yield_sleep_is_shorter_than_idle_poll_sleep(self, mock_sleep):
+        class SingleEventHandler(IStreamHandler):
+            def __init__(self):
+                self._value = "event\n"
+
+            def setup(self):
+                pass
+
+            def get_value(self):
+                value = self._value
+                self._value = None
+                return value
+
+            def cleanup(self):
+                pass
+
+        web_app = WebApp(self.context, self.controller)
+        web_app.add_streaming_handler(SingleEventHandler)
+
+        stream = web_app._WebApp__web_stream()
+
+        self.assertEqual("event\n", next(stream))
+        self.assertEqual(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000, mock_sleep.call_args_list[0][0][0])
+
+        web_app.stop()
+        next(stream, None)

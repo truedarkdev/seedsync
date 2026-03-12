@@ -86,7 +86,7 @@ class ModelBuilder:
 
     def set_downloaded_files(self, downloaded_files: Set[str]):
         prev_downloaded_files = self.__downloaded_files
-        self.__downloaded_files = downloaded_files
+        self.__downloaded_files = set(downloaded_files)
         # Invalidate the cache
         if self.__downloaded_files != prev_downloaded_files:
             self.__cached_model = None
