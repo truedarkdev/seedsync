@@ -171,7 +171,7 @@ Canonical PB status ledger:
 
 | PB | Status | Why | Proof | Last updated |
 | --- | --- | --- | --- | --- |
-| `PB-001` | still needed | Python 3.11/Poetry baseline shift still deferred; repo still pins Python 3.8. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-001` | closed | Python baseline now targets `~3.11`, Poetry metadata/lock were refreshed to Poetry `2.3.2`, and both docker build paths now use explicit `python:3.11-slim-bullseye` bases. | Main-session verification passed: runtime/deb Docker builds, 46-test Python smoke, PyInstaller `6.19.0` smoke, and a clean 3.11 `WebApp` import smoke. | `2026-03-12` |
 | `PB-002` | still needed | docker-image build still depends on staged export images. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
 | `PB-003` | partially needed | some compatibility groundwork landed, but main Node/Angular/Karma modernization remains. | Partial groundwork noted in audit batches; no full local closure recorded. | `2026-03-12` |
 | `PB-004` | still needed | broad Angular/RxJS modernization chain still deferred. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
@@ -182,7 +182,7 @@ Canonical PB status ledger:
 | `PB-009` | partially needed | partial cross-arch groundwork exists, but platform wiring/ARM64 lane is incomplete. | Audit notes partial ARM/cross-arch coverage without a closing local batch. | `2026-03-12` |
 | `PB-010` | partially needed | release/publish workflow exists, but deprecated release actions and docker-publish modernization remain. | Existing workflow covers part of the lane; no closing local modernization batch recorded. | `2026-03-12` |
 | `PB-011` | closed | closed by `ac8b6447`, `f4a62a75`, `754b6a50`. | Explicit local proof: `ac8b6447`, `f4a62a75`, `754b6a50`. | `2026-03-12` |
-| `PB-012` | matrix should be corrected | no active implementation gap under the current Bottle `0.12.19` pin; this should move to a conditional future-follow-up state tied to a later Bottle upgrade. | Audit rationale now treats this as conditional under the current Bottle pin, not an active gap. | `2026-03-12` |
+| `PB-012` | matrix should be corrected | no active implementation gap is currently evidenced, including after the PB-001 Bottle `0.12.25` refresh; keep this as a conditional future follow-up only if a real `_stop_flag` regression appears. | Main-session 3.11 `WebApp` import smoke remained clean after the Bottle refresh, so the old pin-specific rationale is now superseded. | `2026-03-12` |
 | `PB-013` | partially needed | missing common-module tests remain; skip-policy piece still undecided. | Partial test coverage exists, but no full local closure recorded. | `2026-03-12` |
 | `PB-014` | partially needed | one narrow guard landed, but bounded-state/memory-monitor work remains. | Audit notes one landed guard without closing the broader hardening lane. | `2026-03-12` |
 | `PB-015` | partially needed | some lock-safety intent landed, but exception-safe status/log locking remains. | Partial local lock-safety coverage exists; no closing batch recorded. | `2026-03-12` |
@@ -1252,7 +1252,7 @@ Covered elsewhere:
 Skipped:
 - `88d96a1` controller-side callback status propagation was skipped in this pass because it overlaps controller command behavior and belongs with later Subject 18 review.
 - `a50a6ec` non-handler cleanup was skipped because current master already took the POST/DELETE mutation contract through Subject 12, while the remaining rate-limiter/type-annotation pieces are broader controller cleanup rather than this subject's narrow API gap.
-- `0cb3228` was skipped because the current pinned Bottle `0.12.19` path does not reproduce the `_stop_flag` attribute conflict; revisit only if Bottle is upgraded later.
+- `0cb3228` was originally skipped because the then-current Bottle `0.12.19` path did not reproduce the `_stop_flag` attribute conflict; after PB-001 refreshed Bottle to `0.12.25`, a clean Python 3.11 `WebApp` import smoke still did not surface an active gap, so PB-012 remains a conditional future follow-up rather than reopened work.
 - `4c485d9` and `6e680df` remain classified under Subject 6 because they are primarily security-hardening changes rather than low-risk API semantics.
 - `df868bc`, `5c7bfc8`, `a4cbdc6`, `4533679`, and `7297af2` remain classified under Subject 12 because they are bulk file-operation API work coupled to files-page behavior.
 - `850f500`, `815a19d`, `cd8d78a`, `a92af56`, `2e54493`, and `9444eb2` were skipped here because they introduce larger webhook/import feature surfaces that belong with later model/controller feature subjects rather than this conservative API pass.

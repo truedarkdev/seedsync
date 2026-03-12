@@ -1,5 +1,5 @@
 # Creates environment to build python binaries
-FROM python:3.8-slim-bullseye AS seedsync_build_pyinstaller_env
+FROM python:3.11-slim-bullseye AS seedsync_build_pyinstaller_env
 RUN apt-get update && apt-get install -y \
     binutils \
     build-essential \
@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
 # Install Poetry
-RUN pip3 install poetry
+RUN pip3 install "poetry==2.3.2"
 RUN poetry config virtualenvs.create false
 COPY src/python/pyproject.toml /app/python/
 COPY src/python/poetry.lock /app/python/
