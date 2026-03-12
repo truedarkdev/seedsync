@@ -36,13 +36,13 @@ class MockStreamServiceRegistry {
     connectedService = TestBed.get(ConnectedService);
 }
 
-function createRecord(loggerName: string, message: string): LogRecord {
+function createRecord(loggerName: string, message: string, traceback: string = null): LogRecord {
     return new LogRecord({
         time: new Date(0),
         level: LogRecord.Level.INFO,
         loggerName: loggerName,
         message: message,
-        exceptionTraceback: null
+        exceptionTraceback: traceback
     });
 }
 
@@ -107,5 +107,34 @@ describe("Testing logs page component", () => {
 
         const records = fixture.nativeElement.querySelectorAll("p.record");
         expect(records.length).toBe(2);
+    });
+
+    it("should filter logs from the DOM input using trimmed search text", () => {
+        logService.push(createRecord("Downloader", "queued first item"));
+        logService.push(createRecord("Scanner", "Remote scan complete"));
+        fixture.detectChanges();
+
+        const input = fixture.nativeElement.querySelector("#logs-filter-input");
+        input.value = "  scan  ";
+        input.dispatchEvent(new Event("input"));
+        fixture.detectChanges();
+
+        const records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(component.searchQuery).toBe("  scan  ");
+        expect(records.length).toBe(1);
+        expect(records[0].textContent).toContain("Scanner");
+    });
+
+    it("should match logs by traceback text", () => {
+        logService.push(createRecord("Downloader", "queued first item"));
+        logService.push(createRecord("Scanner", "Remote scan complete", "Permission denied on remote host"));
+        fixture.detectChanges();
+
+        component.onSearchQueryChange("permission denied");
+        fixture.detectChanges();
+
+        const records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(records.length).toBe(1);
+        expect(records[0].textContent).toContain("Scanner");
     });
 });

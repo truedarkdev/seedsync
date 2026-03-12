@@ -203,10 +203,10 @@ Canonical PD status ledger:
 
 | PD | Status | Why | Source audit rows | Last updated |
 | --- | --- | --- | --- | --- |
-| `PD-001` | open | OpenSSH 9.x compatibility follow-ups were reopened in the archive but never given a canonical task home; current tree still lacks the OpenSSH-password test-container config from `d11b3f37` and the controller-side flexible assertion follow-up from `77df9236`. | `77df9236`, `d11b3f37` | `2026-03-12` |
-| `PD-002` | open | Docker/tooling warning cleanup rows were reopened in the archive but never given a canonical task home; current tree still lacks the docker-image `build-essential` follow-up from `e15601a8`, while `3eefa631` and `f56d78ac` need a fresh conservative rescope against the current packaging path and warning-cleanup baseline. | `e15601a8`, `3eefa631`, `f56d78ac` | `2026-03-12` |
-| `PD-003` | open | The logs-page text-search half of `2054b149` is only recorded as stale `working tree` intent in tracker notes and never received a canonical task row, even though the archive explicitly marked it as a separate needed follow-up. | `2054b149` | `2026-03-12` |
-| `PD-004` | open | The path-pair documentation follow-up from `5d2edbe4` is likewise only recorded as stale `working tree` intent in tracker notes and never received a canonical task row, even though the archive marked it as a separate needed follow-up. | `5d2edbe4` | `2026-03-12` |
+| `PD-001` | closed | OpenSSH 9.x test compatibility is now covered conservatively by enabling password auth in the Docker Python test image and by relaxing the controller integration assertions that were still pinned to one older SSH error format. | Local proof: `src/docker/test/python/Dockerfile` now appends `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`, and `UsePAM yes`; the three OpenSSH-sensitive controller tests from `test_controller.py` passed in the Docker Python lane after the image rebuild. | `2026-03-12` |
+| `PD-002` | closed | The smallest conservative Docker/tooling warning-cleanup slice is now landed: docker-image uses `build-essential`, the stale `pkg_resources.py2_warn` PyInstaller hidden import is gone, the scanner/extract regexes use raw strings, and Angular app compilation excludes `app/tests/**/*` cleanly. | Local proof: `git diff --check` and `python3 -m py_compile` passed on the touched files, and `make run-tests-angular` passed with `253 SUCCESS` after the `tsconfig.app.json` exclusion update. | `2026-03-12` |
+| `PD-003` | closed | The logs-page text-search follow-up is now landed as a conservative local-filter polish rather than a broader backend search feature: the existing UI now presents explicit search wording and has focused DOM/traceback/trim coverage. | Local proof: `logs-page.component.html` now uses `Search logs`, `logs-page.component.spec.ts` now covers DOM input-driven filtering plus traceback matching, and `make run-tests-angular` passed with `253 SUCCESS`. | `2026-03-12` |
+| `PD-004` | closed | Path-pair user-facing docs now describe the shipped multi-path workflow without importing rapidcopy theming or broader rebrand docs. | Local proof: `README.md` now lists multiple path pairs as a feature, and `src/python/docs/usage.md` now documents `Settings > Path Pairs`, files-page source labels, path-pair stats, and per-path-pair AutoQueue behavior. | `2026-03-12` |
 
 - Pass date: `2026-03-11`
 - Active fork: `thejuran`
@@ -214,10 +214,10 @@ Canonical PD status ledger:
 
 Reopened subjects:
 - original Phase B reopened subjects are fully closed
-- archive reconciliation on `2026-03-12` identified additional missed task homes under Subjects `1`, `2`, `3`, `4`, `5`, `9`, and `13`, now recorded as `PD-001` through `PD-004`
+- archive reconciliation on `2026-03-12` identified additional missed task homes under Subjects `1`, `2`, `3`, `4`, `5`, `9`, and `13`; those follow-up clusters were then closed in the same recovery wave as `PD-001` through `PD-004`
 
 New integration tasks:
-- archive reconciliation on `2026-03-12` added `PD-001` through `PD-004` as canonical task homes for four missed follow-up clusters that never received PB coverage
+- archive reconciliation on `2026-03-12` added `PD-001` through `PD-004` as canonical task homes for four missed follow-up clusters that never received PB coverage; all four are now closed
 
 Intentional audit closures worth remembering:
 - Validation/download-integrity follow-up `227b5a34` is now adapted conservatively in-tree: manual validation command/API/model/files-UI coverage landed without importing the broader inline repair or settings churn from upstream.
@@ -422,7 +422,7 @@ Notes:
 
 Integrated:
 - no direct rapidcopy cherry-picks in this pass
-- the docs-only path-pair guidance half of `5d2edbe` remains unlanded and is now tracked explicitly under `PD-004`: refresh `src/python/docs/usage.md` so it explains the shipped path-pair workflow, files-list source labels, and path-pair stats card without importing unrelated RapidCopy theming/docs churn
+- the docs-only path-pair guidance half of `5d2edbe` is now landed under `PD-004`: `src/python/docs/usage.md` explains the shipped path-pair workflow, files-list source labels, path-pair stats card, and per-path-pair AutoQueue behavior without importing unrelated RapidCopy theming/docs churn
 
 Pending:
 - none
@@ -1131,7 +1131,7 @@ Notes:
 
 Integrated:
 - adapted from `rapidcopy` `d4e4b7e` selectively: cap the live logs DOM at 500 rendered records so long-running sessions do not keep growing the page without bound
-- the user-facing logs search half of `2054b14` remains unlanded and is now tracked explicitly under `PD-003`: add a logs-page text filter with focused page-level coverage while leaving rapidcopy's broader log-file persistence and feature-surface expansion out of this conservative pass
+- the user-facing logs search half of `2054b14` is now landed under `PD-003`: the existing local logs-page filter now uses explicit search wording and has focused page-level coverage while leaving rapidcopy's broader log-file persistence and feature-surface expansion out of this conservative pass
 
 Pending:
 - none
