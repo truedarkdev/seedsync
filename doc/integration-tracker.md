@@ -174,7 +174,7 @@ Reopened subjects:
 - none
 
 New integration tasks:
-- Network mounts and `/mounts` Docker-path policy: `0b49f975` and `58c588b7` remain unintegrated and should be revisited as one packaging/config/runtime task rather than split apart.
+- none
 
 Intentional audit closures worth remembering:
 - Validation/download-integrity follow-up `227b5a34` is now adapted conservatively in-tree: manual validation command/API/model/files-UI coverage landed without importing the broader inline repair or settings churn from upstream.
@@ -186,6 +186,7 @@ Audit workflow learnings:
 - Explorer-first triage should check whether a commit only touches a stack already marked as intentionally deferred or already assigned to an open follow-up task before proposing a new task; during this batch, derivative Playwright and validation commits initially over-escalated until they were reconciled against the existing deferral/follow-up ledger.
 - Reviewer subagents should stay read-only during audit waves; have reviewers return evidence only, keep ledger edits in the main thread, and use `worker` only for intentional implementation tasks.
 - Recount the exact row span before archiving and summary updates; this batch rolled 30 rapidcopy rows into one wave, so the archive chunk and status totals needed a post-archive count check instead of assuming the requested wave size.
+- The remaining `/mounts` Docker-path follow-up from `0b49f975` and `58c588b7` is now closed conservatively as a packaging/config/runtime batch: Docker path-pair validation accepts both `/downloads` and `/mounts`, the image creates a writable `/mounts` directory, and install guidance explains `/downloads` for ordinary local storage versus optional `/mounts` usage without importing the broader network-mount CRUD/runtime feature stack.
 
 Rapidcopy audit status:
 - `rapidcopy` is now fully closed through frozen tip `c300b72f808772b00cc977ccceaa23f3c373ce33`; the next audit fork is `thejuran` once the maintainer confirms the next batch.

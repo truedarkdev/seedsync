@@ -18,6 +18,7 @@ class PathPairError(AppError):
 
 
 DOCKER_DOWNLOADS_BASE = "/downloads"
+DOCKER_MOUNTS_BASE = "/mounts"
 
 
 def is_running_in_docker() -> bool:
@@ -63,11 +64,20 @@ class PathPair:
         if is_running_in_docker():
             local_path = os.path.normpath(self.local_path)
             downloads_base = os.path.normpath(DOCKER_DOWNLOADS_BASE)
-            if not (local_path == downloads_base or local_path.startswith(downloads_base + os.sep)):
+            mounts_base = os.path.normpath(DOCKER_MOUNTS_BASE)
+            is_under_downloads = local_path == downloads_base or local_path.startswith(downloads_base + os.sep)
+            is_under_mounts = local_path == mounts_base or local_path.startswith(mounts_base + os.sep)
+            if not is_under_downloads and not is_under_mounts:
                 warnings.append(
-                    "Path pair '{}': Local path '{}' is not under '{}'. In Docker, local paths "
-                    "should be subdirectories of '{}'.".format(
-                        self.name, self.local_path, DOCKER_DOWNLOADS_BASE, DOCKER_DOWNLOADS_BASE
+                    "Path pair '{}': Local path '{}' is not under '{}' or '{}'. In Docker, local "
+                    "paths should be subdirectories of '{}' for ordinary local storage or '{}' "
+                    "for additional mounted or network-backed paths.".format(
+                        self.name,
+                        self.local_path,
+                        DOCKER_DOWNLOADS_BASE,
+                        DOCKER_MOUNTS_BASE,
+                        DOCKER_DOWNLOADS_BASE,
+                        DOCKER_MOUNTS_BASE,
                     )
                 )
         return warnings

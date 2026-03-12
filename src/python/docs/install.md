@@ -38,14 +38,16 @@ Select the section for your platform:
         docker run \
            -p 8800:8800 \
            -v <downloads directory>:/downloads \
+           [-v <mounts directory>:/mounts] \
            -v <config directory>:/config \
            ipsingh06/seedsync
 
     where
 
     * `<downloads directory>` refers to the location on host machine where downloaded files will be placed
+    * `<mounts directory>` is optional and refers to an additional mounted or network-backed host location you want to expose inside the container
     * `<config directory>` refers to the location on host machine where config files will be placed
-    * both these directories must already exist
+    * any host directories you mount must already exist
 
     By default the docker image is run under the default user (uid=1000).
     To run as a different user, include the option `--user <uid>:<gid>`.
@@ -61,7 +63,8 @@ Select the section for your platform:
 2. Access application GUI by going to [http://localhost:8800](http://localhost:8800) in your browser.
 
 3. Go to the Settings page and fill out the required information.
-   Under the Local Directory setting, enter `/downloads`.
+   Under the Local Directory setting, enter `/downloads` for ordinary local storage.
+   If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
 
 4. **While password-based login is supported, key-based authentication is highly recommended!**
    See the [Key-Based Authentication Setup](#key-auth) section for details.
@@ -85,14 +88,16 @@ SeedSync supports Windows via the Docker container.
         docker run \
            -p 8800:8800 \
            -v <downloads directory>:/downloads \
+           [-v <mounts directory>:/mounts] \
            -v <config directory>:/config \
            ipsingh06/seedsync
 
     where
 
     * `<downloads directory>` refers to the location on host machine where downloaded files will be placed
+    * `<mounts directory>` is optional and refers to an additional mounted or network-backed host location you want to expose inside the container
     * `<config directory>` refers to the location on host machine where config files will be placed
-    * both these directories must already exist
+    * any host directories you mount must already exist
 
     !!! note
         The Windows host machine path is specified as `/c/Users/...`
@@ -112,7 +117,8 @@ SeedSync supports Windows via the Docker container.
    3. Verify that SeedSync dashboard loads.
 
 5. Go to the Settings page and fill out the required information.
-   Under the Local Directory setting, enter `/downloads`.
+   Under the Local Directory setting, enter `/downloads` for ordinary local storage.
+   If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
 
 6. **While password-based login is supported, key-based authentication is highly recommended!**
    See the [Key-Based Authentication Setup](#key-auth) section for details.
