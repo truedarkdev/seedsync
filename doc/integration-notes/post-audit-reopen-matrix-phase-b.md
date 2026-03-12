@@ -186,7 +186,7 @@ Inputs used:
   - `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5`
 
 ### PB-012 - WebApp `_stop_flag` compatibility
-- Status: matrix should be corrected - under the current Bottle pin this is conditional/deferred, not active missing work.
+- Status: matrix should be corrected - there is no active implementation gap under the current Bottle `0.12.19` pin; this should be reclassified as a conditional future follow-up to revisit only if the Bottle baseline changes.
 - RAF buckets: `RAF-012`
 - Why this stays separate: it is a narrow Bottle/WebApp runtime compatibility slice.
 - Dependencies: none
