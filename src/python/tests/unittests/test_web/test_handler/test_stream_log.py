@@ -134,3 +134,61 @@ class TestCachedQueueLogHandler(unittest.TestCase):
         # Get cached record, should return nothing
         actual = cache.get_cached_records()
         self.assertEqual(0, len(actual))
+
+    @patch("web.handler.stream_log.time")
+    def test_get_cached_records_releases_lock_after_exception(self, mock_time_module):
+        mock_time_module.time.return_value = 10.0
+        cache = CachedQueueLogHandler(history_size_in_ms=3000)
+        cache.emit(create_log_record(9.5, "record1"))
+
+        with patch("web.handler.stream_log.copy.copy", side_effect=RuntimeError("copy failed")) as mock_copy:
+            with self.assertRaises(RuntimeError) as error:
+                cache.get_cached_records()
+        self.assertEqual("copy failed", str(error.exception))
+        mock_copy.assert_called_once()
+
+        self.assertTrue(cache._CachedQueueLogHandler__cache_lock.acquire(blocking=False))
+        cache._CachedQueueLogHandler__cache_lock.release()
+
+        actual = cache.get_cached_records()
+        self.assertEqual(1, len(actual))
+        self.assertEqual("record1", actual[0].msg)
+
+    @patch("web.handler.stream_log.time")
+    def test_get_cached_records_releases_lock_after_prune_exception(self, mock_time_module):
+        mock_time_module.time.return_value = 10.0
+        cache = CachedQueueLogHandler(history_size_in_ms=3000)
+        cache.emit(create_log_record(9.5, "record1"))
+
+        with patch.object(cache, "_CachedQueueLogHandler__prune_history", side_effect=RuntimeError("prune failed")):
+            with self.assertRaises(RuntimeError) as error:
+                cache.get_cached_records()
+        self.assertEqual("prune failed", str(error.exception))
+
+        self.assertTrue(cache._CachedQueueLogHandler__cache_lock.acquire(blocking=False))
+        cache._CachedQueueLogHandler__cache_lock.release()
+
+        actual = cache.get_cached_records()
+        self.assertEqual(1, len(actual))
+        self.assertEqual("record1", actual[0].msg)
+
+    @patch("web.handler.stream_log.time")
+    def test_emit_releases_lock_after_exception(self, mock_time_module):
+        mock_time_module.time.return_value = 10.0
+        cache = CachedQueueLogHandler(history_size_in_ms=3000)
+
+        with patch.object(cache, "_CachedQueueLogHandler__prune_history", side_effect=RuntimeError("prune failed")):
+            with self.assertRaises(RuntimeError) as error:
+                cache.emit(create_log_record(9.5, "record1"))
+        self.assertEqual("prune failed", str(error.exception))
+
+        self.assertTrue(cache._CachedQueueLogHandler__cache_lock.acquire(blocking=False))
+        cache._CachedQueueLogHandler__cache_lock.release()
+
+        with patch.object(cache, "_CachedQueueLogHandler__prune_history", wraps=cache._CachedQueueLogHandler__prune_history):
+            cache.emit(create_log_record(9.6, "record2"))
+
+        actual = cache.get_cached_records()
+        self.assertEqual(2, len(actual))
+        self.assertEqual("record1", actual[0].msg)
+        self.assertEqual("record2", actual[1].msg)

@@ -29,6 +29,22 @@ class DummyStatusListener(IStatusListener):
         pass
 
 
+class FailingListenerList(list):
+    def __init__(self, fail_on):
+        super().__init__()
+        self.fail_on = fail_on
+
+    def append(self, item):
+        if self.fail_on == "append":
+            raise RuntimeError("append failed")
+        super().append(item)
+
+    def remove(self, item):
+        if self.fail_on == "remove":
+            raise RuntimeError("remove failed")
+        super().remove(item)
+
+
 class TestStatusComponent(unittest.TestCase):
     def test_property_values(self):
         d = DummyStatusComponent()
@@ -119,6 +135,51 @@ class TestStatus(unittest.TestCase):
         listener.notify.reset_mock()
         status.server.error_msg = "Everything's good"
         listener.notify.assert_called_once_with()
+
+    def test_listener_notification_releases_lock_after_exception(self):
+        listener = DummyStatusListener()
+        listener.notify = MagicMock(side_effect=RuntimeError("boom"))
+        status = Status()
+        status.add_listener(listener)
+
+        with self.assertRaises(RuntimeError) as error:
+            status.server.up = False
+        self.assertEqual("boom", str(error.exception))
+
+        self.assertTrue(status._listeners_lock.acquire(blocking=False))
+        status._listeners_lock.release()
+
+        other_listener = DummyStatusListener()
+        status.add_listener(other_listener)
+        status.remove_listener(other_listener)
+
+    def test_add_remove_listener_releases_lock_after_exception(self):
+        listener = DummyStatusListener()
+
+        status = Status()
+        status._listeners = FailingListenerList(fail_on="append")
+        with self.assertRaises(RuntimeError) as error:
+            status.add_listener(listener)
+        self.assertEqual("append failed", str(error.exception))
+
+        self.assertTrue(status._listeners_lock.acquire(blocking=False))
+        status._listeners_lock.release()
+
+        status._listeners = []
+        status.add_listener(listener)
+
+        status._listeners = FailingListenerList(fail_on="remove")
+        status._listeners.append(listener)
+        with self.assertRaises(RuntimeError) as error:
+            status.remove_listener(listener)
+        self.assertEqual("remove failed", str(error.exception))
+
+        self.assertTrue(status._listeners_lock.acquire(blocking=False))
+        status._listeners_lock.release()
+
+        status._listeners = [listener]
+        status.remove_listener(listener)
+        self.assertEqual([], status._listeners)
 
     def test_cannot_replace_component(self):
         status = Status()
