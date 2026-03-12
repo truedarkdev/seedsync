@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock
 
+import pexpect
 import timeout_decorator
 
 from tests.utils import TestUtils
@@ -169,6 +170,45 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual("tv", statuses[0].path_pair_id)
         self.assertEqual("TV", statuses[0].path_pair_name)
+
+    def test_run_command_logs_warning_on_timeout(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = b"harmless output"
+        process.after = pexpect.TIMEOUT
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        lftp._Lftp__process = process
+
+        out = lftp._Lftp__run_command("ls")
+
+        self.assertEqual("harmless output", out)
+        lftp.logger.warning.assert_called_once_with("Lftp timeout exception")
+
+    def test_run_command_logs_warning_on_error_recovery_timeout(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = b"mirror: Access failed"
+        process.after = pexpect.TIMEOUT
+        process.expect.side_effect = [None, pexpect.exceptions.TIMEOUT("timeout")]
+        lftp._Lftp__process = process
+
+        out = lftp._Lftp__run_command("mirror")
+
+        self.assertEqual("mirror: Access failed", out)
+        self.assertEqual("mirror: Access failed", lftp._Lftp__pending_error)
+        lftp.logger.warning.assert_called_once_with("Lftp timeout exception")
 
     def setUp(self):
         # Delete and recreate the local dir

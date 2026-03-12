@@ -192,7 +192,7 @@ Canonical PB status ledger:
 | `PB-019` | partially needed | client-side SSE hardening is partial; unknown-event/reconnect/payload guards remain. | Partial client SSE coverage exists; no closing local hardening batch recorded. | `2026-03-12` |
 | `PB-020` | closed | single-action web handler callbacks now use a bounded 30 second wait and return `504` on timeout while preserving existing success/error mapping. | Local proof: targeted controller handler timeout coverage in `src/python/tests/integration/test_web/test_handler/test_controller.py`. | `2026-03-12` |
 | `PB-021` | closed | closed by `cc62a633`. | Explicit local proof: `cc62a633`. | `2026-03-12` |
-| `PB-022` | still needed | LFTP terminate-loop/timeout observability hardening remains. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-022` | closed | AppProcess terminate now uses a short sleep-based poll before forced termination, and both LFTP `pexpect.TIMEOUT` handlers now log at warning level. | Local proof: targeted coverage in `src/python/tests/unittests/test_common/test_app_process.py` and `src/python/tests/unittests/test_lftp/test_lftp.py`. | `2026-03-12` |
 | `PB-023` | closed | closed by `76ac3f04`. | Explicit local proof: `76ac3f04`. | `2026-03-12` |
 | `PB-024` | closed | closed by `8764202f`. | Explicit local proof: `8764202f`. | `2026-03-12` |
 | `PB-025` | closed | closed by `c9027296`. | Explicit local proof: `c9027296`. | `2026-03-12` |

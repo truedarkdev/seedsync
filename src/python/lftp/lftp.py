@@ -138,7 +138,7 @@ class Lftp:
         try:
             self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
         except pexpect.exceptions.TIMEOUT:
-            self.logger.debug("Lftp timeout exception")
+            self.logger.warning("Lftp timeout exception")
             pass
         except pexpect.exceptions.EOF:
             self.logger.error("Lftp process died unexpectedly (EOF)")
@@ -163,7 +163,7 @@ class Lftp:
             try:
                 self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
             except pexpect.exceptions.TIMEOUT:
-                self.logger.debug("Lftp timeout exception")
+                self.logger.warning("Lftp timeout exception")
                 pass
             except pexpect.exceptions.EOF:
                 self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")

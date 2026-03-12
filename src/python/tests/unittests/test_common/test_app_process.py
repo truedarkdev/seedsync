@@ -6,6 +6,7 @@ import sys
 import time
 from multiprocessing import Value
 import threading
+from unittest.mock import patch
 
 import timeout_decorator
 
@@ -165,6 +166,17 @@ class TestAppProcess(unittest.TestCase):
         self.process.terminate()
         self.process.join()
         self.process = None
+
+    def test_terminate_wait_loop_sleeps_between_alive_polls(self):
+        process = DummyProcess(fail=False)
+        process.is_alive = unittest.mock.MagicMock(side_effect=[True, True, False])
+
+        with patch("common.app_process.time.sleep") as mock_sleep, \
+                patch("common.app_process.Process.terminate") as mock_terminate:
+            process.terminate()
+
+        self.assertEqual(2, mock_sleep.call_count)
+        mock_terminate.assert_called_once_with()
 
 
 class TestAppOneShotProcess(unittest.TestCase):

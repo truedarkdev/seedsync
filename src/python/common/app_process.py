@@ -7,6 +7,7 @@ from multiprocessing import Process, Queue, Event
 import queue
 import signal
 import threading
+import time
 from datetime import datetime
 
 import tblib.pickling_support
@@ -41,6 +42,7 @@ class AppProcess(Process):
 
     # Timeout before process is force terminated
     __DEFAULT_TERMINATE_TIMEOUT_MS = 1000
+    __TERMINATE_WAIT_POLL_INTERVAL_S = 0.01
 
     def __init__(self, name: str):
         self.__name = name
@@ -110,7 +112,7 @@ class AppProcess(Process):
         timestamp_start = datetime.now()
         while self.is_alive() and \
                 elapsed_ms(timestamp_start) < AppProcess.__DEFAULT_TERMINATE_TIMEOUT_MS:
-            pass
+            time.sleep(AppProcess.__TERMINATE_WAIT_POLL_INTERVAL_S)
 
         super().terminate()
 
