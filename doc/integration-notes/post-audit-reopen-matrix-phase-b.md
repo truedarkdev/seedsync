@@ -214,7 +214,7 @@ Inputs used:
   - `2d866f1d12d476236e332c46e3350964b4d879cf`
 
 ### PB-014 - Backend bounded-state and memory-monitoring hardening
-- Status: partially needed - one narrow guard landed, but bounded-state and memory-monitor work remain.
+- Status: partially needed - bounded stream queues have landed, but broader bounded-state and memory-monitor work remain.
 - RAF buckets: `RAF-018`
 - Why this stays separate: it is broader than the narrower status-lock or endpoint hardening slices.
 - Dependencies: none
@@ -224,7 +224,7 @@ Inputs used:
   - `c52554b3863cf6e90b34a127061f8085c95944ca`
 
 ### PB-015 - Status/log lock-safety hardening
-- Status: partially needed - some lock-safety intent landed, but exception-safe status/log locking remains.
+- Status: closed - exception-safe status/listener and cached-log locking has landed locally with focused unit coverage.
 - RAF buckets: `RAF-019`
 - Why this stays separate: part of the wider locking work already landed locally, so the remaining delta should stay isolated.
 - Dependencies: none
@@ -244,7 +244,7 @@ Inputs used:
   - `812f8a9049e8bfee83901464cdd346f5e6a76d57`
 
 ### PB-017 - Bulk endpoint concurrency and hardening
-- Status: partially needed - bulk validation landed, but bounded wait/concurrency hardening remains.
+- Status: partially needed - bulk validation and bounded callback wait handling have landed, but broader concurrency hardening remains.
 - RAF buckets: `RAF-021`
 - Why this stays separate: the remaining work is a concentrated controller/bulk-endpoint hardening lane that may still split internally during implementation.
 - Dependencies: none
