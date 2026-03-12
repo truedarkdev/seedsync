@@ -37,11 +37,13 @@ class WebResponseActionCallback(Controller.Command.ICallback):
         self.success = True
         self.__event.set()
 
-    def wait(self):
-        self.__event.wait()
+    def wait(self, timeout: float = None):
+        return self.__event.wait(timeout=timeout)
 
 
 class ControllerHandler(IHandler):
+    _ACTION_TIMEOUT = 30.0
+
     def __init__(self, controller: Controller):
         self.__controller = controller
 
@@ -66,13 +68,12 @@ class ControllerHandler(IHandler):
             "delete_remote": Controller.Command.Action.DELETE_REMOTE
         }.get(action)
 
-    def __execute_action(self, action, file_name: str):
+    def __execute_action(self, action, file_name: str, timeout: float = None):
         command = Controller.Command(action, file_name)
         callback = WebResponseActionCallback()
         command.add_callback(callback)
         self.__controller.queue_command(command)
-        callback.wait()
-        return callback
+        return callback, callback.wait(timeout=timeout)
 
     def __resolve_command_identifier(self, file_name: str, file_id: str = None, path_pair_id: str = None):
         model_files = self.__controller.get_model_files()
@@ -121,7 +122,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.QUEUE, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.QUEUE,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Queued file '{}'".format(file_name))
         else:
@@ -144,7 +151,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.STOP, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.STOP,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Stopped file '{}'".format(file_name))
         else:
@@ -167,7 +180,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.EXTRACT, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.EXTRACT,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Requested extraction for file '{}'".format(file_name))
         else:
@@ -190,7 +209,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.DELETE_LOCAL, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.DELETE_LOCAL,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Requested local delete for file '{}'".format(file_name))
         else:
@@ -213,7 +238,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.VALIDATE, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.VALIDATE,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Requested validation for file '{}'".format(file_name))
         else:
@@ -236,7 +267,13 @@ class ControllerHandler(IHandler):
         if error_response:
             return error_response
 
-        callback = self.__execute_action(Controller.Command.Action.DELETE_REMOTE, file_identifier)
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.DELETE_REMOTE,
+            file_identifier,
+            timeout=self._ACTION_TIMEOUT
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Requested remote delete for file '{}'".format(file_name))
         else:
@@ -292,7 +329,7 @@ class ControllerHandler(IHandler):
         failures = []
         success_count = 0
         for display_name, identifier in ordered_commands:
-            callback = self.__execute_action(command_action, identifier)
+            callback, _ = self.__execute_action(command_action, identifier)
             if callback.success:
                 success_count += 1
             else:

@@ -1,10 +1,11 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from urllib.parse import quote
 
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 from controller import Controller
+from web.handler.controller import ControllerHandler
 
 
 class TestControllerHandler(BaseTestWebApp):
@@ -318,6 +319,27 @@ class TestControllerHandler(BaseTestWebApp):
 
         self.assertEqual(404, response.status_code)
         self.assertEqual("missing", response.text)
+
+    def test_queue_times_out_when_callback_never_completes(self):
+        self.controller.queue_command = MagicMock()
+
+        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+            response = self.test_app.post("/server/command/queue/test1", expect_errors=True)
+
+        self.assertEqual(504, response.status_code)
+        self.assertEqual("Operation timed out", response.text)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("test1", command.filename)
+
+    def test_validate_times_out_when_callback_never_completes(self):
+        self.controller.queue_command = MagicMock()
+
+        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+            response = self.test_app.post("/server/command/validate/test1", expect_errors=True)
+
+        self.assertEqual(504, response.status_code)
+        self.assertEqual("Operation timed out", response.text)
 
     def test_stop_propagates_conflict_status_code(self):
         def side_effect(cmd: Controller.Command):
