@@ -165,16 +165,49 @@ Post-audit consolidation task:
   - scope: every `needs subject reopen` audit row was mapped to at least one raw missing-feature bucket, with merge commits allowed in multiple buckets when a single row covered multiple still-missing slices
 - Phase B deduplicated execution matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-b.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-b.md)
   - scope: merged only the narrow Phase A buckets that shared implementation scope cleanly, preserved broader modernization and partially covered lanes as separate tasks, and recorded dependencies for one-by-one execution
+  - status note: the matrix remains the canonical Phase B task list; several PB tasks are still open or partial, and there are no additional post-audit tasks beyond that matrix plus the small follow-ups called out below
+
+Canonical PB status ledger:
+
+| PB | Status | Why | Proof | Last updated |
+| --- | --- | --- | --- | --- |
+| `PB-001` | still needed | Python 3.11/Poetry baseline shift still deferred; repo still pins Python 3.8. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-002` | still needed | docker-image build still depends on staged export images. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-003` | partially needed | some compatibility groundwork landed, but main Node/Angular/Karma modernization remains. | Partial groundwork noted in audit batches; no full local closure recorded. | `2026-03-12` |
+| `PB-004` | still needed | broad Angular/RxJS modernization chain still deferred. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-005` | partially needed | deb-side mitigation appears partial, but cross-path GLIBC policy remains unresolved. | Audit reopened the GLIBC lane; no full local closure recorded. | `2026-03-12` |
+| `PB-006` | still needed | stage/deb systemd+cgroup container compatibility still missing. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-007` | still needed | Ubuntu/GLIBC policy docs/CI remain on older floor. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-008` | still needed | E2E dashboard/AutoQueue reliability slice still missing. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-009` | partially needed | partial cross-arch groundwork exists, but platform wiring/ARM64 lane is incomplete. | Audit notes partial ARM/cross-arch coverage without a closing local batch. | `2026-03-12` |
+| `PB-010` | partially needed | release/publish workflow exists, but deprecated release actions and docker-publish modernization remain. | Existing workflow covers part of the lane; no closing local modernization batch recorded. | `2026-03-12` |
+| `PB-011` | closed | closed by `ac8b6447`, `f4a62a75`, `754b6a50`. | Explicit local proof: `ac8b6447`, `f4a62a75`, `754b6a50`. | `2026-03-12` |
+| `PB-012` | matrix should be corrected | current Bottle pin means this is conditional/deferred, so matrix should be corrected rather than treated as active missing work. | Audit rationale now treats this as conditional under the current Bottle pin, not an active gap. | `2026-03-12` |
+| `PB-013` | partially needed | missing common-module tests remain; skip-policy piece still undecided. | Partial test coverage exists, but no full local closure recorded. | `2026-03-12` |
+| `PB-014` | partially needed | one narrow guard landed, but bounded-state/memory-monitor work remains. | Audit notes one landed guard without closing the broader hardening lane. | `2026-03-12` |
+| `PB-015` | partially needed | some lock-safety intent landed, but exception-safe status/log locking remains. | Partial local lock-safety coverage exists; no closing batch recorded. | `2026-03-12` |
+| `PB-016` | still needed | subscription cleanup leftovers remain in files/options lifecycle. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-017` | partially needed | bulk validation landed, but bounded wait/concurrency hardening remains. | Audit notes landed validation while the hardening lane stays open. | `2026-03-12` |
+| `PB-018` | still needed | SSE server heartbeat/fair-yield transport hardening remains. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-019` | partially needed | client-side SSE hardening is partial; unknown-event/reconnect/payload guards remain. | Partial client SSE coverage exists; no closing local hardening batch recorded. | `2026-03-12` |
+| `PB-020` | still needed | single-action endpoint waits still have no timeout guard. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-021` | closed | closed by `cc62a633`. | Explicit local proof: `cc62a633`. | `2026-03-12` |
+| `PB-022` | still needed | LFTP terminate-loop/timeout observability hardening remains. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
+| `PB-023` | closed | closed by `76ac3f04`. | Explicit local proof: `76ac3f04`. | `2026-03-12` |
+| `PB-024` | closed | closed by `8764202f`. | Explicit local proof: `8764202f`. | `2026-03-12` |
+| `PB-025` | closed | closed by `c9027296`. | Explicit local proof: `c9027296`. | `2026-03-12` |
+| `PB-026` | closed | closed by `6acac2db`. | Explicit local proof: `6acac2db`. | `2026-03-12` |
+| `PB-027` | closed | closed by `7c19fdf5`. | Explicit local proof: `7c19fdf5`. | `2026-03-12` |
 
 - Pass date: `2026-03-11`
 - Active fork: `thejuran`
 - Batch size completed this pass: `15`
 
 Reopened subjects:
-- none
+- none beyond the canonical Phase B matrix and the small follow-ups explicitly listed in this summary
 
 New integration tasks:
-- none
+- no new post-audit tasks beyond the Phase B matrix and the small follow-ups explicitly listed in this summary
 
 Intentional audit closures worth remembering:
 - Validation/download-integrity follow-up `227b5a34` is now adapted conservatively in-tree: manual validation command/API/model/files-UI coverage landed without importing the broader inline repair or settings churn from upstream.

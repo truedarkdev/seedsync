@@ -17,6 +17,7 @@ Inputs used:
 ## Final Execution Tasks
 
 ### PB-001 - Python 3.11 baseline and Poetry metadata refresh
+- Status: still needed - Python 3.11/Poetry baseline shift is still deferred, and the repo still pins Python 3.8.
 - RAF buckets: `RAF-001`, `RAF-002`
 - Why this is one task: the lockfile and metadata work is part of the same deferred Python 3.11 baseline shift.
 - Dependencies: none
@@ -34,6 +35,7 @@ Inputs used:
   - `461fa45757cd05e61be965c4d3413dfad6f656c8`
 
 ### PB-002 - Self-contained docker-image build path
+- Status: still needed - docker-image build still depends on staged export images.
 - RAF buckets: `RAF-003`
 - Why this stays separate: it replaces the docker-image packaging path and should not be collapsed into release automation or broader container policy work.
 - Dependencies: `PB-001`
@@ -43,6 +45,7 @@ Inputs used:
   - `74f20dc737b4d1f79bb60978d012dc79bf8739c6`
 
 ### PB-003 - Angular build and test-stack compatibility
+- Status: partially needed - some compatibility groundwork landed, but the main Node/Angular/Karma modernization remains.
 - RAF buckets: `RAF-004`, `RAF-006`
 - Why this is one task: both buckets belong to the same narrower Node/Angular compatibility lane around native dependency builds, Karma, and Docker test-image behavior.
 - Dependencies: `PB-001`
@@ -69,6 +72,7 @@ Inputs used:
   - `068bb9dda0a014ce024b800b736da229e3d6c7fd`
 
 ### PB-004 - Angular framework and RxJS modernization chain
+- Status: still needed - the broad Angular/RxJS modernization chain remains deferred.
 - RAF buckets: `RAF-007`
 - Why this stays separate: this is the broader Angular replatforming lane, not just compatibility cleanup.
 - Dependencies: `PB-001`, `PB-003`
@@ -90,6 +94,7 @@ Inputs used:
   - `1336c07e3046629a342c8a4d65c12d73211a50af`
 
 ### PB-005 - PyInstaller GLIBC mitigation path
+- Status: partially needed - deb-side mitigation appears partial, but the cross-path GLIBC policy remains unresolved.
 - RAF buckets: `RAF-005`
 - Why this stays separate: the actual artifact/runtime compatibility choice is still its own packaging decision.
 - Dependencies: `PB-001`
@@ -102,6 +107,7 @@ Inputs used:
   - `31b68ec981dc800b0c85abd7a053c39645c86103`
 
 ### PB-006 - Stage/deb systemd container compatibility
+- Status: still needed - stage/deb systemd+cgroup container compatibility is still missing.
 - RAF buckets: `RAF-008`
 - Why this stays separate: this is the systemd/cgroups/container-runtime lane for the stage/deb path.
 - Dependencies: `PB-002`
@@ -119,6 +125,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-007 - Deb E2E GLIBC floor and Ubuntu policy
+- Status: still needed - Ubuntu/GLIBC policy docs and CI still reflect the older floor.
 - RAF buckets: `RAF-009`
 - Why this stays separate: this is the policy/docs/workflow reflection of the GLIBC floor, and should follow the actual mitigation choice.
 - Dependencies: `PB-005`
@@ -128,6 +135,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-008 - Legacy E2E dashboard and AutoQueue stability
+- Status: still needed - the E2E dashboard/AutoQueue reliability slice is still missing.
 - RAF buckets: `RAF-010`
 - Why this stays separate: these are app-specific E2E reliability fixes on the current legacy suite.
 - Dependencies: `PB-003`, `PB-006`
@@ -137,6 +145,7 @@ Inputs used:
   - `50a8ce3af858f5daf16421c4b55f1445fe76b532`
 
 ### PB-009 - ARM and cross-architecture CI/E2E support
+- Status: partially needed - partial cross-arch groundwork exists, but platform wiring and the ARM64 lane are incomplete.
 - RAF buckets: `RAF-011`
 - Why this stays separate: architecture support can move on a different schedule than GLIBC policy or publish automation.
 - Dependencies: `PB-006`
@@ -151,6 +160,7 @@ Inputs used:
   - `5fdae7852c37632f126b2f297fab6106f4b0f9c3`
 
 ### PB-010 - Release and docker publish workflow modernization
+- Status: partially needed - release/publish workflow exists, but deprecated release actions and docker-publish modernization remain.
 - RAF buckets: `RAF-017`
 - Why this stays separate: the remaining work is publication automation, not packaging-path replacement.
 - Dependencies: `PB-002`, `PB-009`
@@ -161,6 +171,7 @@ Inputs used:
   - `f01806802f833451d072042958ca7e3c535b67e9`
 
 ### PB-011 - Path-pair settings, API, dashboard, and dependent tests
+- Status: closed - explicit local proof is `ac8b6447`, `f4a62a75`, and `754b6a50`.
 - RAF buckets: `RAF-022`, `RAF-023`, `RAF-024`, `RAF-025`, `RAF-026`
 - Why this is one task: the tracker already reopens these as one path-pair feature family spanning CRUD, stats UI, validation, schema, and tests.
 - Dependencies: none on other Phase B tasks
@@ -175,6 +186,7 @@ Inputs used:
   - `15a9918ec8254fcd37ff691c0d7fd5c6fd650fa5`
 
 ### PB-012 - WebApp `_stop_flag` compatibility
+- Status: matrix should be corrected - under the current Bottle pin this is conditional/deferred, not active missing work.
 - RAF buckets: `RAF-012`
 - Why this stays separate: it is a narrow Bottle/WebApp runtime compatibility slice.
 - Dependencies: none
@@ -185,6 +197,7 @@ Inputs used:
   - `49e8d61c652e557d1c2b0324c8b01b24ae885f40`
 
 ### PB-013 - Test reliability skips and common-module coverage
+- Status: partially needed - missing common-module tests remain, and the skip-policy piece is still undecided.
 - RAF buckets: `RAF-013`, `RAF-033`
 - Why this is one task: both buckets are test-only reopen work rather than runtime behavior, and they can be executed as one verification-focused lane.
 - Dependencies: `PB-008` is a helpful stability baseline
@@ -200,6 +213,7 @@ Inputs used:
   - `2d866f1d12d476236e332c46e3350964b4d879cf`
 
 ### PB-014 - Backend bounded-state and memory-monitoring hardening
+- Status: partially needed - one narrow guard landed, but bounded-state and memory-monitor work remain.
 - RAF buckets: `RAF-018`
 - Why this stays separate: it is broader than the narrower status-lock or endpoint hardening slices.
 - Dependencies: none
@@ -209,6 +223,7 @@ Inputs used:
   - `c52554b3863cf6e90b34a127061f8085c95944ca`
 
 ### PB-015 - Status/log lock-safety hardening
+- Status: partially needed - some lock-safety intent landed, but exception-safe status/log locking remains.
 - RAF buckets: `RAF-019`
 - Why this stays separate: part of the wider locking work already landed locally, so the remaining delta should stay isolated.
 - Dependencies: none
@@ -217,6 +232,7 @@ Inputs used:
   - `7a88f02b0f7eb83786e3d4e8dc70dbf5b4780d4d`
 
 ### PB-016 - Angular subscription cleanup leftovers
+- Status: still needed - subscription cleanup leftovers remain in the files/options lifecycle.
 - RAF buckets: `RAF-020`
 - Why this stays separate: this may still need an internal split later between shared-service cleanup and files-page cleanup, but it should not be merged with unrelated frontend modernization.
 - Dependencies: none
@@ -227,6 +243,7 @@ Inputs used:
   - `812f8a9049e8bfee83901464cdd346f5e6a76d57`
 
 ### PB-017 - Bulk endpoint concurrency and hardening
+- Status: partially needed - bulk validation landed, but bounded wait/concurrency hardening remains.
 - RAF buckets: `RAF-021`
 - Why this stays separate: the remaining work is a concentrated controller/bulk-endpoint hardening lane that may still split internally during implementation.
 - Dependencies: none
@@ -236,6 +253,7 @@ Inputs used:
   - `7297af2890b4ee0ffc4f637e08f50ae9e28f8462`
 
 ### PB-018 - SSE server transport reliability
+- Status: still needed - SSE server heartbeat and fair-yield transport hardening remain.
 - RAF buckets: `RAF-027`, `RAF-028`
 - Why this is one task: heartbeat/reconnect and fair-yield transport behavior are one server-side SSE execution unit.
 - Dependencies: `PB-015`
@@ -248,6 +266,7 @@ Inputs used:
   - `33cc1cf0480adaaa2c50cf1cf6c0f7ffb6be71e8`
 
 ### PB-019 - SSE client dispatch hardening
+- Status: partially needed - client-side SSE hardening is partial; unknown-event, reconnect, and payload guards remain.
 - RAF buckets: `RAF-029`
 - Why this stays separate: this is the client-side registry/timer/payload guard lane, not the server transport lane.
 - Dependencies: `PB-018`
@@ -258,6 +277,7 @@ Inputs used:
   - `7631bfba10ef76d193b09e692e0188b931e82404`
 
 ### PB-020 - Single-action endpoint timeout guard
+- Status: still needed - single-action endpoint waits still have no timeout guard.
 - RAF buckets: `RAF-030`
 - Why this stays separate: it is the narrow single-file callback-wait timeout lane and should remain directly traceable.
 - Dependencies: `PB-017`
@@ -265,6 +285,7 @@ Inputs used:
   - `05a00038c6e383acb842b9fef3ad0113287bbe4c`
 
 ### PB-021 - CSP allowlist for GitHub API version checks
+- Status: closed - explicit local proof is `cc62a633`.
 - RAF buckets: `RAF-031`
 - Why this stays separate: it is a narrow security/configuration adjustment.
 - Dependencies: none
@@ -272,6 +293,7 @@ Inputs used:
   - `246c0639d4a7c7aeb0c1ddcbb4ef0947d32f6882`
 
 ### PB-022 - LFTP timeout and terminate-loop hardening
+- Status: still needed - LFTP terminate-loop and timeout observability hardening remain.
 - RAF buckets: `RAF-032`
 - Why this stays separate: it is a focused process-control/observability fix.
 - Dependencies: none
@@ -279,6 +301,7 @@ Inputs used:
   - `a53869eee59348cb727541099d399692f38a5df9`
 
 ### PB-023 - Files-page dropdown and action-visibility improvements
+- Status: closed - explicit local proof is `76ac3f04`.
 - RAF buckets: `RAF-034`, `RAF-035`
 - Why this is one task: both buckets belong to the same files-page interaction and visibility lane.
 - Dependencies: none
@@ -290,6 +313,7 @@ Inputs used:
   - `ebe0cd69265f867e310c308f8e75b3b8b7972194`
 
 ### PB-024 - AutoQueue/files disabled-state hardening
+- Status: closed - explicit local proof is `8764202f`.
 - RAF buckets: `RAF-036`
 - Why this stays separate: it is the smaller defense-in-depth tail of the files/AutoQueue UI lane.
 - Dependencies: `PB-023`
@@ -297,6 +321,7 @@ Inputs used:
   - `15aee39be6869941200bbeee04c0e4cd35d5b31f`
 
 ### PB-025 - Linux `st_ctime` fallback for created timestamps
+- Status: closed - explicit local proof is `c9027296`.
 - RAF buckets: `RAF-037`
 - Why this stays separate: it is one small scanner compatibility task with its own test coverage.
 - Dependencies: none
@@ -305,6 +330,7 @@ Inputs used:
   - `7d85e6aed9233e07d92c255f075e7533007a5686`
 
 ### PB-026 - Packaging-side SSH host-key hardening
+- Status: closed - explicit local proof is `6acac2db`.
 - RAF buckets: `RAF-038`
 - Why this stays separate: it is a packaging/runtime security alignment change, not a general SSH-runtime rewrite.
 - Dependencies: `PB-002`
@@ -312,6 +338,7 @@ Inputs used:
   - `e34ba5e11f298509463d5697835f71dfacc29776`
 
 ### PB-027 - `DELETE_LOCAL` fallback to staging path
+- Status: closed - explicit local proof is `7c19fdf5`.
 - RAF buckets: `RAF-039`
 - Why this stays separate: it is a concrete runtime-correctness fix in the transfer/delete path.
 - Dependencies: none
