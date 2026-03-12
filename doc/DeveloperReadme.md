@@ -77,6 +77,9 @@ npm install
    make clean
    make
    ```
+   `make docker-image` now builds the Angular web assets and `scanfs` binary
+   inside the final image build; it no longer depends on separately pushed
+   staged export images.
 
 4. The .deb package will be generated inside `build` directory.
    The docker image will be pushed to the local registry as `seedsync:latest`. See if using:
@@ -320,4 +323,3 @@ Use the following command to run the docker image locally:
 ```bash
 docker run --rm -p 8800:8800 localhost:5000/seedsync:latest
 ```
-

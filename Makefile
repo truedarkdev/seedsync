@@ -54,32 +54,10 @@ docker-image: docker-buildx
 	fi;
 	echo "${green}STAGING_VERSION=$${STAGING_VERSION}${reset}";
 
-	# scanfs image
-	$(DOCKER) buildx build \
-		-f ${SOURCEDIR}/docker/build/deb/Dockerfile \
-		--target seedsync_build_scanfs_export \
-		--tag $${STAGING_REGISTRY}/seedsync/build/scanfs/export:$${STAGING_VERSION} \
-		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync/build/scanfs/export:cache,mode=max \
-		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync/build/scanfs/export:cache \
-		--push \
-		${ROOTDIR}
-
-	# angular html export
-	$(DOCKER) buildx build \
-		-f ${SOURCEDIR}/docker/build/deb/Dockerfile \
-		--target seedsync_build_angular_export \
-		--tag $${STAGING_REGISTRY}/seedsync/build/angular/export:$${STAGING_VERSION} \
-		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync/build/angular/export:cache,mode=max \
-		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync/build/angular/export:cache \
-		--push \
-		${ROOTDIR}
-
 	# final image
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
 		--target seedsync_run \
-		--build-arg STAGING_VERSION=$${STAGING_VERSION} \
-		--build-arg STAGING_REGISTRY=$${STAGING_REGISTRY} \
 		--tag $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} \
 		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
@@ -92,10 +70,6 @@ docker-image-release:
 		export STAGING_REGISTRY="${DEFAULT_STAGING_REGISTRY}"; \
 	fi;
 	echo "${green}STAGING_REGISTRY=$${STAGING_REGISTRY}${reset}";
-	@if [[ -z "${STAGING_VERSION}" ]] ; then \
-		export STAGING_VERSION="latest"; \
-	fi;
-	echo "${green}STAGING_VERSION=$${STAGING_VERSION}${reset}";
 	@if [[ -z "${RELEASE_REGISTRY}" ]] ; then \
 		echo "${red}ERROR: RELEASE_REGISTRY is required${reset}"; exit 1; \
 	fi
@@ -109,8 +83,6 @@ docker-image-release:
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
 		--target seedsync_run \
-		--build-arg STAGING_VERSION=$${STAGING_VERSION} \
-		--build-arg STAGING_REGISTRY=$${STAGING_REGISTRY} \
 		--tag ${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION} \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
 		--platform linux/amd64,linux/arm64,linux/arm/v7 \

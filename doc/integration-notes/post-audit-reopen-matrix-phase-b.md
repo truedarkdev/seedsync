@@ -35,7 +35,7 @@ Inputs used:
   - `461fa45757cd05e61be965c4d3413dfad6f656c8`
 
 ### PB-002 - Self-contained docker-image build path
-- Status: still needed - docker-image build still depends on staged export images.
+- Status: closed - the docker-image build now compiles Angular assets and `scanfs` internally, and the final image no longer depends on separately published staged export images. Cross-architecture publish coverage remains in `PB-009`.
 - RAF buckets: `RAF-003`
 - Why this stays separate: it replaces the docker-image packaging path and should not be collapsed into release automation or broader container policy work.
 - Dependencies: `PB-001`
