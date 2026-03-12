@@ -309,6 +309,45 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertIn("1 succeeded, 1 failed", response.text)
         self.assertIn("'test2': bad file", response.text)
 
+    def test_bulk_queue_times_out_when_callback_never_completes(self):
+        self.controller.queue_command = MagicMock()
+
+        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+            response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"filenames": ["test1"]},
+                expect_errors=True
+            )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("0 succeeded, 1 failed", response.text)
+        self.assertIn("'test1': Operation timed out", response.text)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("test1", command.filename)
+
+    def test_bulk_queue_continues_after_timeout_and_summarizes_failures(self):
+        seen_commands = []
+
+        def side_effect(cmd: Controller.Command):
+            seen_commands.append(cmd.filename)
+            if cmd.filename == "test2":
+                cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        with patch.object(ControllerHandler, "_ACTION_TIMEOUT", 0.01):
+            response = self.test_app.post_json(
+                "/server/command/bulk/queue",
+                {"filenames": ["test1", "test2"]},
+                expect_errors=True
+            )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(["test1", "test2"], seen_commands)
+        self.assertIn("1 succeeded, 1 failed", response.text)
+        self.assertIn("'test1': Operation timed out", response.text)
+
     def test_queue_propagates_not_found_status_code(self):
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_failure("missing", 404)
