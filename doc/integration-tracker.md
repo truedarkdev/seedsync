@@ -183,7 +183,7 @@ Canonical PB status ledger:
 | `PB-010` | partially needed | release/publish workflow exists, but deprecated release actions and docker-publish modernization remain. | Existing workflow covers part of the lane; no closing local modernization batch recorded. | `2026-03-12` |
 | `PB-011` | closed | closed by `ac8b6447`, `f4a62a75`, `754b6a50`. | Explicit local proof: `ac8b6447`, `f4a62a75`, `754b6a50`. | `2026-03-12` |
 | `PB-012` | matrix should be corrected | no active implementation gap is currently evidenced, including after the PB-001 Bottle `0.12.25` refresh; keep this as a conditional future follow-up only if a real `_stop_flag` regression appears. | Main-session 3.11 `WebApp` import smoke remained clean after the Bottle refresh, so the old pin-specific rationale is now superseded. | `2026-03-12` |
-| `PB-013` | partially needed | missing common-module tests remain; skip-policy piece still undecided. | Partial test coverage exists, but no full local closure recorded. | `2026-03-12` |
+| `PB-013` | partially needed | common-module tests have landed, but the skip-policy piece is still undecided. | Local proof: targeted common-module coverage now exists in `test_constants.py`, `test_error.py`, `test_localization.py`, `test_context.py`, and `test_types.py`; no full local closure recorded while skip-policy remains open. | `2026-03-12` |
 | `PB-014` | partially needed | one narrow guard landed, but bounded-state/memory-monitor work remains. | Audit notes one landed guard without closing the broader hardening lane. | `2026-03-12` |
 | `PB-015` | closed | remaining manual status/listener and cached-log lock handling now uses exception-safe context-managed locking while preserving behavior. | Targeted unit coverage passed in `src/python/tests/unittests/test_common/test_status.py` and `src/python/tests/unittests/test_web/test_handler/test_stream_log.py`, including regression checks that listener/cache exceptions do not strand the lock. | `2026-03-12` |
 | `PB-016` | still needed | subscription cleanup leftovers remain in files/options lifecycle. | Phase B matrix task remains open; no local closing commit recorded. | `2026-03-12` |
@@ -460,7 +460,7 @@ Integrated:
 - adapted from `2bea28e` plus repo-neutral portions of later workflow refreshes -> `8c7be91`: update deprecated GitHub Actions versions and switch GHCR CI logins to `GITHUB_TOKEN`
 
 Pending:
-- Audit reopen: `91fa0101` and `5e39fdeb` exposed a missing common-module unit-test slice (`test_constants.py`, `test_error.py`, `test_localization.py`, `test_context.py`, `test_types.py`) that was never dispositioned during the original Subject 2 pass; keep the related Phase 16 planning rows tied to the same reopen.
+- Audit reopen: `91fa0101` and `5e39fdeb` exposed a common-module unit-test slice (`test_constants.py`, `test_error.py`, `test_localization.py`, `test_context.py`, `test_types.py`) that has now landed locally; keep PB-013 partial until the skip-policy half is resolved.
 
 Covered elsewhere:
 - thejuran workflow and docker publish refinements such as `bbf1310`, `fd9c25f`, `eab6146`, and `a0b0e5f`: current pass took the safe action-version and GHCR-auth portions only; broader publishing behavior is better handled under packaging and install
@@ -482,7 +482,7 @@ Verification:
 
 Notes:
 - A targeted `python3 -m pytest tests/integration/test_web/test_handler/test_controller.py -q` attempt failed in this shell because local Python dependencies such as `tblib` are not installed outside the project environment.
-- Audit on `2026-03-11` reopened Subject 2 for the missing common-module unit-test slice from `91fa0101` and `5e39fdeb`; the later web-handler coverage cluster stayed covered by `d0b9195`, while the large controller-suite expansion remains intentionally skipped.
+- Audit on `2026-03-11` reopened Subject 2 for the common-module unit-test slice from `91fa0101` and `5e39fdeb`; that test gap is now covered locally, the later web-handler coverage cluster stayed covered by `d0b9195`, and the large controller-suite expansion remains intentionally skipped.
 
 ### rapidcopy
 
