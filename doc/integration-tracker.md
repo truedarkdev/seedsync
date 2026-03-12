@@ -165,7 +165,7 @@ Post-audit consolidation task:
   - scope: every `needs subject reopen` audit row was mapped to at least one raw missing-feature bucket, with merge commits allowed in multiple buckets when a single row covered multiple still-missing slices
 - Phase B deduplicated execution matrix completed on `2026-03-11`: [post-audit-reopen-matrix-phase-b.md](/mnt/c/Git/seedsync/doc/integration-notes/post-audit-reopen-matrix-phase-b.md)
   - scope: merged only the narrow Phase A buckets that shared implementation scope cleanly, preserved broader modernization and partially covered lanes as separate tasks, and recorded dependencies for one-by-one execution
-  - status note: the matrix remains the canonical Phase B task list; all PB tasks are closed, and there are no additional post-audit tasks beyond that matrix plus the small follow-ups called out below
+  - status note: the matrix remains the canonical Phase B task list for the original reopen sweep; all PB tasks are closed, and a later archive reconciliation on `2026-03-12` identified the additional missed `PD` tasks listed below
 
 Canonical PB status ledger:
 
@@ -199,15 +199,25 @@ Canonical PB status ledger:
 | `PB-026` | closed | closed by `6acac2db`. | Explicit local proof: `6acac2db`. | `2026-03-12` |
 | `PB-027` | closed | closed by `7c19fdf5`. | Explicit local proof: `7c19fdf5`. | `2026-03-12` |
 
+Canonical PD status ledger:
+
+| PD | Status | Why | Source audit rows | Last updated |
+| --- | --- | --- | --- | --- |
+| `PD-001` | open | OpenSSH 9.x compatibility follow-ups were reopened in the archive but never given a canonical task home; current tree still lacks the OpenSSH-password test-container config from `d11b3f37` and the controller-side flexible assertion follow-up from `77df9236`. | `77df9236`, `d11b3f37` | `2026-03-12` |
+| `PD-002` | open | Docker/tooling warning cleanup rows were reopened in the archive but never given a canonical task home; current tree still lacks the docker-image `build-essential` follow-up from `e15601a8`, while `3eefa631` and `f56d78ac` need a fresh conservative rescope against the current packaging path and warning-cleanup baseline. | `e15601a8`, `3eefa631`, `f56d78ac` | `2026-03-12` |
+| `PD-003` | open | The logs-page text-search half of `2054b149` is only recorded as stale `working tree` intent in tracker notes and never received a canonical task row, even though the archive explicitly marked it as a separate needed follow-up. | `2054b149` | `2026-03-12` |
+| `PD-004` | open | The path-pair documentation follow-up from `5d2edbe4` is likewise only recorded as stale `working tree` intent in tracker notes and never received a canonical task row, even though the archive marked it as a separate needed follow-up. | `5d2edbe4` | `2026-03-12` |
+
 - Pass date: `2026-03-11`
 - Active fork: `thejuran`
 - Batch size completed this pass: `15`
 
 Reopened subjects:
-- none beyond the canonical Phase B matrix and the small follow-ups explicitly listed in this summary
+- original Phase B reopened subjects are fully closed
+- archive reconciliation on `2026-03-12` identified additional missed task homes under Subjects `1`, `2`, `3`, `4`, `5`, `9`, and `13`, now recorded as `PD-001` through `PD-004`
 
 New integration tasks:
-- no new post-audit tasks beyond the Phase B matrix and the small follow-ups explicitly listed in this summary
+- archive reconciliation on `2026-03-12` added `PD-001` through `PD-004` as canonical task homes for four missed follow-up clusters that never received PB coverage
 
 Intentional audit closures worth remembering:
 - Validation/download-integrity follow-up `227b5a34` is now adapted conservatively in-tree: manual validation command/API/model/files-UI coverage landed without importing the broader inline repair or settings churn from upstream.
@@ -412,7 +422,7 @@ Notes:
 
 Integrated:
 - no direct rapidcopy cherry-picks in this pass
-- adapted docs-only parts of `5d2edbe` -> `working tree`: refresh `src/python/docs/usage.md` so it explains the shipped path-pair workflow, files-list source labels, and path-pair stats card without importing unrelated RapidCopy theming/docs churn
+- the docs-only path-pair guidance half of `5d2edbe` remains unlanded and is now tracked explicitly under `PD-004`: refresh `src/python/docs/usage.md` so it explains the shipped path-pair workflow, files-list source labels, and path-pair stats card without importing unrelated RapidCopy theming/docs churn
 
 Pending:
 - none
@@ -1121,7 +1131,7 @@ Notes:
 
 Integrated:
 - adapted from `rapidcopy` `d4e4b7e` selectively: cap the live logs DOM at 500 rendered records so long-running sessions do not keep growing the page without bound
-- adapted the user-facing logs search half of `2054b14` as `working tree`: add a logs-page text filter with focused page-level coverage while leaving rapidcopy's broader log-file persistence and feature-surface expansion out of this conservative pass
+- the user-facing logs search half of `2054b14` remains unlanded and is now tracked explicitly under `PD-003`: add a logs-page text filter with focused page-level coverage while leaving rapidcopy's broader log-file persistence and feature-surface expansion out of this conservative pass
 
 Pending:
 - none
