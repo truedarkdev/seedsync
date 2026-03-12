@@ -234,7 +234,7 @@ Inputs used:
   - `7a88f02b0f7eb83786e3d4e8dc70dbf5b4780d4d`
 
 ### PB-016 - Angular subscription cleanup leftovers
-- Status: still needed - subscription cleanup leftovers remain in the files/options lifecycle.
+- Status: closed - the files/options lifecycle now stores and tears down its subscriptions on destroy, so the remaining files-page cleanup gap is closed.
 - RAF buckets: `RAF-020`
 - Why this stays separate: this may still need an internal split later between shared-service cleanup and files-page cleanup, but it should not be merged with unrelated frontend modernization.
 - Dependencies: none
@@ -243,9 +243,10 @@ Inputs used:
   - `b32eb93c83ad85cfa9aaefb8ec3242815d84223a`
   - `aaeddbf8f3448cc93d6ce980ce4617dcbbb9e3ae`
   - `812f8a9049e8bfee83901464cdd346f5e6a76d57`
+  - `52402b269d790c1c8d8599143ced4af818c8f499`
 
 ### PB-017 - Bulk endpoint concurrency and hardening
-- Status: partially needed - bulk validation and bounded callback wait handling have landed, but broader concurrency hardening remains.
+- Status: closed - bulk requests now enforce payload bounds, reject overlapping in-flight bulk requests, and preserve the bounded callback wait and timeout-summary behavior across retries.
 - RAF buckets: `RAF-021`
 - Why this stays separate: the remaining work is a concentrated controller/bulk-endpoint hardening lane that may still split internally during implementation.
 - Dependencies: none
@@ -253,6 +254,8 @@ Inputs used:
   - `5c7bfc853588aa5885b4bca2e68fe0c102eadfbd`
   - `a4cbdc6bc850eb5de08380d99e2ed9b67d409a6b`
   - `7297af2890b4ee0ffc4f637e08f50ae9e28f8462`
+  - `85cbe899c72cb8e98de8d545e5b1c4aa7d3c7b22`
+  - `52402b269d790c1c8d8599143ced4af818c8f499`
 
 ### PB-018 - SSE server transport reliability
 - Status: closed - the server stream now registers a heartbeat handler and uses one-event-per-handler fair yielding plus short per-event pacing so busy producers do not monopolize or flood the multiplexed SSE stream.
@@ -279,12 +282,13 @@ Inputs used:
   - `7631bfba10ef76d193b09e692e0188b931e82404`
 
 ### PB-020 - Single-action endpoint timeout guard
-- Status: still needed - single-action endpoint waits still have no timeout guard.
+- Status: closed - single-action web handlers now apply the shared 30 second timeout and return `504` when the callback never completes.
 - RAF buckets: `RAF-030`
 - Why this stays separate: it is the narrow single-file callback-wait timeout lane and should remain directly traceable.
 - Dependencies: `PB-017`
 - Commits:
   - `05a00038c6e383acb842b9fef3ad0113287bbe4c`
+  - `f288e3abedcbc92c1723934fc6f1d41d0d589f20`
 
 ### PB-021 - CSP allowlist for GitHub API version checks
 - Status: closed - explicit local proof is `cc62a633`.
