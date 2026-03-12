@@ -329,8 +329,14 @@ class ControllerHandler(IHandler):
         failures = []
         success_count = 0
         for display_name, identifier in ordered_commands:
-            callback, _ = self.__execute_action(command_action, identifier)
-            if callback.success:
+            callback, completed = self.__execute_action(
+                command_action,
+                identifier,
+                timeout=self._ACTION_TIMEOUT
+            )
+            if not completed:
+                failures.append("'{}': Operation timed out".format(display_name))
+            elif callback.success:
                 success_count += 1
             else:
                 failures.append("'{}': {}".format(display_name, callback.error))
