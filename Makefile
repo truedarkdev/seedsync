@@ -126,12 +126,6 @@ run-tests-angular: tests-angular
 tests-e2e-deps:
 	# deb pre-reqs
 	$(DOCKER) build \
-		${SOURCEDIR}/docker/stage/deb/ubuntu-systemd/ubuntu-16.04-systemd \
-		-t ubuntu-systemd:16.04
-	$(DOCKER) build \
-		${SOURCEDIR}/docker/stage/deb/ubuntu-systemd/ubuntu-18.04-systemd \
-		-t ubuntu-systemd:18.04
-	$(DOCKER) build \
 		${SOURCEDIR}/docker/stage/deb/ubuntu-systemd/ubuntu-20.04-systemd \
 		-t ubuntu-systemd:20.04
 
@@ -151,7 +145,9 @@ run-tests-e2e: tests-e2e-deps
 	@if [[ ! -z "${SEEDSYNC_DEB}" ]] ; then \
 		if [[ -z "${SEEDSYNC_OS}" ]] ; then \
 			echo "${red}ERROR: SEEDSYNC_OS is required for DEB e2e test${reset}"; \
-			echo "${red}Options include: ubu1604, ubu1804, ubu2004${reset}"; exit 1; \
+			echo "${red}Use SEEDSYNC_OS=ubu2004 for the active DEB e2e lane (Ubuntu 20.04)${reset}"; exit 1; \
+		elif [[ "${SEEDSYNC_OS}" != "ubu2004" ]] ; then \
+			echo "${red}ERROR: Active DEB e2e policy requires SEEDSYNC_OS=ubu2004 (Ubuntu 20.04)${reset}"; exit 1; \
 		fi
 	fi
 
