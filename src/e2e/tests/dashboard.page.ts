@@ -21,10 +21,16 @@ export class FileActionButtonState {
 export class DashboardPage extends App {
     navigateTo() {
         return browser.get(Urls.APP_BASE_URL + "dashboard").then(value => {
-            // Wait for the files list to show up
-            return browser.wait(ExpectedConditions.presenceOf(
-                element.all(by.css("#file-list .file")).first()
-            ));
+            return browser.waitForAngular().then(() => {
+                // Wait for the files list to show up
+                return browser.wait(ExpectedConditions.presenceOf(
+                    element.all(by.css("#file-list .file")).first()
+                ), 10000).then(() => {
+                    return browser.wait(ExpectedConditions.visibilityOf(
+                        element.all(by.css("#file-list .file")).first()
+                    ), 10000);
+                });
+            });
         })
     }
 
@@ -37,7 +43,7 @@ export class DashboardPage extends App {
                     return browser.executeScript(
                         "return arguments[0].innerHTML;",
                         statusElm.element(by.css("span.text"))
-                    );
+                    ).then((content: string) => content.trim());
                 } else {
                     return "";
                 }
@@ -49,7 +55,9 @@ export class DashboardPage extends App {
     }
 
     selectFile(index: number) {
-        element.all(by.css("#file-list .file")).get(index).click();
+        return element.all(by.css("#file-list .file")).get(index).click().then(() => {
+            return browser.waitForAngular();
+        });
     }
 
     isFileActionsVisible(index: number) {
@@ -65,7 +73,7 @@ export class DashboardPage extends App {
                         let title = browser.executeScript(
                             "return arguments[0].innerHTML;",
                             buttonElm.element(by.css("div.text span"))
-                        );
+                        ).then((content: string) => content.trim());
                         let isEnabled = buttonElm.getAttribute("disabled").then(value => {
                             return value == null;
                         });

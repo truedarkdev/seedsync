@@ -62,7 +62,7 @@ npm install
    docker buildx use mybuilder
    docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
    docker buildx inspect --bootstrap
-   # Make sure the following architectures are listed: linux/amd64, linux/arm64, linux/arm/v7 
+   # Make sure the following architectures are listed: linux/amd64, linux/arm64, linux/arm/v7
    ```
 
 2. Multi-arch docker images can only be stored in a registry.
@@ -76,10 +76,14 @@ npm install
    ```bash
    make clean
    make
+   make verify-deb-glibc
    ```
    `make docker-image` now builds the Angular web assets and `scanfs` binary
    inside the final image build; it no longer depends on separately pushed
    staged export images.
+   `make verify-deb-glibc` extracts the built `.deb` and verifies the bundled
+   `seedsync` and `scanfs` binaries stay within the active Ubuntu 20.04+
+   compatibility floor (default max required GLIBC symbol version: `2.31`).
 
 4. The .deb package will be generated inside `build` directory.
    The docker image will be pushed to the local registry as `seedsync:latest`. See if using:
@@ -246,13 +250,17 @@ For example:
 make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=arm64 STAGING_REGISTRY=ghcr.io/truedarkdev
 ```
 
+`SEEDSYNC_ARCH` is resolved through `src/docker/test/resolve_platform.sh`, so the
+active E2E architecture codes remain `amd64`, `arm64`, and `arm/v7` while the
+Docker platform string stays consistent across `make`, Compose, and CI.
+
 
 
 # Release
 
 ## Continuous Integration
 
-This method uses Github Action to post releases.
+This method uses GitHub Actions plus `gh release` on the hosted runner to post releases.
 
 1. Do all of these in one change
    1. Version update in `src/angular/package.json`

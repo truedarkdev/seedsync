@@ -6,6 +6,8 @@ FROM ubuntu:16.04
 
 ENV container docker
 
+VOLUME [ "/sys/fs/cgroup" ]
+
 # Don't start any optional services except for the few we need.
 RUN find /etc/systemd/system \
          /lib/systemd/system \

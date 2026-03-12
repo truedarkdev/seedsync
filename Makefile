@@ -15,12 +15,14 @@ ROOTDIR:=$(shell realpath .)
 SOURCEDIR:=$(shell realpath ./src)
 BUILDDIR:=$(shell realpath ./build)
 DEFAULT_STAGING_REGISTRY:=localhost:5000
+DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
+DEB_GLIBC_MAX:=2.31
 
 #DOCKER_BUILDKIT_FLAGS=BUILDKIT_PROGRESS=plain
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image clean coverage-python
+.PHONY: builddir deb docker-image verify-deb-glibc clean coverage-python
 
 all: deb docker-image
 
@@ -61,7 +63,7 @@ docker-image: docker-buildx
 		--tag $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} \
 		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
-		--platform linux/amd64,linux/arm64,linux/arm/v7 \
+		--platform ${DOCKER_IMAGE_PLATFORMS} \
 		--push \
 		${ROOTDIR}
 
@@ -85,9 +87,19 @@ docker-image-release:
 		--target seedsync_run \
 		--tag ${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION} \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
-		--platform linux/amd64,linux/arm64,linux/arm/v7 \
+		--platform ${DOCKER_IMAGE_PLATFORMS} \
 		--push \
 		${ROOTDIR}
+
+verify-deb-glibc:
+	@if ! compgen -G "${BUILDDIR}/*.deb" > /dev/null; then \
+		echo "${red}ERROR: No .deb artifact found in ${BUILDDIR}${reset}"; exit 1; \
+	fi
+	@deb_files=( ${BUILDDIR}/*.deb ); \
+	if [[ $${#deb_files[@]} -ne 1 ]]; then \
+		echo "${red}ERROR: Expected exactly one .deb artifact in ${BUILDDIR}, found $${#deb_files[@]}${reset}"; exit 1; \
+	fi; \
+	${SOURCEDIR}/docker/test/verify_glibc.sh "$${deb_files[0]}" ${DEB_GLIBC_MAX}
 
 tests-python:
 	# python run
@@ -130,8 +142,7 @@ tests-e2e-deps:
 		-t ubuntu-systemd:20.04
 
 	# Setup docker for the systemd container
-	# See: https://github.com/solita/docker-systemd
-	$(DOCKER) run --rm --privileged -v /:/host solita/ubuntu-systemd setup
+	$(DOCKER) run --rm --privileged -v /:/host ubuntu-systemd:20.04 setup
 
 run-tests-e2e: tests-e2e-deps
 	# Check our settings
@@ -157,13 +168,19 @@ run-tests-e2e: tests-e2e-deps
 			echo "${red}ERROR: SEEDSYNC_ARCH is required for docker image e2e test${reset}"; \
 			echo "${red}Options include: amd64, arm64, arm/v7${reset}"; exit 1; \
 		fi
+		RESOLVED_SEEDSYNC_PLATFORM=`${SOURCEDIR}/docker/test/resolve_platform.sh "$${SEEDSYNC_ARCH}"`; \
+		if [[ ! -z "${SEEDSYNC_PLATFORM}" ]] && [[ "${SEEDSYNC_PLATFORM}" != "$${RESOLVED_SEEDSYNC_PLATFORM}" ]] ; then \
+			echo "${red}ERROR: SEEDSYNC_PLATFORM=${SEEDSYNC_PLATFORM} does not match SEEDSYNC_ARCH=${SEEDSYNC_ARCH}${reset}"; exit 1; \
+		fi; \
+		export SEEDSYNC_PLATFORM="$${RESOLVED_SEEDSYNC_PLATFORM}"; \
+		echo "${green}SEEDSYNC_PLATFORM=$${SEEDSYNC_PLATFORM}${reset}"; \
 		if [[ -z "${STAGING_REGISTRY}" ]] ; then \
 			export STAGING_REGISTRY="${DEFAULT_STAGING_REGISTRY}"; \
 		fi;
 		echo "${green}STAGING_REGISTRY=$${STAGING_REGISTRY}${reset}";
 		# Removing and pulling is the only way to select the arch from a multi-arch image :(
-		$(DOCKER) rmi -f $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION}
-		$(DOCKER) pull $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} --platform linux/$${SEEDSYNC_ARCH}
+		$(DOCKER) rmi -f $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} || true
+		$(DOCKER) pull $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} --platform $${SEEDSYNC_PLATFORM}
 	fi
 
 	# Set the flags

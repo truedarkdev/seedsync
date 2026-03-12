@@ -70,6 +70,9 @@ jobs:
       - name: Build deb package
         run: make deb
 
+      - name: Verify deb GLIBC floor
+        run: make verify-deb-glibc
+
       # Upload package
       - name: Publish artifact
         uses: actions/upload-artifact@v4
@@ -133,17 +136,29 @@ jobs:
           name: deb-${{ github.run_number }}
           path: build/
 
+      - name: Configure Docker cgroup namespace for systemd lane
+        run: |
+          echo $'{\n  "default-cgroupns-mode": "host"\n}' | sudo tee /etc/docker/daemon.json
+          sudo service docker restart
+          docker info
+
       # Run e2e test
       - name: Run e2e test
         run: make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=${{ matrix.oscode }}
 
   e2etests-docker-image:
     name: End-to-end tests on Docker Image
-    runs-on: ubuntu-latest
     needs: [ build-docker-image ]
     strategy:
       matrix:
-        arch: [ amd64, arm64, arm/v7 ]
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+          - arch: arm/v7
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -174,13 +189,16 @@ jobs:
       # Set staging registry
       - name: Set staging registry env variable
         run: echo "staging_registry=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+      - name: Resolve E2E platform
+        run: echo "SEEDSYNC_PLATFORM=$(src/docker/test/resolve_platform.sh '${{ matrix.arch }}')" >> $GITHUB_ENV
 
       # Run e2e test
       - name: Run e2e test
         run: make run-tests-e2e \
           STAGING_REGISTRY=${{ env.staging_registry }} \
           STAGING_VERSION=${{ github.run_number }} \
-          SEEDSYNC_ARCH=${{ matrix.arch }}
+          SEEDSYNC_ARCH=${{ matrix.arch }} \
+          SEEDSYNC_PLATFORM=${{ env.SEEDSYNC_PLATFORM }}
 
   publish-docker-image:
     name: Publish Docker Image
@@ -250,24 +268,22 @@ jobs:
         run: |
           echo "DEB_PATH=$(readlink -f ./build/*.deb)" >> $GITHUB_ENV
           echo "DEB_NAME=$(basename $(readlink -f ./build/*.deb))" >> $GITHUB_ENV
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Publish GitHub release asset
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ github.ref }}
-          body: ${{ github.event.head_commit.message }}
-          draft: false
-          prerelease: false
-      - name: Upload Release Asset
-        id: upload-release-asset
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ${{ env.DEB_PATH }}
-          asset_name: ${{ env.DEB_NAME }}
-          asset_content_type: application/x-deb
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          release_notes_file=$(mktemp)
+          if [[ -n "${RELEASE_NOTES}" ]]; then
+            printf '%s\n' "${RELEASE_NOTES}" > "${release_notes_file}"
+          else
+            printf 'Release %s\n' "${GITHUB_REF_NAME}" > "${release_notes_file}"
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${DEB_PATH}#${DEB_NAME}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${DEB_PATH}#${DEB_NAME}" \
+              --title "Release ${GITHUB_REF}" \
+              --notes-file "${release_notes_file}"
+          fi
