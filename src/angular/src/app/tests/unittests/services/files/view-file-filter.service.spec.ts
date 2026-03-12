@@ -18,6 +18,7 @@ describe("Testing view file filter service", () => {
     let filterCriteria: ViewFileFilterCriteria;
 
     beforeEach(() => {
+        filterCriteria = undefined;
         TestBed.configureTestingModule({
             providers: [
                 ViewFileFilterService,

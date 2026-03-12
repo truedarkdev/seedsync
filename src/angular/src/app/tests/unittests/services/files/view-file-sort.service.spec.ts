@@ -18,6 +18,7 @@ describe("Testing view file sort service", () => {
     let sortComparator: ViewFileComparator;
 
     beforeEach(() => {
+        sortComparator = undefined;
         TestBed.configureTestingModule({
             providers: [
                 ViewFileSortService,
