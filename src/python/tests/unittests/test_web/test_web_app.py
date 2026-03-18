@@ -59,6 +59,25 @@ class TestWebAppStream(unittest.TestCase):
 
         sleep.assert_any_call(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
 
+    def test_stop_does_not_raise_and_stops_active_stream(self):
+        cleanup_log = []
+        self.web_app.add_streaming_handler(
+            QueueStreamHandler,
+            values=["a1"],
+            cleanup_log=cleanup_log,
+        )
+
+        with patch("web.web_app.time.sleep"):
+            stream = self.web_app._WebApp__web_stream()
+            self.assertEqual("a1", next(stream))
+
+            self.web_app.stop()
+
+            with self.assertRaises(StopIteration):
+                next(stream)
+
+        self.assertEqual([True], cleanup_log)
+
     def test_builder_registers_heartbeat_stream_handler(self):
         auto_queue_persist = MagicMock()
 
