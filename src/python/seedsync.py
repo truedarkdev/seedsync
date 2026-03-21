@@ -117,6 +117,7 @@ class Seedsync:
     def run(self):
         self.context.logger.info("Starting SeedSync")
         self.context.logger.info("Platform: {}".format(platform.machine()))
+        Seedsync._emit_startup_warnings(self.context.logger, self.context.config)
 
         # Create controller
         controller = Controller(self.context, self.controller_persist)
@@ -360,6 +361,34 @@ class Seedsync:
                     if field_name not in skip_fields:
                         incomplete_fields.append(field_name)
         return incomplete_fields
+
+    @staticmethod
+    def _is_blank_config_value(value) -> bool:
+        return value is None or (isinstance(value, str) and value.strip() == "")
+
+    @staticmethod
+    def _emit_startup_warnings(logger: logging.Logger, config: Config, web_bind_host: str = "0.0.0.0") -> None:
+        general_config = getattr(config, "general", None)
+        if general_config is None:
+            return
+
+        # webhook_secret is not part of all local config models; only warn when present.
+        webhook_secret = getattr(general_config, "webhook_secret", None)
+        if hasattr(general_config, "webhook_secret") and Seedsync._is_blank_config_value(webhook_secret):
+            logger.warning(
+                "Security: webhook_secret is not configured. Webhook endpoints may accept unauthenticated requests."
+            )
+
+        api_token = getattr(general_config, "api_token", None)
+        if Seedsync._is_blank_config_value(api_token):
+            logger.warning(
+                "Security: No API token configured. API requests will be accepted without authentication."
+            )
+            if web_bind_host == "0.0.0.0":
+                logger.warning(
+                    "Security: Application is bound to 0.0.0.0 without an API token. "
+                    "Any host on the network can access the API."
+                )
 
     @staticmethod
     def _load_persist(cls: Type[T_Persist], file_path: str) -> T_Persist:
