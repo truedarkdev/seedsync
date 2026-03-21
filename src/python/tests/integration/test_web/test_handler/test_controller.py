@@ -245,6 +245,51 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual("Invalid file path", response.text)
         self.controller.queue_command.assert_not_called()
 
+    def test_delete_local_rejects_mismatched_file_id_authoritative_traversal_target(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file("safe.mkv", "[\"tv\",\"safe.mkv\"]", "tv"),
+            self.__model_file("../../etc/passwd", "[\"movies\",\"../../etc/passwd\"]", "movies")
+        ]
+
+        safe_uri = quote(quote("safe.mkv", safe=""), safe="")
+        traversal_file_id = quote("[\"movies\",\"../../etc/passwd\"]", safe="")
+        response = self.test_app.delete(
+            "/server/command/delete_local/{}?file_id={}&path_pair_id=tv".format(safe_uri, traversal_file_id),
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_delete_local_rejects_when_local_path_root_is_unavailable(self):
+        self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=None)
+        self.web_app = self.web_app_builder.build()
+        self.test_app = type(self.test_app)(self.web_app)
+        self.controller.queue_command = MagicMock()
+
+        response = self.test_app.delete("/server/command/delete_local/test1", expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_queue_remains_allowed_when_local_path_root_is_unavailable(self):
+        self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=None)
+        self.web_app = self.web_app_builder.build()
+        self.test_app = type(self.test_app)(self.web_app)
+
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post("/server/command/queue/test1")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("Queued file 'test1'", response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+
     def test_bulk_queue_preserves_order_and_deduplicates(self):
         seen_commands = []
 
@@ -365,6 +410,55 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(1, self.controller.queue_command.call_count)
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
+        self.assertEqual("test1", command.filename)
+
+    def test_bulk_delete_remote_rejects_mismatched_file_id_authoritative_traversal_target(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+        self.controller.get_model_files.return_value = [
+            self.__model_file("good.mkv", "good-file-id"),
+            self.__model_file("../../etc/passwd", "traversal-file-id")
+        ]
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/delete_remote",
+            {
+                "files": [
+                    {"name": "good.mkv", "file_id": "traversal-file-id"},
+                    {"name": "good.mkv", "file_id": "good-file-id"}
+                ]
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("1 succeeded, 1 failed", response.text)
+        self.assertIn("'good.mkv': Invalid file path", response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual("good-file-id", command.filename)
+
+    def test_bulk_extract_rejects_path_traversal_and_continues(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/extract",
+            {"filenames": ["../../etc/passwd", "test1"]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("1 succeeded, 1 failed", response.text)
+        self.assertIn("'../../etc/passwd': Invalid file path", response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.EXTRACT, command.action)
         self.assertEqual("test1", command.filename)
 
     def test_bulk_queue_does_not_guard_path_traversal_filenames(self):
