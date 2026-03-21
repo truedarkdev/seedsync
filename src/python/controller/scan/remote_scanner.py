@@ -9,7 +9,7 @@ import hashlib
 
 from .scanner_process import IScanner, ScannerError
 from common import overrides, Localization
-from ssh import Sshcp, SshcpError
+from ssh import Sshcp, SshcpError, TRANSIENT_ERROR_PATTERNS
 from system import SystemFile
 
 
@@ -17,6 +17,12 @@ class RemoteScanner(IScanner):
     """
     Scanner implementation to scan the remote filesystem
     """
+
+    @staticmethod
+    def _is_transient_ssh_error(error: SshcpError) -> bool:
+        error_message = str(error)
+        return any(pattern in error_message for pattern in TRANSIENT_ERROR_PATTERNS)
+
     def __init__(self,
                  remote_address: str,
                  remote_username: str,
@@ -73,9 +79,9 @@ class RemoteScanner(IScanner):
             # Any scanner errors are fatal
             if "SystemScannerError" in str(e):
                 recoverable = False
-            # First time errors are fatal
-            # User should be prompted to correct these
-            if self.__first_run:
+            # First run errors are only recoverable for transient SSH issues.
+            # Non-transient first-run errors should still prompt user correction.
+            if self.__first_run and not self._is_transient_ssh_error(e):
                 recoverable = False
             raise ScannerError(
                 Localization.Error.REMOTE_SERVER_SCAN.format(str(e).strip()),
@@ -111,7 +117,7 @@ class RemoteScanner(IScanner):
             self.logger.exception("Caught scp exception")
             raise ScannerError(
                 Localization.Error.REMOTE_SERVER_INSTALL.format(str(e).strip()),
-                recoverable=False
+                recoverable=self.__first_run and self._is_transient_ssh_error(e)
             )
 
         # Go ahead and install
@@ -133,5 +139,5 @@ class RemoteScanner(IScanner):
             self.logger.exception("Caught scp exception")
             raise ScannerError(
                 Localization.Error.REMOTE_SERVER_INSTALL.format(str(e).strip()),
-                recoverable=False
+                recoverable=self.__first_run and self._is_transient_ssh_error(e)
             )

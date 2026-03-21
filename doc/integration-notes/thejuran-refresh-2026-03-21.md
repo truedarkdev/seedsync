@@ -56,8 +56,8 @@ Review state values:
 | `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards` | `reviewed` | `already integrated` | Adapted locally with a conservative `local_path` guard for destructive controller actions and WebAppBuilder wiring while preserving the existing bulk response summary contract. |
 | `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc in upstream `.planning`; tracked through this repo's integration ledger and commit history. |
 | `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only phase completion doc in upstream `.planning`; tracked through this repo's integration ledger and commit history. |
-| `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal` | `not yet reviewed` |  |  |
-| `7bf7fb2826b759bf1feb456a250e6d00cb35651c` `fix: update tests for api_token field, config redaction, and POST restart route` | `not yet reviewed` |  |  |
+| `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal` | `reviewed` | `already integrated` | Adapted locally with a narrow scanner slice: first-run transient SSH failures (`Timed out`, `Connection refused by server`) are recoverable in scan and scanfs install paths, while non-transient first-run failures remain fatal. |
+| `7bf7fb2826b759bf1feb456a250e6d00cb35651c` `fix: update tests for api_token field, config redaction, and POST restart route` | `reviewed` | `covered elsewhere` | Local commits `8dc4b400` and `caa3ebb8` already covered the same test expectations (`api_token` config/test surface, config redaction assertions, and POST restart route handling). |
 | `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests` | `not yet reviewed` |  |  |
 | `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script` | `not yet reviewed` |  | Local commit `caa3ebb8` already updates the same caller for batch coherence, so this commit may disposition as `covered elsewhere` when reviewed in order. |
 | `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps` | `not yet reviewed` |  |  |
@@ -74,9 +74,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal`
+- `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests`
 
 ## Next Candidate Batch
 
-- `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal`
-- `7bf7fb2826b759bf1feb456a250e6d00cb35651c` `fix: update tests for api_token field, config redaction, and POST restart route`
+- `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests`
+- `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script`

@@ -16,6 +16,9 @@ class SshcpError(AppError):
     pass
 
 
+TRANSIENT_ERROR_PATTERNS = ("Timed out", "Connection refused by server")
+
+
 class Sshcp:
     """
     Scp command utility
