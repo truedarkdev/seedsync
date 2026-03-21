@@ -9,6 +9,10 @@ from ..serialize import SerializeConfig
 
 
 class ConfigHandler(IHandler):
+    __URL_SET_BLOCKED_FIELDS = {
+        "general": {"api_token"},
+    }
+
     def __init__(self, config: Config):
         self.__config = config
 
@@ -31,6 +35,11 @@ class ConfigHandler(IHandler):
         inner_config = getattr(self.__config, section)
         if not inner_config.has_property(key):
             return HTTPResponse(body="Section '{}' in config has no option '{}'".format(section, key), status=404)
+        if section in ConfigHandler.__URL_SET_BLOCKED_FIELDS and key in ConfigHandler.__URL_SET_BLOCKED_FIELDS[section]:
+            return HTTPResponse(
+                body="Section '{}' option '{}' cannot be set via URL".format(section, key),
+                status=403
+            )
         try:
             inner_config.set_property(key, value)
             return HTTPResponse(body="{}.{} set to {}".format(section, key, value))

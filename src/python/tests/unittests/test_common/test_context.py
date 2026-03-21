@@ -56,6 +56,7 @@ class TestContext(unittest.TestCase):
             "general": {
                 "debug": True,
                 "verbose": False,
+                "api_token": "super-secret-token",
             }
         }
         args = Args()
@@ -72,6 +73,7 @@ class TestContext(unittest.TestCase):
                 call("Config:"),
                 call("  general.debug: True"),
                 call("  general.verbose: False"),
+                call("  general.api_token: **REDACTED**"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),
                 call("  html_path: /tmp/ui"),
