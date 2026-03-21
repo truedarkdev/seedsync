@@ -7,7 +7,8 @@ from common import Config
 
 
 _SENSITIVE_FIELDS = {
-    "lftp": ["remote_password"],
+    "lftp": ["remote_password", "remote_address", "remote_username", "remote_path"],
+    "general": ["api_token"],
 }
 
 _REDACTED = "**REDACTED**"

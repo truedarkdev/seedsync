@@ -44,8 +44,8 @@ Review state values:
 | `1f1a12b453e67743d14e7c4ec0259f0eacfd7a01` `docs(phase-47): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
 | `41c53e5d57a35ea543ee9dd8f43883961011aefe` `docs(48): research phase config and webhook layer` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
 | `fa96fdf303b99919f10698511f12a3801d9f2cfe` `docs(48): create phase plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
-| `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction` | `not yet reviewed` |  |  |
-| `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan` | `not yet reviewed` |  |  |
+| `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction` | `reviewed` | `already integrated` | Adapted locally with minimal diffs: added `General.api_token`, backfilled missing `api_token` in `Config.from_dict`, seeded default config value, and expanded config API redaction for SSH topology and `api_token` with aligned tests. |
+| `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc; implementation outcome is tracked in this ledger and local commits. |
 | `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests` | `not yet reviewed` |  |  |
 | `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests` | `not yet reviewed` |  |  |
 | `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan` | `not yet reviewed` |  |  |
@@ -74,9 +74,10 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction`
+- `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests`
 
 ## Next Candidate Batch
 
-- `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction`
-- `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan`
+- `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests`
+- `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests`
+- `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan`
