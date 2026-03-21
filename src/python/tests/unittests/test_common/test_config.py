@@ -196,10 +196,12 @@ class TestConfig(unittest.TestCase):
         good_dict = {
             "debug": "True",
             "verbose": "False",
+            "api_token": "token-value",
         }
         general = Config.General.from_dict(good_dict)
         self.assertEqual(True, general.debug)
         self.assertEqual(False, general.verbose)
+        self.assertEqual("token-value", general.api_token)
 
         self.check_common(Config.General,
                           good_dict,
@@ -437,6 +439,7 @@ class TestConfig(unittest.TestCase):
 
         self.assertEqual(False, config.general.debug)
         self.assertEqual(True, config.general.verbose)
+        self.assertEqual("", config.general.api_token)
 
         self.assertEqual("remote.server.com", config.lftp.remote_address)
         self.assertEqual("remote-user", config.lftp.remote_username)
@@ -487,6 +490,7 @@ class TestConfig(unittest.TestCase):
         config = Config()
         config.general.debug = True
         config.general.verbose = False
+        config.general.api_token = "api-token-value"
         config.lftp.remote_address = "server.remote.com"
         config.lftp.remote_username = "user-on-remote-server"
         config.lftp.remote_password = "pass-on-remote-server"
@@ -520,6 +524,7 @@ class TestConfig(unittest.TestCase):
         [General]
         debug = True
         verbose = False
+        api_token = api-token-value
 
         [Lftp]
         remote_address = server.remote.com
