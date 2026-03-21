@@ -1,6 +1,8 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import os
 from threading import BoundedSemaphore, Event
+from typing import Optional
 from urllib.parse import unquote
 
 import bottle
@@ -45,10 +47,36 @@ class ControllerHandler(IHandler):
     _ACTION_TIMEOUT = 30.0
     _MAX_BULK_ITEMS = 100
     _MAX_CONCURRENT_BULK_REQUESTS = 1
+    _GUARDED_ACTIONS = {
+        Controller.Command.Action.EXTRACT,
+        Controller.Command.Action.DELETE_LOCAL,
+        Controller.Command.Action.DELETE_REMOTE
+    }
 
-    def __init__(self, controller: Controller):
+    def __init__(self, controller: Controller, local_path: str = None):
         self.__controller = controller
+        self.__local_path_root = self.__normalize_local_path(local_path)
         self.__bulk_request_limiter = BoundedSemaphore(self._MAX_CONCURRENT_BULK_REQUESTS)
+
+    @staticmethod
+    def __normalize_local_path(local_path: str) -> Optional[str]:
+        if not isinstance(local_path, str) or local_path.strip() == "":
+            return None
+        return os.path.realpath(local_path)
+
+    def __check_path_safe(self, file_name: str) -> Optional[HTTPResponse]:
+        if self.__local_path_root is None:
+            return None
+
+        candidate_path = os.path.realpath(os.path.join(self.__local_path_root, file_name))
+        try:
+            common_path = os.path.commonpath([self.__local_path_root, candidate_path])
+        except ValueError:
+            common_path = ""
+
+        if os.path.normcase(common_path) != os.path.normcase(self.__local_path_root):
+            return HTTPResponse(body="Invalid file path", status=400)
+        return None
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -175,6 +203,10 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
+        guard_response = self.__check_path_safe(file_name)
+        if guard_response:
+            return guard_response
+
         file_identifier, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
@@ -203,6 +235,10 @@ class ControllerHandler(IHandler):
         """
         # value is double encoded
         file_name = unquote(file_name)
+
+        guard_response = self.__check_path_safe(file_name)
+        if guard_response:
+            return guard_response
 
         file_identifier, error_response = self.__resolve_command_identifier(
             file_name,
@@ -261,6 +297,10 @@ class ControllerHandler(IHandler):
         """
         # value is double encoded
         file_name = unquote(file_name)
+
+        guard_response = self.__check_path_safe(file_name)
+        if guard_response:
+            return guard_response
 
         file_identifier, error_response = self.__resolve_command_identifier(
             file_name,
@@ -346,6 +386,12 @@ class ControllerHandler(IHandler):
             failures = []
             success_count = 0
             for display_name, identifier in ordered_commands:
+                if command_action in self._GUARDED_ACTIONS:
+                    guard_response = self.__check_path_safe(display_name)
+                    if guard_response:
+                        failures.append("'{}': Invalid file path".format(display_name))
+                        continue
+
                 callback, completed = self.__execute_action(
                     command_action,
                     identifier,
