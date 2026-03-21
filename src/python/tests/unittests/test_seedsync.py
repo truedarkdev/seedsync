@@ -198,7 +198,8 @@ class TestSeedsync(unittest.TestCase):
         Seedsync._emit_startup_warnings(logger, config)
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
-        self.assertTrue(any("No API token configured" in message for message in warning_messages))
+        self.assertTrue(any("general.api_token is not configured" in message for message in warning_messages))
+        self.assertTrue(any("is not enforced by the API" in message for message in warning_messages))
         self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
         self.assertEqual(2, logger.warning.call_count)
 
@@ -210,7 +211,8 @@ class TestSeedsync(unittest.TestCase):
         Seedsync._emit_startup_warnings(logger, config, web_bind_host="127.0.0.1")
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
-        self.assertTrue(any("No API token configured" in message for message in warning_messages))
+        self.assertTrue(any("general.api_token is not configured" in message for message in warning_messages))
+        self.assertTrue(any("is not enforced by the API" in message for message in warning_messages))
         self.assertFalse(any("0.0.0.0" in message for message in warning_messages))
         self.assertEqual(1, logger.warning.call_count)
 
