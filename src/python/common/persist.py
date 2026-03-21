@@ -46,10 +46,20 @@ class Persist(Serializable):
     def from_file(cls: Type[T_Persist], file_path: str) -> T_Persist:
         if not os.path.isfile(file_path):
             raise AppError(Localization.Error.MISSING_FILE.format(file_path))
+        if os.name == "posix":
+            os.chmod(file_path, 0o600)
         with open(file_path, "r") as f:
             return cls.from_str(f.read())
 
     def to_file(self, file_path: str):
+        if os.name == "posix":
+            if os.path.isfile(file_path):
+                os.chmod(file_path, 0o600)
+            fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(self.to_str())
+            os.chmod(file_path, 0o600)
+            return
         with open(file_path, "w") as f:
             f.write(self.to_str())
 
