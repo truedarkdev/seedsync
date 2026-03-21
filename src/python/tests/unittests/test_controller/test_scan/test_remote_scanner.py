@@ -277,6 +277,28 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(Localization.Error.REMOTE_SERVER_INSTALL.format("Timed out"), str(ctx.exception))
         self.assertTrue(ctx.exception.recoverable)
 
+    def test_raises_recoverable_error_on_md5sum_connection_refused(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        # Ssh returns connection refused error for md5sum check
+        self.mock_ssh.shell.side_effect = SshcpError("Connection refused by server")
+
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+        self.assertEqual(
+            Localization.Error.REMOTE_SERVER_INSTALL.format("Connection refused by server"),
+            str(ctx.exception)
+        )
+        self.assertTrue(ctx.exception.recoverable)
+
     def test_calls_correct_ssh_scan_command(self):
         scanner = RemoteScanner(
             remote_address="my remote address",
@@ -521,6 +543,30 @@ class TestRemoteScanner(unittest.TestCase):
         with self.assertRaises(ScannerError) as ctx:
             scanner.scan()
         self.assertEqual(Localization.Error.REMOTE_SERVER_INSTALL.format("Timed out"), str(ctx.exception))
+        self.assertTrue(ctx.exception.recoverable)
+
+    def test_raises_recoverable_error_on_failed_copy_connection_refused(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        # noinspection PyUnusedLocal
+        def ssh_copy(*args, **kwargs):
+            raise SshcpError("Connection refused by server")
+        self.mock_ssh.copy.side_effect = ssh_copy
+
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+        self.assertEqual(
+            Localization.Error.REMOTE_SERVER_INSTALL.format("Connection refused by server"),
+            str(ctx.exception)
+        )
         self.assertTrue(ctx.exception.recoverable)
 
     def test_raises_nonrecoverable_error_on_mangled_output(self):
