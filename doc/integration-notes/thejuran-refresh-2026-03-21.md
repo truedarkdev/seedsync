@@ -38,12 +38,12 @@ Review state values:
 | `b5afc96c0599c9e82e7b92f920487c3b79a4e587` `feat(47-01): harden config file permissions to 0600 in Persist` | `reviewed` | `already integrated` | Adapted together with `7f025d7864c3e56dfe6cda3b15ced4ea7832a752` in local commit `f4efff8e`. |
 | `b7c5a40fd0ef2c3d52cc07b1bb8f87fb78ca8ec5` `feat(47-03): implement SSH topology redaction in _redact_sensitive()` | `reviewed` | `already integrated` | Adapted together with `97bb7d0104dbc0bf8c3a96039d0afe259dbbf9f5` and `e99c1ec375134b504b772ce211664e25f2305902` in local commit `caa3ebb8`. |
 | `e99c1ec375134b504b772ce211664e25f2305902` `fix(47-02): change Angular restart service from GET to POST` | `reviewed` | `already integrated` | Adapted together with `97bb7d0104dbc0bf8c3a96039d0afe259dbbf9f5` and `b7c5a40fd0ef2c3d52cc07b1bb8f87fb78ca8ec5` in local commit `caa3ebb8`. |
-| `00a0c86214261ad58592eb6978b71a948ae91e47` `docs(47-01): complete config file permission hardening plan` | `not yet reviewed` |  |  |
-| `60304acf2129b5a32ad66116d7a8a27d4372f31d` `docs(47-03): complete SSH topology redaction plan` | `not yet reviewed` |  |  |
-| `4709e977a240979a77f02772fcb148ae442b5606` `docs(47-02): complete restart endpoint CSRF fix plan` | `not yet reviewed` |  |  |
-| `1f1a12b453e67743d14e7c4ec0259f0eacfd7a01` `docs(phase-47): complete phase execution` | `not yet reviewed` |  |  |
-| `41c53e5d57a35ea543ee9dd8f43883961011aefe` `docs(48): research phase config and webhook layer` | `not yet reviewed` |  |  |
-| `fa96fdf303b99919f10698511f12a3801d9f2cfe` `docs(48): create phase plan` | `not yet reviewed` |  |  |
+| `00a0c86214261ad58592eb6978b71a948ae91e47` `docs(47-01): complete config file permission hardening plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
+| `60304acf2129b5a32ad66116d7a8a27d4372f31d` `docs(47-03): complete SSH topology redaction plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
+| `4709e977a240979a77f02772fcb148ae442b5606` `docs(47-02): complete restart endpoint CSRF fix plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
+| `1f1a12b453e67743d14e7c4ec0259f0eacfd7a01` `docs(phase-47): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
+| `41c53e5d57a35ea543ee9dd8f43883961011aefe` `docs(48): research phase config and webhook layer` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
+| `fa96fdf303b99919f10698511f12a3801d9f2cfe` `docs(48): create phase plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
 | `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction` | `not yet reviewed` |  |  |
 | `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan` | `not yet reviewed` |  |  |
 | `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests` | `not yet reviewed` |  |  |
@@ -74,11 +74,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `00a0c86214261ad58592eb6978b71a948ae91e47` `docs(47-01): complete config file permission hardening plan`
+- `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction`
 
 ## Next Candidate Batch
 
-- `00a0c86214261ad58592eb6978b71a948ae91e47` `docs(47-01): complete config file permission hardening plan`
-- `60304acf2129b5a32ad66116d7a8a27d4372f31d` `docs(47-03): complete SSH topology redaction plan`
-- `4709e977a240979a77f02772fcb148ae442b5606` `docs(47-02): complete restart endpoint CSRF fix plan`
-- `1f1a12b453e67743d14e7c4ec0259f0eacfd7a01` `docs(phase-47): complete phase execution`
+- `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction`
+- `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan`

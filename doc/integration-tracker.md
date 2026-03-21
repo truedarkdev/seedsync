@@ -41,13 +41,13 @@ Refresh rule:
 
 ## thejuran
 - Source branch: `thejuran/master`
-- Last fully processed upstream commit: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
+- Last fully processed upstream commit: `fa96fdf303b99919f10698511f12a3801d9f2cfe`
 - Fork tip at last full review: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
 - Last full review date: `2026-03-21`
 - Status: refresh needed
 - Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work across docs, CI, packaging, compatibility, security hardening, web/API hardening, files page behavior, SSH/runtime handling, transfers/LFTP, scanning, extraction, controller hardening, dashboard updates, and cleanup safety while leaving explicitly rejected or out-of-direction changes out.
-- Resume when new upstream appears: resume the current refresh from `00a0c86214261ad58592eb6978b71a948ae91e47` after the local restart-route and SSH-topology-redaction batch, then continue oldest-to-newest through the remaining commits after `a8561cdc318460de32de082e3cf33f6b6a0093cb`.
-- Notes: `thejuran/master` is now at `36c13b3f4200971ab8fe08b3212ee5e7ea890a4f` with 44 newer commits beyond the fully processed checkpoint. The first six new commits are `.planning`/research docs that this fork does not currently mirror. Local adaptation of upstream `7f025d78` + `b5afc96c` landed in `f4efff8e` as the persist-permissions hardening batch. Local adaptation of upstream `97bb7d01` + `b7c5a40f` + `e99c1ec3` landed in `caa3ebb8` as the restart-route and SSH-topology-redaction batch; because that batch also aligned the local e2e restart caller early, upstream `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` will likely disposition as `covered elsewhere` when reached in order. Treat `a8561cdc318460de32de082e3cf33f6b6a0093cb` as the current fully processed checkpoint, not as a claim that every earlier commit was directly integrated verbatim.
+- Resume when new upstream appears: resume the current refresh from `5c899615b5ce4ece819e766951efe7be10907892` after the phase-47/phase-48 doc-only planning block, then continue oldest-to-newest through the remaining commits after `fa96fdf303b99919f10698511f12a3801d9f2cfe`.
+- Notes: `thejuran/master` is now at `36c13b3f0acf5b9f0df738cd9964a44f31885771` with 27 newer commits beyond the fully processed checkpoint. The six doc-only commits from `00a0c86214261ad58592eb6978b71a948ae91e47` through `fa96fdf303b99919f10698511f12a3801d9f2cfe` were reviewed and dispositioned as `intentionally skipped` because they are upstream planning artifacts already represented by this repo's own integration ledger/tracker workflow. Local adaptation of upstream `7f025d78` + `b5afc96c` landed in `f4efff8e` as the persist-permissions hardening batch. Local adaptation of upstream `97bb7d01` + `b7c5a40f` + `e99c1ec3` landed in `caa3ebb8` as the restart-route and SSH-topology-redaction batch; because that batch also aligned the local e2e restart caller early, upstream `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` will likely disposition as `covered elsewhere` when reached in order.
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
