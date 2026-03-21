@@ -384,10 +384,16 @@ class Seedsync:
             logger.warning(
                 "Security: No API token configured. API requests will be accepted without authentication."
             )
-            if web_bind_host == "0.0.0.0":
+        if web_bind_host == "0.0.0.0":
+            if Seedsync._is_blank_config_value(api_token):
                 logger.warning(
-                    "Security: Application is bound to 0.0.0.0 without an API token. "
+                    "Security: Application is bound to 0.0.0.0 and API requests are unauthenticated. "
                     "Any host on the network can access the API."
+                )
+            else:
+                logger.warning(
+                    "Security: Application is bound to 0.0.0.0. general.api_token is currently only stored in "
+                    "config and is not enforced by the API in this build. Any host on the network can access the API."
                 )
 
     @staticmethod

@@ -66,7 +66,7 @@ class Context:
         for section in config_dict.keys():
             for option in config_dict[section].keys():
                 value = config_dict[section][option]
-                if str(section).lower() == "general" and str(option).lower() == "api_token":
+                if str(section).lower() == "general" and str(option).lower() in {"api_token", "webhook_secret"}:
                     value = "**REDACTED**"
                 self.logger.debug("  {}.{}: {}".format(section, option, value))
 
