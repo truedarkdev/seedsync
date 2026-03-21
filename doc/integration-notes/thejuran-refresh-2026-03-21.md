@@ -54,8 +54,8 @@ Review state values:
 | `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards` | `reviewed` | `intentionally skipped` | Planning-only `.planning` phase plan doc; implementation tracking stays in local integration notes and tracker. |
 | `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests` | `reviewed` | `already integrated` | Adapted into the local integration web-handler test surface (`test_web/test_handler/test_controller.py`) instead of importing the missing upstream unit-test path. |
 | `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards` | `reviewed` | `already integrated` | Adapted locally with a conservative `local_path` guard for destructive controller actions and WebAppBuilder wiring while preserving the existing bulk response summary contract. |
-| `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan` | `not yet reviewed` |  |  |
-| `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution` | `not yet reviewed` |  |  |
+| `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc in upstream `.planning`; tracked through this repo's integration ledger and commit history. |
+| `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only phase completion doc in upstream `.planning`; tracked through this repo's integration ledger and commit history. |
 | `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal` | `not yet reviewed` |  |  |
 | `7bf7fb2826b759bf1feb456a250e6d00cb35651c` `fix: update tests for api_token field, config redaction, and POST restart route` | `not yet reviewed` |  |  |
 | `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests` | `not yet reviewed` |  |  |
@@ -74,9 +74,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan`
+- `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal`
 
 ## Next Candidate Batch
 
-- `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan`
-- `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution`
+- `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal`
+- `7bf7fb2826b759bf1feb456a250e6d00cb35651c` `fix: update tests for api_token field, config redaction, and POST restart route`
