@@ -72,3 +72,20 @@ class TestConfigHandlerSet(unittest.TestCase):
         )
 
         self.assertEqual(400, response.status_code)
+
+    def test_set_api_token_via_url_is_forbidden(self):
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.general = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "general", "api_token", quote("super-secret-token")
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(
+            "Section 'general' option 'api_token' cannot be set via URL",
+            response.body
+        )
+        inner.set_property.assert_not_called()

@@ -9,6 +9,10 @@ from tests.integration.test_web.test_web_app import BaseTestWebApp
 class TestConfigHandler(BaseTestWebApp):
     def test_get(self):
         self.context.config.general.debug = True
+        self.context.config.general.api_token = "super-secret-token"
+        self.context.config.lftp.remote_address = "server.remote.com"
+        self.context.config.lftp.remote_username = "seedsync-user"
+        self.context.config.lftp.remote_port = 2222
         self.context.config.lftp.remote_path = "/remote/server/path"
         self.context.config.controller.interval_ms_local_scan = 5678
         self.context.config.web.port = 8080
@@ -16,7 +20,11 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(200, resp.status_int)
         json_dict = json.loads(str(resp.html))
         self.assertEqual(True, json_dict["general"]["debug"])
+        self.assertEqual("**REDACTED**", json_dict["general"]["api_token"])
+        self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_address"])
+        self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_username"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_path"])
+        self.assertEqual(2222, json_dict["lftp"]["remote_port"])
         self.assertEqual(5678, json_dict["controller"]["interval_ms_local_scan"])
         self.assertEqual(8080, json_dict["web"]["port"])
 
@@ -41,6 +49,20 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.get("/server/config/set/web/port/8080")
         self.assertEqual(200, resp.status_int)
         self.assertEqual(8080, self.context.config.web.port)
+
+    def test_set_api_token_via_url_is_forbidden(self):
+        self.assertEqual(None, self.context.config.general.api_token)
+        resp = self.test_app.get(
+            "/server/config/set/general/api_token/super-secret-token",
+            expect_errors=True
+        )
+        self.assertEqual(403, resp.status_int)
+        self.assertEqual(
+            "Section 'general' option 'api_token' cannot be set via URL",
+            str(resp.html)
+        )
+        self.assertEqual(None, self.context.config.general.api_token)
+        self.assertNotIn("super-secret-token", str(resp.html))
 
     def test_set_missing_section(self):
         self.assertFalse(self.context.config.has_section("bad_section"))
