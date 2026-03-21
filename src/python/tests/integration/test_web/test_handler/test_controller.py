@@ -12,6 +12,10 @@ from web.handler.controller import ControllerHandler
 class TestControllerHandler(BaseTestWebApp):
     def setUp(self):
         super().setUp()
+        self.context.config.lftp.local_path = self.temp_dir
+        self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=self.temp_dir)
+        self.web_app = self.web_app_builder.build()
+        self.test_app = type(self.test_app)(self.web_app)
         self.controller.get_model_files = MagicMock(return_value=[])
 
     @staticmethod
@@ -103,11 +107,11 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.EXTRACT, command.action)
         self.assertEqual("test1", command.filename)
 
-        uri = quote(quote("/value/with/slashes", safe=""), safe="")
+        uri = quote(quote("value/with/slashes", safe=""), safe="")
         print(self.test_app.post("/server/command/extract/"+uri))
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.EXTRACT, command.action)
-        self.assertEqual("/value/with/slashes", command.filename)
+        self.assertEqual("value/with/slashes", command.filename)
 
         uri = quote(quote(" value with spaces", safe=""), safe="")
         print(self.test_app.post("/server/command/extract/"+uri))
@@ -138,11 +142,11 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
         self.assertEqual("test1", command.filename)
 
-        uri = quote(quote("/value/with/slashes", safe=""), safe="")
+        uri = quote(quote("value/with/slashes", safe=""), safe="")
         print(self.test_app.delete("/server/command/delete_local/"+uri))
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
-        self.assertEqual("/value/with/slashes", command.filename)
+        self.assertEqual("value/with/slashes", command.filename)
 
         uri = quote(quote(" value with spaces", safe=""), safe="")
         print(self.test_app.delete("/server/command/delete_local/"+uri))
@@ -173,11 +177,11 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
         self.assertEqual("test1", command.filename)
 
-        uri = quote(quote("/value/with/slashes", safe=""), safe="")
+        uri = quote(quote("value/with/slashes", safe=""), safe="")
         print(self.test_app.delete("/server/command/delete_remote/"+uri))
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
-        self.assertEqual("/value/with/slashes", command.filename)
+        self.assertEqual("value/with/slashes", command.filename)
 
         uri = quote(quote(" value with spaces", safe=""), safe="")
         print(self.test_app.delete("/server/command/delete_remote/"+uri))
@@ -207,6 +211,39 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.VALIDATE, command.action)
         self.assertEqual("test1", command.filename)
+
+    def test_extract_rejects_path_traversal(self):
+        self.controller.queue_command = MagicMock()
+        uri = quote(quote("../../etc/passwd", safe=""), safe="")
+
+        response = self.test_app.post("/server/command/extract/"+uri, expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_delete_local_rejects_path_traversal_without_path_leak(self):
+        self.controller.queue_command = MagicMock()
+        uri = quote(quote("../../etc/passwd", safe=""), safe="")
+
+        response = self.test_app.delete("/server/command/delete_local/"+uri, expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.assertNotIn("/etc", response.text)
+        self.assertNotIn("passwd", response.text)
+        self.assertNotIn(self.temp_dir, response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_delete_remote_rejects_path_traversal(self):
+        self.controller.queue_command = MagicMock()
+        uri = quote(quote("../../etc/passwd", safe=""), safe="")
+
+        response = self.test_app.delete("/server/command/delete_remote/"+uri, expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
 
     def test_bulk_queue_preserves_order_and_deduplicates(self):
         seen_commands = []
@@ -309,6 +346,44 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(2, call_count)
         self.assertIn("1 succeeded, 1 failed", response.text)
         self.assertIn("'test2': bad file", response.text)
+
+    def test_bulk_delete_local_rejects_path_traversal_and_continues(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/delete_local",
+            {"filenames": ["../../etc/passwd", "test1"]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("1 succeeded, 1 failed", response.text)
+        self.assertIn("'../../etc/passwd': Invalid file path", response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
+        self.assertEqual("test1", command.filename)
+
+    def test_bulk_queue_does_not_guard_path_traversal_filenames(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"filenames": ["../../etc/passwd"]}
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("Bulk queue completed: 1 succeeded, 0 failed", response.text)
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("../../etc/passwd", command.filename)
 
     def test_bulk_rejects_oversized_filenames_payload(self):
         with patch.object(ControllerHandler, "_MAX_BULK_ITEMS", 2):

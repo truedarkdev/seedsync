@@ -26,7 +26,11 @@ class WebAppBuilder:
         self.__context = context
         self.__controller = controller
 
-        self.controller_handler = ControllerHandler(controller)
+        local_path = None
+        if getattr(context, "config", None) is not None and getattr(context.config, "lftp", None) is not None:
+            local_path = getattr(context.config.lftp, "local_path", None)
+
+        self.controller_handler = ControllerHandler(controller, local_path=local_path)
         self.server_handler = ServerHandler(context)
         self.config_handler = ConfigHandler(context.config)
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)

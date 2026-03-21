@@ -52,8 +52,8 @@ Review state values:
 | `20db99f5af5fce18d92f440d147935e80dd4fb72` `docs(phase-48): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only phase completion doc; tracked via this ledger and local commits. |
 | `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards` | `reviewed` | `intentionally skipped` | Planning-only `.planning` research doc; this fork tracks integration intent in the local ledger/tracker workflow. |
 | `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards` | `reviewed` | `intentionally skipped` | Planning-only `.planning` phase plan doc; implementation tracking stays in local integration notes and tracker. |
-| `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests` | `not yet reviewed` |  |  |
-| `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards` | `not yet reviewed` |  |  |
+| `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests` | `reviewed` | `already integrated` | Adapted into the local integration web-handler test surface (`test_web/test_handler/test_controller.py`) instead of importing the missing upstream unit-test path. |
+| `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards` | `reviewed` | `already integrated` | Adapted locally with a conservative `local_path` guard for destructive controller actions and WebAppBuilder wiring while preserving the existing bulk response summary contract. |
 | `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan` | `not yet reviewed` |  |  |
 | `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution` | `not yet reviewed` |  |  |
 | `04ed3ace76b760ef6263f22ec376fc97d55f9279` `fix: make first-run SSH timeouts recoverable instead of fatal` | `not yet reviewed` |  |  |
@@ -74,9 +74,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests`
+- `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan`
 
 ## Next Candidate Batch
 
-- `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests`
-- `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards`
+- `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan`
+- `0342b5bc9c4e9ad7b7a02322a03fe662dd256d4d` `docs(phase-49): complete phase execution`
