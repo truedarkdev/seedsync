@@ -7,6 +7,7 @@ import tempfile
 import os
 import shutil
 from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair
 from seedsync import Seedsync
@@ -188,6 +189,57 @@ class TestSeedsync(unittest.TestCase):
             self.assertEqual([], Seedsync._detect_incomplete_config(config, manager))
         finally:
             shutil.rmtree(manager._config_dir)
+
+    def test_emit_startup_warnings_warns_when_api_token_is_blank(self):
+        config = Seedsync._create_default_config()
+        config.general.api_token = ""
+        logger = MagicMock()
+
+        Seedsync._emit_startup_warnings(logger, config)
+
+        warning_messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertTrue(any("No API token configured" in message for message in warning_messages))
+        self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
+        self.assertEqual(2, logger.warning.call_count)
+
+    def test_emit_startup_warnings_omits_public_bind_warning_for_localhost_bind(self):
+        config = Seedsync._create_default_config()
+        config.general.api_token = ""
+        logger = MagicMock()
+
+        Seedsync._emit_startup_warnings(logger, config, web_bind_host="127.0.0.1")
+
+        warning_messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertTrue(any("No API token configured" in message for message in warning_messages))
+        self.assertFalse(any("0.0.0.0" in message for message in warning_messages))
+        self.assertEqual(1, logger.warning.call_count)
+
+    def test_emit_startup_warnings_no_warnings_when_api_token_is_set(self):
+        config = Seedsync._create_default_config()
+        config.general.api_token = "configured-token"
+        logger = MagicMock()
+
+        Seedsync._emit_startup_warnings(logger, config)
+
+        logger.warning.assert_not_called()
+
+    def test_emit_startup_warnings_skips_webhook_secret_warning_when_field_absent(self):
+        config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token"))
+        logger = MagicMock()
+
+        Seedsync._emit_startup_warnings(logger, config)
+
+        logger.warning.assert_not_called()
+
+    def test_emit_startup_warnings_warns_when_webhook_secret_field_exists_and_is_blank(self):
+        config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token", webhook_secret=""))
+        logger = MagicMock()
+
+        Seedsync._emit_startup_warnings(logger, config)
+
+        warning_messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertTrue(any("webhook_secret is not configured" in message for message in warning_messages))
+        self.assertEqual(1, logger.warning.call_count)
 
     def test_persist_does_not_rewrite_unchanged_config(self):
         config = Seedsync._create_default_config()
