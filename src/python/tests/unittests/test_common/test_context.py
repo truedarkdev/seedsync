@@ -57,6 +57,7 @@ class TestContext(unittest.TestCase):
                 "debug": True,
                 "verbose": False,
                 "api_token": "super-secret-token",
+                "webhook_secret": "super-secret-webhook-secret",
             }
         }
         args = Args()
@@ -74,6 +75,7 @@ class TestContext(unittest.TestCase):
                 call("  general.debug: True"),
                 call("  general.verbose: False"),
                 call("  general.api_token: **REDACTED**"),
+                call("  general.webhook_secret: **REDACTED**"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),
                 call("  html_path: /tmp/ui"),

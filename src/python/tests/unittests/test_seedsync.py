@@ -221,13 +221,17 @@ class TestSeedsync(unittest.TestCase):
 
         Seedsync._emit_startup_warnings(logger, config)
 
-        logger.warning.assert_not_called()
+        warning_messages = [call.args[0] for call in logger.warning.call_args_list]
+        self.assertTrue(any("general.api_token is currently only stored in config" in message
+                            for message in warning_messages))
+        self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
+        self.assertEqual(1, logger.warning.call_count)
 
     def test_emit_startup_warnings_skips_webhook_secret_warning_when_field_absent(self):
         config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token"))
         logger = MagicMock()
 
-        Seedsync._emit_startup_warnings(logger, config)
+        Seedsync._emit_startup_warnings(logger, config, web_bind_host="127.0.0.1")
 
         logger.warning.assert_not_called()
 
@@ -235,7 +239,7 @@ class TestSeedsync(unittest.TestCase):
         config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token", webhook_secret=""))
         logger = MagicMock()
 
-        Seedsync._emit_startup_warnings(logger, config)
+        Seedsync._emit_startup_warnings(logger, config, web_bind_host="127.0.0.1")
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
         self.assertTrue(any("webhook_secret is not configured" in message for message in warning_messages))
