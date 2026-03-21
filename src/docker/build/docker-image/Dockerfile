@@ -153,11 +153,9 @@ RUN /scripts/setup_default_config.sh
 # Must run app inside shell
 # Otherwise the container crashes as soon as a child process exits
 CMD [ \
-    "python", \
-    "/app/python/seedsync.py", \
-    "-c", "/config", \
-    "--html", "/app/html", \
-    "--scanfs", "/app/scanfs" \
+    "/bin/bash", \
+    "-lc", \
+    "/scripts/setup_default_config.sh && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs" \
 ]
 
 EXPOSE 8800

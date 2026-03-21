@@ -1,0 +1,14 @@
+services:
+  seedsync:
+    image: seedsync-local:compose
+    container_name: seedsync-local-compose
+    build:
+      context: .
+      dockerfile: src/docker/build/docker-image/Dockerfile
+      target: seedsync_run
+    ports:
+      - "8800:8800"
+    volumes:
+      - ./build/docker-local/config:/config
+      - ./build/docker-local/downloads:/downloads
+      - ./build/docker-local/mounts:/mounts
