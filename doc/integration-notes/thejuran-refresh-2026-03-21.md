@@ -46,10 +46,10 @@ Review state values:
 | `fa96fdf303b99919f10698511f12a3801d9f2cfe` `docs(48): create phase plan` | `reviewed` | `intentionally skipped` | Planning-only docs; covered by the local integration ledger and commit history instead of importing upstream planning artifacts. |
 | `5c899615b5ce4ece819e766951efe7be10907892` `feat(48-01): add api_token config field and extend config API redaction` | `reviewed` | `already integrated` | Adapted locally with minimal diffs: added `General.api_token`, backfilled missing `api_token` in `Config.from_dict`, seeded default config value, and expanded config API redaction for SSH topology and `api_token` with aligned tests. |
 | `a29cae1108bf481181bc363903de4d8c6db765e3` `docs(48-01): complete api_token config field and redaction plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc; implementation outcome is tracked in this ledger and local commits. |
-| `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests` | `not yet reviewed` |  |  |
-| `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests` | `not yet reviewed` |  |  |
-| `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan` | `not yet reviewed` |  |  |
-| `20db99f5af5fce18d92f440d147935e80dd4fb72` `docs(phase-48): complete phase execution` | `not yet reviewed` |  |  |
+| `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests` | `reviewed` | `needs new integration task` | Targets webhook request-handling paths that are not present in this local fork; track as separate future work instead of inventing webhook subsystem scaffolding in this slice. |
+| `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests` | `reviewed` | `already integrated` | Adapted conservatively in local commit `cd07bfcf`: advisory startup warnings for missing `api_token` plus `0.0.0.0` exposure warning; `webhook_secret` warning is conditional on the field existing in the local runtime config. |
+| `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc; tracked via this ledger and local commits. |
+| `20db99f5af5fce18d92f440d147935e80dd4fb72` `docs(phase-48): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only phase completion doc; tracked via this ledger and local commits. |
 | `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards` | `not yet reviewed` |  |  |
 | `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards` | `not yet reviewed` |  |  |
 | `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests` | `not yet reviewed` |  |  |
@@ -74,10 +74,10 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests`
+- `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards`
 
 ## Next Candidate Batch
 
-- `7063a03b8e4cd212b597adbb2827720c872a6130` `feat(48-02): add webhook payload size cap with tests`
-- `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests`
-- `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan`
+- `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards`
+- `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards`
+- `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests`
