@@ -272,3 +272,104 @@ class TestSerializeLogRecord(unittest.TestCase):
             "command failed: -u seedbox,**REDACTED** password: **REDACTED**",
             data["exc_tb"]
         )
+
+
+class TestRedactSensitive(unittest.TestCase):
+    def test_redact_sftp_url(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Connecting to sftp://myuser@seedbox.example.com/downloads"
+        )
+        self.assertNotIn("myuser", result)
+        self.assertNotIn("seedbox.example.com", result)
+        self.assertIn("sftp://", result)
+        self.assertIn("**REDACTED**", result)
+
+    def test_redact_ssh_command_args_user_at_host(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@seedbox.example.com', 'ls']"
+        )
+        self.assertNotIn("myuser@seedbox", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_scp_user_at_host_colon_path(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['scp', 'myuser@seedbox.example.com:/remote/path', '/local/path']"
+        )
+        self.assertNotIn("myuser@seedbox", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_lftp_prompt(self):
+        result = SerializeLogRecord._redact_sensitive("lftp myuser@seedbox.example.com:~>")
+        self.assertNotIn("myuser@seedbox", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_ssh_command_args_user_at_ipv4(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@127.0.0.1', 'ls']"
+        )
+        self.assertNotIn("myuser@127.0.0.1", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_scp_user_at_ipv4_colon_path(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['scp', 'myuser@127.0.0.1:/remote/path', '/local/path']"
+        )
+        self.assertNotIn("myuser@127.0.0.1", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_ssh_command_args_user_at_remote(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@remote', 'ls']"
+        )
+        self.assertNotIn("myuser@remote", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_ssh_command_args_user_at_localhost(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@localhost', 'ls']"
+        )
+        self.assertNotIn("myuser@localhost", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_start_of_string_user_at_remote_prompt(self):
+        result = SerializeLogRecord._redact_sensitive("myuser@remote:~>")
+        self.assertEqual("**REDACTED**@**REDACTED**:~>", result)
+
+    def test_redact_ssh_command_args_user_at_leading_digit_host(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@1seedbox', 'ls']"
+        )
+        self.assertNotIn("myuser@1seedbox", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_redact_ssh_command_args_user_at_underscore_host(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Command: ['ssh', '-p', '22', 'myuser@my_seedbox', 'ls']"
+        )
+        self.assertNotIn("myuser@my_seedbox", result)
+        self.assertIn("**REDACTED**@**REDACTED**", result)
+
+    def test_no_redact_filename_with_at(self):
+        msg = "Downloading file@720p.mkv"
+        result = SerializeLogRecord._redact_sensitive(msg)
+        self.assertEqual(msg, result)
+
+    def test_no_redact_filename_at_version(self):
+        msg = "Processing release@1.0.tar.gz"
+        result = SerializeLogRecord._redact_sensitive(msg)
+        self.assertEqual(msg, result)
+
+    def test_no_redact_embedded_at_in_path(self):
+        msg = "/downloads/show@720p/file.mkv"
+        result = SerializeLogRecord._redact_sensitive(msg)
+        self.assertEqual(msg, result)
+
+    def test_no_redact_filename_like_token_with_letter_suffix(self):
+        msg = "Now playing episode@final.mkv"
+        result = SerializeLogRecord._redact_sensitive(msg)
+        self.assertEqual(msg, result)
+
+    def test_existing_password_redaction_preserved(self):
+        result = SerializeLogRecord._redact_sensitive("-u myuser,secretpass123")
+        self.assertNotIn("secretpass123", result)
+        self.assertIn("**REDACTED**", result)

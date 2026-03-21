@@ -11,7 +11,9 @@ wait_for_app() {
 }
 
 call_api() {
-  curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" "$1"
+  local url="$1"
+  local method="${2:-GET}"
+  curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" --request "${method}" "${url}"
   echo
 }
 
@@ -26,7 +28,7 @@ call_api "${base_url}/server/config/set/lftp/remote_port/1234"
 call_api "${base_url}/server/config/set/lftp/remote_path/%252Fhome%252Fremoteuser%252Ffiles"
 call_api "${base_url}/server/config/set/autoqueue/patterns_only/true"
 
-call_api "${base_url}/server/command/restart"
+call_api "${base_url}/server/command/restart" POST
 
 wait_for_app "Seedsync app is up (after configuring)"
 
