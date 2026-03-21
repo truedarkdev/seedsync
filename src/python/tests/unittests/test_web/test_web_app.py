@@ -1,4 +1,5 @@
 import unittest
+import os
 from unittest.mock import MagicMock, patch
 
 from web.web_app import IStreamHandler, WebApp
@@ -88,3 +89,24 @@ class TestWebAppStream(unittest.TestCase):
             for stream_handler in web_app._WebApp__streaming_handlers
         ]
         self.assertEqual("HeartbeatStreamHandler", streaming_handler_classes[-1].__name__)
+
+    def test_builder_wires_lftp_local_path_into_controller_handler(self):
+        auto_queue_persist = MagicMock()
+        self.context.config.lftp = MagicMock()
+        self.context.config.lftp.local_path = "/tmp/downloads"
+
+        builder = WebAppBuilder(self.context, MagicMock(), auto_queue_persist)
+
+        self.assertEqual(
+            os.path.realpath("/tmp/downloads"),
+            builder.controller_handler._ControllerHandler__local_path_root
+        )
+
+    def test_builder_leaves_controller_guard_root_unset_without_local_path(self):
+        auto_queue_persist = MagicMock()
+        self.context.config.lftp = MagicMock()
+        self.context.config.lftp.local_path = None
+
+        builder = WebAppBuilder(self.context, MagicMock(), auto_queue_persist)
+
+        self.assertIsNone(builder.controller_handler._ControllerHandler__local_path_root)

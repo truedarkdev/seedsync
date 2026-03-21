@@ -66,7 +66,7 @@ class ControllerHandler(IHandler):
 
     def __check_path_safe(self, file_name: str) -> Optional[HTTPResponse]:
         if self.__local_path_root is None:
-            return None
+            return HTTPResponse(body="Invalid file path", status=400)
 
         candidate_path = os.path.realpath(os.path.join(self.__local_path_root, file_name))
         try:
@@ -111,30 +111,32 @@ class ControllerHandler(IHandler):
 
         if file_id is not None:
             if not isinstance(file_id, str) or file_id == "":
-                return None, HTTPResponse(body="Invalid file_id query parameter", status=400)
+                return None, None, HTTPResponse(body="Invalid file_id query parameter", status=400)
             matches = [model_file for model_file in model_files if model_file.file_id == file_id]
             if len(matches) != 1:
-                return None, HTTPResponse(body="File identity did not match exactly one file", status=400)
-            return file_id, None
+                return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
+            return file_id, matches[0].name, None
 
         if path_pair_id is not None:
             if not isinstance(path_pair_id, str) or path_pair_id == "":
-                return None, HTTPResponse(body="Invalid path_pair_id query parameter", status=400)
+                return None, None, HTTPResponse(body="Invalid path_pair_id query parameter", status=400)
             matches = [
                 model_file for model_file in model_files
                 if model_file.name == file_name and model_file.path_pair_id == path_pair_id
             ]
             if len(matches) != 1:
-                return None, HTTPResponse(body="File identity did not match exactly one file", status=400)
-            return matches[0].file_id, None
+                return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
+            return matches[0].file_id, matches[0].name, None
 
         matches = [model_file for model_file in model_files if model_file.name == file_name]
         if len(matches) > 1:
-            return None, HTTPResponse(
+            return None, None, HTTPResponse(
                 body="File name '{}' is ambiguous; resend with file_id".format(file_name),
                 status=400
             )
-        return file_name, None
+        if len(matches) == 1:
+            return file_name, matches[0].name, None
+        return file_name, file_name, None
 
     def __handle_action_queue(self, file_name: str):
         """
@@ -145,7 +147,7 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
@@ -174,7 +176,7 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
@@ -203,17 +205,17 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        guard_response = self.__check_path_safe(file_name)
-        if guard_response:
-            return guard_response
-
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
         )
         if error_response:
             return error_response
+
+        guard_response = self.__check_path_safe(guard_name)
+        if guard_response:
+            return guard_response
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.EXTRACT,
@@ -236,17 +238,17 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        guard_response = self.__check_path_safe(file_name)
-        if guard_response:
-            return guard_response
-
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
         )
         if error_response:
             return error_response
+
+        guard_response = self.__check_path_safe(guard_name)
+        if guard_response:
+            return guard_response
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.DELETE_LOCAL,
@@ -269,7 +271,7 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
@@ -298,17 +300,17 @@ class ControllerHandler(IHandler):
         # value is double encoded
         file_name = unquote(file_name)
 
-        guard_response = self.__check_path_safe(file_name)
-        if guard_response:
-            return guard_response
-
-        file_identifier, error_response = self.__resolve_command_identifier(
+        file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
             bottle.request.query.get("file_id"),
             bottle.request.query.get("path_pair_id")
         )
         if error_response:
             return error_response
+
+        guard_response = self.__check_path_safe(guard_name)
+        if guard_response:
+            return guard_response
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.DELETE_REMOTE,
@@ -352,11 +354,15 @@ class ControllerHandler(IHandler):
                 if path_pair_id is not None and (not isinstance(path_pair_id, str) or path_pair_id == ""):
                     return HTTPResponse(body="Bulk command path_pair_id values must be non-empty strings", status=400)
 
-                identifier, error_response = self.__resolve_command_identifier(file_name, file_id, path_pair_id)
+                identifier, guard_name, error_response = self.__resolve_command_identifier(
+                    file_name,
+                    file_id,
+                    path_pair_id
+                )
                 if error_response:
                     return error_response
                 if identifier not in seen_identifiers:
-                    ordered_commands.append((file_name, identifier))
+                    ordered_commands.append((file_name, identifier, guard_name))
                     seen_identifiers.add(identifier)
         elif isinstance(filenames, list) and len(filenames) > 0:
             if len(filenames) > self._MAX_BULK_ITEMS:
@@ -367,11 +373,11 @@ class ControllerHandler(IHandler):
             for file_name in filenames:
                 if not isinstance(file_name, str) or file_name == "":
                     return HTTPResponse(body="Bulk command filenames must be non-empty strings", status=400)
-                identifier, error_response = self.__resolve_command_identifier(file_name)
+                identifier, guard_name, error_response = self.__resolve_command_identifier(file_name)
                 if error_response:
                     return error_response
                 if identifier not in seen_identifiers:
-                    ordered_commands.append((file_name, identifier))
+                    ordered_commands.append((file_name, identifier, guard_name))
                     seen_identifiers.add(identifier)
         else:
             return HTTPResponse(
@@ -385,9 +391,9 @@ class ControllerHandler(IHandler):
         try:
             failures = []
             success_count = 0
-            for display_name, identifier in ordered_commands:
+            for display_name, identifier, guard_name in ordered_commands:
                 if command_action in self._GUARDED_ACTIONS:
-                    guard_response = self.__check_path_safe(display_name)
+                    guard_response = self.__check_path_safe(guard_name)
                     if guard_response:
                         failures.append("'{}': Invalid file path".format(display_name))
                         continue
