@@ -50,8 +50,8 @@ Review state values:
 | `e670f5d436089766732175f907b1fcb993991ddd` `feat(48-02): add startup security warnings with tests` | `reviewed` | `already integrated` | Adapted conservatively in local commit `cd07bfcf`: advisory startup warnings for missing `api_token` plus `0.0.0.0` exposure warning; `webhook_secret` warning is conditional on the field existing in the local runtime config. |
 | `44953995cfe8c58ee3b3c5e470fed53adc773bfd` `docs(48-02): complete webhook payload size cap and startup warnings plan` | `reviewed` | `intentionally skipped` | Planning-only completion doc; tracked via this ledger and local commits. |
 | `20db99f5af5fce18d92f440d147935e80dd4fb72` `docs(phase-48): complete phase execution` | `reviewed` | `intentionally skipped` | Planning-only phase completion doc; tracked via this ledger and local commits. |
-| `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards` | `not yet reviewed` |  |  |
-| `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards` | `not yet reviewed` |  |  |
+| `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards` | `reviewed` | `intentionally skipped` | Planning-only `.planning` research doc; this fork tracks integration intent in the local ledger/tracker workflow. |
+| `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards` | `reviewed` | `intentionally skipped` | Planning-only `.planning` phase plan doc; implementation tracking stays in local integration notes and tracker. |
 | `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests` | `not yet reviewed` |  |  |
 | `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards` | `not yet reviewed` |  |  |
 | `fd33fa151d3ef44d21883894df39486b16981c63` `docs(49-01): complete path traversal guards plan` | `not yet reviewed` |  |  |
@@ -74,10 +74,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards`
+- `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests`
 
 ## Next Candidate Batch
 
-- `e3badf3c2365d72f79dbb628c5c3a2dbbdc580e7` `docs(49): research phase path-traversal-guards`
-- `cbfa789568548fa57fb4a0ef7379692c46bba41e` `docs(49): add research and plan for path traversal guards`
 - `be88511c2ddd5db187cf197d94a04098c81c334c` `test(49-01): add failing path traversal guard tests`
+- `89c7a7c5f569fd2bc6925049eb5d1d957ea1d13f` `feat(49-01): implement realpath-based path traversal guards`
