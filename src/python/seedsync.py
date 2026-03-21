@@ -382,7 +382,8 @@ class Seedsync:
         api_token = getattr(general_config, "api_token", None)
         if Seedsync._is_blank_config_value(api_token):
             logger.warning(
-                "Security: No API token configured. API requests will be accepted without authentication."
+                "Security: general.api_token is not configured. In this build, general.api_token is only stored in "
+                "config and is not enforced by the API. API requests are unauthenticated."
             )
         if web_bind_host == "0.0.0.0":
             if Seedsync._is_blank_config_value(api_token):
