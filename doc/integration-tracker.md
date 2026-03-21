@@ -43,11 +43,11 @@ Refresh rule:
 - Source branch: `thejuran/master`
 - Last fully processed upstream commit: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
 - Fork tip at last full review: `a8561cdc318460de32de082e3cf33f6b6a0093cb`
-- Last full review date: `2026-03-13`
-- Status: caught up through this tip
+- Last full review date: `2026-03-21`
+- Status: refresh needed
 - Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work across docs, CI, packaging, compatibility, security hardening, web/API hardening, files page behavior, SSH/runtime handling, transfers/LFTP, scanning, extraction, controller hardening, dashboard updates, and cleanup safety while leaving explicitly rejected or out-of-direction changes out.
-- Resume when new upstream appears: fetch `thejuran`, diff new commits after `a8561cdc318460de32de082e3cf33f6b6a0093cb`, and evaluate them directly against current local behavior before opening any new integration batch.
-- Notes: treat this commit as the current fully processed checkpoint, not as a claim that every earlier commit was directly integrated verbatim.
+- Resume when new upstream appears: resume the current refresh from `97bb7d0104dbc0bf8c3a96039d0afe259dbbf9f5` after the local persist-permissions batch, then continue oldest-to-newest through the remaining commits after `a8561cdc318460de32de082e3cf33f6b6a0093cb`.
+- Notes: `thejuran/master` is now at `36c13b3f4200971ab8fe08b3212ee5e7ea890a4f` with 44 newer commits beyond the fully processed checkpoint. The first six new commits are `.planning`/research docs that this fork does not currently mirror. Local adaptation of upstream `7f025d78` + `b5afc96c` landed in `f4efff8e` as the persist-permissions hardening batch; next unreviewed code commit is `97bb7d0104dbc0bf8c3a96039d0afe259dbbf9f5`. Treat `a8561cdc318460de32de082e3cf33f6b6a0093cb` as the current fully processed checkpoint, not as a claim that every earlier commit was directly integrated verbatim.
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
