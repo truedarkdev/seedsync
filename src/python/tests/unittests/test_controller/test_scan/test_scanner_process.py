@@ -164,6 +164,27 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIn("recoverable error", warning_message)
         self.assertIn("failed result", warning_message.lower())
 
+    def test_sends_partial_files_on_recoverable_error(self):
+        partial_file = SystemFile("partial", 42, False)
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock()
+        mock_scanner.scan.side_effect = ScannerError(
+            "recoverable error",
+            recoverable=True,
+            files=[partial_file]
+        )
+
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100,
+                                 verbose=False)
+        process.logger = MagicMock()
+
+        process.run_loop()
+        result = process.pop_latest_result()
+        self.assertEqual([partial_file], result.files)
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+
     @timeout_decorator.timeout(10)
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()

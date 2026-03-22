@@ -18,9 +18,13 @@ class ScannerError(AppError):
     Args:
         recoverable: indicates scans can be retried
     """
-    def __init__(self, message: str, recoverable: bool = False):
+    def __init__(self,
+                 message: str,
+                 recoverable: bool = False,
+                 files: Optional[List[SystemFile]] = None):
         super().__init__(message)
         self.recoverable = recoverable
+        self.files = files
 
 
 class IScanner(ABC):
@@ -97,13 +101,14 @@ class ScannerProcess(AppProcess):
             if not e.recoverable:
                 raise
             error_message = str(e)
+            files = e.files if e.files is not None else []
             if error_message != self.__last_recoverable_error_message:
                 self.logger.warning(
                     "Recoverable scanner error; returning failed result: {}".format(error_message)
                 )
                 self.__last_recoverable_error_message = error_message
             result = ScannerResult(timestamp=timestamp_start,
-                                   files=[],
+                                   files=files,
                                    failed=True,
                                    error_message=error_message)
         self.__queue.put(result)

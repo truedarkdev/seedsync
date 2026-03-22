@@ -62,6 +62,7 @@ class MultiPathRemoteScanner(IScanner):
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         all_files = []
+        recoverable_errors = []
         for scanner in self.__scanners:
             try:
                 files = scanner.scan()
@@ -70,9 +71,23 @@ class MultiPathRemoteScanner(IScanner):
                     system_file.path_pair_name = scanner.path_pair_name
                 all_files.extend(files)
             except ScannerError as err:
-                self.logger.warning(
-                    "Failed to scan remote path for pair '{}': {}".format(scanner.path_pair_name, str(err))
+                error_message = "Failed to scan remote path for pair '{}': {}".format(
+                    scanner.path_pair_name,
+                    str(err)
                 )
+                self.logger.warning(error_message)
                 if not err.recoverable:
                     raise
+                partial_files = err.files if err.files is not None else []
+                for system_file in partial_files:
+                    system_file.path_pair_id = scanner.path_pair_id
+                    system_file.path_pair_name = scanner.path_pair_name
+                all_files.extend(partial_files)
+                recoverable_errors.append(error_message)
+        if recoverable_errors:
+            raise ScannerError(
+                "Remote scan completed with recoverable errors: {}".format("; ".join(recoverable_errors)),
+                recoverable=True,
+                files=all_files
+            )
         return all_files

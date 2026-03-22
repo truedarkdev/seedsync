@@ -41,6 +41,20 @@ export class HeaderComponent implements OnInit {
         this._notificationService.hide(notif);
     }
 
+    private __formatRemoteScanError(error: string): string {
+        if (!error) {
+            return "";
+        }
+
+        const aggregatePrefix = /^Remote scan completed with recoverable errors:\s*/i;
+        const pathPrefix = /Failed to scan remote path for pair '(.+?)':\s*/gi;
+        const summary = error
+            .replace(aggregatePrefix, "")
+            .replace(pathPrefix, (_match, pairName) => `${pairName}: `);
+
+        return summary || error;
+    }
+
     ngOnInit() {
         // Set up a subscriber to show server status notifications
         this._serverStatusService.status.subscribe({
@@ -102,7 +116,9 @@ export class HeaderComponent implements OnInit {
                 if (status.server.up && status.controller.latestRemoteScanFailed === true) {
                     // Server up and remote scan failed - show notification if not already shown
                     const level = Notification.Level.WARNING;
-                    const text = Localization.Notification.STATUS_REMOTE_SERVER_ERROR(status.controller.latestRemoteScanError);
+                    const text = Localization.Notification.STATUS_REMOTE_SERVER_ERROR(
+                        this.__formatRemoteScanError(status.controller.latestRemoteScanError)
+                    );
                     if (this._prevRemoteServerErrorNotification != null
                            && this._prevRemoteServerErrorNotification.text !== text) {
                         // Text changed, hide old notification

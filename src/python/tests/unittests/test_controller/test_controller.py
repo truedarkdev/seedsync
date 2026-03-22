@@ -58,6 +58,31 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.set_lftp_statuses.assert_not_called()
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
 
+    def test_update_model_sets_remote_scan_failure_status_from_partial_result(self):
+        partial_file = ModelFile("partial", False)
+        latest_remote_scan = SimpleNamespace(
+            timestamp=object(),
+            files=[partial_file],
+            failed=True,
+            error_message="Failed to scan remote path for pair 'TV': temporary remote failure"
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = latest_remote_scan
+        self.controller._Controller__context.status.controller = SimpleNamespace(
+            latest_remote_scan_time=None,
+            latest_remote_scan_failed=None,
+            latest_remote_scan_error=None
+        )
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_remote_files.assert_called_once_with([partial_file])
+        self.assertIs(latest_remote_scan.timestamp, self.controller._Controller__context.status.controller.latest_remote_scan_time)
+        self.assertTrue(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
+        self.assertEqual(
+            "Failed to scan remote path for pair 'TV': temporary remote failure",
+            self.controller._Controller__context.status.controller.latest_remote_scan_error
+        )
+
     def test_get_model_files_uses_file_ids_when_available(self):
         file_movies = ModelFile("dup", False)
         file_movies.path_pair_id = "movies"
