@@ -7,15 +7,6 @@ This note records the meaningful cross-cutting UX/workflow candidates reviewed f
 
 ## thejuran
 
-- Candidate: dashboard filename width guard
-  - Value: accessibility / readability / clarity improvement
-  - Faithfulness: A
-  - Scope: local
-  - Gateability: cleanly isolatable
-  - Action: default
-  - Maintainer input: no
-  - Rationale: prevents the filename column from collapsing on medium-width dashboards without changing the dashboard model, information density, or SeedSync visual identity.
-
 - Candidate: terminal presentation suite
   - Source: `ef728cc2`, `6865ea03`, `29e7d5d0`, `42d75b03`, `0bdeef59`, `b7fdff1a`, `d8570982`, `12a05c86`
   - Value: mostly taste / style / flavor
@@ -46,16 +37,6 @@ This note records the meaningful cross-cutting UX/workflow candidates reviewed f
   - Maintainer input: no
   - Rationale: these changes restyle the dashboard into the terminal suite rather than improving the original SeedSync presentation.
 
-- Candidate: confirm modal replacement and hardening
-  - Source: `9365743d`, `31889adf`, `52b72a6c`
-  - Value: correctness / bug fix
-  - Faithfulness: B
-  - Scope: sectional
-  - Gateability: somewhat messy
-  - Action: adapt
-  - Maintainer input: no
-  - Rationale: the underlying focus-trap and focus-restoration concerns are valid, but thejuran solves them by replacing the current modal stack with a custom service. Subject 21 adapts only the missing accessibility behavior onto the existing `ngx-modialog` path through a local helper, without importing the custom service or the z-index/XSS-specific implementation details.
-
 ## rapidcopy
 
 - Candidate: theme toggle and light/dark theme system
@@ -67,26 +48,6 @@ This note records the meaningful cross-cutting UX/workflow candidates reviewed f
   - Action: maintainer decision needed before optional/adapt/reject is finalized
   - Maintainer input: yes
   - Rationale: unlike thejuran's terminal suite, this is a more conventional optional theme system, but it still creates a new global settings model and sets precedent for configurable product identity. It should not be added without explicit maintainer approval.
-
-- Candidate: dashboard pagination, sorting, bulk selection, and status counts
-  - Source: `ee0718ab`, `f1fc34ca`, `ea4ae40f`, `821c730b`, `c630cf5c`
-  - Value: useful enhancement
-  - Faithfulness: A
-  - Scope: sectional
-  - Gateability: cleanly isolatable
-  - Action: covered elsewhere
-  - Maintainer input: no
-  - Rationale: these dashboard workflow improvements are already present locally and do not need further Subject 21 action.
-
-- Candidate: logs live-view safety and default filtering
-  - Source: `d4e4b7e0`
-  - Value: accessibility / readability / clarity improvement
-  - Faithfulness: A
-  - Scope: local
-  - Gateability: cleanly isolatable
-  - Action: covered elsewhere
-  - Maintainer input: no
-  - Rationale: current master already caps live log DOM growth. The remaining rapidcopy behavior assumes a search/filter model that current master does not carry, so there is no standalone Subject 21 import to land here.
 
 - Candidate: rebrand assets and RapidCopy naming
   - Source: `08d714e6`, `6d59994d`
