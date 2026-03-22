@@ -1,5 +1,7 @@
-import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
+import {ChangeDetectionStrategy, Component} from "@angular/core";
+import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
+import {By} from "@angular/platform-browser";
 import {Observable} from "rxjs/Observable";
 import {BehaviorSubject} from "rxjs/Rx";
 import "rxjs/add/observable/of";
@@ -101,10 +103,17 @@ class MockModalAccessibilityService {
     enhance = jasmine.createSpy("enhance").and.callFake((dialogRefPromise: Promise<any>) => dialogRefPromise);
 }
 
+@Component({
+    changeDetection: ChangeDetectionStrategy.OnPush,
+    template: "<app-path-pairs></app-path-pairs>"
+})
+class PathPairsHostComponent {
+}
+
 
 describe("Testing path pairs component", () => {
     let component: PathPairsComponent;
-    let fixture: ComponentFixture<PathPairsComponent>;
+    let fixture: ComponentFixture<PathPairsHostComponent>;
     let pathPairService: MockPathPairService;
     let notificationService: MockNotificationService;
     let modal: MockModal;
@@ -113,6 +122,7 @@ describe("Testing path pairs component", () => {
     beforeEach(() => {
         TestBed.configureTestingModule({
             declarations: [
+                PathPairsHostComponent,
                 PathPairsComponent
             ],
             imports: [
@@ -126,13 +136,14 @@ describe("Testing path pairs component", () => {
             ]
         });
 
-        fixture = TestBed.createComponent(PathPairsComponent);
-        component = fixture.componentInstance;
+        fixture = TestBed.createComponent(PathPairsHostComponent);
         pathPairService = TestBed.get(PathPairService);
         notificationService = TestBed.get(NotificationService);
         modal = TestBed.get(Modal);
         modalAccessibilityService = TestBed.get(ModalAccessibilityService);
         fixture.detectChanges();
+        fixture.autoDetectChanges(true);
+        component = fixture.debugElement.query(By.directive(PathPairsComponent)).componentInstance;
     });
 
     it("should create an instance", () => {
@@ -197,6 +208,31 @@ describe("Testing path pairs component", () => {
 
         expect(pathPairService.reorder).toHaveBeenCalledWith(["tv", "movies"]);
     });
+
+    it("should replace the empty state when path pairs refresh", fakeAsync(() => {
+        expect(fixture.nativeElement.querySelector(".empty-state")).not.toBeNull();
+        expect(fixture.nativeElement.querySelectorAll(".path-pair-item").length).toBe(0);
+
+        setTimeout(() => {
+            pathPairService.push([
+                {
+                    id: "movies",
+                    name: "Movies",
+                    remote_path: "/remote/movies",
+                    local_path: "/downloads/movies",
+                    enabled: true,
+                    auto_queue: true
+                }
+            ]);
+        });
+
+        tick();
+
+        expect(fixture.nativeElement.querySelector(".empty-state")).toBeNull();
+        const items = fixture.nativeElement.querySelectorAll(".path-pair-item");
+        expect(items.length).toBe(1);
+        expect(items[0].querySelector(".pair-name").textContent.trim()).toBe("Movies");
+    }));
 
     it("should delete a path pair after confirmation", fakeAsync(() => {
         modal.shouldConfirm = true;
