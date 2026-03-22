@@ -27,8 +27,8 @@ Review state values:
 
 | Upstream commit | Review state | Disposition | Notes |
 | --- | --- | --- | --- |
-| `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests` | `not yet reviewed` |  |  |
-| `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script` | `not yet reviewed` |  | Local commit `caa3ebb8` already updates the same caller for batch coherence, so this commit may disposition as `covered elsewhere` when reviewed in order. |
+| `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests` | `reviewed` | `already integrated` | Local integration now waits for extracted files to exist and be non-empty before asserting. |
+| `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script` | `reviewed` | `covered elsewhere` | Local commit `caa3ebb8` already updates the same restart caller, so the upstream hunk is already represented here. |
 | `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps` | `not yet reviewed` |  |  |
 | `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config` | `not yet reviewed` |  |  |
 | `4090a2aea9ce7acc4cbf02663a003dff860cb9e9` `ci: ignore TypeScript and zone.js minor+ bumps in dependabot` | `not yet reviewed` |  |  |
@@ -43,9 +43,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests`
+- `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps`
 
 ## Next Candidate Batch
 
-- `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests`
-- `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script`
+- `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps`
+- `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config`
