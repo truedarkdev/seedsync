@@ -85,6 +85,12 @@ class TestWebApp(BaseTestWebApp):
             response.headers["Content-Security-Policy"]
         )
 
+    def test_index_html_is_served_directly(self):
+        response = self.test_app.get("/index.html")
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("<html></html>", response.text)
+
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):
             def __init__(self, values):

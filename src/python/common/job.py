@@ -24,6 +24,7 @@ class Job(threading.Thread, ABC):
         # The shutdown_flag is a threading.Event object that
         # indicates whether the thread should be terminated.
         self.shutdown_flag = threading.Event()
+        self.__setup_complete = threading.Event()
 
         # For exception propagation
         self.exc_info = None
@@ -34,8 +35,18 @@ class Job(threading.Thread, ABC):
 
         # ... Setup code here ...
         self.logger.debug("Calling setup for {}".format(self.name))
-        self.setup()
-        self.logger.debug("Finished setup for {}".format(self.name))
+        setup_completed = False
+        try:
+            self.setup()
+            setup_completed = True
+        except Exception:
+            self.exc_info = sys.exc_info()
+            self.logger.exception("Caught exception in job {}".format(self.name))
+            self.shutdown_flag.set()
+        finally:
+            self.__setup_complete.set()
+            if setup_completed:
+                self.logger.debug("Finished setup for {}".format(self.name))
 
         while not self.shutdown_flag.is_set():
             # ... Job code here ...
@@ -64,6 +75,21 @@ class Job(threading.Thread, ABC):
         :return:
         """
         self.shutdown_flag.set()
+
+    def wait_until_setup_complete(self, timeout: float = None) -> bool:
+        """
+        Wait for the job setup phase to finish.
+        :param timeout:
+        :return:
+        """
+        return self.__setup_complete.wait(timeout=timeout)
+
+    def is_setup_complete(self) -> bool:
+        """
+        Check whether the job setup phase has completed.
+        :return:
+        """
+        return self.__setup_complete.is_set()
 
     def propagate_exception(self):
         """
