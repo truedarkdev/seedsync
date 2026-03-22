@@ -2,11 +2,12 @@
 
 import logging
 import multiprocessing
+import os
 import queue
 from typing import Dict, List, Optional, Tuple
 
 from .scanner_process import IScanner
-from common import overrides
+from common import overrides, Constants
 from system import SystemFile, SystemScanner, SystemScannerError
 
 
@@ -15,12 +16,16 @@ class MultiPathActiveScanner(IScanner):
     Scanner that routes active file scans to the correct local root.
     """
 
-    def __init__(self, path_pair_paths: Dict[str, str]):
+    def __init__(self, path_pair_paths: Dict[str, str], use_temp_file: bool = False):
         self.logger = logging.getLogger("MultiPathActiveScanner")
+        self.__use_temp_file = use_temp_file
         self.__scanners = {
             path_pair_id: SystemScanner(local_path)
             for path_pair_id, local_path in path_pair_paths.items()
         }
+        if use_temp_file:
+            for scanner in self.__scanners.values():
+                scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__active_files_queue = multiprocessing.Queue()
         self.__active_files: List[Tuple[str, Optional[str], Optional[str]]] = []
 
@@ -60,5 +65,17 @@ class MultiPathActiveScanner(IScanner):
                 system_file.path_pair_name = path_pair_name
                 results.append(system_file)
             except SystemScannerError as ex:
+                if self.__is_status_only_partial(scanner, file_name):
+                    continue
                 self.logger.warning(str(ex))
         return results
+
+    def __is_status_only_partial(self, scanner: SystemScanner, file_name: str) -> bool:
+        if not self.__use_temp_file:
+            return False
+
+        base_path = os.path.join(scanner.path_to_scan, file_name)
+        temp_path = base_path + Constants.LFTP_TEMP_FILE_SUFFIX
+        if os.path.exists(base_path) or os.path.exists(temp_path):
+            return False
+        return os.path.isfile(temp_path + ".lftp-pget-status")
