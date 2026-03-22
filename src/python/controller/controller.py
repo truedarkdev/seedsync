@@ -164,7 +164,7 @@ class Controller:
                 self.__path_pair_staging_paths[pair.id] = pair_staging_path
             self.__active_scanner = MultiPathActiveScanner({
                 pair.id: self.__path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
-            })
+            }, use_temp_file=self.__context.config.lftp.use_temp_file)
             self.__local_scanner = MultiPathLocalScanner([
                 LocalScanner(
                     local_path=pair.local_path,
@@ -188,7 +188,10 @@ class Controller:
                 ) for pair in enabled_path_pairs
             ])
         else:
-            self.__active_scanner = ActiveScanner(self.__staging_path)
+            self.__active_scanner = ActiveScanner(
+                self.__staging_path,
+                use_temp_file=self.__context.config.lftp.use_temp_file
+            )
             self.__local_scanner = LocalScanner(
                 local_path=self.__context.config.lftp.local_path,
                 use_temp_file=self.__context.config.lftp.use_temp_file,
