@@ -314,7 +314,7 @@ make run-remote-server
 make stop-remote-server
 ```
 
-By default, the service mounts the checked-in fixture directory from
+By default, the service mounts the repo-root-relative directory
 `build/docker-local/remote-files` into `/home/remoteuser/files`. That keeps the
 manual helper files alongside the local SeedSync Docker setup while leaving the
 checked-in e2e fixture data untouched.
@@ -327,7 +327,8 @@ SEEDSYNC_REMOTE_FILES_DIR=/path/to/local/files make run-remote-server
 ```
 
 If you want to use the default without an override, drop the files you want the
-SSH test server to expose into `build/docker-local/remote-files`.
+SSH test server to expose into `build/docker-local/remote-files` at the repo
+root.
 
 The connection parameters for the remote server are:
 
