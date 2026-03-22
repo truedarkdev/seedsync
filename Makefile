@@ -244,6 +244,7 @@ run-tests-e2e: tests-e2e-deps
 run-remote-server:
 	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
 		$(DOCKER_COMPOSE) \
+		--project-directory ${ROOTDIR} \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
 		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		up -d --build remote
@@ -251,6 +252,7 @@ run-remote-server:
 stop-remote-server:
 	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
 		$(DOCKER_COMPOSE) \
+		--project-directory ${ROOTDIR} \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
 		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		stop remote
