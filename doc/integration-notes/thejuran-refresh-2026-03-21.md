@@ -36,16 +36,15 @@ Review state values:
 | `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 — Angular 21 Migration` | `reviewed` | `intentionally skipped` | The `.gsd` planning scaffold does not exist locally and is not a direct integration target. |
 | `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 → 21 with full dependency refresh (M001)` | `reviewed` | `needs new integration task` | The Angular 19→21 migration cluster is structurally incompatible with the current Angular 4 module/bootstrap stack and belongs in a separate migration task. |
 | `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `fix: move provideZoneChangeDetection into appConfig, clean empty imports` | `reviewed` | `needs subject reopen` | It only becomes meaningful if that broader migration subject is reopened. |
-| `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration` | `not yet reviewed` |  |  |
-| `ab74f8c53d9daf1e765315808bf995a6ea01974a` `fix: resolve undici CVE via npm override, revert strictTemplates` | `not yet reviewed` |  |  |
-| `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1` `fix(ci): migrate to application builder to fix Karma test hang in Docker` | `not yet reviewed` |  |  |
-| `36c13b3f0acf5b9f0df738cd9964a44f31885771` `fix(e2e): add change detection waits after clicks for esbuild builder` | `not yet reviewed` |  |  |
+| `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration` | `reviewed` | `needs subject reopen` | Tightly coupled to the Angular 21 migration state and only becomes relevant if that subject is reopened. |
+| `ab74f8c53d9daf1e765315808bf995a6ea01974a` `fix: resolve undici CVE via npm override, revert strictTemplates` | `reviewed` | `intentionally skipped` | The npm override/template-typing tweak belongs to a modernized frontend dependency graph, not the current Angular 4 stack. |
+| `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1` `fix(ci): migrate to application builder to fix Karma test hang in Docker` | `reviewed` | `intentionally skipped` | The application-builder/toolchain migration is incompatible with the current legacy Angular 4 build layout. |
+| `36c13b3f0acf5b9f0df738cd9964a44f31885771` `fix(e2e): add change detection waits after clicks for esbuild builder` | `reviewed` | `intentionally skipped` | The Playwright/esbuild stabilization does not map directly onto the current protractor-based e2e setup. |
 
 ## Next Unresolved Commit
 
-- `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration`
+- none; the frozen thejuran review range is fully processed through `36c13b3f0acf5b9f0df738cd9964a44f31885771`
 
 ## Next Candidate Batch
 
-- `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration`
-- `ab74f8c53d9daf1e765315808bf995a6ea01974a` `fix: resolve undici CVE via npm override, revert strictTemplates`
+- none; resume with the next upstream commits only if `thejuran/master` advances beyond `36c13b3f0acf5b9f0df738cd9964a44f31885771`
