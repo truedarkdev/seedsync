@@ -5,6 +5,7 @@ from typing import List, Callable
 from threading import Lock
 from queue import Queue
 from enum import Enum
+from datetime import datetime
 import copy
 import os
 import shutil
@@ -851,10 +852,22 @@ class Controller:
             self.logger.warning("Caught lftp error: {}".format(str(e)))
         self.__active_scan_process.propagate_exception()
         self.__local_scan_process.propagate_exception()
-        self.__remote_scan_process.propagate_exception()
+        try:
+            self.__remote_scan_process.propagate_exception()
+        except Exception as error:
+            self.__record_first_remote_scan_failure(str(error))
+            raise
         self.__mp_logger.propagate_exception()
         self.__extract_process.propagate_exception()
         self.__validate_process.propagate_exception()
+
+    def __record_first_remote_scan_failure(self, error_message: str):
+        if self.__context.status.controller.latest_remote_scan_time is not None:
+            return
+
+        self.__context.status.controller.latest_remote_scan_time = datetime.now()
+        self.__context.status.controller.latest_remote_scan_failed = True
+        self.__context.status.controller.latest_remote_scan_error = error_message
 
     def __cleanup_commands(self):
         """
