@@ -4,6 +4,7 @@ import unittest
 import multiprocessing
 import logging
 import sys
+import time
 from unittest.mock import MagicMock
 
 import timeout_decorator
@@ -148,17 +149,71 @@ class TestScannerProcess(unittest.TestCase):
         mock_scanner.scan = MagicMock()
         mock_scanner.scan.side_effect = ScannerError("recoverable error", recoverable=True)
 
-        self.process = ScannerProcess(scanner=mock_scanner,
-                                      interval_in_ms=100)
-        self.process.start()
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100,
+                                 verbose=False)
+        process.logger = MagicMock()
 
-        while True:
-            result = self.process.pop_latest_result()
-            if result:
-                break
+        process.run_loop()
+        result = process.pop_latest_result()
         self.assertEqual(0, len(result.files))
         self.assertTrue(result.failed)
         self.assertEqual("recoverable error", result.error_message)
+        process.logger.warning.assert_called_once()
+        warning_message = process.logger.warning.call_args[0][0]
+        self.assertIn("recoverable error", warning_message)
+        self.assertIn("failed result", warning_message.lower())
+
+    @timeout_decorator.timeout(10)
+    def test_recoverable_error_warning_resets_after_success(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock()
+        mock_scanner.scan.side_effect = [
+            ScannerError("recoverable error", recoverable=True),
+            ScannerError("recoverable error", recoverable=True),
+            [],
+            ScannerError("recoverable error", recoverable=True),
+        ]
+
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=0,
+                                 verbose=False)
+        process.logger = MagicMock()
+
+        def _pop_result():
+            result = None
+            for _ in range(100):
+                result = process.pop_latest_result()
+                if result is not None:
+                    return result
+                time.sleep(0.01)
+            return result
+
+        process.run_loop()
+        result = _pop_result()
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual(1, process.logger.warning.call_count)
+
+        process.run_loop()
+        result = _pop_result()
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual(1, process.logger.warning.call_count)
+
+        process.run_loop()
+        result = _pop_result()
+        self.assertFalse(result.failed)
+        self.assertEqual([], result.files)
+        self.assertEqual(1, process.logger.warning.call_count)
+
+        process.run_loop()
+        result = _pop_result()
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual(2, process.logger.warning.call_count)
+        self.assertIn("recoverable error", process.logger.warning.call_args_list[0][0][0])
+        self.assertIn("recoverable error", process.logger.warning.call_args_list[1][0][0])
 
     @timeout_decorator.timeout(10)
     def test_sends_fatal_exception_on_nonrecoverable_error(self):

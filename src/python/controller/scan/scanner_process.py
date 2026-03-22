@@ -70,6 +70,7 @@ class ScannerProcess(AppProcess):
         self.__wake_event = multiprocessing.Event()
         self.__scanner = scanner
         self.__interval_in_ms = interval_in_ms
+        self.__last_recoverable_error_message = None
         self.verbose = verbose
 
     @overrides(AppProcess)
@@ -88,16 +89,23 @@ class ScannerProcess(AppProcess):
             self.logger.debug("Running a scan")
         try:
             files = self.__scanner.scan()
+            self.__last_recoverable_error_message = None
             result = ScannerResult(timestamp=timestamp_start,
                                    files=files)
         except ScannerError as e:
             # Non-recoverable errors continue up as a fatal error
             if not e.recoverable:
                 raise
+            error_message = str(e)
+            if error_message != self.__last_recoverable_error_message:
+                self.logger.warning(
+                    "Recoverable scanner error; returning failed result: {}".format(error_message)
+                )
+                self.__last_recoverable_error_message = error_message
             result = ScannerResult(timestamp=timestamp_start,
                                    files=[],
                                    failed=True,
-                                   error_message=str(e))
+                                   error_message=error_message)
         self.__queue.put(result)
         delta_in_s = (datetime.now() - timestamp_start).total_seconds()
         delta_in_ms = int(delta_in_s * 1000)

@@ -148,6 +148,9 @@ class TestController(unittest.TestCase):
         self.assertIsNotNone(self.controller._Controller__context.status.controller.latest_remote_scan_time)
         self.assertTrue(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
         self.assertEqual("remote failed", self.controller._Controller__context.status.controller.latest_remote_scan_error)
+        self.controller.logger.warning.assert_called_once_with(
+            "Fatal remote scan failure recorded: remote failed"
+        )
         self.controller._Controller__active_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__local_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__mp_logger.propagate_exception.assert_not_called()
@@ -169,27 +172,39 @@ class TestController(unittest.TestCase):
         self.assertIsNotNone(self.controller._Controller__context.status.controller.latest_remote_scan_time)
         self.assertTrue(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
         self.assertEqual("missing scanfs", self.controller._Controller__context.status.controller.latest_remote_scan_error)
+        self.controller.logger.warning.assert_called_once_with(
+            "Fatal remote scan failure recorded: missing scanfs"
+        )
         self.controller._Controller__active_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__local_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__mp_logger.propagate_exception.assert_not_called()
         self.controller._Controller__extract_process.propagate_exception.assert_not_called()
         self.controller._Controller__validate_process.propagate_exception.assert_not_called()
 
-    def test_propagate_exceptions_preserves_existing_remote_scan_status(self):
+    def test_propagate_exceptions_records_fatal_remote_failure_after_prior_recoverable_status(self):
         existing_time = object()
         self.controller._Controller__context.status.controller = SimpleNamespace(
             latest_remote_scan_time=existing_time,
-            latest_remote_scan_failed=False,
-            latest_remote_scan_error=None
+            latest_remote_scan_failed=True,
+            latest_remote_scan_error="fatal remote error"
         )
-        self.controller._Controller__remote_scan_process.propagate_exception.side_effect = AppError("remote failed")
+        self.controller._Controller__remote_scan_process.propagate_exception.side_effect = FileNotFoundError("fatal remote error")
 
-        with self.assertRaises(AppError):
+        with self.assertRaises(FileNotFoundError) as ctx:
             self.controller._Controller__propagate_exceptions()
 
-        self.assertIs(existing_time, self.controller._Controller__context.status.controller.latest_remote_scan_time)
-        self.assertFalse(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
-        self.assertIsNone(self.controller._Controller__context.status.controller.latest_remote_scan_error)
+        self.assertEqual("fatal remote error", str(ctx.exception))
+        self.assertIsNot(existing_time, self.controller._Controller__context.status.controller.latest_remote_scan_time)
+        self.assertTrue(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
+        self.assertEqual("fatal remote error", self.controller._Controller__context.status.controller.latest_remote_scan_error)
+        self.controller.logger.warning.assert_called_once_with(
+            "Fatal remote scan failure recorded: fatal remote error"
+        )
+        self.controller._Controller__active_scan_process.propagate_exception.assert_called_once_with()
+        self.controller._Controller__local_scan_process.propagate_exception.assert_called_once_with()
+        self.controller._Controller__mp_logger.propagate_exception.assert_not_called()
+        self.controller._Controller__extract_process.propagate_exception.assert_not_called()
+        self.controller._Controller__validate_process.propagate_exception.assert_not_called()
 
     def test_update_model_sets_multi_path_active_scan_entries(self):
         self.controller._Controller__active_scanner = MultiPathActiveScanner({})

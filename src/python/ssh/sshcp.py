@@ -41,6 +41,21 @@ class Sshcp:
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild(self.__class__.__name__)
 
+    def __describe_target(self) -> str:
+        return "host={}, user={}, port={}".format(self.__host, self.__user, self.__port)
+
+    def __log_timeout(self, phase: str, command: str, sp, start_time: float):
+        elapsed = time.time() - start_time
+        self.logger.exception(
+            "Timed out during {} after {:.3f}s (command={}, {})".format(
+                phase,
+                elapsed,
+                command,
+                self.__describe_target()
+            )
+        )
+        self.logger.error("Command output before:\n{}".format(sp.before))
+
     def __run_command(self,
                       command: str,
                       flags: list,
@@ -71,7 +86,9 @@ class Sshcp:
         start_time = time.time()
         sp = pexpect.spawn(command_args[0], command_args[1:])
         try:
+            timeout_phase = "command execution"
             if self.__password is not None:
+                timeout_phase = "password prompt"
                 i = sp.expect([
                     r'(?i)password:\s*',  # i=0, all's good
                     pexpect.EOF,  # i=1, unknown error
@@ -83,7 +100,7 @@ class Sshcp:
                     'Connection timed out',  # i=7, connection timeout
                     'REMOTE HOST IDENTIFICATION HAS CHANGED',  # i=8, possible MITM
                     'Permission denied',  # i=9, auth rejected before/at prompt
-                ])
+                ], timeout=self.__TIMEOUT_SECS)
                 if i > 0:
                     before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
                     after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
@@ -107,6 +124,7 @@ class Sshcp:
                 elif i == 9:
                     raise SshcpError("Incorrect password")
                 sp.sendline(self.__password)
+                timeout_phase = "command execution"
 
             i = sp.expect(
                 [
@@ -144,8 +162,7 @@ class Sshcp:
                 raise SshcpError("Incorrect password")
 
         except pexpect.exceptions.TIMEOUT:
-            self.logger.exception("Timed out")
-            self.logger.error("Command output before:\n{}".format(sp.before))
+            self.__log_timeout(timeout_phase, command, sp, start_time)
             raise SshcpError("Timed out")
         sp.close()
         end_time = time.time()

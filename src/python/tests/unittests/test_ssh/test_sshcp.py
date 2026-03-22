@@ -7,7 +7,9 @@ import shutil
 import filecmp
 import logging
 import sys
+from unittest.mock import MagicMock, patch
 
+import pexpect
 import timeout_decorator
 from parameterized import parameterized
 
@@ -179,6 +181,39 @@ class TestSshcp(unittest.TestCase):
         with self.assertRaises(SshcpError) as ctx:
             sshcp.shell("cd {}; pwd".format(self.local_dir))
         self.assertEqual("Incorrect password", str(ctx.exception))
+
+    @timeout_decorator.timeout(5)
+    def test_shell_timeout_logs_password_prompt_context(self):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
+        sshcp.logger = MagicMock()
+
+        spawn = MagicMock()
+        spawn.expect.side_effect = pexpect.exceptions.TIMEOUT("timed out")
+        spawn.before = b"waiting for password"
+
+        with patch("ssh.sshcp.pexpect.spawn", return_value=spawn), \
+                patch("ssh.sshcp.time.time", side_effect=[100.0, 103.25]):
+            with self.assertRaises(SshcpError) as ctx:
+                sshcp.shell("cd {}; pwd".format(self.local_dir))
+
+        self.assertEqual("Timed out", str(ctx.exception))
+        self.assertEqual(1, spawn.expect.call_count)
+        self.assertEqual(
+            sshcp._Sshcp__TIMEOUT_SECS,
+            spawn.expect.call_args.kwargs["timeout"]
+        )
+
+        sshcp.logger.exception.assert_called_once()
+        timeout_message = sshcp.logger.exception.call_args[0][0]
+        self.assertIn("password prompt", timeout_message)
+        self.assertIn("command=ssh", timeout_message)
+        self.assertIn("host={}".format(self.host), timeout_message)
+        self.assertIn("user={}".format(self.user), timeout_message)
+        self.assertIn("port={}".format(self.port), timeout_message)
+        self.assertIn("3.250", timeout_message)
+        sshcp.logger.error.assert_called_once_with(
+            "Command output before:\n{}".format(spawn.before)
+        )
 
     @parameterized.expand(_PARAMS)
     @timeout_decorator.timeout(5)

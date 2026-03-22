@@ -862,9 +862,7 @@ class Controller:
         self.__validate_process.propagate_exception()
 
     def __record_first_remote_scan_failure(self, error_message: str):
-        if self.__context.status.controller.latest_remote_scan_time is not None:
-            return
-
+        self.logger.warning("Fatal remote scan failure recorded: {}".format(error_message))
         self.__context.status.controller.latest_remote_scan_time = datetime.now()
         self.__context.status.controller.latest_remote_scan_failed = True
         self.__context.status.controller.latest_remote_scan_error = error_message
