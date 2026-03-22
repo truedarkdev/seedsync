@@ -242,12 +242,16 @@ run-tests-e2e: tests-e2e-deps
 	fi
 
 run-remote-server:
-	$(DOCKER) container rm -f seedsync_test_e2e_remote-dev
-	$(DOCKER) run \
-		-it --init \
-		-p 1234:1234 \
-		--name seedsync_test_e2e_remote-dev \
-		seedsync/test/e2e/remote
+	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
+		$(DOCKER_COMPOSE) \
+		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		up -d --build remote
+
+stop-remote-server:
+	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
+		$(DOCKER_COMPOSE) \
+		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		stop remote
 
 coverage-python:
 	cd ${SOURCEDIR}/python && poetry run pytest --cov --cov-report=term-missing --cov-report=html
