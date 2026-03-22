@@ -37,6 +37,16 @@ This note records the meaningful cross-cutting UX/workflow candidates reviewed f
   - Maintainer input: no
   - Rationale: these changes restyle the dashboard into the terminal suite rather than improving the original SeedSync presentation.
 
+- Candidate: confirm modal replacement and hardening
+  - Source: `9365743d`, `31889adf`, `52b72a6c`
+  - Value: correctness / bug fix
+  - Faithfulness: B
+  - Scope: sectional
+  - Gateability: somewhat messy
+  - Action: adapt follow-up remains
+  - Maintainer input: no
+  - Rationale: most of the modal hardening was adapted locally through `modal.confirm()` paths and `modal-accessibility.service.ts`, but `path-pairs.component.ts` still uses native `confirm(...)` for pair deletion, so this Subject 21 item is not fully closed yet.
+
 ## rapidcopy
 
 - Candidate: theme toggle and light/dark theme system
