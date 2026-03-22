@@ -43,9 +43,9 @@ This note records the meaningful cross-cutting UX/workflow candidates reviewed f
   - Faithfulness: B
   - Scope: sectional
   - Gateability: somewhat messy
-  - Action: adapt follow-up remains
+  - Action: integrated locally
   - Maintainer input: no
-  - Rationale: most of the modal hardening was adapted locally through `modal.confirm()` paths and `modal-accessibility.service.ts`, but `path-pairs.component.ts` still uses native `confirm(...)` for pair deletion, so this Subject 21 item is not fully closed yet.
+  - Rationale: the remaining native `confirm(...)` path for path-pair deletion now uses the same builder-style `modal.confirm()` and `ModalAccessibilityService` hardening as the other destructive actions, so this follow-up is closed.
 
 ## rapidcopy
 

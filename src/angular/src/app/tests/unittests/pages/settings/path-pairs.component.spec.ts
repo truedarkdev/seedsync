@@ -1,9 +1,10 @@
-import {ComponentFixture, TestBed} from "@angular/core/testing";
+import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
 import {Observable} from "rxjs/Observable";
 import {BehaviorSubject} from "rxjs/Rx";
 import "rxjs/add/observable/of";
 import "rxjs/add/observable/throw";
+import {Modal} from "ngx-modialog/plugins/bootstrap";
 
 import {PathPairsComponent} from "../../../../pages/settings/path-pairs.component";
 import {
@@ -12,6 +13,7 @@ import {
 } from "../../../../services/settings/path-pair.service";
 import {NotificationService} from "../../../../services/utils/notification.service";
 import {Notification} from "../../../../services/utils/notification";
+import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
 
 
 class MockPathPairService {
@@ -55,12 +57,58 @@ class MockNotificationService {
     show = jasmine.createSpy("show");
 }
 
+class MockDialogResult {
+    constructor(private shouldConfirm: boolean) {}
+
+    then(resolve: Function, reject: Function) {
+        if (this.shouldConfirm) {
+            resolve();
+        } else if (reject != null) {
+            reject();
+        }
+
+        return this;
+    }
+}
+
+class MockDialogBuilder {
+    constructor(private shouldConfirm: boolean) {}
+
+    title() { return this; }
+    okBtn() { return this; }
+    okBtnClass() { return this; }
+    cancelBtn() { return this; }
+    cancelBtnClass() { return this; }
+    isBlocking() { return this; }
+    showClose() { return this; }
+    body() { return this; }
+    open() {
+        return Promise.resolve({
+            result: new MockDialogResult(this.shouldConfirm)
+        });
+    }
+}
+
+class MockModal {
+    public shouldConfirm = true;
+
+    confirm() {
+        return new MockDialogBuilder(this.shouldConfirm);
+    }
+}
+
+class MockModalAccessibilityService {
+    enhance = jasmine.createSpy("enhance").and.callFake((dialogRefPromise: Promise<any>) => dialogRefPromise);
+}
+
 
 describe("Testing path pairs component", () => {
     let component: PathPairsComponent;
     let fixture: ComponentFixture<PathPairsComponent>;
     let pathPairService: MockPathPairService;
     let notificationService: MockNotificationService;
+    let modal: MockModal;
+    let modalAccessibilityService: MockModalAccessibilityService;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -72,7 +120,9 @@ describe("Testing path pairs component", () => {
             ],
             providers: [
                 {provide: PathPairService, useClass: MockPathPairService},
-                {provide: NotificationService, useClass: MockNotificationService}
+                {provide: NotificationService, useClass: MockNotificationService},
+                {provide: Modal, useClass: MockModal},
+                {provide: ModalAccessibilityService, useClass: MockModalAccessibilityService}
             ]
         });
 
@@ -80,6 +130,8 @@ describe("Testing path pairs component", () => {
         component = fixture.componentInstance;
         pathPairService = TestBed.get(PathPairService);
         notificationService = TestBed.get(NotificationService);
+        modal = TestBed.get(Modal);
+        modalAccessibilityService = TestBed.get(ModalAccessibilityService);
         fixture.detectChanges();
     });
 
@@ -146,8 +198,8 @@ describe("Testing path pairs component", () => {
         expect(pathPairService.reorder).toHaveBeenCalledWith(["tv", "movies"]);
     });
 
-    it("should delete a path pair after confirmation", () => {
-        spyOn(window, "confirm").and.returnValue(true);
+    it("should delete a path pair after confirmation", fakeAsync(() => {
+        modal.shouldConfirm = true;
 
         component.delete({
             id: "movies",
@@ -158,11 +210,14 @@ describe("Testing path pairs component", () => {
             auto_queue: true
         });
 
+        flushMicrotasks();
+
+        expect(modalAccessibilityService.enhance).toHaveBeenCalled();
         expect(pathPairService.delete).toHaveBeenCalledWith("movies");
-    });
+    }));
 
-    it("should not delete a path pair when confirmation is cancelled", () => {
-        spyOn(window, "confirm").and.returnValue(false);
+    it("should not delete a path pair when confirmation is cancelled", fakeAsync(() => {
+        modal.shouldConfirm = false;
 
         component.delete({
             id: "movies",
@@ -172,7 +227,9 @@ describe("Testing path pairs component", () => {
             enabled: true,
             auto_queue: true
         });
+
+        flushMicrotasks();
 
         expect(pathPairService.delete).not.toHaveBeenCalled();
-    });
+    }));
 });

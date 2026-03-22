@@ -1,6 +1,7 @@
 import {Component, OnDestroy, OnInit} from "@angular/core";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
+import {Modal} from "ngx-modialog/plugins/bootstrap";
 
 import {
     PathPair,
@@ -10,6 +11,8 @@ import {
 } from "../../services/settings/path-pair.service";
 import {NotificationService} from "../../services/utils/notification.service";
 import {Notification} from "../../services/utils/notification";
+import {Localization} from "../../common/localization";
+import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
 
 
 @Component({
@@ -32,7 +35,9 @@ export class PathPairsComponent implements OnInit, OnDestroy {
     private _destroy$ = new Subject<void>();
 
     constructor(private _pathPairService: PathPairService,
-                private _notificationService: NotificationService) {
+                private _notificationService: NotificationService,
+                private _modal: Modal,
+                private _modalAccessibility: ModalAccessibilityService) {
     }
 
     ngOnInit() {
@@ -118,18 +123,32 @@ export class PathPairsComponent implements OnInit, OnDestroy {
     }
 
     delete(pair: PathPair) {
-        if (!confirm(`Are you sure you want to delete "${pair.name}"?`)) {
-            return;
-        }
+        const dialogRef = this._modal.confirm()
+            .title(Localization.Modal.DELETE_PATH_PAIR_TITLE)
+            .okBtn("Delete")
+            .okBtnClass("btn btn-danger")
+            .cancelBtn("Cancel")
+            .cancelBtnClass("btn btn-secondary")
+            .isBlocking(false)
+            .showClose(false)
+            .body(Localization.Modal.DELETE_PATH_PAIR_MESSAGE(pair.name))
+            .open();
 
-        this._pathPairService.delete(pair.id).subscribe({
-            next: () => {
-                this.showSuccess("Path pair deleted");
-                if (this.editingPair && this.editingPair.id === pair.id) {
-                    this.cancel();
-                }
-            },
-            error: error => this.showError("Failed to delete: " + error.message)
+        this._modalAccessibility.enhance(dialogRef).then(dRef => {
+            dRef.result.then(
+                () => {
+                    this._pathPairService.delete(pair.id).subscribe({
+                        next: () => {
+                            this.showSuccess("Path pair deleted");
+                            if (this.editingPair && this.editingPair.id === pair.id) {
+                                this.cancel();
+                            }
+                        },
+                        error: error => this.showError("Failed to delete: " + error.message)
+                    });
+                },
+                () => { return; }
+            );
         });
     }
 

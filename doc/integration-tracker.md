@@ -53,10 +53,10 @@ Refresh rule:
   - `5c899615b5ce4ece819e766951efe7be10907892` was adapted locally for `api_token` config support and stronger config API redaction; `a29cae1108bf481181bc363903de4d8c6db765e3` was intentionally skipped as planning-only documentation.
   - Phase 48/49 hardening/runtime work split across local adaptations and deferrals: startup warnings (`cd07bfcf`), path-traversal guards and tests, transient SSH scan recovery (`04ed3ace76b760ef6263f22ec376fc97d55f9279`), plus covered-elsewhere items such as `7bf7fb2826b759bf1feb456a250e6d00cb35651c`, `f63e7cf5935433389acce7cc943859a834147ff4`, and `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f`.
   - The CI/dependency cluster was treated as Angular-19-specific policy noise against the legacy Angular 4 baseline, with `cea63a27b502869241d704aabe266e18200d167c` split to a separate legacy dependency-audit task.
-  - The Angular migration trio landed as `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `intentionally skipped`, `db497146b623aaa860d641c24b78e18919215242` `needs new integration task`, and `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `needs subject reopen`; the migration-tail commits `c6318bc50b88ab1ffa978852193d61be321cc42a`, `ab74f8c53d9daf1e765315808bf995a6ea01974a`, `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1`, and `36c13b3f0acf5b9f0df738cd9964a44f31885771` closed the frozen range, with `c6318bc50b88ab1ffa978852193d61be321cc42a` left in `### Active subject reopens`.
+  - The Angular migration trio landed as `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `intentionally skipped`, `db497146b623aaa860d641c24b78e18919215242` `needs new integration task`, and `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `needs subject reopen`; the migration-tail commits `c6318bc50b88ab1ffa978852193d61be321cc42a`, `ab74f8c53d9daf1e765315808bf995a6ea01974a`, `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1`, and `36c13b3f0acf5b9f0df738cd9964a44f31885771` closed the frozen range, and the `c6318bc50b88ab1ffa978852193d61be321cc42a` follow-up is now integrated locally via the Subject 21 note.
 
 ### Active subject reopens
-- Subject 21 - Angular migration follow-ups: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`, `c6318bc50b88ab1ffa978852193d61be321cc42a`
+- Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
@@ -70,3 +70,4 @@ Refresh rule:
 
 ## Reference Notes
 - Subject 21 user-facing conflict review: [doc/integration-notes/S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
+  - The confirm-modal replacement and hardening follow-up from `c6318bc50b88ab1ffa978852193d61be321cc42a` is integrated locally.

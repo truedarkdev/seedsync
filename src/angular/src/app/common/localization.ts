@@ -31,6 +31,10 @@ export class Localization {
         public static readonly DELETE_REMOTE_MESSAGE =
             (name: string) => `Are you sure you want to delete <b>${name}</b> from the remote server?`
 
+        public static readonly DELETE_PATH_PAIR_TITLE = "Delete Path Pair";
+        public static readonly DELETE_PATH_PAIR_MESSAGE =
+            (name: string) => `Are you sure you want to delete path pair <b>${name}</b>?`
+
         public static readonly DELETE_LOCAL_BULK_TITLE = "Delete Local Files";
         public static readonly DELETE_LOCAL_BULK_MESSAGE =
             (names: string[]) => Localization.Modal.BULK_DELETE_MESSAGE(names, "local server")
