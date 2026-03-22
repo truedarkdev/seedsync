@@ -9,7 +9,7 @@ import shutil
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from common import overrides, Config, PathPairManager, PathPair
+from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit
 from seedsync import Seedsync
 
 
@@ -190,6 +190,168 @@ class TestSeedsync(unittest.TestCase):
         finally:
             shutil.rmtree(manager._config_dir)
 
+    def test_start_jobs_waits_for_controller_setup_before_webapp_start(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None))
+        )
+        controller_job = MagicMock()
+        webapp_job = MagicMock()
+        call_order = []
+
+        controller_job.start.side_effect = lambda: call_order.append("controller.start")
+        def wait_until_setup_complete(timeout=None):
+            call_order.append("controller.wait_until_setup_complete")
+            return True
+
+        controller_job.wait_until_setup_complete.side_effect = wait_until_setup_complete
+        webapp_job.start.side_effect = lambda: call_order.append("webapp.start")
+
+        controller_start_failed, controller_start_isolated = Seedsync._Seedsync__start_jobs(
+            context, True, controller_job, webapp_job
+        )
+
+        self.assertFalse(controller_start_failed)
+        self.assertFalse(controller_start_isolated)
+        self.assertTrue(controller_job.daemon)
+        controller_job.wait_until_setup_complete.assert_called_once_with(
+            timeout=Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        )
+        self.assertEqual(
+            [
+                "controller.start",
+                "controller.wait_until_setup_complete",
+                "webapp.start"
+            ],
+            call_order
+        )
+
+    def test_start_jobs_continues_with_webapp_when_controller_setup_times_out(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None))
+        )
+        controller_job = MagicMock()
+        webapp_job = MagicMock()
+
+        controller_job.start.return_value = None
+        controller_job.wait_until_setup_complete.return_value = False
+
+        controller_start_failed, controller_start_isolated = Seedsync._Seedsync__start_jobs(
+            context, True, controller_job, webapp_job
+        )
+
+        self.assertFalse(controller_start_failed)
+        self.assertTrue(controller_start_isolated)
+        self.assertTrue(controller_job.daemon)
+        controller_job.wait_until_setup_complete.assert_called_once_with(
+            timeout=Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        )
+        webapp_job.start.assert_called_once_with()
+        controller_job.propagate_exception.assert_not_called()
+        self.assertFalse(context.status.server.up)
+        self.assertIn("timed out", context.status.server.error_msg)
+        context.logger.error.assert_called_once()
+
+    def test_timeout_status_clears_only_for_matching_timeout_recovery(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(
+                server=SimpleNamespace(
+                    up=False,
+                    error_msg="Controller startup timed out after {} seconds; continuing with web UI".format(
+                        Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+                    )
+                )
+            )
+        )
+        controller_job = MagicMock()
+        controller_job.exc_info = None
+        controller_job.wait_until_setup_complete.return_value = True
+
+        controller_start_isolated = Seedsync._Seedsync__handle_controller_startup_timeout(
+            context,
+            controller_job,
+            True
+        )
+
+        self.assertFalse(controller_start_isolated)
+        controller_job.wait_until_setup_complete.assert_called_once_with(timeout=0)
+        self.assertTrue(context.status.server.up)
+        self.assertIsNone(context.status.server.error_msg)
+        context.logger.info.assert_called_once_with("Controller startup recovered after timeout")
+
+    def test_timeout_status_keeps_later_controller_failure_degraded(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(
+                server=SimpleNamespace(
+                    up=False,
+                    error_msg="Controller startup timed out after {} seconds; continuing with web UI".format(
+                        Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+                    )
+                )
+            )
+        )
+        controller_job = MagicMock()
+        controller_job.exc_info = (PermissionError, PermissionError("permission denied"), None)
+
+        controller_start_isolated = Seedsync._Seedsync__handle_controller_startup_timeout(
+            context,
+            controller_job,
+            True
+        )
+
+        self.assertTrue(controller_start_isolated)
+        self.assertFalse(context.status.server.up)
+        self.assertEqual("permission denied", context.status.server.error_msg)
+        context.logger.error.assert_called_once()
+
+    def test_start_jobs_marks_immediate_controller_setup_failure(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None))
+        )
+        controller_job = MagicMock()
+        webapp_job = MagicMock()
+
+        controller_job.start.return_value = None
+        controller_job.wait_until_setup_complete.return_value = True
+        controller_job.exc_info = (PermissionError, PermissionError("permission denied"), None)
+
+        controller_start_failed, controller_start_isolated = Seedsync._Seedsync__start_jobs(
+            context, True, controller_job, webapp_job
+        )
+
+        self.assertTrue(controller_start_failed)
+        self.assertFalse(controller_start_isolated)
+        self.assertTrue(controller_job.daemon)
+        controller_job.wait_until_setup_complete.assert_called_once_with(
+            timeout=Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        )
+        webapp_job.start.assert_called_once_with()
+        self.assertFalse(context.status.server.up)
+        self.assertEqual("permission denied", context.status.server.error_msg)
+        context.logger.error.assert_called_once()
+
+    def test_start_jobs_skips_controller_when_disabled(self):
+        context = SimpleNamespace(
+            logger=MagicMock(),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None))
+        )
+        controller_job = MagicMock()
+        webapp_job = MagicMock()
+
+        controller_start_failed, controller_start_isolated = Seedsync._Seedsync__start_jobs(
+            context, False, controller_job, webapp_job
+        )
+
+        self.assertFalse(controller_start_failed)
+        self.assertFalse(controller_start_isolated)
+        controller_job.start.assert_not_called()
+        controller_job.wait_until_setup_complete.assert_not_called()
+        webapp_job.start.assert_called_once_with()
+
     def test_emit_startup_warnings_warns_when_api_token_is_blank(self):
         config = Seedsync._create_default_config()
         config.general.api_token = ""
@@ -228,6 +390,200 @@ class TestSeedsync(unittest.TestCase):
                             for message in warning_messages))
         self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
         self.assertEqual(1, logger.warning.call_count)
+
+    def test_run_exits_early_in_bootstrap_mode(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            config=SimpleNamespace(),
+            args=SimpleNamespace(exit=True),
+        )
+        seedsync.persist = MagicMock()
+
+        with patch("seedsync.Seedsync._emit_startup_warnings"), \
+             patch("seedsync.Controller") as mock_controller, \
+             patch("seedsync.AutoQueue") as mock_auto_queue, \
+             patch("seedsync.WebAppBuilder") as mock_web_app_builder, \
+             patch("seedsync.ControllerJob") as mock_controller_job, \
+             patch("seedsync.WebAppJob") as mock_webapp_job, \
+             self.assertRaises(ServiceExit):
+            seedsync.run()
+
+        mock_controller.assert_not_called()
+        mock_auto_queue.assert_not_called()
+        mock_web_app_builder.assert_not_called()
+        mock_controller_job.assert_not_called()
+        mock_webapp_job.assert_not_called()
+        seedsync.persist.assert_called_once_with()
+        seedsync.context.logger.info.assert_any_call(
+            "Bootstrap mode requested; persisting defaults and exiting before startup"
+        )
+
+    def test_run_bootstrap_mode_skips_incomplete_config_validation(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            config=SimpleNamespace(),
+            args=SimpleNamespace(exit=True),
+        )
+        seedsync.persist = MagicMock()
+
+        with patch("seedsync.Seedsync._emit_startup_warnings"), \
+             patch("seedsync.Seedsync._detect_incomplete_config") as mock_detect_incomplete_config, \
+             patch("seedsync.Controller") as mock_controller, \
+             patch("seedsync.AutoQueue") as mock_auto_queue, \
+             patch("seedsync.WebAppBuilder") as mock_web_app_builder, \
+             patch("seedsync.ControllerJob") as mock_controller_job, \
+             patch("seedsync.WebAppJob") as mock_webapp_job, \
+             self.assertRaises(ServiceExit):
+            seedsync.run()
+
+        mock_detect_incomplete_config.assert_not_called()
+        mock_controller.assert_not_called()
+        mock_auto_queue.assert_not_called()
+        mock_web_app_builder.assert_not_called()
+        mock_controller_job.assert_not_called()
+        mock_webapp_job.assert_not_called()
+        seedsync.persist.assert_called_once_with()
+        seedsync.context.logger.info.assert_any_call(
+            "Bootstrap mode requested; persisting defaults and exiting before startup"
+        )
+
+    def test_run_skips_controller_join_when_setup_times_out(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            web_access_logger=MagicMock(),
+            config=SimpleNamespace(
+                lftp=SimpleNamespace(
+                    remote_password="pw",
+                    use_ssh_key=False,
+                    remote_address="addr",
+                    remote_port=21,
+                    remote_username="user",
+                    remote_path="/remote",
+                    local_path="/local",
+                    remote_path_to_scan_script="/scan",
+                    use_temp_file=False,
+                    rate_limit=None,
+                ),
+                controller=SimpleNamespace(
+                    interval_ms_downloading_scan=1,
+                    interval_ms_local_scan=1,
+                    interval_ms_remote_scan=1,
+                    use_local_path_as_extract_path=False,
+                    extract_path="/extract",
+                ),
+                general=SimpleNamespace(debug=False, verbose=False),
+                web=SimpleNamespace(port=8800),
+            ),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
+            path_pair_manager=None,
+            create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
+        )
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.persist = MagicMock()
+
+        controller = MagicMock()
+        auto_queue = MagicMock()
+        web_app = MagicMock()
+        web_app_builder = MagicMock()
+        web_app_builder.build.return_value = web_app
+        web_app_builder.server_handler.is_restart_requested.return_value = False
+
+        controller_job = MagicMock()
+        controller_job.wait_until_setup_complete.return_value = False
+        controller_job.is_setup_complete.return_value = False
+        webapp_job = MagicMock()
+
+        with patch("seedsync.Seedsync._emit_startup_warnings"), \
+             patch("seedsync.Seedsync._detect_incomplete_config", return_value=[]), \
+             patch("seedsync.Controller", return_value=controller), \
+             patch("seedsync.AutoQueue", return_value=auto_queue), \
+             patch("seedsync.WebAppBuilder", return_value=web_app_builder), \
+             patch("seedsync.ControllerJob", return_value=controller_job) as mock_controller_job, \
+             patch("seedsync.WebAppJob", return_value=webapp_job) as mock_webapp_job, \
+             patch("seedsync.time.sleep", side_effect=[ServiceExit(), None]):
+            mock_controller_job.__name__ = "ControllerJob"
+            mock_webapp_job.__name__ = "WebAppJob"
+            with self.assertRaises(ServiceExit):
+                seedsync.run()
+
+        controller_job.terminate.assert_called_once_with()
+        controller_job.join.assert_not_called()
+        webapp_job.terminate.assert_called_once_with()
+        webapp_job.join.assert_called_once_with()
+
+    def test_run_redirects_restart_request_while_controller_setup_is_degraded(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            web_access_logger=MagicMock(),
+            config=SimpleNamespace(
+                lftp=SimpleNamespace(
+                    remote_password="pw",
+                    use_ssh_key=False,
+                    remote_address="addr",
+                    remote_port=21,
+                    remote_username="user",
+                    remote_path="/remote",
+                    local_path="/local",
+                    remote_path_to_scan_script="/scan",
+                    use_temp_file=False,
+                    rate_limit=None,
+                ),
+                controller=SimpleNamespace(
+                    interval_ms_downloading_scan=1,
+                    interval_ms_local_scan=1,
+                    interval_ms_remote_scan=1,
+                    use_local_path_as_extract_path=False,
+                    extract_path="/extract",
+                ),
+                general=SimpleNamespace(debug=False, verbose=False),
+                web=SimpleNamespace(port=8800),
+            ),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
+            path_pair_manager=None,
+            create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
+        )
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.persist = MagicMock()
+
+        controller = MagicMock()
+        auto_queue = MagicMock()
+        web_app = MagicMock()
+        web_app_builder = MagicMock()
+        web_app_builder.build.return_value = web_app
+        web_app_builder.server_handler.is_restart_requested.return_value = True
+
+        controller_job = MagicMock()
+        controller_job.wait_until_setup_complete.return_value = False
+        controller_job.is_setup_complete.return_value = False
+        webapp_job = MagicMock()
+
+        with patch("seedsync.Seedsync._emit_startup_warnings"), \
+             patch("seedsync.Seedsync._detect_incomplete_config", return_value=[]), \
+             patch("seedsync.Controller", return_value=controller), \
+             patch("seedsync.AutoQueue", return_value=auto_queue), \
+             patch("seedsync.WebAppBuilder", return_value=web_app_builder), \
+             patch("seedsync.ControllerJob", return_value=controller_job) as mock_controller_job, \
+             patch("seedsync.WebAppJob", return_value=webapp_job) as mock_webapp_job, \
+             self.assertRaises(ServiceExit):
+            mock_controller_job.__name__ = "ControllerJob"
+            mock_webapp_job.__name__ = "WebAppJob"
+            seedsync.run()
+
+        controller_job.terminate.assert_called_once_with()
+        controller_job.join.assert_not_called()
+        webapp_job.terminate.assert_called_once_with()
+        webapp_job.join.assert_called_once_with()
+        seedsync.context.logger.warning.assert_any_call(
+            "Restart requested while controller startup is degraded; exiting instead of restarting"
+        )
 
     def test_emit_startup_warnings_skips_webhook_secret_warning_when_field_absent(self):
         config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token"))

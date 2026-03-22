@@ -119,6 +119,11 @@ class Seedsync:
         self.context.logger.info("Platform: {}".format(platform.machine()))
         Seedsync._emit_startup_warnings(self.context.logger, self.context.config)
 
+        if self.context.args.exit:
+            self.context.logger.info("Bootstrap mode requested; persisting defaults and exiting before startup")
+            self.persist()
+            raise ServiceExit()
+
         # Create controller
         controller = Controller(self.context, self.controller_persist)
 
@@ -145,20 +150,19 @@ class Seedsync:
         # Initial checks to see if we should bother starting the controller
         incomplete_fields = Seedsync._detect_incomplete_config(self.context.config, self.context.path_pair_manager)
         if incomplete_fields:
-            if not self.context.args.exit:
-                do_start_controller = False
-                self.context.logger.error("Config is incomplete: %s", ", ".join(incomplete_fields))
-                self.context.status.server.up = False
-                self.context.status.server.error_msg = Localization.Error.SETTINGS_INCOMPLETE_FIELDS.format(
-                    ", ".join(incomplete_fields)
-                )
-            else:
-                raise AppError("Config is incomplete: {}".format(", ".join(incomplete_fields)))
+            do_start_controller = False
+            self.context.logger.error("Config is incomplete: %s", ", ".join(incomplete_fields))
+            self.context.status.server.up = False
+            self.context.status.server.error_msg = Localization.Error.SETTINGS_INCOMPLETE_FIELDS.format(
+                ", ".join(incomplete_fields)
+            )
 
-        # Start child threads here
-        if do_start_controller:
-            controller_job.start()
-        webapp_job.start()
+        controller_start_failed, controller_start_isolated = self.__start_jobs(
+            self.context,
+            do_start_controller,
+            controller_job,
+            webapp_job
+        )
 
         try:
             prev_persist_timestamp = datetime.now()
@@ -174,18 +178,30 @@ class Seedsync:
                 # Propagate exceptions
                 webapp_job.propagate_exception()
                 # Catch controller exceptions and keep running, but notify the web server of the error
-                try:
-                    controller_job.propagate_exception()
-                except AppError as exc:
-                    if not self.context.args.exit:
-                        self.context.status.server.up = False
-                        self.context.status.server.error_msg = str(exc)
-                        Seedsync.logger.exception("Caught exception")
-                    else:
-                        raise
+                if controller_start_isolated:
+                    controller_start_isolated = Seedsync.__handle_controller_startup_timeout(
+                        self.context,
+                        controller_job,
+                        controller_start_isolated
+                    )
+                elif do_start_controller and not controller_start_failed:
+                    try:
+                        controller_job.propagate_exception()
+                    except AppError as exc:
+                        if not self.context.args.exit:
+                            self.context.status.server.up = False
+                            self.context.status.server.error_msg = str(exc)
+                            Seedsync.logger.exception("Caught exception")
+                        else:
+                            raise
 
                 # Check if a restart is requested
                 if web_app_builder.server_handler.is_restart_requested():
+                    if controller_start_isolated:
+                        self.context.logger.warning(
+                            "Restart requested while controller startup is degraded; exiting instead of restarting"
+                        )
+                        raise ServiceExit()
                     raise ServiceRestart()
 
                 # Nothing else to do
@@ -203,11 +219,15 @@ class Seedsync:
             # Join all the threads here
             if do_start_controller:
                 controller_job.terminate()
+                if controller_job.is_setup_complete():
+                    controller_job.join()
+                else:
+                    self.context.logger.warning(
+                        "Skipping controller join because setup never completed"
+                    )
             webapp_job.terminate()
 
             # Wait for the threads to close
-            if do_start_controller:
-                controller_job.join()
             webapp_job.join()
 
             # Last persist
@@ -240,6 +260,74 @@ class Seedsync:
         # Signals is a generated enum
         self.context.logger.info("Caught signal {}".format(signal.Signals(signum).name))
         raise ServiceExit()
+
+    @staticmethod
+    def __start_jobs(context, do_start_controller, controller_job, webapp_job):
+        """
+        Start the controller before the web server thread so controller subprocess startup
+        does not race against the threaded web app.
+        """
+        controller_start_failed = False
+        controller_start_isolated = False
+        if do_start_controller:
+            controller_job.daemon = True
+            controller_job.start()
+            setup_finished = controller_job.wait_until_setup_complete(
+                timeout=Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+            )
+            if not setup_finished:
+                controller_start_isolated = True
+                context.status.server.up = False
+                context.status.server.error_msg = (
+                    "Controller startup timed out after {} seconds; continuing with web UI".format(
+                        Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+                    )
+                )
+                context.logger.error(context.status.server.error_msg)
+            elif isinstance(controller_job.exc_info, tuple):
+                controller_start_failed = True
+                context.status.server.up = False
+                context.status.server.error_msg = str(controller_job.exc_info[1])
+                context.logger.error(
+                    "Controller failed to start; keeping the web UI available",
+                    exc_info=controller_job.exc_info
+                )
+
+        webapp_job.start()
+        return controller_start_failed, controller_start_isolated
+
+    @staticmethod
+    def __handle_controller_startup_timeout(context, controller_job, controller_start_isolated):
+        """
+        Keep monitoring a controller that timed out during startup without crashing the web service.
+        """
+        if not controller_start_isolated:
+            return False
+
+        timeout_error_msg = "Controller startup timed out after {} seconds; continuing with web UI".format(
+            Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        )
+
+        if isinstance(controller_job.exc_info, tuple):
+            error_msg = str(controller_job.exc_info[1])
+            if context.status.server.error_msg != error_msg:
+                context.status.server.up = False
+                context.status.server.error_msg = error_msg
+                context.logger.error(
+                    "Controller failed after startup timeout; keeping the web UI available",
+                    exc_info=controller_job.exc_info
+                )
+            return True
+
+        if not controller_job.wait_until_setup_complete(timeout=0):
+            return True
+
+        if context.status.server.error_msg == timeout_error_msg:
+            context.status.server.up = True
+            context.status.server.error_msg = None
+            context.logger.info("Controller startup recovered after timeout")
+
+        return False
 
     @staticmethod
     def _parse_args(args):
