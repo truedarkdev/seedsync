@@ -11,11 +11,13 @@ class TestSerializeConfig(unittest.TestCase):
     def test_section_general(self):
         config = Config()
         config.general.debug = True
+        config.general.config_api_redact_remote_details = True
         config.general.api_token = "super-secret-token"
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("general", out_dict)
         self.assertEqual(True, out_dict["general"]["debug"])
+        self.assertEqual(True, out_dict["general"]["config_api_redact_remote_details"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
         self.assertNotIn("super-secret-token", out)
 
@@ -50,8 +52,31 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(4, out_dict["lftp"]["num_max_total_connections"])
         self.assertNotIn("server.remote.com", out)
         self.assertNotIn("user-on-remote-server", out)
-        self.assertNotIn("/remote/server/path", out)
         self.assertNotIn("secret123", out)
+
+    def test_section_lftp_with_remote_detail_redaction_disabled(self):
+        config = Config()
+        config.general.config_api_redact_remote_details = False
+        config.general.api_token = "super-secret-token"
+        config.lftp.remote_address = "server.remote.com"
+        config.lftp.remote_username = "user-on-remote-server"
+        config.lftp.remote_password = "secret123"
+        config.lftp.remote_port = 3456
+        config.lftp.remote_path = "/remote/server/path"
+        config.lftp.local_path = "/local/server/path"
+        config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+        out = SerializeConfig.config(config)
+        out_dict = json.loads(out)
+        self.assertIn("lftp", out_dict)
+        self.assertEqual(False, out_dict["general"]["config_api_redact_remote_details"])
+        self.assertEqual("server.remote.com", out_dict["lftp"]["remote_address"])
+        self.assertEqual("user-on-remote-server", out_dict["lftp"]["remote_username"])
+        self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
+        self.assertEqual(3456, out_dict["lftp"]["remote_port"])
+        self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
+        self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
+        self.assertEqual("/remote/server/path/to/script", out_dict["lftp"]["remote_path_to_scan_script"])
+        self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
     def test_section_controller(self):
         config = Config()
