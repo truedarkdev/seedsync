@@ -64,6 +64,20 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(None, self.context.config.general.api_token)
         self.assertNotIn("super-secret-token", str(resp.html))
 
+    def test_set_config_api_redaction_via_url_is_forbidden(self):
+        self.assertEqual(True, self.context.config.general.config_api_redact_remote_details)
+        resp = self.test_app.get(
+            "/server/config/set/general/config_api_redact_remote_details/False",
+            expect_errors=True
+        )
+        self.assertEqual(403, resp.status_int)
+        self.assertEqual(
+            "Section 'general' option 'config_api_redact_remote_details' cannot be set via URL",
+            str(resp.html)
+        )
+        self.assertEqual(True, self.context.config.general.config_api_redact_remote_details)
+        self.assertNotIn("False", str(resp.html))
+
     def test_set_missing_section(self):
         self.assertFalse(self.context.config.has_section("bad_section"))
         resp = self.test_app.get("/server/config/set/bad_section/option/value", expect_errors=True)

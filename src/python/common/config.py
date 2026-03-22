@@ -77,6 +77,14 @@ class Checkers:
         return value
 
     @staticmethod
+    def bool_value(cls: T, name: str, value: bool) -> bool:
+        if type(value) is not bool:
+            raise ConfigError("Bad config: {}.{} ({}) must be a boolean value".format(
+                cls.__name__, name, value
+            ))
+        return value
+
+    @staticmethod
     def string_nonempty(cls: T, name: str, value: str) -> str:
         if not value or not value.strip():
             raise ConfigError("Bad config: {}.{} is empty".format(
@@ -243,12 +251,26 @@ class Config(Persist):
         debug = PROP("debug", Checkers.null, Converters.bool)
         verbose = PROP("verbose", Checkers.null, Converters.bool)
         api_token = PROP("api_token", Checkers.null, Converters.null)
+        config_api_redact_remote_details = PROP("config_api_redact_remote_details",
+                                                Checkers.bool_value,
+                                                Converters.bool)
 
         def __init__(self):
             super().__init__()
             self.debug = None
             self.verbose = None
             self.api_token = None
+            self.config_api_redact_remote_details = True
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "api_token" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["api_token"] = ""
+            if "config_api_redact_remote_details" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["config_api_redact_remote_details"] = True
+            return super().from_dict(config_dict)
 
     class Lftp(IC):
         remote_address = PROP("remote_address", Checkers.string_nonempty, Converters.null)
@@ -394,11 +416,7 @@ class Config(Persist):
         config_dict = dict(config_dict)  # copy that we can modify
         config = Config()
 
-        general_dict = Config._check_section(config_dict, "General")
-        if "api_token" not in general_dict:
-            general_dict = dict(general_dict)
-            general_dict["api_token"] = ""
-        config.general = Config.General.from_dict(general_dict)
+        config.general = Config.General.from_dict(Config._check_section(config_dict, "General"))
         config.lftp = Config.Lftp.from_dict(Config._check_section(config_dict, "Lftp"))
         config.controller = Config.Controller.from_dict(Config._check_section(config_dict, "Controller"))
         config.web = Config.Web.from_dict(Config._check_section(config_dict, "Web"))

@@ -197,11 +197,13 @@ class TestConfig(unittest.TestCase):
             "debug": "True",
             "verbose": "False",
             "api_token": "token-value",
+            "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
         self.assertEqual(True, general.debug)
         self.assertEqual(False, general.verbose)
         self.assertEqual("token-value", general.api_token)
+        self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
                           good_dict,
@@ -215,6 +217,17 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "debug", "-1")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
+
+    def test_general_redaction_flag_requires_bool(self):
+        general = Config.General()
+        general.config_api_redact_remote_details = False
+
+        with self.assertRaises(ConfigError) as error:
+            general.config_api_redact_remote_details = "False"
+        self.assertEqual(
+            "Bad config: General.config_api_redact_remote_details (False) must be a boolean value",
+            str(error.exception)
+        )
 
     def test_lftp(self):
         good_dict = {
@@ -440,6 +453,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(False, config.general.debug)
         self.assertEqual(True, config.general.verbose)
         self.assertEqual("", config.general.api_token)
+        self.assertEqual(True, config.general.config_api_redact_remote_details)
 
         self.assertEqual("remote.server.com", config.lftp.remote_address)
         self.assertEqual("remote-user", config.lftp.remote_username)
@@ -491,6 +505,7 @@ class TestConfig(unittest.TestCase):
         config.general.debug = True
         config.general.verbose = False
         config.general.api_token = "api-token-value"
+        config.general.config_api_redact_remote_details = True
         config.lftp.remote_address = "server.remote.com"
         config.lftp.remote_username = "user-on-remote-server"
         config.lftp.remote_password = "pass-on-remote-server"
@@ -525,6 +540,7 @@ class TestConfig(unittest.TestCase):
         debug = True
         verbose = False
         api_token = api-token-value
+        config_api_redact_remote_details = True
 
         [Lftp]
         remote_address = server.remote.com
