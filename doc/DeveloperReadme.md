@@ -305,11 +305,24 @@ make docker-image-release RELEASE_VERSION=latest RELEASE_REGISTRY=<registry name
 
 ## Remote Server
 
-Use the following command to run the docker image for the remote server for development testing.
-This is the same image used by the end-to-end tests.
+Use the following commands to start and stop the reusable SSH test server for
+development testing. This reuses the same Compose-managed `remote` service and
+the same image used by the end-to-end tests.
 
 ```bash
 make run-remote-server
+make stop-remote-server
+```
+
+By default, the service mounts the checked-in fixture directory from
+`src/docker/test/e2e/remote/files` into `/home/remoteuser/files`, so the
+existing e2e behavior stays unchanged.
+
+To point the server at a different host folder, set `SEEDSYNC_REMOTE_FILES_DIR`
+before starting it:
+
+```bash
+SEEDSYNC_REMOTE_FILES_DIR=/path/to/local/files make run-remote-server
 ```
 
 The connection parameters for the remote server are:
@@ -321,6 +334,9 @@ The connection parameters for the remote server are:
 | Username       | remoteuser                        |
 | Pass           | remotepass                        |
 | Remote Path    | /home/remoteuser/files            |
+
+The SSH port is published on `localhost:1234` when the remote server is
+started through the Compose helper above.
 
 
 
