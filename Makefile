@@ -245,12 +245,14 @@ run-remote-server:
 	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
 		$(DOCKER_COMPOSE) \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		up -d --build remote
 
 stop-remote-server:
 	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
 		$(DOCKER_COMPOSE) \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		stop remote
 
 coverage-python:

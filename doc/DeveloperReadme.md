@@ -329,14 +329,16 @@ The connection parameters for the remote server are:
 
 | Option         | Value                             |
 | -------------- | --------------------------------- |
-| Remote Address | localhost or host.docker.internal |
+| Remote Address | localhost                         |
 | Remote Port    | 1234                              |
 | Username       | remoteuser                        |
 | Pass           | remotepass                        |
 | Remote Path    | /home/remoteuser/files            |
 
 The SSH port is published on `localhost:1234` when the remote server is
-started through the Compose helper above.
+started through the Compose helper above. Use that host address with the
+manual helper; `host.docker.internal` is not needed for this loopback-only
+bind.
 
 
 
