@@ -29,10 +29,10 @@ Review state values:
 | --- | --- | --- | --- |
 | `f63e7cf5935433389acce7cc943859a834147ff4` `fix: prevent race condition in extract integration tests` | `reviewed` | `already integrated` | Local integration now waits for extracted files to exist and be non-empty before asserting. |
 | `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f` `fix: use POST for restart in E2E setup script` | `reviewed` | `covered elsewhere` | Local commit `caa3ebb8` already updates the same restart caller, so the upstream hunk is already represented here. |
-| `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps` | `not yet reviewed` |  |  |
-| `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config` | `not yet reviewed` |  |  |
-| `4090a2aea9ce7acc4cbf02663a003dff860cb9e9` `ci: ignore TypeScript and zone.js minor+ bumps in dependabot` | `not yet reviewed` |  |  |
-| `cea63a27b502869241d704aabe266e18200d167c` `fix: resolve 13 of 16 dependabot security alerts` | `not yet reviewed` |  |  |
+| `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps` | `reviewed` | `intentionally skipped` | Angular-19-era Dependabot policy noise; this repo has no `.github/dependabot.yml` and still ships the legacy Angular 4 frontend stack. |
+| `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config` | `reviewed` | `intentionally skipped` | Same Angular-19-specific Dependabot policy noise, not a fit for this repo's current frontend baseline. |
+| `4090a2aea9ce7acc4cbf02663a003dff860cb9e9` `ci: ignore TypeScript and zone.js minor+ bumps in dependabot` | `reviewed` | `intentionally skipped` | Same Angular-19-specific Dependabot policy noise, not a fit for this repo's current frontend baseline. |
+| `cea63a27b502869241d704aabe266e18200d167c` `fix: resolve 13 of 16 dependabot security alerts` | `reviewed` | `needs new integration task` | Angular 19 security-lockfile refresh does not map cleanly to this repo; track the legacy dependency-audit work separately instead of importing this directly. |
 | `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 — Angular 21 Migration` | `not yet reviewed` |  |  |
 | `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 → 21 with full dependency refresh (M001)` | `not yet reviewed` |  |  |
 | `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `fix: move provideZoneChangeDetection into appConfig, clean empty imports` | `not yet reviewed` |  |  |
@@ -43,9 +43,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps`
+- `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 â€” Angular 21 Migration`
 
 ## Next Candidate Batch
 
-- `d671686e982bdec4bc42910689d9db1125a37943` `ci: add dependabot config ignoring webpack minor+ bumps`
-- `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config`
+- `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 â€” Angular 21 Migration`
+- `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 â†’ 21 with full dependency refresh (M001)`
