@@ -33,9 +33,9 @@ Review state values:
 | `6f4920dddd29315067db8022b509d11d22f06b59` `ci: ignore major version bumps in dependabot config` | `reviewed` | `intentionally skipped` | Same Angular-19-specific Dependabot policy noise, not a fit for this repo's current frontend baseline. |
 | `4090a2aea9ce7acc4cbf02663a003dff860cb9e9` `ci: ignore TypeScript and zone.js minor+ bumps in dependabot` | `reviewed` | `intentionally skipped` | Same Angular-19-specific Dependabot policy noise, not a fit for this repo's current frontend baseline. |
 | `cea63a27b502869241d704aabe266e18200d167c` `fix: resolve 13 of 16 dependabot security alerts` | `reviewed` | `needs new integration task` | Angular 19 security-lockfile refresh does not map cleanly to this repo; track the legacy dependency-audit work separately instead of importing this directly. |
-| `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 — Angular 21 Migration` | `not yet reviewed` |  |  |
-| `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 → 21 with full dependency refresh (M001)` | `not yet reviewed` |  |  |
-| `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `fix: move provideZoneChangeDetection into appConfig, clean empty imports` | `not yet reviewed` |  |  |
+| `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 — Angular 21 Migration` | `reviewed` | `intentionally skipped` | The `.gsd` planning scaffold does not exist locally and is not a direct integration target. |
+| `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 → 21 with full dependency refresh (M001)` | `reviewed` | `needs new integration task` | The Angular 19→21 migration cluster is structurally incompatible with the current Angular 4 module/bootstrap stack and belongs in a separate migration task. |
+| `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `fix: move provideZoneChangeDetection into appConfig, clean empty imports` | `reviewed` | `needs subject reopen` | It only becomes meaningful if that broader migration subject is reopened. |
 | `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration` | `not yet reviewed` |  |  |
 | `ab74f8c53d9daf1e765315808bf995a6ea01974a` `fix: resolve undici CVE via npm override, revert strictTemplates` | `not yet reviewed` |  |  |
 | `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1` `fix(ci): migrate to application builder to fix Karma test hang in Docker` | `not yet reviewed` |  |  |
@@ -43,9 +43,9 @@ Review state values:
 
 ## Next Unresolved Commit
 
-- `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 â€” Angular 21 Migration`
+- `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration`
 
 ## Next Candidate Batch
 
-- `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `chore: add GSD milestone M001 â€” Angular 21 Migration`
-- `db497146b623aaa860d641c24b78e18919215242` `feat: upgrade Angular 19 â†’ 21 with full dependency refresh (M001)`
+- `c6318bc50b88ab1ffa978852193d61be321cc42a` `refactor: address code review findings from Angular 21 migration`
+- `ab74f8c53d9daf1e765315808bf995a6ea01974a` `fix: resolve undici CVE via npm override, revert strictTemplates`
