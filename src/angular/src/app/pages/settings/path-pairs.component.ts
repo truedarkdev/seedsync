@@ -1,4 +1,4 @@
-import {Component, OnDestroy, OnInit} from "@angular/core";
+import {ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
 import {Modal} from "ngx-modialog/plugins/bootstrap";
@@ -34,7 +34,8 @@ export class PathPairsComponent implements OnInit, OnDestroy {
 
     private _destroy$ = new Subject<void>();
 
-    constructor(private _pathPairService: PathPairService,
+    constructor(private _changeDetector: ChangeDetectorRef,
+                private _pathPairService: PathPairService,
                 private _notificationService: NotificationService,
                 private _modal: Modal,
                 private _modalAccessibility: ModalAccessibilityService) {
@@ -44,6 +45,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
         this._pathPairService.pathPairs.takeUntil(this._destroy$).subscribe({
             next: pathPairs => {
                 this.pathPairs = pathPairs;
+                this._changeDetector.markForCheck();
             }
         });
     }
