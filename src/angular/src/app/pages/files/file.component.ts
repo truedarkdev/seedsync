@@ -1,6 +1,6 @@
 import {
     Component, Input, Output, ChangeDetectionStrategy,
-    EventEmitter, OnChanges, SimpleChanges, ViewChild
+    EventEmitter, OnChanges, SimpleChanges, ViewChild, ChangeDetectorRef
 } from "@angular/core";
 
 import {Modal} from "ngx-modialog/plugins/bootstrap";
@@ -48,7 +48,8 @@ export class FileComponent implements OnChanges {
     activeAction: FileAction = null;
 
     constructor(private modal: Modal,
-                private modalAccessibility: ModalAccessibilityService) {}
+                private modalAccessibility: ModalAccessibilityService,
+                private _changeDetector: ChangeDetectorRef) {}
 
     ngOnChanges(changes: SimpleChanges): void {
         if (changes.file == null) {
@@ -60,7 +61,7 @@ export class FileComponent implements OnChanges {
         const newFile: ViewFile = changes.file.currentValue;
         if (oldFile != null && newFile != null && oldFile.status !== newFile.status) {
             // Reset any active action
-            this.activeAction = null;
+            this.resetActiveAction();
 
             // Scroll into view if this file is selected and not already in viewport
             const fileElement = this.fileElement && this.fileElement.nativeElement;
@@ -186,6 +187,11 @@ export class FileComponent implements OnChanges {
 
         this.activeAction = FileAction.VALIDATE;
         this.validateEvent.emit(file);
+    }
+
+    resetActiveAction(): void {
+        this.activeAction = null;
+        this._changeDetector.markForCheck();
     }
 
     onToggleSelection(file: ViewFile) {

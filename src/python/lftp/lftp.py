@@ -468,15 +468,9 @@ class Lftp:
         for status in self.status():
             if status.name != name:
                 continue
-            if remote_path is not None and (
-                status.remote_path is None or
-                self.__normalize_path(status.remote_path) != self.__normalize_path(remote_path)
-            ):
+            if remote_path is not None and not self.__path_is_within(status.remote_path, remote_path):
                 continue
-            if local_path is not None and (
-                status.local_path is None or
-                self.__normalize_path(status.local_path) != self.__normalize_path(local_path)
-            ):
+            if local_path is not None and not self.__path_is_within(status.local_path, local_path):
                 continue
             if remote_path is None and local_path is None and path_pair_id is not None and status.path_pair_id != path_pair_id:
                 continue

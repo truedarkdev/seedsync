@@ -212,6 +212,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("mirror: Access failed", lftp._Lftp__pending_error)
         lftp.logger.warning.assert_called_once_with("Lftp timeout exception")
 
+
     def setUp(self):
         # Delete and recreate the local dir
         shutil.rmtree(os.path.join(TestLftp.temp_dir, "local"))
@@ -962,3 +963,27 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
         self.assertIn("StrictHostKeyChecking accept-new", contents)
         self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)
+
+
+class TestLftpKillPathMatching(unittest.TestCase):
+    def test_kill_matches_running_pget_job_by_staging_root(self):
+        lftp = TestLftp._build_test_lftp()
+        status = LftpJobStatus(
+            job_id=11,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="stop-repro-7g.bin",
+            flags="-c",
+            remote_path="/remote/downloads/stop-repro-7g.bin",
+            local_path="/downloads/incomplete/stop-repro-7g.bin.lftp"
+        )
+        lftp.status = MagicMock(return_value=[status])
+
+        killed = lftp.kill(
+            "stop-repro-7g.bin",
+            remote_path="/remote/downloads",
+            local_path="/downloads/incomplete"
+        )
+
+        self.assertTrue(killed)
+        lftp._Lftp__run_command.assert_called_once_with("kill 11")
