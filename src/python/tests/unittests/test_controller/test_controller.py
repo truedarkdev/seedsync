@@ -83,6 +83,101 @@ class TestController(unittest.TestCase):
             self.controller._Controller__context.status.controller.latest_remote_scan_error
         )
 
+    def test_update_model_filters_only_malformed_status_only_active_entries(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+        self.controller._Controller__lftp.status.return_value = [status_a, status_b]
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            malformed_status_only_file_ids={"a"}
+        )
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with(["b"])
+        self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status_b])
+
+    def test_update_model_keeps_malformed_status_only_suppression_across_missing_active_scan_cycle(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+        self.controller._Controller__lftp.status.return_value = [status_a, status_b]
+        self.controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                malformed_status_only_file_ids={"a"}
+            ),
+            None
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__active_scanner.set_active_files.call_count)
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
+        self.assertEqual(
+            [[status_b], [status_b]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+
+    def test_update_model_keeps_malformed_suppression_when_next_active_scan_is_empty(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+        self.controller._Controller__lftp.status.return_value = [status_a, status_b]
+        self.controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                malformed_status_only_file_ids={"a"}
+            ),
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                malformed_status_only_file_ids=[]
+            )
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__active_scanner.set_active_files.call_count)
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
+        self.assertEqual(
+            [[status_b], [status_b]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+
+    def test_update_model_clears_malformed_suppression_when_lftp_activity_drops_file_id(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+        self.controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                malformed_status_only_file_ids={"a"}
+            ),
+            None,
+            None,
+        ]
+        self.controller._Controller__lftp.status.side_effect = [
+            [status_a, status_b],
+            [status_b],
+            [status_a],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+        self.assertEqual(
+            [[status_b], [status_b], [status_a]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+
     def test_get_model_files_uses_file_ids_when_available(self):
         file_movies = ModelFile("dup", False)
         file_movies.path_pair_id = "movies"

@@ -41,6 +41,9 @@ class IScanner(ABC):
     def set_base_logger(self, base_logger: logging.Logger):
         pass
 
+    def pop_malformed_status_only_file_ids(self) -> List[str]:
+        return []
+
 
 class ScannerResult:
     """
@@ -49,10 +52,12 @@ class ScannerResult:
     def __init__(self,
                  timestamp: datetime,
                  files: List[SystemFile],
+                 malformed_status_only_file_ids: Optional[List[str]] = None,
                  failed: bool = False,
                  error_message: str = None):
         self.timestamp = timestamp
         self.files = files
+        self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
         self.failed = failed
         self.error_message = error_message
 
@@ -93,15 +98,18 @@ class ScannerProcess(AppProcess):
             self.logger.debug("Running a scan")
         try:
             files = self.__scanner.scan()
+            malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
             self.__last_recoverable_error_message = None
             result = ScannerResult(timestamp=timestamp_start,
-                                   files=files)
+                                   files=files,
+                                   malformed_status_only_file_ids=malformed_status_only_file_ids)
         except ScannerError as e:
             # Non-recoverable errors continue up as a fatal error
             if not e.recoverable:
                 raise
             error_message = str(e)
             files = e.files if e.files is not None else []
+            malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
             if error_message != self.__last_recoverable_error_message:
                 self.logger.warning(
                     "Recoverable scanner error; returning failed result: {}".format(error_message)
@@ -109,6 +117,7 @@ class ScannerProcess(AppProcess):
                 self.__last_recoverable_error_message = error_message
             result = ScannerResult(timestamp=timestamp_start,
                                    files=files,
+                                   malformed_status_only_file_ids=malformed_status_only_file_ids,
                                    failed=True,
                                    error_message=error_message)
         self.__queue.put(result)

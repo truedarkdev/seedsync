@@ -251,6 +251,7 @@ class Controller:
         # Keep track of active files
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
+        self.__malformed_status_only_file_ids = set()
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -505,6 +506,9 @@ class Controller:
             self.__active_scanner.set_active_files([name for name, _, _ in active_files])
 
     def __update_model(self):
+        if not hasattr(self, "_Controller__malformed_status_only_file_ids"):
+            self.__malformed_status_only_file_ids = set()
+
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
         latest_local_scan = self.__local_scan_process.pop_latest_result()
@@ -523,9 +527,17 @@ class Controller:
 
         # Grab the latest extracted file names
         latest_extracted_results = self.__extract_process.pop_completed()
+        if latest_active_scan is not None:
+            self.__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
 
         # Update list of active file names
         if lftp_statuses is not None:
+            active_status_file_ids = {status.file_id for status in lftp_statuses}
+            self.__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
+            lftp_statuses = [
+                status for status in lftp_statuses
+                if status.file_id not in self.__malformed_status_only_file_ids
+            ]
             self.__active_downloading_file_names = [
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING

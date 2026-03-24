@@ -328,6 +328,25 @@ class TestSystemScanner(unittest.TestCase):
         """)
         self.assertEqual(104792064, size)
 
+    def test_lftp_status_file_size_rejects_malformed_status(self):
+        self.setup_default_tree()
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        size = scanner._lftp_status_file_size("""
+        size=-2
+        0.pos=0
+        """)
+        self.assertIsNone(size)
+
+    def test_lftp_status_file_size_rejects_impossible_range(self):
+        self.setup_default_tree()
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        size = scanner._lftp_status_file_size("""
+        size=1
+        0.pos=2
+        0.limit=3
+        """)
+        self.assertIsNone(size)
+
     def test_scan_lftp_partial_file(self):
         tempdir = TestSystemScanner.temp_dir
 

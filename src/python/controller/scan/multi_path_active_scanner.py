@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 from .scanner_process import IScanner
 from common import overrides, Constants
+from model import ModelFile
 from system import SystemFile, SystemScanner, SystemScannerError
 
 
@@ -28,6 +29,7 @@ class MultiPathActiveScanner(IScanner):
                 scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__active_files_queue = multiprocessing.Queue()
         self.__active_files: List[Tuple[str, Optional[str], Optional[str]]] = []
+        self.__malformed_status_only_file_ids = []
 
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger):
@@ -41,6 +43,7 @@ class MultiPathActiveScanner(IScanner):
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
+        self.__malformed_status_only_file_ids = []
         try:
             while True:
                 self.__active_files = self.__active_files_queue.get(block=False)
@@ -65,12 +68,27 @@ class MultiPathActiveScanner(IScanner):
                 system_file.path_pair_name = path_pair_name
                 results.append(system_file)
             except SystemScannerError as ex:
-                if self.__is_status_only_partial(scanner, file_name):
+                status_only_partial = self.__is_status_only_partial(scanner, file_name, path_pair_id)
+                if status_only_partial is True:
                     continue
+                if status_only_partial is None:
+                    self.__malformed_status_only_file_ids.append(
+                        ModelFile.build_file_id(file_name, path_pair_id)
+                    )
                 self.logger.warning(str(ex))
         return results
 
-    def __is_status_only_partial(self, scanner: SystemScanner, file_name: str) -> bool:
+    def pop_malformed_status_only_file_ids(self) -> List[str]:
+        malformed_status_only_file_ids = self.__malformed_status_only_file_ids
+        self.__malformed_status_only_file_ids = []
+        return malformed_status_only_file_ids
+
+    def __is_status_only_partial(
+            self,
+            scanner: SystemScanner,
+            file_name: str,
+            path_pair_id: Optional[str]
+    ) -> Optional[bool]:
         if not self.__use_temp_file:
             return False
 
@@ -78,4 +96,8 @@ class MultiPathActiveScanner(IScanner):
         temp_path = base_path + Constants.LFTP_TEMP_FILE_SUFFIX
         if os.path.exists(base_path) or os.path.exists(temp_path):
             return False
-        return os.path.isfile(temp_path + ".lftp-pget-status")
+        status_path = temp_path + ".lftp-pget-status"
+        if not os.path.isfile(status_path):
+            return False
+        with open(status_path, "r") as handle:
+            return True if SystemScanner._lftp_status_file_size(handle.read()) is not None else None
