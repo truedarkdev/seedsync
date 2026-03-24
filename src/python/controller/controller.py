@@ -81,9 +81,21 @@ class Controller:
         """
         Wraps any one-shot command processes launched by the controller
         """
-        def __init__(self, process: AppOneShotProcess, post_callback: Callable):
+        def __init__(
+            self,
+            command: "Controller.Command",
+            file_id: str,
+            file_name: str,
+            process: AppOneShotProcess,
+            post_callback: Callable,
+            await_completion: bool
+        ):
+            self.command = command
+            self.file_id = file_id
+            self.file_name = file_name
             self.process = process
             self.post_callback = post_callback
+            self.await_completion = await_completion
 
     def __init__(self,
                  context: Context,
@@ -426,20 +438,24 @@ class Controller:
                 error
             )
 
-    def __get_delete_local_path(self, file: ModelFile) -> str:
+    def __get_delete_local_target(self, file: ModelFile) -> tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
         final_path = path_pair.local_path if path_pair is not None else self.__context.config.lftp.local_path
         staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
         final_target = os.path.join(final_path, file.name)
 
         if os.path.exists(final_target) or not staging_path:
-            return final_path
+            return final_path, file.name
 
         staging_target = os.path.join(staging_path, file.name)
         if os.path.exists(staging_target):
-            return staging_path
+            return staging_path, file.name
 
-        return final_path
+        staging_target = os.path.join(staging_path, file.name + Constants.LFTP_TEMP_FILE_SUFFIX)
+        if os.path.exists(staging_target):
+            return staging_path, file.name + Constants.LFTP_TEMP_FILE_SUFFIX
+
+        return final_path, file.name
 
     def __recover_interrupted_downloads(self, remote_files):
         self.__startup_recovery_done = True
@@ -783,15 +799,20 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
+                    delete_local_path, delete_local_name = self.__get_delete_local_target(file)
                     process = DeleteLocalProcess(
-                        local_path=self.__get_delete_local_path(file),
-                        file_name=file.name
+                        local_path=delete_local_path,
+                        file_name=delete_local_name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)
                     post_callback = self.__local_scan_process.force_scan
                     command_wrapper = Controller.CommandProcessWrapper(
+                        command=command,
+                        file_id=file.file_id,
+                        file_name=file.name,
                         process=process,
-                        post_callback=post_callback
+                        post_callback=post_callback,
+                        await_completion=True
                     )
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
@@ -829,8 +850,12 @@ class Controller:
                     process.set_multiprocessing_logger(self.__mp_logger)
                     post_callback = self.__remote_scan_process.force_scan
                     command_wrapper = Controller.CommandProcessWrapper(
+                        command=command,
+                        file_id=file.file_id,
+                        file_name=file.name,
                         process=process,
-                        post_callback=post_callback
+                        post_callback=post_callback,
+                        await_completion=False
                     )
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
@@ -842,8 +867,9 @@ class Controller:
                 Controller.Command.Action.STOP
             ):
                 self.__validate_process.clear(file.file_id)
-            for callback in command.callbacks:
-                callback.on_success()
+            if command.action != Controller.Command.Action.DELETE_LOCAL:
+                for callback in command.callbacks:
+                    callback.on_success()
 
     def __log_memory_usage(self):
         with self.__model_lock:
@@ -899,8 +925,44 @@ class Controller:
             if command_process.process.is_alive():
                 still_active_processes.append(command_process)
             else:
-                # Do the post callback
-                command_process.post_callback()
-                # Propagate the exception
-                command_process.process.propagate_exception()
+                if command_process.await_completion:
+                    try:
+                        command_process.process.propagate_exception()
+                    except FileNotFoundError as error:
+                        self.logger.warning(
+                            "Command {} for file {} failed: {}".format(
+                                command_process.command.action,
+                                command_process.file_name,
+                                error
+                            )
+                        )
+                        self.__persist.stopped_file_names.discard(command_process.file_id)
+                        for callback in command_process.command.callbacks:
+                            callback.on_failure(
+                                "File '{}' does not exist locally".format(command_process.file_name),
+                                404
+                            )
+                    except Exception as error:
+                        self.logger.warning(
+                            "Command {} for file {} failed: {}".format(
+                                command_process.command.action,
+                                command_process.file_name,
+                                error
+                            )
+                        )
+                        self.__persist.stopped_file_names.discard(command_process.file_id)
+                        for callback in command_process.command.callbacks:
+                            callback.on_failure(
+                                "Failed to delete local file '{}'".format(command_process.file_name),
+                                500
+                            )
+                    else:
+                        command_process.post_callback()
+                        for callback in command_process.command.callbacks:
+                            callback.on_success()
+                else:
+                    # Do the post callback
+                    command_process.post_callback()
+                    # Propagate the exception
+                    command_process.process.propagate_exception()
         self.__active_command_processes = still_active_processes

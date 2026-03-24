@@ -20,6 +20,9 @@ class MockViewFileService {
     stop = jasmine.createSpy("stop").and.returnValue(
         Observable.of(new WebReaction(false, null, "Operation timed out"))
     );
+    deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
+        Observable.of(new WebReaction(true, "ok", null))
+    );
 
     get filteredFiles() {
         return this._filteredFiles.asObservable();
@@ -105,6 +108,24 @@ describe("Testing file list component", () => {
         component.onStop(createViewFile());
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+    });
+
+    it("should clear the delete local loading state when the delete request succeeds", () => {
+        component.onDeleteLocal(createViewFile());
+
+        expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+    });
+
+    it("should clear the delete local loading state when the delete request fails", () => {
+        mockViewFileService.deleteLocal.and.returnValue(
+            Observable.of(new WebReaction(false, null, "Operation timed out"))
+        );
+
+        component.onDeleteLocal(createViewFile());
+
+        expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
         expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
     });
 });

@@ -1,3 +1,4 @@
+import os
 import unittest
 from queue import Queue
 from unittest.mock import MagicMock, patch
@@ -502,7 +503,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {
             "movies": "/local/movies/incomplete"
         }
-        exists.side_effect = lambda path: path == "/local/movies/incomplete/dup"
+        exists.side_effect = lambda path: os.path.normpath(path) == os.path.normpath("/local/movies/incomplete/dup")
 
         with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
             process = MagicMock()
@@ -515,6 +516,34 @@ class TestController(unittest.TestCase):
         delete_local_process.assert_called_once_with(
             local_path="/local/movies/incomplete",
             file_name="dup"
+        )
+
+    @patch("controller.controller.os.path.exists")
+    def test_process_commands_delete_local_prefers_staging_temp_suffix_for_partial_file(self, exists):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        exists.side_effect = lambda path: os.path.normpath(path) == os.path.normpath("/local/movies/incomplete/dup.lftp")
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_called_once_with(
+            local_path="/local/movies/incomplete",
+            file_name="dup.lftp"
         )
 
     @patch("controller.controller.os.path.exists")
@@ -544,6 +573,70 @@ class TestController(unittest.TestCase):
             local_path="/local/movies",
             file_name="dup"
         )
+
+    def test_cleanup_commands_delete_local_reports_success_after_process_completion(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        post_callback = MagicMock()
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=True
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_called_once_with()
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+
+    def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        process = MagicMock()
+        process.is_alive.return_value = False
+        process.propagate_exception.side_effect = FileNotFoundError("/local/movies/incomplete/dup.lftp")
+        post_callback = MagicMock()
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=True
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_not_called()
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
     def test_process_commands_validate_queues_validation(self):
         file = ModelFile("dup", False)

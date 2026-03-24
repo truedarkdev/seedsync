@@ -166,6 +166,18 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command.action)
         self.assertEqual("value\"with\"doublequote", command.filename)
 
+    def test_delete_local_returns_failure_response(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_failure("File 'test1' does not exist locally", 404)
+
+        self.controller.queue_command = MagicMock()
+        self.controller.queue_command.side_effect = side_effect
+
+        response = self.test_app.delete("/server/command/delete_local/test1", expect_errors=True)
+
+        self.assertEqual(404, response.status_code)
+        self.assertEqual("File 'test1' does not exist locally", response.text)
+
     def test_delete_remote(self):
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_success()

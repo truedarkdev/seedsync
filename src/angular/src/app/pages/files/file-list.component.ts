@@ -131,11 +131,11 @@ export class FileListComponent implements OnInit, OnDestroy {
             data => {
                 this._logger.info(data);
                 if (data != null && !data.success) {
-                    this.resetStopLoading(file);
+                    this.resetFileLoading(file);
                 }
             },
             () => {
-                this.resetStopLoading(file);
+                this.resetFileLoading(file);
             }
         );
     }
@@ -149,6 +149,9 @@ export class FileListComponent implements OnInit, OnDestroy {
     onDeleteLocal(file: ViewFile) {
         this.viewFileService.deleteLocal(file).subscribe(data => {
             this._logger.info(data);
+            this.resetFileLoading(file);
+        }, () => {
+            this.resetFileLoading(file);
         });
     }
 
@@ -186,7 +189,7 @@ export class FileListComponent implements OnInit, OnDestroy {
         return Math.min((this.currentPage + 1) * this.pageSize, this.totalCount);
     }
 
-    private resetStopLoading(file: ViewFile): void {
+    private resetFileLoading(file: ViewFile): void {
         if (this.fileComponents == null) {
             return;
         }

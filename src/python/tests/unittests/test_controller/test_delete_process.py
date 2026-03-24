@@ -1,3 +1,5 @@
+import os
+import shlex
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +23,7 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf '/remote/what'\"'\"'s.mkv'")
+        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "what's.mkv")))
 
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_quotes_shell_metacharacters(self, sshcp_cls):
@@ -39,7 +41,7 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf '/remote/bad;rm -rf /'")
+        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "bad;rm -rf /")))
 
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_leaves_normal_filename_unquoted(self, sshcp_cls):
@@ -57,17 +59,27 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf /remote/normal.mkv")
+        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "normal.mkv")))
 
 
 class TestDeleteLocalProcess(unittest.TestCase):
     @patch("controller.delete.delete_process.shutil.rmtree")
     @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)
-    def test_run_once_ignores_directory_delete_errors(self, _, __, rmtree):
+    def test_run_once_deletes_directory_target(self, _, __, rmtree):
         process = DeleteLocalProcess(local_path="/local", file_name="dir")
         process.logger = MagicMock()
 
         process.run_once()
 
-        rmtree.assert_called_once_with("/local/dir", ignore_errors=True)
+        rmtree.assert_called_once_with(os.path.join("/local", "dir"))
+
+    @patch("controller.delete.delete_process.os.path.exists", return_value=False)
+    def test_run_once_raises_for_missing_target(self, exists):
+        process = DeleteLocalProcess(local_path="/local", file_name="missing.lftp")
+        process.logger = MagicMock()
+
+        with self.assertRaises(FileNotFoundError):
+            process.run_once()
+
+        exists.assert_called_once_with(os.path.join("/local", "missing.lftp"))
