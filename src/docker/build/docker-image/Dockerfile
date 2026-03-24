@@ -140,9 +140,14 @@ RUN groupadd -g 1000 seedsync && \
 RUN mkdir /config && \
     mkdir /downloads && \
     mkdir /mounts && \
+    mkdir -p /home/seedsync/.ssh && \
+    echo "StrictHostKeyChecking accept-new" > /home/seedsync/.ssh/config && \
     chown seedsync:seedsync /config && \
     chown seedsync:seedsync /downloads && \
-    chown seedsync:seedsync /mounts
+    chown seedsync:seedsync /mounts && \
+    chown -R seedsync:seedsync /home/seedsync && \
+    chmod 700 /home/seedsync/.ssh && \
+    chmod 600 /home/seedsync/.ssh/config
 
 # Switch to non-root user
 USER seedsync
