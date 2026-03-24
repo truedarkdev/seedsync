@@ -20,11 +20,16 @@ class DeleteLocalProcess(AppOneShotProcess):
         self.logger.debug("Deleting local file {}".format(self.__file_name))
         if not os.path.exists(file_path):
             self.logger.error("Failed to delete non-existing file: {}".format(file_path))
+            raise FileNotFoundError(file_path)
         else:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-            else:
-                shutil.rmtree(file_path, ignore_errors=True)
+            try:
+                if os.path.isfile(file_path):
+                    os.remove(file_path)
+                else:
+                    shutil.rmtree(file_path)
+            except OSError:
+                self.logger.exception("Failed to delete local file {}".format(file_path))
+                raise
 
 
 class DeleteRemoteProcess(AppOneShotProcess):
