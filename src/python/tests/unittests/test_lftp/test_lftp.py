@@ -6,7 +6,9 @@ import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock
+from unittest.mock import patch
 
 import pexpect
 import timeout_decorator
@@ -868,3 +870,95 @@ class TestLftp(unittest.TestCase):
         with self.assertRaises(LftpError) as ctx:
             self.lftp.raise_pending_error()
         self.assertTrue("Login failed: Login incorrect" in str(ctx.exception))
+
+
+class TestLftpPromptClassification(unittest.TestCase):
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_raises_lftp_error_on_ssh_host_key_prompt_timeout(self, spawn):
+        process = MagicMock()
+        process.before = (
+            b"The authenticity of host 'localhost (127.0.0.1)' can't be established.\n"
+            b"Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+        )
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        spawn.return_value = process
+
+        with self.assertRaises(LftpError) as ctx:
+            Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+        self.assertIn("SSH host-key prompt", str(ctx.exception))
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_propagates_generic_startup_timeout(self, spawn):
+        process = MagicMock()
+        process.before = b"some harmless startup output"
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        spawn.return_value = process
+
+        with self.assertRaises(pexpect.exceptions.TIMEOUT):
+            Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+    def test_run_command_raises_lftp_error_on_ssh_host_key_prompt_timeout(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = (
+            b"The authenticity of host 'localhost (127.0.0.1)' can't be established.\n"
+            b"Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+        )
+        process.after = pexpect.TIMEOUT
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        lftp._Lftp__process = process
+
+        with self.assertRaises(LftpError) as ctx:
+            lftp._Lftp__run_command("ls")
+
+        self.assertIn("SSH host-key prompt", str(ctx.exception))
+        lftp.logger.warning.assert_not_called()
+
+    def test_run_command_raises_lftp_error_on_ssh_host_key_prompt_timeout_during_error_recovery(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.after = pexpect.TIMEOUT
+
+        call_count = {"value": 0}
+
+        def expect_side_effect(*args, **kwargs):
+            call_count["value"] += 1
+            if call_count["value"] == 1:
+                process.before = b"mirror: Access failed"
+                return None
+            process.before = (
+                b"The authenticity of host 'localhost (127.0.0.1)' can't be established.\n"
+                b"Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            )
+            raise pexpect.exceptions.TIMEOUT("timeout")
+
+        process.expect.side_effect = expect_side_effect
+        lftp._Lftp__process = process
+
+        with self.assertRaises(LftpError) as ctx:
+            lftp._Lftp__run_command("mirror")
+
+        self.assertIn("SSH host-key prompt", str(ctx.exception))
+        self.assertEqual("mirror: Access failed", lftp._Lftp__pending_error)
+        lftp.logger.warning.assert_not_called()
+
+    def test_docker_runtime_user_ssh_config_guardrail(self):
+        dockerfile = Path(__file__).resolve().parents[5] / "src" / "docker" / "build" / "docker-image" / "Dockerfile"
+        contents = dockerfile.read_text(encoding="utf-8")
+
+        self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
+        self.assertIn("StrictHostKeyChecking accept-new", contents)
+        self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)

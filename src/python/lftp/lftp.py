@@ -69,7 +69,12 @@ class Lftp:
             "sftp://{}".format(self.__address)
         ]
         self.__process = pexpect.spawn("/usr/bin/lftp", args, dimensions=(24, 10000))
-        self.__process.expect(self.__expect_pattern)
+        try:
+            self.__process.expect(self.__expect_pattern)
+        except pexpect.exceptions.TIMEOUT:
+            out = self.__process.before.decode("utf8", "replace").strip()
+            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "startup"):
+                raise
         self.__setup()
 
     def set_verbose_logging(self, verbose: bool):
@@ -130,6 +135,21 @@ class Lftp:
             self.__pending_error = None
             raise LftpError(error)
 
+    @staticmethod
+    def __detect_ssh_host_key_prompt(out: str) -> bool:
+        prompt_fragments = [
+            "The authenticity of host ",
+            "Are you sure you want to continue connecting (yes/no",
+        ]
+        return any(fragment in out for fragment in prompt_fragments)
+
+    def __raise_lftp_error_for_ssh_host_key_prompt(self, out: str, context: str) -> bool:
+        if self.__detect_ssh_host_key_prompt(out):
+            error = "Lftp stalled on SSH host-key prompt during {}: {}".format(context, out)
+            self.logger.error(error)
+            raise LftpError(error)
+        return False
+
     @with_check_process
     def __run_command(self, command: str):
         if self.__log_command_output:
@@ -138,7 +158,9 @@ class Lftp:
         try:
             self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
         except pexpect.exceptions.TIMEOUT:
-            self.logger.warning("Lftp timeout exception")
+            out = self.__process.before.decode("utf8", "replace").strip()
+            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
+                self.logger.warning("Lftp timeout exception")
             pass
         except pexpect.exceptions.EOF:
             self.logger.error("Lftp process died unexpectedly (EOF)")
@@ -163,7 +185,9 @@ class Lftp:
             try:
                 self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
             except pexpect.exceptions.TIMEOUT:
-                self.logger.warning("Lftp timeout exception")
+                out = self.__process.before.decode("utf8", "replace").strip()
+                if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "recovering from error"):
+                    self.logger.warning("Lftp timeout exception")
                 pass
             except pexpect.exceptions.EOF:
                 self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
