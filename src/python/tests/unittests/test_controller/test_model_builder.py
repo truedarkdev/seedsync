@@ -206,6 +206,15 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DOWNLOADING, model.get_file("a").state)
 
+        # Downloading - remote only
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 0, False)])
+        self.model_builder.set_lftp_statuses([
+            LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        ])
+        model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DOWNLOADING, model.get_file("a").state)
+
         # Default
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])

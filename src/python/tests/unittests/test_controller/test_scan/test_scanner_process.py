@@ -185,6 +185,39 @@ class TestScannerProcess(unittest.TestCase):
         self.assertTrue(result.failed)
         self.assertEqual("recoverable error", result.error_message)
 
+    def test_propagates_malformed_status_only_file_ids_with_scan_result(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(return_value=[])
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=["a"])
+
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100,
+                                 verbose=False)
+
+        process.run_loop()
+        result = process.pop_latest_result()
+
+        self.assertEqual([], result.files)
+        self.assertEqual(["a"], result.malformed_status_only_file_ids)
+        mock_scanner.pop_malformed_status_only_file_ids.assert_called_once()
+
+    def test_propagates_malformed_status_only_file_ids_on_recoverable_error(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(side_effect=ScannerError("recoverable error", recoverable=True))
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=["a"])
+
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100,
+                                 verbose=False)
+
+        process.run_loop()
+        result = process.pop_latest_result()
+
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual(["a"], result.malformed_status_only_file_ids)
+        mock_scanner.pop_malformed_status_only_file_ids.assert_called_once()
+
     @timeout_decorator.timeout(10)
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()

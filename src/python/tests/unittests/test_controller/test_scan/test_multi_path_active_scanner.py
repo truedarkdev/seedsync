@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from controller.scan import MultiPathActiveScanner
+from model import ModelFile
 
 
 class TestMultiPathActiveScanner(unittest.TestCase):
@@ -76,3 +77,20 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
         self.assertEqual([], files)
         scanner.logger.warning.assert_not_called()
+
+    def test_scan_ignores_malformed_status_only_partial_when_temp_file_missing(self):
+        scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
+        scanner._MultiPathActiveScanner__active_files = [("download.zip", "movies", "Movies")]
+        scanner.logger = MagicMock()
+
+        with open(os.path.join(self.movies_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=-2\n0.pos=0\n")
+
+        files = scanner.scan()
+
+        self.assertEqual([], files)
+        scanner.logger.warning.assert_called_once()
+        self.assertEqual(
+            [ModelFile.build_file_id("download.zip", "movies")],
+            scanner.pop_malformed_status_only_file_ids()
+        )

@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import List
+from typing import List, Optional
 import multiprocessing
 import queue
 
@@ -25,6 +25,7 @@ class ActiveScanner(IScanner):
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__active_files_queue = multiprocessing.Queue()
         self.__active_files = []  # latest state
+        self.__malformed_status_only_file_ids = []
         self.logger = logging.getLogger(self.__class__.__name__)
 
     @overrides(IScanner)
@@ -41,6 +42,7 @@ class ActiveScanner(IScanner):
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
+        self.__malformed_status_only_file_ids = []
         # Grab the latest list of active files, if any
         try:
             while True:
@@ -56,12 +58,20 @@ class ActiveScanner(IScanner):
                 result.append(self.__scanner.scan_single(file_name))
             except SystemScannerError as ex:
                 # Ignore errors here, file may have been deleted
-                if self.__is_status_only_partial(file_name):
+                status_only_partial = self.__is_status_only_partial(file_name)
+                if status_only_partial is True:
                     continue
+                if status_only_partial is None:
+                    self.__malformed_status_only_file_ids.append(file_name)
                 self.logger.warning(str(ex))
         return result
 
-    def __is_status_only_partial(self, file_name: str) -> bool:
+    def pop_malformed_status_only_file_ids(self) -> List[str]:
+        malformed_status_only_file_ids = self.__malformed_status_only_file_ids
+        self.__malformed_status_only_file_ids = []
+        return malformed_status_only_file_ids
+
+    def __is_status_only_partial(self, file_name: str) -> Optional[bool]:
         if not self.__use_temp_file:
             return False
 
@@ -69,4 +79,8 @@ class ActiveScanner(IScanner):
         temp_path = base_path + Constants.LFTP_TEMP_FILE_SUFFIX
         if os.path.exists(base_path) or os.path.exists(temp_path):
             return False
-        return os.path.isfile(temp_path + ".lftp-pget-status")
+        status_path = temp_path + ".lftp-pget-status"
+        if not os.path.isfile(status_path):
+            return False
+        with open(status_path, "r") as handle:
+            return True if SystemScanner._lftp_status_file_size(handle.read()) is not None else None

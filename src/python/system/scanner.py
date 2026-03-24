@@ -2,7 +2,7 @@
 
 import os
 import re
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 
 # my libs
@@ -155,7 +155,9 @@ class SystemScanner:
             lftp_status_file_path = entry.path + SystemScanner.__LFTP_STATUS_FILE_SUFFIX
             if os.path.isfile(lftp_status_file_path):
                 with open(lftp_status_file_path, "r") as f:
-                    file_size = SystemScanner._lftp_status_file_size(f.read())
+                    parsed_size = SystemScanner._lftp_status_file_size(f.read())
+                    if parsed_size is not None:
+                        file_size = parsed_size
             # Check to see if this is a lftp temp file, and if so, use the real name
             file_name = entry.name.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
             if self.__lftp_temp_file_suffix is not None and \
@@ -195,7 +197,7 @@ class SystemScanner:
         return children
 
     @staticmethod
-    def _lftp_status_file_size(status: str) -> int:
+    def _lftp_status_file_size(status: str) -> Optional[int]:
         """
         Returns the real file size as indicated by an lftp status content
         :param status:
@@ -207,27 +209,32 @@ class SystemScanner:
         lines = [s.strip() for s in status.splitlines()]
         lines = list(filter(None, lines))  # remove blank lines
         if not lines:
-            return 0
+            return None
 
         empty_size = 0
         # First line should be a size
         result = size_pattern_m.search(lines[0])
         if not result:
-            return 0
+            return None
         total_size = int(result.group(1))
         lines.pop(0)
         while lines:
             # There should be pairs of lines
             if len(lines) < 2:
-                return 0
+                return None
             result_pos = pos_pattern_m.search(lines[0])
             result_limit = limit_pattern_m.search(lines[1])
             if not result_pos or not result_limit:
-                return 0
+                return None
             pos = int(result_pos.group(1))
             limit = int(result_limit.group(1))
+            if pos > total_size or limit > total_size or limit < pos:
+                return None
             empty_size += limit - pos
             lines.pop(0)
             lines.pop(0)
+
+        if empty_size > total_size:
+            return None
 
         return total_size-empty_size

@@ -145,7 +145,6 @@ class ModelBuilder:
             local = self.__local_files.get(file_id, None)
             status = self.__lftp_statuses.get(file_id, None)
             name = remote.name if remote else local.name if local else file_id
-
             if remote is None and local is None and status is None:
                 # this should never happen, but just in case
                 raise ModelError("Zero sources have a file object")
@@ -226,7 +225,8 @@ class ModelBuilder:
             __fill_model_file(model_file,
                               remote,
                               local,
-                              status.total_transfer_state if status and status.state == LftpJobStatus.State.RUNNING
+                              status.total_transfer_state if status and
+                              status.state == LftpJobStatus.State.RUNNING
                               else None)
 
             # Traverse SystemFile children tree in BFS order
