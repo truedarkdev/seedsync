@@ -1,4 +1,4 @@
-import {SimpleChange} from "@angular/core";
+import {ChangeDetectorRef, SimpleChange} from "@angular/core";
 
 import {Modal} from "ngx-modialog/plugins/bootstrap";
 
@@ -10,6 +10,10 @@ import {ModalAccessibilityService} from "../../../../services/utils/modal-access
 class MockModal {}
 
 class MockModalAccessibilityService {}
+
+class MockChangeDetectorRef {
+    markForCheck = jasmine.createSpy("markForCheck");
+}
 
 function createViewFile(props): ViewFile {
     return new ViewFile({
@@ -27,11 +31,14 @@ function createViewFile(props): ViewFile {
 
 describe("Testing file component", () => {
     let component: FileComponent;
+    let changeDetector: MockChangeDetectorRef;
 
     beforeEach(() => {
+        changeDetector = new MockChangeDetectorRef();
         component = new FileComponent(
             new MockModal() as Modal,
-            new MockModalAccessibilityService() as ModalAccessibilityService
+            new MockModalAccessibilityService() as ModalAccessibilityService,
+            changeDetector as unknown as ChangeDetectorRef
         );
     });
 
@@ -108,5 +115,14 @@ describe("Testing file component", () => {
 
         expect(component.activeAction).toBe(FileAction.VALIDATE);
         expect(validateSpy).toHaveBeenCalledWith(component.file);
+    });
+
+    it("should clear the active action when resetActiveAction is called", () => {
+        component.activeAction = FileAction.STOP;
+
+        component.resetActiveAction();
+
+        expect(component.activeAction).toBe(null);
+        expect(changeDetector.markForCheck).toHaveBeenCalled();
     });
 });

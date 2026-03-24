@@ -212,6 +212,23 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once_with("Lftp error: bad status", 500)
         callback.on_success.assert_not_called()
 
+    def test_process_commands_stop_reports_missing_lftp_job_as_failure(self):
+        file = ModelFile("example", False)
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.kill.return_value = False
+
+        command = Controller.Command(Controller.Command.Action.STOP, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("File 'example' could not be stopped", 409)
+        callback.on_success.assert_not_called()
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+
     def test_process_commands_reports_not_found_as_404(self):
         self.controller._Controller__model.get_file.side_effect = ModelError("missing")
 

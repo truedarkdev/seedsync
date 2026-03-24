@@ -702,12 +702,19 @@ class Controller:
                     if path_pair is not None:
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
                         local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
-                    self.__lftp.kill(
+                    killed = self.__lftp.kill(
                         file.name,
                         path_pair_id=file.path_pair_id,
                         remote_path=remote_path,
                         local_path=local_path
                     )
+                    if not killed:
+                        _notify_failure(
+                            command,
+                            "File '{}' could not be stopped".format(command.filename),
+                            409
+                        )
+                        continue
                     self.__persist.stopped_file_names.add(file.file_id)
                 except (LftpError, LftpJobStatusParserError) as e:
                     _notify_failure(command, "Lftp error: {}".format(str(e)), 500)

@@ -1,4 +1,4 @@
-import {ChangeDetectorRef, ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/core";
+import {ChangeDetectorRef, ChangeDetectionStrategy, Component, OnDestroy, OnInit, QueryList, ViewChildren} from "@angular/core";
 import {Observable} from "rxjs/Observable";
 import {Subscription} from "rxjs/Subscription";
 
@@ -11,6 +11,7 @@ import {LoggerService} from "../../services/utils/logger.service";
 import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ViewFileOptionsService} from "../../services/files/view-file-options.service";
 import {FileSelectionService} from "../../services/files/file-selection.service";
+import {FileComponent} from "./file.component";
 
 @Component({
     selector: "app-file-list",
@@ -28,6 +29,7 @@ export class FileListComponent implements OnInit, OnDestroy {
     public identify = FileListComponent.identify;
     public options: Observable<ViewFileOptions>;
     public SortMethod = ViewFileOptions.SortMethod;
+    @ViewChildren(FileComponent) private fileComponents: QueryList<FileComponent>;
     private _filesSubscription: Subscription;
     private _paginationSubscription: Subscription;
     public totalCount = 0;
@@ -125,9 +127,17 @@ export class FileListComponent implements OnInit, OnDestroy {
     }
 
     onStop(file: ViewFile) {
-        this.viewFileService.stop(file).subscribe(data => {
-            this._logger.info(data);
-        });
+        this.viewFileService.stop(file).subscribe(
+            data => {
+                this._logger.info(data);
+                if (data != null && !data.success) {
+                    this.resetStopLoading(file);
+                }
+            },
+            () => {
+                this.resetStopLoading(file);
+            }
+        );
     }
 
     onExtract(file: ViewFile) {
@@ -174,5 +184,24 @@ export class FileListComponent implements OnInit, OnDestroy {
 
     get pageEnd(): number {
         return Math.min((this.currentPage + 1) * this.pageSize, this.totalCount);
+    }
+
+    private resetStopLoading(file: ViewFile): void {
+        if (this.fileComponents == null) {
+            return;
+        }
+
+        const fileKey = file.fileId || file.name;
+        const fileComponent = this.fileComponents.toArray().find(component => {
+            if (component.file == null) {
+                return false;
+            }
+
+            return (component.file.fileId || component.file.name) === fileKey;
+        });
+
+        if (fileComponent != null) {
+            fileComponent.resetActiveAction();
+        }
     }
 }
