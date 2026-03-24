@@ -6,6 +6,44 @@ services:
       context: .
       dockerfile: src/docker/build/docker-image/Dockerfile
       target: seedsync_run
+    environment:
+      SEEDSYNC_DEBUG: "${SEEDSYNC_DEBUG:-0}"
+    command:
+      - /bin/bash
+      - -lc
+      - >
+        DEBUG_FLAG="";
+        if [ "$$SEEDSYNC_DEBUG" = "1" ]; then DEBUG_FLAG="-d"; fi;
+        /scripts/setup_default_config.sh &&
+        if grep -Eq '^[[:space:]]*config_api_redact_remote_details[[:space:]]*=' /config/settings.cfg; then
+          sed -i -E 's|^[[:space:]]*config_api_redact_remote_details[[:space:]]*=.*$|config_api_redact_remote_details = False|' /config/settings.cfg;
+        else
+          awk '
+            BEGIN { in_general = 0; inserted = 0 }
+            /^\[General\][[:space:]]*$/ {
+              in_general = 1
+              print
+              next
+            }
+            /^\[[^]]+\][[:space:]]*$/ {
+              if (in_general && !inserted) {
+                print "config_api_redact_remote_details = False"
+                inserted = 1
+              }
+              in_general = 0
+              print
+              next
+            }
+            { print }
+            END {
+              if (in_general && !inserted) {
+                print "config_api_redact_remote_details = False"
+              }
+            }
+          ' /config/settings.cfg > /config/settings.cfg.tmp &&
+          mv /config/settings.cfg.tmp /config/settings.cfg;
+        fi &&
+        exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/scanfs
     ports:
       - "8800:8800"
     volumes:
