@@ -31,7 +31,7 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertEqual({"complete.mkv", "partial.mkv"}, {system_file.name for system_file in files})
 
-    def test_scan_prefers_final_local_entry_over_staging_duplicate(self):
+    def test_scan_prefers_staging_entry_over_final_local_duplicate(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
         os.mkdir(staging_dir)
         with open(os.path.join(self.temp_dir, "movie.mkv"), "w") as handle:
@@ -48,4 +48,4 @@ class TestLocalScanner(unittest.TestCase):
         files = scanner.scan()
 
         self.assertEqual(["movie.mkv"], [system_file.name for system_file in files])
-        self.assertEqual(5, files[0].size)
+        self.assertEqual(7, files[0].size)
