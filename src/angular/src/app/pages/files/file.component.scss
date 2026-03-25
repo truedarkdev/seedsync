@@ -256,7 +256,7 @@
     .content .name      {flex-grow: 1; flex-basis: 0; min-width: 120px;}
     .content .speed     {width: 100px; min-width: 100px;}
     .content .eta       {width: 100px; min-width: 100px;}
-    .content .size      {width: 30%; min-width: 30%;}
+    .content .size      {flex-grow: 0; width: 30%; min-width: 30%;}
 
     .content {
         /* single row */
