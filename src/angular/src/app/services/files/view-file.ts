@@ -13,6 +13,7 @@ interface IViewFile {
     localSize: number;
     remoteSize: number;
     transferredSize: number;
+    displaySizeTotal: number;
     percentDownloaded: number;
     status: ViewFile.Status;
     downloadingSpeed: number;
@@ -47,6 +48,7 @@ const DefaultViewFile: IViewFile = {
     localSize: null,
     remoteSize: null,
     transferredSize: null,
+    displaySizeTotal: null,
     percentDownloaded: null,
     status: null,
     downloadingSpeed: null,
@@ -82,6 +84,7 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     localSize: number;
     remoteSize: number;
     transferredSize: number;
+    displaySizeTotal: number;
     percentDownloaded: number;
     status: ViewFile.Status;
     downloadingSpeed: number;
