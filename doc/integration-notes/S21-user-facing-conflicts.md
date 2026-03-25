@@ -105,6 +105,7 @@ Recommended future task shape:
 Fork material to revisit in that future task:
 - rapidcopy light/dark theme system: `58ead058`, `fb4e7db4`
   - adds a global `ThemeService`, persists a `theme-preference`, follows system color preference on first load, applies `data-theme` on the document root, and exposes a sidebar light/dark toggle
+  - note: the old theme-toggle asset lane also carried `moon.svg` and `sun.svg` under the former Angular `public/assets/icons/` path; those assets were intentionally left behind with the deferred theme system and are not referenced by the current app, unlike `default-local.svg` which was a separate files-page asset carry-over miss
 - rapidcopy theme infrastructure and UI follow-ons: `ad35d2e5`, `7e4157ba`, `ce373a2b`, `528e845b`, `facb52b4`
   - builds out the broader reusable theme lane around `ThemeService`, including first-load FOUC prevention, registration/bootstrap wiring, and focused Settings-page toggle coverage
 - thejuran earlier dark-mode styling lane: `9a32aa9f`, `88d6258e`, `3f1d7d2e`, `31e2aae5`
