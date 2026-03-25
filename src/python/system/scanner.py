@@ -153,11 +153,18 @@ class SystemScanner:
             # Check if it's a partial lftp file, and if so, use the lftp
             # status to get the real file size
             lftp_status_file_path = entry.path + SystemScanner.__LFTP_STATUS_FILE_SUFFIX
+            parsed_size = None
             if os.path.isfile(lftp_status_file_path):
                 with open(lftp_status_file_path, "r") as f:
                     parsed_size = SystemScanner._lftp_status_file_size(f.read())
                     if parsed_size is not None:
                         file_size = parsed_size
+            if self.__lftp_temp_file_suffix is not None and \
+                    entry.path.endswith(self.__lftp_temp_file_suffix) and \
+                    parsed_size is None:
+                # Temp files can be sparse or preallocated before LFTP writes
+                # the status sidecar, so do not trust the raw on-disk size.
+                file_size = 0
             # Check to see if this is a lftp temp file, and if so, use the real name
             file_name = entry.name.encode('utf-8', 'surrogateescape').decode('utf-8', 'replace')
             if self.__lftp_temp_file_suffix is not None and \

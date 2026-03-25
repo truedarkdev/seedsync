@@ -407,6 +407,25 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual("partial.mkv", partial_mkv.name)
         self.assertEqual(10148, partial_mkv.size)
 
+    def test_scan_single_lftp_temp_file_with_malformed_status_is_conservative(self):
+        tempdir = TestSystemScanner.temp_dir
+
+        temp_path = os.path.join(tempdir, "partial.mkv.lftp")
+        with open(temp_path, 'wb') as f:
+            f.write(bytearray([0xff] * 24588))
+        status_path = os.path.join(tempdir, "partial.mkv.lftp.lftp-pget-status")
+        with open(status_path, "w") as f:
+            f.write("""
+            size=-2
+            0.pos=0
+            """)
+
+        scanner = SystemScanner(tempdir)
+        scanner.set_lftp_temp_suffix(".lftp")
+        partial_mkv = scanner.scan_single("partial.mkv")
+        self.assertEqual("partial.mkv", partial_mkv.name)
+        self.assertEqual(0, partial_mkv.size)
+
     def test_scan_lftp_temp_file(self):
         tempdir = TestSystemScanner.temp_dir
 
@@ -462,15 +481,22 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual(True, f.is_dir)
 
         # Temp suffix set
+        path = os.path.join(tempdir, "a.mkv.lftp.lftp-pget-status")
+        with open(path, "w") as f:
+            f.write("""
+            size=100
+            0.pos=30
+            0.limit=100
+            """)
         scanner.set_lftp_temp_suffix(".lftp")
         files = scanner.scan()
         self.assertEqual(6, len(files))
         a, b, c, d, e, f = tuple(files)
         self.assertEqual("a.mkv", a.name)
-        self.assertEqual(100, a.size)
+        self.assertEqual(30, a.size)
         self.assertEqual(False, a.is_dir)
         self.assertEqual("b.rar", b.name)
-        self.assertEqual(200, b.size)
+        self.assertEqual(0, b.size)
         self.assertEqual(False, b.is_dir)
         self.assertEqual("c.rar", c.name)
         self.assertEqual(300, c.size)
@@ -479,12 +505,12 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual(400, d.size)
         self.assertEqual(False, d.is_dir)
         self.assertEqual("e", e.name)
-        self.assertEqual(500, e.size)
+        self.assertEqual(0, e.size)
         self.assertEqual(True, e.is_dir)
         self.assertEqual(1, len(e.children))
         ea = e.children[0]
         self.assertEqual("ea.txt", ea.name)
-        self.assertEqual(500, ea.size)
+        self.assertEqual(0, ea.size)
         self.assertEqual(False, ea.is_dir)
         self.assertEqual("f.lftp", f.name)
         self.assertEqual(0, f.size)
@@ -551,10 +577,17 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual(False, child.is_dir)
 
         # Temp suffix set, must NOT include temp suffix in name param
+        path = os.path.join(tempdir, "a.mkv.lftp.lftp-pget-status")
+        with open(path, "w") as f:
+            f.write("""
+            size=100
+            0.pos=30
+            0.limit=100
+            """)
         scanner.set_lftp_temp_suffix(".lftp")
         file = scanner.scan_single("a.mkv")
         self.assertEqual("a.mkv", file.name)
-        self.assertEqual(100, file.size)
+        self.assertEqual(30, file.size)
         self.assertEqual(False, file.is_dir)
 
         file = scanner.scan_single("b.rar")
@@ -564,12 +597,12 @@ class TestSystemScanner(unittest.TestCase):
 
         file = scanner.scan_single("c.lftp")
         self.assertEqual("c.lftp", file.name)
-        self.assertEqual(500, file.size)
+        self.assertEqual(0, file.size)
         self.assertEqual(True, file.is_dir)
         self.assertEqual(1, len(file.children))
         child = file.children[0]
         self.assertEqual("c.txt", child.name)
-        self.assertEqual(500, child.size)
+        self.assertEqual(0, child.size)
         self.assertEqual(False, child.is_dir)
         # also, shouldn't look for directories with temp suffix
         with self.assertRaises(SystemScannerError) as ctx:
@@ -578,11 +611,11 @@ class TestSystemScanner(unittest.TestCase):
 
         file = scanner.scan_single("d")
         self.assertEqual("d", file.name)
-        self.assertEqual(600, file.size)
+        self.assertEqual(0, file.size)
         self.assertEqual(True, file.is_dir)
         child = file.children[0]
         self.assertEqual("d.avi", child.name)
-        self.assertEqual(600, child.size)
+        self.assertEqual(0, child.size)
         self.assertEqual(False, child.is_dir)
 
         # No file and no temp file

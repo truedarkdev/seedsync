@@ -25,6 +25,22 @@ class TestActiveScanner(unittest.TestCase):
 
         self.assertEqual(1, len(files))
         self.assertEqual("download.zip", files[0].name)
+        self.assertEqual(0, files[0].size)
+
+    def test_scan_uses_status_sidecar_for_temp_file_size_when_final_active_path_is_missing(self):
+        scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        scanner.set_active_files(["download.zip"])
+
+        with open(os.path.join(self.temp_dir, "download.zip.lftp"), "wb") as handle:
+            handle.write(b"temp")
+        with open(os.path.join(self.temp_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
+            handle.write("size=100\n0.pos=30\n0.limit=100\n")
+
+        files = scanner.scan()
+
+        self.assertEqual(1, len(files))
+        self.assertEqual("download.zip", files[0].name)
+        self.assertEqual(30, files[0].size)
 
     def test_scan_ignores_status_only_partial_when_temp_file_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
