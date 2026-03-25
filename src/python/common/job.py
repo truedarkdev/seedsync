@@ -60,7 +60,7 @@ class Job(threading.Thread, ABC):
                 self.shutdown_flag.set()
                 break
 
-            time.sleep(Job._DEFAULT_SLEEP_INTERVAL_IN_SECS)
+            time.sleep(self._get_sleep_interval_in_secs())
 
         # ... Clean shutdown code here ...
         self.logger.debug("Calling cleanup for {}".format(self.name))
@@ -101,6 +101,13 @@ class Job(threading.Thread, ABC):
             exc_info = self.exc_info
             self.exc_info = None
             raise exc_info[1].with_traceback(exc_info[2])
+
+    def _get_sleep_interval_in_secs(self) -> float:
+        """
+        Return the sleep interval used between job executions.
+        :return:
+        """
+        return Job._DEFAULT_SLEEP_INTERVAL_IN_SECS
 
     @abstractmethod
     def setup(self):

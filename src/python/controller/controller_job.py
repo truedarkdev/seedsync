@@ -12,6 +12,8 @@ class ControllerJob(Job):
     The controller service
     Handles querying and downloading of files
     """
+    _SLEEP_INTERVAL_IN_SECS = 0.1
+
     def __init__(self,
                  context: Context,
                  controller: Controller,
@@ -28,6 +30,10 @@ class ControllerJob(Job):
     def execute(self):
         self.__controller.process()
         self.__auto_queue.process()
+
+    @overrides(Job)
+    def _get_sleep_interval_in_secs(self):
+        return ControllerJob._SLEEP_INTERVAL_IN_SECS
 
     @overrides(Job)
     def cleanup(self):
