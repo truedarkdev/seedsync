@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 import time
 
 
@@ -32,6 +32,19 @@ class DummySetupJob(Job):
 
     def execute(self):
         raise DummyError()
+
+    def cleanup(self):
+        # noinspection PyAttributeOutsideInit
+        self.cleanup_run = True
+
+
+class DummyTerminatingJob(Job):
+    def setup(self):
+        # noinspection PyAttributeOutsideInit
+        self.setup_run = True
+
+    def execute(self):
+        self.terminate()
 
     def cleanup(self):
         # noinspection PyAttributeOutsideInit
@@ -80,3 +93,16 @@ class TestJob(unittest.TestCase):
         job.terminate()
         job.join()
         self.assertTrue(job.cleanup_run)
+
+    def test_non_controller_job_uses_default_sleep_interval(self):
+        context = MagicMock()
+        # noinspection PyTypeChecker
+        job = DummyTerminatingJob("DummyTerminatingJob", context)
+
+        with patch("common.job.time.sleep") as mock_sleep:
+            job.start()
+            self.assertTrue(job.wait_until_setup_complete(1))
+            job.join(1)
+
+        self.assertFalse(job.is_alive())
+        mock_sleep.assert_called_once_with(Job._DEFAULT_SLEEP_INTERVAL_IN_SECS)
