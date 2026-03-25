@@ -19,6 +19,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_command_processes = []
         self.controller._Controller__active_downloading_file_names = []
         self.controller._Controller__active_extracting_file_names = []
+        self.controller._Controller__pending_auto_purge_file_ids = set()
         self.controller._Controller__context = MagicMock()
         self.controller._Controller__context.status.controller = MagicMock()
         self.controller._Controller__context.config.lftp.local_path = "/local"
@@ -403,6 +404,95 @@ class TestController(unittest.TestCase):
             {stale_a, stale_b, added_file.file_id},
             self.controller._Controller__model_builder.set_downloaded_files.call_args_list[-1][0][0]
         )
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_reconsiders_pending_zero_byte_local_only_file_after_remote_reconciliation(self, diff_models):
+        file = ModelFile("stale", False)
+        file.path_pair_id = "movies"
+        file.local_size = 0
+        file.remote_size = None
+        file.state = ModelFile.State.DEFAULT
+
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                failed=True,
+                error_message="remote failed"
+            ),
+            SimpleNamespace(
+                timestamp=object(),
+                files=[],
+                failed=False,
+                error_message=None
+            ),
+        ]
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        diff_models.return_value = [SimpleNamespace(change=ModelDiff.Change.ADDED, new_file=file)]
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            self.controller._Controller__update_model()
+            delete_local_process.assert_not_called()
+            self.controller._Controller__model_builder.has_changes.return_value = False
+            self.controller._Controller__update_model()
+
+        delete_local_process.assert_called_once_with(
+            local_path="/local/movies",
+            file_name="stale"
+        )
+        delete_local_process.return_value.start.assert_called_once_with()
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual(1, len(self.controller._Controller__active_command_processes))
+        self.assertEqual(file.file_id, self.controller._Controller__active_command_processes[0].file_id)
+
+    def test_update_model_skips_auto_purge_for_tracked_zero_byte_local_only_file(self):
+        file = ModelFile("stale", False)
+        file.path_pair_id = "movies"
+        file.local_size = 0
+        file.remote_size = None
+        file.state = ModelFile.State.DEFAULT
+
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.assertFalse(self.controller._Controller__should_auto_purge_local_file(file))
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_skips_auto_purge_for_queued_delete_command(self, diff_models):
+        file = ModelFile("stale", False)
+        file.path_pair_id = "movies"
+        file.local_size = 0
+        file.remote_size = None
+        file.state = ModelFile.State.DEFAULT
+
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            failed=False,
+            error_message=None
+        )
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        diff_models.return_value = [SimpleNamespace(change=ModelDiff.Change.ADDED, new_file=file)]
+        self.controller._Controller__command_queue.put(
+            Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        )
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            self.controller._Controller__update_model()
+
+        delete_local_process.assert_not_called()
+        self.assertEqual([], self.controller._Controller__active_command_processes)
 
     def test_process_commands_queue_uses_path_pair_paths(self):
         file = ModelFile("dup", False)
