@@ -328,6 +328,64 @@ describe("Testing view file service", () => {
         expect(count).toBe(testVectors.length);
     }));
 
+    it("should treat local-only default files as complete", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("a", new ModelFile({
+            name: "a",
+            local_size: 24,
+            remote_size: null,
+            transferred_size: 5,
+            state: ModelFile.State.DEFAULT
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let count = 0;
+        viewService.files.subscribe({
+            next: list => {
+                expect(list.size).toBe(1);
+                const file = list.get(0);
+                expect(file.status).toBe(ViewFile.Status.DEFAULT);
+                expect(file.localSize).toBe(24);
+                expect(file.remoteSize).toBe(0);
+                expect(file.transferredSize).toBe(24);
+                expect(file.displaySizeTotal).toBe(24);
+                expect(file.percentDownloaded).toBe(100);
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(1);
+    }));
+
+    it("should treat local-only downloaded files as complete", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("a", new ModelFile({
+            name: "a",
+            local_size: 24,
+            remote_size: null,
+            transferred_size: 5,
+            state: ModelFile.State.DOWNLOADED
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let count = 0;
+        viewService.files.subscribe({
+            next: list => {
+                expect(list.size).toBe(1);
+                const file = list.get(0);
+                expect(file.status).toBe(ViewFile.Status.DOWNLOADED);
+                expect(file.localSize).toBe(24);
+                expect(file.remoteSize).toBe(0);
+                expect(file.transferredSize).toBe(24);
+                expect(file.displaySizeTotal).toBe(24);
+                expect(file.percentDownloaded).toBe(100);
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(1);
+    }));
+
     it("should should correctly set ViewFile isQueueable", fakeAsync(() => {
         // Test and expected result vectors
         // test - [ModelFile.State, local size, remote size]
