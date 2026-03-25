@@ -264,6 +264,7 @@ class Controller:
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
         self.__malformed_status_only_file_ids = set()
+        self.__pending_auto_purge_file_ids = set()
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -457,6 +458,49 @@ class Controller:
 
         return final_path, file.name
 
+    def __has_active_command_for_file(self, file_id: str) -> bool:
+        return any(command_process.file_id == file_id for command_process in self.__active_command_processes)
+
+    def __has_pending_delete_local_command(self, file_id: str) -> bool:
+        if self.__has_active_command_for_file(file_id):
+            return True
+        with self.__command_queue.mutex:
+            return any(
+                command.action == Controller.Command.Action.DELETE_LOCAL and
+                command.filename == file_id
+                for command in self.__command_queue.queue
+            )
+
+    def __should_auto_purge_local_file(self, file: ModelFile) -> bool:
+        if file.is_dir or file.remote_size is not None or file.local_size != 0:
+            return False
+        if file.state != ModelFile.State.DEFAULT:
+            return False
+        if self.__is_previously_downloaded(file.name, file.path_pair_id) or \
+                self.__is_explicitly_stopped(file.name, file.path_pair_id):
+            return False
+        if file.file_id in self.__persist.extracted_file_names or file.name in self.__persist.extracted_file_names:
+            return False
+        return not self.__has_pending_delete_local_command(file.file_id)
+
+    def __queue_delete_local_process(self, file: ModelFile, post_callback: Callable):
+        delete_local_path, delete_local_name = self.__get_delete_local_target(file)
+        process = DeleteLocalProcess(
+            local_path=delete_local_path,
+            file_name=delete_local_name
+        )
+        process.set_multiprocessing_logger(self.__mp_logger)
+        command_wrapper = Controller.CommandProcessWrapper(
+            command=Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id),
+            file_id=file.file_id,
+            file_name=file.name,
+            process=process,
+            post_callback=post_callback,
+            await_completion=True
+        )
+        self.__active_command_processes.append(command_wrapper)
+        command_wrapper.process.start()
+
     def __recover_interrupted_downloads(self, remote_files):
         self.__startup_recovery_done = True
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
@@ -524,6 +568,8 @@ class Controller:
     def __update_model(self):
         if not hasattr(self, "_Controller__malformed_status_only_file_ids"):
             self.__malformed_status_only_file_ids = set()
+        if not hasattr(self, "_Controller__pending_auto_purge_file_ids"):
+            self.__pending_auto_purge_file_ids = set()
 
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
@@ -588,6 +634,8 @@ class Controller:
             self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
         # Build the new model, if needed
+        auto_purge_candidate_ids = set()
+        remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
         if self.__model_builder.has_changes():
             new_model = self.__model_builder.build_model()
 
@@ -622,6 +670,19 @@ class Controller:
                         self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
+
+                current_auto_purge_candidate_ids = {
+                    diff.new_file.file_id
+                    for diff in model_diff
+                    if diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED) and
+                    self.__should_auto_purge_local_file(diff.new_file)
+                }
+                if remote_reconciliation_established:
+                    auto_purge_candidate_ids.update(current_auto_purge_candidate_ids)
+                else:
+                    self.__pending_auto_purge_file_ids.update(
+                        current_auto_purge_candidate_ids
+                    )
 
                 # Prune the extracted files list of any files that were deleted locally
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded
@@ -660,6 +721,25 @@ class Controller:
                     self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                     self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
                 self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+
+        if remote_reconciliation_established and self.__pending_auto_purge_file_ids:
+            pending_auto_purge_candidates = set()
+            for file_id in list(self.__pending_auto_purge_file_ids):
+                try:
+                    file = self.__model.get_file(file_id)
+                except ModelError:
+                    self.__pending_auto_purge_file_ids.discard(file_id)
+                    continue
+                if self.__should_auto_purge_local_file(file):
+                    pending_auto_purge_candidates.add(file_id)
+                else:
+                    self.__pending_auto_purge_file_ids.discard(file_id)
+            auto_purge_candidate_ids.update(pending_auto_purge_candidates)
+            self.__pending_auto_purge_file_ids.difference_update(auto_purge_candidate_ids)
+
+        for file_id in auto_purge_candidate_ids:
+            file = self.__model.get_file(file_id)
+            self.__queue_delete_local_process(file, self.__local_scan_process.force_scan)
 
         # Update the controller status
         if latest_remote_scan is not None:
@@ -799,23 +879,7 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
-                    delete_local_path, delete_local_name = self.__get_delete_local_target(file)
-                    process = DeleteLocalProcess(
-                        local_path=delete_local_path,
-                        file_name=delete_local_name
-                    )
-                    process.set_multiprocessing_logger(self.__mp_logger)
-                    post_callback = self.__local_scan_process.force_scan
-                    command_wrapper = Controller.CommandProcessWrapper(
-                        command=command,
-                        file_id=file.file_id,
-                        file_name=file.name,
-                        process=process,
-                        post_callback=post_callback,
-                        await_completion=True
-                    )
-                    self.__active_command_processes.append(command_wrapper)
-                    command_wrapper.process.start()
+                    self.__queue_delete_local_process(file, self.__local_scan_process.force_scan)
                     self.__persist.stopped_file_names.add(file.file_id)
                     self.__validate_process.clear(file.file_id)
 
