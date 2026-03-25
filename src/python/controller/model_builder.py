@@ -2,6 +2,7 @@
 
 import os
 import logging
+from dataclasses import dataclass
 from typing import List, Optional, Set
 import math
 
@@ -11,6 +12,15 @@ from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
 from .extract import ExtractStatus, Extract
 from .validate import ValidateStatus
+
+
+@dataclass
+class _RecentLiveTransferSnapshot:
+    root_file_id: str
+    size_local: Optional[int]
+    percent_local: Optional[int]
+    speed: Optional[int]
+    eta: Optional[int]
 
 
 class ModelBuilder:
@@ -27,6 +37,7 @@ class ModelBuilder:
         self.__local_files = dict()
         self.__remote_files = dict()
         self.__lftp_statuses = dict()
+        self.__recent_live_transfer_snapshots = dict()
         self.__downloaded_files = None
         self.__extract_statuses = dict()
         self.__extracted_files = set()
@@ -62,6 +73,63 @@ class ModelBuilder:
                 return int(round(percent_local * 100))
             return int(round(percent_local))
         return percent_local
+
+    def __store_recent_live_transfer_snapshot(self,
+                                              file_id: str,
+                                              root_file_id: str,
+                                              transfer_state: LftpJobStatus.TransferState):
+        snapshot = _RecentLiveTransferSnapshot(
+            root_file_id=root_file_id,
+            size_local=transfer_state.size_local,
+            percent_local=ModelBuilder.__normalize_download_progress(transfer_state.percent_local),
+            speed=transfer_state.speed,
+            eta=transfer_state.eta
+        )
+        if snapshot.size_local is None:
+            return
+        self.__recent_live_transfer_snapshots[file_id] = snapshot
+
+    def __sweep_recent_live_transfer_snapshots(self, seen_file_ids: Optional[Set[str]] = None):
+        for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
+            if self.__lftp_statuses.get(snapshot.root_file_id) is not None:
+                continue
+            if seen_file_ids is not None and file_id not in seen_file_ids:
+                self.__recent_live_transfer_snapshots.pop(file_id, None)
+
+    def __evict_recent_live_transfer_snapshots(self, root_file_id: str):
+        for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
+            if snapshot.root_file_id == root_file_id:
+                self.__recent_live_transfer_snapshots.pop(file_id, None)
+
+    def __has_pending_recent_live_transfer_snapshots(self) -> bool:
+        for snapshot in self.__recent_live_transfer_snapshots.values():
+            if self.__lftp_statuses.get(snapshot.root_file_id) is None:
+                return True
+        return False
+
+    def __get_recent_live_transfer_state(self,
+                                         file_id: str,
+                                         remote: Optional[SystemFile],
+                                         local: Optional[SystemFile]) -> Optional[LftpJobStatus.TransferState]:
+        snapshot = self.__recent_live_transfer_snapshots.get(file_id)
+        if snapshot is None:
+            return None
+        if self.__lftp_statuses.get(snapshot.root_file_id) is not None:
+            return None
+        if remote is None or local is None or local.size is None or snapshot.size_local is None:
+            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            return None
+        if local.size >= snapshot.size_local or (remote.size is not None and local.size >= remote.size):
+            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            return None
+
+        return LftpJobStatus.TransferState(
+            snapshot.size_local,
+            remote.size,
+            snapshot.percent_local,
+            snapshot.speed,
+            snapshot.eta
+        )
 
     def set_active_files(self, active_files: List[SystemFile]):
         # Update the local file state with this latest information
@@ -127,6 +195,7 @@ class ModelBuilder:
         self.__local_files.clear()
         self.__remote_files.clear()
         self.__lftp_statuses.clear()
+        self.__recent_live_transfer_snapshots.clear()
         self.__downloaded_files = None
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
@@ -138,15 +207,16 @@ class ModelBuilder:
         Returns true is model has changes and requires rebuild
         :return:
         """
-        return self.__cached_model is None
+        return self.__cached_model is None or self.__has_pending_recent_live_transfer_snapshots()
 
     def build_model(self) -> Model:
-        if self.__cached_model is not None:
+        if self.__cached_model is not None and not self.__has_pending_recent_live_transfer_snapshots():
             return self.__cached_model
 
         model = Model()
         model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
         live_transferred_file_ids = set()
+        seen_file_ids = set()
         all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
         source_file_ids = set(self.__local_files.keys()).union(self.__remote_files.keys())
         for status_file_id in self.__lftp_statuses.keys():
@@ -154,6 +224,7 @@ class ModelBuilder:
                 all_file_ids.add(status_file_id)
 
         for file_id in all_file_ids:
+            seen_file_ids.add(file_id)
             remote = self.__remote_files.get(file_id, None)
             local = self.__local_files.get(file_id, None)
             status = self.__lftp_statuses.get(file_id, None)
@@ -172,7 +243,9 @@ class ModelBuilder:
             def __fill_model_file(_model_file: ModelFile,
                                   _remote: Optional[SystemFile],
                                   _local: Optional[SystemFile],
-                                  _transfer_state: Optional[LftpJobStatus.TransferState]):
+                                  _transfer_state: Optional[LftpJobStatus.TransferState],
+                                  _store_recent_snapshot: bool,
+                                  _recent_snapshot_root_file_id: Optional[str]):
                 # set local and remote sizes
                 if _remote:
                     _model_file.remote_size = _remote.size
@@ -184,6 +257,12 @@ class ModelBuilder:
 
                 # set the downloading speed and eta
                 if _transfer_state:
+                    if _store_recent_snapshot:
+                        self.__store_recent_live_transfer_snapshot(
+                            _model_file.file_id,
+                            _recent_snapshot_root_file_id if _recent_snapshot_root_file_id is not None else _model_file.file_id,
+                            _transfer_state
+                        )
                     download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
                     if download_progress is not None:
                         _model_file.download_progress = download_progress
@@ -243,16 +322,26 @@ class ModelBuilder:
             # set the file state
             # for now we only set to Queued or Downloading
             # later after all children are built, we can set to Downloaded after performing a check
+            recent_transfer_state = None
+            current_transfer_state = status.total_transfer_state if status and \
+                status.state == LftpJobStatus.State.RUNNING else None
+            if current_transfer_state is None and status is None:
+                recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
             if status:
                 model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
                                    else ModelFile.State.DOWNLOADING
+                if status.state == LftpJobStatus.State.QUEUED:
+                    self.__evict_recent_live_transfer_snapshots(status.file_id)
+            elif recent_transfer_state:
+                model_file.state = ModelFile.State.DOWNLOADING
             # fill the rest
             __fill_model_file(model_file,
                               remote,
                               local,
-                              status.total_transfer_state if status and
-                              status.state == LftpJobStatus.State.RUNNING
-                              else None)
+                              current_transfer_state if current_transfer_state is not None
+                              else recent_transfer_state,
+                              current_transfer_state is not None,
+                              status.file_id if status is not None else None)
 
             # Traverse SystemFile children tree in BFS order
             # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
@@ -283,18 +372,11 @@ class ModelBuilder:
                         _model_file.path_pair_id,
                         _model_file.path_pair_name
                     )
+                    seen_file_ids.add(_child_model_file.file_id)
 
                     # add it to the parent right away so we can access the full path
                     _model_file.add_child(_child_model_file)
 
-                    # find the transfer state (if it exists) corresponding to this child
-                    # Note: transfer states are in full paths
-                    # Note2: transfer states don't include root path
-                    _child_status_path = os.path.join(*(_child_model_file.full_path.split(os.sep)[1:]))
-                    _child_transfer_state = None
-                    if _status:
-                        _child_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
-                                                     if n == _child_status_path), None)
                     # Set the state, first matching criteria below decides state
                     #   child is a directory: Default
                     #   child is active: Downloading
@@ -307,9 +389,24 @@ class ModelBuilder:
                     #   finished files are Downloaded
                     #   Queued and Downloading root's unfinished files are Queued
                     #   Local-only files are Default
+                    _child_current_transfer_state = None
+                    _child_recent_transfer_state = None
+                    if _status and _status.state == LftpJobStatus.State.RUNNING:
+                        # Transfer states are in root-relative paths.
+                        _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
+                        _child_current_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
+                                                             if n == _child_status_path), None)
+                    if _child_current_transfer_state is None and _status is None:
+                        _child_recent_transfer_state = self.__get_recent_live_transfer_state(
+                            _child_model_file.file_id,
+                            _remote_child,
+                            _local_child
+                        )
                     if _is_dir:
                         _child_model_file.state = ModelFile.State.DEFAULT
-                    elif _child_transfer_state:
+                    elif _child_current_transfer_state:
+                        _child_model_file.state = ModelFile.State.DOWNLOADING
+                    elif _child_recent_transfer_state:
                         _child_model_file.state = ModelFile.State.DOWNLOADING
                     elif _remote_child and _local_child and _local_child.size >= _remote_child.size:
                         _child_model_file.state = ModelFile.State.DOWNLOADED
@@ -322,7 +419,10 @@ class ModelBuilder:
                     __fill_model_file(_child_model_file,
                                       _remote_child,
                                       _local_child,
-                                      _child_transfer_state)
+                                      _child_current_transfer_state if _child_current_transfer_state is not None
+                                      else _child_recent_transfer_state,
+                                      _child_current_transfer_state is not None,
+                                      status.file_id if status is not None else None)
                     # add child to frontier
                     frontier.append((_remote_child, _local_child, _status, _child_model_file))
 
@@ -429,5 +529,6 @@ class ModelBuilder:
 
             model.add_file(model_file)
 
+        self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         self.__cached_model = model
         return model

@@ -64,10 +64,13 @@ class LocalScanner(IScanner):
                 self.logger.exception("Caught SystemScannerError")
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
 
-            local_names = {system_file.name for system_file in result}
+            local_names = {system_file.name: index for index, system_file in enumerate(result)}
             for staging_file in staging_result:
                 if staging_file.name not in local_names:
+                    local_names[staging_file.name] = len(result)
                     result.append(staging_file)
+                else:
+                    result[local_names[staging_file.name]] = staging_file
         return result
 
     @staticmethod
