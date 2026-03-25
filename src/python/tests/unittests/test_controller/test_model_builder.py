@@ -690,7 +690,7 @@ class TestModelBuilder(unittest.TestCase):
         m_ab = m_a_ch["ab"]
         self.assertEqual((512, 512, 512), (m_ab.remote_size, m_ab.local_size, m_ab.transferred_size))
         m_b = model.get_file("b")
-        self.assertEqual((3090, 1611, 1512), (m_b.remote_size, m_b.local_size, m_b.transferred_size))
+        self.assertEqual((3090, 1611, 1611), (m_b.remote_size, m_b.local_size, m_b.transferred_size))
         m_b_ch = {m.name: m for m in model.get_file("b").get_children()}
         m_ba = m_b_ch["ba"]
         self.assertEqual((2048, 512, 512), (m_ba.remote_size, m_ba.local_size, m_ba.transferred_size))
@@ -1307,6 +1307,34 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([SystemFile("a", 55, False)])
         model = self.model_builder.build_model()
         self.assertEqual(42, model.get_file("a").transferred_size)
+
+        # active download prefers live transfer bytes
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 42, False)])
+        self.model_builder.set_local_files([SystemFile("a", 22, False)])
+        s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        s.total_transfer_state = LftpJobStatus.TransferState(33, 42, 0.75, 1000, 5)
+        self.model_builder.set_lftp_statuses([s])
+        model = self.model_builder.build_model()
+        self.assertEqual(33, model.get_file("a").transferred_size)
+
+        # downloading directories without an explicit live root value still
+        # aggregate child live bytes
+        self.model_builder.clear()
+        remote_root = SystemFile("root", 100, True)
+        remote_child = SystemFile("child", 100, False)
+        remote_root.add_child(remote_child)
+        local_root = SystemFile("root", 0, True)
+        local_child = SystemFile("child", 0, False)
+        local_root.add_child(local_child)
+        status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "root", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(None, 100, None, 1000, 5)
+        status.add_active_file_transfer_state("child", LftpJobStatus.TransferState(18, 100, 0.18, 500, 3))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([status])
+        model = self.model_builder.build_model()
+        self.assertEqual(18, model.get_file("root").transferred_size)
 
         # both remote and local directory (but no children specified)
         self.model_builder.clear()

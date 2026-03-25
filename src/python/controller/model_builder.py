@@ -146,6 +146,7 @@ class ModelBuilder:
 
         model = Model()
         model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
+        live_transferred_file_ids = set()
         all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
         source_file_ids = set(self.__local_files.keys()).union(self.__remote_files.keys())
         for status_file_id in self.__lftp_statuses.keys():
@@ -186,20 +187,29 @@ class ModelBuilder:
                     download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
                     if download_progress is not None:
                         _model_file.download_progress = download_progress
+                    if _transfer_state.size_local is not None:
+                        _model_file.transferred_size = _transfer_state.size_local
+                        live_transferred_file_ids.add(_model_file.file_id)
                     _model_file.downloading_speed = _transfer_state.speed
                     _model_file.eta = _transfer_state.eta
 
                 # set the transferred size (only if file or dir exists on both ends)
                 if _local and _remote:
                     if _model_file.is_dir:
-                        # dir transferred size is updated by child files
-                        _model_file.transferred_size = 0
+                        if _model_file.transferred_size is None:
+                            # dir transferred size is updated by child files
+                            _model_file.transferred_size = 0
                     else:
-                        _model_file.transferred_size = min(_local.size, _remote.size)
+                        if _model_file.transferred_size is None:
+                            _model_file.transferred_size = min(_local.size, _remote.size)
 
                         # also update all parent directories
                         _parent_file = _model_file.parent
                         while _parent_file is not None:
+                            if _parent_file.file_id in live_transferred_file_ids:
+                                break
+                            if _parent_file.transferred_size is None:
+                                _parent_file.transferred_size = 0
                             _parent_file.transferred_size += _model_file.transferred_size
                             _parent_file = _parent_file.parent
 

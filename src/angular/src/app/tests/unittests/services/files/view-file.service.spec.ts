@@ -103,6 +103,7 @@ describe("Testing view file service", () => {
                 expect(file.isDir).toBe(true);
                 expect(file.localSize).toBe(0);
                 expect(file.remoteSize).toBe(11);
+                expect(file.transferredSize).toBe(0);
                 expect(file.status).toBe(ViewFile.Status.DEFAULT);
                 expect(file.downloadingSpeed).toBe(111);
                 expect(file.eta).toBe(1111);
@@ -117,6 +118,62 @@ describe("Testing view file service", () => {
         });
         tick();
         expect(count).toBe(1);
+    }));
+
+    it("should prefer transferred size for active downloads", fakeAsync(() => {
+        const testVectors = [
+            {
+                name: "idle",
+                state: ModelFile.State.DEFAULT,
+                local_size: 24,
+                remote_size: 100,
+                transferred_size: null,
+                expected: 24
+            },
+            {
+                name: "active",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: 24,
+                remote_size: 100,
+                transferred_size: 18,
+                expected: 18
+            },
+            {
+                name: "active-fallback",
+                state: ModelFile.State.DOWNLOADING,
+                local_size: 24,
+                remote_size: 100,
+                transferred_size: null,
+                expected: 24
+            }
+        ];
+
+        let count = -1;
+        viewService.files.subscribe({
+            next: list => {
+                if (count >= 0) {
+                    expect(list.size).toBe(1);
+                    const file = list.get(0);
+                    expect(file.transferredSize).toBe(testVectors[count].expected);
+                }
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(0);
+
+        for (const vector of testVectors) {
+            const model = Immutable.Map<string, ModelFile>().set("a", new ModelFile({
+                name: vector.name,
+                state: vector.state,
+                local_size: vector.local_size,
+                remote_size: vector.remote_size,
+                transferred_size: vector.transferred_size
+            }));
+            mockModelService._files.next(model);
+            tick();
+        }
+        expect(count).toBe(testVectors.length);
     }));
 
     it("should correctly set the ViewFile status", fakeAsync(() => {

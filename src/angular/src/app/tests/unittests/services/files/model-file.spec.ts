@@ -12,6 +12,7 @@ describe("Testing model file initialization", () => {
             is_dir: false,
             local_size: 1234,
             remote_size: 4567,
+            transferred_size: 1234,
             download_progress: 42,
             state: "default",
             downloading_speed: 99,
@@ -64,6 +65,7 @@ describe("Testing model file initialization", () => {
         expect(baseModelFile.is_dir).toBe(false);
         expect(baseModelFile.local_size).toBe(1234);
         expect(baseModelFile.remote_size).toBe(4567);
+        expect(baseModelFile.transferred_size).toBe(1234);
         expect(baseModelFile.download_progress).toBe(42);
         expect(baseModelFile.state).toBe(ModelFile.State.DEFAULT);
         expect(baseModelFile.downloading_speed).toBe(99);
@@ -99,6 +101,7 @@ describe("Testing model file initialization", () => {
                 is_dir: true,
                 local_size: 1,
                 remote_size: 11,
+                transferred_size: 1,
                 download_progress: 11,
                 state: "default",
                 downloading_speed: 111,
@@ -111,6 +114,7 @@ describe("Testing model file initialization", () => {
                         is_dir: false,
                         local_size: 1,
                         remote_size: 11,
+                        transferred_size: 1,
                         download_progress: 12,
                         state: "default",
                         downloading_speed: 111,
@@ -126,6 +130,7 @@ describe("Testing model file initialization", () => {
                 is_dir: false,
                 local_size: 2,
                 remote_size: 22,
+                transferred_size: 2,
                 download_progress: 22,
                 state: "default",
                 downloading_speed: 222,
@@ -143,6 +148,7 @@ describe("Testing model file initialization", () => {
         expect(a.is_dir).toBe(true);
         expect(a.local_size).toBe(1);
         expect(a.remote_size).toBe(11);
+        expect(a.transferred_size).toBe(1);
         expect(a.download_progress).toBe(11);
         expect(a.state).toBe(ModelFile.State.DEFAULT);
         expect(a.downloading_speed).toBe(111);
@@ -156,6 +162,7 @@ describe("Testing model file initialization", () => {
         expect(aa.is_dir).toBe(false);
         expect(aa.local_size).toBe(1);
         expect(aa.remote_size).toBe(11);
+        expect(aa.transferred_size).toBe(1);
         expect(aa.download_progress).toBe(12);
         expect(aa.state).toBe(ModelFile.State.DEFAULT);
         expect(aa.downloading_speed).toBe(111);
@@ -169,6 +176,7 @@ describe("Testing model file initialization", () => {
         expect(b.is_dir).toBe(false);
         expect(b.local_size).toBe(2);
         expect(b.remote_size).toBe(22);
+        expect(b.transferred_size).toBe(2);
         expect(b.download_progress).toBe(22);
         expect(b.state).toBe(ModelFile.State.DEFAULT);
         expect(b.downloading_speed).toBe(222);
