@@ -29,7 +29,7 @@ module.exports = function (config) {
         colors: true,
         logLevel: config.LOG_INFO,
         autoWatch: true,
-        browsers: ['Chrome'],
+        browsers: ['ChromeHeadless'],
         singleRun: false,
         browserDisconnectTimeout: 30000,
         browserDisconnectTolerance: 3,
@@ -38,25 +38,6 @@ module.exports = function (config) {
         processKillTimeout: 10000,
 
         customLaunchers: {
-            ChromeHeadless: {
-                base: 'Chrome',
-                flags: [
-                    '--headless=new',
-                    '--disable-gpu',
-                    '--remote-debugging-port=9222',
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-setuid-sandbox',
-                    '--disable-extensions',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--mute-audio',
-                    '--no-first-run',
-                    '--user-data-dir=/tmp/chrome-user-data',
-                    '--window-size=1920,1080'
-                ]
-            },
             ChromeHeadlessCI: {
                 base: 'Chrome',
                 flags: [

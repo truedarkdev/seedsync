@@ -5,7 +5,7 @@
 # Environment Setup
 
 ## Install dependencies
-1. Install [nodejs](https://joshtronic.com/2019/04/29/how-to-install-node-v12-on-debian-and-ubuntu/) (comes with npm)
+1. Install [Node.js 20 LTS](https://nodejs.org/en/download) (comes with npm). The Angular toolchain here is validated against the Docker baseline, not the old Node 12-era setup.
 
 2. Install [Poetry](https://python-poetry.org/docs/#installation):
 
@@ -44,7 +44,7 @@ poetry install
 ## Setup angular node modules
 ```bash
 cd src/angular
-npm install
+npm ci --legacy-peer-deps
 ```
 
 ## Setup end-to-end tests node modules
@@ -220,7 +220,15 @@ poetry run pytest
 
 ```bash
 cd src/angular
-node_modules/@angular/cli/bin/ng test
+npm test
+```
+
+`npm test` uses the headless launcher configured in `karma.conf.js`, so it works
+without a GUI Chrome session. If you want an interactive browser run for local
+debugging, override the browser explicitly, for example:
+
+```bash
+npm test -- --browsers Chrome
 ```
 
 ### E2E Tests
