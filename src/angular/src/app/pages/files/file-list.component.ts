@@ -130,9 +130,7 @@ export class FileListComponent implements OnInit, OnDestroy {
         this.viewFileService.stop(file).subscribe(
             data => {
                 this._logger.info(data);
-                if (data != null && !data.success) {
-                    this.resetFileLoading(file);
-                }
+                this.resetFileLoading(file);
             },
             () => {
                 this.resetFileLoading(file);

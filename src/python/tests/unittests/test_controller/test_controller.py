@@ -374,6 +374,13 @@ class TestController(unittest.TestCase):
         self.assertEqual({"keep-id"}, self.controller._Controller__persist.downloaded_file_names)
         self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({"keep-id"})
 
+    def test_update_model_forwards_stopped_file_names(self):
+        self.controller._Controller__persist.stopped_file_names = {"stopped-id"}
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_stopped_files.assert_called_once_with({"stopped-id"})
+
     @patch("controller.controller.ModelDiffUtil.diff_models")
     def test_update_model_keeps_downloaded_file_ids_when_new_download_completes(self, diff_models):
         added_file = ModelFile("keep", False)
@@ -548,6 +555,23 @@ class TestController(unittest.TestCase):
         file.path_pair_id = "movies"
         file.remote_size = 10
         self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_queue_clears_legacy_stopped_name_identity(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__persist.stopped_file_names = {file.name}
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")

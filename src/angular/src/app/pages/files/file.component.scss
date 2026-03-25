@@ -171,6 +171,7 @@
 }
 .actions .button {
     @extend %button;
+    padding: 0;
 
     /* bottom margin for when buttons get wrapped to multiple rows */
     margin-bottom: 10px;
@@ -216,6 +217,10 @@
     @keyframes spin {
         0% { transform: rotate(0deg); }
         100% { transform: rotate(360deg); }
+    }
+
+    &[disabled] {
+        pointer-events: none;
     }
 
     // Show loader icon when loading

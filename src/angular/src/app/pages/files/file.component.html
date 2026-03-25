@@ -69,7 +69,9 @@
             </div>
         </div>
         <div class="speed">
-            <span *ngIf="file.downloadingSpeed">{{file.downloadingSpeed | fileSize:3}}/s</span>
+            <span *ngIf="file.status === ViewFile.Status.DOWNLOADING && file.downloadingSpeed">
+                {{file.downloadingSpeed | fileSize:3}}/s
+            </span>
             <!-- for mobile layout -->
             <div class="speed-eta">
                 <span *ngIf="file.status === ViewFile.Status.DOWNLOADING">eta: {{file.eta | eta}}</span>
@@ -114,15 +116,16 @@
             <img src="assets/icons/queue.svg" />
             <div class="text"><span>Queue</span></div>
         </div>
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isStoppable() ? null : true"
+        <button type="button" class="button stop-action" appClickStopPropagation
+             [disabled]="!isStoppable()"
+             [attr.aria-disabled]="!isStoppable()"
              [class.disabled]="!isStoppable()"
-             (click)="!isStoppable() || onStop(file)"
+             (click)="onStop(file)"
              [class.loading]="activeAction == FileAction.STOP">
             <div class="loader"></div>
             <img src="assets/icons/stop.svg" />
             <div class="text"><span>Stop</span></div>
-        </div>
+        </button>
         <div class="button" appClickStopPropagation
              [attr.disabled]="isExtractable() ? null : true"
              [class.disabled]="!isExtractable()"

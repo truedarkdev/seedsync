@@ -1,4 +1,8 @@
-import {ChangeDetectorRef, SimpleChange} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {ChangeDetectorRef, Directive, Input, Pipe, PipeTransform, SimpleChange} from "@angular/core";
+import {ComponentFixture, TestBed} from "@angular/core/testing";
+import {By} from "@angular/platform-browser";
+import {Observable} from "rxjs/Rx";
 
 import {Modal} from "ngx-modialog/plugins/bootstrap";
 
@@ -15,10 +19,37 @@ class MockChangeDetectorRef {
     markForCheck = jasmine.createSpy("markForCheck");
 }
 
+@Directive({
+    selector: "[appClickStopPropagation]"
+})
+class MockClickStopPropagationDirective {}
+
+@Pipe({name: "capitalize"})
+class MockCapitalizePipe implements PipeTransform {
+    transform(value: any): any {
+        return value;
+    }
+}
+
+@Pipe({name: "fileSize"})
+class MockFileSizePipe implements PipeTransform {
+    transform(value: any): any {
+        return value;
+    }
+}
+
+@Pipe({name: "eta"})
+class MockEtaPipe implements PipeTransform {
+    transform(value: any): any {
+        return value;
+    }
+}
+
 function createViewFile(props): ViewFile {
     return new ViewFile({
         fileId: props.fileId || "file-1",
         name: props.name || "sample",
+        status: props.status || ViewFile.Status.DEFAULT,
         isArchive: props.isArchive || false,
         isQueueable: props.isQueueable || false,
         isStoppable: props.isStoppable || false,
@@ -32,6 +63,7 @@ function createViewFile(props): ViewFile {
 describe("Testing file component", () => {
     let component: FileComponent;
     let changeDetector: MockChangeDetectorRef;
+    let fixture: ComponentFixture<FileComponent>;
 
     beforeEach(() => {
         changeDetector = new MockChangeDetectorRef();
@@ -40,6 +72,26 @@ describe("Testing file component", () => {
             new MockModalAccessibilityService() as ModalAccessibilityService,
             changeDetector as unknown as ChangeDetectorRef
         );
+    });
+
+    beforeEach(() => {
+        TestBed.configureTestingModule({
+            declarations: [
+                FileComponent,
+                MockClickStopPropagationDirective,
+                MockCapitalizePipe,
+                MockFileSizePipe,
+                MockEtaPipe
+            ],
+            imports: [CommonModule],
+            providers: [
+                {provide: Modal, useClass: MockModal},
+                {provide: ModalAccessibilityService, useClass: MockModalAccessibilityService},
+                {provide: ChangeDetectorRef, useValue: changeDetector}
+            ]
+        });
+
+        fixture = TestBed.createComponent(FileComponent);
     });
 
     it("should return false for action predicates when file is missing", () => {
@@ -124,5 +176,43 @@ describe("Testing file component", () => {
 
         expect(component.activeAction).toBe(null);
         expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
+    it("should render the stop action as a disabled button for stopped rows", () => {
+        const stopSpy = spyOn(fixture.componentInstance.stopEvent, "emit");
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.STOPPED,
+            isStoppable: false
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = Observable.of(null) as any;
+
+        fixture.detectChanges();
+
+        const stopButton = fixture.debugElement.query(By.css("button.stop-action")).nativeElement as HTMLButtonElement;
+        stopButton.click();
+
+        expect(stopButton.disabled).toBe(true);
+        expect(stopButton.getAttribute("aria-disabled")).toBe("true");
+        expect(stopSpy).not.toHaveBeenCalled();
+    });
+
+    it("should keep the stop action enabled for stoppable rows", () => {
+        const stopSpy = spyOn(fixture.componentInstance.stopEvent, "emit");
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADING,
+            isStoppable: true
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = Observable.of(null) as any;
+
+        fixture.detectChanges();
+
+        const stopButton = fixture.debugElement.query(By.css("button.stop-action")).nativeElement as HTMLButtonElement;
+        stopButton.click();
+
+        expect(stopButton.disabled).toBe(false);
+        expect(fixture.componentInstance.activeAction).toBe(FileAction.STOP);
+        expect(stopSpy).toHaveBeenCalledWith(fixture.componentInstance.file);
     });
 });
