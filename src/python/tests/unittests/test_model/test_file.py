@@ -65,6 +65,23 @@ class TestModelFile(unittest.TestCase):
         with self.assertRaises(ValueError):
             file.transferred_size = -100
 
+    def test_download_progress(self):
+        file = ModelFile("test", False)
+
+        file.download_progress = 100
+        self.assertEqual(100, file.download_progress)
+        file.download_progress = 0
+        self.assertEqual(0, file.download_progress)
+        file.download_progress = None
+        self.assertEqual(None, file.download_progress)
+
+        with self.assertRaises(TypeError):
+            file.download_progress = "BadValue"
+        with self.assertRaises(ValueError):
+            file.download_progress = -100
+        with self.assertRaises(ValueError):
+            file.download_progress = 101
+
     def test_downloading_speed(self):
         file = ModelFile("test", False)
 

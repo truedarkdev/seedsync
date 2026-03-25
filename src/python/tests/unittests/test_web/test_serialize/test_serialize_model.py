@@ -198,6 +198,22 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual(0, data[1]["local_size"])
         self.assertEqual(100, data[2]["local_size"])
 
+    def test_download_progress(self):
+        serialize = SerializeModel()
+        a = ModelFile("a", True)
+        a.download_progress = None
+        b = ModelFile("b", False)
+        b.download_progress = 0
+        c = ModelFile("c", True)
+        c.download_progress = 100
+        files = [a, b, c]
+        out = parse_stream(serialize.model(files))
+        data = json.loads(out["data"])
+        self.assertEqual(3, len(data))
+        self.assertEqual(None, data[0]["download_progress"])
+        self.assertEqual(0, data[1]["download_progress"])
+        self.assertEqual(100, data[2]["download_progress"])
+
     def test_downloading_speed(self):
         serialize = SerializeModel()
         a = ModelFile("a", True)

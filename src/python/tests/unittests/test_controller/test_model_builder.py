@@ -428,6 +428,51 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(99, model.get_file("a").local_size)
 
+    def test_build_download_progress(self):
+        remote_root = SystemFile("a", 100, True)
+        remote_child = SystemFile("aa", 100, False)
+        remote_root.add_child(remote_child)
+
+        local_root = SystemFile("a", 24, True)
+        local_child = SystemFile("aa", 24, False)
+        local_root.add_child(local_child)
+
+        s = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "a", "")
+        s.total_transfer_state = LftpJobStatus.TransferState(24, 100, 60, 1000, 5)
+        s.add_active_file_transfer_state("aa", LftpJobStatus.TransferState(24, 100, 60, 500, 3))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([s])
+        model = self.model_builder.build_model()
+        m_a = model.get_file("a")
+        m_a_ch = {m.name: m for m in m_a.get_children()}
+
+        self.assertEqual(24, m_a.local_size)
+        self.assertEqual(100, m_a.remote_size)
+        self.assertEqual(60, m_a.download_progress)
+        self.assertEqual(60, m_a_ch["aa"].download_progress)
+
+    def test_build_download_progress_fractional_percent_local(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 100, False)])
+        self.model_builder.set_local_files([SystemFile("a", 25, False)])
+        s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        s.total_transfer_state = LftpJobStatus.TransferState(25, 100, 0.25, 1000, 5)
+        self.model_builder.set_lftp_statuses([s])
+        model = self.model_builder.build_model()
+        self.assertEqual(25, model.get_file("a").download_progress)
+
+    def test_build_download_progress_percent_local_one_is_literal_percent(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 100, False)])
+        self.model_builder.set_local_files([SystemFile("a", 1, False)])
+        s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        s.total_transfer_state = LftpJobStatus.TransferState(1, 100, 1.0, 1000, 5)
+        self.model_builder.set_lftp_statuses([s])
+        model = self.model_builder.build_model()
+        self.assertEqual(1, model.get_file("a").download_progress)
+
     def test_build_downloading_state_is_retained(self):
         # downloading files latest info should be retained even after
         # they have stopped downloading
