@@ -125,6 +125,7 @@ class Controller:
         self.__model_builder.set_base_logger(self.logger)
         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
+        self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
         self.__staging_path = self.__build_staging_path(
             self.__context.config.lftp.local_path,
@@ -632,6 +633,7 @@ class Controller:
             for result in latest_extracted_results:
                 self.__persist.extracted_file_names.add(result.name)
             self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
+        self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
         # Build the new model, if needed
         auto_purge_candidate_ids = set()
@@ -779,6 +781,7 @@ class Controller:
                         local_base_dir_path=self.__get_staging_path(file.path_pair_id if path_pair else None)
                     )
                     self.__persist.stopped_file_names.discard(file.file_id)
+                    self.__persist.stopped_file_names.discard(file.name)
                 except LftpError as e:
                     _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
                     continue

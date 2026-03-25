@@ -11,6 +11,7 @@ from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelError, ModelFile, Model
 from controller import ModelBuilder
+from controller.model_builder import _RecentLiveTransferSnapshot
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 
@@ -638,6 +639,323 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(file_a.downloading_speed)
         self.assertIsNone(file_a.eta)
         self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_name_entry_preserves_retained_transfer_metrics_without_active_state(self):
+        self.model_builder.clear()
+        remote_file = SystemFile("dup", 1000, False)
+        remote_file.path_pair_id = "movies"
+        remote_file.path_pair_name = "Movies"
+        local_file = SystemFile("dup", 650, False)
+        local_file.path_pair_id = "movies"
+        local_file.path_pair_name = "Movies"
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stopped_files({"dup"})
+
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "dup", "")
+        status.path_pair_id = "movies"
+        status.path_pair_name = "Movies"
+        status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        file_dup = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        self.assertEqual(ModelFile.State.DEFAULT, file_dup.state)
+        self.assertEqual(750, file_dup.transferred_size)
+        self.assertEqual(75, file_dup.download_progress)
+        self.assertIsNone(file_dup.downloading_speed)
+        self.assertIsNone(file_dup.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_status_only_stopped_file_name_entry_preserves_retained_transfer_metrics(self):
+        self.model_builder.clear()
+        self.model_builder.set_stopped_files({"dup"})
+
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "dup", "")
+        status.path_pair_id = "movies"
+        status.path_pair_name = "Movies"
+        status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        self.model_builder.set_lftp_statuses([status])
+
+        model = self.model_builder.build_model()
+        file_dup = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        self.assertEqual(ModelFile.State.DEFAULT, file_dup.state)
+        self.assertEqual(750, file_dup.transferred_size)
+        self.assertEqual(75, file_dup.download_progress)
+        self.assertIsNone(file_dup.downloading_speed)
+        self.assertIsNone(file_dup.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_id_entry_preserves_retained_snapshot_with_legacy_status_root_id(self):
+        self.model_builder.clear()
+        remote_file = SystemFile("dup", 1000, False)
+        remote_file.path_pair_id = "movies"
+        remote_file.path_pair_name = "Movies"
+        local_file = SystemFile("dup", 650, False)
+        local_file.path_pair_id = "movies"
+        local_file.path_pair_name = "Movies"
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        file_id = ModelFile.build_file_id("dup", "movies")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = _RecentLiveTransferSnapshot(
+            root_file_id="dup",
+            size_local=750,
+            percent_local=75,
+            speed=1000,
+            eta=5
+        )
+        self.model_builder.set_stopped_files({ModelFile.build_file_id("dup", "movies")})
+
+        model = self.model_builder.build_model()
+        file_dup = model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, file_dup.state)
+        self.assertEqual(750, file_dup.transferred_size)
+        self.assertEqual(75, file_dup.download_progress)
+        self.assertIsNone(file_dup.downloading_speed)
+        self.assertIsNone(file_dup.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_id_entry_does_not_suppress_other_path_pair_snapshot(self):
+        self.model_builder.clear()
+        remote_file = SystemFile("dup", 1000, False)
+        remote_file.path_pair_id = "tv"
+        remote_file.path_pair_name = "TV"
+        local_file = SystemFile("dup", 650, False)
+        local_file.path_pair_id = "tv"
+        local_file.path_pair_name = "TV"
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        file_id = ModelFile.build_file_id("dup", "tv")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_id] = _RecentLiveTransferSnapshot(
+            root_file_id="dup",
+            size_local=750,
+            percent_local=75,
+            speed=1000,
+            eta=5
+        )
+        self.model_builder.set_stopped_files({ModelFile.build_file_id("dup", "movies")})
+
+        model = self.model_builder.build_model()
+        file_dup = model.get_file(file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, file_dup.state)
+        self.assertEqual(750, file_dup.transferred_size)
+        self.assertEqual(75, file_dup.download_progress)
+        self.assertEqual(1000, file_dup.downloading_speed)
+        self.assertEqual(5, file_dup.eta)
+        self.assertTrue(self.model_builder.has_changes())
+
+    def test_build_stopped_directory_name_entry_suppresses_child_live_transfer_state(self):
+        remote_root = SystemFile("dup", 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("aa", 1000, False)
+        remote_root.add_child(remote_child)
+
+        local_root = SystemFile("dup", 650, True)
+        local_root.path_pair_id = "movies"
+        local_root.path_pair_name = "Movies"
+        local_child = SystemFile("aa", 650, False)
+        local_root.add_child(local_child)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "dup", "")
+        running_status.path_pair_id = "movies"
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        running_status.add_active_file_transfer_state("aa", LftpJobStatus.TransferState(750, 1000, 75, 1000, 5))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stopped_files({"dup"})
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        child = root.get_children()[0]
+
+        self.assertEqual(ModelFile.State.DEFAULT, root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, child.state)
+        self.assertEqual(650, child.transferred_size)
+        self.assertIsNone(child.download_progress)
+        self.assertIsNone(child.downloading_speed)
+        self.assertIsNone(child.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_directory_name_entry_suppresses_nested_descendant_live_transfer_state(self):
+        remote_root = SystemFile("dup", 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("aa", 1000, True)
+        remote_root.add_child(remote_child)
+        remote_grandchild = SystemFile("bb", 1000, False)
+        remote_child.add_child(remote_grandchild)
+
+        local_root = SystemFile("dup", 650, True)
+        local_root.path_pair_id = "movies"
+        local_root.path_pair_name = "Movies"
+        local_child = SystemFile("aa", 650, True)
+        local_root.add_child(local_child)
+        local_grandchild = SystemFile("bb", 650, False)
+        local_child.add_child(local_grandchild)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "dup", "")
+        running_status.path_pair_id = "movies"
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        running_status.add_active_file_transfer_state("aa/bb", LftpJobStatus.TransferState(750, 1000, 75, 1000, 5))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stopped_files({"dup"})
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        child = root.get_children()[0]
+        grandchild = child.get_children()[0]
+
+        self.assertEqual(ModelFile.State.DEFAULT, root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, child.state)
+        self.assertEqual(ModelFile.State.DEFAULT, grandchild.state)
+        self.assertEqual(650, grandchild.transferred_size)
+        self.assertIsNone(grandchild.download_progress)
+        self.assertIsNone(grandchild.downloading_speed)
+        self.assertIsNone(grandchild.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_descendant_file_id_suppresses_nested_descendant_live_transfer_state(self):
+        remote_root = SystemFile("dup", 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("aa", 1000, True)
+        remote_root.add_child(remote_child)
+        remote_grandchild = SystemFile("bb", 1000, False)
+        remote_child.add_child(remote_grandchild)
+
+        local_root = SystemFile("dup", 650, True)
+        local_root.path_pair_id = "movies"
+        local_root.path_pair_name = "Movies"
+        local_child = SystemFile("aa", 650, True)
+        local_root.add_child(local_child)
+        local_grandchild = SystemFile("bb", 650, False)
+        local_child.add_child(local_grandchild)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "dup", "")
+        running_status.path_pair_id = "movies"
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        running_status.add_active_file_transfer_state("aa/bb", LftpJobStatus.TransferState(750, 1000, 75, 1000, 5))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stopped_files({ModelFile.build_file_id(os.path.join("dup", "aa", "bb"), "movies")})
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        child = root.get_children()[0]
+        grandchild = child.get_children()[0]
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, child.state)
+        self.assertEqual(ModelFile.State.DEFAULT, grandchild.state)
+        self.assertEqual(650, grandchild.transferred_size)
+        self.assertIsNone(grandchild.download_progress)
+        self.assertIsNone(grandchild.downloading_speed)
+        self.assertIsNone(grandchild.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_unrelated_legacy_stopped_name_does_not_suppress_matching_grandchild(self):
+        remote_root = SystemFile("dup", 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("aa", 1000, True)
+        remote_root.add_child(remote_child)
+        remote_grandchild = SystemFile("bb", 1000, False)
+        remote_child.add_child(remote_grandchild)
+
+        local_root = SystemFile("dup", 650, True)
+        local_root.path_pair_id = "movies"
+        local_root.path_pair_name = "Movies"
+        local_child = SystemFile("aa", 650, True)
+        local_root.add_child(local_child)
+        local_grandchild = SystemFile("bb", 650, False)
+        local_child.add_child(local_grandchild)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "dup", "")
+        running_status.path_pair_id = "movies"
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        running_status.add_active_file_transfer_state("aa/bb", LftpJobStatus.TransferState(750, 1000, 75, 1000, 5))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_stopped_files({"bb"})
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        child = root.get_children()[0]
+        grandchild = child.get_children()[0]
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, child.state)
+        self.assertEqual(ModelFile.State.DOWNLOADING, grandchild.state)
+        self.assertEqual(750, grandchild.transferred_size)
+        self.assertEqual(75, grandchild.download_progress)
+        self.assertEqual(1000, grandchild.downloading_speed)
+        self.assertEqual(5, grandchild.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_recent_live_transfer_descendant_snapshot_ignores_unrelated_legacy_stopped_name(self):
+        remote_root = SystemFile("dup", 1000, True)
+        remote_root.path_pair_id = "movies"
+        remote_root.path_pair_name = "Movies"
+        remote_child = SystemFile("aa", 1000, True)
+        remote_root.add_child(remote_child)
+        remote_grandchild = SystemFile("bb", 1000, False)
+        remote_child.add_child(remote_grandchild)
+
+        local_root = SystemFile("dup", 650, True)
+        local_root.path_pair_id = "movies"
+        local_root.path_pair_name = "Movies"
+        local_child = SystemFile("aa", 650, True)
+        local_root.add_child(local_child)
+        local_grandchild = SystemFile("bb", 650, False)
+        local_child.add_child(local_grandchild)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "dup", "")
+        running_status.path_pair_id = "movies"
+        running_status.path_pair_name = "Movies"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 75, 1000, 5)
+        running_status.add_active_file_transfer_state("aa/bb", LftpJobStatus.TransferState(750, 1000, 75, 1000, 5))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        grandchild = root.get_children()[0].get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADING, grandchild.state)
+        self.assertEqual(750, grandchild.transferred_size)
+        self.assertEqual(75, grandchild.download_progress)
+        self.assertFalse(self.model_builder.has_changes())
+
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_stopped_files({"bb"})
+
+        model = self.model_builder.build_model()
+        root = model.get_file(ModelFile.build_file_id("dup", "movies"))
+        child = root.get_children()[0]
+        grandchild = child.get_children()[0]
+        self.assertEqual(ModelFile.State.DOWNLOADING, root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, child.state)
+        self.assertEqual(ModelFile.State.DOWNLOADING, grandchild.state)
+        self.assertEqual(750, grandchild.transferred_size)
+        self.assertEqual(75, grandchild.download_progress)
+        self.assertEqual(1000, grandchild.downloading_speed)
+        self.assertEqual(5, grandchild.eta)
+        self.assertTrue(self.model_builder.has_changes())
 
     def test_build_recent_live_transfer_snapshot_survives_until_local_catches_up(self):
         self.model_builder.clear()

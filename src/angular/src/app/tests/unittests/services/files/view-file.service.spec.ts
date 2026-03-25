@@ -290,7 +290,7 @@ describe("Testing view file service", () => {
     it("should correctly set ViewFile percent downloaded", fakeAsync(() => {
         // Test vectors of local size, remote size, state, transfer progress, percentage
         let testVectors = [
-            [24, 100, ModelFile.State.DEFAULT, 60, 24],
+            [24, 100, ModelFile.State.DEFAULT, 60, 60],
             [24, 100, ModelFile.State.DOWNLOADING, 60, 60],
             [24, 100, ModelFile.State.DOWNLOADING, null, 24],
             [null, 100, ModelFile.State.DOWNLOADING, 60, 60],
@@ -326,6 +326,84 @@ describe("Testing view file service", () => {
             tick();
         }
         expect(count).toBe(testVectors.length);
+    }));
+
+    it("should preserve retained stopped progress from transferred size and snapshot percent", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("partial", new ModelFile({
+            name: "partial",
+            state: ModelFile.State.DEFAULT,
+            local_size: 50,
+            remote_size: 100,
+            transferred_size: 75,
+            download_progress: 75
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let count = 0;
+        viewService.files.subscribe({
+            next: list => {
+                expect(list.size).toBe(1);
+                const file = list.get(0);
+                expect(file.status).toBe(ViewFile.Status.STOPPED);
+                expect(file.transferredSize).toBe(75);
+                expect(file.percentDownloaded).toBe(75);
+                count++;
+            }
+        });
+        tick();
+        expect(count).toBe(1);
+    }));
+
+    it("should mark retained-progress rows as stopped even when local size is zero", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("partial", new ModelFile({
+            name: "partial",
+            state: ModelFile.State.DEFAULT,
+            local_size: 0,
+            remote_size: 100,
+            transferred_size: 25,
+            download_progress: 25
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let latestFile: ViewFile = null;
+        viewService.files.subscribe({
+            next: list => {
+                latestFile = list.get(0);
+            }
+        });
+        tick();
+
+        expect(latestFile.status).toBe(ViewFile.Status.STOPPED);
+        expect(latestFile.transferredSize).toBe(25);
+        expect(latestFile.percentDownloaded).toBe(25);
+    }));
+
+    it("should preserve stopped retained progress when remote size is missing", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>().set("partial", new ModelFile({
+            name: "partial",
+            state: ModelFile.State.DEFAULT,
+            local_size: 0,
+            remote_size: null,
+            transferred_size: 25,
+            download_progress: 25
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        let latestFile: ViewFile = null;
+        viewService.files.subscribe({
+            next: list => {
+                latestFile = list.get(0);
+            }
+        });
+        tick();
+
+        expect(latestFile.status).toBe(ViewFile.Status.STOPPED);
+        expect(latestFile.transferredSize).toBe(25);
+        expect(latestFile.percentDownloaded).toBe(25);
+        expect(latestFile.remoteSize).toBe(0);
     }));
 
     it("should treat local-only default files as complete", fakeAsync(() => {

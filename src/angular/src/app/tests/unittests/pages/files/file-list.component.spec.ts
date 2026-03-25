@@ -91,7 +91,7 @@ describe("Testing file list component", () => {
         expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
     });
 
-    it("should keep the stop loading state when the stop request succeeds", () => {
+    it("should clear the stop loading state when the stop request succeeds", () => {
         mockViewFileService.stop.and.returnValue(
             Observable.of(new WebReaction(true, "ok", null))
         );
@@ -99,7 +99,7 @@ describe("Testing file list component", () => {
         component.onStop(createViewFile());
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).not.toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
     });
 
     it("should clear the stop loading state when the stop request errors", () => {
