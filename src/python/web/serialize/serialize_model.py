@@ -53,6 +53,7 @@ class SerializeModel(Serialize):
     }
     __KEY_FILE_REMOTE_SIZE = "remote_size"
     __KEY_FILE_LOCAL_SIZE = "local_size"
+    __KEY_FILE_DOWNLOAD_PROGRESS = "download_progress"
     __KEY_FILE_DOWNLOADING_SPEED = "downloading_speed"
     __KEY_FILE_ETA = "eta"
     __KEY_FILE_IS_EXTRACTABLE = "is_extractable"
@@ -77,6 +78,7 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_STATE] = SerializeModel.__VALUES_FILE_STATE[model_file.state]
         json_dict[SerializeModel.__KEY_FILE_REMOTE_SIZE] = model_file.remote_size
         json_dict[SerializeModel.__KEY_FILE_LOCAL_SIZE] = model_file.local_size
+        json_dict[SerializeModel.__KEY_FILE_DOWNLOAD_PROGRESS] = model_file.download_progress
         json_dict[SerializeModel.__KEY_FILE_DOWNLOADING_SPEED] = model_file.downloading_speed
         json_dict[SerializeModel.__KEY_FILE_ETA] = model_file.eta
         json_dict[SerializeModel.__KEY_FILE_IS_EXTRACTABLE] = model_file.is_extractable

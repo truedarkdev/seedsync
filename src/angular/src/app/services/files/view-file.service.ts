@@ -415,7 +415,10 @@ export class ViewFileService {
             remoteSize = 0;
         }
         let percentDownloaded: number = 0;
-        if (remoteSize > 0) {
+        // Prefer the live transfer percentage for active downloads; fall back to size ratios otherwise.
+        if (modelFile.state === ModelFile.State.DOWNLOADING && modelFile.download_progress != null) {
+            percentDownloaded = modelFile.download_progress;
+        } else if (remoteSize > 0) {
             percentDownloaded = Math.round(100.0 * localSize / remoteSize);
         }
 

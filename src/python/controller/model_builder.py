@@ -51,6 +51,18 @@ class ModelBuilder:
         model_file.path_pair_id = path_pair_id
         model_file.path_pair_name = path_pair_name
 
+    @staticmethod
+    def __normalize_download_progress(percent_local):
+        if percent_local is None:
+            return None
+        if type(percent_local) == float:
+            # Treat fractional values below 1.0 as 0-1 progress fractions.
+            # Keep an exact 1.0 as a literal 1% reading rather than 100%.
+            if percent_local < 1:
+                return int(round(percent_local * 100))
+            return int(round(percent_local))
+        return percent_local
+
     def set_active_files(self, active_files: List[SystemFile]):
         # Update the local file state with this latest information
         for file in active_files:
@@ -171,6 +183,9 @@ class ModelBuilder:
 
                 # set the downloading speed and eta
                 if _transfer_state:
+                    download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
+                    if download_progress is not None:
+                        _model_file.download_progress = download_progress
                     _model_file.downloading_speed = _transfer_state.speed
                     _model_file.eta = _transfer_state.eta
 

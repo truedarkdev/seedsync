@@ -231,16 +231,13 @@ describe("Testing view file service", () => {
     }));
 
     it("should correctly set ViewFile percent downloaded", fakeAsync(() => {
-        // Test vectors of local size, remote size, percentage
+        // Test vectors of local size, remote size, state, transfer progress, percentage
         let testVectors = [
-            [0, 10, 0],
-            [1, 3, 33],
-            [2, 3, 67],
-            [5, 10, 50],
-            [10, 10, 100],
-            [null, 10, 0],
-            [10, null, 0],
-            [0, 0, 0]
+            [24, 100, ModelFile.State.DEFAULT, 60, 24],
+            [24, 100, ModelFile.State.DOWNLOADING, 60, 60],
+            [24, 100, ModelFile.State.DOWNLOADING, null, 24],
+            [null, 100, ModelFile.State.DOWNLOADING, 60, 60],
+            [0, 0, ModelFile.State.DEFAULT, 60, 0]
         ];
 
         let count = -1;
@@ -250,7 +247,7 @@ describe("Testing view file service", () => {
                 if(count >= 0) {
                     expect(list.size).toBe(1);
                     let file = list.get(0);
-                    expect(file.percentDownloaded).toBe(testVectors[count][2]);
+                    expect(file.percentDownloaded).toBe(testVectors[count][4]);
                 }
                 count++;
             }
@@ -265,6 +262,8 @@ describe("Testing view file service", () => {
                 name: "a",
                 local_size: vector[0],
                 remote_size: vector[1],
+                state: vector[2],
+                download_progress: vector[3],
             }));
             mockModelService._files.next(model);
             tick();

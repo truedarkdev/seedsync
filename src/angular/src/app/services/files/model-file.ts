@@ -12,6 +12,7 @@ interface IModelFile {
     is_dir: boolean;
     local_size: number;
     remote_size: number;
+    download_progress: number;
     state: ModelFile.State;
     downloading_speed: number;
     eta: number;
@@ -36,6 +37,7 @@ const DefaultModelFile: IModelFile = {
     is_dir: null,
     local_size: null,
     remote_size: null,
+    download_progress: null,
     state: null,
     downloading_speed: null,
     eta: null,
@@ -66,6 +68,7 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     is_dir: boolean;
     local_size: number;
     remote_size: number;
+    download_progress: number;
     state: ModelFile.State;
     downloading_speed: number;
     eta: number;
