@@ -23,6 +23,7 @@ describe("Testing model file initialization", () => {
             local_modified_timestamp: "1541828418.9439101",
             remote_created_timestamp: "1541828418.0",
             remote_modified_timestamp: "1541828418.9439101",
+            is_stoppable: true,
             children: []
         };
         baseModelFile = ModelFile.fromJson(baseJson);
@@ -72,6 +73,7 @@ describe("Testing model file initialization", () => {
         expect(baseModelFile.eta).toBe(54);
         expect(baseModelFile.full_path).toBe("/full/path/to/file.one");
         expect(baseModelFile.is_extractable).toBe(true);
+        expect(baseModelFile.is_stoppable).toBe(true);
         expect(baseModelFile.local_created_timestamp).toEqual(new Date("November 9, 2018 21:40:18 PST"));
         expect(baseModelFile.local_modified_timestamp).toEqual(new Date(1541828418943));
         expect(baseModelFile.remote_created_timestamp).toEqual(new Date("November 9, 2018 21:40:18 PST"));
@@ -108,6 +110,7 @@ describe("Testing model file initialization", () => {
                 eta: 1111,
                 full_path: "root/a",
                 is_extractable: true,
+                is_stoppable: false,
                 children: [
                     {
                         name: "aa",
@@ -121,6 +124,7 @@ describe("Testing model file initialization", () => {
                         eta: 1111,
                         full_path: "root/a/aa",
                         is_extractable: true,
+                        is_stoppable: true,
                         children: []
                     },
                 ]
@@ -137,6 +141,7 @@ describe("Testing model file initialization", () => {
                 eta: 2222,
                 full_path: "root/b",
                 is_extractable: false,
+                is_stoppable: false,
                 children: []
             }
         ];
@@ -155,6 +160,7 @@ describe("Testing model file initialization", () => {
         expect(a.eta).toBe(1111);
         expect(a.full_path).toBe("root/a");
         expect(a.is_extractable).toBe(true);
+        expect(a.is_stoppable).toBe(false);
         expect(a.children.size).toBe(1);
 
         let aa = a.children.find(value => {return value.name === "aa"});
@@ -169,6 +175,7 @@ describe("Testing model file initialization", () => {
         expect(aa.eta).toBe(1111);
         expect(aa.full_path).toBe("root/a/aa");
         expect(aa.is_extractable).toBe(true);
+        expect(aa.is_stoppable).toBe(true);
         expect(aa.children.size).toBe(0);
 
         let b = baseModelFile.children.find(value => {return value.name === "b"});
@@ -183,6 +190,7 @@ describe("Testing model file initialization", () => {
         expect(b.eta).toBe(2222);
         expect(b.full_path).toBe("root/b");
         expect(b.is_extractable).toBe(false);
+        expect(b.is_stoppable).toBe(false);
         expect(b.children.size).toBe(0);
     });
 });

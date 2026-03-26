@@ -3,7 +3,7 @@
 import os
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import math
 import json
 
@@ -35,8 +35,10 @@ class ModelBuilder:
     """
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
+        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__local_files = dict()
         self.__remote_files = dict()
+        self.__active_file_ids = set()
         self.__lftp_statuses = dict()
         self.__recent_live_transfer_snapshots = dict()
         self.__retained_stopped_transfer_snapshots = dict()
@@ -45,10 +47,78 @@ class ModelBuilder:
         self.__extracted_files = set()
         self.__stopped_files = set()
         self.__validation_statuses = dict()
+        self.__local_root_paths = dict()
+        self.__local_staging_paths = dict()
         self.__cached_model = None
+        self.__stop_resume_trace_file_id = None
+        self.__stop_resume_trace_cycle_id = None
+        self.__stop_resume_trace_emitted = False
+        self.__stop_resume_trace_last_idle_signature = None
 
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("ModelBuilder")
+        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
+
+    def set_stop_resume_trace_file_id(self, file_id: Optional[str]):
+        self.__stop_resume_trace_file_id = file_id.strip() if file_id is not None and file_id.strip() else None
+        self.__stop_resume_trace_last_idle_signature = None
+
+    def __is_stop_resume_trace_enabled(self) -> bool:
+        return self.__stop_resume_trace_file_id is not None
+
+    @staticmethod
+    def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
+        if identifier is None:
+            return None
+        try:
+            parsed_identifier = json.loads(identifier)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return identifier
+        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
+            return parsed_identifier[1]
+        return identifier
+
+    def __trace_selector_matches_model_file(self, model_file: ModelFile, root_file_id: str) -> bool:
+        if not self.__is_stop_resume_trace_enabled():
+            return False
+        if self.__stop_resume_trace_file_id == model_file.file_id:
+            return True
+        if model_file.file_id != root_file_id:
+            return False
+        selector_name = self.__extract_trace_selector_name(self.__stop_resume_trace_file_id)
+        return selector_name == model_file.name
+
+    def begin_stop_resume_trace_cycle(self, cycle_id: int):
+        self.__stop_resume_trace_cycle_id = cycle_id
+        self.__stop_resume_trace_emitted = False
+
+    def finish_stop_resume_trace_cycle(self, model: Model, build_triggered: bool):
+        if not self.__is_stop_resume_trace_enabled() or self.__stop_resume_trace_emitted:
+            return
+        target_file = None
+        try:
+            target_file = model.get_file(self.__stop_resume_trace_file_id)
+        except ModelError:
+            for file_id in model.get_file_ids():
+                candidate_file = model.get_file(file_id)
+                if self.__trace_selector_matches_model_file(candidate_file, candidate_file.file_id):
+                    target_file = candidate_file
+                    break
+
+        event = "target_not_rendered" if build_triggered else "no_rebuild"
+        payload = {
+            "model_source": "rebuilt" if build_triggered else "cached",
+            "target_file_id": self.__stop_resume_trace_file_id,
+            "final_model": self.__summarize_rendered_model(target_file),
+        }
+        idle_signature = json.dumps({
+            "event": event,
+            "payload": payload,
+        }, sort_keys=True)
+        if idle_signature == self.__stop_resume_trace_last_idle_signature:
+            return
+        self.__stop_resume_trace_last_idle_signature = idle_signature
+        self.__trace_cycle_event(event, payload)
 
     @staticmethod
     def __root_file_id(name: str, path_pair_id: Optional[str]) -> str:
@@ -107,6 +177,214 @@ class ModelBuilder:
     def __apply_path_pair_metadata(model_file: ModelFile, path_pair_id: Optional[str], path_pair_name: Optional[str]):
         model_file.path_pair_id = path_pair_id
         model_file.path_pair_name = path_pair_name
+
+    @staticmethod
+    def __enum_name(value):
+        return value.name if value is not None and hasattr(value, "name") else value
+
+    @staticmethod
+    def __collect_active_file_ids(system_file: SystemFile,
+                                  file_ids: Set[str],
+                                  parent_path: Optional[str] = None,
+                                  path_pair_id: Optional[str] = None):
+        current_path = system_file.name if parent_path is None else os.path.join(parent_path, system_file.name)
+        effective_path_pair_id = system_file.path_pair_id if system_file.path_pair_id is not None else path_pair_id
+        file_ids.add(ModelFile.build_file_id(current_path, effective_path_pair_id))
+        for child in system_file.children:
+            ModelBuilder.__collect_active_file_ids(child, file_ids, current_path, effective_path_pair_id)
+
+    @staticmethod
+    def __summarize_transfer_state(transfer_state: Optional[LftpJobStatus.TransferState]):
+        if transfer_state is None:
+            return None
+        return {
+            "size_local": transfer_state.size_local,
+            "size_remote": transfer_state.size_remote,
+            "percent_local": transfer_state.percent_local,
+            "speed": transfer_state.speed,
+            "eta": transfer_state.eta,
+        }
+
+    @staticmethod
+    def __summarize_rendered_model(model_file: Optional[ModelFile]):
+        if model_file is None:
+            return None
+        return {
+            "state": ModelBuilder.__enum_name(model_file.state),
+            "transferred_size": model_file.transferred_size,
+            "download_progress": model_file.download_progress,
+            "downloading_speed": model_file.downloading_speed,
+            "eta": model_file.eta,
+        }
+
+    @staticmethod
+    def __summarize_local_freshness(local_file: Optional[SystemFile]) -> str:
+        if local_file is None:
+            return "missing"
+        return "staging" if getattr(local_file, "is_staging", False) else "authoritative"
+
+    @staticmethod
+    def __summarize_local_data_role(model_file: Optional[ModelFile],
+                                    local_file: Optional[SystemFile],
+                                    transfer_state: Optional[LftpJobStatus.TransferState],
+                                    arbitration_source: str) -> Optional[str]:
+        if local_file is None or model_file is None:
+            return None
+        if arbitration_source in (
+            "suppressed_by_authoritative_local_completion",
+            "suppressed_by_staging_completion_after_live_status_lost",
+            "staging_completion_without_live_status",
+        ):
+            return "completion"
+        if ModelBuilder.__is_authoritative_local_file(local_file) and \
+                transfer_state is None and \
+                local_file.size is not None and \
+                model_file.transferred_size is not None and \
+                model_file.transferred_size == local_file.size and \
+                model_file.state != ModelFile.State.DOWNLOADED:
+            return "progress"
+        return "presence"
+
+    @staticmethod
+    def __is_stoppable_model_file(model_file: ModelFile,
+                                  local_file: Optional[SystemFile],
+                                  current_transfer_state: Optional[LftpJobStatus.TransferState]) -> bool:
+        if model_file.state == ModelFile.State.QUEUED:
+            return True
+        if model_file.state != ModelFile.State.DOWNLOADING:
+            return False
+        if current_transfer_state is None:
+            return False
+        if model_file.is_dir:
+            return True
+        return local_file is not None and \
+            getattr(local_file, "status_sidecar_ready", False)
+
+    def set_local_root_paths(self,
+                             local_root_paths: Dict[Optional[str], str],
+                             local_staging_paths: Optional[Dict[Optional[str], str]] = None):
+        self.__local_root_paths = {path_pair_id: path for path_pair_id, path in local_root_paths.items() if path}
+        self.__local_staging_paths = {
+            path_pair_id: path for path_pair_id, path in (local_staging_paths or {}).items() if path
+        }
+
+    def __resolve_local_disk_path(self,
+                                  model_file: ModelFile,
+                                  local_file: Optional[SystemFile]) -> Optional[str]:
+        if local_file is None:
+            return None
+        root_paths = self.__local_staging_paths if getattr(local_file, "is_staging", False) else self.__local_root_paths
+        resolved_root = root_paths.get(model_file.path_pair_id)
+        if resolved_root is None and model_file.path_pair_id is not None:
+            resolved_root = root_paths.get(None)
+        if resolved_root is None:
+            return None
+        return os.path.join(resolved_root, model_file.full_path)
+
+    def __get_allocated_local_size(self, model_file: ModelFile, local_file: Optional[SystemFile]) -> Optional[int]:
+        local_path = self.__resolve_local_disk_path(model_file, local_file)
+        if local_path is None or not os.path.exists(local_path):
+            return None
+        try:
+            stat_result = os.stat(local_path)
+        except (OSError, TypeError, ValueError):
+            return None
+        blocks = getattr(stat_result, "st_blocks", None)
+        if blocks is None:
+            return None
+        try:
+            return int(blocks) * 512
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def __summarize_snapshot_source(arbitration_source: str) -> str:
+        if arbitration_source == "recent_live_snapshot":
+            return "recent_live_snapshot"
+        if arbitration_source == "retained_recent_live_snapshot":
+            return "retained_recent_live_snapshot"
+        if arbitration_source in (
+            "retained_stopped_snapshot",
+            "retained_stopped_snapshot_from_live_status",
+            "retained_stopped_snapshot_without_live_progress",
+            "live_status_coalesced_with_retained_floor",
+        ):
+            return "retained_stopped_snapshot"
+        return "none"
+
+    def __trace_cycle_event(self, event: str, payload: dict):
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        trace_payload = {
+            "cycle": self.__stop_resume_trace_cycle_id,
+            "event": event,
+        }
+        trace_payload.update(payload)
+        self.__stop_resume_trace_logger.info("stop_resume_trace %s", json.dumps(trace_payload, sort_keys=True))
+
+    def __trace_target_arbitration(self,
+                                   model_file: ModelFile,
+                                   root_file_id: str,
+                                   is_stopped: bool,
+                                   remote_present: bool,
+                                   local_present: bool,
+                                   local: Optional[SystemFile],
+                                   active_present: bool,
+                                   local_freshness: str,
+                                   status: Optional[LftpJobStatus],
+                                   transfer_state: Optional[LftpJobStatus.TransferState],
+                                   arbitration_source: str):
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        if not self.__trace_selector_matches_model_file(model_file, root_file_id):
+            return
+        self.__stop_resume_trace_emitted = True
+        self.__stop_resume_trace_last_idle_signature = None
+        self.__trace_cycle_event("arbitration", {
+            "model_source": "rebuilt",
+            "snapshot_source": ModelBuilder.__summarize_snapshot_source(arbitration_source),
+            "local_freshness": local_freshness,
+            "recent_snapshot_present": arbitration_source == "recent_live_snapshot",
+            "retained_snapshot_present": arbitration_source in (
+                "retained_recent_live_snapshot",
+                "retained_stopped_snapshot",
+                "retained_stopped_snapshot_from_live_status",
+                "retained_stopped_snapshot_without_live_progress",
+                "live_status_coalesced_with_retained_floor",
+            ),
+            "resolved_identity": {
+                "file_id": model_file.file_id,
+                "root_file_id": root_file_id,
+                "path_pair_id": model_file.path_pair_id,
+                "path_pair_name": model_file.path_pair_name,
+            },
+            "stopped": is_stopped,
+            "raw_lftp_status": {
+                "state": ModelBuilder.__enum_name(status.state) if status is not None else None,
+                "job_id": status.id if status is not None else None,
+                "file_id": status.file_id if status is not None else None,
+                "transfer": ModelBuilder.__summarize_transfer_state(transfer_state),
+            },
+            "matched_local": {
+                "name": local.name if local is not None else None,
+                "path": self.__resolve_local_disk_path(model_file, local),
+            },
+            "local_data_role": ModelBuilder.__summarize_local_data_role(
+                model_file,
+                local,
+                transfer_state,
+                arbitration_source,
+            ),
+            "local_size_apparent": local.size if local is not None else None,
+            "local_size_allocated": self.__get_allocated_local_size(model_file, local),
+            "presence": {
+                "remote": remote_present,
+                "local": local_present,
+                "active": active_present,
+            },
+            "arbitration_source": arbitration_source,
+            "final_model": ModelBuilder.__summarize_rendered_model(model_file),
+        })
 
     @staticmethod
     def __is_authoritative_local_file(local_file: Optional[SystemFile]) -> bool:
@@ -508,11 +786,15 @@ class ModelBuilder:
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
 
     def set_active_files(self, active_files: List[SystemFile]):
+        self.__active_file_ids = set()
         # Update the local file state with this latest information
         for file in active_files:
+            self.__collect_active_file_ids(file, self.__active_file_ids)
             file_id = self.__root_file_id(file.name, file.path_pair_id)
             existing_file = self.__local_files.get(file_id)
             remote_file = self.__remote_files.get(file_id)
+            if existing_file is not None and getattr(existing_file, "is_staging", False):
+                continue
             if existing_file is not None and \
                     self.__is_authoritative_local_file(existing_file) and \
                     getattr(file, "is_staging", False) and \
@@ -602,6 +884,7 @@ class ModelBuilder:
     def clear(self):
         self.__local_files.clear()
         self.__remote_files.clear()
+        self.__active_file_ids.clear()
         self.__lftp_statuses.clear()
         self.__recent_live_transfer_snapshots.clear()
         self.__retained_stopped_transfer_snapshots.clear()
@@ -737,6 +1020,7 @@ class ModelBuilder:
             # later after all children are built, we can set to Downloaded after performing a check
             recent_transfer_state = None
             retained_transfer_state = None
+            arbitration_source = "scan_only"
             raw_current_transfer_state = status.total_transfer_state if status and \
                 status.state == LftpJobStatus.State.RUNNING else None
             current_transfer_state = raw_current_transfer_state if not is_stopped else None
@@ -756,6 +1040,7 @@ class ModelBuilder:
                     status.file_id if status is not None else model_file.file_id,
                     raw_current_transfer_state
                 )
+                arbitration_source = "retained_stopped_snapshot_from_live_status"
             elif current_transfer_state is not None:
                 current_transfer_state = self.__coalesce_retained_stopped_transfer_state(
                     file_id,
@@ -764,6 +1049,9 @@ class ModelBuilder:
                     local,
                     current_transfer_state
                 )
+                arbitration_source = "live_status"
+                if current_transfer_state != raw_current_transfer_state:
+                    arbitration_source = "live_status_coalesced_with_retained_floor"
             elif status is not None:
                 retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
                     file_id,
@@ -772,8 +1060,13 @@ class ModelBuilder:
                     local,
                     preserve_when_local_growth_only=is_stopped
                 )
+                arbitration_source = "retained_stopped_snapshot_without_live_progress" \
+                    if retained_transfer_state is not None else \
+                    "suppressed_stopped_live_status" if is_stopped else "live_status_without_transfer_state"
             if current_transfer_state is None and status is None and not is_stopped:
                 recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
+                if recent_transfer_state is not None:
+                    arbitration_source = "recent_live_snapshot"
             if retained_transfer_state is None and status is None and is_stopped:
                 retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
                     file_id,
@@ -782,13 +1075,19 @@ class ModelBuilder:
                     local,
                     preserve_when_local_growth_only=True
                 )
+                if retained_transfer_state is not None:
+                    arbitration_source = "retained_stopped_snapshot"
             if retained_transfer_state is None and status is None and is_stopped:
                 retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
+                if retained_transfer_state is not None:
+                    arbitration_source = "retained_recent_live_snapshot"
             if status and not is_stopped:
                 model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
                                    else ModelFile.State.DOWNLOADING
                 if status.state == LftpJobStatus.State.QUEUED:
                     self.__evict_recent_live_transfer_snapshots(status.file_id)
+                    if arbitration_source == "scan_only":
+                        arbitration_source = "live_status_queued"
             elif recent_transfer_state:
                 model_file.state = ModelFile.State.DOWNLOADING
             # fill the rest
@@ -850,6 +1149,7 @@ class ModelBuilder:
                     #   Local-only files are Default
                     _child_current_transfer_state = None
                     _child_recent_transfer_state = None
+                    _child_arbitration_source = "scan_only"
                     if _status and _status.state == LftpJobStatus.State.RUNNING and \
                             not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
                             not _child_is_stopped:
@@ -857,6 +1157,8 @@ class ModelBuilder:
                         _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
                         _child_current_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
                                                              if n == _child_status_path), None)
+                        if _child_current_transfer_state is not None:
+                            _child_arbitration_source = "live_status"
                     if _child_current_transfer_state is None and _status is None:
                         _child_recent_transfer_state = self.__get_recent_live_transfer_state(
                             _child_model_file.file_id,
@@ -865,6 +1167,8 @@ class ModelBuilder:
                             _root_remote,
                             _root_local
                         )
+                        if _child_recent_transfer_state is not None:
+                            _child_arbitration_source = "recent_live_snapshot"
                     if _is_dir:
                         _child_model_file.state = ModelFile.State.DEFAULT
                     elif _child_current_transfer_state:
@@ -878,8 +1182,11 @@ class ModelBuilder:
                     elif _remote_child and not _child_is_stopped and \
                             model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
                         _child_model_file.state = ModelFile.State.QUEUED
+                        _child_arbitration_source = "queued_by_root_state"
                     else:
                         _child_model_file.state = ModelFile.State.DEFAULT
+                        if _child_is_stopped and _status is not None:
+                            _child_arbitration_source = "suppressed_stopped_live_status"
 
                     # fill the rest
                     __fill_model_file(_child_model_file,
@@ -889,6 +1196,25 @@ class ModelBuilder:
                                       else _child_recent_transfer_state,
                                       _child_current_transfer_state is not None,
                                       status.file_id if status is not None else None)
+                    _child_model_file.is_stoppable = self.__is_stoppable_model_file(
+                        _child_model_file,
+                        _local_child,
+                        _child_current_transfer_state
+                    )
+                    if self.__is_stop_resume_trace_enabled():
+                        self.__trace_target_arbitration(
+                            _child_model_file,
+                            model_file.file_id,
+                            _child_is_stopped,
+                            _remote_child is not None,
+                            _local_child is not None,
+                            _local_child,
+                            _child_model_file.file_id in self.__active_file_ids,
+                            ModelBuilder.__summarize_local_freshness(_local_child),
+                            _status,
+                            _child_current_transfer_state,
+                            _child_arbitration_source
+                        )
                     # add child to frontier
                     frontier.append((_remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local))
 
@@ -914,6 +1240,30 @@ class ModelBuilder:
                 model_file.download_progress = None
                 model_file.downloading_speed = None
                 model_file.eta = None
+                arbitration_source = "suppressed_by_authoritative_local_completion"
+            if model_file.state == ModelFile.State.DOWNLOADING and \
+                    status is None and \
+                    not is_stopped and \
+                    remote is not None and \
+                    local is not None and \
+                    getattr(local, "is_staging", False) and \
+                    local.size is not None and \
+                    remote.size is not None and \
+                    local.size >= remote.size and \
+                    self.__resolve_recent_live_transfer_snapshot(
+                        file_id,
+                        status.file_id if status is not None else model_file.file_id
+                    )[1] is not None:
+                self.__evict_transfer_completion_snapshots(
+                    file_id,
+                    status.file_id if status is not None else model_file.file_id
+                )
+                model_file.state = ModelFile.State.DOWNLOADED
+                model_file.transferred_size = remote.size
+                model_file.download_progress = None
+                model_file.downloading_speed = None
+                model_file.eta = None
+                arbitration_source = "suppressed_by_staging_completion_after_live_status_lost"
 
             # now we can determine if root is Downloaded
             # root is Downloaded if all child remote files are Downloaded
@@ -927,6 +1277,17 @@ class ModelBuilder:
                         model_file.local_size >= model_file.remote_size:
                     # root is a finished single file
                     model_file.state = ModelFile.State.DOWNLOADED
+                elif not model_file.is_dir and \
+                        status is None and \
+                        not is_stopped and \
+                        model_file.local_size is not None and \
+                        model_file.remote_size is not None and \
+                        getattr(local, "is_staging", False) and \
+                        model_file.local_size >= model_file.remote_size:
+                    # Deadlock escape for a full-size staging copy when scan-only
+                    # is all we have left and no live path can win the arbitration.
+                    model_file.state = ModelFile.State.DOWNLOADED
+                    arbitration_source = "staging_completion_without_live_status"
                 elif not model_file.is_dir and \
                         model_file.local_size is not None and \
                         model_file.remote_size is None and \
@@ -1007,6 +1368,27 @@ class ModelBuilder:
                 model_file.validation_progress = validation_status.progress
                 model_file.validation_error = validation_status.error
                 model_file.corrupt_chunks = validation_status.corrupt_chunks
+
+            model_file.is_stoppable = self.__is_stoppable_model_file(
+                model_file,
+                local,
+                current_transfer_state
+            )
+
+            if self.__is_stop_resume_trace_enabled():
+                self.__trace_target_arbitration(
+                    model_file,
+                    status.file_id if status is not None else model_file.file_id,
+                    is_stopped,
+                    remote is not None,
+                    local is not None,
+                    local,
+                    model_file.file_id in self.__active_file_ids,
+                    ModelBuilder.__summarize_local_freshness(local),
+                    status,
+                    raw_current_transfer_state,
+                    arbitration_source
+                )
 
             model.add_file(model_file)
 

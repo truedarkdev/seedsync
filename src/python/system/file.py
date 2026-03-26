@@ -26,6 +26,7 @@ class SystemFile:
         self.__path_pair_id = None
         self.__path_pair_name = None
         self.__is_staging = is_staging
+        self.__status_sidecar_ready = False
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -77,6 +78,15 @@ class SystemFile:
         if type(is_staging) != bool:
             raise TypeError
         self.__is_staging = is_staging
+
+    @property
+    def status_sidecar_ready(self) -> bool: return self.__status_sidecar_ready
+
+    @status_sidecar_ready.setter
+    def status_sidecar_ready(self, status_sidecar_ready: bool):
+        if type(status_sidecar_ready) != bool:
+            raise TypeError
+        self.__status_sidecar_ready = status_sidecar_ready
 
     def add_child(self, file: "SystemFile"):
         if not self.__is_dir:

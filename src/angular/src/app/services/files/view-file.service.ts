@@ -497,7 +497,8 @@ export class ViewFileService {
                                     ViewFile.Status.CORRUPT].includes(status)
                                     && remoteSize > 0;
         const isStoppable: boolean = [ViewFile.Status.QUEUED,
-                                    ViewFile.Status.DOWNLOADING].includes(status);
+                                    ViewFile.Status.DOWNLOADING].includes(status)
+                                    && modelFile.is_stoppable;
         const isExtractable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,

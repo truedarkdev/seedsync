@@ -7,6 +7,7 @@ from queue import Queue
 from enum import Enum
 from datetime import datetime
 import copy
+import json
 import os
 import shutil
 
@@ -103,6 +104,8 @@ class Controller:
         self.__context = context
         self.__persist = persist
         self.logger = context.logger.getChild("Controller")
+        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
+        self.__stop_resume_trace_file_id = os.environ.get("SEEDSYNC_STOP_RESUME_TRACE_FILE_ID")
 
         # Decide the password here
         self.__password = context.config.lftp.remote_password if not context.config.lftp.use_ssh_key else None
@@ -408,6 +411,86 @@ class Controller:
             return self.__path_pair_staging_paths.get(path_pair_id)
         return self.__staging_path
 
+    def __get_stop_resume_trace_file_details(self, path: str, include_allocated_size: bool = False) -> dict:
+        if path is None:
+            return {
+                "exists": False,
+                "size": None,
+                "mtime": None,
+                "allocated_size": None
+            }
+
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            return {
+                "exists": False,
+                "size": None,
+                "mtime": None,
+                "allocated_size": None
+            }
+
+        details = {
+            "exists": True,
+            "size": stat_result.st_size,
+            "mtime": stat_result.st_mtime,
+            "allocated_size": None
+        }
+        if include_allocated_size:
+            blocks = getattr(stat_result, "st_blocks", None)
+            if blocks is not None:
+                try:
+                    details["allocated_size"] = int(blocks) * 512
+                except (TypeError, ValueError, OverflowError):
+                    details["allocated_size"] = None
+        return details
+
+    def __log_stop_resume_trace(self,
+                                reason: str,
+                                file_id: str,
+                                file_name: str,
+                                path_pair_id: str = None,
+                                is_dir: bool = False,
+                                current_state: str = None,
+                                remote_base_dir_path: str = None,
+                                local_base_dir_path: str = None,
+        stopped_marked: bool = False):
+        trace_file_id = getattr(self, "_Controller__stop_resume_trace_file_id", None)
+        if trace_file_id is None or (trace_file_id != file_id and trace_file_id != file_name):
+            return
+
+        temp_path = None
+        sidecar_path = None
+        if local_base_dir_path is not None and not is_dir:
+            temp_path = os.path.join(local_base_dir_path, file_name + Constants.LFTP_TEMP_FILE_SUFFIX)
+            sidecar_path = temp_path + ".lftp-pget-status"
+
+        temp_details = self.__get_stop_resume_trace_file_details(temp_path, include_allocated_size=True)
+        sidecar_details = self.__get_stop_resume_trace_file_details(sidecar_path)
+        logger = getattr(self, "_Controller__stop_resume_trace_logger", self.logger.getChild("StopResumeTrace"))
+        logger.info(
+            "stop_resume_trace %s",
+            json.dumps({
+                "reason": reason,
+                "file_id": file_id,
+                "filename": file_name,
+                "path_pair_id": path_pair_id,
+                "current_state": current_state,
+                "remote_base_dir_path": remote_base_dir_path,
+                "local_base_dir_path": local_base_dir_path,
+                "stopped_marked": stopped_marked,
+                "temp_path": temp_path,
+                "temp_exists": temp_details["exists"],
+                "temp_apparent_size": temp_details["size"],
+                "temp_allocated_size": temp_details["allocated_size"],
+                "temp_mtime": temp_details["mtime"],
+                "sidecar_path": sidecar_path,
+                "sidecar_exists": sidecar_details["exists"],
+                "sidecar_size": sidecar_details["size"],
+                "sidecar_mtime": sidecar_details["mtime"]
+            }, sort_keys=True)
+        )
+
     def __move_from_staging(self, name: str, path_pair_id: str = None):
         if path_pair_id:
             staging_path = self.__get_staging_path(path_pair_id)
@@ -550,6 +633,18 @@ class Controller:
 
                 path_pair = self.__get_path_pair(path_pair_id)
                 try:
+                    file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    self.__log_stop_resume_trace(
+                        "recover_interrupted_download",
+                        file_id,
+                        file_name,
+                        path_pair_id,
+                        is_dir,
+                        None,
+                        path_pair.remote_path if path_pair is not None else None,
+                        staging_path,
+                        False
+                    )
                     self.__lftp.queue(
                         file_name,
                         is_dir,
@@ -735,7 +830,7 @@ class Controller:
                 if remove_downloaded_file_names:
                     self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                     self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
-                self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                    self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
 
         if remote_reconciliation_established and self.__pending_auto_purge_file_ids:
             pending_auto_purge_candidates = set()
@@ -787,11 +882,25 @@ class Controller:
                     continue
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
+                    local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
+                    stopped_marked = file.file_id in self.__persist.stopped_file_names or \
+                        file.name in self.__persist.stopped_file_names
+                    self.__log_stop_resume_trace(
+                        "queue_after_stop" if stopped_marked else "queue_fresh",
+                        file.file_id,
+                        file.name,
+                        file.path_pair_id,
+                        file.is_dir,
+                        getattr(file.state, "name", file.state),
+                        path_pair.remote_path if path_pair else None,
+                        local_base_dir_path,
+                        stopped_marked
+                    )
                     self.__lftp.queue(
                         file.name,
                         file.is_dir,
                         remote_base_dir_path=path_pair.remote_path if path_pair else None,
-                        local_base_dir_path=self.__get_staging_path(file.path_pair_id if path_pair else None)
+                        local_base_dir_path=local_base_dir_path
                     )
                     self.__persist.stopped_file_names.discard(file.file_id)
                     self.__persist.stopped_file_names.discard(file.name)
@@ -807,13 +916,34 @@ class Controller:
                         409
                     )
                     continue
+                if not file.is_stoppable:
+                    _notify_failure(
+                        command,
+                        "File '{}' could not be stopped".format(command.filename),
+                        409
+                    )
+                    continue
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
                     remote_path = None
                     local_path = None
+                    local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
                     if path_pair is not None:
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
                         local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
+                    stopped_marked = file.file_id in self.__persist.stopped_file_names or \
+                        file.name in self.__persist.stopped_file_names
+                    self.__log_stop_resume_trace(
+                        "stop",
+                        file.file_id,
+                        file.name,
+                        file.path_pair_id,
+                        file.is_dir,
+                        getattr(file.state, "name", file.state),
+                        path_pair.remote_path if path_pair else None,
+                        local_base_dir_path,
+                        stopped_marked
+                    )
                     killed = self.__lftp.kill(
                         file.name,
                         path_pair_id=file.path_pair_id,

@@ -8,6 +8,8 @@ services:
       target: seedsync_run
     environment:
       SEEDSYNC_DEBUG: "${SEEDSYNC_DEBUG:-0}"
+      # Kept visible so the stop-trace local override can set this key explicitly.
+      SEEDSYNC_STOP_RESUME_TRACE_FILE_ID: "${SEEDSYNC_STOP_RESUME_TRACE_FILE_ID:-}"
     command:
       - /bin/bash
       - -lc

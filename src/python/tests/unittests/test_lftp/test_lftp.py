@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
+from unittest.mock import call
 from unittest.mock import patch
 
 import pexpect
@@ -930,6 +931,24 @@ class TestLftpPromptClassification(unittest.TestCase):
 
         with self.assertRaises(pexpect.exceptions.TIMEOUT):
             Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_sets_short_pget_save_status_interval(self, spawn):
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.expect.return_value = None
+        spawn.return_value = process
+
+        Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+        self.assertEqual(
+            [
+                call('set cmd:at-exit "kill all"'),
+                call("set sftp:auto-confirm 1"),
+                call("set pget:save-status 2"),
+            ],
+            process.sendline.call_args_list
+        )
 
     def test_run_command_raises_lftp_error_on_ssh_host_key_prompt_timeout(self):
         lftp = Lftp.__new__(Lftp)

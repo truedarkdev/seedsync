@@ -159,6 +159,7 @@ class SystemScanner:
                     parsed_size = SystemScanner._lftp_status_file_size(f.read())
                     if parsed_size is not None:
                         file_size = parsed_size
+            status_sidecar_ready = parsed_size is not None
             if self.__lftp_temp_file_suffix is not None and \
                     entry.path.endswith(self.__lftp_temp_file_suffix) and \
                     parsed_size is None:
@@ -178,6 +179,7 @@ class SystemScanner:
                                   False,
                                   time_created=time_created,
                                   time_modified=time_modified)
+            sys_file.status_sidecar_ready = status_sidecar_ready
         return sys_file
 
     def __create_children(self, path: str) -> List[SystemFile]:
