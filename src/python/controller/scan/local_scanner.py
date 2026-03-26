@@ -71,6 +71,9 @@ class LocalScanner(IScanner):
                     local_names[staging_file.name] = len(result)
                     result.append(staging_file)
                 else:
+                    existing_file = result[local_names[staging_file.name]]
+                    if self.__should_prefer_existing_local_file(existing_file, staging_file):
+                        continue
                     result[local_names[staging_file.name]] = staging_file
         return result
 
@@ -91,3 +94,10 @@ class LocalScanner(IScanner):
         system_file.is_staging = True
         for child in system_file.children:
             LocalScanner.__mark_staging_file_tree(child)
+
+    @staticmethod
+    def __should_prefer_existing_local_file(existing_file: SystemFile, staging_file: SystemFile) -> bool:
+        return not existing_file.is_staging and \
+            not existing_file.is_dir and \
+            not staging_file.is_dir and \
+            existing_file.size >= staging_file.size
