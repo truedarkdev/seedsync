@@ -484,7 +484,12 @@ class Controller:
             return False
         return not self.__has_pending_delete_local_command(file.file_id)
 
-    def __queue_delete_local_process(self, file: ModelFile, post_callback: Callable):
+    def __queue_delete_local_process(
+        self,
+        file: ModelFile,
+        post_callback: Callable,
+        command: "Controller.Command" = None
+    ):
         delete_local_path, delete_local_name = self.__get_delete_local_target(file)
         process = DeleteLocalProcess(
             local_path=delete_local_path,
@@ -492,7 +497,7 @@ class Controller:
         )
         process.set_multiprocessing_logger(self.__mp_logger)
         command_wrapper = Controller.CommandProcessWrapper(
-            command=Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id),
+            command=command or Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id),
             file_id=file.file_id,
             file_name=file.name,
             process=process,
@@ -882,7 +887,11 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
-                    self.__queue_delete_local_process(file, self.__local_scan_process.force_scan)
+                    self.__queue_delete_local_process(
+                        file,
+                        self.__local_scan_process.force_scan,
+                        command=command
+                    )
                     self.__persist.stopped_file_names.add(file.file_id)
                     self.__validate_process.clear(file.file_id)
 
