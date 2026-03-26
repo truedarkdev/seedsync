@@ -38,6 +38,7 @@ class ModelBuilder:
         self.__remote_files = dict()
         self.__lftp_statuses = dict()
         self.__recent_live_transfer_snapshots = dict()
+        self.__retained_stopped_transfer_snapshots = dict()
         self.__downloaded_files = None
         self.__extract_statuses = dict()
         self.__extracted_files = set()
@@ -111,6 +112,17 @@ class ModelBuilder:
         return local_file is not None and not getattr(local_file, "is_staging", False)
 
     @staticmethod
+    def __local_size_is_authoritative_progress(local_file: Optional[SystemFile],
+                                               remote_file: Optional[SystemFile],
+                                               retained_size_local: Optional[int]) -> bool:
+        if not ModelBuilder.__is_authoritative_local_file(local_file):
+            return False
+        if local_file is None or local_file.size is None or retained_size_local is None:
+            return False
+        return local_file.size >= retained_size_local or \
+            (remote_file is not None and remote_file.size is not None and local_file.size >= remote_file.size)
+
+    @staticmethod
     def __normalize_download_progress(percent_local):
         if percent_local is None:
             return None
@@ -136,6 +148,21 @@ class ModelBuilder:
         if snapshot.size_local is None:
             return
         self.__recent_live_transfer_snapshots[file_id] = snapshot
+
+    def __store_retained_stopped_transfer_snapshot(self,
+                                                   file_id: str,
+                                                   root_file_id: str,
+                                                   transfer_state: LftpJobStatus.TransferState):
+        snapshot = _RecentLiveTransferSnapshot(
+            root_file_id=root_file_id,
+            size_local=transfer_state.size_local,
+            percent_local=ModelBuilder.__normalize_download_progress(transfer_state.percent_local),
+            speed=transfer_state.speed,
+            eta=transfer_state.eta
+        )
+        if snapshot.size_local is None:
+            return
+        self.__retained_stopped_transfer_snapshots[file_id] = snapshot
 
     @staticmethod
     def __build_retained_transfer_state(size_local: Optional[int],
@@ -197,7 +224,7 @@ class ModelBuilder:
         if remote is None or local is None or local.size is None or snapshot.size_local is None:
             self.__recent_live_transfer_snapshots.pop(file_id, None)
             return None
-        if local.size >= snapshot.size_local or (remote.size is not None and local.size >= remote.size):
+        if self.__local_size_is_authoritative_progress(local, remote, snapshot.size_local):
             self.__recent_live_transfer_snapshots.pop(file_id, None)
             return None
 
@@ -209,6 +236,54 @@ class ModelBuilder:
             snapshot.eta
         )
 
+    @staticmethod
+    def __has_clear_transfer_reset_signal(local: Optional[SystemFile],
+                                          current_transfer_state: LftpJobStatus.TransferState,
+                                          retained_snapshot: _RecentLiveTransferSnapshot) -> bool:
+        normalized_percent = ModelBuilder.__normalize_download_progress(current_transfer_state.percent_local)
+        if current_transfer_state.size_local == 0 or normalized_percent == 0:
+            return True
+        return ModelBuilder.__is_authoritative_local_file(local) and \
+            local is not None and \
+            local.size is not None and \
+            retained_snapshot.size_local is not None and \
+            local.size < retained_snapshot.size_local
+
+    def __coalesce_retained_stopped_transfer_state(self,
+                                                   file_id: str,
+                                                   remote: Optional[SystemFile],
+                                                   local: Optional[SystemFile],
+                                                   current_transfer_state: LftpJobStatus.TransferState
+                                                   ) -> LftpJobStatus.TransferState:
+        retained_snapshot = self.__retained_stopped_transfer_snapshots.get(file_id)
+        if retained_snapshot is None or retained_snapshot.size_local is None:
+            return current_transfer_state
+        if self.__has_clear_transfer_reset_signal(local, current_transfer_state, retained_snapshot):
+            self.__retained_stopped_transfer_snapshots.pop(file_id, None)
+            return current_transfer_state
+        current_percent = ModelBuilder.__normalize_download_progress(current_transfer_state.percent_local)
+        retained_percent = retained_snapshot.percent_local
+        size_has_caught_up = current_transfer_state.size_local is not None and \
+            current_transfer_state.size_local >= retained_snapshot.size_local
+        percent_has_caught_up = retained_percent is None or \
+            (current_percent is not None and current_percent >= retained_percent)
+        if size_has_caught_up and percent_has_caught_up:
+            self.__retained_stopped_transfer_snapshots.pop(file_id, None)
+            return current_transfer_state
+        coalesced_size_local = retained_snapshot.size_local
+        if size_has_caught_up:
+            coalesced_size_local = current_transfer_state.size_local
+        coalesced_percent_local = retained_percent
+        if percent_has_caught_up:
+            coalesced_percent_local = current_percent
+        return LftpJobStatus.TransferState(
+            coalesced_size_local,
+            remote.size if remote is not None else current_transfer_state.size_remote,
+            coalesced_percent_local,
+            current_transfer_state.speed,
+            current_transfer_state.eta
+        )
+
     def __get_retained_recent_transfer_state(self,
                                              file_id: str,
                                              remote: Optional[SystemFile],
@@ -216,12 +291,11 @@ class ModelBuilder:
         snapshot = self.__recent_live_transfer_snapshots.get(file_id)
         if snapshot is None:
             return None
-        if remote is None or local is None or local.size is None or snapshot.size_local is None:
+        if snapshot.size_local is None:
             self.__recent_live_transfer_snapshots.pop(file_id, None)
             return None
-        if local.size >= snapshot.size_local or (remote.size is not None and local.size >= remote.size):
-            self.__recent_live_transfer_snapshots.pop(file_id, None)
-            return None
+        if remote is None:
+            return self.__build_retained_transfer_state(snapshot.size_local, None, snapshot.percent_local)
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
 
     def set_active_files(self, active_files: List[SystemFile]):
@@ -297,6 +371,7 @@ class ModelBuilder:
         self.__remote_files.clear()
         self.__lftp_statuses.clear()
         self.__recent_live_transfer_snapshots.clear()
+        self.__retained_stopped_transfer_snapshots.clear()
         self.__downloaded_files = None
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
@@ -383,17 +458,19 @@ class ModelBuilder:
                             _model_file.transferred_size = 0
                     else:
                         if _model_file.transferred_size is None:
-                            _model_file.transferred_size = min(_local.size, _remote.size)
+                            if self.__is_authoritative_local_file(_local):
+                                _model_file.transferred_size = min(_local.size, _remote.size)
 
-                        # also update all parent directories
-                        _parent_file = _model_file.parent
-                        while _parent_file is not None:
-                            if _parent_file.file_id in live_transferred_file_ids:
-                                break
-                            if _parent_file.transferred_size is None:
-                                _parent_file.transferred_size = 0
-                            _parent_file.transferred_size += _model_file.transferred_size
-                            _parent_file = _parent_file.parent
+                        if _model_file.transferred_size is not None:
+                            # also update all parent directories
+                            _parent_file = _model_file.parent
+                            while _parent_file is not None:
+                                if _parent_file.file_id in live_transferred_file_ids:
+                                    break
+                                if _parent_file.transferred_size is None:
+                                    _parent_file.transferred_size = 0
+                                _parent_file.transferred_size += _model_file.transferred_size
+                                _parent_file = _parent_file.parent
 
                 # set the is_extractable flag
                 if not _model_file.is_dir and Extract.is_archive_fast(_model_file.name):
@@ -440,6 +517,18 @@ class ModelBuilder:
                     model_file.file_id,
                     status.file_id if status is not None else model_file.file_id,
                     raw_current_transfer_state
+                )
+                self.__store_retained_stopped_transfer_snapshot(
+                    model_file.file_id,
+                    status.file_id if status is not None else model_file.file_id,
+                    raw_current_transfer_state
+                )
+            elif current_transfer_state is not None:
+                current_transfer_state = self.__coalesce_retained_stopped_transfer_state(
+                    file_id,
+                    remote,
+                    local,
+                    current_transfer_state
                 )
             if current_transfer_state is None and status is None and not is_stopped:
                 recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
@@ -569,6 +658,7 @@ class ModelBuilder:
             # again we use BFS to traverse
             if model_file.state == ModelFile.State.DEFAULT:
                 if not model_file.is_dir and \
+                        not (is_stopped and retained_transfer_state is not None) and \
                         model_file.local_size is not None and \
                         model_file.remote_size is not None and \
                         self.__is_authoritative_local_file(local) and \
