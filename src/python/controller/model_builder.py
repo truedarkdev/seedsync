@@ -107,6 +107,10 @@ class ModelBuilder:
         model_file.path_pair_name = path_pair_name
 
     @staticmethod
+    def __is_authoritative_local_file(local_file: Optional[SystemFile]) -> bool:
+        return local_file is not None and not getattr(local_file, "is_staging", False)
+
+    @staticmethod
     def __normalize_download_progress(percent_local):
         if percent_local is None:
             return None
@@ -571,6 +575,7 @@ class ModelBuilder:
                 elif not model_file.is_dir and \
                         model_file.local_size is not None and \
                         model_file.remote_size is None and \
+                        self.__is_authoritative_local_file(local) and \
                         self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
                     # keep previously-downloaded local-only files recognizable
                     model_file.state = ModelFile.State.DOWNLOADED
