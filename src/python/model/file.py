@@ -40,6 +40,7 @@ class ModelFile:
         self.__downloading_speed = None  # in bytes / sec, None if not downloading
         self.__eta = None  # est. time remaining in seconds, None if not available
         self.__is_extractable = False  # whether file is an archive or dir contains archives
+        self.__is_stoppable = False  # whether stop is currently safe and enabled
         self.__local_created_timestamp = None
         self.__local_modified_timestamp = None
         self.__remote_created_timestamp = None
@@ -206,6 +207,13 @@ class ModelFile:
     @is_extractable.setter
     def is_extractable(self, is_extractable: bool):
         self.__is_extractable = is_extractable
+
+    @property
+    def is_stoppable(self) -> bool: return self.__is_stoppable
+
+    @is_stoppable.setter
+    def is_stoppable(self, is_stoppable: bool):
+        self.__is_stoppable = is_stoppable
 
     @property
     def local_created_timestamp(self) -> datetime: return self.__local_created_timestamp

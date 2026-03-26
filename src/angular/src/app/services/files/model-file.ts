@@ -27,6 +27,7 @@ interface IModelFile {
     validation_progress: number;
     validation_error: string;
     corrupt_chunks: number[];
+    is_stoppable: boolean;
 }
 
 // Boiler plate code to set up an immutable class
@@ -52,7 +53,8 @@ const DefaultModelFile: IModelFile = {
     children: null,
     validation_progress: null,
     validation_error: null,
-    corrupt_chunks: null
+    corrupt_chunks: null,
+    is_stoppable: null
 };
 const ModelFileRecord = Record(DefaultModelFile);
 
@@ -85,6 +87,7 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     validation_progress: number;
     validation_error: string;
     corrupt_chunks: number[];
+    is_stoppable: boolean;
 
     constructor(props) {
         super(props);

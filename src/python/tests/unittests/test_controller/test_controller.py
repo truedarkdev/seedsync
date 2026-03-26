@@ -1,4 +1,5 @@
 import os
+import json
 import unittest
 from queue import Queue
 from unittest.mock import MagicMock, patch
@@ -39,6 +40,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process = MagicMock()
         self.controller._Controller__validate_process = MagicMock()
         self.controller._Controller__mp_logger = MagicMock()
+        self.controller._Controller__stop_resume_trace_logger = MagicMock()
+        self.controller._Controller__stop_resume_trace_file_id = None
         self.controller._Controller__staging_path = "/local/incomplete"
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
@@ -222,6 +225,7 @@ class TestController(unittest.TestCase):
     def test_process_commands_stop_reports_lftp_status_parser_errors(self):
         file = ModelFile("example", False)
         file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__lftp.kill.side_effect = LftpJobStatusParserError("bad status")
 
@@ -238,6 +242,7 @@ class TestController(unittest.TestCase):
     def test_process_commands_stop_reports_missing_lftp_job_as_failure(self):
         file = ModelFile("example", False)
         file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__lftp.kill.return_value = False
 
@@ -251,6 +256,23 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once_with("File 'example' could not be stopped", 409)
         callback.on_success.assert_not_called()
         self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_stop_rejects_non_stoppable_downloads(self):
+        file = ModelFile("example", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = False
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.STOP, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with("File 'example' could not be stopped", 409)
+        callback.on_success.assert_not_called()
+        self.controller._Controller__lftp.kill.assert_not_called()
 
     def test_process_commands_reports_not_found_as_404(self):
         self.controller._Controller__model.get_file.side_effect = ModelError("missing")
@@ -574,6 +596,7 @@ class TestController(unittest.TestCase):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
@@ -1072,3 +1095,185 @@ class TestController(unittest.TestCase):
             remote_base_dir_path="/remote/movies",
             local_base_dir_path="/local/movies/incomplete"
         )
+
+    def test_process_commands_queue_logs_fresh_and_resume_like_trace_details(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        self.controller._Controller__stop_resume_trace_file_id = file.file_id
+        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        temp_path = os.path.join("/local/movies/incomplete", "dup.lftp")
+        sidecar_path = temp_path + ".lftp-pget-status"
+
+        def stat_side_effect(path):
+            if path == temp_path:
+                return SimpleNamespace(st_size=250, st_mtime=111, st_blocks=8)
+            if path == sidecar_path:
+                return SimpleNamespace(st_size=64, st_mtime=222)
+            raise OSError(path)
+
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
+                patch.object(trace_logger, "info") as trace_info:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("queue_fresh", payload["reason"])
+        self.assertEqual(file.file_id, payload["file_id"])
+        self.assertEqual("dup", payload["filename"])
+        self.assertEqual("DEFAULT", payload["current_state"])
+        self.assertEqual("/local/movies/incomplete", payload["local_base_dir_path"])
+        self.assertEqual(temp_path, payload["temp_path"])
+        self.assertTrue(payload["temp_exists"])
+        self.assertEqual(250, payload["temp_apparent_size"])
+        self.assertEqual(4096, payload["temp_allocated_size"])
+        self.assertEqual(sidecar_path, payload["sidecar_path"])
+        self.assertTrue(payload["sidecar_exists"])
+        self.assertEqual(64, payload["sidecar_size"])
+        self.assertEqual(222, payload["sidecar_mtime"])
+        self.assertFalse(payload["stopped_marked"])
+
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        trace_logger.reset_mock()
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
+                patch.object(trace_logger, "info") as trace_info:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("queue_after_stop", payload["reason"])
+        self.assertTrue(payload["stopped_marked"])
+        self.assertEqual(temp_path, payload["temp_path"])
+
+    def test_process_commands_queue_logs_trace_for_bare_filename_selector(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        self.controller._Controller__stop_resume_trace_file_id = file.name
+        trace_logger = self.controller._Controller__stop_resume_trace_logger
+
+        with patch.object(trace_logger, "info") as trace_info:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual(file.file_id, payload["file_id"])
+        self.assertEqual("dup", payload["filename"])
+
+    def test_process_commands_queue_does_not_match_unrelated_trace_selector(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        self.controller._Controller__stop_resume_trace_file_id = "other-name"
+        trace_logger = self.controller._Controller__stop_resume_trace_logger
+
+        with patch.object(trace_logger, "info") as trace_info:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+            self.controller._Controller__process_commands()
+
+        trace_info.assert_not_called()
+
+    def test_process_commands_stop_logs_trace_details(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete"
+        }
+        self.controller._Controller__stop_resume_trace_file_id = file.file_id
+        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        temp_path = os.path.join("/local/movies/incomplete", "dup.lftp")
+        sidecar_path = temp_path + ".lftp-pget-status"
+
+        def stat_side_effect(path):
+            if path == temp_path:
+                return SimpleNamespace(st_size=250, st_mtime=111, st_blocks=8)
+            if path == sidecar_path:
+                return SimpleNamespace(st_size=64, st_mtime=222)
+            raise OSError(path)
+
+        self.controller._Controller__lftp.kill.return_value = True
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
+                patch.object(trace_logger, "info") as trace_info:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, file.file_id))
+            self.controller._Controller__process_commands()
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("stop", payload["reason"])
+        self.assertEqual(file.file_id, payload["file_id"])
+        self.assertEqual("dup", payload["filename"])
+        self.assertEqual("DOWNLOADING", payload["current_state"])
+        self.assertEqual("/local/movies/incomplete", payload["local_base_dir_path"])
+        self.assertEqual(temp_path, payload["temp_path"])
+        self.assertTrue(payload["temp_exists"])
+        self.assertEqual(250, payload["temp_apparent_size"])
+        self.assertEqual(4096, payload["temp_allocated_size"])
+        self.assertEqual(sidecar_path, payload["sidecar_path"])
+        self.assertTrue(payload["sidecar_exists"])
+        self.assertEqual(64, payload["sidecar_size"])
+
+    def test_recover_interrupted_downloads_logs_trace_details(self):
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__stop_resume_trace_file_id = "movie.mkv"
+        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        temp_path = os.path.join("/local/incomplete", "movie.mkv.lftp")
+        sidecar_path = temp_path + ".lftp-pget-status"
+
+        def stat_side_effect(path):
+            if path == temp_path:
+                return SimpleNamespace(st_size=250, st_mtime=111, st_blocks=8)
+            if path == sidecar_path:
+                return SimpleNamespace(st_size=64, st_mtime=222)
+            raise OSError(path)
+
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch("controller.controller.os.path.isdir", return_value=False), \
+                patch("controller.controller.os.stat", side_effect=stat_side_effect), \
+                patch.object(trace_logger, "info") as trace_info:
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("recover_interrupted_download", payload["reason"])
+        self.assertEqual("movie.mkv", payload["file_id"])
+        self.assertEqual("movie.mkv", payload["filename"])
+        self.assertEqual("/local/incomplete", payload["local_base_dir_path"])
+        self.assertEqual(temp_path, payload["temp_path"])
+        self.assertTrue(payload["temp_exists"])
+        self.assertEqual(250, payload["temp_apparent_size"])
+        self.assertEqual(4096, payload["temp_allocated_size"])
+        self.assertEqual(sidecar_path, payload["sidecar_path"])
+        self.assertTrue(payload["sidecar_exists"])
+        self.assertEqual(64, payload["sidecar_size"])

@@ -275,6 +275,19 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual(False, data[0]["is_extractable"])
         self.assertEqual(True, data[1]["is_extractable"])
 
+    def test_file_is_stoppable(self):
+        serialize = SerializeModel()
+        a = ModelFile("a", True)
+        a.is_stoppable = False
+        b = ModelFile("b", False)
+        b.is_stoppable = True
+        files = [a, b]
+        out = parse_stream(serialize.model(files))
+        data = json.loads(out["data"])
+        self.assertEqual(2, len(data))
+        self.assertEqual(False, data[0]["is_stoppable"])
+        self.assertEqual(True, data[1]["is_stoppable"])
+
     def test_local_created_timestamp(self):
         serialize = SerializeModel()
         a = ModelFile("a", True)

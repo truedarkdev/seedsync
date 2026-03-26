@@ -36,6 +36,7 @@ class Lftp:
     __SET_NUM_MAX_TOTAL_CONNECTIONS = "net:connection-limit"
     __SET_RATE_LIMIT = "net:limit-rate"
     __SET_MIN_CHUNK_SIZE = "pget:min-chunk-size"
+    __SET_PGET_SAVE_STATUS = "pget:save-status"
     __SET_NUM_PARALLEL_JOBS = "cmd:queue-parallel"
     __SET_MOVE_BACKGROUND_ON_EXIT = "cmd:move-background"
     __SET_COMMAND_AT_EXIT = "cmd:at-exit"
@@ -92,6 +93,8 @@ class Lftp:
         self.__set(Lftp.__SET_COMMAND_AT_EXIT, "\"kill all\"")
         # Auto-add server to known host file
         self.sftp_auto_confirm = True
+        # Keep pget status snapshots fresher to reduce valid stop/resume rollback.
+        self.__set(Lftp.__SET_PGET_SAVE_STATUS, "2")
 
     def with_check_process(method: Callable):
         """

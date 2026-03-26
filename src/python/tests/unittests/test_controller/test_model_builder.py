@@ -4,8 +4,10 @@ import logging
 import os
 import sys
 import unittest
+import json
 from unittest.mock import patch
 from datetime import datetime
+from types import SimpleNamespace
 
 from system import SystemFile
 from lftp import LftpJobStatus
@@ -387,14 +389,13 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
 
-    def test_build_state_does_not_promote_staging_only_root_file_from_remote_size_match(self):
+    def test_build_scan_only_staging_root_file_promotes_to_downloaded_when_local_size_matches_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
         self.model_builder.set_local_files([SystemFile("archive.zip", 100, False, is_staging=True)])
-        self.model_builder.set_extracted_files({"archive.zip"})
 
         model = self.model_builder.build_model()
 
-        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("archive.zip").state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("archive.zip").state)
 
     def test_build_state_does_not_promote_staging_only_child_file_from_remote_size_match(self):
         remote_root = SystemFile("folder", 100, True)
@@ -854,6 +855,52 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
 
         self.assertIsNone(model.get_file("a").transferred_size)
+
+    def test_build_recent_live_snapshot_promotes_full_size_staging_copy_after_live_status_disappears(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("archive.zip", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("archive.zip", 1000, False, is_staging=True)])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["archive.zip"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="archive.zip",
+                size_local=990,
+                percent_local=99,
+                speed=1000,
+                eta=1
+            )
+
+        model = self.model_builder.build_model()
+        file_archive = model.get_file("archive.zip")
+        self.assertEqual(ModelFile.State.DOWNLOADED, file_archive.state)
+        self.assertEqual(1000, file_archive.transferred_size)
+        self.assertIsNone(file_archive.download_progress)
+        self.assertIsNone(file_archive.downloading_speed)
+        self.assertIsNone(file_archive.eta)
+        self.assertNotIn("archive.zip", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_build_running_staging_file_does_not_promote_to_downloaded_while_live_progress_is_active(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("archive.zip", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("archive.zip", 1000, False, is_staging=True)])
+        self.model_builder.set_active_files([SystemFile("archive.zip", 975, False)])
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        running_status = LftpJobStatus(
+            0,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "archive.zip",
+            ""
+        )
+        running_status.total_transfer_state = LftpJobStatus.TransferState(975, 1000, 97, 1000, 0)
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        file_archive = model.get_file("archive.zip")
+        self.assertEqual(ModelFile.State.DOWNLOADING, file_archive.state)
+        self.assertEqual(975, file_archive.transferred_size)
+        self.assertEqual(97, file_archive.download_progress)
+        self.assertEqual(1000, file_archive.local_size)
 
     def test_build_staging_child_without_transfer_bytes_does_not_break_parent_rollup(self):
         self.model_builder.clear()
@@ -1956,6 +2003,50 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(None, model.get_file("a").downloading_speed)
 
+    def test_build_sets_is_stoppable_for_queued_and_resumable_downloads(self):
+        self.model_builder.set_remote_files([SystemFile("queued", 100, False),
+                                             SystemFile("downloading", 100, False)])
+        queued_local = SystemFile("queued", 0, False, is_staging=True)
+        downloading_local = SystemFile("downloading", 10, False, is_staging=True)
+        downloading_local.status_sidecar_ready = True
+        self.model_builder.set_local_files([
+            queued_local,
+            downloading_local,
+        ])
+
+        queued_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "queued", "")
+        downloading_status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "downloading", "")
+        downloading_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        self.model_builder.set_lftp_statuses([queued_status, downloading_status])
+
+        model = self.model_builder.build_model()
+        self.assertTrue(model.get_file("queued").is_stoppable)
+        self.assertTrue(model.get_file("downloading").is_stoppable)
+
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
+        downloading_local = SystemFile("downloading", 10, False, is_staging=True)
+        downloading_local.status_sidecar_ready = False
+        self.model_builder.set_local_files([downloading_local])
+        downloading_status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "downloading", "")
+        downloading_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        self.model_builder.set_lftp_statuses([downloading_status])
+
+        model = self.model_builder.build_model()
+        self.assertFalse(model.get_file("downloading").is_stoppable)
+
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
+        downloading_local = SystemFile("downloading", 10, False)
+        downloading_local.status_sidecar_ready = True
+        self.model_builder.set_local_files([downloading_local])
+        downloading_status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "downloading", "")
+        downloading_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        self.model_builder.set_lftp_statuses([downloading_status])
+
+        model = self.model_builder.build_model()
+        self.assertTrue(model.get_file("downloading").is_stoppable)
+
     def test_build_eta(self):
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         s.total_transfer_state = LftpJobStatus.TransferState(None, None, None, None, 4567)
@@ -3055,6 +3146,244 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.VALIDATING, model.get_file("a").state)
         self.assertEqual(35, model.get_file("a").validation_progress)
+
+    def test_stop_resume_trace_is_target_specific(self):
+        remote_file = SystemFile("a", 1000, False)
+        local_file = SystemFile("a", 250, False)
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.set_stop_resume_trace_file_id("b")
+        self.model_builder.begin_stop_resume_trace_cycle(1)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("target_not_rendered", payload["event"])
+        self.assertEqual("rebuilt", payload["model_source"])
+        self.assertEqual("b", payload["target_file_id"])
+        self.assertIsNone(payload["final_model"])
+
+    def test_stop_resume_trace_logs_arbitration_for_selected_file(self):
+        file_name = "verifier-stop-regression-1g.bin"
+        remote_file = SystemFile(file_name, 1073741824, False)
+        local_file = SystemFile(file_name, 1067800592, False)
+        active_file = SystemFile(file_name, 1067800592, False)
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(1044601281, 1073741824, 97, 50, 15)
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_active_files([active_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.set_stop_resume_trace_file_id(file_name)
+        self.model_builder.begin_stop_resume_trace_cycle(3)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        self.assertEqual("stop_resume_trace %s", trace_info.call_args[0][0])
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual(3, payload["cycle"])
+        self.assertEqual("arbitration", payload["event"])
+        self.assertEqual("rebuilt", payload["model_source"])
+        self.assertEqual("none", payload["snapshot_source"])
+        self.assertEqual("authoritative", payload["local_freshness"])
+        self.assertFalse(payload["recent_snapshot_present"])
+        self.assertFalse(payload["retained_snapshot_present"])
+        self.assertEqual(file_name, payload["resolved_identity"]["file_id"])
+        self.assertEqual(file_name, payload["resolved_identity"]["root_file_id"])
+        self.assertEqual("RUNNING", payload["raw_lftp_status"]["state"])
+        self.assertEqual(7, payload["raw_lftp_status"]["job_id"])
+        self.assertEqual(1044601281, payload["raw_lftp_status"]["transfer"]["size_local"])
+        self.assertEqual(97, payload["raw_lftp_status"]["transfer"]["percent_local"])
+        self.assertEqual(1067800592, payload["local_size_apparent"])
+        self.assertIsNone(payload["local_size_allocated"])
+        self.assertEqual({
+            "remote": True,
+            "local": True,
+            "active": True,
+        }, payload["presence"])
+        self.assertEqual("live_status", payload["arbitration_source"])
+        self.assertEqual("DOWNLOADING", payload["final_model"]["state"])
+        self.assertEqual(1044601281, payload["final_model"]["transferred_size"])
+        self.assertEqual(97, payload["final_model"]["download_progress"])
+
+    def test_stop_resume_trace_reports_allocated_size_for_selected_staging_file(self):
+        file_name = "verifier-stop-regression-allocated.bin"
+        remote_file = SystemFile(file_name, 1000, False)
+        local_file = SystemFile(file_name, 250, False, is_staging=True)
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+
+        local_root_path = os.path.join("C:\\seedsync", "local")
+        staging_root_path = os.path.join("C:\\seedsync", "local", "incomplete")
+        selected_local_path = os.path.join(staging_root_path, file_name)
+        self.model_builder.set_local_root_paths(
+            {None: local_root_path},
+            {None: staging_root_path}
+        )
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.set_stop_resume_trace_file_id(file_name)
+        self.model_builder.begin_stop_resume_trace_cycle(4)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info, \
+             patch("controller.model_builder.os.path.exists", side_effect=lambda path: path == selected_local_path), \
+             patch("controller.model_builder.os.stat", return_value=SimpleNamespace(st_blocks=8)):
+            model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual(4096, payload["local_size_allocated"])
+        self.assertEqual(250, payload["local_size_apparent"])
+        self.assertEqual("staging", payload["local_freshness"])
+        self.assertEqual({"name": file_name, "path": selected_local_path}, payload["matched_local"])
+        self.assertEqual("presence", payload["local_data_role"])
+
+    def test_stop_resume_trace_logs_arbitration_for_qualified_root_file_id_selected_by_root_name(self):
+        remote_file = SystemFile("backup.zip", 1000, False)
+        remote_file.path_pair_id = "homeserver"
+        remote_file.path_pair_name = "Home Server"
+        local_file = SystemFile("backup.zip", 250, False)
+        local_file.path_pair_id = "homeserver"
+        local_file.path_pair_name = "Home Server"
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "backup.zip", "")
+        running_status.path_pair_id = "homeserver"
+        running_status.path_pair_name = "Home Server"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.set_stop_resume_trace_file_id("backup.zip")
+        self.model_builder.begin_stop_resume_trace_cycle(4)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("arbitration", payload["event"])
+        self.assertEqual(ModelFile.build_file_id("backup.zip", "homeserver"), payload["resolved_identity"]["file_id"])
+        self.assertEqual("homeserver", payload["resolved_identity"]["path_pair_id"])
+        self.assertEqual({"name": "backup.zip", "path": None}, payload["matched_local"])
+        self.assertEqual("presence", payload["local_data_role"])
+
+    def test_stop_resume_trace_logs_snapshot_sources_for_selected_file(self):
+        remote_file = SystemFile("a", 1000, False)
+        local_file = SystemFile("a", 100, False, is_staging=True)
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stop_resume_trace_file_id("a")
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
+            root_file_id="a",
+            size_local=250,
+            percent_local=25,
+            speed=50,
+            eta=15
+        )
+        self.model_builder.begin_stop_resume_trace_cycle(6)
+
+        with patch.object(trace_logger, "info") as trace_info:
+            recent_model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(recent_model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        recent_payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("rebuilt", recent_payload["model_source"])
+        self.assertEqual("recent_live_snapshot", recent_payload["snapshot_source"])
+        self.assertEqual("staging", recent_payload["local_freshness"])
+        self.assertTrue(recent_payload["recent_snapshot_present"])
+        self.assertFalse(recent_payload["retained_snapshot_present"])
+
+        self.model_builder.clear()
+        authoritative_local_file = SystemFile("a", 250, False)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([authoritative_local_file])
+        self.model_builder.set_stopped_files({"a"})
+        self.model_builder.set_stop_resume_trace_file_id("a")
+        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
+            root_file_id="a",
+            size_local=250,
+            percent_local=25,
+            speed=50,
+            eta=15
+        )
+        self.model_builder.begin_stop_resume_trace_cycle(7)
+
+        with patch.object(trace_logger, "info") as trace_info:
+            retained_model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(retained_model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        retained_payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("rebuilt", retained_payload["model_source"])
+        self.assertEqual("retained_stopped_snapshot", retained_payload["snapshot_source"])
+        self.assertEqual("authoritative", retained_payload["local_freshness"])
+        self.assertFalse(retained_payload["recent_snapshot_present"])
+        self.assertTrue(retained_payload["retained_snapshot_present"])
+
+    def test_stop_resume_trace_logs_arbitration_for_exact_qualified_file_id_selector(self):
+        remote_file = SystemFile("backup.zip", 1000, False)
+        remote_file.path_pair_id = "homeserver"
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "backup.zip", "")
+        running_status.path_pair_id = "homeserver"
+        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+        qualified_file_id = ModelFile.build_file_id("backup.zip", "homeserver")
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.set_stop_resume_trace_file_id(qualified_file_id)
+        self.model_builder.begin_stop_resume_trace_cycle(5)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            model = self.model_builder.build_model()
+            self.model_builder.finish_stop_resume_trace_cycle(model, True)
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("arbitration", payload["event"])
+        self.assertEqual(qualified_file_id, payload["resolved_identity"]["file_id"])
+
+    def test_stop_resume_trace_throttles_repeated_idle_cycle_events(self):
+        self.model_builder.set_stop_resume_trace_file_id("missing-file")
+        self.model_builder.begin_stop_resume_trace_cycle(1)
+
+        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            empty_model = Model()
+            self.model_builder.finish_stop_resume_trace_cycle(empty_model, True)
+            self.model_builder.begin_stop_resume_trace_cycle(2)
+            self.model_builder.finish_stop_resume_trace_cycle(empty_model, True)
+            self.model_builder.begin_stop_resume_trace_cycle(3)
+            self.model_builder.finish_stop_resume_trace_cycle(empty_model, False)
+
+        self.assertEqual(2, trace_info.call_count)
+        first_payload = json.loads(trace_info.call_args_list[0][0][1])
+        second_payload = json.loads(trace_info.call_args_list[1][0][1])
+        self.assertEqual("target_not_rendered", first_payload["event"])
+        self.assertEqual("rebuilt", first_payload["model_source"])
+        self.assertEqual("no_rebuild", second_payload["event"])
+        self.assertEqual("cached", second_payload["model_source"])
 
     def test_build_model_preserves_validation_status_across_rebuilds(self):
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])

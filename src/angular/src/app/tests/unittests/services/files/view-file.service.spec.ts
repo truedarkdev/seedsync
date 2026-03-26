@@ -526,27 +526,29 @@ describe("Testing view file service", () => {
 
     it("should should correctly set ViewFile isStoppable", fakeAsync(() => {
         // Test and expected result vectors
-        // test - [ModelFile.State, local size, remote size]
+        // test - [ModelFile.State, local size, remote size, is_stoppable]
         // result - [isStoppable, ViewFile.Status]
         let testVectors: any[][][] = [
             // Default remote file is NOT stoppable
-            [[ModelFile.State.DEFAULT, null, 100], [false, ViewFile.Status.DEFAULT]],
+            [[ModelFile.State.DEFAULT, null, 100, false], [false, ViewFile.Status.DEFAULT]],
             // Default local file is NOT stoppable
-            [[ModelFile.State.DEFAULT, 100, null], [false, ViewFile.Status.DEFAULT]],
+            [[ModelFile.State.DEFAULT, 100, null, false], [false, ViewFile.Status.DEFAULT]],
             // Stopped file is NOT stoppable
-            [[ModelFile.State.DEFAULT, 50, 100], [false, ViewFile.Status.STOPPED]],
+            [[ModelFile.State.DEFAULT, 50, 100, false], [false, ViewFile.Status.STOPPED]],
             // Deleted file is NOT stoppable
-            [[ModelFile.State.DELETED, null, 100], [false, ViewFile.Status.DELETED]],
+            [[ModelFile.State.DELETED, null, 100, false], [false, ViewFile.Status.DELETED]],
             // Queued file is stoppable
-            [[ModelFile.State.QUEUED, null, 100], [true, ViewFile.Status.QUEUED]],
-            // Downloading file is stoppable
-            [[ModelFile.State.DOWNLOADING, 10, 100], [true, ViewFile.Status.DOWNLOADING]],
+            [[ModelFile.State.QUEUED, null, 100, true], [true, ViewFile.Status.QUEUED]],
+            // Downloading file is stoppable once resumable metadata exists
+            [[ModelFile.State.DOWNLOADING, 10, 100, true], [true, ViewFile.Status.DOWNLOADING]],
+            // Downloading file without resumable metadata is not stoppable
+            [[ModelFile.State.DOWNLOADING, 0, 100, false], [false, ViewFile.Status.DOWNLOADING]],
             // Downloaded file is NOT stoppable
-            [[ModelFile.State.DOWNLOADED, 100, 100], [false, ViewFile.Status.DOWNLOADED]],
+            [[ModelFile.State.DOWNLOADED, 100, 100, false], [false, ViewFile.Status.DOWNLOADED]],
             // Extracting file is NOT stoppable
-            [[ModelFile.State.EXTRACTING, 100, 100], [false, ViewFile.Status.EXTRACTING]],
+            [[ModelFile.State.EXTRACTING, 100, 100, false], [false, ViewFile.Status.EXTRACTING]],
             // Extracted file is NOT stoppable
-            [[ModelFile.State.EXTRACTED, 100, 100], [false, ViewFile.Status.EXTRACTED]],
+            [[ModelFile.State.EXTRACTED, 100, 100, false], [false, ViewFile.Status.EXTRACTED]],
         ];
 
         let count = -1;
@@ -575,6 +577,7 @@ describe("Testing view file service", () => {
                 state: testVector[0],
                 local_size: testVector[1],
                 remote_size: testVector[2],
+                is_stoppable: testVector[3],
             }));
             mockModelService._files.next(model);
             tick();
