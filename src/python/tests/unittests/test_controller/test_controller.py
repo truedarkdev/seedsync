@@ -776,6 +776,82 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
+    def test_queue_delete_local_process_without_command_uses_synthetic_no_callback_command(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            post_callback = MagicMock()
+
+            self.controller._Controller__queue_delete_local_process(file, post_callback)
+
+        self.assertEqual(1, len(self.controller._Controller__active_command_processes))
+        command_wrapper = self.controller._Controller__active_command_processes[0]
+        self.assertEqual(Controller.Command.Action.DELETE_LOCAL, command_wrapper.command.action)
+        self.assertEqual(file.file_id, command_wrapper.command.filename)
+        self.assertEqual([], command_wrapper.command.callbacks)
+        self.assertTrue(command_wrapper.await_completion)
+        self.assertIs(post_callback, command_wrapper.post_callback)
+
+    def test_process_commands_delete_local_preserves_callbacks_for_successful_cleanup(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            process.is_alive.return_value = False
+            process.propagate_exception.return_value = None
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            callback = MagicMock()
+            command.add_callback(callback)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+            self.controller._Controller__cleanup_commands()
+
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    def test_process_commands_delete_local_preserves_callbacks_for_failed_cleanup(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            process.is_alive.return_value = False
+            process.propagate_exception.side_effect = FileNotFoundError("/local/movies/dup")
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            callback = MagicMock()
+            command.add_callback(callback)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+            self.controller._Controller__cleanup_commands()
+
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+
     def test_process_commands_validate_queues_validation(self):
         file = ModelFile("dup", False)
         file.local_size = 10
