@@ -31,11 +31,31 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertEqual({"complete.mkv", "partial.mkv"}, {system_file.name for system_file in files})
 
-    def test_scan_prefers_staging_entry_over_final_local_duplicate(self):
+    def test_scan_prefers_authoritative_final_entry_over_same_name_staging_duplicate(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
         os.mkdir(staging_dir)
         with open(os.path.join(self.temp_dir, "movie.mkv"), "w") as handle:
-            handle.write("final")
+            handle.write("complete")
+        with open(os.path.join(staging_dir, "movie.mkv"), "w") as handle:
+            handle.write("partial")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir
+        )
+
+        files = scanner.scan()
+
+        self.assertEqual(["movie.mkv"], [system_file.name for system_file in files])
+        self.assertEqual(8, files[0].size)
+        self.assertFalse(files[0].is_staging)
+
+    def test_scan_prefers_staging_entry_when_same_name_final_duplicate_is_less_complete(self):
+        staging_dir = os.path.join(self.temp_dir, "incomplete")
+        os.mkdir(staging_dir)
+        with open(os.path.join(self.temp_dir, "movie.mkv"), "w") as handle:
+            handle.write("part")
         with open(os.path.join(staging_dir, "movie.mkv"), "w") as handle:
             handle.write("partial")
 
@@ -50,6 +70,26 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual(["movie.mkv"], [system_file.name for system_file in files])
         self.assertEqual(7, files[0].size)
         self.assertTrue(files[0].is_staging)
+
+    def test_scan_prefers_final_entry_when_same_name_duplicate_sizes_are_equal(self):
+        staging_dir = os.path.join(self.temp_dir, "incomplete")
+        os.mkdir(staging_dir)
+        with open(os.path.join(self.temp_dir, "movie.mkv"), "w") as handle:
+            handle.write("partial")
+        with open(os.path.join(staging_dir, "movie.mkv"), "w") as handle:
+            handle.write("staging")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir
+        )
+
+        files = scanner.scan()
+
+        self.assertEqual(["movie.mkv"], [system_file.name for system_file in files])
+        self.assertEqual(7, files[0].size)
+        self.assertFalse(files[0].is_staging)
 
     def test_scan_marks_staging_entries(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
