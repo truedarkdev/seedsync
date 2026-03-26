@@ -72,9 +72,10 @@ class LocalScanner(IScanner):
                     result.append(staging_file)
                 else:
                     existing_file = result[local_names[staging_file.name]]
-                    if self.__should_prefer_existing_local_file(existing_file, staging_file):
-                        continue
-                    result[local_names[staging_file.name]] = staging_file
+                    result[local_names[staging_file.name]] = self.__merge_duplicate_local_entries(
+                        existing_file,
+                        staging_file
+                    )
         return result
 
     @staticmethod
@@ -101,3 +102,47 @@ class LocalScanner(IScanner):
             not existing_file.is_dir and \
             not staging_file.is_dir and \
             existing_file.size >= staging_file.size
+
+    @staticmethod
+    def __build_merged_directory(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
+        merged_children = []
+        staging_children_by_name = {child.name: child for child in staging_file.children}
+        consumed_staging_names = set()
+
+        for existing_child in existing_file.children:
+            staging_child = staging_children_by_name.get(existing_child.name)
+            if staging_child is None:
+                merged_children.append(existing_child)
+                continue
+            consumed_staging_names.add(existing_child.name)
+            merged_children.append(
+                LocalScanner.__merge_duplicate_local_entries(existing_child, staging_child)
+            )
+
+        for staging_child in staging_file.children:
+            if staging_child.name in consumed_staging_names:
+                continue
+            merged_children.append(staging_child)
+
+        merged_children.sort(key=lambda child: child.name)
+        merged_file = SystemFile(
+            existing_file.name,
+            sum(child.size for child in merged_children),
+            True,
+            time_created=existing_file.timestamp_created,
+            time_modified=existing_file.timestamp_modified,
+            is_staging=False
+        )
+        merged_file.path_pair_id = existing_file.path_pair_id
+        merged_file.path_pair_name = existing_file.path_pair_name
+        for child in merged_children:
+            merged_file.add_child(child)
+        return merged_file
+
+    @staticmethod
+    def __merge_duplicate_local_entries(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
+        if existing_file.is_dir and staging_file.is_dir:
+            return LocalScanner.__build_merged_directory(existing_file, staging_file)
+        if LocalScanner.__should_prefer_existing_local_file(existing_file, staging_file):
+            return existing_file
+        return staging_file

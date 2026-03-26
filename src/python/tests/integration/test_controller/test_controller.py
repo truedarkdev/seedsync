@@ -20,6 +20,8 @@ from common import overrides, Context, Config, Args, AppError, Localization, Sta
 from controller import Controller, ControllerPersist
 from model import ModelFile, IModelListener
 
+HAS_RAR = shutil.which("rar") is not None
+
 
 class DummyListener(IModelListener):
     @overrides(IModelListener)
@@ -64,6 +66,13 @@ class TestController(unittest.TestCase):
             f.write(bytearray([0xff] * size))
 
     @staticmethod
+    def my_sparse_touch(size, *args):
+        path = os.path.join(TestController.temp_dir, *args)
+        with open(path, 'wb') as f:
+            f.seek(size - 1)
+            f.write(b"\0")
+
+    @staticmethod
     def create_archive(*args):
         """
         Creates a archive of a text file containing name of archive
@@ -83,6 +92,8 @@ class TestController(unittest.TestCase):
             zf.write(temp_file_path, os.path.basename(temp_file_path))
             zf.close()
         elif ext == "rar":
+            if not HAS_RAR:
+                raise FileNotFoundError("rar executable not available")
             fnull = open(os.devnull, 'w')
             subprocess.Popen(
                 [
@@ -168,14 +179,16 @@ class TestController(unittest.TestCase):
         self.archive_sizes = {}
         TestController.my_mkdir("remote", "rd")
         self.archive_sizes["rd.zip"] = TestController.create_archive("remote", "rd", "rd.zip")
-        self.archive_sizes["re.rar"] = TestController.create_archive("remote", "re.rar")
+        if HAS_RAR:
+            self.archive_sizes["re.rar"] = TestController.create_archive("remote", "re.rar")
         TestController.my_mkdir("remote", "rf")
         TestController.my_mkdir("remote", "rf", "rfa")
         self.archive_sizes["rfa.zip"] = TestController.create_archive("remote", "rf", "rfa", "rfa.zip")
         TestController.my_mkdir("remote", "rf", "rfb")
         self.archive_sizes["rfb.zip"] = TestController.create_archive("remote", "rf", "rfb", "rfb.zip")
         TestController.my_mkdir("local", "lc")
-        self.archive_sizes["lca.rar"] = TestController.create_archive("local", "lc", "lca.rar")
+        if HAS_RAR:
+            self.archive_sizes["lca.rar"] = TestController.create_archive("local", "lc", "lca.rar")
         self.archive_sizes["lcb.zip"] = TestController.create_archive("local", "lc", "lcb.zip")
 
         # Allow group access to remote files for seedsynctest account
@@ -227,9 +240,6 @@ class TestController(unittest.TestCase):
         f_rdx.remote_size = self.archive_sizes["rd.zip"]
         f_rdx.is_extractable = True
         f_rd.add_child(f_rdx)
-        f_re = ModelFile("re.rar", False)
-        f_re.remote_size = self.archive_sizes["re.rar"]
-        f_re.is_extractable = True
         f_rf = ModelFile("rf", True)
         f_rf.remote_size = self.archive_sizes["rfa.zip"] + self.archive_sizes["rfb.zip"]
         f_rf.is_extractable = True
@@ -262,21 +272,31 @@ class TestController(unittest.TestCase):
         f_lb.local_size = 2*1024
 
         f_lc = ModelFile("lc", True)
-        f_lc.local_size = self.archive_sizes["lca.rar"] + self.archive_sizes["lcb.zip"]
+        f_lc.local_size = self.archive_sizes["lcb.zip"]
         f_lc.is_extractable = True
-        f_lca = ModelFile("lca.rar", False)
-        f_lca.local_size = self.archive_sizes["lca.rar"]
-        f_lca.is_extractable = True
-        f_lc.add_child(f_lca)
         f_lcb = ModelFile("lcb.zip", False)
         f_lcb.local_size = self.archive_sizes["lcb.zip"]
         f_lcb.is_extractable = True
         f_lc.add_child(f_lcb)
 
-        self.initial_state = {f.name: f for f in [
-            f_ra, f_rb, f_rc, f_rd, f_re, f_rf,
+        if HAS_RAR:
+            f_re = ModelFile("re.rar", False)
+            f_re.remote_size = self.archive_sizes["re.rar"]
+            f_re.is_extractable = True
+
+            f_lca = ModelFile("lca.rar", False)
+            f_lca.local_size = self.archive_sizes["lca.rar"]
+            f_lca.is_extractable = True
+            f_lc.local_size += self.archive_sizes["lca.rar"]
+            f_lc.add_child(f_lca)
+
+        initial_files = [
+            f_ra, f_rb, f_rc, f_rd, f_rf,
             f_la, f_lb, f_lc
-        ]}
+        ]
+        if HAS_RAR:
+            initial_files.append(f_re)
+        self.initial_state = {f.name: f for f in initial_files}
 
         # We need to overwrite the timestamp properties since it's too tedious to make
         # them match manually for all the model files
@@ -379,6 +399,34 @@ class TestController(unittest.TestCase):
     def __wait_for_initial_model(self):
         while len(self.controller.get_model_files()) < 5:
             self.controller.process()
+
+    def __process_until(self, predicate, message, max_iterations=2000):
+        for _ in range(max_iterations):
+            self.controller.process()
+            if predicate():
+                return
+        self.fail(message)
+
+    def __find_model_file(self, name):
+        return next((file for file in self.controller.get_model_files() if file.name == name), None)
+
+    def __get_model_file(self, name):
+        file = self.__find_model_file(name)
+        self.assertIsNotNone(file, "File '{}' not found in model".format(name))
+        return file
+
+    def __wait_for_model_file(self, name, predicate, message, max_iterations=2000):
+        match = {}
+
+        def _predicate():
+            file = self.__find_model_file(name)
+            if file is None or not predicate(file):
+                return False
+            match["file"] = file
+            return True
+
+        self.__process_until(_predicate, message, max_iterations=max_iterations)
+        return match["file"]
 
     @timeout_decorator.timeout(20)
     def test_bad_config_doesnot_raise_ctor_exception(self):
@@ -1271,6 +1319,7 @@ class TestController(unittest.TestCase):
         self.assertEqual("File 'invalidfile' not found", error)
 
     @timeout_decorator.timeout(20)
+    @unittest.skipUnless(HAS_RAR, "rar executable not available")
     def test_command_extract_after_downloading_remote_file(self):
         self.controller = Controller(self.context, self.controller_persist)
         self.controller.start()
@@ -1452,6 +1501,7 @@ class TestController(unittest.TestCase):
             self.assertEqual("rfb.zip", f.read())
 
     @timeout_decorator.timeout(20)
+    @unittest.skipUnless(HAS_RAR, "rar executable not available")
     def test_command_extract_local_directory(self):
         self.controller = Controller(self.context, self.controller_persist)
         self.controller.start()
@@ -1498,6 +1548,7 @@ class TestController(unittest.TestCase):
             self.assertEqual("lcb.zip", f.read())
 
     @timeout_decorator.timeout(20)
+    @unittest.skipUnless(HAS_RAR, "rar executable not available")
     def test_command_reextract_after_extracting_remote_file(self):
         self.controller = Controller(self.context, self.controller_persist)
         self.controller.start()
@@ -1585,6 +1636,7 @@ class TestController(unittest.TestCase):
             self.assertEqual("re.rar", f.read())
 
     @timeout_decorator.timeout(20)
+    @unittest.skipUnless(HAS_RAR, "rar executable not available")
     def test_command_extract_remote_only_fails(self):
         self.controller = Controller(self.context, self.controller_persist)
         self.controller.start()
@@ -2406,6 +2458,184 @@ class TestController(unittest.TestCase):
         # Remove the files
         shutil.rmtree(path)
         shutil.rmtree(local_path)
+
+    def test_stop_refresh_resume_completion_does_not_leave_stale_downloading_state(self):
+        remote_name = "resume-refresh.bin"
+        remote_size = 512 * 1024
+        TestController.my_sparse_touch(remote_size, "remote", remote_name)
+
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+        # noinspection PyUnresolvedReferences
+        self.controller._Controller__lftp.rate_limit = 64 * 1024
+
+        self.__wait_for_initial_model()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
+
+        downloading_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size > 0,
+            "Timed out waiting for download to start",
+        )
+        stable_file_id = downloading_file.file_id
+
+        near_complete_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= int(remote_size * 0.9),
+            "Timed out waiting for near-complete download progress",
+            max_iterations=4000,
+        )
+        near_complete_size = near_complete_file.local_size
+        near_complete_progress = near_complete_file.download_progress
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
+
+        stopped_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and file.local_size is not None and file.local_size >= near_complete_size,
+            "Timed out waiting for stopped transfer state",
+        )
+        self.assertEqual(stable_file_id, stopped_file.file_id)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        if near_complete_progress is not None:
+            self.assertGreaterEqual(stopped_file.download_progress, near_complete_progress)
+
+        previous_local_scan_time = self.context.status.controller.latest_local_scan_time
+        previous_remote_scan_time = self.context.status.controller.latest_remote_scan_time
+        self.controller._Controller__local_scan_process.force_scan()
+        self.controller._Controller__remote_scan_process.force_scan()
+        self.__process_until(
+            lambda: (
+                self.context.status.controller.latest_local_scan_time is not None and
+                self.context.status.controller.latest_remote_scan_time is not None and
+                self.context.status.controller.latest_local_scan_time != previous_local_scan_time and
+                self.context.status.controller.latest_remote_scan_time != previous_remote_scan_time
+            ),
+            "Timed out waiting for forced scans to refresh controller state",
+        )
+
+        refreshed_file = self.__get_model_file(remote_name)
+        self.assertEqual(stable_file_id, refreshed_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, refreshed_file.state)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
+
+        resumed_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= near_complete_size,
+            "Timed out waiting for resumed download progress",
+            max_iterations=4000,
+        )
+        self.assertEqual(stable_file_id, resumed_file.file_id)
+
+        final_target = os.path.join(TestController.temp_dir, "local", remote_name)
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", remote_name)
+        downloaded_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
+            "Timed out waiting for resumed transfer to finish",
+            max_iterations=4000,
+        )
+
+        for _ in range(20):
+            self.controller.process()
+
+        final_file = self.__get_model_file(remote_name)
+        self.assertEqual(stable_file_id, final_file.file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, final_file.state)
+        self.assertEqual(remote_size, final_file.local_size)
+        self.assertEqual(remote_size, downloaded_file.local_size)
+        self.assertNotEqual(99, final_file.download_progress)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertNotIn(stable_file_id, self.controller_persist.stopped_file_names)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertFalse(os.path.exists(staging_target))
+        self.assertTrue(cmp(
+            os.path.join(TestController.temp_dir, "remote", remote_name),
+            final_target
+        ))
+
+    def test_stop_persisted_across_controller_restart_resumes_with_same_identity(self):
+        remote_name = "resume-restart.bin"
+        remote_size = 256 * 1024
+        TestController.my_sparse_touch(remote_size, "remote", remote_name)
+
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+        # noinspection PyUnresolvedReferences
+        self.controller._Controller__lftp.rate_limit = 64 * 1024
+
+        self.__wait_for_initial_model()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
+
+        partial_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= 64 * 1024,
+            "Timed out waiting for partial download progress before stop",
+            max_iterations=3000,
+        )
+        stable_file_id = partial_file.file_id
+        partial_size = partial_file.local_size
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
+        stopped_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and file.local_size is not None and file.local_size >= partial_size,
+            "Timed out waiting for stopped file state before restart",
+        )
+        self.assertEqual(stable_file_id, stopped_file.file_id)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", remote_name)
+        final_target = os.path.join(TestController.temp_dir, "local", remote_name)
+        self.assertTrue(os.path.exists(staging_target))
+        self.assertFalse(os.path.exists(final_target))
+
+        self.controller.exit()
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+
+        self.__wait_for_initial_model()
+
+        restarted_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and file.local_size is not None and file.local_size >= partial_size,
+            "Timed out waiting for restarted controller to recover stopped transfer state",
+        )
+        self.assertEqual(stable_file_id, restarted_file.file_id)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, stable_file_id))
+
+        resumed_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
+            "Timed out waiting for restarted controller to complete resumed transfer",
+            max_iterations=4000,
+        )
+
+        for _ in range(20):
+            self.controller.process()
+
+        final_file = self.__get_model_file(remote_name)
+        self.assertEqual(stable_file_id, final_file.file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, final_file.state)
+        self.assertEqual(remote_size, final_file.local_size)
+        self.assertEqual(remote_size, resumed_file.local_size)
+        self.assertNotEqual(99, final_file.download_progress)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertNotIn(stable_file_id, self.controller_persist.stopped_file_names)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertFalse(os.path.exists(staging_target))
+        self.assertTrue(cmp(
+            os.path.join(TestController.temp_dir, "remote", remote_name),
+            final_target
+        ))
 
     @timeout_decorator.timeout(20)
     def test_password_auth(self):
