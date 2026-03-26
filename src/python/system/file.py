@@ -13,7 +13,8 @@ class SystemFile:
                  size: int,
                  is_dir: bool = False,
                  time_created: datetime = None,
-                 time_modified: datetime = None):
+                 time_modified: datetime = None,
+                 is_staging: bool = False):
         if size < 0:
             raise ValueError("File size must be greater than zero")
         self.__name = name
@@ -24,6 +25,7 @@ class SystemFile:
         self.__children = []
         self.__path_pair_id = None
         self.__path_pair_name = None
+        self.__is_staging = is_staging
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -67,6 +69,15 @@ class SystemFile:
             raise TypeError
         self.__path_pair_name = path_pair_name
 
+    @property
+    def is_staging(self) -> bool: return self.__is_staging
+
+    @is_staging.setter
+    def is_staging(self, is_staging: bool):
+        if type(is_staging) != bool:
+            raise TypeError
+        self.__is_staging = is_staging
+
     def add_child(self, file: "SystemFile"):
         if not self.__is_dir:
             raise TypeError("Cannot add children to a file")
@@ -86,6 +97,8 @@ class SystemFile:
             d["path_pair_id"] = self.__path_pair_id
         if self.__path_pair_name is not None:
             d["path_pair_name"] = self.__path_pair_name
+        if self.__is_staging:
+            d["is_staging"] = True
         if self.__children:
             d["children"] = [child.to_dict() for child in self.__children]
         return d
@@ -104,6 +117,7 @@ class SystemFile:
             is_dir=data.get("is_dir", False),
             time_created=time_created,
             time_modified=time_modified,
+            is_staging=data.get("is_staging", False),
         )
         system_file.path_pair_id = data.get("path_pair_id")
         system_file.path_pair_name = data.get("path_pair_name")

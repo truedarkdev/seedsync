@@ -236,6 +236,14 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
 
+        # Staging-only local file should not be promoted by stale completion markers
+        self.model_builder.clear()
+        self.model_builder.set_local_files([SystemFile("archive.zip", 100, False, is_staging=True)])
+        self.model_builder.set_downloaded_files({"archive.zip"})
+        self.model_builder.set_extracted_files({"archive.zip"})
+        model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("archive.zip").state)
+
         # Downloaded
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])
@@ -369,6 +377,15 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_extracted_files({"a"})
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DELETED, model.get_file("a").state)
+
+    def test_build_state_keeps_final_root_local_only_file_completed_from_persisted_markers(self):
+        self.model_builder.set_local_files([SystemFile("archive.zip", 100, False)])
+        self.model_builder.set_downloaded_files({"archive.zip"})
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
 
     def test_build_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("a", 42, False)])

@@ -66,6 +66,7 @@ class LocalScanner(IScanner):
 
             local_names = {system_file.name: index for index, system_file in enumerate(result)}
             for staging_file in staging_result:
+                self.__mark_staging_file_tree(staging_file)
                 if staging_file.name not in local_names:
                     local_names[staging_file.name] = len(result)
                     result.append(staging_file)
@@ -84,3 +85,9 @@ class LocalScanner(IScanner):
         if staging_parent != self.__normalize_path(self.__local_path):
             return None
         return os.path.basename(self.__staging_path.rstrip(os.sep))
+
+    @staticmethod
+    def __mark_staging_file_tree(system_file: SystemFile):
+        system_file.is_staging = True
+        for child in system_file.children:
+            LocalScanner.__mark_staging_file_tree(child)

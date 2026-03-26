@@ -8,7 +8,7 @@ from controller import Controller
 from controller.scan import MultiPathActiveScanner
 from common import AppError
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
-from model import ModelDiff, ModelError, ModelFile
+from model import Model, ModelDiff, ModelError, ModelFile
 
 
 class TestController(unittest.TestCase):
@@ -411,6 +411,30 @@ class TestController(unittest.TestCase):
             {stale_a, stale_b, added_file.file_id},
             self.controller._Controller__model_builder.set_downloaded_files.call_args_list[-1][0][0]
         )
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_keeps_staging_only_completed_markers_from_repromoting_snapshot(self, diff_models):
+        self.controller._Controller__persist.downloaded_file_names = {"archive.zip"}
+        self.controller._Controller__persist.extracted_file_names = {"archive.zip"}
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.set_base_logger(self.controller.logger)
+        self.controller._Controller__model_builder.has_changes.return_value = True
+
+        staging_only_file = ModelFile("archive.zip", False)
+        staging_only_file.state = ModelFile.State.DEFAULT
+        staging_only_file.local_size = 100
+
+        new_model = Model()
+        new_model.set_base_logger(self.controller.logger)
+        new_model.add_file(staging_only_file)
+        self.controller._Controller__model_builder.build_model.return_value = new_model
+        diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=staging_only_file)]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, self.controller._Controller__model.get_file("archive.zip").state)
+        self.assertEqual({"archive.zip"}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({"archive.zip"}, self.controller._Controller__persist.extracted_file_names)
 
     @patch("controller.controller.ModelDiffUtil.diff_models")
     def test_update_model_reconsiders_pending_zero_byte_local_only_file_after_remote_reconciliation(self, diff_models):

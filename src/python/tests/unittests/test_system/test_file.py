@@ -49,6 +49,13 @@ class TestSystemFile(unittest.TestCase):
         self.assertEqual(False, sf.children[1].is_dir)
         self.assertEqual(99, sf.children[1].size)
 
+    def test_is_staging(self):
+        sf = SystemFile("test", 0, False, is_staging=True)
+        self.assertTrue(sf.is_staging)
+
+        sf.is_staging = False
+        self.assertFalse(sf.is_staging)
+
     def test_fail_add_child_to_file(self):
         sf = SystemFile("", 0, False)
         with self.assertRaises(TypeError) as context:
