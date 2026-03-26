@@ -387,6 +387,41 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
 
+    def test_build_state_does_not_promote_staging_only_root_file_from_remote_size_match(self):
+        self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
+        self.model_builder.set_local_files([SystemFile("archive.zip", 100, False, is_staging=True)])
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("archive.zip").state)
+
+    def test_build_state_does_not_promote_staging_only_child_file_from_remote_size_match(self):
+        remote_root = SystemFile("folder", 100, True)
+        remote_child = SystemFile("archive.zip", 100, False)
+        remote_root.add_child(remote_child)
+        local_root = SystemFile("folder", 100, True)
+        local_child = SystemFile("archive.zip", 100, False, is_staging=True)
+        local_root.add_child(local_child)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        model = self.model_builder.build_model()
+
+        built_root = model.get_file("folder")
+        self.assertEqual(ModelFile.State.DEFAULT, built_root.state)
+        self.assertEqual(ModelFile.State.DEFAULT, built_root.get_children()[0].state)
+
+    def test_build_state_keeps_final_root_remote_size_match_completed(self):
+        self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
+        self.model_builder.set_local_files([SystemFile("archive.zip", 100, False)])
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
+
     def test_build_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("a", 42, False)])
         model = self.model_builder.build_model()

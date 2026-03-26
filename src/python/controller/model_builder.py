@@ -532,7 +532,9 @@ class ModelBuilder:
                         _child_model_file.state = ModelFile.State.DOWNLOADING
                     elif _child_recent_transfer_state:
                         _child_model_file.state = ModelFile.State.DOWNLOADING
-                    elif _remote_child and _local_child and _local_child.size >= _remote_child.size:
+                    elif _remote_child and \
+                            self.__is_authoritative_local_file(_local_child) and \
+                            _local_child.size >= _remote_child.size:
                         _child_model_file.state = ModelFile.State.DOWNLOADED
                     elif _remote_child and not _child_is_stopped and \
                             model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
@@ -569,6 +571,7 @@ class ModelBuilder:
                 if not model_file.is_dir and \
                         model_file.local_size is not None and \
                         model_file.remote_size is not None and \
+                        self.__is_authoritative_local_file(local) and \
                         model_file.local_size >= model_file.remote_size:
                     # root is a finished single file
                     model_file.state = ModelFile.State.DOWNLOADED
