@@ -57,8 +57,29 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.controller.logger.warning.assert_called_once_with("Caught lftp error: bad status")
-        self.controller._Controller__model_builder.set_lftp_statuses.assert_not_called()
+        self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+
+    def test_update_model_evicts_recent_live_snapshots_after_unhealthy_empty_status_poll(self):
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+
+    def test_update_model_preserves_recent_live_snapshots_for_roots_returned_by_unhealthy_poll(self):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__lftp.status.return_value = [status]
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status])
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with({"a"})
 
     def test_update_model_sets_remote_scan_failure_status_from_partial_result(self):
         partial_file = ModelFile("partial", False)

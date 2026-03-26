@@ -565,6 +565,32 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(file_a.download_progress)
         self.assertFalse(self.model_builder.has_changes())
 
+    def test_build_recent_live_transfer_snapshot_rekeys_legacy_alias_to_canonical_file_id(self):
+        self.model_builder.clear()
+        qualified_file_id = ModelFile.build_file_id("dup", "movies")
+        remote_file = SystemFile("dup", 1000, False)
+        remote_file.path_pair_id = "movies"
+        local_file = SystemFile("dup", 900, False)
+        local_file.path_pair_id = "movies"
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["dup"] = _RecentLiveTransferSnapshot(
+            root_file_id="dup",
+            size_local=950,
+            percent_local=95,
+            speed=1000,
+            eta=5
+        )
+
+        model = self.model_builder.build_model()
+        built_file = model.get_file(qualified_file_id)
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, built_file.state)
+        self.assertEqual(950, built_file.transferred_size)
+        self.assertEqual(95, built_file.download_progress)
+        self.assertIn(qualified_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn("dup", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
     def test_build_recent_live_transfer_child_snapshot_handoff_uses_real_file_id(self):
         remote_root = SystemFile("a", 1000, True)
         remote_child = SystemFile("aa", 1000, False)
@@ -849,7 +875,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(0, built_root.transferred_size)
         self.assertIsNone(built_child.transferred_size)
 
-    def test_build_stopped_final_root_file_preserves_retained_snapshot_over_completion_sized_local_file(self):
+    def test_build_stopped_final_root_file_promotes_to_downloaded_when_authoritative_local_is_complete(self):
         self.model_builder.clear()
         remote_file = SystemFile("a", 1000, False)
         local_file = SystemFile("a", 1000, False)
@@ -862,13 +888,22 @@ class TestModelBuilder(unittest.TestCase):
             speed=1000,
             eta=5
         )
+        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
+            root_file_id="a",
+            size_local=650,
+            percent_local=65,
+            speed=None,
+            eta=None
+        )
         self.model_builder.set_stopped_files({"a"})
 
         model = self.model_builder.build_model()
         file_a = model.get_file("a")
-        self.assertEqual(ModelFile.State.DEFAULT, file_a.state)
-        self.assertEqual(650, file_a.transferred_size)
-        self.assertEqual(65, file_a.download_progress)
+        self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
+        self.assertEqual(1000, file_a.transferred_size)
+        self.assertIsNone(file_a.download_progress)
+        self.assertNotIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn("a", self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
         self.assertFalse(self.model_builder.has_changes())
 
     def test_build_stopped_file_prefers_retained_snapshot_over_larger_local_scan_size(self):
@@ -1227,6 +1262,29 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(file_a.downloading_speed)
         self.assertIsNone(file_a.eta)
 
+    def test_build_resumed_queued_state_keeps_retained_stopped_floor_for_authoritative_local_progress(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 750, False)])
+        self.model_builder.set_stopped_files({"a"})
+
+        stopped_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        stopped_status.total_transfer_state = LftpJobStatus.TransferState(750, 1000, 78, 1000, 5)
+        self.model_builder.set_lftp_statuses([stopped_status])
+        self.model_builder.build_model()
+
+        self.model_builder.set_stopped_files(set())
+        queued_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "a", "")
+        self.model_builder.set_lftp_statuses([queued_status])
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.QUEUED, file_a.state)
+        self.assertEqual(750, file_a.transferred_size)
+        self.assertEqual(78, file_a.download_progress)
+        self.assertIsNone(file_a.downloading_speed)
+        self.assertIsNone(file_a.eta)
+
     def test_build_resumed_queued_state_allows_explicit_zero_reset_after_stop(self):
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
@@ -1338,6 +1396,23 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(1000, file_a.downloading_speed)
         self.assertEqual(5, file_a.eta)
 
+    def test_build_running_state_promotes_to_downloaded_when_authoritative_local_file_is_complete(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 1000, False)])
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(990, 1000, 99, 1000, 0)
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
+        self.assertEqual(1000, file_a.transferred_size)
+        self.assertIsNone(file_a.download_progress)
+        self.assertIsNone(file_a.downloading_speed)
+        self.assertIsNone(file_a.eta)
+
     def test_build_stopped_file_retains_snapshot_across_remote_missing_then_reappears(self):
         self.model_builder.clear()
         local_file = SystemFile("a", 650, False)
@@ -1367,6 +1442,91 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(650, second_file.transferred_size)
         self.assertEqual(65, second_file.download_progress)
         self.assertFalse(self.model_builder.has_changes())
+
+    def test_evict_recent_live_transfer_snapshots_missing_roots_preserves_stopped_snapshot(self):
+        self.model_builder.clear()
+        local_file = SystemFile("a", 650, False)
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stopped_files({"a"})
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
+            root_file_id="a",
+            size_local=650,
+            percent_local=65,
+            speed=None,
+            eta=None
+        )
+
+        self.model_builder.evict_recent_live_transfer_snapshots_missing_roots(set())
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.DEFAULT, file_a.state)
+        self.assertEqual(650, file_a.transferred_size)
+        self.assertEqual(65, file_a.download_progress)
+        self.assertIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_evict_recent_live_transfer_snapshots_missing_roots_preserves_stopped_and_evicts_non_stopped(self):
+        self.model_builder.clear()
+        stopped_local_file = SystemFile("a", 650, False)
+        running_local_file = SystemFile("b", 400, False)
+        self.model_builder.set_local_files([stopped_local_file, running_local_file])
+        self.model_builder.set_stopped_files({"a"})
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
+            root_file_id="a",
+            size_local=650,
+            percent_local=65,
+            speed=None,
+            eta=None
+        )
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["b"] = _RecentLiveTransferSnapshot(
+            root_file_id="b",
+            size_local=400,
+            percent_local=40,
+            speed=None,
+            eta=None
+        )
+
+        self.model_builder.evict_recent_live_transfer_snapshots_missing_roots(set())
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        file_b = model.get_file("b")
+        self.assertEqual(ModelFile.State.DEFAULT, file_a.state)
+        self.assertEqual(650, file_a.transferred_size)
+        self.assertEqual(65, file_a.download_progress)
+        self.assertEqual(ModelFile.State.DEFAULT, file_b.state)
+        self.assertIsNone(file_b.transferred_size)
+        self.assertIsNone(file_b.download_progress)
+        self.assertIn("a", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn("b", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_evict_recent_live_transfer_snapshots_missing_roots_alias_stopped_snapshot_is_removed_after_protection_clears(self):
+        self.model_builder.clear()
+        qualified_file_id = ModelFile.build_file_id("dup", "movies")
+        local_file = SystemFile("dup", 650, False)
+        local_file.path_pair_id = "movies"
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_stopped_files({qualified_file_id})
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[qualified_file_id] = _RecentLiveTransferSnapshot(
+            root_file_id="dup",
+            size_local=650,
+            percent_local=65,
+            speed=None,
+            eta=None
+        )
+
+        self.model_builder.evict_recent_live_transfer_snapshots_missing_roots(set())
+        self.assertIn(qualified_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+        self.model_builder.set_stopped_files(set())
+        self.model_builder.evict_recent_live_transfer_snapshots_missing_roots(set())
+
+        model = self.model_builder.build_model()
+        file_dup = model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, file_dup.state)
+        self.assertIsNone(file_dup.transferred_size)
+        self.assertIsNone(file_dup.download_progress)
+        self.assertNotIn(qualified_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
 
     def test_build_stopped_directory_name_entry_suppresses_child_live_transfer_state(self):
         remote_root = SystemFile("dup", 1000, True)

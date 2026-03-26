@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Set, Tuple
 import math
+import json
 
 # my libs
 from system import SystemFile
@@ -123,6 +124,15 @@ class ModelBuilder:
             (remote_file is not None and remote_file.size is not None and local_file.size >= remote_file.size)
 
     @staticmethod
+    def __local_file_proves_download_completion(local_file: Optional[SystemFile],
+                                                remote_file: Optional[SystemFile]) -> bool:
+        if not ModelBuilder.__is_authoritative_local_file(local_file):
+            return False
+        if local_file is None or local_file.size is None or remote_file is None or remote_file.size is None:
+            return False
+        return local_file.size >= remote_file.size
+
+    @staticmethod
     def __normalize_download_progress(percent_local):
         if percent_local is None:
             return None
@@ -164,41 +174,135 @@ class ModelBuilder:
             return
         self.__retained_stopped_transfer_snapshots[file_id] = snapshot
 
-    def __get_retained_stopped_transfer_alias_keys(self,
-                                                   root_file_id: Optional[str],
-                                                   excluded_keys: Optional[Set[str]] = None) -> List[str]:
+    @staticmethod
+    def __candidate_snapshot_root_aliases(root_file_id: Optional[str]) -> List[str]:
         if root_file_id is None:
+            return []
+        alias_candidates = [root_file_id]
+        try:
+            parsed_root = json.loads(root_file_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_root = None
+        if isinstance(parsed_root, list) and len(parsed_root) == 2 and isinstance(parsed_root[1], str):
+            alias_candidates.append(parsed_root[1])
+        return list(dict.fromkeys(alias_candidates))
+
+    @staticmethod
+    def __get_transfer_snapshot_alias_keys(snapshot_store: dict,
+                                           root_file_id: Optional[str],
+                                           excluded_keys: Optional[Set[str]] = None) -> List[str]:
+        root_aliases = ModelBuilder.__candidate_snapshot_root_aliases(root_file_id)
+        if not root_aliases:
             return []
         excluded_keys = excluded_keys if excluded_keys is not None else set()
         alias_keys = []
-        if root_file_id not in excluded_keys and root_file_id in self.__retained_stopped_transfer_snapshots:
-            alias_keys.append(root_file_id)
-        for stored_file_id, snapshot in self.__retained_stopped_transfer_snapshots.items():
-            if stored_file_id in excluded_keys or stored_file_id == root_file_id:
+        for root_alias in root_aliases:
+            if root_alias not in excluded_keys and root_alias in snapshot_store:
+                alias_keys.append(root_alias)
+        for stored_file_id, snapshot in snapshot_store.items():
+            if stored_file_id in excluded_keys or stored_file_id in root_aliases:
                 continue
-            if snapshot.root_file_id == root_file_id:
+            if snapshot.root_file_id in root_aliases:
                 alias_keys.append(stored_file_id)
-        return alias_keys
+        return list(dict.fromkeys(alias_keys))
+
+    def __resolve_transfer_snapshot(self,
+                                    snapshot_store: dict,
+                                    file_id: str,
+                                    root_file_id: Optional[str] = None
+                                    ) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
+        snapshot = snapshot_store.get(file_id)
+        if snapshot is not None:
+            return file_id, snapshot
+        if root_file_id is None:
+            return None, None
+        alias_keys = self.__get_transfer_snapshot_alias_keys(snapshot_store, root_file_id, {file_id})
+        if len(alias_keys) == 1:
+            alias_key = alias_keys[0]
+            return alias_key, snapshot_store.get(alias_key)
+        return None, None
+
+    @staticmethod
+    def __promote_transfer_snapshot(snapshot_store: dict,
+                                    resolved_file_id: Optional[str],
+                                    canonical_file_id: str,
+                                    canonical_root_file_id: Optional[str]
+                                    ) -> Optional[_RecentLiveTransferSnapshot]:
+        if resolved_file_id is None:
+            return None
+        snapshot = snapshot_store.get(resolved_file_id)
+        if snapshot is None:
+            return None
+        if canonical_root_file_id is not None:
+            snapshot.root_file_id = canonical_root_file_id
+        if resolved_file_id != canonical_file_id:
+            snapshot_store.pop(resolved_file_id, None)
+            snapshot_store[canonical_file_id] = snapshot
+        return snapshot
 
     def __resolve_retained_stopped_transfer_snapshot(
             self,
             file_id: str,
             root_file_id: Optional[str] = None) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
-        snapshot = self.__retained_stopped_transfer_snapshots.get(file_id)
-        if snapshot is not None:
-            return file_id, snapshot
-        if root_file_id is None:
-            return None, None
-        alias_keys = self.__get_retained_stopped_transfer_alias_keys(root_file_id, {file_id})
-        if len(alias_keys) == 1:
-            alias_key = alias_keys[0]
-            return alias_key, self.__retained_stopped_transfer_snapshots.get(alias_key)
-        return None, None
+        resolved_file_id, snapshot = self.__resolve_transfer_snapshot(
+            self.__retained_stopped_transfer_snapshots,
+            file_id,
+            root_file_id
+        )
+        promoted_snapshot = self.__promote_transfer_snapshot(
+            self.__retained_stopped_transfer_snapshots,
+            resolved_file_id,
+            file_id,
+            root_file_id
+        )
+        if promoted_snapshot is not None:
+            return file_id, promoted_snapshot
+        return resolved_file_id, snapshot
+
+    def __resolve_recent_live_transfer_snapshot(
+            self,
+            file_id: str,
+            root_file_id: Optional[str] = None) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
+        resolved_file_id, snapshot = self.__resolve_transfer_snapshot(
+            self.__recent_live_transfer_snapshots,
+            file_id,
+            root_file_id
+        )
+        promoted_snapshot = self.__promote_transfer_snapshot(
+            self.__recent_live_transfer_snapshots,
+            resolved_file_id,
+            file_id,
+            root_file_id
+        )
+        if promoted_snapshot is not None:
+            return file_id, promoted_snapshot
+        return resolved_file_id, snapshot
 
     def __evict_retained_stopped_transfer_snapshots(self,
                                                     resolved_file_id: str,
                                                     root_file_id: Optional[str] = None):
         self.__retained_stopped_transfer_snapshots.pop(resolved_file_id, None)
+
+    def __evict_transfer_completion_snapshots(self,
+                                              file_id: str,
+                                              root_file_id: Optional[str] = None):
+        recent_snapshot_key, _ = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
+        if recent_snapshot_key is not None:
+            self.__recent_live_transfer_snapshots.pop(recent_snapshot_key, None)
+
+        retained_snapshot_key, _ = self.__resolve_retained_stopped_transfer_snapshot(file_id, root_file_id)
+        if retained_snapshot_key is not None:
+            self.__retained_stopped_transfer_snapshots.pop(retained_snapshot_key, None)
+
+    @staticmethod
+    def __resolve_root_file_id(file_id: str,
+                               root_remote: Optional[SystemFile],
+                               root_local: Optional[SystemFile]) -> str:
+        if root_remote is not None:
+            return ModelBuilder.__root_file_id(root_remote.name, root_remote.path_pair_id)
+        if root_local is not None:
+            return ModelBuilder.__root_file_id(root_local.name, root_local.path_pair_id)
+        return file_id
 
     @staticmethod
     def __build_retained_transfer_state(size_local: Optional[int],
@@ -246,22 +350,32 @@ class ModelBuilder:
                                          local: Optional[SystemFile],
                                          root_remote: Optional[SystemFile] = None,
                                          root_local: Optional[SystemFile] = None) -> Optional[LftpJobStatus.TransferState]:
-        snapshot = self.__recent_live_transfer_snapshots.get(file_id)
+        root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
+        resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
             return None
         root_status = self.__lftp_statuses.get(snapshot.root_file_id)
         stop_remote = root_remote if root_remote is not None else remote
         stop_local = root_local if root_local is not None else local
         if self.__is_stopped_file(snapshot.root_file_id, stop_remote, stop_local, root_status):
-            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            self.__recent_live_transfer_snapshots.pop(
+                resolved_file_id if resolved_file_id is not None else file_id,
+                None
+            )
             return None
         if self.__lftp_statuses.get(snapshot.root_file_id) is not None:
             return None
         if remote is None or local is None or local.size is None or snapshot.size_local is None:
-            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            self.__recent_live_transfer_snapshots.pop(
+                resolved_file_id if resolved_file_id is not None else file_id,
+                None
+            )
             return None
         if self.__local_size_is_authoritative_progress(local, remote, snapshot.size_local):
-            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            self.__recent_live_transfer_snapshots.pop(
+                resolved_file_id if resolved_file_id is not None else file_id,
+                None
+            )
             return None
 
         return LftpJobStatus.TransferState(
@@ -337,6 +451,12 @@ class ModelBuilder:
         )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return None
+        if self.__local_file_proves_download_completion(local, remote):
+            self.__evict_transfer_completion_snapshots(
+                file_id,
+                root_file_id
+            )
+            return None
         if ModelBuilder.__is_authoritative_local_file(local) and local is not None and local.size is not None:
             if local.size == 0:
                 self.__evict_retained_stopped_transfer_snapshots(
@@ -344,7 +464,7 @@ class ModelBuilder:
                     retained_snapshot.root_file_id
                 )
                 return None
-            if self.__local_size_is_authoritative_progress(local, remote, retained_snapshot.size_local):
+            if local.size > retained_snapshot.size_local:
                 return None
         return self.__build_retained_transfer_state(
             retained_snapshot.size_local,
@@ -355,12 +475,21 @@ class ModelBuilder:
     def __get_retained_recent_transfer_state(self,
                                              file_id: str,
                                              remote: Optional[SystemFile],
-                                             local: Optional[SystemFile]) -> Optional[LftpJobStatus.TransferState]:
-        snapshot = self.__recent_live_transfer_snapshots.get(file_id)
+                                             local: Optional[SystemFile],
+                                             root_remote: Optional[SystemFile] = None,
+                                             root_local: Optional[SystemFile] = None) -> Optional[LftpJobStatus.TransferState]:
+        root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
+        resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
             return None
         if snapshot.size_local is None:
-            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            self.__recent_live_transfer_snapshots.pop(
+                resolved_file_id if resolved_file_id is not None else file_id,
+                None
+            )
+            return None
+        if self.__local_file_proves_download_completion(local, remote):
+            self.__evict_transfer_completion_snapshots(file_id, root_file_id)
             return None
         if remote is None:
             return self.__build_retained_transfer_state(snapshot.size_local, None, snapshot.percent_local)
@@ -397,6 +526,19 @@ class ModelBuilder:
         self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
         # Invalidate the cache
         if self.__lftp_statuses != prev_lftp_statuses:
+            self.__cached_model = None
+
+    def evict_recent_live_transfer_snapshots_missing_roots(self, active_root_file_ids: Set[str]):
+        removed = False
+        for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
+            if snapshot.root_file_id in active_root_file_ids:
+                continue
+            root_status = self.__lftp_statuses.get(snapshot.root_file_id)
+            if self.__is_stopped_file(file_id) or self.__is_stopped_file(snapshot.root_file_id, status=root_status):
+                continue
+            self.__recent_live_transfer_snapshots.pop(file_id, None)
+            removed = True
+        if removed:
             self.__cached_model = None
 
     def set_downloaded_files(self, downloaded_files: Set[str]):
@@ -609,7 +751,7 @@ class ModelBuilder:
             if current_transfer_state is None and status is None and not is_stopped:
                 recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
             if retained_transfer_state is None and status is None and is_stopped:
-                retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local)
+                retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
             if status and not is_stopped:
                 model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
                                    else ModelFile.State.DOWNLOADING
@@ -728,6 +870,18 @@ class ModelBuilder:
                 # First-order estimate
                 remaining_size = max(model_file.remote_size - model_file.transferred_size, 0)
                 model_file.eta = int(math.ceil(remaining_size / model_file.downloading_speed))
+
+            if model_file.state == ModelFile.State.DOWNLOADING and \
+                    self.__local_file_proves_download_completion(local, remote):
+                self.__evict_transfer_completion_snapshots(
+                    file_id,
+                    status.file_id if status is not None else model_file.file_id
+                )
+                model_file.state = ModelFile.State.DOWNLOADED
+                model_file.transferred_size = remote.size if remote is not None else model_file.local_size
+                model_file.download_progress = None
+                model_file.downloading_speed = None
+                model_file.eta = None
 
             # now we can determine if root is Downloaded
             # root is Downloaded if all child remote files are Downloaded

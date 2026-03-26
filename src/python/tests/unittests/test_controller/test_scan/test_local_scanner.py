@@ -109,3 +109,31 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertFalse(files["complete.mkv"].is_staging)
         self.assertTrue(files["partial.zip"].is_staging)
+
+    def test_scan_merges_same_name_directory_collision_without_masking_final_tree(self):
+        staging_dir = os.path.join(self.temp_dir, "incomplete")
+        os.mkdir(staging_dir)
+        os.mkdir(os.path.join(self.temp_dir, "series"))
+        with open(os.path.join(self.temp_dir, "series", "complete.txt"), "w") as handle:
+            handle.write("complete")
+        os.mkdir(os.path.join(staging_dir, "series"))
+        with open(os.path.join(staging_dir, "series", "partial.txt"), "w") as handle:
+            handle.write("partial")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertEqual(["series"], list(files.keys()))
+        self.assertTrue(files["series"].is_dir)
+        self.assertFalse(files["series"].is_staging)
+        self.assertEqual(
+            ["complete.txt", "partial.txt"],
+            [child.name for child in files["series"].children]
+        )
+        self.assertFalse(files["series"].children[0].is_staging)
+        self.assertTrue(files["series"].children[1].is_staging)

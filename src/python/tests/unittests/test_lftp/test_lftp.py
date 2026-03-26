@@ -145,6 +145,8 @@ class TestLftp(unittest.TestCase):
         lftp = self._build_test_lftp()
         lftp._Lftp__job_status_parser = MagicMock()
         lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__last_command_timed_out = False
+        lftp._Lftp__last_status_poll_healthy = True
         lftp._Lftp__path_pairs_by_id = {
             "movies": {
                 "name": "Movies",
@@ -172,6 +174,33 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual("tv", statuses[0].path_pair_id)
         self.assertEqual("TV", statuses[0].path_pair_name)
+        self.assertTrue(lftp.last_status_poll_healthy)
+
+    def test_status_marks_poll_unhealthy_when_jobs_command_times_out(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__last_command_timed_out = True
+        lftp._Lftp__last_status_poll_healthy = True
+
+        statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+
+    def test_status_marks_poll_unhealthy_when_parser_error_is_suppressed(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("bad status")
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__last_command_timed_out = False
+        lftp._Lftp__last_status_poll_healthy = True
+
+        statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
 
     def test_run_command_logs_warning_on_timeout(self):
         lftp = Lftp.__new__(Lftp)
@@ -180,6 +209,7 @@ class TestLftp(unittest.TestCase):
         lftp._Lftp__timeout = 30
         lftp._Lftp__log_command_output = False
         lftp._Lftp__pending_error = None
+        lftp._Lftp__last_command_timed_out = False
         process = MagicMock()
         process.isalive.return_value = True
         process.before = b"harmless output"
@@ -191,6 +221,7 @@ class TestLftp(unittest.TestCase):
 
         self.assertEqual("harmless output", out)
         lftp.logger.warning.assert_called_once_with("Lftp timeout exception")
+        self.assertTrue(lftp._Lftp__last_command_timed_out)
 
     def test_run_command_logs_warning_on_error_recovery_timeout(self):
         lftp = Lftp.__new__(Lftp)
@@ -199,6 +230,7 @@ class TestLftp(unittest.TestCase):
         lftp._Lftp__timeout = 30
         lftp._Lftp__log_command_output = False
         lftp._Lftp__pending_error = None
+        lftp._Lftp__last_command_timed_out = False
         process = MagicMock()
         process.isalive.return_value = True
         process.before = b"mirror: Access failed"

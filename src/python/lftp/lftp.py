@@ -59,6 +59,8 @@ class Lftp:
         self.__timeout = 30  # in seconds
         self.__consecutive_status_errors = 0
         self.__path_pairs_by_id: Dict[str, Dict[str, str]] = {}
+        self.__last_command_timed_out = False
+        self.__last_status_poll_healthy = True
 
         self.__log_command_output = False
         self.__pending_error = None
@@ -152,12 +154,14 @@ class Lftp:
 
     @with_check_process
     def __run_command(self, command: str):
+        self.__last_command_timed_out = False
         if self.__log_command_output:
             self.logger.debug("command: {}".format(command.encode('utf8', 'surrogateescape')))
         self.__process.sendline(command)
         try:
             self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
         except pexpect.exceptions.TIMEOUT:
+            self.__last_command_timed_out = True
             out = self.__process.before.decode("utf8", "replace").strip()
             if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
                 self.logger.warning("Lftp timeout exception")
@@ -348,6 +352,10 @@ class Lftp:
         self.__set(Lftp.__SET_SFTP_AUTO_CONFIRM, str(int(auto_confirm)))
 
     @property
+    def last_status_poll_healthy(self) -> bool:
+        return self.__last_status_poll_healthy
+
+    @property
     def sftp_connect_program(self) -> str:
         return self.__get(Lftp.__SET_SFTP_CONNECT_PROGRAM)
 
@@ -361,11 +369,14 @@ class Lftp:
         :return:
         """
         out = self.__run_command("jobs -v")
+        timed_out = self.__last_command_timed_out
         try:
             statuses = self.__job_status_parser.parse(out)
             self.__consecutive_status_errors = 0
+            self.__last_status_poll_healthy = not timed_out
         except LftpJobStatusParserError:
             self.__consecutive_status_errors += 1
+            self.__last_status_poll_healthy = False
             if self.__consecutive_status_errors <= MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
                 statuses = []

@@ -584,10 +584,14 @@ class Controller:
 
         # Grab the Lftp status
         lftp_statuses = None
+        lftp_status_poll_healthy = True
         try:
             lftp_statuses = self.__lftp.status()
+            lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
         except (LftpError, LftpJobStatusParserError) as e:
             self.logger.warning("Caught lftp error: {}".format(str(e)))
+            lftp_statuses = []
+            lftp_status_poll_healthy = False
 
         # Grab the latest extract results
         latest_extract_statuses = self.__extract_process.pop_latest_statuses()
@@ -630,6 +634,10 @@ class Controller:
             self.__model_builder.set_active_files(latest_active_scan.files)
         if lftp_statuses is not None:
             self.__model_builder.set_lftp_statuses(lftp_statuses)
+            if not lftp_status_poll_healthy:
+                self.__model_builder.evict_recent_live_transfer_snapshots_missing_roots(
+                    {status.file_id for status in lftp_statuses}
+                )
         if latest_extract_statuses is not None:
             self.__model_builder.set_extract_statuses(latest_extract_statuses.statuses)
         if latest_validation_statuses is not None:
