@@ -16,6 +16,7 @@ from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatus
 
 # How many status errors are allowed before error propagates out
 MAX_CONSECUTIVE_STATUS_ERRORS = 2
+MAX_KILL_MATCH_ATTEMPTS = 20
 
 
 class LftpError(AppError):
@@ -474,33 +475,52 @@ class Lftp:
         :param name:
         :return: True if job of given name was found, False otherwise
         """
-        # look for this name in the status list
-        job_to_kill = None
-        for status in self.status():
-            if status.name != name:
-                continue
-            if remote_path is not None and not self.__path_is_within(status.remote_path, remote_path):
-                continue
-            if local_path is not None and not self.__path_is_within(status.local_path, local_path):
-                continue
-            if remote_path is None and local_path is None and path_pair_id is not None and status.path_pair_id != path_pair_id:
-                continue
-            job_to_kill = status
-            break
-        if job_to_kill is None:
+        def find_matching_jobs():
+            matching_jobs = []
+            for status in self.status():
+                if status.name != name:
+                    continue
+                if remote_path is not None and not self.__path_is_within(status.remote_path, remote_path):
+                    continue
+                if local_path is not None and not self.__path_is_within(status.local_path, local_path):
+                    continue
+                if remote_path is None and local_path is None and path_pair_id is not None and status.path_pair_id != path_pair_id:
+                    continue
+                matching_jobs.append(status)
+            return matching_jobs
+
+        killed_any = False
+        previous_match_signature = None
+        attempts = 0
+        while attempts < MAX_KILL_MATCH_ATTEMPTS:
+            matching_jobs = find_matching_jobs()
+            if not matching_jobs:
+                break
+            match_signature = tuple((job.id, job.state) for job in matching_jobs)
+            if match_signature == previous_match_signature:
+                self.logger.warning("Kill did not converge for job '{}' after repeated matching polls".format(name))
+                break
+            previous_match_signature = match_signature
+            attempts += 1
+            job_to_kill = matching_jobs[0]
+            killed_any = True
+            # Note: there's a chance that job ids change between when we called status
+            #       and when we execute the kill command
+            #       in this case the wrong job may be killed, there's nothing we can do about it
+            if job_to_kill.state == LftpJobStatus.State.RUNNING:
+                self.logger.debug("Killing running job '{}'...".format(name))
+                self.__run_command("kill {}".format(job_to_kill.id))
+            elif job_to_kill.state == LftpJobStatus.State.QUEUED:
+                self.logger.debug("Killing queued job '{}'...".format(name))
+                self.__run_command("queue --delete {}".format(job_to_kill.id))
+            else:
+                raise NotImplementedError("Unsupported state {}".format(str(job_to_kill.state)))
+        else:
+            self.logger.warning("Kill reached max attempts for job '{}'".format(name))
+
+        if not killed_any:
             self.logger.debug("Kill failed to find job '{}'".format(name))
             return False
-        # Note: there's a chance that job ids change between when we called status
-        #       and when we execute the kill command
-        #       in this case the wrong job may be killed, there's nothing we can do about it
-        if job_to_kill.state == LftpJobStatus.State.RUNNING:
-            self.logger.debug("Killing running job '{}'...".format(name))
-            self.__run_command("kill {}".format(job_to_kill.id))
-        elif job_to_kill.state == LftpJobStatus.State.QUEUED:
-            self.logger.debug("Killing queued job '{}'...".format(name))
-            self.__run_command("queue --delete {}".format(job_to_kill.id))
-        else:
-            raise NotImplementedError("Unsupported state {}".format(str(job_to_kill.state)))
         return True
 
     def kill_all(self):

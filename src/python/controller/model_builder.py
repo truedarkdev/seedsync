@@ -144,6 +144,17 @@ class ModelBuilder:
             return int(round(percent_local))
         return percent_local
 
+    @staticmethod
+    def __remote_indicates_newer_content(local_file: Optional[SystemFile],
+                                         remote_file: Optional[SystemFile]) -> bool:
+        if local_file is None or remote_file is None:
+            return False
+        if not ModelBuilder.__local_file_proves_download_completion(local_file, remote_file):
+            return True
+        if local_file.timestamp_modified is None or remote_file.timestamp_modified is None:
+            return False
+        return remote_file.timestamp_modified > local_file.timestamp_modified
+
     def __store_recent_live_transfer_snapshot(self,
                                               file_id: str,
                                               root_file_id: str,
@@ -444,7 +455,8 @@ class ModelBuilder:
             file_id: str,
             root_file_id: Optional[str],
             remote: Optional[SystemFile],
-            local: Optional[SystemFile]) -> Optional[LftpJobStatus.TransferState]:
+            local: Optional[SystemFile],
+            preserve_when_local_growth_only: bool = False) -> Optional[LftpJobStatus.TransferState]:
         retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
             file_id,
             root_file_id
@@ -464,7 +476,7 @@ class ModelBuilder:
                     retained_snapshot.root_file_id
                 )
                 return None
-            if local.size > retained_snapshot.size_local:
+            if local.size > retained_snapshot.size_local and not preserve_when_local_growth_only:
                 return None
         return self.__build_retained_transfer_state(
             retained_snapshot.size_local,
@@ -498,7 +510,18 @@ class ModelBuilder:
     def set_active_files(self, active_files: List[SystemFile]):
         # Update the local file state with this latest information
         for file in active_files:
-            self.__local_files[self.__root_file_id(file.name, file.path_pair_id)] = file
+            file_id = self.__root_file_id(file.name, file.path_pair_id)
+            existing_file = self.__local_files.get(file_id)
+            remote_file = self.__remote_files.get(file_id)
+            if existing_file is not None and \
+                    self.__is_authoritative_local_file(existing_file) and \
+                    getattr(file, "is_staging", False) and \
+                    existing_file.size is not None and \
+                    file.size is not None and \
+                    existing_file.size >= file.size and \
+                    not self.__remote_indicates_newer_content(existing_file, remote_file):
+                continue
+            self.__local_files[file_id] = file
         # Invalidate the cache
         if len(active_files) > 0:
             self.__cached_model = None
@@ -746,10 +769,19 @@ class ModelBuilder:
                     file_id,
                     status.file_id if status is not None else model_file.file_id,
                     remote,
-                    local
+                    local,
+                    preserve_when_local_growth_only=is_stopped
                 )
             if current_transfer_state is None and status is None and not is_stopped:
                 recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
+            if retained_transfer_state is None and status is None and is_stopped:
+                retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
+                    file_id,
+                    model_file.file_id,
+                    remote,
+                    local,
+                    preserve_when_local_growth_only=True
+                )
             if retained_transfer_state is None and status is None and is_stopped:
                 retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
             if status and not is_stopped:

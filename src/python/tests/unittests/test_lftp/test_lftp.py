@@ -1019,3 +1019,71 @@ class TestLftpKillPathMatching(unittest.TestCase):
 
         self.assertTrue(killed)
         lftp._Lftp__run_command.assert_called_once_with("kill 11")
+
+    def test_kill_removes_all_matching_running_jobs(self):
+        lftp = TestLftp._build_test_lftp()
+        lftp._Lftp__path_is_within = MagicMock(return_value=True)
+        status_1 = LftpJobStatus(
+            job_id=3,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup.bin",
+            flags="-c",
+            remote_path="/remote/downloads/dup.bin",
+            local_path="/local/incomplete/dup.bin.lftp"
+        )
+        status_2 = LftpJobStatus(
+            job_id=4,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup.bin",
+            flags="-c",
+            remote_path="/remote/downloads/dup.bin",
+            local_path="/local/incomplete/dup.bin.lftp"
+        )
+        lftp.status = MagicMock(side_effect=[
+            [status_1, status_2],
+            [status_2],
+            []
+        ])
+
+        killed = lftp.kill(
+            "dup.bin",
+            remote_path="/remote/downloads",
+            local_path="/local/incomplete"
+        )
+
+        self.assertTrue(killed)
+        self.assertEqual(
+            [("kill 3",), ("kill 4",)],
+            [call.args for call in lftp._Lftp__run_command.call_args_list]
+        )
+
+    def test_kill_stops_when_matching_jobs_do_not_converge(self):
+        lftp = TestLftp._build_test_lftp()
+        lftp._Lftp__path_is_within = MagicMock(return_value=True)
+        stuck_status = LftpJobStatus(
+            job_id=3,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="dup.bin",
+            flags="-c",
+            remote_path="/remote/downloads/dup.bin",
+            local_path="/local/incomplete/dup.bin.lftp"
+        )
+        lftp.status = MagicMock(side_effect=[
+            [stuck_status],
+            [stuck_status]
+        ])
+
+        killed = lftp.kill(
+            "dup.bin",
+            remote_path="/remote/downloads",
+            local_path="/local/incomplete"
+        )
+
+        self.assertTrue(killed)
+        lftp._Lftp__run_command.assert_called_once_with("kill 3")
+        lftp.logger.warning.assert_called_once_with(
+            "Kill did not converge for job 'dup.bin' after repeated matching polls"
+        )

@@ -906,6 +906,48 @@ class TestModelBuilder(unittest.TestCase):
         self.assertNotIn("a", self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
         self.assertFalse(self.model_builder.has_changes())
 
+    def test_build_running_file_promotes_to_downloaded_when_active_scan_only_has_staging_copy(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_active_files([SystemFile("a", 975, False, is_staging=True)])
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(975, 1000, 99, 1000, 0)
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.DOWNLOADED, file_a.state)
+        self.assertEqual(1000, file_a.local_size)
+        self.assertEqual(1000, file_a.transferred_size)
+        self.assertIsNone(file_a.download_progress)
+        self.assertIsNone(file_a.downloading_speed)
+        self.assertIsNone(file_a.eta)
+
+    def test_build_running_file_prefers_staging_copy_when_remote_timestamp_indicates_newer_content(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([
+            SystemFile("a", 1000, False, time_modified=datetime(2026, 3, 26, 12, 0, 0))
+        ])
+        self.model_builder.set_local_files([
+            SystemFile("a", 1000, False, time_modified=datetime(2026, 3, 25, 12, 0, 0))
+        ])
+        self.model_builder.set_active_files([SystemFile("a", 100, False, is_staging=True)])
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(100, 1000, 10, 1000, 1)
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        file_a = model.get_file("a")
+        self.assertEqual(ModelFile.State.DOWNLOADING, file_a.state)
+        self.assertEqual(100, file_a.local_size)
+        self.assertEqual(100, file_a.transferred_size)
+        self.assertEqual(10, file_a.download_progress)
+        self.assertEqual(1000, file_a.downloading_speed)
+        self.assertEqual(1, file_a.eta)
+
     def test_build_stopped_file_prefers_retained_snapshot_over_larger_local_scan_size(self):
         self.model_builder.clear()
         remote_file = SystemFile("verifier-stop-regression-1g.bin", 1073741824, False)
@@ -928,6 +970,65 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(1067800592, file_bin.local_size)
         self.assertEqual(1044601281, file_bin.transferred_size)
         self.assertEqual(97, file_bin.download_progress)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_keeps_retained_snapshot_when_local_scan_grows_without_live_status(self):
+        self.model_builder.clear()
+        file_name = "verifier-stop-regression-1g.bin"
+        self.model_builder.set_remote_files([SystemFile(file_name, 1073741824, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 1044601281, False)])
+        self.model_builder.set_stopped_files({file_name})
+
+        stopped_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        stopped_status.total_transfer_state = LftpJobStatus.TransferState(1044601281, 1073741824, 97, 1000, 5)
+        self.model_builder.set_lftp_statuses([stopped_status])
+
+        stopped_model = self.model_builder.build_model()
+        stopped_file = stopped_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DEFAULT, stopped_file.state)
+        self.assertEqual(1044601281, stopped_file.transferred_size)
+        self.assertEqual(97, stopped_file.download_progress)
+
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots.pop(file_name, None)
+        self.model_builder.set_local_files([SystemFile(file_name, 1067800592, False)])
+
+        rebuilt_model = self.model_builder.build_model()
+        rebuilt_file = rebuilt_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DEFAULT, rebuilt_file.state)
+        self.assertEqual(1067800592, rebuilt_file.local_size)
+        self.assertEqual(1044601281, rebuilt_file.transferred_size)
+        self.assertEqual(97, rebuilt_file.download_progress)
+        self.assertIsNone(rebuilt_file.downloading_speed)
+        self.assertIsNone(rebuilt_file.eta)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_keeps_retained_snapshot_when_only_queued_status_remains(self):
+        self.model_builder.clear()
+        file_name = "verifier-stop-regression-1g.bin"
+        self.model_builder.set_remote_files([SystemFile(file_name, 1073741824, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 1044601281, False)])
+        self.model_builder.set_stopped_files({file_name})
+
+        stopped_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        stopped_status.total_transfer_state = LftpJobStatus.TransferState(1044601281, 1073741824, 97, 1000, 5)
+        self.model_builder.set_lftp_statuses([stopped_status])
+        self.model_builder.build_model()
+
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots.pop(file_name, None)
+        self.model_builder.set_local_files([SystemFile(file_name, 1067800592, False)])
+        self.model_builder.set_lftp_statuses([
+            LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file_name, "")
+        ])
+
+        rebuilt_model = self.model_builder.build_model()
+        rebuilt_file = rebuilt_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DEFAULT, rebuilt_file.state)
+        self.assertEqual(1067800592, rebuilt_file.local_size)
+        self.assertEqual(1044601281, rebuilt_file.transferred_size)
+        self.assertEqual(97, rebuilt_file.download_progress)
+        self.assertIsNone(rebuilt_file.downloading_speed)
+        self.assertIsNone(rebuilt_file.eta)
         self.assertFalse(self.model_builder.has_changes())
 
     def test_build_resumed_running_state_keeps_retained_stopped_snapshot_until_progress_catches_up(self):
