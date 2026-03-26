@@ -3,7 +3,7 @@
 import os
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 import math
 
 # my libs
@@ -164,6 +164,42 @@ class ModelBuilder:
             return
         self.__retained_stopped_transfer_snapshots[file_id] = snapshot
 
+    def __get_retained_stopped_transfer_alias_keys(self,
+                                                   root_file_id: Optional[str],
+                                                   excluded_keys: Optional[Set[str]] = None) -> List[str]:
+        if root_file_id is None:
+            return []
+        excluded_keys = excluded_keys if excluded_keys is not None else set()
+        alias_keys = []
+        if root_file_id not in excluded_keys and root_file_id in self.__retained_stopped_transfer_snapshots:
+            alias_keys.append(root_file_id)
+        for stored_file_id, snapshot in self.__retained_stopped_transfer_snapshots.items():
+            if stored_file_id in excluded_keys or stored_file_id == root_file_id:
+                continue
+            if snapshot.root_file_id == root_file_id:
+                alias_keys.append(stored_file_id)
+        return alias_keys
+
+    def __resolve_retained_stopped_transfer_snapshot(
+            self,
+            file_id: str,
+            root_file_id: Optional[str] = None) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
+        snapshot = self.__retained_stopped_transfer_snapshots.get(file_id)
+        if snapshot is not None:
+            return file_id, snapshot
+        if root_file_id is None:
+            return None, None
+        alias_keys = self.__get_retained_stopped_transfer_alias_keys(root_file_id, {file_id})
+        if len(alias_keys) == 1:
+            alias_key = alias_keys[0]
+            return alias_key, self.__retained_stopped_transfer_snapshots.get(alias_key)
+        return None, None
+
+    def __evict_retained_stopped_transfer_snapshots(self,
+                                                    resolved_file_id: str,
+                                                    root_file_id: Optional[str] = None):
+        self.__retained_stopped_transfer_snapshots.pop(resolved_file_id, None)
+
     @staticmethod
     def __build_retained_transfer_state(size_local: Optional[int],
                                         size_remote: Optional[int],
@@ -240,26 +276,28 @@ class ModelBuilder:
     def __has_clear_transfer_reset_signal(local: Optional[SystemFile],
                                           current_transfer_state: LftpJobStatus.TransferState,
                                           retained_snapshot: _RecentLiveTransferSnapshot) -> bool:
-        normalized_percent = ModelBuilder.__normalize_download_progress(current_transfer_state.percent_local)
-        if current_transfer_state.size_local == 0 or normalized_percent == 0:
+        if current_transfer_state.size_local == 0 or current_transfer_state.percent_local == 0:
             return True
-        return ModelBuilder.__is_authoritative_local_file(local) and \
-            local is not None and \
-            local.size is not None and \
-            retained_snapshot.size_local is not None and \
-            local.size < retained_snapshot.size_local
+        return False
 
     def __coalesce_retained_stopped_transfer_state(self,
                                                    file_id: str,
+                                                   root_file_id: Optional[str],
                                                    remote: Optional[SystemFile],
                                                    local: Optional[SystemFile],
                                                    current_transfer_state: LftpJobStatus.TransferState
                                                    ) -> LftpJobStatus.TransferState:
-        retained_snapshot = self.__retained_stopped_transfer_snapshots.get(file_id)
+        retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
+            file_id,
+            root_file_id
+        )
         if retained_snapshot is None or retained_snapshot.size_local is None:
             return current_transfer_state
         if self.__has_clear_transfer_reset_signal(local, current_transfer_state, retained_snapshot):
-            self.__retained_stopped_transfer_snapshots.pop(file_id, None)
+            self.__evict_retained_stopped_transfer_snapshots(
+                retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                retained_snapshot.root_file_id
+            )
             return current_transfer_state
         current_percent = ModelBuilder.__normalize_download_progress(current_transfer_state.percent_local)
         retained_percent = retained_snapshot.percent_local
@@ -268,7 +306,10 @@ class ModelBuilder:
         percent_has_caught_up = retained_percent is None or \
             (current_percent is not None and current_percent >= retained_percent)
         if size_has_caught_up and percent_has_caught_up:
-            self.__retained_stopped_transfer_snapshots.pop(file_id, None)
+            self.__evict_retained_stopped_transfer_snapshots(
+                retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                retained_snapshot.root_file_id
+            )
             return current_transfer_state
         coalesced_size_local = retained_snapshot.size_local
         if size_has_caught_up:
@@ -282,6 +323,33 @@ class ModelBuilder:
             coalesced_percent_local,
             current_transfer_state.speed,
             current_transfer_state.eta
+        )
+
+    def __get_retained_stopped_transfer_state_without_live_progress(
+            self,
+            file_id: str,
+            root_file_id: Optional[str],
+            remote: Optional[SystemFile],
+            local: Optional[SystemFile]) -> Optional[LftpJobStatus.TransferState]:
+        retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
+            file_id,
+            root_file_id
+        )
+        if retained_snapshot is None or retained_snapshot.size_local is None:
+            return None
+        if ModelBuilder.__is_authoritative_local_file(local) and local is not None and local.size is not None:
+            if local.size == 0:
+                self.__evict_retained_stopped_transfer_snapshots(
+                    retained_snapshot_key if retained_snapshot_key is not None else file_id,
+                    retained_snapshot.root_file_id
+                )
+                return None
+            if self.__local_size_is_authoritative_progress(local, remote, retained_snapshot.size_local):
+                return None
+        return self.__build_retained_transfer_state(
+            retained_snapshot.size_local,
+            remote.size if remote is not None else None,
+            retained_snapshot.percent_local
         )
 
     def __get_retained_recent_transfer_state(self,
@@ -526,9 +594,17 @@ class ModelBuilder:
             elif current_transfer_state is not None:
                 current_transfer_state = self.__coalesce_retained_stopped_transfer_state(
                     file_id,
+                    status.file_id if status is not None else model_file.file_id,
                     remote,
                     local,
                     current_transfer_state
+                )
+            elif status is not None:
+                retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
+                    file_id,
+                    status.file_id if status is not None else model_file.file_id,
+                    remote,
+                    local
                 )
             if current_transfer_state is None and status is None and not is_stopped:
                 recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
