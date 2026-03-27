@@ -191,6 +191,7 @@ class Controller:
                     local_path=pair.local_path,
                     use_temp_file=self.__context.config.lftp.use_temp_file,
                     staging_path=self.__path_pair_staging_paths[pair.id],
+                    managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
@@ -216,7 +217,8 @@ class Controller:
             self.__local_scanner = LocalScanner(
                 local_path=self.__context.config.lftp.local_path,
                 use_temp_file=self.__context.config.lftp.use_temp_file,
-                staging_path=self.__staging_path
+                staging_path=self.__staging_path,
+                managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
             )
             self.__remote_scanner = RemoteScanner(
                 remote_address=self.__context.config.lftp.remote_address,
@@ -249,7 +251,8 @@ class Controller:
             out_dir_path = self.__context.config.controller.extract_path
         self.__extract_process = ExtractProcess(
             out_dir_path=out_dir_path,
-            local_path=self.__context.config.lftp.local_path
+            local_path=self.__context.config.lftp.local_path,
+            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
         )
         self.__validate_process = ValidateProcess(
             remote_address=self.__context.config.lftp.remote_address,
@@ -533,16 +536,18 @@ class Controller:
             "is_extractable": file.is_extractable,
         }
 
-    def __find_target_archive_model_file(self, file_name: str):
+    def __find_target_archive_model_file(self, file_name: str, file_id: str = None):
         try:
             file_ids = self.__model.get_file_ids()
         except AttributeError:
             return None
-        for file_id in file_ids:
+        for candidate_file_id in file_ids:
             try:
-                file = self.__model.get_file(file_id)
+                file = self.__model.get_file(candidate_file_id)
             except ModelError:
                 continue
+            if file_id is not None and file.file_id == file_id:
+                return file
             if file.name == file_name and self.__target_archive_trace_selector_matches_file(file.file_id, file.name):
                 return file
         return None
@@ -872,6 +877,9 @@ class Controller:
             self.__model_builder.set_remote_files(latest_remote_scan.files)
         if latest_local_scan is not None:
             self.__model_builder.set_local_files(latest_local_scan.files)
+            recovered_extracted_file_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
+            if isinstance(recovered_extracted_file_ids, (list, tuple, set)):
+                self.__persist.extracted_file_names.update(recovered_extracted_file_ids)
         if latest_active_scan is not None:
             self.__model_builder.set_active_files(latest_active_scan.files)
         if lftp_statuses is not None:
@@ -895,8 +903,11 @@ class Controller:
             self.__model_builder.set_validation_statuses(latest_validation_statuses.statuses)
         if latest_extracted_results:
             for result in latest_extracted_results:
-                self.__persist.extracted_file_names.add(result.name)
-                trace_target_file = self.__find_target_archive_model_file(result.name)
+                extracted_file_ids = {result.name}
+                if result.file_id is not None:
+                    extracted_file_ids.add(result.file_id)
+                self.__persist.extracted_file_names.update(extracted_file_ids)
+                trace_target_file = self.__find_target_archive_model_file(result.name, result.file_id)
                 if trace_target_file is not None:
                     self.__trace_target_archive_event("extracted_marker_added", {
                         "file": self.__summarize_target_archive_file(trace_target_file),

@@ -389,6 +389,25 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
 
+    def test_build_state_uses_exact_path_pair_extracted_marker(self):
+        local_archive = SystemFile("archive.zip", 100, False)
+        local_archive.path_pair_id = "movies"
+
+        self.model_builder.set_local_files([local_archive])
+        self.model_builder.set_downloaded_files({
+            ModelFile.build_file_id("archive.zip", "movies")
+        })
+        self.model_builder.set_extracted_files({
+            ModelFile.build_file_id("archive.zip", "movies")
+        })
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(
+            ModelFile.State.EXTRACTED,
+            model.get_file(ModelFile.build_file_id("archive.zip", "movies")).state
+        )
+
     def test_build_state_does_not_promote_duplicate_root_names_from_persisted_extracted_marker(self):
         local_movies = SystemFile("archive.zip", 100, False)
         local_movies.path_pair_id = "movies"

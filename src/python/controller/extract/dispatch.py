@@ -11,6 +11,10 @@ from abc import ABC, abstractmethod
 import re
 
 from .extract import Extract, ExtractError
+from common.managed_extract import (
+    build_managed_extract_folder_path,
+    write_managed_extract_marker,
+)
 from model import ModelFile
 from common import AppError
 
@@ -21,11 +25,19 @@ class ExtractDispatchError(AppError):
 
 class ExtractListener(ABC):
     @abstractmethod
-    def extract_completed(self, name: str, is_dir: bool):
+    def extract_completed(self,
+                          name: str,
+                          is_dir: bool,
+                          file_id: str = None,
+                          path_pair_id: str = None):
         pass
 
     @abstractmethod
-    def extract_failed(self, name: str, is_dir: bool):
+    def extract_failed(self,
+                       name: str,
+                       is_dir: bool,
+                       file_id: str = None,
+                       path_pair_id: str = None):
         pass
 
 
@@ -60,17 +72,29 @@ class ExtractDispatch:
     __WORKER_SLEEP_INTERVAL_IN_SECS = 0.5
 
     class _Task:
-        def __init__(self, root_name: str, root_is_dir: bool):
+        def __init__(self,
+                     root_name: str,
+                     root_is_dir: bool,
+                     root_file_id: str = None,
+                     path_pair_id: str = None):
             self.root_name = root_name
             self.root_is_dir = root_is_dir
-            self.archive_paths = []  # list of (archive path, out path) pairs
+            self.root_file_id = root_file_id
+            self.path_pair_id = path_pair_id
+            self.archive_paths = []  # list of (archive path, out path, archive name, archive file_id, path_pair_id) tuples
 
-        def add_archive(self, archive_path: str, out_dir_path: str):
-            self.archive_paths.append((archive_path, out_dir_path))
+        def add_archive(self,
+                        archive_path: str,
+                        out_dir_path: str,
+                        archive_name: str,
+                        archive_file_id: str = None,
+                        path_pair_id: str = None):
+            self.archive_paths.append((archive_path, out_dir_path, archive_name, archive_file_id, path_pair_id))
 
-    def __init__(self, out_dir_path: str, local_path: str):
+    def __init__(self, out_dir_path: str, local_path: str, managed_extract_folders_enabled: bool = True):
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
+        self.__managed_extract_folders_enabled = managed_extract_folders_enabled
 
         self.__task_queue = queue.Queue()
         self.__worker = threading.Thread(name="ExtractWorker",
@@ -112,7 +136,12 @@ class ExtractDispatch:
 
         # Build the task before taking the queue mutex.
         # noinspection PyProtectedMember
-        task = ExtractDispatch._Task(model_file.name, model_file.is_dir)
+        task = ExtractDispatch._Task(
+            model_file.name,
+            model_file.is_dir,
+            model_file.file_id,
+            model_file.path_pair_id
+        )
 
         if model_file.is_dir:
             # For a directory, try and find all archives
@@ -128,8 +157,13 @@ class ExtractDispatch:
                     if curr_file.local_size is not None \
                             and curr_file.local_size > 0 \
                             and Extract.is_archive(archive_full_path):
-                        task.add_archive(archive_path=archive_full_path,
-                                         out_dir_path=out_dir_path)
+                        task.add_archive(
+                            archive_path=archive_full_path,
+                            out_dir_path=out_dir_path,
+                            archive_name=curr_file.name,
+                            archive_file_id=curr_file.file_id,
+                            path_pair_id=curr_file.path_pair_id
+                        )
 
             # Coalesce extractions
             ExtractDispatch.__coalesce_extractions(task)
@@ -145,8 +179,13 @@ class ExtractDispatch:
             archive_full_path = os.path.join(self.__local_path, model_file.name)
             if not Extract.is_archive(archive_full_path):
                 raise ExtractDispatchError("File is not an archive: {}".format(model_file.name))
-            task.add_archive(archive_path=archive_full_path,
-                             out_dir_path=self.__out_dir_path)
+            task.add_archive(
+                archive_path=archive_full_path,
+                out_dir_path=self.__out_dir_path,
+                archive_name=model_file.name,
+                archive_file_id=model_file.file_id,
+                path_pair_id=model_file.path_pair_id
+            )
 
         with self.__task_queue.mutex:
             for queued_task in self.__task_queue.queue:
@@ -173,7 +212,7 @@ class ExtractDispatch:
                 completed = True
 
                 try:
-                    for archive_path, out_dir_path in task.archive_paths:
+                    for archive_path, out_dir_path, archive_name, archive_file_id, path_pair_id in task.archive_paths:
                         if self.__worker_shutdown.is_set():
                             # exit early
                             self.logger.warning("Extraction failed, shutdown requested")
@@ -181,10 +220,26 @@ class ExtractDispatch:
                             break
 
                         self.logger.debug("Extracting {}".format(archive_path))
+                        resolved_out_dir_path = out_dir_path
+                        if self.__managed_extract_folders_enabled:
+                            resolved_out_dir_path = build_managed_extract_folder_path(
+                                out_dir_path,
+                                archive_name
+                            )
                         Extract.extract_archive(
                             archive_path=archive_path,
-                            out_dir_path=out_dir_path
+                            out_dir_path=resolved_out_dir_path
                         )
+                        if self.__managed_extract_folders_enabled:
+                            try:
+                                write_managed_extract_marker(
+                                    resolved_out_dir_path,
+                                    archive_name=archive_name,
+                                    archive_file_id=archive_file_id,
+                                    path_pair_id=path_pair_id
+                                )
+                            except OSError as error:
+                                raise ExtractError(str(error))
 
                 except ExtractError:
                     self.logger.exception("Caught an extraction error")
@@ -199,9 +254,19 @@ class ExtractDispatch:
                     listeners_snapshot = list(self.__listeners)
                 for listener in listeners_snapshot:
                     if completed:
-                        listener.extract_completed(task.root_name, task.root_is_dir)
+                        listener.extract_completed(
+                            task.root_name,
+                            task.root_is_dir,
+                            task.root_file_id,
+                            task.path_pair_id
+                        )
                     else:
-                        listener.extract_failed(task.root_name, task.root_is_dir)
+                        listener.extract_failed(
+                            task.root_name,
+                            task.root_is_dir,
+                            task.root_file_id,
+                            task.path_pair_id
+                        )
 
                 with self.__task_queue.mutex:
                     has_tasks = len(self.__task_queue.queue) > 0
@@ -219,8 +284,8 @@ class ExtractDispatch:
         """
         # Filter out any rxx files for a split rar
         filtered_paths = []
-        for archive_path, out_path in task.archive_paths:
+        for archive_path, out_path, archive_name, archive_file_id, path_pair_id in task.archive_paths:
             file_ext = os.path.splitext(os.path.basename(archive_path))[1]
             if not re.match(r"^\.r\d{2,}$", file_ext):
-                filtered_paths.append((archive_path, out_path))
+                filtered_paths.append((archive_path, out_path, archive_name, archive_file_id, path_pair_id))
         task.archive_paths = filtered_paths

@@ -21,10 +21,17 @@ class ExtractStatusResult:
 
 
 class ExtractCompletedResult:
-    def __init__(self, timestamp: datetime, name: str, is_dir: bool):
+    def __init__(self,
+                 timestamp: datetime,
+                 name: str,
+                 is_dir: bool,
+                 file_id: str = None,
+                 path_pair_id: str = None):
         self.timestamp = timestamp
         self.name = name
         self.is_dir = is_dir
+        self.file_id = file_id
+        self.path_pair_id = path_pair_id
 
 
 class ExtractProcess(AppProcess):
@@ -39,28 +46,43 @@ class ExtractProcess(AppProcess):
             self.completed_queue = completed_queue
             self.trace_owner = trace_owner
 
-        def extract_completed(self, name: str, is_dir: bool):
+        def extract_completed(self,
+                              name: str,
+                              is_dir: bool,
+                              file_id: str = None,
+                              path_pair_id: str = None):
             self.logger.info("Extraction completed for {}".format(name))
             self.trace_owner._ExtractProcess__trace_target_archive_event("extract_completed", {
                 "file_name": name,
                 "is_dir": is_dir,
+                "file_id": file_id,
+                "path_pair_id": path_pair_id,
             })
             completed_result = ExtractCompletedResult(timestamp=datetime.datetime.now(),
                                                       name=name,
-                                                      is_dir=is_dir)
+                                                      is_dir=is_dir,
+                                                      file_id=file_id,
+                                                      path_pair_id=path_pair_id)
             self.completed_queue.put(completed_result)
 
-        def extract_failed(self, name: str, is_dir: bool):
+        def extract_failed(self,
+                           name: str,
+                           is_dir: bool,
+                           file_id: str = None,
+                           path_pair_id: str = None):
             self.logger.error("Extraction failed for {}".format(name))
             self.trace_owner._ExtractProcess__trace_target_archive_event("extract_failed", {
                 "file_name": name,
                 "is_dir": is_dir,
+                "file_id": file_id,
+                "path_pair_id": path_pair_id,
             })
 
-    def __init__(self, out_dir_path: str, local_path: str):
+    def __init__(self, out_dir_path: str, local_path: str, managed_extract_folders_enabled: bool = True):
         super().__init__(name=self.__class__.__name__)
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
+        self.__managed_extract_folders_enabled = managed_extract_folders_enabled
         self.__command_queue = multiprocessing.Queue()
         self.__status_result_queue = multiprocessing.Queue()
         self.__completed_result_queue = multiprocessing.Queue()
@@ -113,7 +135,8 @@ class ExtractProcess(AppProcess):
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         # Create dispatch inside the process
         self.__dispatch = ExtractDispatch(out_dir_path=self.__out_dir_path,
-                                          local_path=self.__local_path)
+                                          local_path=self.__local_path,
+                                          managed_extract_folders_enabled=self.__managed_extract_folders_enabled)
 
         # Add extract listener
         listener = ExtractProcess.__ExtractListener(

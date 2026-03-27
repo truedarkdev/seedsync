@@ -68,6 +68,7 @@ interface IController {
     interval_ms_downloading_scan: number;
     extract_path: string;
     use_local_path_as_extract_path: boolean;
+    managed_extract_folders_enabled: boolean;
 }
 const DefaultController: IController = {
     interval_ms_remote_scan: null,
@@ -75,6 +76,7 @@ const DefaultController: IController = {
     interval_ms_downloading_scan: null,
     extract_path: null,
     use_local_path_as_extract_path: null,
+    managed_extract_folders_enabled: null,
 };
 const ControllerRecord = Record(DefaultController);
 
