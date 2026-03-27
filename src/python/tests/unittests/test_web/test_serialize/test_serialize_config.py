@@ -89,6 +89,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(1234, out_dict["controller"]["interval_ms_remote_scan"])
         self.assertEqual(5678, out_dict["controller"]["interval_ms_local_scan"])
         self.assertEqual(9012, out_dict["controller"]["interval_ms_downloading_scan"])
+        self.assertEqual(True, out_dict["controller"]["managed_extract_folders_enabled"])
 
     def test_section_web(self):
         config = Config()

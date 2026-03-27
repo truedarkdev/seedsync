@@ -43,6 +43,12 @@ class MultiPathLocalScanner(IScanner):
                     raise
         return all_files
 
+    def pop_managed_extract_file_ids(self) -> List[str]:
+        managed_extract_file_ids = []
+        for scanner in self.__scanners:
+            managed_extract_file_ids.extend(scanner.pop_managed_extract_file_ids())
+        return sorted(set(managed_extract_file_ids))
+
 
 class MultiPathRemoteScanner(IScanner):
     """

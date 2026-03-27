@@ -330,6 +330,7 @@ class Config(Persist):
         interval_ms_downloading_scan = PROP("interval_ms_downloading_scan", Checkers.int_positive, Converters.int)
         extract_path = PROP("extract_path", Checkers.string_nonempty, Converters.null)
         use_local_path_as_extract_path = PROP("use_local_path_as_extract_path", Checkers.null, Converters.bool)
+        managed_extract_folders_enabled = PROP("managed_extract_folders_enabled", Checkers.null, Converters.bool)
 
         def __init__(self):
             super().__init__()
@@ -338,6 +339,14 @@ class Config(Persist):
             self.interval_ms_downloading_scan = None
             self.extract_path = None
             self.use_local_path_as_extract_path = None
+            self.managed_extract_folders_enabled = True
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "managed_extract_folders_enabled" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["managed_extract_folders_enabled"] = True
+            return super().from_dict(config_dict)
 
     class Web(InnerConfig):
         port = PROP("port", Checkers.int_positive, Converters.int)

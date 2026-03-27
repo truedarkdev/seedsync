@@ -6,6 +6,11 @@ from typing import List, Optional
 
 from .scanner_process import IScanner, ScannerError
 from common import overrides, Localization, Constants
+from common.managed_extract import (
+    is_managed_extract_marker_name,
+    read_managed_extract_marker,
+    resolve_managed_extract_file_id,
+)
 from system import SystemScanner, SystemFile, SystemScannerError
 
 
@@ -17,6 +22,7 @@ class LocalScanner(IScanner):
                  local_path: str,
                  use_temp_file: bool,
                  staging_path: Optional[str] = None,
+                 managed_extract_folders_enabled: bool = True,
                  path_pair_id: str = None,
                  path_pair_name: str = None):
         self.__local_path = local_path
@@ -30,6 +36,8 @@ class LocalScanner(IScanner):
             if use_temp_file:
                 self.__staging_scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.logger = logging.getLogger("LocalScanner")
+        self.__managed_extract_folders_enabled = managed_extract_folders_enabled
+        self.__managed_extract_file_ids = set()
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
 
@@ -47,11 +55,15 @@ class LocalScanner(IScanner):
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
+        self.__managed_extract_file_ids = set()
         try:
             result = self.__scanner.scan()
         except SystemScannerError:
             self.logger.exception("Caught SystemScannerError")
             raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+
+        if self.__managed_extract_folders_enabled:
+            result = self.__prune_managed_extract_entries(result, self.__local_path)
 
         exclude_name = self.__get_nested_staging_name()
         if exclude_name is not None:
@@ -63,6 +75,9 @@ class LocalScanner(IScanner):
             except SystemScannerError:
                 self.logger.exception("Caught SystemScannerError")
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+
+            if self.__managed_extract_folders_enabled:
+                staging_result = self.__prune_managed_extract_entries(staging_result, self.__staging_path)
 
             local_names = {system_file.name: index for index, system_file in enumerate(result)}
             for staging_file in staging_result:
@@ -77,6 +92,11 @@ class LocalScanner(IScanner):
                         staging_file
                     )
         return result
+
+    def pop_managed_extract_file_ids(self) -> List[str]:
+        managed_extract_file_ids = sorted(self.__managed_extract_file_ids)
+        self.__managed_extract_file_ids = set()
+        return managed_extract_file_ids
 
     @staticmethod
     def __normalize_path(path: str) -> str:
@@ -95,6 +115,70 @@ class LocalScanner(IScanner):
         system_file.is_staging = True
         for child in system_file.children:
             LocalScanner.__mark_staging_file_tree(child)
+
+    def __prune_managed_extract_entries(self, system_files: List[SystemFile], root_path: str) -> List[SystemFile]:
+        pruned_files = []
+        for system_file in system_files:
+            pruned_file = self.__prune_managed_extract_tree(
+                system_file,
+                os.path.join(root_path, system_file.name)
+            )
+            if pruned_file is not None:
+                pruned_files.append(pruned_file)
+        pruned_files.sort(key=lambda child: child.name)
+        return pruned_files
+
+    def __prune_managed_extract_tree(self, system_file: SystemFile, disk_path: str) -> Optional[SystemFile]:
+        if not self.__managed_extract_folders_enabled:
+            return system_file
+
+        if is_managed_extract_marker_name(system_file.name):
+            return None
+
+        if not system_file.is_dir:
+            return self.__clone_system_file(system_file)
+
+        marker_child = None
+        for child in system_file.children:
+            if is_managed_extract_marker_name(child.name):
+                marker_child = child
+                break
+        if marker_child is not None:
+            marker_path = os.path.join(disk_path, marker_child.name)
+            marker = read_managed_extract_marker(marker_path)
+            managed_extract_file_id = resolve_managed_extract_file_id(marker) if marker is not None else None
+            if managed_extract_file_id is not None:
+                self.__managed_extract_file_ids.add(managed_extract_file_id)
+                return None
+
+        pruned_children = []
+        for child in system_file.children:
+            if marker_child is not None and child.name == marker_child.name:
+                continue
+            pruned_child = self.__prune_managed_extract_tree(
+                child,
+                os.path.join(disk_path, child.name)
+            )
+            if pruned_child is not None:
+                pruned_children.append(pruned_child)
+        return self.__clone_system_file(system_file, pruned_children)
+
+    @staticmethod
+    def __clone_system_file(system_file: SystemFile, children: Optional[List[SystemFile]] = None) -> SystemFile:
+        cloned = SystemFile(
+            system_file.name,
+            sum(child.size for child in children) if children is not None else system_file.size,
+            system_file.is_dir,
+            time_created=system_file.timestamp_created,
+            time_modified=system_file.timestamp_modified,
+            is_staging=system_file.is_staging
+        )
+        cloned.path_pair_id = system_file.path_pair_id
+        cloned.path_pair_name = system_file.path_pair_name
+        cloned.status_sidecar_ready = system_file.status_sidecar_ready
+        for child in children if children is not None else system_file.children:
+            cloned.add_child(child)
+        return cloned
 
     @staticmethod
     def __should_prefer_existing_local_file(existing_file: SystemFile, staging_file: SystemFile) -> bool:

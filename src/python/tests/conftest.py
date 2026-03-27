@@ -59,6 +59,7 @@ def mock_context(test_logger):
     context.config.controller.interval_ms_remote_scan = 30000
     context.config.controller.use_local_path_as_extract_path = True
     context.config.controller.extract_path = "/extract/path"
+    context.config.controller.managed_extract_folders_enabled = True
 
     context.config.general.verbose = False
 

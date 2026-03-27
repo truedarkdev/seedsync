@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import MagicMock
 
-from controller.scan import MultiPathRemoteScanner, ScannerError
+from controller.scan import MultiPathLocalScanner, MultiPathRemoteScanner, ScannerError
 from system import SystemFile
 
 
@@ -39,6 +39,21 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         self.assertEqual("TV", ctx.exception.files[1].path_pair_name)
         self.assertIn("TV", str(ctx.exception))
         self.assertIn("temporary remote failure", str(ctx.exception))
+
+
+class TestMultiPathLocalScanner(unittest.TestCase):
+    def test_aggregates_recovered_managed_extract_file_ids(self):
+        scanner_one = MagicMock()
+        scanner_one.pop_managed_extract_file_ids.return_value = ["movie.zip", "series.zip"]
+        scanner_two = MagicMock()
+        scanner_two.pop_managed_extract_file_ids.return_value = ["series.zip", "episode.zip"]
+
+        scanner = MultiPathLocalScanner([scanner_one, scanner_two])
+
+        self.assertEqual(
+            ["episode.zip", "movie.zip", "series.zip"],
+            scanner.pop_managed_extract_file_ids()
+        )
 
 
 if __name__ == "__main__":

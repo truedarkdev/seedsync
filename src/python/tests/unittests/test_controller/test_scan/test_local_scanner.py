@@ -1,8 +1,10 @@
+import json
 import os
 import shutil
 import tempfile
 import unittest
 
+from model import ModelFile
 from controller.scan import LocalScanner
 
 
@@ -137,3 +139,153 @@ class TestLocalScanner(unittest.TestCase):
         )
         self.assertFalse(files["series"].children[0].is_staging)
         self.assertTrue(files["series"].children[1].is_staging)
+
+    def test_scan_suppresses_managed_extract_folder_and_recovers_marker_identity(self):
+        managed_dir = os.path.join(self.temp_dir, "movie")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "archive_name": "movie.zip",
+                    "archive_file_id": ModelFile.build_file_id("movie.zip", "pair-1"),
+                    "path_pair_id": "pair-1",
+                    "extracted_at": "2026-01-01T00:00:00",
+                },
+                handle,
+            )
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("hidden")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=None,
+            managed_extract_folders_enabled=True,
+        )
+
+        files = scanner.scan()
+        recovered_ids = scanner.pop_managed_extract_file_ids()
+
+        self.assertEqual(["visible.txt"], [system_file.name for system_file in files])
+        self.assertEqual([ModelFile.build_file_id("movie.zip", "pair-1")], recovered_ids)
+
+    def test_scan_does_not_suppress_managed_extract_folder_when_marker_is_corrupt(self):
+        managed_dir = os.path.join(self.temp_dir, "movie")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not valid json")
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=None,
+            managed_extract_folders_enabled=True,
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertEqual({"movie", "visible.txt"}, set(files.keys()))
+        self.assertEqual(["episode.mkv"], [child.name for child in files["movie"].children])
+        self.assertEqual([], scanner.pop_managed_extract_file_ids())
+
+    def test_scan_does_not_trust_inconsistent_managed_extract_marker_identity(self):
+        managed_dir = os.path.join(self.temp_dir, "movie")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "archive_name": "movie.zip",
+                    "archive_file_id": "wrong-id",
+                    "path_pair_id": "pair-1",
+                    "extracted_at": "2026-01-01T00:00:00",
+                },
+                handle,
+            )
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=None,
+            managed_extract_folders_enabled=True,
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertEqual({"movie", "visible.txt"}, set(files.keys()))
+        self.assertEqual(["episode.mkv"], [child.name for child in files["movie"].children])
+        self.assertEqual([], scanner.pop_managed_extract_file_ids())
+
+    def test_scan_recovers_managed_extract_identity_without_archive_file_id(self):
+        managed_dir = os.path.join(self.temp_dir, "movie")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "archive_name": "movie.zip",
+                    "path_pair_id": "pair-1",
+                    "extracted_at": "2026-01-01T00:00:00",
+                },
+                handle,
+            )
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("hidden")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=None,
+            managed_extract_folders_enabled=True,
+        )
+
+        files = scanner.scan()
+        recovered_ids = scanner.pop_managed_extract_file_ids()
+
+        self.assertEqual(["visible.txt"], [system_file.name for system_file in files])
+        self.assertEqual([ModelFile.build_file_id("movie.zip", "pair-1")], recovered_ids)
+
+    def test_scan_ignores_managed_extract_folders_when_disabled(self):
+        managed_dir = os.path.join(self.temp_dir, "movie")
+        os.mkdir(managed_dir)
+        with open(os.path.join(managed_dir, ".seedsync-extract.json"), "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "schema_version": 1,
+                    "archive_name": "movie.zip",
+                    "archive_file_id": ModelFile.build_file_id("movie.zip", "pair-1"),
+                    "path_pair_id": "pair-1",
+                    "extracted_at": "2026-01-01T00:00:00",
+                },
+                handle,
+            )
+        with open(os.path.join(managed_dir, "episode.mkv"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+        with open(os.path.join(self.temp_dir, "visible.txt"), "w", encoding="utf-8") as handle:
+            handle.write("visible")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=None,
+            managed_extract_folders_enabled=False,
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertEqual({"movie", "visible.txt"}, set(files.keys()))
+        self.assertEqual({".seedsync-extract.json", "episode.mkv"}, {child.name for child in files["movie"].children})
+        self.assertEqual([], scanner.pop_managed_extract_file_ids())

@@ -44,6 +44,9 @@ class IScanner(ABC):
     def pop_malformed_status_only_file_ids(self) -> List[str]:
         return []
 
+    def pop_managed_extract_file_ids(self) -> List[str]:
+        return []
+
 
 class ScannerResult:
     """
@@ -53,11 +56,13 @@ class ScannerResult:
                  timestamp: datetime,
                  files: List[SystemFile],
                  malformed_status_only_file_ids: Optional[List[str]] = None,
+                 managed_extract_file_ids: Optional[List[str]] = None,
                  failed: bool = False,
                  error_message: str = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
+        self.managed_extract_file_ids = [] if managed_extract_file_ids is None else managed_extract_file_ids
         self.failed = failed
         self.error_message = error_message
 
@@ -99,10 +104,12 @@ class ScannerProcess(AppProcess):
         try:
             files = self.__scanner.scan()
             malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
+            managed_extract_file_ids = self.__scanner.pop_managed_extract_file_ids()
             self.__last_recoverable_error_message = None
             result = ScannerResult(timestamp=timestamp_start,
                                    files=files,
-                                   malformed_status_only_file_ids=malformed_status_only_file_ids)
+                                   malformed_status_only_file_ids=malformed_status_only_file_ids,
+                                   managed_extract_file_ids=managed_extract_file_ids)
         except ScannerError as e:
             # Non-recoverable errors continue up as a fatal error
             if not e.recoverable:
@@ -110,6 +117,7 @@ class ScannerProcess(AppProcess):
             error_message = str(e)
             files = e.files if e.files is not None else []
             malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
+            managed_extract_file_ids = self.__scanner.pop_managed_extract_file_ids()
             if error_message != self.__last_recoverable_error_message:
                 self.logger.warning(
                     "Recoverable scanner error; returning failed result: {}".format(error_message)
@@ -118,6 +126,7 @@ class ScannerProcess(AppProcess):
             result = ScannerResult(timestamp=timestamp_start,
                                    files=files,
                                    malformed_status_only_file_ids=malformed_status_only_file_ids,
+                                   managed_extract_file_ids=managed_extract_file_ids,
                                    failed=True,
                                    error_message=error_message)
         self.__queue.put(result)

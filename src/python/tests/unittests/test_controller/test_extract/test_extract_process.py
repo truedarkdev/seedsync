@@ -172,7 +172,7 @@ class TestExtractProcess(unittest.TestCase):
             print("Listener added")
 
             def _callback_sequence():
-                listener.extract_completed(name="a", is_dir=True)
+                listener.extract_completed(name="a", is_dir=True, file_id="a-id", path_pair_id="pair-1")
                 time.sleep(0.1)
                 self.completed_signal.value = 1
 
@@ -194,6 +194,8 @@ class TestExtractProcess(unittest.TestCase):
         self.assertEqual(1, len(completed))
         self.assertEqual("a", completed[0].name)
         self.assertEqual(True, completed[0].is_dir)
+        self.assertEqual("a-id", completed[0].file_id)
+        self.assertEqual("pair-1", completed[0].path_pair_id)
         # next one should be empty
         completed = self.process.pop_completed()
         self.assertEqual(0, len(completed))
