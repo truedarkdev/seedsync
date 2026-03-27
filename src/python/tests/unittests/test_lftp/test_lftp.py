@@ -15,7 +15,7 @@ import pexpect
 import pytest
 
 from tests.utils import TestUtils
-from lftp import Lftp, LftpJobStatus, LftpError
+from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParserError
 
 
 # noinspection PyPep8Naming,SpellCheckingInspection
@@ -26,6 +26,8 @@ class TestLftp(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if os.name == "nt":
+            return
         # Create a temp directory
         TestLftp.temp_dir = tempfile.mkdtemp(prefix="test_lftp_")
         print(f"Temp dir: {TestLftp.temp_dir}")
@@ -61,10 +63,23 @@ class TestLftp(unittest.TestCase):
                 f.write(bytearray([0xff]*size))
 
         def my_mkdir_latin(*args):
-            os.mkdir(os.path.join(TestLftp.temp_dir.encode('latin-1'), *args))
+            if os.name == "nt":
+                path = os.path.join(
+                    TestLftp.temp_dir,
+                    *(arg.decode("latin-1") if isinstance(arg, (bytes, bytearray)) else arg for arg in args)
+                )
+            else:
+                path = os.path.join(os.fsencode(TestLftp.temp_dir), *args)
+            os.mkdir(path)
 
         def my_touch_latin(size, *args):
-            path = os.path.join(TestLftp.temp_dir.encode('latin-1'), *args)
+            if os.name == "nt":
+                path = os.path.join(
+                    TestLftp.temp_dir,
+                    *(arg.decode("latin-1") if isinstance(arg, (bytes, bytearray)) else arg for arg in args)
+                )
+            else:
+                path = os.path.join(os.fsencode(TestLftp.temp_dir), *args)
             with open(path, 'wb') as f:
                 f.write(bytearray([0xff]*size))
 
@@ -93,6 +108,8 @@ class TestLftp(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        if TestLftp.temp_dir is None:
+            return
         # Cleanup
         shutil.rmtree(TestLftp.temp_dir)
 
@@ -249,6 +266,20 @@ class TestLftp(unittest.TestCase):
 
 
     def setUp(self):
+        unit_only_methods = {
+            "test_queue_uses_override_paths",
+            "test_kill_matches_duplicate_names_by_remote_path",
+            "test_status_annotates_path_pairs_from_job_paths",
+            "test_status_marks_poll_unhealthy_when_jobs_command_times_out",
+            "test_status_marks_poll_unhealthy_when_parser_error_is_suppressed",
+            "test_run_command_logs_warning_on_timeout",
+            "test_run_command_logs_warning_on_error_recovery_timeout",
+        }
+        if self._testMethodName in unit_only_methods:
+            return
+        if os.name == "nt":
+            self.skipTest("Requires POSIX pexpect.spawn and /usr/bin/lftp")
+
         # Delete and recreate the local dir
         shutil.rmtree(os.path.join(TestLftp.temp_dir, "local"))
         os.mkdir(os.path.join(TestLftp.temp_dir, "local"))
@@ -275,6 +306,8 @@ class TestLftp(unittest.TestCase):
         logger.addHandler(handler)
 
     def tearDown(self):
+        if not hasattr(self, "lftp"):
+            return
         self.lftp.raise_pending_error()
         self.lftp.exit()
 

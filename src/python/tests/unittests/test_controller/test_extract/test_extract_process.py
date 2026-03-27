@@ -53,9 +53,9 @@ class TestExtractProcess(unittest.TestCase):
             return self.mock_dispatch
         self.mock_dispatch_cls.side_effect = mock_ctor
 
-        self.process = ExtractProcess(out_dir_path="/test/out/path",
-                                      local_path="/test/local/path")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="/test/out/path",
+                                 local_path="/test/local/path")
+        process.run_init()
         # Wait for ctor to be called
         while self.ctor_called.value == 0:
             pass
@@ -71,9 +71,9 @@ class TestExtractProcess(unittest.TestCase):
             return self.mock_dispatch
         self.mock_dispatch_cls.side_effect = mock_ctor
 
-        self.process = ExtractProcess(out_dir_path="/test/out/path",
-                                      local_path="/test/local/path")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="/test/out/path",
+                                 local_path="/test/local/path")
+        process.run_init()
         # Wait for ctor to be called
         while self.ctor_called.value == 0:
             pass
@@ -86,9 +86,9 @@ class TestExtractProcess(unittest.TestCase):
             self.start_called.value = 1
         self.mock_dispatch.start.side_effect = _start
 
-        self.process = ExtractProcess(out_dir_path="/test/out/path",
-                                      local_path="/test/local/path")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="/test/out/path",
+                                 local_path="/test/local/path")
+        process.run_init()
         while self.start_called.value == 0:
             pass
 
@@ -116,13 +116,14 @@ class TestExtractProcess(unittest.TestCase):
             return ret
         self.mock_dispatch.status.side_effect = _status
 
-        self.process = ExtractProcess(out_dir_path="", local_path="")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="", local_path="")
+        process.run_init()
+        process.run_loop()
 
-        # wait for first call to status (actually second call to guarantee first status is queued)
-        while self.status_counter.value < 2:
+        # wait for the first queued status snapshot
+        while self.status_counter.value < 1:
             pass
-        status_result = self.process.pop_latest_statuses()
+        status_result = process.pop_latest_statuses()
         self.assertEqual(1, len(status_result.statuses))
         self.assertEqual("a", status_result.statuses[0].name)
         self.assertEqual(True, status_result.statuses[0].is_dir)
@@ -130,10 +131,10 @@ class TestExtractProcess(unittest.TestCase):
 
         # signal for status #1 and wait status fetch
         self.status_signal.value = 1
-        orig_counter = self.status_counter.value
-        while self.status_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.status_counter.value < 2:
             pass
-        status_result = self.process.pop_latest_statuses()
+        status_result = process.pop_latest_statuses()
         self.assertEqual(2, len(status_result.statuses))
         self.assertEqual("a", status_result.statuses[0].name)
         self.assertEqual(True, status_result.statuses[0].is_dir)
@@ -144,10 +145,10 @@ class TestExtractProcess(unittest.TestCase):
 
         # signal for status #2 and wait status fetch
         self.status_signal.value = 2
-        orig_counter = self.status_counter.value
-        while self.status_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.status_counter.value < 3:
             pass
-        status_result = self.process.pop_latest_statuses()
+        status_result = process.pop_latest_statuses()
         self.assertEqual(1, len(status_result.statuses))
         self.assertEqual("c", status_result.statuses[0].name)
         self.assertEqual(True, status_result.statuses[0].is_dir)
@@ -155,10 +156,10 @@ class TestExtractProcess(unittest.TestCase):
 
         # signal for status #3 and wait status fetch
         self.status_signal.value = 3
-        orig_counter = self.status_counter.value
-        while self.status_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.status_counter.value < 4:
             pass
-        status_result = self.process.pop_latest_statuses()
+        status_result = process.pop_latest_statuses()
         self.assertEqual(0, len(status_result.statuses))
 
     @pytest.mark.timeout(10)
@@ -181,34 +182,34 @@ class TestExtractProcess(unittest.TestCase):
                 time.sleep(0.1)
                 self.completed_signal.value = 2
 
-            threading.Thread(target=_callback_sequence()).start()
+            threading.Thread(target=_callback_sequence).start()
         self.mock_dispatch.add_listener.side_effect = _add_listener
 
-        self.process = ExtractProcess(out_dir_path="", local_path="")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="", local_path="")
+        process.run_init()
 
         while self.completed_signal.value < 1:
             pass
-        completed = self.process.pop_completed()
+        completed = process.pop_completed()
         self.assertEqual(1, len(completed))
         self.assertEqual("a", completed[0].name)
         self.assertEqual(True, completed[0].is_dir)
         self.assertEqual("a-id", completed[0].file_id)
         self.assertEqual("pair-1", completed[0].path_pair_id)
         # next one should be empty
-        completed = self.process.pop_completed()
+        completed = process.pop_completed()
         self.assertEqual(0, len(completed))
 
         while self.completed_signal.value < 2:
             pass
-        completed = self.process.pop_completed()
+        completed = process.pop_completed()
         self.assertEqual(2, len(completed))
         self.assertEqual("b", completed[0].name)
         self.assertEqual(False, completed[0].is_dir)
         self.assertEqual("c", completed[1].name)
         self.assertEqual(True, completed[1].is_dir)
         # next one should be empty
-        completed = self.process.pop_completed()
+        completed = process.pop_completed()
         self.assertEqual(0, len(completed))
 
     def test_extract_listener_logs_target_archive_trace_on_failure(self):
@@ -290,12 +291,20 @@ class TestExtractProcess(unittest.TestCase):
             self.extract_counter.value += 1
         self.mock_dispatch.extract.side_effect = _extract
 
-        self.process = ExtractProcess(out_dir_path="", local_path="")
-        self.process.start()
+        process = ExtractProcess(out_dir_path="", local_path="")
+        process.run_init()
 
-        self.process.extract(a)
-        time.sleep(1)
-        self.process.extract(b)
-        self.process.extract(c)
-        while self.extract_counter.value < 3:
-            pass
+        process.extract(a)
+        time.sleep(0.05)
+        process.run_loop()
+        self.assertEqual(1, self.extract_counter.value)
+
+        process.extract(b)
+        time.sleep(0.05)
+        process.run_loop()
+        self.assertEqual(2, self.extract_counter.value)
+
+        process.extract(c)
+        time.sleep(0.05)
+        process.run_loop()
+        self.assertEqual(3, self.extract_counter.value)
