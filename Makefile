@@ -124,6 +124,10 @@ run-tests-python: tests-python
 		-f ${SOURCEDIR}/docker/test/python/compose.yml \
 		up --force-recreate --exit-code-from tests
 
+run-tests-python-native:
+	# native host python tests
+	cd ${SOURCEDIR}/python && poetry run pytest -p no:cacheprovider
+
 tests-angular:
 	# angular build
 	$(DOCKER) build \
