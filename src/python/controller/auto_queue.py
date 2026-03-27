@@ -2,7 +2,7 @@
 
 import json
 from abc import ABC, abstractmethod
-from typing import Set, List, Callable, Tuple
+from typing import Set, List, Callable, Tuple, Optional
 import fnmatch
 from threading import Lock
 import os
@@ -328,13 +328,21 @@ class AutoQueue:
                 )
                 trace_target_in_candidates = trace_target_in_new_files or trace_target_in_modified_files
                 trace_target_pattern = next(
-                    (pattern.pattern for file, pattern in files_to_extract if file.file_id == trace_target_file.file_id),
+                    (
+                        pattern.pattern if pattern is not None else None
+                        for file, pattern in files_to_extract
+                        if file.file_id == trace_target_file.file_id
+                    ),
                     None
+                )
+                trace_target_selected_for_extract = any(
+                    file.file_id == trace_target_file.file_id
+                    for file, _ in files_to_extract
                 )
                 if not self.__auto_extract_enabled:
                     decision = "disabled"
                     reason = "auto_extract_disabled"
-                elif trace_target_pattern is not None:
+                elif trace_target_selected_for_extract:
                     decision = "queued"
                     reason = "eligible"
                 elif not trace_target_in_candidates:
@@ -428,7 +436,7 @@ class AutoQueue:
 
     def __filter_candidates(self,
                             candidates: List[ModelFile],
-                            accept: Callable[[ModelFile], bool]) -> List[Tuple[ModelFile, AutoQueuePattern]]:
+                            accept: Callable[[ModelFile], bool]) -> List[Tuple[ModelFile, Optional[AutoQueuePattern]]]:
         """
         Given a list of candidate files, filter out those that match the accept criteria
         Also takes into consideration new patterns that were added

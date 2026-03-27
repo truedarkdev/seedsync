@@ -1117,6 +1117,33 @@ class TestAutoQueue(unittest.TestCase):
         self.assertEqual(file_one.file_id, payload["file"]["file_id"])
         self.assertEqual("archive.zip", payload["file"]["name"])
 
+    def test_auto_extract_trace_logs_null_pattern_for_selected_candidate(self):
+        self.context.config.autoqueue.patterns_only = False
+
+        persist = AutoQueuePersist()
+
+        file_one = ModelFile("archive.zip", False)
+        file_one.state = ModelFile.State.DOWNLOADED
+        file_one.local_size = 100
+        file_one.is_extractable = True
+        self.initial_model = [file_one]
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        auto_queue._AutoQueue__target_archive_trace_file_id = file_one.file_id
+        trace_logger = auto_queue._AutoQueue__target_archive_trace_logger
+
+        with patch.object(trace_logger, "info") as trace_info:
+            auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("auto_extract_decision", payload["event"])
+        self.assertEqual("queued", payload["decision"])
+        self.assertIsNone(payload["pattern"])
+        self.assertEqual(file_one.file_id, payload["file"]["file_id"])
+
     def test_patterns_only_auto_extract_does_not_clear_startup_new_file_marker(self):
         persist = AutoQueuePersist()
         persist.add_pattern(AutoQueuePattern(pattern="different-pattern"))
