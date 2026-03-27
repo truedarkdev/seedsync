@@ -31,6 +31,22 @@ class MultiprocessingLogger:
         self.__listener_shutdown = threading.Event()
         self.__listener_exc_info = None
 
+    def __getstate__(self):
+        return {
+            "logger_name": self.logger.name,
+            "queue": self.__queue,
+            "logger_level": self.__logger_level,
+        }
+
+    def __setstate__(self, state):
+        self.logger = logging.getLogger(state["logger_name"])
+        self.__queue = state["queue"]
+        self.__logger_level = state["logger_level"]
+        # Listener lifecycle stays parent-owned; unpickled children only carry the queue.
+        self.__listener = None
+        self.__listener_shutdown = None
+        self.__listener_exc_info = None
+
     def start(self):
         self.__listener.start()
 

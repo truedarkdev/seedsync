@@ -76,14 +76,15 @@ class TestScannerProcess(unittest.TestCase):
             return ret
         mock_scanner.scan.side_effect = _scan
 
-        self.process = ScannerProcess(scanner=mock_scanner,
-                                      interval_in_ms=100)
-        self.process.start()
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100)
+        process.run_init()
+        process.run_loop()
 
-        # wait for first call to scan (actually second call to guarantee first scan is queued)
-        while self.scan_counter.value < 2:
+        # wait for the first queued scan result
+        while self.scan_counter.value < 1:
             pass
-        result = self.process.pop_latest_result()
+        result = process.pop_latest_result()
         self.assertEqual(1, len(result.files))
         self.assertEqual("a", result.files[0].name)
         self.assertEqual(True, result.files[0].is_dir)
@@ -98,10 +99,10 @@ class TestScannerProcess(unittest.TestCase):
 
         # signal for scan #1 and wait scan fetch
         self.scan_signal.value = 1
-        orig_counter = self.scan_counter.value
-        while self.scan_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.scan_counter.value < 2:
             pass
-        result = self.process.pop_latest_result()
+        result = process.pop_latest_result()
         self.assertEqual(2, len(result.files))
         self.assertEqual("a", result.files[0].name)
         self.assertEqual(True, result.files[0].is_dir)
@@ -127,10 +128,10 @@ class TestScannerProcess(unittest.TestCase):
 
         # signal for scan #2 and wait scan fetch
         self.scan_signal.value = 2
-        orig_counter = self.scan_counter.value
-        while self.scan_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.scan_counter.value < 3:
             pass
-        result = self.process.pop_latest_result()
+        result = process.pop_latest_result()
         self.assertEqual(1, len(result.files))
         self.assertEqual("c", result.files[0].name)
         self.assertEqual(False, result.files[0].is_dir)
@@ -138,10 +139,10 @@ class TestScannerProcess(unittest.TestCase):
 
         # signal for scan #3 and wait scan fetch
         self.scan_signal.value = 3
-        orig_counter = self.scan_counter.value
-        while self.scan_counter.value < orig_counter+2:
+        process.run_loop()
+        while self.scan_counter.value < 4:
             pass
-        result = self.process.pop_latest_result()
+        result = process.pop_latest_result()
         self.assertEqual(0, len(result.files))
 
     def test_sends_error_result_on_recoverable_error(self):
@@ -279,11 +280,9 @@ class TestScannerProcess(unittest.TestCase):
         mock_scanner.scan = MagicMock()
         mock_scanner.scan.side_effect = ScannerError("non-recoverable error", recoverable=False)
 
-        self.process = ScannerProcess(scanner=mock_scanner,
-                                      interval_in_ms=100)
-        self.process.start()
+        process = ScannerProcess(scanner=mock_scanner,
+                                 interval_in_ms=100)
+        process.run_init()
         with self.assertRaises(ScannerError) as ctx:
-            while True:
-                self.process.propagate_exception()
-        # noinspection PyUnreachableCode
+            process.run_loop()
         self.assertEqual("non-recoverable error", str(ctx.exception))
