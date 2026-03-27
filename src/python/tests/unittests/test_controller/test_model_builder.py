@@ -207,7 +207,7 @@ class TestModelBuilder(unittest.TestCase):
             LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         ])
         model = self.model_builder.build_model()
-        self.assertEqual(ModelFile.State.DOWNLOADING, model.get_file("a").state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
 
         # Downloading - remote only
         self.model_builder.clear()
@@ -2222,7 +2222,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_remote_files([SystemFile("a", 2000, False)])
         self.model_builder.set_local_files([SystemFile("a", 2000, False)])
         model = self.model_builder.build_model()
-        self.assertEqual(0, model.get_file("a").eta)
+        self.assertEqual(None, model.get_file("a").eta)
 
         # local size larger than remote
         self.model_builder.clear()
@@ -2232,7 +2232,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_remote_files([SystemFile("a", 2000, False)])
         self.model_builder.set_local_files([SystemFile("a", 3000, False)])
         model = self.model_builder.build_model()
-        self.assertEqual(0, model.get_file("a").eta)
+        self.assertEqual(None, model.get_file("a").eta)
 
     def test_build_children_names(self):
         model = self.__build_test_model_children_tree_1()
@@ -2648,7 +2648,7 @@ class TestModelBuilder(unittest.TestCase):
 
         model = self.model_builder.build_model()
         m_a = model.get_file("a")
-        self.assertEqual(ModelFile.State.DOWNLOADING, m_a.state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, m_a.state)
         m_a_ch = {m.name: m for m in model.get_file("a").get_children()}
         m_aa = m_a_ch["aa"]
         self.assertEqual(ModelFile.State.DEFAULT, m_aa.state)
@@ -2700,7 +2700,7 @@ class TestModelBuilder(unittest.TestCase):
 
         model = self.model_builder.build_model()
         m_a = model.get_file("a")
-        self.assertEqual(ModelFile.State.DOWNLOADING, m_a.state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, m_a.state)
         m_a_ch = {m.name: m for m in model.get_file("a").get_children()}
         m_aa = m_a_ch["aa"]
         self.assertEqual(ModelFile.State.DEFAULT, m_aa.state)
