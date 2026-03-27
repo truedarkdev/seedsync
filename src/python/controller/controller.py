@@ -106,6 +106,11 @@ class Controller:
         self.logger = context.logger.getChild("Controller")
         self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__stop_resume_trace_file_id = os.environ.get("SEEDSYNC_STOP_RESUME_TRACE_FILE_ID")
+        self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
+        self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
+        if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
+            self.__target_archive_trace_file_id = None
+        self.__target_archive_trace_last_signature = None
 
         # Decide the password here
         self.__password = context.config.lftp.remote_password if not context.config.lftp.use_ssh_key else None
@@ -491,6 +496,109 @@ class Controller:
             }, sort_keys=True)
         )
 
+    @staticmethod
+    def __extract_target_archive_trace_selector_name(identifier: str):
+        if identifier is None:
+            return None
+        try:
+            parsed_identifier = json.loads(identifier)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return identifier
+        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
+            return parsed_identifier[1]
+        return identifier
+
+    def __is_target_archive_trace_enabled(self) -> bool:
+        return self.__target_archive_trace_file_id is not None
+
+    def __target_archive_trace_selector_matches_file(self, file_id: str, file_name: str) -> bool:
+        if not self.__is_target_archive_trace_enabled():
+            return False
+        if self.__target_archive_trace_file_id == file_id or self.__target_archive_trace_file_id == file_name:
+            return True
+        selector_name = self.__extract_target_archive_trace_selector_name(self.__target_archive_trace_file_id)
+        return selector_name == file_name
+
+    @staticmethod
+    def __summarize_target_archive_file(file: ModelFile) -> dict:
+        return {
+            "file_id": file.file_id,
+            "name": file.name,
+            "path_pair_id": file.path_pair_id,
+            "path_pair_name": file.path_pair_name,
+            "state": getattr(file.state, "name", file.state),
+            "is_dir": file.is_dir,
+            "local_size": file.local_size,
+            "remote_size": file.remote_size,
+            "is_extractable": file.is_extractable,
+        }
+
+    def __find_target_archive_model_file(self, file_name: str):
+        try:
+            file_ids = self.__model.get_file_ids()
+        except AttributeError:
+            return None
+        for file_id in file_ids:
+            try:
+                file = self.__model.get_file(file_id)
+            except ModelError:
+                continue
+            if file.name == file_name and self.__target_archive_trace_selector_matches_file(file.file_id, file.name):
+                return file
+        return None
+
+    def __trace_target_archive_event(self, event: str, payload: dict):
+        if not self.__is_target_archive_trace_enabled():
+            return
+        trace_payload = {
+            "event": event,
+            "target_selector": self.__target_archive_trace_file_id,
+        }
+        trace_payload.update(payload)
+        signature = json.dumps(trace_payload, sort_keys=True)
+        if signature == self.__target_archive_trace_last_signature:
+            return
+        self.__target_archive_trace_last_signature = signature
+        self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
+
+    def __is_model_file_name_unambiguous(self, file_name: str) -> bool:
+        try:
+            file_ids = self.__model.get_file_ids()
+        except AttributeError:
+            return True
+
+        matching_file_ids = 0
+        try:
+            for file_id in file_ids:
+                try:
+                    file = self.__model.get_file(file_id)
+                except ModelError:
+                    continue
+                if file.name == file_name:
+                    matching_file_ids += 1
+                    if matching_file_ids > 1:
+                        return False
+        except TypeError:
+            return True
+        return matching_file_ids <= 1
+
+    def clear_extracted_marker(self, file: ModelFile):
+        stale_extracted_file_names = set()
+        if file.file_id in self.__persist.extracted_file_names:
+            stale_extracted_file_names.add(file.file_id)
+        if file.name in self.__persist.extracted_file_names and self.__is_model_file_name_unambiguous(file.name):
+            stale_extracted_file_names.add(file.name)
+        if not stale_extracted_file_names:
+            return
+
+        self.logger.info(
+            "Removing stale extracted list entries for blocked auto-extract: {}".format(
+                stale_extracted_file_names
+            )
+        )
+        self.__persist.extracted_file_names.difference_update(stale_extracted_file_names)
+        self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
+
     def __move_from_staging(self, name: str, path_pair_id: str = None):
         if path_pair_id:
             staging_path = self.__get_staging_path(path_pair_id)
@@ -505,14 +613,46 @@ class Controller:
 
         src = os.path.join(staging_path, name)
         dst = os.path.join(final_path, name)
+        trace_file_id = ModelFile.build_file_id(name, path_pair_id)
+        should_trace = self.__target_archive_trace_selector_matches_file(trace_file_id, name)
+        if should_trace:
+            self.__trace_target_archive_event("move_from_staging_attempt", {
+                "file_id": trace_file_id,
+                "file_name": name,
+                "path_pair_id": path_pair_id,
+                "staging_path": staging_path,
+                "final_path": final_path,
+                "source_path": src,
+                "destination_path": dst,
+                "source_exists": os.path.exists(src),
+                "same_path": os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)),
+            })
         if not os.path.exists(src):
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "missing_source",
+                })
             return
         if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "same_path",
+                })
             return
 
         try:
             shutil.move(src, dst)
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "moved",
+                })
             self.__local_scan_process.force_scan()
         except OSError as error:
             self.logger.warning(
@@ -522,6 +662,13 @@ class Controller:
                 final_path,
                 error
             )
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "failed",
+                    "error": str(error),
+                })
 
     def __get_delete_local_target(self, file: ModelFile) -> tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
@@ -735,11 +882,26 @@ class Controller:
                 )
         if latest_extract_statuses is not None:
             self.__model_builder.set_extract_statuses(latest_extract_statuses.statuses)
+            if self.__is_target_archive_trace_enabled():
+                for status in latest_extract_statuses.statuses:
+                    trace_target_file = self.__find_target_archive_model_file(status.name)
+                    if trace_target_file is not None:
+                        self.__trace_target_archive_event("extract_status", {
+                            "file": self.__summarize_target_archive_file(trace_target_file),
+                            "is_dir": status.is_dir,
+                            "state": getattr(status.state, "name", status.state),
+                        })
         if latest_validation_statuses is not None:
             self.__model_builder.set_validation_statuses(latest_validation_statuses.statuses)
         if latest_extracted_results:
             for result in latest_extracted_results:
                 self.__persist.extracted_file_names.add(result.name)
+                trace_target_file = self.__find_target_archive_model_file(result.name)
+                if trace_target_file is not None:
+                    self.__trace_target_archive_event("extracted_marker_added", {
+                        "file": self.__summarize_target_archive_file(trace_target_file),
+                        "is_dir": result.is_dir,
+                    })
             self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
         self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
@@ -779,6 +941,11 @@ class Controller:
                     if downloaded:
                         self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                        self.clear_extracted_marker(diff.new_file)
+                        if self.__target_archive_trace_selector_matches_file(diff.new_file.file_id, diff.new_file.name):
+                            self.__trace_target_archive_event("downloaded_marker_added", {
+                                "file": self.__summarize_target_archive_file(diff.new_file),
+                            })
                         self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
 
                 current_auto_purge_candidate_ids = {
@@ -818,6 +985,13 @@ class Controller:
                 if remove_extracted_file_names:
                     self.logger.info("Removing from extracted list: {}".format(remove_extracted_file_names))
                     self.__persist.extracted_file_names.difference_update(remove_extracted_file_names)
+                    if self.__is_target_archive_trace_enabled():
+                        for extracted_file_name in remove_extracted_file_names:
+                            if self.__target_archive_trace_selector_matches_file(extracted_file_name, extracted_file_name):
+                                self.__trace_target_archive_event("extracted_marker_removed", {
+                                    "file_name": extracted_file_name,
+                                    "file_id": ModelFile.build_file_id(extracted_file_name, None),
+                                })
                     self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
                 active_model_names = set(self.__model.get_file_names())
@@ -830,6 +1004,13 @@ class Controller:
                 if remove_downloaded_file_names:
                     self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                     self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
+                    if self.__is_target_archive_trace_enabled():
+                        for downloaded_file_name in remove_downloaded_file_names:
+                            if self.__target_archive_trace_selector_matches_file(downloaded_file_name, downloaded_file_name):
+                                self.__trace_target_archive_event("downloaded_marker_removed", {
+                                    "file_name": downloaded_file_name,
+                                    "file_id": ModelFile.build_file_id(downloaded_file_name, None),
+                                })
                     self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
 
         if remote_reconciliation_established and self.__pending_auto_purge_file_ids:
@@ -964,11 +1145,17 @@ class Controller:
 
             elif command.action == Controller.Command.Action.EXTRACT:
                 # Note: We don't check the is_extractable flag because it's just a guess
+                should_trace_target = self.__target_archive_trace_selector_matches_file(file.file_id, file.name)
                 if file.state not in (
                         ModelFile.State.DEFAULT,
                         ModelFile.State.DOWNLOADED,
                         ModelFile.State.EXTRACTED
                 ):
+                    if should_trace_target:
+                        self.__trace_target_archive_event("extract_command_blocked", {
+                            "file": self.__summarize_target_archive_file(file),
+                            "reason": "state_not_allowed",
+                        })
                     _notify_failure(
                         command,
                         "File '{}' in state {} cannot be extracted".format(
@@ -978,9 +1165,18 @@ class Controller:
                     )
                     continue
                 elif file.local_size is None:
+                    if should_trace_target:
+                        self.__trace_target_archive_event("extract_command_blocked", {
+                            "file": self.__summarize_target_archive_file(file),
+                            "reason": "missing_local_file",
+                        })
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
+                    if should_trace_target:
+                        self.__trace_target_archive_event("extract_command_queued", {
+                            "file": self.__summarize_target_archive_file(file),
+                        })
                     self.__extract_process.extract(file)
 
             elif command.action == Controller.Command.Action.VALIDATE:

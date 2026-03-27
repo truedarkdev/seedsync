@@ -2,12 +2,13 @@
 
 import unittest
 import logging
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import sys
 import multiprocessing
 import ctypes
 import threading
 import time
+import json
 
 import timeout_decorator
 
@@ -208,6 +209,25 @@ class TestExtractProcess(unittest.TestCase):
         # next one should be empty
         completed = self.process.pop_completed()
         self.assertEqual(0, len(completed))
+
+    def test_extract_listener_logs_target_archive_trace_on_failure(self):
+        process = ExtractProcess(out_dir_path="", local_path="")
+        process._ExtractProcess__target_archive_trace_file_id = "archive.zip"
+        process._ExtractProcess__target_archive_trace_logger = MagicMock()
+        process._ExtractProcess__target_archive_trace_last_signature = None
+
+        listener = ExtractProcess._ExtractProcess__ExtractListener(
+            logger=MagicMock(),
+            completed_queue=MagicMock(),
+            trace_owner=process
+        )
+
+        listener.extract_failed("archive.zip", False)
+
+        process._ExtractProcess__target_archive_trace_logger.info.assert_called_once()
+        payload = json.loads(process._ExtractProcess__target_archive_trace_logger.info.call_args[0][1])
+        self.assertEqual("extract_failed", payload["event"])
+        self.assertEqual("archive.zip", payload["file_name"])
 
     @timeout_decorator.timeout(5)
     def test_forwards_extract_commands(self):

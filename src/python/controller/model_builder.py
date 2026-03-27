@@ -36,6 +36,10 @@ class ModelBuilder:
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
         self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
+        self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
+        self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
+        if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
+            self.__target_archive_trace_file_id = None
         self.__local_files = dict()
         self.__remote_files = dict()
         self.__active_file_ids = set()
@@ -49,15 +53,18 @@ class ModelBuilder:
         self.__validation_statuses = dict()
         self.__local_root_paths = dict()
         self.__local_staging_paths = dict()
+        self.__suppressed_ambiguous_extracted_file_names = set()
         self.__cached_model = None
         self.__stop_resume_trace_file_id = None
         self.__stop_resume_trace_cycle_id = None
         self.__stop_resume_trace_emitted = False
         self.__stop_resume_trace_last_idle_signature = None
+        self.__target_archive_trace_last_signature = None
 
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("ModelBuilder")
         self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
+        self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
 
     def set_stop_resume_trace_file_id(self, file_id: Optional[str]):
         self.__stop_resume_trace_file_id = file_id.strip() if file_id is not None and file_id.strip() else None
@@ -78,6 +85,19 @@ class ModelBuilder:
             return parsed_identifier[1]
         return identifier
 
+    def __is_target_archive_trace_enabled(self) -> bool:
+        return self.__target_archive_trace_file_id is not None
+
+    def __trace_target_archive_selector_matches_model_file(self, model_file: ModelFile, root_file_id: str) -> bool:
+        if not self.__is_target_archive_trace_enabled():
+            return False
+        if self.__target_archive_trace_file_id == model_file.file_id:
+            return True
+        if model_file.file_id != root_file_id:
+            return False
+        selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
+        return selector_name == model_file.name
+
     def __trace_selector_matches_model_file(self, model_file: ModelFile, root_file_id: str) -> bool:
         if not self.__is_stop_resume_trace_enabled():
             return False
@@ -87,6 +107,115 @@ class ModelBuilder:
             return False
         selector_name = self.__extract_trace_selector_name(self.__stop_resume_trace_file_id)
         return selector_name == model_file.name
+
+    @staticmethod
+    def __summarize_target_archive_source(arbitration_source: str,
+                                          model_file: ModelFile,
+                                          local: Optional[SystemFile],
+                                          transfer_state: Optional[LftpJobStatus.TransferState]) -> str:
+        if arbitration_source in (
+            "recent_live_snapshot",
+            "live_status",
+        ):
+            return "live_transfer"
+        if arbitration_source in (
+            "retained_recent_live_snapshot",
+            "retained_stopped_snapshot",
+            "retained_stopped_snapshot_from_live_status",
+            "retained_stopped_snapshot_without_live_progress",
+            "live_status_coalesced_with_retained_floor",
+        ):
+            return "retained_snapshot"
+        if arbitration_source == "staging_completion_without_live_status":
+            return "staging_only"
+        if arbitration_source == "suppressed_by_authoritative_local_completion":
+            return "authoritative_local"
+        if model_file.state == ModelFile.State.EXTRACTED:
+            return "persisted_extracted"
+        if model_file.state == ModelFile.State.DOWNLOADED:
+            return "persisted_downloaded"
+        if ModelBuilder.__is_authoritative_local_file(local):
+            return "authoritative_local"
+        if transfer_state is not None:
+            return "live_transfer"
+        return "scan_only"
+
+    def __trace_target_archive_event(self, event: str, payload: dict):
+        if not self.__is_target_archive_trace_enabled():
+            return
+        trace_payload = {
+            "event": event,
+            "target_selector": self.__target_archive_trace_file_id,
+        }
+        trace_payload.update(payload)
+        signature = json.dumps(trace_payload, sort_keys=True)
+        if signature == self.__target_archive_trace_last_signature:
+            return
+        self.__target_archive_trace_last_signature = signature
+        self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
+
+    def __trace_target_archive_arbitration(self,
+                                           model_file: ModelFile,
+                                           root_file_id: str,
+                                           is_stopped: bool,
+                                           remote_present: bool,
+                                           local_present: bool,
+                                           local: Optional[SystemFile],
+                                           active_present: bool,
+                                           local_freshness: str,
+                                           status: Optional[LftpJobStatus],
+                                           transfer_state: Optional[LftpJobStatus.TransferState],
+                                           arbitration_source: str):
+        if not self.__trace_target_archive_selector_matches_model_file(model_file, root_file_id):
+            return
+
+        self.__trace_target_archive_event("arbitration", {
+            "model_source": "rebuilt",
+            "source_kind": ModelBuilder.__summarize_target_archive_source(
+                arbitration_source,
+                model_file,
+                local,
+                transfer_state,
+            ),
+            "local_freshness": local_freshness,
+            "resolved_identity": {
+                "file_id": model_file.file_id,
+                "root_file_id": root_file_id,
+                "path_pair_id": model_file.path_pair_id,
+                "path_pair_name": model_file.path_pair_name,
+            },
+            "markers": {
+                "downloaded": self.__model_file_matches_persisted_name(model_file, self.__downloaded_files),
+                "extracted": self.__model_file_matches_persisted_name(model_file, self.__extracted_files),
+                "stopped": is_stopped,
+            },
+            "raw_lftp_status": {
+                "state": ModelBuilder.__enum_name(status.state) if status is not None else None,
+                "job_id": status.id if status is not None else None,
+                "file_id": status.file_id if status is not None else None,
+                "transfer": ModelBuilder.__summarize_transfer_state(transfer_state),
+            },
+            "matched_local": {
+                "name": local.name if local is not None else None,
+                "path": self.__resolve_local_disk_path(model_file, local),
+            },
+            "local_data_role": ModelBuilder.__summarize_local_data_role(
+                model_file,
+                local,
+                transfer_state,
+                arbitration_source,
+            ),
+            "local_size_apparent": local.size if local is not None else None,
+            "local_size_allocated": self.__get_allocated_local_size(model_file, local),
+            "presence": {
+                "remote": remote_present,
+                "local": local_present,
+                "active": active_present,
+                "live_transfer": transfer_state is not None,
+            },
+            "arbitration_source": arbitration_source,
+            "final_model": ModelBuilder.__summarize_rendered_model(model_file),
+        })
 
     def begin_stop_resume_trace_cycle(self, cycle_id: int):
         self.__stop_resume_trace_cycle_id = cycle_id
@@ -893,6 +1022,7 @@ class ModelBuilder:
         self.__extracted_files.clear()
         self.__stopped_files.clear()
         self.__validation_statuses.clear()
+        self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__cached_model = None
 
     def has_changes(self) -> bool:
@@ -911,10 +1041,31 @@ class ModelBuilder:
         live_transferred_file_ids = set()
         seen_file_ids = set()
         all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
+        ambiguous_file_names = set()
+        file_name_counts = dict()
         source_file_ids = set(self.__local_files.keys()).union(self.__remote_files.keys())
         for status_file_id in self.__lftp_statuses.keys():
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
+
+        for file_id in all_file_ids:
+            source_file = self.__local_files.get(file_id)
+            if source_file is None:
+                source_file = self.__remote_files.get(file_id)
+            if source_file is None:
+                continue
+            file_name_counts[source_file.name] = file_name_counts.get(source_file.name, 0) + 1
+        ambiguous_file_names = {
+            file_name
+            for file_name, file_name_count in file_name_counts.items()
+            if file_name_count > 1
+        }
+        self.__suppressed_ambiguous_extracted_file_names.intersection_update(self.__extracted_files)
+        self.__suppressed_ambiguous_extracted_file_names.update(
+            file_name
+            for file_name in ambiguous_file_names
+            if file_name in self.__extracted_files
+        )
 
         for file_id in all_file_ids:
             seen_file_ids.add(file_id)
@@ -1284,8 +1435,9 @@ class ModelBuilder:
                         model_file.remote_size is not None and \
                         getattr(local, "is_staging", False) and \
                         model_file.local_size >= model_file.remote_size:
-                    # Deadlock escape for a full-size staging copy when scan-only
-                    # is all we have left and no live path can win the arbitration.
+                    # Keep scan-only recovery for full-size staging copies so
+                    # they can leave incomplete and continue through the
+                    # normal completion path.
                     model_file.state = ModelFile.State.DOWNLOADED
                     arbitration_source = "staging_completion_without_live_status"
                 elif not model_file.is_dir and \
@@ -1351,8 +1503,12 @@ class ModelBuilder:
             # Note: Default files aren't marked extracted because they can still be queued
             #       for download, and it doesn't make sense to queue after extracting
             #       If a Default file is extracted, it will return back to the Default state
+            has_exact_extracted_marker = model_file.file_id in self.__extracted_files
             if self.__model_file_matches_persisted_name(model_file, self.__extracted_files) and \
-                    model_file.state == ModelFile.State.DOWNLOADED:
+                    model_file.state == ModelFile.State.DOWNLOADED and \
+                    self.__is_authoritative_local_file(local) and \
+                    (has_exact_extracted_marker or
+                     model_file.name not in self.__suppressed_ambiguous_extracted_file_names):
                     model_file.state = ModelFile.State.EXTRACTED
 
             validation_status = self.__validation_statuses.get(model_file.file_id)
@@ -1377,6 +1533,20 @@ class ModelBuilder:
 
             if self.__is_stop_resume_trace_enabled():
                 self.__trace_target_arbitration(
+                    model_file,
+                    status.file_id if status is not None else model_file.file_id,
+                    is_stopped,
+                    remote is not None,
+                    local is not None,
+                    local,
+                    model_file.file_id in self.__active_file_ids,
+                    ModelBuilder.__summarize_local_freshness(local),
+                    status,
+                    raw_current_transfer_state,
+                    arbitration_source
+                )
+            if self.__is_target_archive_trace_enabled():
+                self.__trace_target_archive_arbitration(
                     model_file,
                     status.file_id if status is not None else model_file.file_id,
                     is_stopped,

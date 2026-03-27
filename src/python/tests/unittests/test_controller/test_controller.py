@@ -42,6 +42,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__mp_logger = MagicMock()
         self.controller._Controller__stop_resume_trace_logger = MagicMock()
         self.controller._Controller__stop_resume_trace_file_id = None
+        self.controller._Controller__target_archive_trace_logger = MagicMock()
+        self.controller._Controller__target_archive_trace_file_id = None
+        self.controller._Controller__target_archive_trace_last_signature = None
         self.controller._Controller__staging_path = "/local/incomplete"
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
@@ -429,7 +432,6 @@ class TestController(unittest.TestCase):
         added_file = ModelFile("keep", False)
         added_file.path_pair_id = "movies"
         added_file.state = ModelFile.State.DOWNLOADED
-        added_file.file_id = "[\"movies\",\"keep\"]"
 
         stale_a = "[\"movies\",\"a\"]"
         stale_b = "[\"movies\",\"b\"]"
@@ -454,6 +456,43 @@ class TestController(unittest.TestCase):
             {stale_a, stale_b, added_file.file_id},
             self.controller._Controller__model_builder.set_downloaded_files.call_args_list[-1][0][0]
         )
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_removes_stale_extracted_file_names_when_new_download_completes(self, diff_models):
+        added_file = ModelFile("archive.zip", False)
+        added_file.path_pair_id = "movies"
+        added_file.state = ModelFile.State.DOWNLOADED
+
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__persist.extracted_file_names = {"archive.zip"}
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.set_base_logger(self.controller.logger)
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=added_file)]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({added_file.file_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.controller._Controller__model_builder.set_extracted_files.assert_called_with(set())
+
+    def test_clear_extracted_marker_does_not_clear_duplicate_names_across_path_pairs(self):
+        file_a = ModelFile("archive.zip", False)
+        file_a.path_pair_id = "movies"
+        file_b = ModelFile("archive.zip", False)
+        file_b.path_pair_id = "tv"
+
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.set_base_logger(self.controller.logger)
+        self.controller._Controller__model.add_file(file_a)
+        self.controller._Controller__model.add_file(file_b)
+        self.controller._Controller__persist.extracted_file_names = {"archive.zip"}
+
+        self.controller.clear_extracted_marker(file_a)
+
+        self.assertEqual({"archive.zip"}, self.controller._Controller__persist.extracted_file_names)
+        self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
 
     @patch("controller.controller.ModelDiffUtil.diff_models")
     def test_update_model_keeps_staging_only_completed_markers_from_repromoting_snapshot(self, diff_models):
@@ -997,6 +1036,25 @@ class TestController(unittest.TestCase):
             "/local/movies/incomplete/movie.mkv",
             "/local/movies/movie.mkv"
         )
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_logs_target_archive_trace(self, move):
+        self.controller._Controller__target_archive_trace_file_id = "movie.mkv"
+        trace_logger = self.controller._Controller__target_archive_trace_logger
+
+        with patch("controller.controller.os.path.exists", return_value=True), \
+                patch.object(trace_logger, "info") as trace_info:
+            self.controller._Controller__move_from_staging("movie.mkv")
+
+        move.assert_called_once_with(
+            os.path.join("/local/incomplete", "movie.mkv"),
+            os.path.join("/local", "movie.mkv")
+        )
+        self.assertEqual(2, trace_info.call_count)
+        attempt_payload = json.loads(trace_info.call_args_list[0][0][1])
+        result_payload = json.loads(trace_info.call_args_list[1][0][1])
+        self.assertEqual("move_from_staging_attempt", attempt_payload["event"])
+        self.assertEqual("moved", result_payload["result"])
 
     def test_recover_interrupted_downloads_requeues_single_path_temp_file(self):
         self.controller._Controller__persist.downloaded_file_names = set()

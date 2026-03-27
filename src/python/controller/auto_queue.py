@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from typing import Set, List, Callable, Tuple
 import fnmatch
 from threading import Lock
+import os
 
 from common import overrides, Constants, Context, Persist, PersistError, Serializable
 from model import IModelListener, ModelFile
@@ -160,6 +161,11 @@ class AutoQueue:
                  persist: AutoQueuePersist,
                  controller: Controller):
         self.logger = context.logger.getChild("AutoQueue")
+        self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
+        self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
+        if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
+            self.__target_archive_trace_file_id = None
+        self.__target_archive_trace_last_signature = None
         self.__persist = persist
         self.__controller = controller
         self.__model_listener = AutoQueueModelListener()
@@ -180,6 +186,43 @@ class AutoQueue:
             self.logger.debug("Auto-Queue Patterns:")
             for pattern in self.__persist.patterns:
                 self.logger.debug("    {}".format(pattern.pattern))
+
+    @staticmethod
+    def __extract_trace_selector_name(identifier: str):
+        if identifier is None:
+            return None
+        try:
+            parsed_identifier = json.loads(identifier)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return identifier
+        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
+            return parsed_identifier[1]
+        return identifier
+
+    def __is_target_archive_trace_enabled(self) -> bool:
+        return self.__target_archive_trace_file_id is not None
+
+    def __target_archive_trace_selector_matches_file(self, file: ModelFile) -> bool:
+        if not self.__is_target_archive_trace_enabled():
+            return False
+        if self.__target_archive_trace_file_id == file.file_id or self.__target_archive_trace_file_id == file.name:
+            return True
+        selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
+        return selector_name == file.name
+
+    def __trace_target_archive_event(self, event: str, payload: dict):
+        if not self.__is_target_archive_trace_enabled():
+            return
+        trace_payload = {
+            "event": event,
+            "target_selector": self.__target_archive_trace_file_id,
+        }
+        trace_payload.update(payload)
+        signature = json.dumps(trace_payload, sort_keys=True)
+        if signature == self.__target_archive_trace_last_signature:
+            return
+        self.__target_archive_trace_last_signature = signature
+        self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
 
     def process(self):
         """
@@ -262,6 +305,98 @@ class AutoQueue:
                     f.local_size > 0 and
                     f.is_extractable
             )
+
+        trace_target_file = None
+        if self.__is_target_archive_trace_enabled():
+            model_files = self.__controller.get_model_files()
+            trace_target_file = next(
+                (file for file in model_files if self.__target_archive_trace_selector_matches_file(file)),
+                None
+            )
+            if trace_target_file is None:
+                self.__trace_target_archive_event("auto_extract_decision", {
+                    "decision": "not_found",
+                    "reason": "not_present_in_model",
+                })
+            else:
+                trace_target_in_new_files = any(
+                    file.file_id == trace_target_file.file_id for file in self.__model_listener.new_files
+                )
+                trace_target_in_modified_files = any(
+                    new_file.file_id == trace_target_file.file_id
+                    for _, new_file in self.__model_listener.modified_files
+                )
+                trace_target_in_candidates = trace_target_in_new_files or trace_target_in_modified_files
+                trace_target_pattern = next(
+                    (pattern.pattern for file, pattern in files_to_extract if file.file_id == trace_target_file.file_id),
+                    None
+                )
+                if not self.__auto_extract_enabled:
+                    decision = "disabled"
+                    reason = "auto_extract_disabled"
+                elif trace_target_pattern is not None:
+                    decision = "queued"
+                    reason = "eligible"
+                elif not trace_target_in_candidates:
+                    decision = "not_considered"
+                    reason = "not_new_or_recently_downloaded"
+                elif trace_target_file.state != ModelFile.State.DOWNLOADED:
+                    decision = "blocked"
+                    reason = "state_not_downloaded"
+                elif trace_target_file.local_size is None:
+                    decision = "blocked"
+                    reason = "missing_local_size"
+                elif trace_target_file.local_size <= 0:
+                    decision = "blocked"
+                    reason = "empty_local_size"
+                elif not trace_target_file.is_extractable:
+                    decision = "blocked"
+                    reason = "not_extractable"
+                elif self.__patterns_only:
+                    decision = "blocked"
+                    reason = "pattern_no_match"
+                else:
+                    decision = "blocked"
+                    reason = "filtered_out"
+
+                self.__trace_target_archive_event("auto_extract_decision", {
+                    "decision": decision,
+                    "reason": reason,
+                    "file": {
+                        "file_id": trace_target_file.file_id,
+                        "name": trace_target_file.name,
+                        "path_pair_id": trace_target_file.path_pair_id,
+                        "path_pair_name": trace_target_file.path_pair_name,
+                        "state": getattr(trace_target_file.state, "name", trace_target_file.state),
+                        "local_size": trace_target_file.local_size,
+                        "remote_size": trace_target_file.remote_size,
+                        "is_extractable": trace_target_file.is_extractable,
+                    },
+                    "observed_in_cycle": {
+                        "new_files": trace_target_in_new_files,
+                        "modified_files": trace_target_in_modified_files,
+                        "candidate": trace_target_in_candidates,
+                    },
+                    "pattern": trace_target_pattern,
+                    "patterns_only": self.__patterns_only,
+                    "auto_extract_enabled": self.__auto_extract_enabled,
+                })
+
+        if self.__auto_extract_enabled and self.__patterns_only:
+            matched_extract_file_ids = {file.file_id for file, _ in files_to_extract}
+            blocked_extract_candidates = [
+                new_file
+                for old_file, new_file in self.__model_listener.modified_files
+                if old_file.state != ModelFile.State.DOWNLOADED and
+                old_file.state != ModelFile.State.EXTRACTING and
+                new_file.state == ModelFile.State.DOWNLOADED and
+                new_file.local_size is not None and
+                new_file.local_size > 0 and
+                new_file.is_extractable and
+                new_file.file_id not in matched_extract_file_ids
+            ]
+            for file in blocked_extract_candidates:
+                self.__controller.clear_extracted_marker(file)
 
         ###
         # Send commands
