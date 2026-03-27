@@ -201,7 +201,7 @@ export const OPTIONS_CONTEXT_EXTRACT: IOptionsContext = {
             type: OptionType.Checkbox,
             label: "Use managed extract folders",
             valuePath: ["controller", "managed_extract_folders_enabled"],
-            description: "Place each extracted archive in its own folder and keep a hidden recovery marker there"
+            description: "Place each extracted archive in its own folder and hide its contents from local file results"
         },
         {
             type: OptionType.Text,
