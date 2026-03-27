@@ -249,18 +249,22 @@ run-tests-e2e: tests-e2e-deps
 	fi
 
 run-remote-server:
-	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
+	STAGING_REGISTRY="$(if $(strip ${STAGING_REGISTRY}),${STAGING_REGISTRY},localhost:5000)" \
+	STAGING_VERSION="$(if $(strip ${STAGING_VERSION}),${STAGING_VERSION},latest)" \
+	SEEDSYNC_REMOTE_FILES_DIR="$(if $(strip ${SEEDSYNC_REMOTE_FILES_DIR}),${SEEDSYNC_REMOTE_FILES_DIR},${ROOTDIR}/build/docker-local/remote-files)" \
 		$(DOCKER_COMPOSE) \
-		--project-directory ${ROOTDIR} \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		-f ${SOURCEDIR}/docker/stage/docker-image/compose.yml \
 		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		up -d --build remote
 
 stop-remote-server:
-	SEEDSYNC_REMOTE_FILES_DIR="${SEEDSYNC_REMOTE_FILES_DIR}" \
+	STAGING_REGISTRY="$(if $(strip ${STAGING_REGISTRY}),${STAGING_REGISTRY},localhost:5000)" \
+	STAGING_VERSION="$(if $(strip ${STAGING_VERSION}),${STAGING_VERSION},latest)" \
+	SEEDSYNC_REMOTE_FILES_DIR="$(if $(strip ${SEEDSYNC_REMOTE_FILES_DIR}),${SEEDSYNC_REMOTE_FILES_DIR},${ROOTDIR}/build/docker-local/remote-files)" \
 		$(DOCKER_COMPOSE) \
-		--project-directory ${ROOTDIR} \
 		-f ${SOURCEDIR}/docker/test/e2e/compose.yml \
+		-f ${SOURCEDIR}/docker/stage/docker-image/compose.yml \
 		-f ${SOURCEDIR}/docker/test/e2e/compose-remote-dev.yml \
 		stop remote
 
