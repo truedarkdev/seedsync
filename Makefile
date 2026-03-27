@@ -22,7 +22,7 @@ DEB_GLIBC_MAX:=2.31
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc clean coverage-python
+.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python
 
 all: deb docker-image
 
@@ -106,6 +106,9 @@ verify-scanfs-glibc:
 		echo "${red}ERROR: scanfs artifact not found at ${BUILDDIR}/scanfs${reset}"; exit 1; \
 	fi
 	${SOURCEDIR}/docker/test/verify_glibc.sh "${BUILDDIR}/scanfs" ${DEB_GLIBC_MAX}
+
+preflight-linux-wsl:
+	bash ${SOURCEDIR}/docker/test/check_linux_wsl_baseline.sh
 
 tests-python:
 	# python run

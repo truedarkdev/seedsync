@@ -216,6 +216,50 @@ cd src/python
 poetry run pytest
 ```
 
+### Linux/WSL SSH and Archive Baseline
+
+Before chasing failures in the local Linux/WSL SSH-backed or archive-backed
+lanes, run the shared preflight helper from the repo root:
+
+```bash
+make preflight-linux-wsl
+# or, if you want the helper directly
+bash src/docker/test/check_linux_wsl_baseline.sh
+```
+
+The helper checks the current repo-supported Python range (`>=3.11,<3.13`),
+the OpenSSH client, `lftp`, `rar`, `unrar`, and the two local SSH endpoints we
+rely on during WSL/Linux verification:
+
+* `127.0.0.1:22` for the Python integration SSH lane
+* `127.0.0.1:1234` for the Compose-managed reusable remote fixture lane
+
+Lane-specific notes:
+
+* Python integration tests use the localhost SSH target on port 22.
+  The current host-side command remains:
+
+  ```bash
+  cd src/python
+  poetry run pytest -p no:cacheprovider
+  ```
+
+* The reusable remote SSH fixture for the e2e lane is started with:
+
+  ```bash
+  make run-remote-server
+  ```
+
+  That service publishes SSH on port 1234, which is the endpoint checked by
+  the preflight helper.
+
+* Archive-backed extraction coverage depends on `rar` and `unrar` being
+  installed on the Linux/WSL host. The extractor shells out to archive tooling,
+  so a missing binary is an environment problem rather than a repo regression.
+
+See [src/e2e/README.md](../src/e2e/README.md) for the e2e lane-specific
+command summary.
+
 ### Native Windows Backend Tests
 
 Use this lane for host-native backend and unit tests on Windows. The repo
