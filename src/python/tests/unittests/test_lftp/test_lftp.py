@@ -920,6 +920,25 @@ class TestLftp(unittest.TestCase):
             self.lftp.raise_pending_error()
         self.assertTrue("Login failed: Login incorrect" in str(ctx.exception))
 
+    def test_docker_runtime_user_ssh_config_guardrail(self):
+        repo_root = None
+        dockerfile_relpath = Path("src/docker/build/docker-image/Dockerfile")
+        for base_path in Path(__file__).resolve().parents:
+            candidate = base_path / dockerfile_relpath
+            if candidate.is_file() and (base_path / "Makefile").is_file():
+                repo_root = base_path
+                break
+
+        if repo_root is None:
+            self.skipTest("Runtime Dockerfile is unavailable in this test layout; skipping SSH guardrail assertions.")
+
+        dockerfile = repo_root / dockerfile_relpath
+        contents = dockerfile.read_text(encoding="utf-8")
+
+        self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
+        self.assertIn("StrictHostKeyChecking accept-new", contents)
+        self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)
+
 
 class TestLftpPromptClassification(unittest.TestCase):
     @patch("lftp.lftp.pexpect.spawn", create=True)
@@ -1048,15 +1067,6 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertNotIn("\x1b[?2004h", output)
         self.assertNotIn("\x1b[?2004l", output)
         self.assertIn("[0] queue (sftp://someone:@localhost)", output)
-
-    def test_docker_runtime_user_ssh_config_guardrail(self):
-        dockerfile = Path(__file__).resolve().parents[5] / "src" / "docker" / "build" / "docker-image" / "Dockerfile"
-        contents = dockerfile.read_text(encoding="utf-8")
-
-        self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
-        self.assertIn("StrictHostKeyChecking accept-new", contents)
-        self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)
-
 
 class TestLftpKillPathMatching(unittest.TestCase):
     def test_kill_matches_running_pget_job_by_staging_root(self):

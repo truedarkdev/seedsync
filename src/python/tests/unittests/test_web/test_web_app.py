@@ -51,14 +51,15 @@ class TestWebAppStream(unittest.TestCase):
         self.assertEqual([True], second_cleanup)
 
     def test_stream_paces_between_emitted_events(self):
-        self.web_app.add_streaming_handler(QueueStreamHandler, values=["a1"], cleanup_log=[])
+        self.web_app.add_streaming_handler(QueueStreamHandler, values=["a1", "a2"], cleanup_log=[])
 
         with patch("web.web_app.time.sleep") as sleep:
             stream = self.web_app._WebApp__web_stream()
             self.assertEqual("a1", next(stream))
+            self.assertEqual("a2", next(stream))
             stream.close()
 
-        sleep.assert_any_call(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
+        sleep.assert_called_once_with(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
 
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []
