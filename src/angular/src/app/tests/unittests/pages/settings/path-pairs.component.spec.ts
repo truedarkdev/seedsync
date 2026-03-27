@@ -213,20 +213,17 @@ describe("Testing path pairs component", () => {
         expect(fixture.nativeElement.querySelector(".empty-state")).not.toBeNull();
         expect(fixture.nativeElement.querySelectorAll(".path-pair-item").length).toBe(0);
 
-        setTimeout(() => {
-            pathPairService.push([
-                {
-                    id: "movies",
-                    name: "Movies",
-                    remote_path: "/remote/movies",
-                    local_path: "/downloads/movies",
-                    enabled: true,
-                    auto_queue: true
-                }
-            ]);
-        });
-
-        tick();
+        pathPairService.push([
+            {
+                id: "movies",
+                name: "Movies",
+                remote_path: "/remote/movies",
+                local_path: "/downloads/movies",
+                enabled: true,
+                auto_queue: true
+            }
+        ]);
+        fixture.detectChanges();
 
         expect(fixture.nativeElement.querySelector(".empty-state")).toBeNull();
         const items = fixture.nativeElement.querySelectorAll(".path-pair-item");

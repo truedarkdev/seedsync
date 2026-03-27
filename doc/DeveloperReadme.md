@@ -245,14 +245,19 @@ tests that can run on Windows.
 
 ### Angular Unit Tests
 
-```bash
-cd src/angular
-npm test
+On Windows, the validated local command path on Node 20 is:
+
+```powershell
+Set-Location C:\Git\seedsync\src\angular
+$env:CHROME_BIN = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+npm ci --legacy-peer-deps
+npm test -- --watch=false --single-run --browsers=ChromeHeadless
 ```
 
-`npm test` uses the headless launcher configured in `karma.conf.js`, so it works
-without a GUI Chrome session. If you want an interactive browser run for local
-debugging, override the browser explicitly, for example:
+Set `CHROME_BIN` explicitly when Chrome is installed but not on `PATH`. The
+headless launcher configured in `karma.conf.js` works without a GUI Chrome
+session. If you want an interactive browser run for local debugging, override
+the browser explicitly, for example:
 
 ```bash
 npm test -- --browsers Chrome
