@@ -116,6 +116,10 @@ export class ViewFileService {
         return file.fileId || file.name;
     }
 
+    private static getModelFileKey(file: ModelFile): string {
+        return file.file_id || file.name;
+    }
+
     private buildViewFromModelFiles(modelFiles: Immutable.Map<string, ModelFile>) {
         this._logger.debug("Received next model files");
 
@@ -151,11 +155,30 @@ export class ViewFileService {
         // Do the updates first before indices change (re-sort may be required)
         updatedNames.forEach(
             name => {
-                const index = this._indices.get(name);
-                const oldViewFile = newViewFiles.get(index);
-                const newViewFile = ViewFileService.createViewFile(modelFiles.get(name), oldViewFile.isSelected);
-                newViewFiles = newViewFiles.set(index, newViewFile);
-                if (this._sortComparator != null && this._sortComparator(oldViewFile, newViewFile) !== 0) {
+                const previousModelFile = this._prevModelFiles.get(name);
+                const previousViewFileKey = ViewFileService.getModelFileKey(previousModelFile);
+                let index = this._indices.get(previousViewFileKey);
+                let oldViewFile = index != null ? newViewFiles.get(index) : null;
+
+                if (oldViewFile == null) {
+                    index = newViewFiles.findIndex(value => ViewFileService.getViewFileKey(value) === previousViewFileKey);
+                    if (index >= 0) {
+                        oldViewFile = newViewFiles.get(index);
+                        this._indices.set(previousViewFileKey, index);
+                    }
+                }
+
+                const newViewFile = ViewFileService.createViewFile(
+                    modelFiles.get(name),
+                    oldViewFile != null ? oldViewFile.isSelected : false
+                );
+                if (index != null && index >= 0) {
+                    newViewFiles = newViewFiles.set(index, newViewFile);
+                } else {
+                    newViewFiles = newViewFiles.push(newViewFile);
+                    this._indices.set(previousViewFileKey, newViewFiles.size - 1);
+                }
+                if (oldViewFile != null && this._sortComparator != null && this._sortComparator(oldViewFile, newViewFile) !== 0) {
                     reSort = true;
                 }
             }
