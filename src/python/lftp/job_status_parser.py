@@ -77,6 +77,14 @@ class LftpJobStatusParser:
         statuses = list()
         lines = [s.strip() for s in output.splitlines()]
         lines = list(filter(None, lines))  # remove blank lines
+        # lftp in a PTY can leak bracketed-paste toggle lines into the status output.
+        lines = [
+            line for line in lines
+            if line not in {
+                "\x1b[?2004h",
+                "\x1b[?2004l",
+            }
+        ]
         # remove all lines before the first 'jobs -v'
         start = next((i+1 for i, l in enumerate(lines) if l == "jobs -v"), 0)
         lines = lines[start:]

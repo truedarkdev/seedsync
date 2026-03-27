@@ -156,6 +156,19 @@ class Lftp:
             raise LftpError(error)
         return False
 
+    @staticmethod
+    def __normalize_output(out: str) -> str:
+        # lftp in an interactive PTY can leak bracketed-paste toggle lines into command output.
+        bracketed_paste_toggle_lines = {
+            "\x1b[?2004h",
+            "\x1b[?2004l",
+        }
+        lines = [
+            line for line in out.splitlines()
+            if line.strip() not in bracketed_paste_toggle_lines
+        ]
+        return "\n".join(lines).strip()
+
     @with_check_process
     def __run_command(self, command: str):
         self.__last_command_timed_out = False
@@ -166,18 +179,17 @@ class Lftp:
             self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
         except pexpect.exceptions.TIMEOUT:
             self.__last_command_timed_out = True
-            out = self.__process.before.decode("utf8", "replace").strip()
+            out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
             if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
                 self.logger.warning("Lftp timeout exception")
             pass
         except pexpect.exceptions.EOF:
             self.logger.error("Lftp process died unexpectedly (EOF)")
             raise LftpError("Lftp process terminated: {}".format(
-                self.__process.before.decode("utf8", "replace").strip()
+                self.__normalize_output(self.__process.before.decode("utf8", "replace"))
             ))
         finally:
-            out = self.__process.before.decode('utf8', 'replace')
-            out = out.strip()  # remove any CRs
+            out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
 
             if self.__log_command_output:
                 self.logger.debug("out ({} bytes):\n {}".format(len(out), out))
@@ -193,7 +205,7 @@ class Lftp:
             try:
                 self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
             except pexpect.exceptions.TIMEOUT:
-                out = self.__process.before.decode("utf8", "replace").strip()
+                out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
                 if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "recovering from error"):
                     self.logger.warning("Lftp timeout exception")
                 pass
@@ -201,8 +213,7 @@ class Lftp:
                 self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
                 raise LftpError("Lftp process terminated during error recovery")
             finally:
-                out = self.__process.before.decode('utf8', 'replace')
-                out = out.strip()  # remove any CRs
+                out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
                 if self.__log_command_output:
                     self.logger.debug("retry out ({} bytes):\n {}".format(len(out), out))
                     after = self.__process.after.decode('utf8', 'replace').strip() \
