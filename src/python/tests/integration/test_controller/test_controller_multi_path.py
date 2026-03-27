@@ -7,6 +7,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import shlex
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -61,7 +62,7 @@ class TestControllerMultiPath(unittest.TestCase):
         self.local_scanfs_path = os.path.join(self.local_scanfs_dir, "scanfs")
         with open(self.local_scanfs_path, "w") as handle:
             handle.write("#!/bin/sh\n")
-            handle.write("{} {} $*".format(sys.executable, local_script_path))
+            handle.write("/usr/bin/env python3 {} \"$@\"".format(shlex.quote(local_script_path)))
         os.chmod(self.local_scanfs_path, 0o775)
 
         ctx_args = Args()
