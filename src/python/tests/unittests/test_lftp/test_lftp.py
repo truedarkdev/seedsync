@@ -1022,6 +1022,33 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual("mirror: Access failed", lftp._Lftp__pending_error)
         lftp.logger.warning.assert_not_called()
 
+    def test_run_command_strips_bracketed_paste_toggle_lines(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = (
+            b"\x1b[?2004h\n"
+            b"jobs -v\n"
+            b"\x1b[?2004l\n"
+            b"[0] queue (sftp://someone:@localhost)\n"
+            b"sftp://someone:@localhost/home/someone\n"
+            b"Queue is stopped.\n"
+        )
+        process.after = b"prompt>"
+        process.expect.return_value = None
+        lftp._Lftp__process = process
+
+        output = lftp._Lftp__run_command("jobs -v")
+
+        self.assertNotIn("\x1b[?2004h", output)
+        self.assertNotIn("\x1b[?2004l", output)
+        self.assertIn("[0] queue (sftp://someone:@localhost)", output)
+
     def test_docker_runtime_user_ssh_config_guardrail(self):
         dockerfile = Path(__file__).resolve().parents[5] / "src" / "docker" / "build" / "docker-image" / "Dockerfile"
         contents = dockerfile.read_text(encoding="utf-8")

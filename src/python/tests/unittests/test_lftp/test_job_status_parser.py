@@ -72,6 +72,17 @@ class TestLftpJobStatusParser(unittest.TestCase):
         statuses = parser.parse(output)
         self.assertEqual(0, len(statuses))
 
+    def test_empty_output_4_ignores_bracketed_paste_toggle_line(self):
+        output = """
+        \x1b[?2004l
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        [0] Done (queue (sftp://someone:@localhost))
+        """
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+        self.assertEqual(0, len(statuses))
+
     def test_queued_items(self):
         """Queued items, no jobs running"""
         output = """
