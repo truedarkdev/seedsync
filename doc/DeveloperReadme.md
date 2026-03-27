@@ -216,6 +216,33 @@ cd src/python
 poetry run pytest
 ```
 
+### Native Windows Backend Tests
+
+Use this lane for host-native backend and unit tests on Windows. The repo
+currently supports Python `>=3.11,<3.13`, so Python 3.11 or 3.12 is the
+supported native Windows range here. Python 3.13 is the common drift case on
+this machine and is outside the supported backend-test lane.
+
+From a Windows shell:
+
+```powershell
+Set-Location C:\Git\seedsync\src\python
+poetry install
+poetry run pytest -p no:cacheprovider
+```
+
+If you already have GNU Make available on the Windows host, the repository
+also provides a convenience wrapper:
+
+```powershell
+Set-Location C:\Git\seedsync
+make run-tests-python-native
+```
+
+Keep using the Docker-based suite below for Linux-dependent integration
+coverage. This native lane is only the supported host path for backend/unit
+tests that can run on Windows.
+
 ### Angular Unit Tests
 
 ```bash
