@@ -389,13 +389,90 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("archive.zip").state)
 
+    def test_build_state_does_not_promote_duplicate_root_names_from_persisted_extracted_marker(self):
+        local_movies = SystemFile("archive.zip", 100, False)
+        local_movies.path_pair_id = "movies"
+        local_tv = SystemFile("archive.zip", 100, False)
+        local_tv.path_pair_id = "tv"
+
+        self.model_builder.set_local_files([local_movies, local_tv])
+        self.model_builder.set_downloaded_files({
+            ModelFile.build_file_id("archive.zip", "movies"),
+            ModelFile.build_file_id("archive.zip", "tv"),
+        })
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(
+            ModelFile.State.DOWNLOADED,
+            model.get_file(ModelFile.build_file_id("archive.zip", "movies")).state
+        )
+        self.assertEqual(
+            ModelFile.State.DOWNLOADED,
+            model.get_file(ModelFile.build_file_id("archive.zip", "tv")).state
+        )
+
+    def test_build_state_keeps_duplicate_root_name_stale_extracted_marker_from_reviving_after_collapse(self):
+        local_movies = SystemFile("archive.zip", 100, False)
+        local_movies.path_pair_id = "movies"
+        local_tv = SystemFile("archive.zip", 100, False)
+        local_tv.path_pair_id = "tv"
+
+        self.model_builder.set_local_files([local_movies, local_tv])
+        self.model_builder.set_downloaded_files({
+            ModelFile.build_file_id("archive.zip", "movies"),
+            ModelFile.build_file_id("archive.zip", "tv"),
+        })
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        ambiguous_model = self.model_builder.build_model()
+
+        self.assertEqual(
+            ModelFile.State.DOWNLOADED,
+            ambiguous_model.get_file(ModelFile.build_file_id("archive.zip", "movies")).state
+        )
+        self.assertEqual(
+            ModelFile.State.DOWNLOADED,
+            ambiguous_model.get_file(ModelFile.build_file_id("archive.zip", "tv")).state
+        )
+
+        self.model_builder.set_local_files([local_movies])
+        self.model_builder.set_downloaded_files({ModelFile.build_file_id("archive.zip", "movies")})
+
+        collapsed_model = self.model_builder.build_model()
+
+        self.assertEqual(
+            ModelFile.State.DOWNLOADED,
+            collapsed_model.get_file(ModelFile.build_file_id("archive.zip", "movies")).state
+        )
+
     def test_build_scan_only_staging_root_file_promotes_to_downloaded_when_local_size_matches_remote_size(self):
+        self.model_builder.set_remote_files([SystemFile("movie.mkv", 100, False)])
+        self.model_builder.set_local_files([SystemFile("movie.mkv", 100, False, is_staging=True)])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("movie.mkv").state)
+
+    def test_build_scan_only_staging_root_archive_file_promotes_to_downloaded_when_local_size_matches_remote_size(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
         self.model_builder.set_local_files([SystemFile("archive.zip", 100, False, is_staging=True)])
+        self.model_builder.set_extracted_files({"archive.zip"})
 
         model = self.model_builder.build_model()
 
         self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("archive.zip").state)
+
+    def test_build_scan_only_staging_root_archive_file_stays_default_when_local_size_is_short_even_with_persisted_markers(self):
+        self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
+        self.model_builder.set_local_files([SystemFile("archive.zip", 99, False, is_staging=True)])
+        self.model_builder.set_downloaded_files({"archive.zip"})
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("archive.zip").state)
 
     def test_build_state_does_not_promote_staging_only_child_file_from_remote_size_match(self):
         remote_root = SystemFile("folder", 100, True)
@@ -3363,6 +3440,29 @@ class TestModelBuilder(unittest.TestCase):
         payload = json.loads(trace_info.call_args[0][1])
         self.assertEqual("arbitration", payload["event"])
         self.assertEqual(qualified_file_id, payload["resolved_identity"]["file_id"])
+
+    def test_target_archive_trace_logs_selected_file_arbitration(self):
+        file_name = "archive.zip"
+        remote_file = SystemFile(file_name, 1000, False)
+        local_file = SystemFile(file_name, 250, False, is_staging=True)
+        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder._ModelBuilder__target_archive_trace_file_id = file_name
+
+        trace_logger = self.model_builder._ModelBuilder__target_archive_trace_logger
+        with patch.object(trace_logger, "info") as trace_info:
+            self.model_builder.build_model()
+
+        self.assertEqual(1, trace_info.call_count)
+        payload = json.loads(trace_info.call_args[0][1])
+        self.assertEqual("arbitration", payload["event"])
+        self.assertEqual(file_name, payload["resolved_identity"]["file_id"])
+        self.assertEqual("live_transfer", payload["source_kind"])
+        self.assertFalse(payload["markers"]["downloaded"])
 
     def test_stop_resume_trace_throttles_repeated_idle_cycle_events(self):
         self.model_builder.set_stop_resume_trace_file_id("missing-file")
