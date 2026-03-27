@@ -18,7 +18,6 @@ pexpect = "*"
 pytz = "*"
 requests = "*"
 tblib = "*"
-timeout-decorator = "*"
 six = "^1.17.0"
 
 [tool.poetry.group.dev.dependencies]

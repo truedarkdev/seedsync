@@ -7,10 +7,12 @@ import time
 import multiprocessing
 
 from testfixtures import LogCapture
-import timeout_decorator
+import pytest
 
 from common import MultiprocessingLogger
 
+
+pytestmark = pytest.mark.timeout(5)
 
 class TestMultiprocessingLogger(unittest.TestCase):
     def setUp(self):
@@ -21,7 +23,6 @@ class TestMultiprocessingLogger(unittest.TestCase):
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
         handler.setFormatter(formatter)
 
-    @timeout_decorator.timeout(5)
     def test_main_logger_receives_records(self):
         def process_1(_mp_logger: MultiprocessingLogger):
             logger = _mp_logger.get_process_safe_logger().getChild("process_1")
@@ -51,7 +52,6 @@ class TestMultiprocessingLogger(unittest.TestCase):
                 ("process_1", "ERROR", "Error line")
             )
 
-    @timeout_decorator.timeout(5)
     def test_children_names(self):
         def process_1(_mp_logger: MultiprocessingLogger):
             logger = _mp_logger.get_process_safe_logger().getChild("process_1")
@@ -76,7 +76,6 @@ class TestMultiprocessingLogger(unittest.TestCase):
                 ("process_1.child_1_1", "DEBUG", "Debug line"),
             )
 
-    @timeout_decorator.timeout(5)
     def test_logger_levels(self):
         def process_1(_mp_logger: MultiprocessingLogger):
             logger = _mp_logger.get_process_safe_logger().getChild("process_1")

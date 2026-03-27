@@ -9,13 +9,15 @@ import tempfile
 import unittest
 from unittest.mock import PropertyMock, patch
 
-import timeout_decorator
+import pytest
 
 from common import Args, Config, Context, Status, overrides
 from common.path_pair import PathPair, PathPairManager
 from controller import Controller, ControllerPersist
 from tests.utils import TestUtils
 
+
+pytestmark = pytest.mark.timeout(30)
 
 class TestControllerMultiPath(unittest.TestCase):
     __KEEP_FILES = False
@@ -202,7 +204,6 @@ class TestControllerMultiPath(unittest.TestCase):
                 return model_file
         return None
 
-    @timeout_decorator.timeout(30)
     def test_scan_keeps_duplicate_top_level_names_per_path_pair(self):
         self._start_controller()
         self._wait_for_duplicate_roots()
@@ -229,7 +230,6 @@ class TestControllerMultiPath(unittest.TestCase):
             }
         )
 
-    @timeout_decorator.timeout(30)
     def test_queue_and_delete_commands_use_matching_path_pair_roots(self):
         self._start_controller()
         self._wait_for_duplicate_roots()

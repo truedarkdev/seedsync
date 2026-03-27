@@ -7,11 +7,13 @@ import sys
 import time
 from unittest.mock import MagicMock
 
-import timeout_decorator
+import pytest
 
 from controller import IScanner, ScannerProcess, ScannerError
 from system import SystemFile
 
+
+pytestmark = pytest.mark.timeout(10)
 
 class DummyScanner(IScanner):
     def scan(self):
@@ -38,7 +40,6 @@ class TestScannerProcess(unittest.TestCase):
         if self.process:
             self.process.terminate()
 
-    @timeout_decorator.timeout(10)
     def test_retrieves_scan_results(self):
         # Use this as a signal to mock to control which result to send
         self.scan_signal = multiprocessing.Value('i', 0)
@@ -143,7 +144,6 @@ class TestScannerProcess(unittest.TestCase):
         result = self.process.pop_latest_result()
         self.assertEqual(0, len(result.files))
 
-    @timeout_decorator.timeout(10)
     def test_sends_error_result_on_recoverable_error(self):
         mock_scanner = DummyScanner()
         mock_scanner.scan = MagicMock()
@@ -224,7 +224,6 @@ class TestScannerProcess(unittest.TestCase):
         mock_scanner.pop_malformed_status_only_file_ids.assert_called_once()
         mock_scanner.pop_managed_extract_file_ids.assert_called_once()
 
-    @timeout_decorator.timeout(10)
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()
         mock_scanner.scan = MagicMock()
@@ -275,7 +274,6 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIn("recoverable error", process.logger.warning.call_args_list[0][0][0])
         self.assertIn("recoverable error", process.logger.warning.call_args_list[1][0][0])
 
-    @timeout_decorator.timeout(10)
     def test_sends_fatal_exception_on_nonrecoverable_error(self):
         mock_scanner = DummyScanner()
         mock_scanner.scan = MagicMock()

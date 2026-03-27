@@ -8,11 +8,13 @@ import tempfile
 import unittest
 from filecmp import dircmp
 
-import timeout_decorator
+import pytest
 
 from tests.utils import TestUtils
 from lftp import Lftp
 
+
+pytestmark = pytest.mark.timeout(5)
 
 class TestLftp(unittest.TestCase):
     temp_dir = None
@@ -71,7 +73,6 @@ class TestLftp(unittest.TestCase):
         self.assertFalse(dcmp.right_only)
         self.assertFalse(dcmp.diff_files)
 
-    @timeout_decorator.timeout(5)
     def test_download_1(self):
         """File names with single quotes"""
         self.lftp.num_parallel_jobs = 2
@@ -95,7 +96,6 @@ class TestLftp(unittest.TestCase):
 
         self.assert_local_equals_remote()
 
-    @timeout_decorator.timeout(5)
     def test_download_2(self):
         """File names with double quotes"""
         self.lftp.num_parallel_jobs = 2
@@ -119,7 +119,6 @@ class TestLftp(unittest.TestCase):
 
         self.assert_local_equals_remote()
 
-    @timeout_decorator.timeout(5)
     def test_download_3(self):
         """File names with quotes and spaces"""
         self.lftp.num_parallel_jobs = 2
@@ -143,7 +142,6 @@ class TestLftp(unittest.TestCase):
 
         self.assert_local_equals_remote()
 
-    @timeout_decorator.timeout(5)
     def test_download_4(self):
         """File names with ' -o '"""
         self.lftp.num_parallel_jobs = 2

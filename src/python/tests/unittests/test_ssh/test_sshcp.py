@@ -10,7 +10,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pexpect
-import timeout_decorator
+import pytest
 from parameterized import parameterized
 
 from tests.utils import TestUtils
@@ -29,6 +29,8 @@ _PARAMS = [
 
 
 # noinspection SpellCheckingInspection
+pytestmark = pytest.mark.timeout(5)
+
 class TestSshcp(unittest.TestCase):
     __KEEP_FILES = False  # for debugging
 
@@ -71,7 +73,6 @@ class TestSshcp(unittest.TestCase):
         self.assertIsNotNone(sshcp)
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_copy(self, _, password):
         self.assertFalse(os.path.exists(self.remote_file))
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=password)
@@ -79,7 +80,6 @@ class TestSshcp(unittest.TestCase):
 
         self.assertTrue(filecmp.cmp(self.local_file, self.remote_file))
 
-    @timeout_decorator.timeout(5)
     def test_copy_error_bad_password(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password="wrong password")
         with self.assertRaises(SshcpError) as ctx:
@@ -87,7 +87,6 @@ class TestSshcp(unittest.TestCase):
         self.assertEqual("Incorrect password", str(ctx.exception))
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_copy_error_missing_local_file(self, _, password):
         local_file = os.path.join(self.local_dir, "nofile.txt")
         self.assertFalse(os.path.exists(self.remote_file))
@@ -99,7 +98,6 @@ class TestSshcp(unittest.TestCase):
         self.assertTrue("No such file or directory" in str(ctx.exception))
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_copy_error_missing_remote_dir(self, _, password):
         remote_file = os.path.join(self.remote_dir, "nodir", "file2.txt")
         self.assertFalse(os.path.exists(remote_file))
@@ -110,7 +108,6 @@ class TestSshcp(unittest.TestCase):
         self.assertTrue("No such file or directory" in str(ctx.exception))
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_copy_error_bad_host(self, _, password):
         sshcp = Sshcp(host="badhost", port=self.port, user=self.user, password=password)
         with self.assertRaises(SshcpError) as ctx:
@@ -129,7 +126,6 @@ class TestSshcp(unittest.TestCase):
         )
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_copy_error_bad_port(self, _, password):
         sshcp = Sshcp(host=self.host, port=666, user=self.user, password=password)
         with self.assertRaises(SshcpError) as ctx:
@@ -146,7 +142,6 @@ class TestSshcp(unittest.TestCase):
         )
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_shell(self, _, password):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=password)
         out = sshcp.shell("cd {}; pwd".format(self.local_dir))
@@ -154,7 +149,6 @@ class TestSshcp(unittest.TestCase):
         self.assertEqual(self.local_dir, out_str)
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_shell_with_escape_characters(self, _, password):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=password)
 
@@ -175,14 +169,12 @@ class TestSshcp(unittest.TestCase):
         with self.assertRaises(ValueError):
             sshcp.shell('mkdir "{}" && cd \'{}\' && pwd'.format(_dir, _dir))
 
-    @timeout_decorator.timeout(5)
     def test_shell_error_bad_password(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password="wrong password")
         with self.assertRaises(SshcpError) as ctx:
             sshcp.shell("cd {}; pwd".format(self.local_dir))
         self.assertEqual("Incorrect password", str(ctx.exception))
 
-    @timeout_decorator.timeout(5)
     def test_shell_timeout_logs_password_prompt_context(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
         sshcp.logger = MagicMock()
@@ -216,7 +208,6 @@ class TestSshcp(unittest.TestCase):
         )
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_shell_error_bad_host(self, _, password):
         sshcp = Sshcp(host="badhost", port=self.port, user=self.user, password=password)
         with self.assertRaises(SshcpError) as ctx:
@@ -234,7 +225,6 @@ class TestSshcp(unittest.TestCase):
         )
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_shell_error_bad_port(self, _, password):
         sshcp = Sshcp(host=self.host, port=6666, user=self.user, password=password)
         with self.assertRaises(SshcpError) as ctx:
@@ -251,7 +241,6 @@ class TestSshcp(unittest.TestCase):
         )
 
     @parameterized.expand(_PARAMS)
-    @timeout_decorator.timeout(5)
     def test_shell_error_bad_command(self, _, password):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=password)
         with self.assertRaises(SshcpError) as ctx:
