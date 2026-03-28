@@ -2129,7 +2129,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_lftp_statuses([downloading_status])
 
         model = self.model_builder.build_model()
-        self.assertTrue(model.get_file("downloading").is_stoppable)
+        self.assertFalse(model.get_file("downloading").is_stoppable)
 
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])

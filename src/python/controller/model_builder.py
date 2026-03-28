@@ -386,10 +386,8 @@ class ModelBuilder:
             return False
         if model_file.is_dir:
             return True
-        # Live file downloads can be stopped once lftp reports an active
-        # transfer. The status sidecar is still useful for freshness, but it
-        # should not be a hard gate when the transfer is clearly active.
-        return local_file is not None
+        # Require the pget status sidecar before STOP can cut a live file download.
+        return local_file is not None and getattr(local_file, "status_sidecar_ready", False)
 
     def set_local_root_paths(self,
                              local_root_paths: Dict[Optional[str], str],
