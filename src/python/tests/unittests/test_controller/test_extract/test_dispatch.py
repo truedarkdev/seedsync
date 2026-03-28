@@ -64,6 +64,15 @@ class TestExtractDispatch(unittest.TestCase):
         if self.dispatch:
             self.dispatch.stop()
 
+    def _wait_for_call_count(self, mock, expected_count: int, timeout_seconds: float = 1.0):
+        deadline = time.time() + timeout_seconds
+        while mock.call_count < expected_count:
+            if time.time() >= deadline:
+                self.fail(
+                    "Timed out waiting for {} calls, saw {}".format(expected_count, mock.call_count)
+                )
+            time.sleep(0.01)
+
     def test_extract_single_raises_error_on_remote_only_file(self):
         mf = ModelFile("aaa", False)
         mf.local_size = None
@@ -106,6 +115,58 @@ class TestExtractDispatch(unittest.TestCase):
             os.path.join(self.out_dir_path, "aaa"),
             archive_name="aaa",
             archive_file_id="aaa",
+            path_pair_id=None
+        )
+
+    def test_extract_dir_does_not_duplicate_same_named_managed_folder(self):
+        self.mock_is_archive.return_value = True
+
+        root = ModelFile("rd", True)
+        root.local_size = 100
+        archive = ModelFile("rd.zip", False)
+        archive.local_size = 100
+        root.add_child(archive)
+
+        self.dispatch.stop()
+        self.dispatch = ExtractDispatch(
+            out_dir_path=self.out_dir_path,
+            local_path=self.local_path
+        )
+        self.dispatch.start()
+        self.dispatch.extract(root)
+
+        self._wait_for_call_count(self.mock_extract_archive, 1)
+        self.mock_extract_archive.assert_called_once_with(
+            archive_path=os.path.join(self.local_path, "rd", "rd.zip"),
+            out_dir_path=os.path.join(self.out_dir_path, "rd")
+        )
+        self.mock_write_managed_extract_marker.assert_called_once_with(
+            os.path.join(self.out_dir_path, "rd"),
+            archive_name="rd.zip",
+            archive_file_id=os.path.join("rd", "rd.zip"),
+            path_pair_id=None
+        )
+
+    def test_extract_dir_does_not_duplicate_same_named_managed_folder_mixed_case(self):
+        self.mock_is_archive.return_value = True
+
+        root = ModelFile("RD", True)
+        root.local_size = 100
+        archive = ModelFile("rd.zip", False)
+        archive.local_size = 100
+        root.add_child(archive)
+
+        self.dispatch.extract(root)
+
+        self._wait_for_call_count(self.mock_extract_archive, 1)
+        self.mock_extract_archive.assert_called_once_with(
+            archive_path=os.path.join(self.local_path, "RD", "rd.zip"),
+            out_dir_path=os.path.join(self.out_dir_path, "RD")
+        )
+        self.mock_write_managed_extract_marker.assert_called_once_with(
+            os.path.join(self.out_dir_path, "RD"),
+            archive_name="rd.zip",
+            archive_file_id=os.path.join("RD", "rd.zip"),
             path_pair_id=None
         )
 

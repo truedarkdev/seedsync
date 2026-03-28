@@ -5,7 +5,7 @@ from typing import List, Callable
 from threading import Lock
 from queue import Queue
 from enum import Enum
-from datetime import datetime
+from datetime import datetime, timedelta
 import copy
 import json
 import os
@@ -277,6 +277,11 @@ class Controller:
         self.__active_extracting_file_names = []
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
+        self.__last_lftp_statuses = []
+        self.__next_lftp_status_poll_at = None
+        self.__lftp_status_poll_retry_seconds = max(5, int(self.__context.config.controller.interval_ms_downloading_scan / 1000))
+        self.__lftp_status_cache_expires_at = None
+        self.__lftp_status_cache_max_age_seconds = max(15, self.__lftp_status_poll_retry_seconds * 3)
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -823,6 +828,16 @@ class Controller:
             self.__malformed_status_only_file_ids = set()
         if not hasattr(self, "_Controller__pending_auto_purge_file_ids"):
             self.__pending_auto_purge_file_ids = set()
+        if not hasattr(self, "_Controller__last_lftp_statuses"):
+            self.__last_lftp_statuses = []
+        if not hasattr(self, "_Controller__next_lftp_status_poll_at"):
+            self.__next_lftp_status_poll_at = None
+        if not hasattr(self, "_Controller__lftp_status_poll_retry_seconds"):
+            self.__lftp_status_poll_retry_seconds = 5
+        if not hasattr(self, "_Controller__lftp_status_cache_expires_at"):
+            self.__lftp_status_cache_expires_at = None
+        if not hasattr(self, "_Controller__lftp_status_cache_max_age_seconds"):
+            self.__lftp_status_cache_max_age_seconds = max(15, self.__lftp_status_poll_retry_seconds * 3)
 
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
@@ -830,15 +845,61 @@ class Controller:
         latest_active_scan = self.__active_scan_process.pop_latest_result()
 
         # Grab the Lftp status
-        lftp_statuses = None
+        lftp_statuses = []
         lftp_status_poll_healthy = True
-        try:
-            lftp_statuses = self.__lftp.status()
-            lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
-        except (LftpError, LftpJobStatusParserError) as e:
-            self.logger.warning("Caught lftp error: {}".format(str(e)))
-            lftp_statuses = []
-            lftp_status_poll_healthy = False
+        lftp_status_snapshot_fresh = True
+        now = datetime.now()
+        cache_expired = self.__lftp_status_cache_expires_at is not None and now >= self.__lftp_status_cache_expires_at
+        if cache_expired:
+            self.__last_lftp_statuses = []
+            self.__lftp_status_cache_expires_at = None
+        if self.__next_lftp_status_poll_at is not None and now < self.__next_lftp_status_poll_at:
+            if self.__last_lftp_statuses:
+                lftp_statuses = self.__last_lftp_statuses
+                lftp_status_snapshot_fresh = False
+            else:
+                lftp_status_poll_healthy = False
+        else:
+            try:
+                lftp_statuses = self.__lftp.status()
+                lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
+                poll_finished_at = datetime.now()
+                if lftp_status_poll_healthy:
+                    self.__last_lftp_statuses = lftp_statuses
+                    self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
+                        seconds=self.__lftp_status_cache_max_age_seconds
+                    )
+                    self.__next_lftp_status_poll_at = None
+                else:
+                    self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
+                        seconds=self.__lftp_status_poll_retry_seconds
+                    )
+                    if self.__lftp_status_cache_expires_at is not None and poll_finished_at >= self.__lftp_status_cache_expires_at:
+                        self.__last_lftp_statuses = []
+                        self.__lftp_status_cache_expires_at = None
+                        lftp_statuses = []
+                    elif self.__last_lftp_statuses:
+                        lftp_statuses = self.__last_lftp_statuses
+                        lftp_status_snapshot_fresh = False
+                    elif lftp_statuses:
+                        self.__last_lftp_statuses = lftp_statuses
+                        self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
+                            seconds=self.__lftp_status_cache_max_age_seconds
+                        )
+            except (LftpError, LftpJobStatusParserError) as e:
+                self.logger.warning("Caught lftp error: {}".format(str(e)))
+                lftp_statuses = []
+                lftp_status_poll_healthy = False
+                poll_finished_at = datetime.now()
+                self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
+                    seconds=self.__lftp_status_poll_retry_seconds
+                )
+                if self.__lftp_status_cache_expires_at is not None and poll_finished_at >= self.__lftp_status_cache_expires_at:
+                    self.__last_lftp_statuses = []
+                    self.__lftp_status_cache_expires_at = None
+                elif self.__last_lftp_statuses:
+                    lftp_statuses = self.__last_lftp_statuses
+                    lftp_status_snapshot_fresh = False
 
         # Grab the latest extract results
         latest_extract_statuses = self.__extract_process.pop_latest_statuses()
@@ -884,7 +945,7 @@ class Controller:
             self.__model_builder.set_active_files(latest_active_scan.files)
         if lftp_statuses is not None:
             self.__model_builder.set_lftp_statuses(lftp_statuses)
-            if not lftp_status_poll_healthy:
+            if lftp_status_snapshot_fresh and not lftp_status_poll_healthy:
                 self.__model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                     {status.file_id for status in lftp_statuses}
                 )

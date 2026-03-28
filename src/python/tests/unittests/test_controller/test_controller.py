@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 import os
 import json
 import unittest
@@ -48,6 +49,11 @@ class TestController(unittest.TestCase):
         self.controller._Controller__staging_path = "/local/incomplete"
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
+        self.controller._Controller__last_lftp_statuses = []
+        self.controller._Controller__next_lftp_status_poll_at = None
+        self.controller._Controller__lftp_status_poll_retry_seconds = 5
+        self.controller._Controller__lftp_status_cache_expires_at = None
+        self.controller._Controller__lftp_status_cache_max_age_seconds = 15
         self.controller._Controller__startup_recovery_done = False
         self.controller._Controller__memory_monitor = MagicMock()
 
@@ -86,6 +92,120 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status])
         self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with({"a"})
+
+    def test_update_model_uses_unhealthy_returned_statuses_during_cooldown_without_prior_healthy_cache(self):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__lftp.status.return_value = [status]
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during cooldown without cache")
+        self.controller._Controller__update_model()
+
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            [[status], [status]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with({"a"})
+        self.assertEqual(
+            [["a"], ["a"]],
+            [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
+        )
+
+    def test_update_model_drops_stale_lftp_statuses_after_unhealthy_poll_returns_data_and_cache_expires(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+
+        self.controller._Controller__lftp.status.return_value = [status_a]
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__lftp.status.return_value = [status_b]
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() - timedelta(seconds=1)
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll once cache expires during cooldown")
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            [[status_a], [status_a], []],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_with(set())
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call([])
+
+    def test_update_model_uses_cached_lftp_statuses_during_unhealthy_retry_window(self):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__lftp.status.side_effect = [
+            [status],
+            LftpError("bad status"),
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during retry window")
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__lftp.status.call_count)
+        self.assertIsNotNone(self.controller._Controller__next_lftp_status_poll_at)
+        self.assertEqual(
+            [[status], [status], [status]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+
+    def test_update_model_drops_stale_lftp_statuses_after_cache_age_expires(self):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__lftp.status.side_effect = [
+            [status],
+            LftpError("bad status"),
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() - timedelta(seconds=1)
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll once cache expires during cooldown")
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            [[status], [status], []],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_with(set())
+        self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call([])
+
+    def test_update_model_resumes_lftp_status_polling_after_retry_window_expires(self):
+        status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
+        self.controller._Controller__lftp.status.side_effect = [
+            [status_a],
+            LftpError("bad status"),
+            [status_b],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        self.controller._Controller__update_model()
+
+        self.assertEqual(3, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            [[status_a], [status_a], [status_b]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
 
     def test_update_model_sets_remote_scan_failure_status_from_partial_result(self):
         partial_file = ModelFile("partial", False)
