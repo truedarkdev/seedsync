@@ -2129,19 +2129,24 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_lftp_statuses([downloading_status])
 
         model = self.model_builder.build_model()
+        self.assertTrue(model.get_file("downloading").is_stoppable)
+
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
+        downloading_local = SystemFile("downloading", 10, False)
+        self.model_builder.set_local_files([downloading_local])
+
+        model = self.model_builder.build_model()
         self.assertFalse(model.get_file("downloading").is_stoppable)
 
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("downloading", 100, False)])
         downloading_local = SystemFile("downloading", 10, False)
-        downloading_local.status_sidecar_ready = True
+        downloading_local.status_sidecar_ready = False
         self.model_builder.set_local_files([downloading_local])
-        downloading_status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "downloading", "")
-        downloading_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
-        self.model_builder.set_lftp_statuses([downloading_status])
 
         model = self.model_builder.build_model()
-        self.assertTrue(model.get_file("downloading").is_stoppable)
+        self.assertFalse(model.get_file("downloading").is_stoppable)
 
     def test_build_eta(self):
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
