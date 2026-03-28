@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 import logging
 import sys
 import shutil
@@ -124,15 +124,16 @@ class TestWebApp(BaseTestWebApp):
     def test_stream_yield_sleep_is_shorter_than_idle_poll_sleep(self, mock_sleep):
         class SingleEventHandler(IStreamHandler):
             def __init__(self):
-                self._value = "event\n"
+                self._values = ["event1\n", "event2\n"]
 
             def setup(self):
                 pass
 
             def get_value(self):
-                value = self._value
-                self._value = None
-                return value
+                if not self._values:
+                    return None
+
+                return self._values.pop(0)
 
             def cleanup(self):
                 pass
@@ -141,9 +142,11 @@ class TestWebApp(BaseTestWebApp):
         web_app.add_streaming_handler(SingleEventHandler)
 
         stream = web_app._WebApp__web_stream()
+        expected_sleep = WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000
 
-        self.assertEqual("event\n", next(stream))
-        self.assertEqual(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000, mock_sleep.call_args_list[0][0][0])
+        self.assertEqual("event1\n", next(stream))
+        self.assertEqual("event2\n", next(stream))
 
         web_app.stop()
         next(stream, None)
+        self.assertEqual([call(expected_sleep), call(expected_sleep)], mock_sleep.call_args_list)
