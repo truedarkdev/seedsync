@@ -12,6 +12,7 @@ import re
 
 from .extract import Extract, ExtractError
 from common.managed_extract import (
+    build_managed_extract_folder_name,
     build_managed_extract_folder_path,
     write_managed_extract_marker,
 )
@@ -222,10 +223,13 @@ class ExtractDispatch:
                         self.logger.debug("Extracting {}".format(archive_path))
                         resolved_out_dir_path = out_dir_path
                         if self.__managed_extract_folders_enabled:
-                            resolved_out_dir_path = build_managed_extract_folder_path(
-                                out_dir_path,
-                                archive_name
-                            )
+                            managed_extract_folder_name = build_managed_extract_folder_name(archive_name)
+                            out_dir_name = os.path.basename(os.path.normpath(out_dir_path))
+                            if out_dir_name.casefold() != managed_extract_folder_name.casefold():
+                                resolved_out_dir_path = build_managed_extract_folder_path(
+                                    out_dir_path,
+                                    archive_name
+                                )
                         Extract.extract_archive(
                             archive_path=archive_path,
                             out_dir_path=resolved_out_dir_path
