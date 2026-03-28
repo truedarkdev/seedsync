@@ -5,7 +5,8 @@ import tempfile
 import unittest
 
 from model import ModelFile
-from controller.scan import LocalScanner
+from controller.scan import LocalScanner, ScannerError
+from common import Localization
 
 
 class TestLocalScanner(unittest.TestCase):
@@ -139,6 +140,28 @@ class TestLocalScanner(unittest.TestCase):
         )
         self.assertFalse(files["series"].children[0].is_staging)
         self.assertTrue(files["series"].children[1].is_staging)
+
+    def test_scan_rejects_non_absolute_local_path(self):
+        scanner = LocalScanner(
+            local_path="relative/path",
+            use_temp_file=False
+        )
+
+        with self.assertRaises(ScannerError) as error:
+            scanner.scan()
+
+        self.assertEqual(Localization.Error.LOCAL_SERVER_SCAN, str(error.exception))
+
+    def test_scan_rejects_non_string_local_path(self):
+        scanner = LocalScanner(
+            local_path=None,
+            use_temp_file=False
+        )
+
+        with self.assertRaises(ScannerError) as error:
+            scanner.scan()
+
+        self.assertEqual(Localization.Error.LOCAL_SERVER_SCAN, str(error.exception))
 
     def test_scan_suppresses_managed_extract_folder_and_recovers_marker_identity(self):
         managed_dir = os.path.join(self.temp_dir, "movie")

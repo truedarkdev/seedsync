@@ -31,7 +31,8 @@ class LocalScanner(IScanner):
         if use_temp_file:
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__staging_scanner = None
-        if staging_path and self.__normalize_path(staging_path) != self.__normalize_path(local_path):
+        if self.__is_valid_scan_path(local_path) and self.__is_valid_scan_path(staging_path) and \
+                self.__normalize_path(staging_path) != self.__normalize_path(local_path):
             self.__staging_scanner = SystemScanner(staging_path)
             if use_temp_file:
                 self.__staging_scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
@@ -56,6 +57,8 @@ class LocalScanner(IScanner):
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         self.__managed_extract_file_ids = set()
+        if not self.__is_valid_scan_path(self.__local_path):
+            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
         try:
             result = self.__scanner.scan()
         except SystemScannerError:
@@ -101,6 +104,10 @@ class LocalScanner(IScanner):
     @staticmethod
     def __normalize_path(path: str) -> str:
         return os.path.normcase(os.path.abspath(path))
+
+    @staticmethod
+    def __is_valid_scan_path(path) -> bool:
+        return isinstance(path, str) and path.strip() and os.path.isabs(path)
 
     def __get_nested_staging_name(self) -> Optional[str]:
         if not self.__staging_path:
