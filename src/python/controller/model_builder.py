@@ -1448,23 +1448,34 @@ class ModelBuilder:
                     # keep previously-downloaded local-only files recognizable
                     model_file.state = ModelFile.State.DOWNLOADED
                 elif model_file.is_dir and model_file.remote_size is not None:
-                    # root is a directory that also exists remotely
-                    # check all the children
-                    all_downloaded = True
-                    has_downloadable_children = False
-                    frontier = []
-                    frontier += model_file.get_children()
-                    while frontier:
-                        _child_file = frontier.pop(0)
-                        if not _child_file.is_dir and \
-                                _child_file.remote_size is not None:
-                            has_downloadable_children = True
-                            if _child_file.state != ModelFile.State.DOWNLOADED:
-                                all_downloaded = False
-                                break
-                        frontier += _child_file.get_children()
-                    if has_downloadable_children and all_downloaded:
+                    if status is None and \
+                            not is_stopped and \
+                            local is not None and \
+                            getattr(local, "is_staging", False) and \
+                            local.size is not None and \
+                            local.size >= model_file.remote_size:
+                        # A fully staged directory copy should be treated as complete even
+                        # if live transfer state has already disappeared.
                         model_file.state = ModelFile.State.DOWNLOADED
+                        arbitration_source = "staging_completion_without_live_status"
+                    else:
+                        # root is a directory that also exists remotely
+                        # check all the children
+                        all_downloaded = True
+                        has_downloadable_children = False
+                        frontier = []
+                        frontier += model_file.get_children()
+                        while frontier:
+                            _child_file = frontier.pop(0)
+                            if not _child_file.is_dir and \
+                                    _child_file.remote_size is not None:
+                                has_downloadable_children = True
+                                if _child_file.state != ModelFile.State.DOWNLOADED:
+                                    all_downloaded = False
+                                    break
+                            frontier += _child_file.get_children()
+                        if has_downloadable_children and all_downloaded:
+                            model_file.state = ModelFile.State.DOWNLOADED
 
             # next we determine if root was Deleted
             # root is Deleted if it does not exist locally, but was downloaded in the past

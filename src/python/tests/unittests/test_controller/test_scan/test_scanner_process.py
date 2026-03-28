@@ -225,6 +225,19 @@ class TestScannerProcess(unittest.TestCase):
         mock_scanner.pop_malformed_status_only_file_ids.assert_called_once()
         mock_scanner.pop_managed_extract_file_ids.assert_called_once()
 
+    def test_pop_latest_result_returns_last_drained_result_when_queue_get_fails(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False)
+        process.logger = MagicMock()
+        first_result = object()
+        process._ScannerProcess__queue = MagicMock()
+        process._ScannerProcess__queue.get.side_effect = [first_result, OSError("queue broken")]
+
+        latest_result = process.pop_latest_result()
+
+        self.assertIs(latest_result, first_result)
+        process.logger.warning.assert_called_once()
+        self.assertIn("Scanner queue read failed", process.logger.warning.call_args[0][0])
+
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()
         mock_scanner.scan = MagicMock()

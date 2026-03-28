@@ -2983,6 +2983,15 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(None, model.get_file("a").transferred_size)
 
+    def test_build_staging_directory_without_live_status_is_marked_downloaded(self):
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("a", 42, True)])
+        self.model_builder.set_local_files([SystemFile("a", 42, True, is_staging=True)])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
+
     def test_build_local_created_timestamp(self):
         self.model_builder.set_local_files([
             SystemFile("a", 42, False, time_created=datetime(2018, 11, 9, 21, 40, 18)),
