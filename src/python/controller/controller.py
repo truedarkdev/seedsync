@@ -98,6 +98,14 @@ class Controller:
             self.post_callback = post_callback
             self.await_completion = await_completion
 
+    @staticmethod
+    def __lftp_status_refresh_timing(interval_ms_downloading_scan: int):
+        # Keep the retry window close to the downloading scan cadence so a
+        # brief lftp hiccup does not pin a finished transfer in a stale state.
+        lftp_status_poll_retry_seconds = max(1, int(interval_ms_downloading_scan / 1000))
+        lftp_status_cache_max_age_seconds = max(3, lftp_status_poll_retry_seconds * 3)
+        return lftp_status_poll_retry_seconds, lftp_status_cache_max_age_seconds
+
     def __init__(self,
                  context: Context,
                  persist: ControllerPersist):
@@ -111,6 +119,10 @@ class Controller:
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
         self.__target_archive_trace_last_signature = None
+        self.__temp_diag_file_id = os.environ.get("SEEDSYNC_TEMP_DIAG_FILE_ID")
+        if self.__temp_diag_file_id is not None and not self.__temp_diag_file_id.strip():
+            self.__temp_diag_file_id = None
+        self.__temp_diag_last_signature = None
 
         # Decide the password here
         self.__password = context.config.lftp.remote_password if not context.config.lftp.use_ssh_key else None
@@ -279,9 +291,11 @@ class Controller:
         self.__pending_auto_purge_file_ids = set()
         self.__last_lftp_statuses = []
         self.__next_lftp_status_poll_at = None
-        self.__lftp_status_poll_retry_seconds = max(5, int(self.__context.config.controller.interval_ms_downloading_scan / 1000))
+        (
+            self.__lftp_status_poll_retry_seconds,
+            self.__lftp_status_cache_max_age_seconds
+        ) = Controller.__lftp_status_refresh_timing(self.__context.config.controller.interval_ms_downloading_scan)
         self.__lftp_status_cache_expires_at = None
-        self.__lftp_status_cache_max_age_seconds = max(15, self.__lftp_status_poll_retry_seconds * 3)
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -325,7 +339,10 @@ class Controller:
     def exit(self):
         self.logger.debug("Exiting controller")
         if self.__started:
-            self.__lftp.exit()
+            try:
+                self.__lftp.exit()
+            except LftpError as exc:
+                self.logger.warning("Ignoring lftp teardown failure: {}".format(exc))
             self.__active_scan_process.terminate()
             self.__local_scan_process.terminate()
             self.__remote_scan_process.terminate()
@@ -570,6 +587,20 @@ class Controller:
             return
         self.__target_archive_trace_last_signature = signature
         self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
+
+    def __temp_diag(self, stage: str, file_id: str = None, **payload):
+        if self.__temp_diag_file_id is None:
+            return
+        if file_id is not None and file_id != self.__temp_diag_file_id:
+            return
+        payload["stage"] = stage
+        if file_id is not None:
+            payload["file_id"] = file_id
+        signature = json.dumps(payload, sort_keys=True, default=str)
+        if signature == self.__temp_diag_last_signature:
+            return
+        self.__temp_diag_last_signature = signature
+        print("TEMP_DIAG {}".format(signature), flush=True)
 
     def __is_model_file_name_unambiguous(self, file_name: str) -> bool:
         try:
@@ -833,11 +864,11 @@ class Controller:
         if not hasattr(self, "_Controller__next_lftp_status_poll_at"):
             self.__next_lftp_status_poll_at = None
         if not hasattr(self, "_Controller__lftp_status_poll_retry_seconds"):
-            self.__lftp_status_poll_retry_seconds = 5
+            self.__lftp_status_poll_retry_seconds = 1
         if not hasattr(self, "_Controller__lftp_status_cache_expires_at"):
             self.__lftp_status_cache_expires_at = None
         if not hasattr(self, "_Controller__lftp_status_cache_max_age_seconds"):
-            self.__lftp_status_cache_max_age_seconds = max(15, self.__lftp_status_poll_retry_seconds * 3)
+            self.__lftp_status_cache_max_age_seconds = max(3, self.__lftp_status_poll_retry_seconds * 3)
 
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
@@ -848,17 +879,17 @@ class Controller:
         lftp_statuses = []
         lftp_status_poll_healthy = True
         lftp_status_snapshot_fresh = True
+        lftp_status_source = "fresh_healthy"
         now = datetime.now()
-        cache_expired = self.__lftp_status_cache_expires_at is not None and now >= self.__lftp_status_cache_expires_at
-        if cache_expired:
-            self.__last_lftp_statuses = []
-            self.__lftp_status_cache_expires_at = None
-        if self.__next_lftp_status_poll_at is not None and now < self.__next_lftp_status_poll_at:
+        lftp_status_poll_due = self.__next_lftp_status_poll_at is None or now >= self.__next_lftp_status_poll_at
+        if not lftp_status_poll_due:
             if self.__last_lftp_statuses:
                 lftp_statuses = self.__last_lftp_statuses
                 lftp_status_snapshot_fresh = False
+                lftp_status_source = "cached_retry"
             else:
                 lftp_status_poll_healthy = False
+                lftp_status_source = "retry_empty"
         else:
             try:
                 lftp_statuses = self.__lftp.status()
@@ -870,22 +901,23 @@ class Controller:
                         seconds=self.__lftp_status_cache_max_age_seconds
                     )
                     self.__next_lftp_status_poll_at = None
+                    lftp_status_source = "fresh_healthy"
                 else:
                     self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
                         seconds=self.__lftp_status_poll_retry_seconds
                     )
-                    if self.__lftp_status_cache_expires_at is not None and poll_finished_at >= self.__lftp_status_cache_expires_at:
-                        self.__last_lftp_statuses = []
-                        self.__lftp_status_cache_expires_at = None
-                        lftp_statuses = []
-                    elif self.__last_lftp_statuses:
+                    if self.__last_lftp_statuses:
                         lftp_statuses = self.__last_lftp_statuses
                         lftp_status_snapshot_fresh = False
+                        lftp_status_source = "cached_unhealthy"
                     elif lftp_statuses:
                         self.__last_lftp_statuses = lftp_statuses
                         self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
                             seconds=self.__lftp_status_cache_max_age_seconds
                         )
+                        lftp_status_source = "fresh_unhealthy"
+                    else:
+                        lftp_status_source = "unhealthy_empty"
             except (LftpError, LftpJobStatusParserError) as e:
                 self.logger.warning("Caught lftp error: {}".format(str(e)))
                 lftp_statuses = []
@@ -894,12 +926,12 @@ class Controller:
                 self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
                     seconds=self.__lftp_status_poll_retry_seconds
                 )
-                if self.__lftp_status_cache_expires_at is not None and poll_finished_at >= self.__lftp_status_cache_expires_at:
-                    self.__last_lftp_statuses = []
-                    self.__lftp_status_cache_expires_at = None
-                elif self.__last_lftp_statuses:
+                if self.__last_lftp_statuses:
                     lftp_statuses = self.__last_lftp_statuses
                     lftp_status_snapshot_fresh = False
+                    lftp_status_source = "cached_error"
+                else:
+                    lftp_status_source = "error_empty"
 
         # Grab the latest extract results
         latest_extract_statuses = self.__extract_process.pop_latest_statuses()
@@ -927,6 +959,18 @@ class Controller:
                 (s.name, None, None)
                 for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
             ]
+        self.__temp_diag(
+            "update_model",
+            lftp_status_source=lftp_status_source,
+            lftp_status_poll_healthy=lftp_status_poll_healthy,
+            lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
+            lftp_status_count=len(lftp_statuses) if lftp_statuses is not None else None,
+            active_downloading_count=len(self.__active_downloading_file_names),
+            active_extracting_count=len(self.__active_extracting_file_names),
+            last_lftp_status_count=len(self.__last_lftp_statuses),
+            next_lftp_status_poll_at=self.__next_lftp_status_poll_at,
+            lftp_status_cache_expires_at=self.__lftp_status_cache_expires_at,
+        )
 
         # Update the active scanner's state
         self.__set_active_scanner_files(
@@ -1128,6 +1172,16 @@ class Controller:
             except ModelError:
                 _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                 continue
+            self.__temp_diag(
+                "command_received",
+                file_id=file.file_id,
+                file_name=file.name,
+                command=getattr(command.action, "name", str(command.action)),
+                state=getattr(file.state, "name", file.state),
+                local_size=file.local_size,
+                remote_size=file.remote_size,
+                is_dir=file.is_dir,
+            )
 
             if command.action == Controller.Command.Action.QUEUE:
                 if file.remote_size is None:
@@ -1216,6 +1270,14 @@ class Controller:
                     continue
 
             elif command.action == Controller.Command.Action.EXTRACT:
+                self.__temp_diag(
+                    "extract_command_evaluating",
+                    file_id=file.file_id,
+                    file_name=file.name,
+                    state=getattr(file.state, "name", file.state),
+                    local_size=file.local_size,
+                    remote_size=file.remote_size,
+                )
                 # Note: We don't check the is_extractable flag because it's just a guess
                 should_trace_target = self.__target_archive_trace_selector_matches_file(file.file_id, file.name)
                 if file.state not in (
@@ -1223,6 +1285,13 @@ class Controller:
                         ModelFile.State.DOWNLOADED,
                         ModelFile.State.EXTRACTED
                 ):
+                    self.__temp_diag(
+                        "extract_command_blocked",
+                        file_id=file.file_id,
+                        file_name=file.name,
+                        state=getattr(file.state, "name", file.state),
+                        reason="state_not_allowed",
+                    )
                     if should_trace_target:
                         self.__trace_target_archive_event("extract_command_blocked", {
                             "file": self.__summarize_target_archive_file(file),
@@ -1237,6 +1306,13 @@ class Controller:
                     )
                     continue
                 elif file.local_size is None:
+                    self.__temp_diag(
+                        "extract_command_blocked",
+                        file_id=file.file_id,
+                        file_name=file.name,
+                        state=getattr(file.state, "name", file.state),
+                        reason="missing_local_file",
+                    )
                     if should_trace_target:
                         self.__trace_target_archive_event("extract_command_blocked", {
                             "file": self.__summarize_target_archive_file(file),
@@ -1245,11 +1321,23 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
                     continue
                 else:
+                    self.__temp_diag(
+                        "extract_command_queued",
+                        file_id=file.file_id,
+                        file_name=file.name,
+                        state=getattr(file.state, "name", file.state),
+                    )
                     if should_trace_target:
                         self.__trace_target_archive_event("extract_command_queued", {
                             "file": self.__summarize_target_archive_file(file),
                         })
                     self.__extract_process.extract(file)
+                    self.__temp_diag(
+                        "extract_command_dispatched",
+                        file_id=file.file_id,
+                        file_name=file.name,
+                        state=getattr(file.state, "name", file.state),
+                    )
 
             elif command.action == Controller.Command.Action.VALIDATE:
                 if file.state not in (
@@ -1402,6 +1490,7 @@ class Controller:
         Cleanup the list of active commands and do any callbacks
         :return:
         """
+        self.__temp_diag("cleanup_commands", active_command_count=len(self.__active_command_processes))
         still_active_processes = []
         for command_process in self.__active_command_processes:
             if command_process.process.is_alive():

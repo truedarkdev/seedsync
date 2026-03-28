@@ -46,14 +46,16 @@ class TestController(unittest.TestCase):
         self.controller._Controller__target_archive_trace_logger = MagicMock()
         self.controller._Controller__target_archive_trace_file_id = None
         self.controller._Controller__target_archive_trace_last_signature = None
+        self.controller._Controller__temp_diag_file_id = None
+        self.controller._Controller__temp_diag_last_signature = None
         self.controller._Controller__staging_path = "/local/incomplete"
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
         self.controller._Controller__last_lftp_statuses = []
         self.controller._Controller__next_lftp_status_poll_at = None
-        self.controller._Controller__lftp_status_poll_retry_seconds = 5
+        self.controller._Controller__lftp_status_poll_retry_seconds = 1
         self.controller._Controller__lftp_status_cache_expires_at = None
-        self.controller._Controller__lftp_status_cache_max_age_seconds = 15
+        self.controller._Controller__lftp_status_cache_max_age_seconds = 3
         self.controller._Controller__startup_recovery_done = False
         self.controller._Controller__memory_monitor = MagicMock()
 
@@ -115,7 +117,38 @@ class TestController(unittest.TestCase):
             [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
         )
 
-    def test_update_model_drops_stale_lftp_statuses_after_unhealthy_poll_returns_data_and_cache_expires(self):
+    def test_update_model_skips_status_poll_during_retry_window_without_cache(self):
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during retry window without cache")
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(0, self.controller._Controller__lftp.status.call_count)
+        self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+
+    def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.exit.side_effect = LftpError("teardown failed")
+
+        self.controller.exit()
+
+        self.controller.logger.warning.assert_called_once()
+        self.controller._Controller__active_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__extract_process.terminate.assert_called_once_with()
+        self.controller._Controller__validate_process.terminate.assert_called_once_with()
+        self.controller._Controller__active_scan_process.join.assert_called_once_with()
+        self.controller._Controller__local_scan_process.join.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.join.assert_called_once_with()
+        self.controller._Controller__extract_process.join.assert_called_once_with()
+        self.controller._Controller__validate_process.join.assert_called_once_with()
+        self.controller._Controller__mp_logger.stop.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__started)
+
+    def test_update_model_preserves_stale_lftp_statuses_after_unhealthy_poll_returns_data_and_cache_expires(self):
         status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
 
@@ -133,12 +166,12 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(2, self.controller._Controller__lftp.status.call_count)
         self.assertEqual(
-            [[status_a], [status_a], []],
+            [[status_a], [status_a], [status_a]],
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
         )
-        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_with(set())
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
-        self.controller._Controller__active_scanner.set_active_files.assert_any_call([])
+        self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
 
     def test_update_model_uses_cached_lftp_statuses_during_unhealthy_retry_window(self):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -161,7 +194,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
 
-    def test_update_model_drops_stale_lftp_statuses_after_cache_age_expires(self):
+    def test_update_model_preserves_stale_lftp_statuses_after_cache_age_expires_during_unhealthy_poll(self):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         self.controller._Controller__lftp.status.side_effect = [
             [status],
@@ -177,13 +210,12 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(2, self.controller._Controller__lftp.status.call_count)
         self.assertEqual(
-            [[status], [status], []],
+            [[status], [status], [status]],
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
         )
-        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_with(set())
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
         self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
-        self.controller._Controller__active_scanner.set_active_files.assert_any_call([])
 
     def test_update_model_resumes_lftp_status_polling_after_retry_window_expires(self):
         status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -206,6 +238,22 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
+
+    def test_lftp_status_refresh_timing_tracks_downloading_scan_interval(self):
+        self.assertEqual((1, 3), Controller._Controller__lftp_status_refresh_timing(100))
+        self.assertEqual((1, 3), Controller._Controller__lftp_status_refresh_timing(1000))
+
+    def test_temp_diag_dedupes_repeated_payloads(self):
+        self.controller._Controller__temp_diag_file_id = "rf"
+        self.controller._Controller__temp_diag_last_signature = None
+
+        with patch("builtins.print") as print_mock:
+            self.controller._Controller__temp_diag("update_model", lftp_status_source="cached_error")
+            self.controller._Controller__temp_diag("update_model", lftp_status_source="cached_error")
+            self.controller._Controller__temp_diag("update_model", lftp_status_source="fresh_healthy")
+
+        self.assertEqual(2, print_mock.call_count)
+        self.assertTrue(print_mock.call_args_list[0].args[0].startswith("TEMP_DIAG "))
 
     def test_update_model_sets_remote_scan_failure_status_from_partial_result(self):
         partial_file = ModelFile("partial", False)

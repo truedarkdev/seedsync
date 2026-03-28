@@ -169,60 +169,127 @@ class Lftp:
         ]
         return "\n".join(lines).strip()
 
-    @with_check_process
-    def __run_command(self, command: str):
-        self.__last_command_timed_out = False
-        if self.__log_command_output:
-            self.logger.debug("command: {}".format(command.encode('utf8', 'surrogateescape')))
-        self.__process.sendline(command)
+    def __ensure_prompt_ready(self, context: str):
         try:
-            self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
+            self.__process.expect(self.__expect_pattern, timeout=1)
         except pexpect.exceptions.TIMEOUT:
-            self.__last_command_timed_out = True
             out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
-            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
-                self.logger.warning("Lftp timeout exception")
-            pass
+            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, context):
+                self.__process.sendline()
+                try:
+                    self.__process.expect(self.__expect_pattern, timeout=3)
+                except pexpect.exceptions.TIMEOUT:
+                    retry_out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                    if not self.__raise_lftp_error_for_ssh_host_key_prompt(retry_out, context):
+                        self.logger.warning("Lftp timeout exception")
+                        raise LftpError("Lftp process is not ready for {}: {}".format(context, retry_out))
+                except pexpect.exceptions.EOF:
+                    retry_out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                    self.logger.error("Lftp process died unexpectedly (EOF) before {}".format(context))
+                    raise LftpError("Lftp process terminated before {}: {}".format(context, retry_out))
         except pexpect.exceptions.EOF:
-            self.logger.error("Lftp process died unexpectedly (EOF)")
-            raise LftpError("Lftp process terminated: {}".format(
-                self.__normalize_output(self.__process.before.decode("utf8", "replace"))
-            ))
-        finally:
-            out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
+            out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+            self.logger.error("Lftp process died unexpectedly (EOF) before {}".format(context))
+            raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
-            if self.__log_command_output:
-                self.logger.debug("out ({} bytes):\n {}".format(len(out), out))
-                after = self.__process.after.decode('utf8', 'replace').strip() \
-                    if self.__process.after not in (pexpect.TIMEOUT, None) else ""
-                self.logger.debug("after: {}".format(after))
-
-        # let's try and detect some errors
-        if self.__detect_errors_from_output(out):
-            # we need to consume the actual output so that
-            # it doesn't get passed onto next command
-            error_out = out
+    @with_check_process
+    def __run_command(self, command: str, timeout_seconds: Optional[int] = None, require_prompt_ready: bool = True, status_poll: bool = False):
+        self.__last_command_timed_out = False
+        restore_delaybeforesend = None
+        out = ""
+        log_command_output = self.__log_command_output and not status_poll
+        if status_poll:
+            restore_delaybeforesend = getattr(self.__process, "delaybeforesend", None)
+            self.__process.delaybeforesend = 0
+        try:
+            if require_prompt_ready:
+                self.__ensure_prompt_ready("running command")
+            if log_command_output:
+                self.logger.debug("command: {}".format(command.encode('utf8', 'surrogateescape')))
             try:
-                self.__process.expect(self.__expect_pattern, timeout=self.__timeout)
+                if status_poll:
+                    self.__process.send(command + "\n")
+                else:
+                    self.__process.sendline(command)
             except pexpect.exceptions.TIMEOUT:
+                if status_poll:
+                    self.__last_command_timed_out = True
+                    self.logger.warning("Lftp timeout exception")
+                    return ""
+                raise
+            except pexpect.exceptions.EOF:
+                if status_poll:
+                    self.__last_command_timed_out = True
+                    self.logger.error("Lftp process died unexpectedly (EOF) while sending status command")
+                    return ""
+                raise
+            timeout_seconds = self.__timeout if timeout_seconds is None else timeout_seconds
+            try:
+                self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
+            except pexpect.exceptions.TIMEOUT:
+                self.__last_command_timed_out = True
                 out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
-                if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "recovering from error"):
+                if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
                     self.logger.warning("Lftp timeout exception")
                 pass
             except pexpect.exceptions.EOF:
-                self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
-                raise LftpError("Lftp process terminated during error recovery")
+                self.logger.error("Lftp process died unexpectedly (EOF)")
+                raise LftpError("Lftp process terminated: {}".format(
+                    self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                ))
+            except pexpect.exceptions.ExceptionPexpect as exc:
+                if status_poll:
+                    self.__last_command_timed_out = True
+                    self.logger.warning("Ignoring status poll failure: {}".format(exc))
+                    return ""
+                raise
+            except OSError as exc:
+                if status_poll:
+                    self.__last_command_timed_out = True
+                    self.logger.warning("Ignoring status poll failure: {}".format(exc))
+                    return ""
+                raise
             finally:
                 out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
-                if self.__log_command_output:
-                    self.logger.debug("retry out ({} bytes):\n {}".format(len(out), out))
+
+                if log_command_output:
+                    if status_poll:
+                        self.logger.debug("status out ({} bytes, bounded)".format(len(out)))
+                    else:
+                        self.logger.debug("out ({} bytes):\n {}".format(len(out), out))
                     after = self.__process.after.decode('utf8', 'replace').strip() \
                         if self.__process.after not in (pexpect.TIMEOUT, None) else ""
-                    self.logger.debug("retry after: {}".format(after))
-                self.logger.error("Lftp detected error: {}".format(error_out))
-                # save pending error
-                self.__pending_error = error_out
-        return out
+                    self.logger.debug("after: {}".format(after))
+
+            # let's try and detect some errors
+            if self.__detect_errors_from_output(out):
+                # we need to consume the actual output so that
+                # it doesn't get passed onto next command
+                error_out = out
+                try:
+                    self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
+                except pexpect.exceptions.TIMEOUT:
+                    out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                    if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "recovering from error"):
+                        self.logger.warning("Lftp timeout exception")
+                    pass
+                except pexpect.exceptions.EOF:
+                    self.logger.error("Lftp process died unexpectedly (EOF) during error recovery")
+                    raise LftpError("Lftp process terminated during error recovery")
+                finally:
+                    out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
+                    if log_command_output:
+                        self.logger.debug("retry out ({} bytes):\n {}".format(len(out), out))
+                        after = self.__process.after.decode('utf8', 'replace').strip() \
+                            if self.__process.after not in (pexpect.TIMEOUT, None) else ""
+                        self.logger.debug("retry after: {}".format(after))
+                    self.logger.error("Lftp detected error: {}".format(error_out))
+                    # save pending error
+                    self.__pending_error = error_out
+            return out
+        finally:
+            if status_poll and restore_delaybeforesend is not None:
+                self.__process.delaybeforesend = restore_delaybeforesend
 
     @staticmethod
     def __detect_errors_from_output(out: str) -> bool:
@@ -244,7 +311,7 @@ class Lftp:
         :param value:
         :return:
         """
-        self.__run_command("set {} {}".format(setting, value))
+        self.__run_command("set {} {}".format(setting, value), require_prompt_ready=False)
 
     def __get(self, setting: str) -> str:
         """
@@ -383,7 +450,26 @@ class Lftp:
         Return a status list of queued and running jobs
         :return:
         """
-        out = self.__run_command("jobs -v")
+        try:
+            out = self.__run_command("jobs -v", timeout_seconds=1, require_prompt_ready=False, status_poll=True)
+        except pexpect.exceptions.TIMEOUT:
+            self.__consecutive_status_errors = 0
+            self.__last_command_timed_out = True
+            self.__last_status_poll_healthy = False
+            self.logger.warning("Lftp timeout exception")
+            return []
+        except pexpect.exceptions.EOF:
+            self.__consecutive_status_errors = 0
+            self.__last_command_timed_out = True
+            self.__last_status_poll_healthy = False
+            self.logger.error("Lftp process died unexpectedly (EOF) during status poll")
+            return []
+        except LftpError as exc:
+            self.__consecutive_status_errors = 0
+            self.__last_command_timed_out = True
+            self.__last_status_poll_healthy = False
+            self.logger.warning("Ignoring status poll failure: {}".format(exc))
+            return []
         timed_out = self.__last_command_timed_out
         try:
             statuses = self.__job_status_parser.parse(out)
@@ -543,8 +629,8 @@ class Lftp:
         :return:
         """
         # empty the queue and kill running jobs
-        self.__run_command("queue -d *")
-        self.__run_command("kill all")
+        self.__run_command("queue -d *", require_prompt_ready=False)
+        self.__run_command("kill all", require_prompt_ready=False)
 
     def exit(self):
         """

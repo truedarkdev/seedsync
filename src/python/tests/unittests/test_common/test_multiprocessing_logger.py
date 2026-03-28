@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import io
 import unittest
 import logging
 import sys
@@ -8,6 +9,7 @@ import multiprocessing
 
 from testfixtures import LogCapture
 import pytest
+from unittest.mock import MagicMock
 
 from common import MultiprocessingLogger
 
@@ -78,6 +80,34 @@ class TestMultiprocessingLogger(unittest.TestCase):
                 ("process_1.child_1", "DEBUG", "Debug line"),
                 ("process_1.child_1_1", "DEBUG", "Debug line"),
             )
+
+    def test_closed_stream_handlers_are_pruned_without_breaking_logging(self):
+        closed_stream = io.StringIO()
+        closed_handler = logging.StreamHandler(closed_stream)
+        closed_handler.handleError = MagicMock()
+        self.logger.addHandler(closed_handler)
+        closed_stream.close()
+
+        mp_logger = MultiprocessingLogger(self.logger)
+        p_1 = multiprocessing.Process(target=_process_1,
+                                      args=(mp_logger,))
+
+        with LogCapture("TestMultiprocessingLogger.MPLogger.process_1") as log_capture:
+            mp_logger.start()
+            p_1.start()
+            time.sleep(1)
+            p_1.join()
+            mp_logger.stop()
+
+            log_capture.check(
+                ("process_1", "DEBUG", "Debug line"),
+                ("process_1", "INFO", "Info line"),
+                ("process_1", "WARNING", "Warning line"),
+                ("process_1", "ERROR", "Error line")
+            )
+
+        self.assertNotIn(closed_handler, self.logger.handlers)
+        closed_handler.handleError.assert_not_called()
 
     def test_logger_levels(self):
         def _wait_for_records(log_capture, expected_count):

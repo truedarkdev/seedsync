@@ -149,11 +149,14 @@ class ScannerProcess(AppProcess):
         :return:
         """
         latest_scan = None
-        try:
-            while True:
+        while True:
+            try:
                 latest_scan = self.__queue.get(block=False)
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break
+            except (OSError, EOFError) as exc:
+                self.logger.warning("Scanner queue read failed: {}".format(exc))
+                return latest_scan
         return latest_scan
 
     def force_scan(self):

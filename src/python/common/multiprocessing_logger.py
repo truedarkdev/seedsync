@@ -65,6 +65,18 @@ class MultiprocessingLogger:
             self.__listener_exc_info = None
             raise exc_info[1].with_traceback(exc_info[2])
 
+    @staticmethod
+    def __remove_closed_stream_handlers(logger: logging.Logger):
+        current_logger = logger
+
+        while current_logger:
+            for handler in current_logger.handlers[:]:
+                stream = getattr(handler, "stream", None)
+                if stream is not None and getattr(stream, "closed", False):
+                    current_logger.removeHandler(handler)
+
+            current_logger = current_logger.parent
+
     def get_process_safe_logger(self) -> logging.Logger:
         """
         Returns a process-safe logger
@@ -86,6 +98,7 @@ class MultiprocessingLogger:
         return root_logger
 
     def __listener(self):
+        self.__remove_closed_stream_handlers(self.logger)
         self.logger.debug("Started listener thread")
 
         while not self.__listener_shutdown.is_set():
@@ -94,7 +107,9 @@ class MultiprocessingLogger:
                 while True:
                     try:
                         record = self.__queue.get(block=False)
-                        self.logger.getChild(record.name).handle(record)
+                        record_logger = self.logger.getChild(record.name)
+                        self.__remove_closed_stream_handlers(record_logger)
+                        record_logger.handle(record)
                     except queue.Empty:
                         break
             except Exception:
@@ -106,4 +121,5 @@ class MultiprocessingLogger:
 
             time.sleep(MultiprocessingLogger.__LISTENER_SLEEP_INTERVAL_IN_SECS)
 
+        self.__remove_closed_stream_handlers(self.logger)
         self.logger.debug("Stopped listener thread")
