@@ -93,7 +93,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status])
-        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with({"a"})
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
 
     def test_update_model_uses_unhealthy_returned_statuses_during_cooldown_without_prior_healthy_cache(self):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -111,7 +111,7 @@ class TestController(unittest.TestCase):
             [[status], [status]],
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
         )
-        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with({"a"})
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
         self.assertEqual(
             [["a"], ["a"]],
             [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
@@ -127,6 +127,26 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
         self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+
+    def test_update_model_skips_status_poll_during_healthy_cooldown_with_cache(self):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__lftp.status.return_value = [status]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during healthy cooldown")
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            [[status], [status]],
+            [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
+        )
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
+        self.assertEqual(
+            [["a"], ["a"]],
+            [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
+        )
 
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True
@@ -177,10 +197,11 @@ class TestController(unittest.TestCase):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         self.controller._Controller__lftp.status.side_effect = [
             [status],
-            LftpError("bad status"),
         ]
 
         self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        self.controller._Controller__lftp.status.side_effect = LftpError("bad status")
         self.controller._Controller__update_model()
         self.controller._Controller__lftp.status.side_effect = AssertionError("should not poll during retry window")
         self.controller._Controller__update_model()
@@ -202,6 +223,7 @@ class TestController(unittest.TestCase):
         ]
 
         self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
         self.controller._Controller__update_model()
         self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
         self.controller._Controller__lftp_status_cache_expires_at = datetime.now() - timedelta(seconds=1)
@@ -580,6 +602,12 @@ class TestController(unittest.TestCase):
         self.controller._Controller__persist.downloaded_file_names = {"keep-id", "stale-id"}
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            failed=False,
+            error_message=None
+        )
         self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
 

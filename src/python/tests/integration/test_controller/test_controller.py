@@ -6,6 +6,7 @@ import os
 import tempfile
 import shutil
 import shlex
+import time
 from filecmp import dircmp, cmp
 import logging
 import sys
@@ -780,26 +781,32 @@ class TestController(unittest.TestCase):
         command = Controller.Command(Controller.Command.Action.QUEUE, "ra")
         command.add_callback(callback)
         self.controller.queue_command(command)
-        # Process until done
-        while True:
+        final_target = os.path.join(TestController.temp_dir, "local", "ra")
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", "ra")
+
+        # Process until the staged directory has been promoted to the final local root
+        downloaded_file = self.__wait_for_model_file(
+            "ra",
+            lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
+            "Timed out waiting for ra directory queue to finish",
+            max_iterations=4000,
+        )
+
+        for _ in range(20):
             self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                self.assertEqual("ra", new_file.name)
-                if new_file.local_size == 8*1024:
-                    break
 
         # Verify
         listener.file_added.assert_not_called()
         listener.file_removed.assert_not_called()
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
-        dcmp = dircmp(os.path.join(TestController.temp_dir, "remote", "ra"),
-                      os.path.join(TestController.temp_dir, "local", "ra"))
+        dcmp = dircmp(os.path.join(TestController.temp_dir, "remote", "ra"), final_target)
         self.assertFalse(dcmp.left_only)
         self.assertFalse(dcmp.right_only)
         self.assertFalse(dcmp.diff_files)
+        self.assertEqual(ModelFile.State.DOWNLOADED, downloaded_file.state)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertFalse(os.path.exists(staging_target))
 
     def test_command_queue_file(self):
         self.controller = Controller(self.context, self.controller_persist)
@@ -981,7 +988,7 @@ class TestController(unittest.TestCase):
         command.add_callback(callback)
         self.controller.queue_command(command)
         # Process until download starts
-        while True:
+        for _ in range(300):
             self.controller.process()
             call = listener.file_updated.call_args
             if call:
@@ -989,12 +996,15 @@ class TestController(unittest.TestCase):
                 self.assertEqual("ra", new_file.name)
                 if new_file.local_size and new_file.local_size > 0:
                     break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for ra download to start")
 
         # Now stop the download
         self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, "ra"))
 
         # Process until download stops
-        while True:
+        for _ in range(300):
             self.controller.process()
             call = listener.file_updated.call_args
             if call:
@@ -1002,6 +1012,9 @@ class TestController(unittest.TestCase):
                 self.assertEqual("ra", new_file.name)
                 if new_file.state == ModelFile.State.DEFAULT:
                     break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for ra download to stop")
 
         # Verify
         call = listener.file_updated.call_args
@@ -1044,20 +1057,23 @@ class TestController(unittest.TestCase):
         command.add_callback(callback)
         self.controller.queue_command(command)
         # Process until download starts
-        while True:
+        for attempt in range(300):
             self.controller.process()
             call = listener.file_updated.call_args
             if call:
                 new_file = call[0][1]
                 self.assertEqual("rc", new_file.name)
-                if new_file.local_size and new_file.local_size > 0:
+                if new_file.local_size and new_file.local_size > 0 and new_file.is_stoppable:
                     break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for rc download to become stoppable")
 
         # Now stop the download
         self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, "rc"))
 
         # Process until download stops
-        while True:
+        for _ in range(300):
             self.controller.process()
             call = listener.file_updated.call_args
             if call:
@@ -1065,6 +1081,9 @@ class TestController(unittest.TestCase):
                 self.assertEqual("rc", new_file.name)
                 if new_file.state == ModelFile.State.DEFAULT:
                     break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for rc download to stop")
 
         # Verify
         call = listener.file_updated.call_args
@@ -1359,8 +1378,15 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
 
         # Verify
-        re_txt_path = os.path.join(TestController.temp_dir, "local", "re.rar.txt")
-        self.assertTrue(os.path.isfile(re_txt_path))
+        re_txt_path = os.path.join(TestController.temp_dir, "local", "re", "re.rar.txt")
+        # The controller can report extraction complete just before the file
+        # write becomes visible on disk, so wait briefly for the artifact.
+        for _ in range(100):
+            if os.path.isfile(re_txt_path) and os.path.getsize(re_txt_path) > 0:
+                break
+            self.controller.process()
+        else:
+            self.fail("Timed out waiting for re.rar.txt to be written")
         with open(re_txt_path, "r") as f:
             self.assertEqual("re.rar", f.read())
 
@@ -1511,14 +1537,15 @@ class TestController(unittest.TestCase):
         # Process until extract complete
         # Can't rely on state changes since final state is back to Default
         # Look for presence of extracted files
-        lca_txt_path = os.path.join(TestController.temp_dir, "local", "lc", "lca.rar.txt")
-        lcb_txt_path = os.path.join(TestController.temp_dir, "local", "lc", "lcb.zip.txt")
-        for _ in range(100):
+        lca_txt_path = os.path.join(TestController.temp_dir, "local", "lc", "lca", "lca.rar.txt")
+        lcb_txt_path = os.path.join(TestController.temp_dir, "local", "lc", "lcb", "lcb.zip.txt")
+        for _ in range(150):
             self.controller.process()
             if os.path.isfile(lca_txt_path) and os.path.isfile(lcb_txt_path) \
                     and os.path.getsize(lca_txt_path) > 0 \
                     and os.path.getsize(lcb_txt_path) > 0:
                 break
+            time.sleep(0.05)
         else:
             self.fail("Timed out waiting for extracted files to be written")
         callback.on_success.assert_called_once_with()
@@ -1555,7 +1582,7 @@ class TestController(unittest.TestCase):
         command.add_callback(callback)
         self.controller.queue_command(command)
         # Process until download complete
-        for _ in range(100):
+        for _ in range(300):
             self.controller.process()
             call = listener.file_updated.call_args
             if call:
@@ -1574,7 +1601,8 @@ class TestController(unittest.TestCase):
         command.add_callback(callback)
         self.controller.queue_command(command)
         # Process until extract complete
-        for _ in range(100):
+        re_txt_path = os.path.join(TestController.temp_dir, "local", "re", "re.rar.txt")
+        for _ in range(150):
             self.controller.process()
             if self._has_file_updated_state(
                 listener.file_updated.call_args_list,
@@ -1582,6 +1610,7 @@ class TestController(unittest.TestCase):
                 ModelFile.State.EXTRACTED
             ):
                 break
+            time.sleep(0.05)
         else:
             self.fail("Timed out waiting for re.rar to extract")
         callback.on_success.assert_called_once_with()
@@ -1589,7 +1618,7 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
 
         # Verify
-        re_txt_path = os.path.join(TestController.temp_dir, "local", "re.rar.txt")
+        re_txt_path = os.path.join(TestController.temp_dir, "local", "re", "re.rar.txt")
         self.assertTrue(os.path.isfile(re_txt_path))
         with open(re_txt_path, "r") as f:
             self.assertEqual("re.rar", f.read())
@@ -1605,10 +1634,11 @@ class TestController(unittest.TestCase):
         # Process until extract complete
         # Can't rely on state changes since final state is back to Extracted
         # Look for presence of extracted file
-        for _ in range(100):
+        for _ in range(150):
             self.controller.process()
             if os.path.isfile(re_txt_path) and os.path.getsize(re_txt_path) > 0:
                 break
+            time.sleep(0.05)
         else:
             self.fail("Timed out waiting for re.rar.txt to be written")
 

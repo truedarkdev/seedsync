@@ -900,7 +900,10 @@ class Controller:
                     self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
                         seconds=self.__lftp_status_cache_max_age_seconds
                     )
-                    self.__next_lftp_status_poll_at = None
+                    # Keep healthy polls from hammering lftp on every controller tick.
+                    self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
+                        seconds=self.__lftp_status_poll_retry_seconds
+                    )
                     lftp_status_source = "fresh_healthy"
                 else:
                     self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
@@ -1112,22 +1115,23 @@ class Controller:
 
                 active_model_names = set(self.__model.get_file_names())
                 active_model_ids = set(self.__model.get_file_ids())
-                remove_downloaded_file_names = {
-                    downloaded_file_name
-                    for downloaded_file_name in self.__persist.downloaded_file_names
-                    if downloaded_file_name not in active_model_names and downloaded_file_name not in active_model_ids
-                }
-                if remove_downloaded_file_names:
-                    self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
-                    self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
-                    if self.__is_target_archive_trace_enabled():
-                        for downloaded_file_name in remove_downloaded_file_names:
-                            if self.__target_archive_trace_selector_matches_file(downloaded_file_name, downloaded_file_name):
-                                self.__trace_target_archive_event("downloaded_marker_removed", {
-                                    "file_name": downloaded_file_name,
-                                    "file_id": ModelFile.build_file_id(downloaded_file_name, None),
-                                })
-                    self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                if remote_reconciliation_established:
+                    remove_downloaded_file_names = {
+                        downloaded_file_name
+                        for downloaded_file_name in self.__persist.downloaded_file_names
+                        if downloaded_file_name not in active_model_names and downloaded_file_name not in active_model_ids
+                    }
+                    if remove_downloaded_file_names:
+                        self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
+                        self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
+                        if self.__is_target_archive_trace_enabled():
+                            for downloaded_file_name in remove_downloaded_file_names:
+                                if self.__target_archive_trace_selector_matches_file(downloaded_file_name, downloaded_file_name):
+                                    self.__trace_target_archive_event("downloaded_marker_removed", {
+                                        "file_name": downloaded_file_name,
+                                        "file_id": ModelFile.build_file_id(downloaded_file_name, None),
+                                    })
+                        self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
 
         if remote_reconciliation_established and self.__pending_auto_purge_file_ids:
             pending_auto_purge_candidates = set()
