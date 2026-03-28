@@ -1412,6 +1412,27 @@ class TestLftpKillPathMatching(unittest.TestCase):
             [call.args for call in lftp._Lftp__run_command.call_args_list]
         )
 
+    def test_kill_does_not_retry_nonmatching_nonempty_status(self):
+        lftp = TestLftp._build_test_lftp()
+        other_status = LftpJobStatus(
+            job_id=99,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="other.bin",
+            flags="-c",
+            remote_path="/remote/downloads/other.bin",
+            local_path="/local/incomplete/other.bin.lftp"
+        )
+        lftp.status = MagicMock(return_value=[other_status])
+
+        with patch("lftp.lftp.time.sleep") as sleep:
+            killed = lftp.kill("rc")
+
+        self.assertFalse(killed)
+        self.assertEqual(1, lftp.status.call_count)
+        sleep.assert_not_called()
+        lftp._Lftp__run_command.assert_not_called()
+
     def test_kill_stops_when_matching_jobs_do_not_converge(self):
         lftp = TestLftp._build_test_lftp()
         lftp._Lftp__path_is_within = MagicMock(return_value=True)
@@ -1440,3 +1461,80 @@ class TestLftpKillPathMatching(unittest.TestCase):
         lftp.logger.warning.assert_called_once_with(
             "Kill did not converge for job 'dup.bin' after repeated matching polls"
         )
+
+    def test_kill_retries_empty_status_before_giving_up(self):
+        lftp = TestLftp._build_test_lftp()
+        status = LftpJobStatus(
+            job_id=11,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="rc",
+            flags="-c",
+            remote_path="/remote/rc",
+            local_path="/local/incomplete/rc.lftp"
+        )
+        polls = iter([
+            ([], False),
+            ([status], True),
+            ([], True),
+        ])
+
+        def status_side_effect():
+            statuses, healthy = next(polls)
+            lftp._Lftp__last_status_poll_healthy = healthy
+            return statuses
+
+        lftp.status = MagicMock(side_effect=status_side_effect)
+
+        with patch("lftp.lftp.time.sleep") as sleep:
+            killed = lftp.kill("rc")
+
+        self.assertTrue(killed)
+        self.assertEqual(3, lftp.status.call_count)
+        sleep.assert_called_once_with(0.05)
+        lftp._Lftp__run_command.assert_called_once_with("kill 11")
+
+    def test_kill_retries_transient_empty_between_multiple_matches(self):
+        lftp = TestLftp._build_test_lftp()
+        first_status = LftpJobStatus(
+            job_id=11,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="rc",
+            flags="-c",
+            remote_path="/remote/rc",
+            local_path="/local/incomplete/rc.lftp"
+        )
+        second_status = LftpJobStatus(
+            job_id=12,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="rc",
+            flags="-c",
+            remote_path="/remote/rc",
+            local_path="/local/incomplete/rc.lftp"
+        )
+        polls = iter([
+            ([first_status, second_status], True),
+            ([], False),
+            ([second_status], True),
+            ([], True),
+        ])
+
+        def status_side_effect():
+            statuses, healthy = next(polls)
+            lftp._Lftp__last_status_poll_healthy = healthy
+            return statuses
+
+        lftp.status = MagicMock(side_effect=status_side_effect)
+
+        with patch("lftp.lftp.time.sleep") as sleep:
+            killed = lftp.kill("rc")
+
+        self.assertTrue(killed)
+        self.assertEqual(4, lftp.status.call_count)
+        self.assertEqual(
+            [("kill 11",), ("kill 12",)],
+            [call.args for call in lftp._Lftp__run_command.call_args_list]
+        )
+        sleep.assert_called_once_with(0.05)

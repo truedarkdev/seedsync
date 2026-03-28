@@ -3,6 +3,7 @@
 import logging
 import re
 import os
+import time
 from functools import wraps
 from typing import Callable, Union, List, Optional, Dict
 
@@ -576,8 +577,10 @@ class Lftp:
         :return: True if job of given name was found, False otherwise
         """
         def find_matching_jobs():
+            statuses = self.status()
+            status_poll_healthy = self.last_status_poll_healthy
             matching_jobs = []
-            for status in self.status():
+            for status in statuses:
                 if status.name != name:
                     continue
                 if remote_path is not None and not self.__path_is_within(status.remote_path, remote_path):
@@ -587,14 +590,36 @@ class Lftp:
                 if remote_path is None and local_path is None and path_pair_id is not None and status.path_pair_id != path_pair_id:
                     continue
                 matching_jobs.append(status)
-            return matching_jobs
+            if not matching_jobs:
+                self.logger.debug(
+                    "Kill poll for '%s' saw statuses: %s",
+                    name,
+                    [
+                        {
+                            "id": status.id,
+                            "name": status.name,
+                            "state": getattr(status.state, "name", status.state),
+                            "remote_path": status.remote_path,
+                            "local_path": status.local_path,
+                            "path_pair_id": status.path_pair_id,
+                        }
+                        for status in statuses
+                    ]
+                )
+            return statuses, matching_jobs, status_poll_healthy
 
         killed_any = False
         previous_match_signature = None
         attempts = 0
         while attempts < MAX_KILL_MATCH_ATTEMPTS:
-            matching_jobs = find_matching_jobs()
+            statuses, matching_jobs, status_poll_healthy = find_matching_jobs()
             if not matching_jobs:
+                if statuses:
+                    break
+                if not status_poll_healthy:
+                    attempts += 1
+                    time.sleep(0.05)
+                    continue
                 break
             match_signature = tuple((job.id, job.state) for job in matching_jobs)
             if match_signature == previous_match_signature:
