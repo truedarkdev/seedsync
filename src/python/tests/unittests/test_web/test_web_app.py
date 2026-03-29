@@ -2,6 +2,8 @@ import unittest
 import os
 from unittest.mock import MagicMock, patch
 
+from common import Config
+from webtest import TestApp
 from web.web_app import IStreamHandler, WebApp
 from web.web_app_builder import WebAppBuilder
 
@@ -111,3 +113,98 @@ class TestWebAppStream(unittest.TestCase):
         builder = WebAppBuilder(self.context, MagicMock(), auto_queue_persist)
 
         self.assertIsNone(builder.controller_handler._ControllerHandler__local_path_root)
+
+
+class TestWebAppHostValidation(unittest.TestCase):
+    def _make_web_app(self, allowed_hostname: str):
+        context = MagicMock()
+        context.logger.getChild.return_value = MagicMock()
+        context.args.html_path = "/tmp"
+        context.status = MagicMock()
+        context.config = Config()
+        context.config.general.allowed_hostname = allowed_hostname
+        return WebApp(context, MagicMock())
+
+    def test_normalizes_hostname_values_for_compare(self):
+        self.assertEqual("myapp.local", WebApp._WebApp__normalize_hostname("  MyApp.Local.  "))
+
+    def test_allows_localhost_when_allowed_hostname_is_configured(self):
+        web_app = self._make_web_app("  MyApp.Local.  ")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server/ping", extra_environ={"HTTP_HOST": "localhost:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_allows_exact_server_path_when_allowed_hostname_is_configured(self):
+        web_app = self._make_web_app("myapp.local")
+
+        @web_app.route("/server")
+        def _server_root():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server", extra_environ={"HTTP_HOST": "myapp.local:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_allows_configured_hostname_with_normalization(self):
+        web_app = self._make_web_app("  MyApp.Local.  ")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server/ping", extra_environ={"HTTP_HOST": "MYAPP.LOCAL.:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_allows_ipv6_literal_when_configured_without_brackets(self):
+        web_app = self._make_web_app("::1")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_allows_ipv6_literal_when_configured_with_brackets(self):
+        web_app = self._make_web_app("[::1]")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_rejects_unlisted_hostname_when_allowed_hostname_is_configured(self):
+        web_app = self._make_web_app("myapp.local")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get(
+            "/server/ping",
+            extra_environ={"HTTP_HOST": "evil.example:8800"},
+            expect_errors=True
+        )
+        self.assertEqual(400, response.status_int)
+
+    def test_allows_any_hostname_when_not_configured(self):
+        web_app = self._make_web_app("")
+
+        @web_app.route("/server/ping")
+        def _ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        response = client.get("/server/ping", extra_environ={"HTTP_HOST": "evil.example:8800"})
+        self.assertEqual(200, response.status_int)

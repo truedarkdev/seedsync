@@ -197,12 +197,14 @@ class TestConfig(unittest.TestCase):
             "debug": "True",
             "verbose": "False",
             "api_token": "token-value",
+            "allowed_hostname": "",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
         self.assertEqual(True, general.debug)
         self.assertEqual(False, general.verbose)
         self.assertEqual("token-value", general.api_token)
+        self.assertEqual("", general.allowed_hostname)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -419,10 +421,8 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_extract", "-1")
 
     def test_from_file(self):
-        # Create empty config file
-        config_file = open(tempfile.mktemp(suffix="test_config"), "w")
-
-        config_file.write("""
+        with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
+            config_file.write("""
         [General]
         debug=False
         verbose=True
@@ -461,146 +461,152 @@ class TestConfig(unittest.TestCase):
         patterns_only=True
         auto_extract=True
         """)
-        config_file.flush()
-        config = Config.from_file(config_file.name)
+            config_path = config_file.name
 
-        self.assertEqual(False, config.general.debug)
-        self.assertEqual(True, config.general.verbose)
-        self.assertEqual("", config.general.api_token)
-        self.assertEqual(True, config.general.config_api_redact_remote_details)
+        try:
+            config = Config.from_file(config_path)
 
-        self.assertEqual("remote.server.com", config.lftp.remote_address)
-        self.assertEqual("remote-user", config.lftp.remote_username)
-        self.assertEqual("remote-pass", config.lftp.remote_password)
-        self.assertEqual(3456, config.lftp.remote_port)
-        self.assertEqual("/path/on/remote/server", config.lftp.remote_path)
-        self.assertEqual("/path/on/local/server", config.lftp.local_path)
-        self.assertEqual("/path/on/remote/server/to/scan/script", config.lftp.remote_path_to_scan_script)
-        self.assertEqual(True, config.lftp.use_ssh_key)
-        self.assertEqual(2, config.lftp.num_max_parallel_downloads)
-        self.assertEqual(3, config.lftp.num_max_parallel_files_per_download)
-        self.assertEqual(4, config.lftp.num_max_connections_per_root_file)
-        self.assertEqual(5, config.lftp.num_max_connections_per_dir_file)
-        self.assertEqual(7, config.lftp.num_max_total_connections)
-        self.assertEqual(False, config.lftp.use_temp_file)
-        self.assertEqual("500K", config.lftp.rate_limit)
-        self.assertEqual("/path/on/local/server/incomplete", config.lftp.staging_path)
+            self.assertEqual(False, config.general.debug)
+            self.assertEqual(True, config.general.verbose)
+            self.assertEqual("", config.general.api_token)
+            self.assertEqual("", config.general.allowed_hostname)
+            self.assertEqual(True, config.general.config_api_redact_remote_details)
 
-        self.assertEqual(30000, config.controller.interval_ms_remote_scan)
-        self.assertEqual(10000, config.controller.interval_ms_local_scan)
-        self.assertEqual(2000, config.controller.interval_ms_downloading_scan)
-        self.assertEqual("/path/where/to/extract/stuff", config.controller.extract_path)
-        self.assertEqual(False, config.controller.use_local_path_as_extract_path)
-        self.assertEqual(True, config.controller.managed_extract_folders_enabled)
+            self.assertEqual("remote.server.com", config.lftp.remote_address)
+            self.assertEqual("remote-user", config.lftp.remote_username)
+            self.assertEqual("remote-pass", config.lftp.remote_password)
+            self.assertEqual(3456, config.lftp.remote_port)
+            self.assertEqual("/path/on/remote/server", config.lftp.remote_path)
+            self.assertEqual("/path/on/local/server", config.lftp.local_path)
+            self.assertEqual("/path/on/remote/server/to/scan/script", config.lftp.remote_path_to_scan_script)
+            self.assertEqual(True, config.lftp.use_ssh_key)
+            self.assertEqual(2, config.lftp.num_max_parallel_downloads)
+            self.assertEqual(3, config.lftp.num_max_parallel_files_per_download)
+            self.assertEqual(4, config.lftp.num_max_connections_per_root_file)
+            self.assertEqual(5, config.lftp.num_max_connections_per_dir_file)
+            self.assertEqual(7, config.lftp.num_max_total_connections)
+            self.assertEqual(False, config.lftp.use_temp_file)
+            self.assertEqual("500K", config.lftp.rate_limit)
+            self.assertEqual("/path/on/local/server/incomplete", config.lftp.staging_path)
 
-        self.assertEqual(88, config.web.port)
+            self.assertEqual(30000, config.controller.interval_ms_remote_scan)
+            self.assertEqual(10000, config.controller.interval_ms_local_scan)
+            self.assertEqual(2000, config.controller.interval_ms_downloading_scan)
+            self.assertEqual("/path/where/to/extract/stuff", config.controller.extract_path)
+            self.assertEqual(False, config.controller.use_local_path_as_extract_path)
+            self.assertEqual(True, config.controller.managed_extract_folders_enabled)
 
-        self.assertEqual(False, config.autoqueue.enabled)
-        self.assertEqual(True, config.autoqueue.patterns_only)
-        self.assertEqual(True, config.autoqueue.auto_extract)
+            self.assertEqual(88, config.web.port)
 
-        # unknown section error
-        config_file.write("""
+            self.assertEqual(False, config.autoqueue.enabled)
+            self.assertEqual(True, config.autoqueue.patterns_only)
+            self.assertEqual(True, config.autoqueue.auto_extract)
+
+            # unknown section error
+            with open(config_path, "a") as config_file:
+                config_file.write("""
         [Unknown]
         key=value
-        """)
-        config_file.flush()
-        with self.assertRaises(ConfigError) as error:
-            Config.from_file(config_file.name)
-        self.assertTrue(str(error.exception).startswith("Unknown section"))
-
-        # Remove config file
-        config_file.close()
-        os.remove(config_file.name)
+                """)
+            with self.assertRaises(ConfigError) as error:
+                Config.from_file(config_path)
+            self.assertTrue(str(error.exception).startswith("Unknown section"))
+        finally:
+            os.remove(config_path)
 
     def test_to_file(self):
-        config_file_path = tempfile.mktemp(suffix="test_config")
+        with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
+            config_file_path = config_file.name
 
-        config = Config()
-        config.general.debug = True
-        config.general.verbose = False
-        config.general.api_token = "api-token-value"
-        config.general.config_api_redact_remote_details = True
-        config.lftp.remote_address = "server.remote.com"
-        config.lftp.remote_username = "user-on-remote-server"
-        config.lftp.remote_password = "pass-on-remote-server"
-        config.lftp.remote_port = 3456
-        config.lftp.remote_path = "/remote/server/path"
-        config.lftp.local_path = "/local/server/path"
-        config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
-        config.lftp.use_ssh_key = True
-        config.lftp.num_max_parallel_downloads = 6
-        config.lftp.num_max_parallel_files_per_download = 7
-        config.lftp.num_max_connections_per_root_file = 2
-        config.lftp.num_max_connections_per_dir_file = 3
-        config.lftp.num_max_total_connections = 4
-        config.lftp.use_temp_file = True
-        config.lftp.staging_path = "/local/server/path/incomplete"
-        config.controller.interval_ms_remote_scan = 1234
-        config.controller.interval_ms_local_scan = 5678
-        config.controller.interval_ms_downloading_scan = 9012
-        config.controller.extract_path = "/path/extract/stuff"
-        config.controller.use_local_path_as_extract_path = True
-        config.controller.managed_extract_folders_enabled = False
-        config.web.port = 13
-        config.autoqueue.enabled = True
-        config.autoqueue.patterns_only = True
-        config.autoqueue.auto_extract = False
-        config.to_file(config_file_path)
-        with open(config_file_path, "r") as f:
-            actual_str = f.read()
-        print(actual_str)
+        try:
+            config = Config()
+            config.general.debug = True
+            config.general.verbose = False
+            config.general.api_token = "api-token-value"
+            config.general.allowed_hostname = ""
+            config.general.config_api_redact_remote_details = True
+            config.lftp.remote_address = "server.remote.com"
+            config.lftp.remote_username = "user-on-remote-server"
+            config.lftp.remote_password = "pass-on-remote-server"
+            config.lftp.remote_port = 3456
+            config.lftp.remote_path = "/remote/server/path"
+            config.lftp.local_path = "/local/server/path"
+            config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+            config.lftp.use_ssh_key = True
+            config.lftp.num_max_parallel_downloads = 6
+            config.lftp.num_max_parallel_files_per_download = 7
+            config.lftp.num_max_connections_per_root_file = 2
+            config.lftp.num_max_connections_per_dir_file = 3
+            config.lftp.num_max_total_connections = 4
+            config.lftp.use_temp_file = True
+            config.lftp.staging_path = "/local/server/path/incomplete"
+            config.controller.interval_ms_remote_scan = 1234
+            config.controller.interval_ms_local_scan = 5678
+            config.controller.interval_ms_downloading_scan = 9012
+            config.controller.extract_path = "/path/extract/stuff"
+            config.controller.use_local_path_as_extract_path = True
+            config.controller.managed_extract_folders_enabled = False
+            config.web.port = 13
+            config.autoqueue.enabled = True
+            config.autoqueue.patterns_only = True
+            config.autoqueue.auto_extract = False
+            config.to_file(config_file_path)
+            with open(config_file_path, "r") as f:
+                actual_str = f.read()
 
-        golden_str = """
-        [General]
-        debug = True
-        verbose = False
-        api_token = api-token-value
-        config_api_redact_remote_details = True
+            golden_str = """
+            [General]
+            debug = True
+            verbose = False
+            api_token = api-token-value
+            allowed_hostname =
+            config_api_redact_remote_details = True
 
-        [Lftp]
-        remote_address = server.remote.com
-        remote_username = user-on-remote-server
-        remote_password = pass-on-remote-server
-        remote_port = 3456
-        remote_path = /remote/server/path
-        local_path = /local/server/path
-        remote_path_to_scan_script = /remote/server/path/to/script
-        use_ssh_key = True
-        num_max_parallel_downloads = 6
-        num_max_parallel_files_per_download = 7
-        num_max_connections_per_root_file = 2
-        num_max_connections_per_dir_file = 3
-        num_max_total_connections = 4
-        use_temp_file = True
-        rate_limit = None
-        staging_path = /local/server/path/incomplete
+            [Lftp]
+            remote_address = server.remote.com
+            remote_username = user-on-remote-server
+            remote_password = pass-on-remote-server
+            remote_port = 3456
+            remote_path = /remote/server/path
+            local_path = /local/server/path
+            remote_path_to_scan_script = /remote/server/path/to/script
+            use_ssh_key = True
+            num_max_parallel_downloads = 6
+            num_max_parallel_files_per_download = 7
+            num_max_connections_per_root_file = 2
+            num_max_connections_per_dir_file = 3
+            num_max_total_connections = 4
+            use_temp_file = True
+            rate_limit = None
+            staging_path = /local/server/path/incomplete
 
-        [Controller]
-        interval_ms_remote_scan = 1234
-        interval_ms_local_scan = 5678
-        interval_ms_downloading_scan = 9012
-        extract_path = /path/extract/stuff
-        use_local_path_as_extract_path = True
-        managed_extract_folders_enabled = False
+            [Controller]
+            interval_ms_remote_scan = 1234
+            interval_ms_local_scan = 5678
+            interval_ms_downloading_scan = 9012
+            extract_path = /path/extract/stuff
+            use_local_path_as_extract_path = True
+            managed_extract_folders_enabled = False
 
-        [Web]
-        port = 13
+            [Web]
+            port = 13
 
-        [AutoQueue]
-        enabled = True
-        patterns_only = True
-        auto_extract = False
-        """
+            [AutoQueue]
+            enabled = True
+            patterns_only = True
+            auto_extract = False
+            """
 
-        golden_lines = [s.strip() for s in golden_str.splitlines()]
-        golden_lines = list(filter(None, golden_lines))  # remove blank lines
-        actual_lines = [s.strip() for s in actual_str.splitlines()]
-        actual_lines = list(filter(None, actual_lines))  # remove blank lines
+            golden_lines = [s.strip() for s in golden_str.splitlines()]
+            golden_lines = list(filter(None, golden_lines))  # remove blank lines
+            actual_lines = [s.strip() for s in actual_str.splitlines()]
+            actual_lines = list(filter(None, actual_lines))  # remove blank lines
 
-        self.assertEqual(len(golden_lines), len(actual_lines))
-        for i, _ in enumerate(golden_lines):
-            self.assertEqual(golden_lines[i], actual_lines[i])
+            self.assertEqual(len(golden_lines), len(actual_lines))
+            for i, _ in enumerate(golden_lines):
+                self.assertEqual(golden_lines[i], actual_lines[i])
+        finally:
+            os.remove(config_file_path)
 
     def test_persist_read_error(self):
         # bad section
