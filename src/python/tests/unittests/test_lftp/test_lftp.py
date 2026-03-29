@@ -1575,7 +1575,7 @@ class TestLftpKillPathMatching(unittest.TestCase):
         )
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 11")
+        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
 
     def test_kill_removes_all_matching_running_jobs(self):
         lftp = TestLftp._build_test_lftp()
@@ -1661,7 +1661,7 @@ class TestLftpKillPathMatching(unittest.TestCase):
         )
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 3")
+        lftp._Lftp__run_command.assert_called_once_with("kill 3", require_prompt_ready=False)
         lftp.logger.warning.assert_called_once_with(
             "Kill did not converge for job 'dup.bin' after repeated matching polls"
         )
@@ -1696,7 +1696,7 @@ class TestLftpKillPathMatching(unittest.TestCase):
         self.assertTrue(killed)
         self.assertEqual(3, lftp.status.call_count)
         sleep.assert_called_once_with(0.05)
-        lftp._Lftp__run_command.assert_called_once_with("kill 11")
+        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
 
     def test_kill_retries_transient_empty_between_multiple_matches(self):
         lftp = TestLftp._build_test_lftp()
