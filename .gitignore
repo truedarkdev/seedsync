@@ -16,3 +16,4 @@ id_rsa
 doc/maintainer-policy.md
 /.backupignore
 /tmp/
+src/python/tmp
