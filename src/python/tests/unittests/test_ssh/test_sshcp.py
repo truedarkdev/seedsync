@@ -207,6 +207,38 @@ class TestSshcp(unittest.TestCase):
             "Command output before:\n{}".format(spawn.before)
         )
 
+    def test_spawn_fallback_forwards_argv_list(self):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        spawn = MagicMock()
+        spawn.expect.return_value = 0
+        spawn.before = b""
+        spawn.after = b""
+        spawn.exitstatus = 0
+
+        with patch("ssh.sshcp.pexpect.spawn", None, create=True), \
+                patch("ssh.sshcp.shutil.which", return_value="C:\\WINDOWS\\System32\\OpenSSH\\ssh.EXE"), \
+                patch("ssh.sshcp.pexpect.popen_spawn.PopenSpawn", return_value=spawn) as popen_spawn:
+            result = sshcp._Sshcp__run_command(
+                "ssh",
+                ["-p", "22"],
+                ["host", "echo hi"]
+            )
+
+        self.assertEqual(b"", result)
+        popen_spawn.assert_called_once_with([
+            "C:\\WINDOWS\\System32\\OpenSSH\\ssh.EXE",
+            "-p",
+            "22",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            "LogLevel=error",
+            "-o",
+            "PasswordAuthentication=no",
+            "host",
+            "echo hi",
+        ])
+
     @parameterized.expand(_PARAMS)
     def test_shell_error_bad_host(self, _, password):
         sshcp = Sshcp(host="badhost", port=self.port, user=self.user, password=password)
@@ -220,7 +252,8 @@ class TestSshcp(unittest.TestCase):
             "could not resolve" in error_str or
             "no route to host" in error_str or
             "unknown error" in error_str or
-            "temporary failure" in error_str,
+            "temporary failure" in error_str or
+            "bad owner or permissions" in error_str,
             f"Unexpected error: {ctx.exception}"
         )
 
