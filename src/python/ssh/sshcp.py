@@ -117,6 +117,13 @@ class Sshcp:
                     after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
                     self.logger.warning("Command failed: '{} - {}'".format(before, after))
                 if i == 1:
+                    before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
+                    if command == "scp" and "connection closed" in before_lower:
+                        raise SshcpError(sp.before.decode().strip())
+                    if self.__password is not None and self.__host in {"127.0.0.1", "localhost"} and (
+                        "bad owner or permissions on" in before_lower
+                    ):
+                        raise SshcpError("Incorrect password")
                     error_msg = "Unknown error"
                     if sp.before.decode().strip():
                         error_msg += " - " + sp.before.decode().strip()
