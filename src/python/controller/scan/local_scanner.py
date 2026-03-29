@@ -234,6 +234,8 @@ class LocalScanner(IScanner):
     def __merge_duplicate_local_entries(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
         if existing_file.is_dir and staging_file.is_dir:
             return LocalScanner.__build_merged_directory(existing_file, staging_file)
+        if existing_file.is_dir != staging_file.is_dir:
+            return existing_file
         if LocalScanner.__should_prefer_existing_local_file(existing_file, staging_file):
             return existing_file
         return staging_file
