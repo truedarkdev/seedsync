@@ -64,7 +64,7 @@ export class FilesPageComponent implements OnInit, OnDestroy {
         }
 
         if (this._pathPairId != null) {
-            return enabledPathPairs.find(pair => pair.id === this._pathPairId) || null;
+            return enabledPathPairs.find(pair => pair.id === this._pathPairId) || enabledPathPairs[0] || null;
         }
 
         return null;
