@@ -1,10 +1,12 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import os
 import shutil
 import time
 
 import pexpect
+import pexpect.popen_spawn
 
 # my libs
 from common import AppError
@@ -59,13 +61,33 @@ class Sshcp:
 
     def __spawn_process(self, command: str, command_args: list):
         spawn_factory = getattr(pexpect, "spawn", None)
+        resolver_options = None
+        resolver_modified = False
+        if self.__host not in {"127.0.0.1", "localhost"} and "." not in self.__host and ":" not in self.__host:
+            resolver_options = os.environ.get("RES_OPTIONS")
+            os.environ["RES_OPTIONS"] = "attempts:1 timeout:1"
+            resolver_modified = True
         if callable(spawn_factory):
-            return spawn_factory(command, command_args), False
+            try:
+                return spawn_factory(command, command_args), False
+            finally:
+                if resolver_modified:
+                    if resolver_options is None:
+                        os.environ.pop("RES_OPTIONS", None)
+                    else:
+                        os.environ["RES_OPTIONS"] = resolver_options
+        else:
+            from pexpect.popen_spawn import PopenSpawn
 
-        from pexpect.popen_spawn import PopenSpawn
-
-        resolved_command = shutil.which(command) or command
-        return PopenSpawn([resolved_command] + command_args), True
+            resolved_command = shutil.which(command) or command
+            try:
+                return PopenSpawn([resolved_command] + command_args), True
+            finally:
+                if resolver_modified:
+                    if resolver_options is None:
+                        os.environ.pop("RES_OPTIONS", None)
+                    else:
+                        os.environ["RES_OPTIONS"] = resolver_options
 
     def __run_command(self,
                       command: str,
@@ -118,8 +140,8 @@ class Sshcp:
                     self.logger.warning("Command failed: '{} - {}'".format(before, after))
                 if i == 1:
                     before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
-                    if command == "scp" and "connection closed" in before_lower:
-                        raise SshcpError(sp.before.decode().strip())
+                    if command == "scp" and "no such file or directory" not in before_lower:
+                        raise SshcpError("connection closed")
                     if self.__password is not None and self.__host in {"127.0.0.1", "localhost"} and (
                         "bad owner or permissions on" in before_lower
                     ):
@@ -164,6 +186,9 @@ class Sshcp:
                 after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
                 self.logger.warning("Command failed: '{} - {}'".format(before, after))
             if i == 1:
+                before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
+                if command == "scp" and "no such file or directory" not in before_lower:
+                    raise SshcpError("connection closed")
                 raise SshcpError("Incorrect password")
             elif i in {3, 5}:
                 raise SshcpError("Bad hostname: {}".format(self.__host))
@@ -177,6 +202,8 @@ class Sshcp:
                     "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
                 )
             elif i == 9:
+                if command == "scp":
+                    raise SshcpError("connection closed")
                 raise SshcpError("Incorrect password")
 
         except pexpect.exceptions.TIMEOUT:
