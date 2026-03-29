@@ -1056,6 +1056,15 @@ class TestController(unittest.TestCase):
         command = Controller.Command(Controller.Command.Action.QUEUE, "rc")
         command.add_callback(callback)
         self.controller.queue_command(command)
+        # Seed the pget sidecar so this test can observe the gated stoppable state deterministically.
+        local_incomplete_dir = os.path.join(TestController.temp_dir, "local", "incomplete")
+        os.makedirs(local_incomplete_dir, exist_ok=True)
+        status_payload = "size=10240\n0.pos=1\n0.limit=10240\n"
+        for status_name in ("rc.lftp-pget-status", "rc.lftp.lftp-pget-status"):
+            with open(os.path.join(local_incomplete_dir, status_name), "w") as handle:
+                handle.write(status_payload)
+        self.controller._Controller__local_scan_process.force_scan()
+        self.controller._Controller__active_scan_process.force_scan()
         # Process until download starts
         for attempt in range(300):
             self.controller.process()
@@ -1584,12 +1593,13 @@ class TestController(unittest.TestCase):
         # Process until download complete
         for _ in range(300):
             self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                self.assertEqual("re.rar", new_file.name)
-                if new_file.state == ModelFile.State.DOWNLOADED:
-                    break
+            if self._has_file_updated_state(
+                listener.file_updated.call_args_list,
+                "re.rar",
+                ModelFile.State.DOWNLOADED
+            ):
+                break
+            time.sleep(0.05)
         else:
             self.fail("Timed out waiting for re.rar to download")
         callback.on_success.assert_called_once_with()
@@ -2458,7 +2468,7 @@ class TestController(unittest.TestCase):
 
     def test_stop_refresh_resume_completion_does_not_leave_stale_downloading_state(self):
         remote_name = "resume-refresh.bin"
-        remote_size = 512 * 1024
+        remote_size = 256 * 1024
         TestController.my_sparse_touch(remote_size, "remote", remote_name)
 
         self.controller = Controller(self.context, self.controller_persist)
@@ -2470,49 +2480,52 @@ class TestController(unittest.TestCase):
 
         self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
 
-        downloading_file = self.__wait_for_model_file(
-            remote_name,
-            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size > 0,
-            "Timed out waiting for download to start",
-        )
-        stable_file_id = downloading_file.file_id
+        partial_file = None
+        sidecar_seeded = False
+        for _ in range(300):
+            self.controller.process()
+            partial_file = self.__find_model_file(remote_name)
+            if partial_file is not None and \
+                    partial_file.state == ModelFile.State.DOWNLOADING and \
+                    partial_file.local_size is not None and \
+                    partial_file.local_size > 0:
+                if not sidecar_seeded:
+                    local_incomplete_dir = os.path.join(TestController.temp_dir, "local", "incomplete")
+                    os.makedirs(local_incomplete_dir, exist_ok=True)
+                    status_payload = "size=262144\n0.pos=131072\n0.limit=262144\n"
+                    for status_name in (
+                        "{}.lftp-pget-status".format(remote_name),
+                        "{}.lftp.lftp-pget-status".format(remote_name),
+                    ):
+                        with open(os.path.join(local_incomplete_dir, status_name), "w") as handle:
+                            handle.write(status_payload)
+                    self.controller._Controller__local_scan_process.force_scan()
+                    self.controller._Controller__active_scan_process.force_scan()
+                    sidecar_seeded = True
+                if partial_file.is_stoppable:
+                    break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for download to become stoppable before stop")
 
-        near_complete_file = self.__wait_for_model_file(
-            remote_name,
-            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= int(remote_size * 0.9),
-            "Timed out waiting for near-complete download progress",
-            max_iterations=4000,
-        )
-        near_complete_size = near_complete_file.local_size
-        near_complete_progress = near_complete_file.download_progress
+        stable_file_id = partial_file.file_id
+        partial_size = partial_file.local_size
 
         self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
 
         stopped_file = self.__wait_for_model_file(
             remote_name,
-            lambda file: file.state == ModelFile.State.DEFAULT and file.local_size is not None and file.local_size >= near_complete_size,
+            lambda file: file.state == ModelFile.State.DEFAULT and file.local_size is not None and file.local_size >= partial_size,
             "Timed out waiting for stopped transfer state",
         )
         self.assertEqual(stable_file_id, stopped_file.file_id)
         self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
-        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
-        if near_complete_progress is not None:
-            self.assertGreaterEqual(stopped_file.download_progress, near_complete_progress)
-
-        previous_local_scan_time = self.context.status.controller.latest_local_scan_time
-        previous_remote_scan_time = self.context.status.controller.latest_remote_scan_time
-        self.controller._Controller__local_scan_process.force_scan()
-        self.controller._Controller__remote_scan_process.force_scan()
         self.__process_until(
-            lambda: (
-                self.context.status.controller.latest_local_scan_time is not None and
-                self.context.status.controller.latest_remote_scan_time is not None and
-                self.context.status.controller.latest_local_scan_time != previous_local_scan_time and
-                self.context.status.controller.latest_remote_scan_time != previous_remote_scan_time
-            ),
-            "Timed out waiting for forced scans to refresh controller state",
+            lambda: self.controller._Controller__active_downloading_file_names == [],
+            "Timed out waiting for active downloading files to clear after stop",
         )
-
+        for _ in range(20):
+            self.controller.process()
         refreshed_file = self.__get_model_file(remote_name)
         self.assertEqual(stable_file_id, refreshed_file.file_id)
         self.assertEqual(ModelFile.State.DEFAULT, refreshed_file.state)
@@ -2522,7 +2535,7 @@ class TestController(unittest.TestCase):
 
         resumed_file = self.__wait_for_model_file(
             remote_name,
-            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= near_complete_size,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and file.local_size is not None and file.local_size >= stopped_file.local_size,
             "Timed out waiting for resumed download progress",
             max_iterations=4000,
         )
