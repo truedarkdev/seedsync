@@ -1,7 +1,7 @@
 import {
     AfterContentChecked, AfterViewInit,
     ChangeDetectionStrategy, ChangeDetectorRef, Component, ElementRef, HostListener,
-    OnDestroy, OnInit, ViewChild, ViewContainerRef
+    OnDestroy, OnInit, ViewChild
 } from "@angular/core";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
@@ -25,15 +25,14 @@ import {Observable} from "rxjs/Observable";
 export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChecked, OnDestroy {
     public readonly LogRecord = LogRecord;
     public readonly Localization = Localization;
-    private static readonly MAX_LIVE_RECORDS = 500;
+    private static readonly MAX_VISIBLE_RECORDS = 1000;
+    private static readonly UPDATE_BATCH_DELAY_MS = 100;
 
     public headerHeight: Observable<number>;
     public searchQuery = "";
-
-    @ViewChild("templateRecord") templateRecord;
-
-    // Where to insert the cloned content
-    @ViewChild("container", {read: ViewContainerRef}) container;
+    public visibleRecords: LogRecord[] = [];
+    public filteredRecordCount = 0;
+    public hiddenRecordCount = 0;
 
     @ViewChild("logHead") logHead;
     @ViewChild("logTail") logTail;
@@ -46,6 +45,8 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     private _logService: LogService;
     private _connectedService: ConnectedService;
     private _records: LogRecord[] = [];
+    private _pendingRecords: LogRecord[] = [];
+    private _flushHandle: number = null;
     private _viewInitialized = false;
     private _destroy$: Subject<void> = new Subject<void>();
 
@@ -59,22 +60,27 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     }
 
     ngOnInit() {
+        this._records = this._logService.getHistorySnapshot();
+        this.hasReceivedLogs = this._records.length > 0;
+        this.updateVisibleRecords(false);
+
         this._connectedService.connected.takeUntil(this._destroy$).subscribe({
             next: connected => {
                 this.isConnected = connected;
                 this._changeDetector.detectChanges();
             }
         });
+
+        this._logService.logs.takeUntil(this._destroy$).subscribe({
+            next: record => {
+                this.enqueueRecord(record);
+            }
+        });
     }
 
     ngAfterViewInit() {
         this._viewInitialized = true;
-        this._logService.logs.takeUntil(this._destroy$).subscribe({
-            next: record => {
-                this.hasReceivedLogs = true;
-                this.insertRecord(record);
-            }
-        });
+        this.refreshScrollButtonVisibility();
     }
 
     ngAfterContentChecked() {
@@ -85,6 +91,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     }
 
     ngOnDestroy() {
+        this.clearPendingFlush();
         this._destroy$.next();
         this._destroy$.complete();
     }
@@ -105,42 +112,59 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     onSearchQueryChange(value: string) {
         this.searchQuery = value || "";
-        this.renderRecords(false);
+        this.updateVisibleRecords(false);
     }
 
-    private insertRecord(record: LogRecord) {
-        if (!this.container || !this.templateRecord || !this.logTail) {
+    identifyRecord(_index: number, record: LogRecord): LogRecord {
+        return record;
+    }
+
+    private enqueueRecord(record: LogRecord) {
+        this._pendingRecords.push(record);
+        if (this._flushHandle !== null) {
             return;
         }
 
-        // Scroll down if the log is visible and already scrolled to the bottom
+        this._flushHandle = window.setTimeout(() => {
+            this._flushHandle = null;
+            this.flushPendingRecords();
+        }, LogsPageComponent.UPDATE_BATCH_DELAY_MS);
+    }
+
+    private flushPendingRecords() {
+        if (this._pendingRecords.length === 0) {
+            return;
+        }
+
+        // Only auto-follow when the log view is visible and already at the tail.
         const scrollToBottom = this._elementRef.nativeElement.offsetParent != null &&
+            this.logTail &&
             LogsPageComponent.isElementInViewport(this.logTail.nativeElement);
-        this._records.push(record);
-        while (this._records.length > LogsPageComponent.MAX_LIVE_RECORDS) {
-            this._records.shift();
+        this.hasReceivedLogs = true;
+        this._records = this._records.concat(this._pendingRecords);
+        this._pendingRecords = [];
+        if (this._records.length > this._logService.maxRetainedRecords) {
+            this._records.splice(0, this._records.length - this._logService.maxRetainedRecords);
         }
-        this.renderRecords(scrollToBottom);
+        this.updateVisibleRecords(scrollToBottom);
     }
 
-    private renderRecords(scrollToBottom: boolean) {
-        if (!this.container || !this.templateRecord) {
-            return;
-        }
-
-        this.container.clear();
-        this.filteredRecords.forEach(record => {
-            this.container.createEmbeddedView(this.templateRecord, {record: record});
-        });
+    private updateVisibleRecords(scrollToBottom: boolean) {
+        const filteredRecords = this.getFilteredRecords();
+        this.filteredRecordCount = filteredRecords.length;
+        this.hiddenRecordCount = Math.max(
+            0,
+            filteredRecords.length - LogsPageComponent.MAX_VISIBLE_RECORDS
+        );
+        this.visibleRecords = filteredRecords.slice(-LogsPageComponent.MAX_VISIBLE_RECORDS);
         this._changeDetector.detectChanges();
-
         if (scrollToBottom) {
             this.scrollToBottom();
         }
         this.refreshScrollButtonVisibility();
     }
 
-    private get filteredRecords(): LogRecord[] {
+    private getFilteredRecords(): LogRecord[] {
         const query = this.searchQuery.trim().toLowerCase();
         if (!query) {
             return this._records;
@@ -153,6 +177,13 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
                 record.exceptionTraceback
             ].some(value => (value || "").toLowerCase().indexOf(query) !== -1);
         });
+    }
+
+    private clearPendingFlush() {
+        if (this._flushHandle !== null) {
+            clearTimeout(this._flushHandle);
+            this._flushHandle = null;
+        }
     }
 
     private refreshScrollButtonVisibility() {

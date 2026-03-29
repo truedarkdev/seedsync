@@ -1,6 +1,6 @@
 import {Injectable} from "@angular/core";
 import {Observable} from "rxjs/Observable";
-import {ReplaySubject} from "rxjs/ReplaySubject";
+import {Subject} from "rxjs/Subject";
 
 import {BaseStreamService} from "../base/base-stream.service";
 import {LogRecord} from "./log-record";
@@ -9,8 +9,10 @@ import {LoggerService} from "../utils/logger.service";
 
 @Injectable()
 export class LogService extends BaseStreamService {
+    private static readonly MAX_RETAINED_RECORDS = 20000;
 
-    private _logs: ReplaySubject<LogRecord> = new ReplaySubject();
+    private _history: LogRecord[] = [];
+    private _logs: Subject<LogRecord> = new Subject();
 
     constructor(private _logger: LoggerService) {
         super();
@@ -18,16 +20,29 @@ export class LogService extends BaseStreamService {
     }
 
     /**
-     * Logs is a hot observable (i.e. no caching)
+     * Logs is a hot observable of live appends only.
      * @returns {Observable<LogRecord>}
      */
     get logs(): Observable<LogRecord> {
         return this._logs.asObservable();
     }
 
+    getHistorySnapshot(): LogRecord[] {
+        return this._history.slice();
+    }
+
+    get maxRetainedRecords(): number {
+        return LogService.MAX_RETAINED_RECORDS;
+    }
+
     protected onEvent(eventName: string, data: string) {
         try {
-            this._logs.next(LogRecord.fromJson(JSON.parse(data)));
+            const record = LogRecord.fromJson(JSON.parse(data));
+            this._history.push(record);
+            if (this._history.length > LogService.MAX_RETAINED_RECORDS) {
+                this._history.splice(0, this._history.length - LogService.MAX_RETAINED_RECORDS);
+            }
+            this._logs.next(record);
         } catch (error) {
             this._logger.error("Failed to parse log event:", error);
         }
