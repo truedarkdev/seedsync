@@ -11,14 +11,23 @@
         </h3>
         <div id="collapse-{{id}}" class="collapse" data-parent="#accordion">
             <div class="card-body">
-                <div *ngFor="let option of options">
-                    <app-option
-                        [type]="option.type"
-                        [label]="option.label"
-                        [description]="option.description"
-                        [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
-                        (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
-                    </app-option>
+                <div [class.autoqueue-core]="id === 'autoqueue'">
+                    <div *ngFor="let option of options">
+                        <app-option
+                            [type]="option.type"
+                            [label]="option.label"
+                            [description]="option.description"
+                            [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
+                            (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
+                        </app-option>
+                    </div>
+                </div>
+                <div *ngIf="id === 'autoqueue'" class="card-subsection autoqueue-patterns">
+                    <div class="subsection-header">
+                        <h4>AutoQueue Patterns</h4>
+                        <p>Manage the filename patterns used when AutoQueue is set to pattern mode.</p>
+                    </div>
+                    <app-autoqueue-page></app-autoqueue-page>
                 </div>
             </div>
         </div>
@@ -40,14 +49,13 @@
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_AUTOQUEUE">
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_EXTRACT">
             </ng-container>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_EXTRACT">
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_AUTOQUEUE">
             </ng-container>
-
         </div>
         <div id="right">
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
@@ -65,11 +73,6 @@
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_OTHER">
             </ng-container>
         </div>
-    </div>
-
-    <div id="autoqueue-patterns">
-        <h3>AutoQueue Patterns</h3>
-        <app-autoqueue-page></app-autoqueue-page>
     </div>
 
     <div id="commands">
