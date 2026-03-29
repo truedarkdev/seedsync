@@ -1177,37 +1177,33 @@ class TestController(unittest.TestCase):
         command = Controller.Command(Controller.Command.Action.QUEUE, "rb")
         command.add_callback(callback)
         self.controller.queue_command(command)
-        # Process until download starts
-        while True:
-            self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                if new_file.name == "rc" and new_file.local_size and new_file.local_size > 0:
-                    break
+        # Process until rc starts.
+        self.__wait_for_model_file(
+            "rc",
+            lambda file: file.local_size is not None and file.local_size > 0,
+            "Timed out waiting for rc download to start",
+        )
 
         # Verify that rb is Queued
-        files = self.controller.get_model_files()
-        files_dict = {f.name: f for f in files}
-        self.assertEqual(ModelFile.State.QUEUED, files_dict["rb"].state)
+        queued_file = self.__wait_for_model_file(
+            "rb",
+            lambda file: file.state == ModelFile.State.QUEUED,
+            "Timed out waiting for rb to become queued",
+        )
+        self.assertEqual(ModelFile.State.QUEUED, queued_file.state)
 
         # Now stop the queued
         self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, "rb"))
 
         # Process until queued stops
-        while True:
-            self.controller.process()
-            break_out = False
-            for call in listener.file_updated.call_args_list:
-                new_file = call[0][1]
-                if new_file.name == "rb" and new_file.state == ModelFile.State.DEFAULT:
-                    break_out = True
-            if break_out:
-                break
+        self.__wait_for_model_file(
+            "rb",
+            lambda file: file.state == ModelFile.State.DEFAULT,
+            "Timed out waiting for queued file to stop",
+        )
 
         # Verify that rc is Downloading, rb is Default
-        files = self.controller.get_model_files()
-        files_dict = {f.name: f for f in files}
+        files_dict = {f.name: f for f in self.controller.get_model_files()}
         self.assertEqual(ModelFile.State.DOWNLOADING, files_dict["rc"].state)
         self.assertEqual(ModelFile.State.DEFAULT, files_dict["rb"].state)
 
@@ -2588,8 +2584,28 @@ class TestController(unittest.TestCase):
             "Timed out waiting for partial download progress before stop",
             max_iterations=3000,
         )
-        stable_file_id = partial_file.file_id
         partial_size = partial_file.local_size
+
+        # Seed the pget sidecar so STOP sees the controller's current stoppable gate deterministically.
+        local_incomplete_dir = os.path.join(TestController.temp_dir, "local", "incomplete")
+        os.makedirs(local_incomplete_dir, exist_ok=True)
+        status_payload = "size={}\n0.pos={}\n0.limit={}\n".format(remote_size, partial_size, remote_size)
+        for status_name in (
+            "{}.lftp-pget-status".format(remote_name),
+            "{}.lftp.lftp-pget-status".format(remote_name),
+        ):
+            with open(os.path.join(local_incomplete_dir, status_name), "w") as handle:
+                handle.write(status_payload)
+        self.controller._Controller__local_scan_process.force_scan()
+        self.controller._Controller__active_scan_process.force_scan()
+
+        partial_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DOWNLOADING and
+            file.local_size is not None and file.local_size >= partial_size and file.is_stoppable,
+            "Timed out waiting for download to become stoppable before stop",
+        )
+        stable_file_id = partial_file.file_id
 
         self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
         stopped_file = self.__wait_for_model_file(
