@@ -59,6 +59,18 @@ class NameFilterCriteria implements ViewFileFilterCriteria {
     }
 }
 
+class PathPairFilterCriteria implements ViewFileFilterCriteria {
+    constructor(private _pathPairId: string) {}
+
+    get pathPairId(): string {
+        return this._pathPairId;
+    }
+
+    meetsCriteria(viewFile: ViewFile): boolean {
+        return this._pathPairId == null || this._pathPairId === viewFile.pathPairId;
+    }
+}
+
 
 /**
  * ViewFileFilterService class provides filtering services for
@@ -71,6 +83,7 @@ class NameFilterCriteria implements ViewFileFilterCriteria {
 export class ViewFileFilterService {
     private _statusFilter: StatusFilterCriteria = null;
     private _nameFilter: NameFilterCriteria = null;
+    private _pathPairFilter: PathPairFilterCriteria = null;
 
     constructor(private _logger: LoggerService,
                 private _viewFileService: ViewFileService,
@@ -101,15 +114,41 @@ export class ViewFileFilterService {
         });
     }
 
+    public setPathPairFilter(pathPairId: string): void {
+        const normalizedPathPairId = pathPairId == null || pathPairId === "" ? null : pathPairId;
+        if (normalizedPathPairId == null) {
+            if (this._pathPairFilter != null) {
+                this._pathPairFilter = null;
+                this._logger.debug("Path pair filter cleared");
+                this._viewFileService.setFilterCriteria(this.buildFilterCriteria());
+            }
+            return;
+        }
+
+        if (this._pathPairFilter == null || this._pathPairFilter.pathPairId !== normalizedPathPairId) {
+            this._pathPairFilter = new PathPairFilterCriteria(normalizedPathPairId);
+            this._logger.debug("Path pair filter set to: " + normalizedPathPairId);
+            this._viewFileService.setFilterCriteria(this.buildFilterCriteria());
+        }
+    }
+
     private buildFilterCriteria(): ViewFileFilterCriteria {
-        if (this._statusFilter != null && this._nameFilter != null) {
-            return new AndFilterCriteria(this._statusFilter, this._nameFilter);
-        } else if (this._statusFilter != null) {
-            return this._statusFilter;
-        } else if (this._nameFilter != null) {
-            return this._nameFilter;
-        } else {
+        const criteria: ViewFileFilterCriteria[] = [
+            this._statusFilter,
+            this._nameFilter,
+            this._pathPairFilter
+        ].filter(criteriaItem => criteriaItem != null);
+
+        if (criteria.length === 0) {
             return null;
         }
+        if (criteria.length === 1) {
+            return criteria[0];
+        }
+
+        return criteria.slice(1).reduce(
+            (combinedCriteria, nextCriteria) => new AndFilterCriteria(combinedCriteria, nextCriteria),
+            criteria[0]
+        );
     }
 }

@@ -2,9 +2,10 @@ import {AfterViewInit, Component, ElementRef, OnDestroy, OnInit, ViewChild} from
 import {NavigationEnd, Router} from "@angular/router";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
-import {ROUTE_INFOS, RouteInfo} from "../../routes";
+import {ROUTE_INFOS} from "../../routes";
 
 import {DomService} from "../../services/utils/dom.service";
+import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 
 @Component({
     selector: "app-root",
@@ -15,20 +16,31 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     @ViewChild("topHeader") topHeader: ElementRef;
 
     showSidebar = false;
-    activeRoute: RouteInfo;
+    activeTitle = "";
     private _destroy$: Subject<void> = new Subject<void>();
     private _resizeObserver: any = null;
+    private _pathPairs: PathPair[] = [];
 
     constructor(private router: Router,
+                private _pathPairService: PathPairService,
                 private _domService: DomService) {}
 
     ngOnInit() {
+        this._pathPairService.pathPairs.takeUntil(this._destroy$).subscribe({
+            next: (pathPairs: PathPair[]) => {
+                this._pathPairs = pathPairs || [];
+                this._updateActiveTitle();
+            }
+        });
+
         // Navigation listener
         //    Close the sidebar
         //    Store the active route
-        this.router.events.takeUntil(this._destroy$).subscribe(() => {
+        this.router.events.takeUntil(this._destroy$).subscribe((evt) => {
             this.showSidebar = false;
-            this.activeRoute = ROUTE_INFOS.find(value => "/" + value.path === this.router.url);
+            if (evt instanceof NavigationEnd) {
+                this._updateActiveTitle();
+            }
         });
 
         // Scroll to top on route changes
@@ -38,6 +50,8 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             }
             window.scrollTo(0, 0);
         });
+
+        this._updateActiveTitle();
     }
 
     ngAfterViewInit() {
@@ -62,4 +76,39 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     }
 
     title = "app";
+
+    private _updateActiveTitle(): void {
+        const currentUrl = (this.router.url || "").split(/[?#]/)[0];
+        const routeInfo = ROUTE_INFOS.find(value => `/${value.path}` === currentUrl);
+        if (routeInfo != null) {
+            this.activeTitle = routeInfo.name;
+            return;
+        }
+
+        const pathPairMatch = currentUrl.match(/^\/dashboard\/([^/]+)$/);
+        if (pathPairMatch != null && this._hasMultipleEnabledPathPairs()) {
+            const pathPairId = this._decodePathPairId(pathPairMatch[1]);
+            if (pathPairId != null) {
+                const enabledPathPair = this._pathPairs.find(pair => pair.enabled && pair.id === pathPairId);
+                this.activeTitle = enabledPathPair != null ? enabledPathPair.name : "Dashboard";
+            } else {
+                this.activeTitle = "Dashboard";
+            }
+            return;
+        }
+
+        this.activeTitle = currentUrl.indexOf("/dashboard") === 0 ? "Dashboard" : "";
+    }
+
+    private _hasMultipleEnabledPathPairs(): boolean {
+        return this._pathPairs.filter(pair => pair.enabled).length > 1;
+    }
+
+    private _decodePathPairId(encodedPathPairId: string): string {
+        try {
+            return decodeURIComponent(encodedPathPairId);
+        } catch (error) {
+            return null;
+        }
+    }
 }

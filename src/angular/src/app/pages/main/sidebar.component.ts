@@ -1,4 +1,6 @@
-import {Component, OnInit} from "@angular/core";
+import {Component, OnDestroy, OnInit} from "@angular/core";
+import {Subject} from "rxjs/Subject";
+import "rxjs/add/operator/takeUntil";
 
 import {ROUTE_INFOS} from "../../routes";
 import {ServerCommandService} from "../../services/server/server-command.service";
@@ -7,6 +9,13 @@ import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
 import {Notification} from "../../services/utils/notification";
 import {NotificationService} from "../../services/utils/notification.service";
+import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
+
+interface SidebarPathPairRoute {
+    path: string;
+    name: string;
+    icon: string;
+}
 
 @Component({
     selector: "app-sidebar",
@@ -14,15 +23,20 @@ import {NotificationService} from "../../services/utils/notification.service";
     styleUrls: ["./sidebar.component.scss"]
 })
 
-export class SidebarComponent implements OnInit {
-    routeInfos = ROUTE_INFOS;
+export class SidebarComponent implements OnInit, OnDestroy {
+    dashboardRouteInfo = ROUTE_INFOS.find(value => value.path === "dashboard");
+    routeInfos = ROUTE_INFOS.filter(value => value.path !== "dashboard");
+    pathPairRoutes: SidebarPathPairRoute[] = [];
+    hasMultipleEnabledPathPairs = false;
 
     public commandsEnabled: boolean;
 
     private _connectedService: ConnectedService;
+    private readonly _destroy$ = new Subject<void>();
 
     constructor(private _logger: LoggerService,
                 _streamServiceRegistry: StreamServiceRegistry,
+                private _pathPairService: PathPairService,
                 private _commandService: ServerCommandService,
                 private _notificationService: NotificationService) {
         this._connectedService = _streamServiceRegistry.connectedService;
@@ -36,6 +50,25 @@ export class SidebarComponent implements OnInit {
                 this.commandsEnabled = connected;
             }
         });
+
+        this._pathPairService.pathPairs
+            .takeUntil(this._destroy$)
+            .subscribe({
+                next: (pathPairs: PathPair[]) => {
+                    const enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);
+                    this.hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
+                    this.pathPairRoutes = enabledPathPairs.map(pair => ({
+                        path: `dashboard/${encodeURIComponent(pair.id)}`,
+                        name: pair.name,
+                        icon: "assets/icons/directory.svg"
+                    }));
+                }
+            });
+    }
+
+    ngOnDestroy(): void {
+        this._destroy$.next();
+        this._destroy$.complete();
     }
 
     onCommandRestart() {
