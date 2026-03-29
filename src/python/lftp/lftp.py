@@ -18,6 +18,7 @@ from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatus
 # How many status errors are allowed before error propagates out
 MAX_CONSECUTIVE_STATUS_ERRORS = 2
 MAX_KILL_MATCH_ATTEMPTS = 20
+STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS = 1.0
 
 
 class LftpError(AppError):
@@ -197,11 +198,16 @@ class Lftp:
     def __run_command(self, command: str, timeout_seconds: Optional[int] = None, require_prompt_ready: bool = True, status_poll: bool = False):
         self.__last_command_timed_out = False
         restore_delaybeforesend = None
+        restore_delayafterread = None
         out = ""
         log_command_output = self.__log_command_output and not status_poll
         if status_poll:
             restore_delaybeforesend = getattr(self.__process, "delaybeforesend", None)
-            self.__process.delaybeforesend = 0
+            restore_delayafterread = getattr(self.__process, "delayafterread", None)
+            if restore_delaybeforesend is not None:
+                self.__process.delaybeforesend = 0
+            if restore_delayafterread is not None:
+                self.__process.delayafterread = 0
         try:
             if require_prompt_ready:
                 self.__ensure_prompt_ready("running command")
@@ -225,31 +231,51 @@ class Lftp:
                     return ""
                 raise
             timeout_seconds = self.__timeout if timeout_seconds is None else timeout_seconds
+            prompt_reached = False
             try:
-                self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
-            except pexpect.exceptions.TIMEOUT:
-                self.__last_command_timed_out = True
-                out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
-                if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
-                    self.logger.warning("Lftp timeout exception")
-                pass
-            except pexpect.exceptions.EOF:
-                self.logger.error("Lftp process died unexpectedly (EOF)")
-                raise LftpError("Lftp process terminated: {}".format(
-                    self.__normalize_output(self.__process.before.decode("utf8", "replace"))
-                ))
-            except pexpect.exceptions.ExceptionPexpect as exc:
                 if status_poll:
-                    self.__last_command_timed_out = True
-                    self.logger.warning("Ignoring status poll failure: {}".format(exc))
-                    return ""
-                raise
-            except OSError as exc:
-                if status_poll:
-                    self.__last_command_timed_out = True
-                    self.logger.warning("Ignoring status poll failure: {}".format(exc))
-                    return ""
-                raise
+                    try:
+                        status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
+                        status_poll_deadline = time.monotonic() + status_poll_timeout_seconds
+                        while True:
+                            try:
+                                self.__process.expect(self.__expect_pattern, timeout=0)
+                                prompt_reached = True
+                                break
+                            except pexpect.exceptions.TIMEOUT:
+                                if time.monotonic() >= status_poll_deadline:
+                                    break
+                                time.sleep(0.01)
+                            except pexpect.exceptions.EOF:
+                                self.__last_command_timed_out = True
+                                self.logger.error("Lftp process died unexpectedly (EOF)")
+                                raise LftpError("Lftp process terminated: {}".format(
+                                    self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                                ))
+                    except pexpect.exceptions.ExceptionPexpect as exc:
+                        self.__last_command_timed_out = True
+                        self.logger.warning("Ignoring status poll failure: {}".format(exc))
+                        return ""
+                    except OSError as exc:
+                        self.__last_command_timed_out = True
+                        self.logger.warning("Ignoring status poll failure: {}".format(exc))
+                        return ""
+                    if not prompt_reached:
+                        self.__last_command_timed_out = True
+                else:
+                    try:
+                        self.__process.expect(self.__expect_pattern, timeout=timeout_seconds)
+                    except pexpect.exceptions.TIMEOUT:
+                        self.__last_command_timed_out = True
+                        out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                        if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "running command"):
+                            self.logger.warning("Lftp timeout exception")
+                        pass
+                    except pexpect.exceptions.EOF:
+                        self.logger.error("Lftp process died unexpectedly (EOF)")
+                        raise LftpError("Lftp process terminated: {}".format(
+                            self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+                        ))
             finally:
                 out = self.__normalize_output(self.__process.before.decode('utf8', 'replace'))
 
@@ -261,6 +287,9 @@ class Lftp:
                     after = self.__process.after.decode('utf8', 'replace').strip() \
                         if self.__process.after not in (pexpect.TIMEOUT, None) else ""
                     self.logger.debug("after: {}".format(after))
+
+            if status_poll and not prompt_reached:
+                out = ""
 
             # let's try and detect some errors
             if self.__detect_errors_from_output(out):
@@ -289,8 +318,10 @@ class Lftp:
                     self.__pending_error = error_out
             return out
         finally:
-            if status_poll and restore_delaybeforesend is not None:
+            if restore_delaybeforesend is not None:
                 self.__process.delaybeforesend = restore_delaybeforesend
+            if restore_delayafterread is not None:
+                self.__process.delayafterread = restore_delayafterread
 
     @staticmethod
     def __detect_errors_from_output(out: str) -> bool:
@@ -452,7 +483,7 @@ class Lftp:
         :return:
         """
         try:
-            out = self.__run_command("jobs -v", timeout_seconds=1, require_prompt_ready=False, status_poll=True)
+            out = self.__run_command("jobs -v", timeout_seconds=0, require_prompt_ready=False, status_poll=True)
         except pexpect.exceptions.TIMEOUT:
             self.__consecutive_status_errors = 0
             self.__last_command_timed_out = True
@@ -564,7 +595,7 @@ class Lftp:
             "\"{local_dir}/\"".format(local_dir=escape(local_dir)),
             "'"
         ])
-        self.__run_command(command)
+        self.__run_command(command, require_prompt_ready=False)
 
     def kill(self,
              name: str,
@@ -634,10 +665,10 @@ class Lftp:
             #       in this case the wrong job may be killed, there's nothing we can do about it
             if job_to_kill.state == LftpJobStatus.State.RUNNING:
                 self.logger.debug("Killing running job '{}'...".format(name))
-                self.__run_command("kill {}".format(job_to_kill.id))
+                self.__run_command("kill {}".format(job_to_kill.id), require_prompt_ready=False)
             elif job_to_kill.state == LftpJobStatus.State.QUEUED:
                 self.logger.debug("Killing queued job '{}'...".format(name))
-                self.__run_command("queue --delete {}".format(job_to_kill.id))
+                self.__run_command("queue --delete {}".format(job_to_kill.id), require_prompt_ready=False)
             else:
                 raise NotImplementedError("Unsupported state {}".format(str(job_to_kill.state)))
         else:
@@ -655,7 +686,7 @@ class Lftp:
         """
         # empty the queue and kill running jobs
         self.__run_command("queue -d *", require_prompt_ready=False)
-        self.__run_command("kill all", require_prompt_ready=False)
+        self.__run_command("kill all", require_prompt_ready=False, timeout_seconds=0)
 
     def exit(self):
         """

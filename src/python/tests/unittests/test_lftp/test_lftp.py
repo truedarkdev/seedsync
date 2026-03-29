@@ -144,6 +144,7 @@ class TestLftp(unittest.TestCase):
         process.before = b""
         process.after = b"prompt>"
         process.delaybeforesend = 7
+        process.delayafterread = 11
         process.expect.return_value = None
         if send_side_effect is not None:
             process.send.side_effect = send_side_effect
@@ -261,7 +262,7 @@ class TestLftp(unittest.TestCase):
         lftp.logger.warning.assert_called_once()
         lftp._Lftp__run_command.assert_called_once_with(
             "jobs -v",
-            timeout_seconds=1,
+            timeout_seconds=0,
             require_prompt_ready=False,
             status_poll=True
         )
@@ -276,8 +277,10 @@ class TestLftp(unittest.TestCase):
         self.assertFalse(lftp.last_status_poll_healthy)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
+        self.assertEqual(11, lftp._Lftp__process.delayafterread)
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
-        lftp._Lftp__process.expect.assert_called_once_with("prompt>", timeout=1)
+        self.assertGreaterEqual(lftp._Lftp__process.expect.call_count, 1)
+        self.assertTrue(all(call.kwargs.get("timeout") == 0 for call in lftp._Lftp__process.expect.call_args_list))
         lftp.logger.warning.assert_called_once()
 
     def test_status_marks_poll_unhealthy_when_jobs_command_raises_oserror(self):
@@ -290,9 +293,101 @@ class TestLftp(unittest.TestCase):
         self.assertFalse(lftp.last_status_poll_healthy)
         self.assertTrue(lftp._Lftp__last_command_timed_out)
         self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
+        self.assertEqual(11, lftp._Lftp__process.delayafterread)
         lftp._Lftp__process.send.assert_called_once_with("jobs -v\n")
-        lftp._Lftp__process.expect.assert_called_once_with("prompt>", timeout=1)
+        self.assertGreaterEqual(lftp._Lftp__process.expect.call_count, 1)
+        self.assertTrue(all(call.kwargs.get("timeout") == 0 for call in lftp._Lftp__process.expect.call_args_list))
         lftp.logger.warning.assert_called_once()
+
+    def test_status_poll_loop_retries_until_deadline_on_timeouts(self):
+        lftp = self._build_status_poll_test_lftp()
+        process = lftp._Lftp__process
+        call_count = {"value": 0}
+
+        def expect_side_effect(pattern, timeout):
+            call_count["value"] += 1
+            raise pexpect.exceptions.TIMEOUT("timeout")
+
+        process.expect.side_effect = expect_side_effect
+        monotonic_values = iter([0.0, 0.01, 1.01])
+        sleep_calls = []
+        with patch("lftp.lftp.time.monotonic", side_effect=lambda: next(monotonic_values)), \
+             patch("lftp.lftp.time.sleep", side_effect=lambda value: sleep_calls.append(value)):
+            statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertTrue(lftp._Lftp__last_command_timed_out)
+        self.assertEqual(2, process.expect.call_count)
+        self.assertTrue(all(call.kwargs.get("timeout") == 0 for call in process.expect.call_args_list))
+        self.assertEqual([0.01], sleep_calls)
+
+    def test_run_command_status_poll_exhausts_to_empty_snapshot(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        lftp._Lftp__last_command_timed_out = False
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = b"stale buffered output"
+        process.after = pexpect.TIMEOUT
+        process.delaybeforesend = 7
+        process.delayafterread = 11
+        process.send.return_value = None
+        process.expect.side_effect = pexpect.exceptions.TIMEOUT("timeout")
+        lftp._Lftp__process = process
+
+        monotonic_values = iter([0.0, 0.01, 1.01])
+        with patch("lftp.lftp.time.monotonic", side_effect=lambda: next(monotonic_values)), \
+             patch("lftp.lftp.time.sleep"):
+            out = lftp._Lftp__run_command(
+                "jobs -v",
+                timeout_seconds=0,
+                require_prompt_ready=False,
+                status_poll=True
+            )
+
+        self.assertEqual("", out)
+        self.assertTrue(lftp._Lftp__last_command_timed_out)
+        self.assertEqual(2, process.expect.call_count)
+        self.assertTrue(all(call.kwargs.get("timeout") == 0 for call in process.expect.call_args_list))
+        self.assertEqual(7, process.delaybeforesend)
+        self.assertEqual(11, process.delayafterread)
+
+    def test_status_restores_process_read_delays_after_poll(self):
+        lftp = self._build_status_poll_test_lftp()
+
+        statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
+        self.assertEqual(11, lftp._Lftp__process.delayafterread)
+
+    def test_run_command_preserves_process_read_delays_when_not_status_poll(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        lftp._Lftp__last_command_timed_out = False
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = b"command output"
+        process.after = b"prompt>"
+        process.delaybeforesend = 7
+        process.delayafterread = 11
+        process.expect.side_effect = [None, None]
+        lftp._Lftp__process = process
+
+        out = lftp._Lftp__run_command("ls")
+
+        self.assertEqual("command output", out)
+        self.assertEqual(7, process.delaybeforesend)
+        self.assertEqual(11, process.delayafterread)
 
     def test_status_logs_bounded_summary_when_verbose(self):
         lftp = self._build_status_poll_test_lftp()
@@ -336,7 +431,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual([], statuses)
         lftp._Lftp__run_command.assert_called_once_with(
             "jobs -v",
-            timeout_seconds=1,
+            timeout_seconds=0,
             require_prompt_ready=False,
             status_poll=True
         )
@@ -484,7 +579,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(
             [
                 call("queue -d *", require_prompt_ready=False),
-                call("kill all", require_prompt_ready=False),
+                call("kill all", require_prompt_ready=False, timeout_seconds=0),
             ],
             lftp._Lftp__run_command.call_args_list
         )
