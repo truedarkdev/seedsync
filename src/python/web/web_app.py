@@ -66,9 +66,30 @@ class WebApp(bottle.Bottle):
         self.__controller = controller
         self.__html_path = context.args.html_path
         self.__status = context.status
+        self.__config = getattr(context, "config", None)
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
         self.__streaming_handlers = []  # list of (handler, kwargs) pairs
+
+        @self.hook("before_request")
+        def __validate_host_header():
+            if not WebApp.__is_server_path(bottle.request.path):
+                return
+
+            allowed_hostname = WebApp.__normalize_hostname(
+                WebApp.__get_allowed_hostname(self.__config)
+            )
+            if not allowed_hostname:
+                return
+
+            host = WebApp.__normalize_hostname(
+                WebApp.__strip_host_port(bottle.request.get_header("Host", ""))
+            )
+
+            # Best-effort local protection only: preserve loopback/container/dev access
+            # while letting an explicit configured hostname narrow exposure.
+            if host not in {"localhost", "127.0.0.1", "[::1]", allowed_hostname}:
+                bottle.abort(400)
 
     def add_default_routes(self):
         """
@@ -114,9 +135,40 @@ class WebApp(bottle.Bottle):
     def stop(self):
         """
         Exit gracefully, kill any connections and clean up any state
-        :return: 
+        :return:
         """
         object.__setattr__(self, "_stop", True)
+
+    @staticmethod
+    def __get_allowed_hostname(config) -> str:
+        general_config = getattr(config, "general", None)
+        if general_config is None:
+            return ""
+        allowed_hostname = getattr(general_config, "allowed_hostname", "")
+        return allowed_hostname if isinstance(allowed_hostname, str) else ""
+
+    @staticmethod
+    def __is_server_path(path: str) -> bool:
+        return path == "/server" or path.startswith("/server/")
+
+    @staticmethod
+    def __strip_host_port(host: str) -> str:
+        if ":" in host and not host.startswith("["):
+            return host.rsplit(":", 1)[0]
+        if host.startswith("[") and "]:" in host:
+            return host.rsplit(":", 1)[0]
+        return host
+
+    @staticmethod
+    def __normalize_hostname(host: str) -> str:
+        normalized = host.strip().lower()
+        if normalized.endswith("."):
+            normalized = normalized[:-1]
+        if normalized.startswith("[") and normalized.endswith("]"):
+            return normalized
+        if ":" in normalized:
+            return "[{}]".format(normalized)
+        return normalized
 
     def __index(self):
         """

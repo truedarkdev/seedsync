@@ -140,6 +140,7 @@ class TestSeedsync(unittest.TestCase):
         config2 = Config.from_dict(config_dict)
         config2_dict = config2.as_dict()
         self.assertEqual(config_dict, config2_dict)
+        self.assertEqual("", config.general.allowed_hostname)
 
     def test_detect_incomplete_config(self):
         # Test a complete config

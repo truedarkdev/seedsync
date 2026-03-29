@@ -1,0 +1,57 @@
+# thejuran Refresh Ledger
+
+Frozen range:
+- Source branch: `thejuran/master`
+- Frozen base (exclusive): `36c13b3f0acf5b9f0df738cd9964a44f31885771`
+- Frozen tip (inclusive): `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`
+- Frozen commit count: `46`
+- Working rule: keep rows in strict oldest-to-newest order and leave untouched rows as `not yet reviewed`.
+
+## Frozen Commit Rows
+
+1. `c84bc4d7dbe15991734a4ed9ebb8846732bd988a` - fix: replace insecure tempfile.mktemp with NamedTemporaryFile - Disposition: already integrated. Rationale: the unsafe temp-file helper in `test_common/test_config.py` now uses `NamedTemporaryFile`, and the touched config tests passed.
+2. `34537d1339fce733e6f1037af7d4ab3b5d26ddd7` - docs(M002): context, requirements, and roadmap - Disposition: not yet reviewed
+3. `a7fac6d5d68092d6f8fe9ca27d3d98ae89353830` - feat(M002/S01): API token authentication - Disposition: needs new integration task. Rationale: the full backend/frontend auth flow is broader than this refresh seed in the legacy Angular 4 stack.
+4. `7bce7f18d0f83581d4f5746820f337f2c40ec465` - docs(M003): context, requirements, and roadmap - Disposition: not yet reviewed
+5. `96b10a8dc197ae99f83f59f0e790b2d5a08e9ed4` - feat(M002/S02): CONF-04 fix and DNS rebinding prevention - Disposition: needs new integration task. Rationale: the host-gate portion is now covered by the local `allowed_hostname` config field and `WebApp` validation, but the conditional config-redaction half belongs with the deferred auth slice.
+6. `12d801a90ab96aa889de42652387882b74d53b17` - feat(M002/S03): CSP hardening with Angular autoCsp - Disposition: intentionally skipped. Rationale: this repo is still on the older Angular 4 CLI layout, so the autoCsp-based policy split is not a straight import.
+7. `99bb511cf55f74a1abc882a7663755bdb574a09e` - feat(M003): UI redesign — earthy palette - Disposition: not yet reviewed
+8. `dd3285040b190a7d59d0acde54d0834eb2ab867b` - fix: code review — XSS escape, test cleanup, SCSS variable, dead CSP/CSS - Disposition: needs new integration task. Rationale: the cleanup bundle is tied to the broader auth/CSP branch and style churn, so only the safer refresh seed was imported here.
+9. `b0082e584016317196c6c86311f97b2c895a6994` - chore: bump version to 3.3.0-dev.1 - Disposition: not yet reviewed
+10. `09fb2f497a69599adc9cfb64535b512c58c51cd6` - fix: CI test failures — add allowed_hostname to test fixtures, fix config redaction assertion - Disposition: needs new integration task. Rationale: the allowed_hostname fixture updates were folded into the local config/tests, but the auth_valid/redaction assertion change depends on the deferred auth work.
+11. `0e36aa3fa7c666970f2e269254facb43889adaca` - fix: make Host header validation opt-in via allowed_hostname - Disposition: already integrated. Rationale: `WebApp` now accepts `/server/*` requests only when the configured hostname is explicitly present, while still allowing the loopback defaults as a best-effort local bypass rather than full public-exposure hardening.
+12. `353ee62c6c5bf1e86a87c70702d5fed773beff16` - fix: E2E test failures — revert auto-generated token, update E2E for nav bar - Disposition: covered elsewhere. Rationale: the repo already keeps `api_token` empty by default; the remaining Playwright selector churn is a separate UI task.
+13. `6274fe99baf79676f96de0b31f2cfb9949762907` - fix: CSP dual-policy conflict blocking Angular bootstrap - Disposition: intentionally skipped. Rationale: it depends on the newer Angular autoCsp/meta-policy model, which is not present in this repository's frontend baseline.
+14. `92fd1decb61b4968cd242ad478d5d4e238aee84a` - feat(M004): polish & dependency updates — R017, R040, 20 deps, code review - Disposition: not yet reviewed
+15. `d311b63b14fa04c8db545a6e3f1dbcacc73b881b` - docs: update PROJECT and STATE after M004 merge - Disposition: not yet reviewed
+16. `eaf3964223a24a637fdfdda59480c168826c9375` - fix: bump requests 2.32.5 → 2.33.0 (CVE-2026-25645) - Disposition: not yet reviewed
+17. `9bcbf0c53b94a7dda32b9695448a8dbb11d7b7b7` - fix: increase E2E timeouts for CI/QEMU environments - Disposition: not yet reviewed
+18. `4682baa297a69dcaef08cb0af792910f39f1f3e9` - fix: E2E test fixes — shift+click modifiers, Playwright waits - Disposition: not yet reviewed
+19. `8fce6bdaa61c43931b1097e625c41971f1da533c` - fix: pass CI=true to E2E test container for proper retries/timeouts - Disposition: not yet reviewed
+20. `b0d098108a6ea876171cb8a704712ac5507ff441` - docs: mark M004 complete in GSD state - Disposition: not yet reviewed
+21. `a02362c6564ed460758119273d22a50ff07db525` - feat: dashboard polish — Triggarr-style pill filters, header alignment, font scale - Disposition: not yet reviewed
+22. `93c63d171856194f7e9ebaa6141f95b89c6b2253` - fix: dashboard column alignment and font scale refinement - Disposition: not yet reviewed
+23. `437da842a94f8bca7c25c3ff696b803cd63bbe82` - feat: Deep Moss palette + Triggarr-style flat file list (#M006) - Disposition: not yet reviewed
+24. `bc031b3566e429bc4d26238dff82bfd5b5f06742` - docs: plan M007 — Settings redesign, docs/screenshots, v3.3.0 release - Disposition: not yet reviewed
+25. `06378bf6ee3632ae952c179f19127248aff9db95` - fix: E2E header checkbox selector — .checkbox → .header-inner - Disposition: not yet reviewed
+26. `edac9002202fabe3da88b67cfe19d1416fc66d91` - docs: close M006 — UAT passed on :dev image, advance to M007 - Disposition: not yet reviewed
+27. `92afca5c120e4d86d04f4d61e856a53cf9bd1bc7` - feat: Settings page Triggarr-style redesign + M007 roadmap (#M007/S01) - Disposition: not yet reviewed
+28. `2b23695c014ac47dff84910e23e08bfe5ff63b61` - feat: merge multi-select bars into single unified bar (#M007/S02) - Disposition: not yet reviewed
+29. `c512411a3c95885e439878e804f7322db08a532d` - docs: defer S03/S04 to future milestone, prepare M007 for completion - Disposition: not yet reviewed
+30. `ee5bf0af2bf0d6bd72d90999048445bb126dc60b` - fix: address all 14 TuringMind deep review findings - Disposition: not yet reviewed
+31. `693b3fa70d01f0e714c77aa7a4273fb32c8b8813` - fix: checkbox labels left-aligned, hide single-file bar during bulk select - Disposition: not yet reviewed
+32. `80f544ea33c368b0d1071c08fed4d756fcede776` - feat: merge AutoQueue page into Settings, delete standalone page (M008/S01) - Disposition: not yet reviewed
+33. `ec687c35961b6eb55f50b8445564fb61047df795` - feat: Triggarr-style toast notifications with icons and slide animation (R040) - Disposition: not yet reviewed
+34. `e6a7c0c6b5b0b3803cca100b1aee5457612e3dba` - chore: update M008 roadmap and state — S01/S02 complete, branches cleaned - Disposition: not yet reviewed
+35. `a662afc67bea01a6b50fb678fe9a5ee1b65dde84` - fix: add /autoqueue redirect to /settings, unique toast tracking IDs - Disposition: not yet reviewed
+36. `adeef833040c7c9d36e80c07e56cdcfd1942f812` - fix: address all TuringMind deep review findings for M008 - Disposition: not yet reviewed
+37. `5f447de97aad6e769009818e88a4b02a17bc59ef` - fix: add takeUntil to all remaining floating subscriptions in settings - Disposition: not yet reviewed
+38. `9b491657e60d41abb3714c04dbfb3a674313c0a0` - fix: full codebase deep review — 55 issues addressed (M009) - Disposition: not yet reviewed
+39. `2e0846952098115ca151a982380382e8a76bbe6a` - fix: revert bare except in config.py, update remote_scanner test for shlex.quote - Disposition: not yet reviewed
+40. `bc209642518819206fa2c76482bf9cfb5e062876` - docs: M009 complete — summary, roadmap, state, decisions updated - Disposition: not yet reviewed
+41. `90095109c75143b48f1d75ecd7243a0196f8a198` - docs: update screenshots and bump version to 3.3.0 - Disposition: not yet reviewed
+42. `4c553898193dc144960876ecb5231f2b1d007659` - bump version to 4.0.0 - Disposition: not yet reviewed
+43. `bc3211afe6db7ec95135267a711485aeddfe1498` - docs: M010 complete — GSD state updated - Disposition: not yet reviewed
+44. `73a736c16982e65d283da2adf4c63fe498946f23` - fix: update E2E about page version expectation to v4.0.0 - Disposition: not yet reviewed
+45. `6108c5d720adbea79ca8cf56db5a181f93798632` - fix: E2E timing stabilization for arm64/QEMU (shift-click, file deselect) - Disposition: not yet reviewed
+46. `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` - fix: increase E2E timing for arm64/QEMU — scrollIntoView, longer waits, explicit timeouts - Disposition: not yet reviewed
