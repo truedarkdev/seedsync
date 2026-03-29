@@ -216,6 +216,15 @@ cd src/python
 poetry run pytest
 ```
 
+If you need junit XML for a local run, create the repo-root `tmp/pytest/`
+tree first and write the file there. From `src/python`, a typical path looks
+like:
+
+```bash
+mkdir -p ../../tmp/pytest
+poetry run pytest --junitxml=../../tmp/pytest/python-unit.xml
+```
+
 ### Linux/WSL SSH and Archive Baseline
 
 Before chasing failures in the local Linux/WSL SSH-backed or archive-backed
@@ -274,6 +283,10 @@ Set-Location C:\Git\seedsync\src\python
 poetry install
 poetry run pytest -p no:cacheprovider
 ```
+
+If you need junit XML on the native Windows lane, create the repo-root
+`tmp\pytest\` tree first and write the file there so the artifacts stay in
+the gitignored temp tree.
 
 If you already have GNU Make available on the Windows host, the repository
 also provides a convenience wrapper:

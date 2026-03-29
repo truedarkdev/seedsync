@@ -14,6 +14,7 @@ reset=`tput sgr0`
 ROOTDIR:=$(shell realpath .)
 SOURCEDIR:=$(shell realpath ./src)
 BUILDDIR:=$(shell realpath ./build)
+PYTEST_ARTIFACT_DIR:=$(ROOTDIR)/tmp/pytest
 DEFAULT_STAGING_REGISTRY:=localhost:5000
 DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
 DEB_GLIBC_MAX:=2.31
@@ -129,6 +130,7 @@ run-tests-python: tests-python
 
 run-tests-python-native:
 	# native host python tests
+	mkdir -p ${PYTEST_ARTIFACT_DIR}
 	cd ${SOURCEDIR}/python && poetry run pytest -p no:cacheprovider
 
 tests-angular:

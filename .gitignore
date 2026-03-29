@@ -12,5 +12,7 @@ AGENTS.md
 # SSH private keys
 id_rsa
 *.pem
-ssh/
+/ssh/
 doc/maintainer-policy.md
+/.backupignore
+/tmp/
