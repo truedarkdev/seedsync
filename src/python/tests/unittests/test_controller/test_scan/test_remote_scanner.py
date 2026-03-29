@@ -8,6 +8,7 @@ import tempfile
 import os
 import json
 import shutil
+import shlex
 
 from controller.scan import RemoteScanner, ScannerError
 from ssh import SshcpError
@@ -326,8 +327,45 @@ class TestRemoteScanner(unittest.TestCase):
         scanner.scan()
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_called_with(
-            "'/remote/path/to/scan/script' '/remote/path/to/scan'"
+            "/remote/path/to/scan/script /remote/path/to/scan"
         )
+
+    def test_quotes_scan_commands_with_spaces_in_remote_paths(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path with spaces/to/scan dir",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path with spaces/to/scan script"
+        )
+
+        self.ssh_run_command_count = 0
+
+        def ssh_shell(*args):
+            self.ssh_run_command_count += 1
+            if self.ssh_run_command_count == 1:
+                return "".encode()
+            return json.dumps([]).encode()
+
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        scanner.scan()
+
+        expected_remote_script = "/remote/path with spaces/to/scan script/script"
+        self.mock_ssh.copy.assert_called_once_with(
+            local_path=TestRemoteScanner.temp_scan_script,
+            remote_path=expected_remote_script
+        )
+        self.assertEqual(2, self.mock_ssh.shell.call_count)
+        self.mock_ssh.shell.assert_has_calls([
+            call("md5sum {} | awk '{{print $1}}' || echo".format(shlex.quote(expected_remote_script))),
+            call("{} {}".format(
+                shlex.quote(expected_remote_script),
+                shlex.quote("/remote/path with spaces/to/scan dir")
+            ))
+        ])
 
     def test_raises_nonrecoverable_error_on_first_failed_ssh(self):
         scanner = RemoteScanner(
