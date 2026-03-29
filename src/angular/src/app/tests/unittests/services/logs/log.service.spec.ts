@@ -67,7 +67,7 @@ describe("Testing log service", () => {
         expect(Immutable.is(latestRecord, LogRecord.fromJson(json))).toBe(true);
     }));
 
-    it("should cache records", fakeAsync(() => {
+    it("should retain records in the history snapshot", fakeAsync(() => {
         let count = 0;
         let latestRecord: LogRecord = null;
         // noinspection JSUnusedAssignment
@@ -88,10 +88,14 @@ describe("Testing log service", () => {
             message: "LftpModel: Adding a listener"
         };
 
-        // Send out some data before subscription
         logService.notifyEvent("log-record", JSON.stringify(data1));
         logService.notifyEvent("log-record", JSON.stringify(data2));
         tick();
+
+        const history = logService.getHistorySnapshot();
+        expect(history.length).toBe(2);
+        expect(Immutable.is(history[0], LogRecord.fromJson(data1))).toBe(true);
+        expect(Immutable.is(history[1], LogRecord.fromJson(data2))).toBe(true);
 
         logService.logs.subscribe({
             next: record => {
@@ -100,18 +104,53 @@ describe("Testing log service", () => {
             }
         });
         tick();
-        // Expect some data here
-        expect(count).toBe(2);
+        expect(count).toBe(0);
 
         logService.notifyEvent("log-record", JSON.stringify(data2));
         tick();
-        expect(count).toBe(3);
+        expect(count).toBe(1);
         expect(Immutable.is(latestRecord, LogRecord.fromJson(data2))).toBe(true);
 
         logService.notifyEvent("log-record", JSON.stringify(data1));
         tick();
-        expect(count).toBe(4);
+        expect(count).toBe(2);
         expect(Immutable.is(latestRecord, LogRecord.fromJson(data1))).toBe(true);
+    }));
+
+    it("should return a defensive copy of the retained history", fakeAsync(() => {
+        const data = {
+            level_name: "WARNING",
+            time: "1514771875.9746701",
+            logger_name: "another name",
+            message: "another message"
+        };
+
+        logService.notifyEvent("log-record", JSON.stringify(data));
+        tick();
+
+        const history = logService.getHistorySnapshot();
+        history.length = 0;
+
+        expect(logService.getHistorySnapshot().length).toBe(1);
+    }));
+
+    it("should drop the oldest retained history when the snapshot exceeds the cap", fakeAsync(() => {
+        for (let index = 0; index < logService.maxRetainedRecords + 1; index++) {
+            logService.notifyEvent("log-record", JSON.stringify({
+                level_name: "INFO",
+                time: 1514771875 + index,
+                logger_name: "logger" + index,
+                message: "message " + index
+            }));
+        }
+        tick();
+
+        const history = logService.getHistorySnapshot();
+        expect(history.length).toBe(logService.maxRetainedRecords);
+        expect(history[0].loggerName).toBe("logger1");
+        expect(history[history.length - 1].loggerName).toBe(
+            "logger" + logService.maxRetainedRecords
+        );
     }));
 
     it("should ignore malformed log events", fakeAsync(() => {

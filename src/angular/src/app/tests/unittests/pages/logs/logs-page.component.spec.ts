@@ -1,4 +1,4 @@
-import {ComponentFixture, TestBed} from "@angular/core/testing";
+import {ComponentFixture, TestBed, fakeAsync, tick} from "@angular/core/testing";
 import {BehaviorSubject, Subject} from "rxjs/Rx";
 import {Observable} from "rxjs/Observable";
 import "rxjs/add/observable/of";
@@ -12,14 +12,28 @@ import {LogRecord} from "../../../../services/logs/log-record";
 
 
 class MockLogService {
+    private _history: LogRecord[] = [];
     private _logs = new Subject<LogRecord>();
 
     get logs() {
         return this._logs.asObservable();
     }
 
+    get maxRetainedRecords(): number {
+        return 20000;
+    }
+
+    getHistorySnapshot(): LogRecord[] {
+        return this._history.slice();
+    }
+
     push(record: LogRecord) {
+        this._history.push(record);
         this._logs.next(record);
+    }
+
+    seedHistory(records: LogRecord[]) {
+        this._history = records.slice();
     }
 }
 
@@ -73,9 +87,27 @@ describe("Testing logs page component", () => {
         fixture.destroy();
     });
 
-    it("should filter logs case-insensitively by logger and message text", () => {
+    it("should render the retained history snapshot on first load", () => {
+        fixture.destroy();
+        logService.seedHistory([
+            createRecord("Downloader", "queued first item"),
+            createRecord("Scanner", "Remote scan complete")
+        ]);
+
+        fixture = TestBed.createComponent(LogsPageComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        const records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(records.length).toBe(2);
+        expect(records[0].textContent).toContain("Downloader");
+        expect(records[1].textContent).toContain("Scanner");
+    });
+
+    it("should filter logs case-insensitively by logger and message text", fakeAsync(() => {
         logService.push(createRecord("Downloader", "queued first item"));
         logService.push(createRecord("Scanner", "Remote scan complete"));
+        tick(100);
         fixture.detectChanges();
 
         component.onSearchQueryChange("scan");
@@ -91,11 +123,12 @@ describe("Testing logs page component", () => {
         const updatedRecords = fixture.nativeElement.querySelectorAll("p.record");
         expect(updatedRecords.length).toBe(1);
         expect(updatedRecords[0].textContent).toContain("queued first item");
-    });
+    }));
 
-    it("should show all visible logs again when the query is cleared", () => {
+    it("should show all visible logs again when the query is cleared", fakeAsync(() => {
         logService.push(createRecord("Downloader", "queued first item"));
         logService.push(createRecord("Scanner", "Remote scan complete"));
+        tick(100);
         fixture.detectChanges();
 
         component.onSearchQueryChange("scan");
@@ -107,11 +140,12 @@ describe("Testing logs page component", () => {
 
         const records = fixture.nativeElement.querySelectorAll("p.record");
         expect(records.length).toBe(2);
-    });
+    }));
 
-    it("should filter logs from the DOM input using trimmed search text", () => {
+    it("should filter logs from the DOM input using trimmed search text", fakeAsync(() => {
         logService.push(createRecord("Downloader", "queued first item"));
         logService.push(createRecord("Scanner", "Remote scan complete"));
+        tick(100);
         fixture.detectChanges();
 
         const input = fixture.nativeElement.querySelector("#logs-filter-input");
@@ -123,11 +157,12 @@ describe("Testing logs page component", () => {
         expect(component.searchQuery).toBe("  scan  ");
         expect(records.length).toBe(1);
         expect(records[0].textContent).toContain("Scanner");
-    });
+    }));
 
-    it("should match logs by traceback text", () => {
+    it("should match logs by traceback text", fakeAsync(() => {
         logService.push(createRecord("Downloader", "queued first item"));
         logService.push(createRecord("Scanner", "Remote scan complete", "Permission denied on remote host"));
+        tick(100);
         fixture.detectChanges();
 
         component.onSearchQueryChange("permission denied");
@@ -136,5 +171,51 @@ describe("Testing logs page component", () => {
         const records = fixture.nativeElement.querySelectorAll("p.record");
         expect(records.length).toBe(1);
         expect(records[0].textContent).toContain("Scanner");
+    }));
+
+    it("should batch live updates before rerendering", fakeAsync(() => {
+        logService.push(createRecord("Downloader", "queued first item"));
+        fixture.detectChanges();
+        expect(fixture.nativeElement.querySelectorAll("p.record").length).toBe(0);
+
+        logService.push(createRecord("Scanner", "Remote scan complete"));
+        fixture.detectChanges();
+        expect(fixture.nativeElement.querySelectorAll("p.record").length).toBe(0);
+
+        tick(100);
+        fixture.detectChanges();
+
+        const records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(records.length).toBe(2);
+        expect(records[0].textContent).toContain("Downloader");
+        expect(records[1].textContent).toContain("Scanner");
+    }));
+
+    it("should keep search over retained history while rendering only the latest visible window", () => {
+        fixture.destroy();
+
+        const retainedRecords: LogRecord[] = [];
+        for (let i = 0; i < 1100; i++) {
+            retainedRecords.push(createRecord("Logger " + i, "message " + i));
+        }
+        retainedRecords[0] = createRecord("History hit", "needle");
+        retainedRecords[1099] = createRecord("Latest hit", "needle");
+        logService.seedHistory(retainedRecords);
+
+        fixture = TestBed.createComponent(LogsPageComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        const records = fixture.nativeElement.querySelectorAll("p.record");
+        expect(records.length).toBe(1000);
+        expect(fixture.nativeElement.textContent).toContain("Showing 1000 of 1100 matching log records");
+
+        component.onSearchQueryChange("needle");
+        fixture.detectChanges();
+
+        const filteredRecords = fixture.nativeElement.querySelectorAll("p.record");
+        expect(filteredRecords.length).toBe(2);
+        expect(filteredRecords[0].textContent).toContain("History hit");
+        expect(filteredRecords[1].textContent).toContain("Latest hit");
     });
 });
