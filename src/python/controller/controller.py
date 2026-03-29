@@ -296,6 +296,7 @@ class Controller:
             self.__lftp_status_cache_max_age_seconds
         ) = Controller.__lftp_status_refresh_timing(self.__context.config.controller.interval_ms_downloading_scan)
         self.__lftp_status_cache_expires_at = None
+        self.__lftp_status_poll_retry_active = False
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -869,6 +870,8 @@ class Controller:
             self.__lftp_status_cache_expires_at = None
         if not hasattr(self, "_Controller__lftp_status_cache_max_age_seconds"):
             self.__lftp_status_cache_max_age_seconds = max(3, self.__lftp_status_poll_retry_seconds * 3)
+        if not hasattr(self, "_Controller__lftp_status_poll_retry_active"):
+            self.__lftp_status_poll_retry_active = False
 
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
@@ -881,7 +884,11 @@ class Controller:
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
         now = datetime.now()
-        lftp_status_poll_due = self.__next_lftp_status_poll_at is None or now >= self.__next_lftp_status_poll_at
+        current_lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
+        lftp_status_poll_due = self.__next_lftp_status_poll_at is None or \
+            now >= self.__next_lftp_status_poll_at or \
+            (self.__last_lftp_statuses and not current_lftp_status_poll_healthy and
+             not self.__lftp_status_poll_retry_active)
         if not lftp_status_poll_due:
             if self.__last_lftp_statuses:
                 lftp_statuses = self.__last_lftp_statuses
@@ -896,6 +903,7 @@ class Controller:
                 lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
                 poll_finished_at = datetime.now()
                 if lftp_status_poll_healthy:
+                    self.__lftp_status_poll_retry_active = False
                     self.__last_lftp_statuses = lftp_statuses
                     self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
                         seconds=self.__lftp_status_cache_max_age_seconds
@@ -906,6 +914,7 @@ class Controller:
                     )
                     lftp_status_source = "fresh_healthy"
                 else:
+                    self.__lftp_status_poll_retry_active = True
                     self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
                         seconds=self.__lftp_status_poll_retry_seconds
                     )
@@ -925,6 +934,7 @@ class Controller:
                 self.logger.warning("Caught lftp error: {}".format(str(e)))
                 lftp_statuses = []
                 lftp_status_poll_healthy = False
+                self.__lftp_status_poll_retry_active = True
                 poll_finished_at = datetime.now()
                 self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
                     seconds=self.__lftp_status_poll_retry_seconds
@@ -942,6 +952,7 @@ class Controller:
 
         # Grab the latest extracted file names
         latest_extracted_results = self.__extract_process.pop_completed()
+        previous_malformed_status_only_file_ids = set(self.__malformed_status_only_file_ids)
         if latest_active_scan is not None:
             self.__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
 
@@ -957,6 +968,8 @@ class Controller:
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
             ]
+        if self.__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
+            self.__next_lftp_status_poll_at = None
         if latest_extract_statuses is not None:
             self.__active_extracting_file_names = [
                 (s.name, None, None)
@@ -992,7 +1005,7 @@ class Controller:
             self.__model_builder.set_active_files(latest_active_scan.files)
         if lftp_statuses is not None:
             self.__model_builder.set_lftp_statuses(lftp_statuses)
-            if lftp_status_snapshot_fresh and not lftp_status_poll_healthy:
+            if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
                 self.__model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                     {status.file_id for status in lftp_statuses}
                 )
