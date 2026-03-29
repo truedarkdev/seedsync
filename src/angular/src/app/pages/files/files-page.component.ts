@@ -50,13 +50,23 @@ export class FilesPageComponent implements OnInit, OnDestroy {
 
     private _updateRouteMode(): void {
         const enabledPathPairs = this._pathPairs.filter(pair => pair.enabled);
+        const selectedPathPair = this._resolveSelectedPathPair(enabledPathPairs);
         const hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
-        const selectedPathPair = hasMultipleEnabledPathPairs && this._pathPairId != null
-            ? enabledPathPairs.find(pair => pair.id === this._pathPairId)
-            : null;
 
         this.showOverview = hasMultipleEnabledPathPairs && selectedPathPair == null;
         this.showDetailView = !this.showOverview;
         this._viewFileFilterService.setPathPairFilter(selectedPathPair != null ? selectedPathPair.id : null);
+    }
+
+    private _resolveSelectedPathPair(enabledPathPairs: PathPair[]): PathPair {
+        if (enabledPathPairs.length === 1) {
+            return enabledPathPairs[0];
+        }
+
+        if (this._pathPairId != null) {
+            return enabledPathPairs.find(pair => pair.id === this._pathPairId) || null;
+        }
+
+        return null;
     }
 }
