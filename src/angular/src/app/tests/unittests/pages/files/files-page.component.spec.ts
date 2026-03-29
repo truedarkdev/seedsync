@@ -144,7 +144,23 @@ describe("Testing files page component", () => {
 
         expect(component.showOverview).toBe(false);
         expect(component.showDetailView).toBe(true);
-        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith(null);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies");
+        expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
+    });
+
+    it("falls back to the sole enabled path pair when the current route points at a disabled pair", () => {
+        route.setParams({pathPairId: "tv"});
+        pathPairService.setPathPairs([
+            createPathPair("movies", "Movies"),
+            createPathPair("tv", "TV", false)
+        ]);
+
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(true);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies");
         expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
     });
