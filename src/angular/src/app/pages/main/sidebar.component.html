@@ -1,7 +1,27 @@
 <div id="sidebar">
+    <a class="button"
+       [routerLink]="['/' + dashboardRouteInfo.path]"
+       [routerLinkActiveOptions]="{exact: true}"
+       routerLinkActive="selected">
+        <img src="{{dashboardRouteInfo.icon}}" />
+        <span class="text">{{dashboardRouteInfo.name}}</span>
+    </a>
+
+    <ng-container *ngIf="hasMultipleEnabledPathPairs">
+        <a *ngFor="let routeInfo of pathPairRoutes"
+           class="button"
+           [routerLink]="['/' + routeInfo.path]"
+           [routerLinkActiveOptions]="{exact: true}"
+           routerLinkActive="selected">
+            <img src="{{routeInfo.icon}}" />
+            <span class="text">{{routeInfo.name}}</span>
+        </a>
+    </ng-container>
+
     <a *ngFor="let routeInfo of routeInfos"
        class="button"
-       routerLink="{{routeInfo.path}}"
+       [routerLink]="['/' + routeInfo.path]"
+       [routerLinkActiveOptions]="{exact: true}"
        routerLinkActive="selected">
         <img src="{{routeInfo.icon}}" />
         <span class="text">{{routeInfo.name}}</span>

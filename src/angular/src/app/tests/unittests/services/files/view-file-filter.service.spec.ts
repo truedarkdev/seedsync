@@ -278,4 +278,42 @@ describe("Testing view file filter service", () => {
             status: ViewFile.Status.QUEUED
         }))).toBe(false);
     }));
+
+    it("composes path pair filtering with name and status filters", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            selectedStatusFilter: ViewFile.Status.QUEUED,
+            nameFilter: "tofu"
+        }));
+        tick();
+
+        viewFilterService.setPathPairFilter("movies");
+        tick();
+
+        expect(viewFileService.setFilterCriteria).toHaveBeenCalledTimes(2);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            name: "tofu",
+            status: ViewFile.Status.QUEUED,
+            pathPairId: "movies"
+        }))).toBe(true);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            name: "tofu",
+            status: ViewFile.Status.QUEUED,
+            pathPairId: "tv"
+        }))).toBe(false);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            name: "flower",
+            status: ViewFile.Status.QUEUED,
+            pathPairId: "movies"
+        }))).toBe(false);
+
+        viewFilterService.setPathPairFilter(null);
+        tick();
+
+        expect(viewFileService.setFilterCriteria).toHaveBeenCalledTimes(3);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            name: "tofu",
+            status: ViewFile.Status.QUEUED,
+            pathPairId: "tv"
+        }))).toBe(true);
+    }));
 });

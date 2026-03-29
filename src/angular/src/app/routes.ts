@@ -52,6 +52,10 @@ export const ROUTES: Routes = [
         component: FilesPageComponent
     },
     {
+        path: "dashboard/:pathPairId",
+        component: FilesPageComponent
+    },
+    {
         path: "settings",
         component: SettingsPageComponent
     },
