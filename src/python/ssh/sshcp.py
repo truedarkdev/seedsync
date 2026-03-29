@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import shutil
 import time
 
 import pexpect
@@ -56,6 +57,16 @@ class Sshcp:
         )
         self.logger.error("Command output before:\n{}".format(sp.before))
 
+    def __spawn_process(self, command: str, command_args: list):
+        spawn_factory = getattr(pexpect, "spawn", None)
+        if callable(spawn_factory):
+            return spawn_factory(command, command_args), False
+
+        from pexpect.popen_spawn import PopenSpawn
+
+        resolved_command = shutil.which(command) or command
+        return PopenSpawn([resolved_command] + command_args), True
+
     def __run_command(self,
                       command: str,
                       flags: list,
@@ -84,7 +95,7 @@ class Sshcp:
         self.logger.debug("Command: {}".format(command_args))
 
         start_time = time.time()
-        sp = pexpect.spawn(command_args[0], command_args[1:])
+        sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
         try:
             timeout_phase = "command execution"
             if self.__password is not None:
@@ -164,12 +175,24 @@ class Sshcp:
         except pexpect.exceptions.TIMEOUT:
             self.__log_timeout(timeout_phase, command, sp, start_time)
             raise SshcpError("Timed out")
-        sp.close()
+        close = getattr(sp, "close", None)
+        if callable(close):
+            close()
+        else:
+            wait = getattr(sp, "wait", None)
+            if callable(wait):
+                wait()
         end_time = time.time()
 
-        self.logger.debug("Return code: {}".format(sp.exitstatus))
+        exitstatus = getattr(sp, "exitstatus", None)
+        if exitstatus is None:
+            wait = getattr(sp, "wait", None)
+            if callable(wait):
+                exitstatus = wait()
+
+        self.logger.debug("Return code: {}".format(exitstatus))
         self.logger.debug("Command took {:.3f}s".format(end_time-start_time))
-        if sp.exitstatus != 0:
+        if exitstatus != 0:
             before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
             after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
             self.logger.warning("Command failed: '{} - {}'".format(before, after))
