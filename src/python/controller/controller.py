@@ -1282,6 +1282,9 @@ class Controller:
                         )
                         continue
                     self.__persist.stopped_file_names.add(file.file_id)
+                    # Force the next model refresh to observe the post-stop lftp state
+                    # instead of reusing the pre-stop running snapshot for one more cycle.
+                    self.__next_lftp_status_poll_at = None
                 except (LftpError, LftpJobStatusParserError) as e:
                     _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
                     continue
