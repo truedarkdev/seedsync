@@ -183,6 +183,61 @@ class TestLocalScanner(unittest.TestCase):
         self.assertFalse(files["movie.mkv"].is_staging)
         self.assertEqual(8, files["movie.mkv"].size)
 
+    def test_scan_prefers_final_nested_directory_when_staging_has_same_name_file(self):
+        staging_dir = os.path.join(self.temp_dir, "incomplete")
+        os.mkdir(staging_dir)
+        os.mkdir(os.path.join(self.temp_dir, "series"))
+        os.mkdir(os.path.join(self.temp_dir, "series", "extras"))
+        with open(os.path.join(self.temp_dir, "series", "extras", "complete.txt"), "w") as handle:
+            handle.write("complete")
+        os.mkdir(os.path.join(staging_dir, "series"))
+        with open(os.path.join(staging_dir, "series", "extras"), "w") as handle:
+            handle.write("partial")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertTrue(files["series"].is_dir)
+        self.assertFalse(files["series"].is_staging)
+        self.assertEqual(["extras"], [child.name for child in files["series"].children])
+        self.assertTrue(files["series"].children[0].is_dir)
+        self.assertFalse(files["series"].children[0].is_staging)
+        self.assertEqual(
+            ["complete.txt"],
+            [child.name for child in files["series"].children[0].children]
+        )
+
+    def test_scan_prefers_final_nested_file_when_staging_has_same_name_directory(self):
+        staging_dir = os.path.join(self.temp_dir, "incomplete")
+        os.mkdir(staging_dir)
+        os.mkdir(os.path.join(self.temp_dir, "series"))
+        with open(os.path.join(self.temp_dir, "series", "extras"), "w") as handle:
+            handle.write("complete")
+        os.mkdir(os.path.join(staging_dir, "series"))
+        os.mkdir(os.path.join(staging_dir, "series", "extras"))
+        with open(os.path.join(staging_dir, "series", "extras", "partial.txt"), "w") as handle:
+            handle.write("partial")
+
+        scanner = LocalScanner(
+            local_path=self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir
+        )
+
+        files = {system_file.name: system_file for system_file in scanner.scan()}
+
+        self.assertTrue(files["series"].is_dir)
+        self.assertFalse(files["series"].is_staging)
+        self.assertEqual(["extras"], [child.name for child in files["series"].children])
+        self.assertFalse(files["series"].children[0].is_dir)
+        self.assertFalse(files["series"].children[0].is_staging)
+        self.assertEqual(8, files["series"].children[0].size)
+
     def test_scan_rejects_non_absolute_local_path(self):
         scanner = LocalScanner(
             local_path="relative/path",
