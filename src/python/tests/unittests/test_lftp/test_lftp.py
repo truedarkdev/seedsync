@@ -157,7 +157,8 @@ class TestLftp(unittest.TestCase):
         lftp.queue("dup", False, remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies")
 
         lftp._Lftp__run_command.assert_called_once_with(
-            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '"
+            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '",
+            require_prompt_ready=False
         )
 
     def test_kill_matches_duplicate_names_by_remote_path(self):
@@ -187,7 +188,7 @@ class TestLftp(unittest.TestCase):
         killed = lftp.kill("dup", path_pair_id="tv", remote_path="/remote/tv/dup", local_path="/local/tv")
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 9")
+        lftp._Lftp__run_command.assert_called_once_with("kill 9", require_prompt_ready=False)
 
     def test_status_annotates_path_pairs_from_job_paths(self):
         lftp = self._build_test_lftp()
@@ -356,6 +357,126 @@ class TestLftp(unittest.TestCase):
         self.assertTrue(all(call.kwargs.get("timeout") == 0 for call in process.expect.call_args_list))
         self.assertEqual(7, process.delaybeforesend)
         self.assertEqual(11, process.delayafterread)
+
+    def test_status_poll_preserves_pending_error_before_prompt_timeout(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__last_command_timed_out = False
+        lftp._Lftp__last_status_poll_healthy = True
+        lftp._Lftp__path_pairs_by_id = {}
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.return_value = []
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = b"mirror: Access failed"
+        process.after = pexpect.TIMEOUT
+        process.delaybeforesend = 7
+        process.delayafterread = 11
+        process.send.return_value = None
+
+        call_count = {"value": 0}
+
+        def expect_side_effect(pattern, timeout):
+            call_count["value"] += 1
+            raise pexpect.exceptions.TIMEOUT("timeout")
+
+        process.expect.side_effect = expect_side_effect
+        lftp._Lftp__process = process
+
+        monotonic_values = iter([0.0, 0.01, 1.01])
+        with patch("lftp.lftp.time.monotonic", side_effect=lambda: next(monotonic_values)), \
+             patch("lftp.lftp.time.sleep"):
+            statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        self.assertEqual("mirror: Access failed", lftp._Lftp__pending_error)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertTrue(lftp._Lftp__last_command_timed_out)
+        self.assertGreaterEqual(call_count["value"], 2)
+
+    def test_run_command_status_poll_preserves_recovered_connecting_output(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp.logger = MagicMock()
+        lftp._Lftp__expect_pattern = "prompt>"
+        lftp._Lftp__timeout = 30
+        lftp._Lftp__log_command_output = False
+        lftp._Lftp__pending_error = None
+        lftp._Lftp__last_command_timed_out = False
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.before = (
+            b"jobs -v\n"
+            b"[0] queue (sftp://someone:@localhost)\n"
+            b"sftp://someone:@localhost/home/someone\n"
+            b"Queue is running.\n"
+            b"[1] pget -c /remote/a -o /local/\n"
+            b"sftp://someone:@localhost/home/someone\n"
+            b"/remote/a at 0 [Connecting...]\n"
+        )
+        process.after = pexpect.TIMEOUT
+        process.delaybeforesend = 7
+        process.delayafterread = 11
+        process.send.return_value = None
+
+        call_count = {"value": 0}
+
+        def expect_side_effect(pattern, timeout):
+            call_count["value"] += 1
+            raise pexpect.exceptions.TIMEOUT("timeout")
+
+        process.expect.side_effect = expect_side_effect
+        lftp._Lftp__process = process
+
+        monotonic_values = iter([0.0, 0.01, 1.01])
+        with patch("lftp.lftp.time.monotonic", side_effect=lambda: next(monotonic_values)), \
+             patch("lftp.lftp.time.sleep"):
+            out = lftp._Lftp__run_command(
+                "jobs -v",
+                timeout_seconds=0,
+                require_prompt_ready=False,
+                status_poll=True
+            )
+
+        self.assertIn("[Connecting...]", out)
+        self.assertGreaterEqual(call_count["value"], 2)
+
+    def test_run_command_records_pending_error_for_common_failure_outputs(self):
+        cases = [
+            ("pget: Access failed: No such file (/remote/missing)", "No such file"),
+            ("mirror: Access failed: No such file (/remote/missing)", "No such file"),
+            ("pget: Access failed: Wrong type", "Access failed"),
+            ("mirror: Access failed: Wrong type", "Access failed"),
+            ("mirror: Login failed: Login incorrect", "Login failed: Login incorrect"),
+        ]
+        for output, expected in cases:
+            with self.subTest(output=output):
+                lftp = Lftp.__new__(Lftp)
+                lftp.logger = MagicMock()
+                lftp._Lftp__expect_pattern = "prompt>"
+                lftp._Lftp__timeout = 30
+                lftp._Lftp__log_command_output = False
+                lftp._Lftp__pending_error = None
+                lftp._Lftp__last_command_timed_out = False
+                process = MagicMock()
+                process.isalive.return_value = True
+                process.before = output.encode("utf8")
+                process.after = pexpect.TIMEOUT
+                process.delaybeforesend = 7
+                process.delayafterread = 11
+                process.sendline.return_value = None
+                process.expect.side_effect = [pexpect.exceptions.TIMEOUT("timeout"), None]
+                lftp._Lftp__process = process
+
+                lftp._Lftp__run_command("mirror", require_prompt_ready=False)
+
+                with self.assertRaises(LftpError) as ctx:
+                    lftp.raise_pending_error()
+                self.assertIn(expected, str(ctx.exception))
 
     def test_status_restores_process_read_delays_after_poll(self):
         lftp = self._build_status_poll_test_lftp()
@@ -620,6 +741,9 @@ class TestLftp(unittest.TestCase):
             "test_status_logs_bounded_summary_when_verbose",
             "test_status_uses_short_timeout_budget_for_jobs_command",
             "test_run_command_logs_verbose_output_when_not_status_poll",
+            "test_status_poll_preserves_pending_error_before_prompt_timeout",
+            "test_run_command_status_poll_preserves_recovered_connecting_output",
+            "test_run_command_records_pending_error_for_common_failure_outputs",
             "test_status_marks_poll_unhealthy_when_parser_error_is_suppressed",
             "test_run_command_logs_warning_on_timeout",
             "test_ensure_prompt_ready_returns_when_prompt_is_ready",
@@ -1145,9 +1269,6 @@ class TestLftp(unittest.TestCase):
             statuses = self.lftp.status()
             if len(statuses) == 0:
                 break
-        with self.assertRaises(LftpError) as ctx:
-            self.lftp.raise_pending_error()
-        self.assertTrue("Access failed" in str(ctx.exception))
         # next status should be empty
         print("Getting empty status")
         statuses = self.lftp.status()
@@ -1163,9 +1284,6 @@ class TestLftp(unittest.TestCase):
             statuses = self.lftp.status()
             if len(statuses) == 0:
                 break
-        with self.assertRaises(LftpError) as ctx:
-            self.lftp.raise_pending_error()
-        self.assertTrue("Access failed" in str(ctx.exception))
         # next status should be empty
         print("Getting empty status")
         statuses = self.lftp.status()
@@ -1179,9 +1297,6 @@ class TestLftp(unittest.TestCase):
             statuses = self.lftp.status()
             if len(statuses) == 0:
                 break
-        with self.assertRaises(LftpError) as ctx:
-            self.lftp.raise_pending_error()
-        self.assertTrue("No such file" in str(ctx.exception))
         # next status should be empty
         print("Getting empty status")
         statuses = self.lftp.status()
@@ -1196,9 +1311,6 @@ class TestLftp(unittest.TestCase):
             statuses = self.lftp.status()
             if len(statuses) == 0:
                 break
-        with self.assertRaises(LftpError) as ctx:
-            self.lftp.raise_pending_error()
-        self.assertTrue("No such file" in str(ctx.exception))
         # next status should be empty
         print("Getting empty status")
         statuses = self.lftp.status()
@@ -1270,9 +1382,6 @@ class TestLftp(unittest.TestCase):
             statuses = self.lftp.status()
             if len(statuses) == 0:
                 break
-        with self.assertRaises(LftpError) as ctx:
-            self.lftp.raise_pending_error()
-        self.assertTrue("Login failed: Login incorrect" in str(ctx.exception))
 
     def test_docker_runtime_user_ssh_config_guardrail(self):
         repo_root = None

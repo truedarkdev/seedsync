@@ -65,6 +65,7 @@ class Lftp:
         self.__path_pairs_by_id: Dict[str, Dict[str, str]] = {}
         self.__last_command_timed_out = False
         self.__last_status_poll_healthy = True
+        self.__status_poll_needs_connection_grace = False
 
         self.__log_command_output = False
         self.__pending_error = None
@@ -200,8 +201,10 @@ class Lftp:
         restore_delaybeforesend = None
         restore_delayafterread = None
         out = ""
+        status_poll_timeout_seconds = None
         log_command_output = self.__log_command_output and not status_poll
         if status_poll:
+            status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
             restore_delaybeforesend = getattr(self.__process, "delaybeforesend", None)
             restore_delayafterread = getattr(self.__process, "delayafterread", None)
             if restore_delaybeforesend is not None:
@@ -232,6 +235,7 @@ class Lftp:
                 raise
             timeout_seconds = self.__timeout if timeout_seconds is None else timeout_seconds
             prompt_reached = False
+            recovered_output_preserved = False
             try:
                 if status_poll:
                     try:
@@ -288,7 +292,23 @@ class Lftp:
                         if self.__process.after not in (pexpect.TIMEOUT, None) else ""
                     self.logger.debug("after: {}".format(after))
 
-            if status_poll and not prompt_reached:
+            if status_poll and "Connecting..." in out:
+                self.__status_poll_needs_connection_grace = True
+            if status_poll and not prompt_reached and "Connecting..." in out:
+                recovered_output_preserved = True
+                try:
+                    connecting_grace_timeout = max(status_poll_timeout_seconds or 0, 5.0)
+                    self.__process.expect(self.__expect_pattern, timeout=connecting_grace_timeout)
+                except pexpect.exceptions.TIMEOUT:
+                    pass
+                except pexpect.exceptions.EOF:
+                    self.__last_command_timed_out = True
+                    self.logger.error("Lftp process died unexpectedly (EOF) during status poll recovery")
+                    raise LftpError("Lftp process terminated during status poll recovery")
+                finally:
+                    out = self.__normalize_output(self.__process.before.decode("utf8", "replace"))
+
+            if status_poll and not prompt_reached and not recovered_output_preserved and not self.__detect_errors_from_output(out):
                 out = ""
 
             # let's try and detect some errors
@@ -516,6 +536,28 @@ class Lftp:
             else:
                 raise
         self.__annotate_status_path_pairs(statuses)
+        if not statuses and getattr(self, "_Lftp__status_poll_needs_connection_grace", False) and not self.__pending_error:
+            self.__status_poll_needs_connection_grace = False
+            connection_grace_timeout = max(STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS, 5.0)
+            out = self.__run_command(
+                "jobs -v",
+                timeout_seconds=connection_grace_timeout,
+                require_prompt_ready=False,
+                status_poll=True
+            )
+            try:
+                statuses = self.__job_status_parser.parse(out)
+                self.__consecutive_status_errors = 0
+                self.__last_status_poll_healthy = not self.__last_command_timed_out
+            except LftpJobStatusParserError:
+                self.__consecutive_status_errors += 1
+                self.__last_status_poll_healthy = False
+                if self.__consecutive_status_errors <= MAX_CONSECUTIVE_STATUS_ERRORS:
+                    self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
+                    statuses = []
+                else:
+                    raise
+            self.__annotate_status_path_pairs(statuses)
         return statuses
 
     def __annotate_status_path_pairs(self, statuses: List[LftpJobStatus]):
