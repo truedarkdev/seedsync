@@ -84,7 +84,9 @@ class TestSshcp(unittest.TestCase):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password="wrong password")
         with self.assertRaises(SshcpError) as ctx:
             sshcp.copy(local_path=self.local_file, remote_path=self.remote_file)
-        self.assertEqual("Incorrect password", str(ctx.exception))
+        error_str = str(ctx.exception).lower()
+        self.assertIn("connection closed", error_str)
+        self.assertNotIn("incorrect password", error_str)
 
     @parameterized.expand(_PARAMS)
     def test_copy_error_missing_local_file(self, _, password):
@@ -174,6 +176,20 @@ class TestSshcp(unittest.TestCase):
         with self.assertRaises(SshcpError) as ctx:
             sshcp.shell("cd {}; pwd".format(self.local_dir))
         self.assertEqual("Incorrect password", str(ctx.exception))
+
+    def test_shell_error_bad_owner_or_permissions_maps_to_incorrect_password(self):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password="wrong password")
+        spawn = MagicMock()
+        spawn.expect.return_value = 1
+        spawn.before = b"Bad owner or permissions on C:\\Users\\johan/.ssh/config"
+        spawn.after = b""
+
+        with patch("ssh.sshcp.pexpect.spawn", return_value=spawn, create=True):
+            with self.assertRaises(SshcpError) as ctx:
+                sshcp.shell("cd {}; pwd".format(self.local_dir))
+
+        self.assertEqual("Incorrect password", str(ctx.exception))
+        spawn.sendline.assert_not_called()
 
     def test_shell_timeout_logs_password_prompt_context(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
