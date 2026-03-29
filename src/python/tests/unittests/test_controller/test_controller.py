@@ -249,6 +249,7 @@ class TestController(unittest.TestCase):
         ]
 
         self.controller._Controller__update_model()
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
         self.controller._Controller__update_model()
         self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
         self.controller._Controller__update_model()
