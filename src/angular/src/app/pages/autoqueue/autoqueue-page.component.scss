@@ -5,6 +5,8 @@
 
     #description {
         font-size: 100%;
+        line-height: 1.45;
+        color: #495057;
     }
 
     #controls {
@@ -12,13 +14,17 @@
             opacity: .65;
         }
 
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid #e9ecef;
+
         .pattern,
         #add-pattern {
             display: flex;
             flex-direction: row;
             flex-wrap: nowrap;
             align-items: center;
-            margin: 10px;
+            margin: 10px 0;
 
             .button {
                 @extend %button;
@@ -81,6 +87,12 @@
 
             label {
                 margin-bottom: 0;
+                flex: 1 1 auto;
+                min-width: 0;
+
+                .form-control {
+                    width: 100%;
+                }
             }
         }
     }
