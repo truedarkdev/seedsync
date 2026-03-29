@@ -67,6 +67,11 @@
         </div>
     </div>
 
+    <div id="autoqueue-patterns">
+        <h3>AutoQueue Patterns</h3>
+        <app-autoqueue-page></app-autoqueue-page>
+    </div>
+
     <div id="commands">
         <div class="button" appClickStopPropagation [attr.disabled]="commandsEnabled ? null : true"
              (click)="!commandsEnabled || onCommandRestart()">

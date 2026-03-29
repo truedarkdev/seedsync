@@ -41,6 +41,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
 
     private _connectedService: ConnectedService;
     private _destroy$: Subject<void> = new Subject<void>();
+    private _destroyed = false;
 
     private _configRestartNotif: Notification;
     private _badValueNotifs: Map<string, Notification>;
@@ -78,12 +79,13 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     }
 
     ngOnDestroy() {
+        this._destroyed = true;
         this._destroy$.next();
         this._destroy$.complete();
     }
 
     onSetConfig(section: string, option: string, value: any) {
-        this._configService.set(section, option, value).subscribe({
+        this._configService.set(section, option, value).takeUntil(this._destroy$).subscribe({
             next: reaction => {
                 const notifKey = section + "." + option;
                 if (reaction.success) {
@@ -129,9 +131,15 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
             .open();
 
         this._modalAccessibility.enhance(dialogRef).then(dRef => {
+            if (this._destroyed) {
+                return;
+            }
             dRef.result.then(
                 () => {
-                    this._commandService.restart().subscribe({
+                    if (this._destroyed) {
+                        return;
+                    }
+                    this._commandService.restart().takeUntil(this._destroy$).subscribe({
                         next: reaction => {
                             if (reaction.success) {
                                 this._logger.info(reaction.data);

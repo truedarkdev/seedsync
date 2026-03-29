@@ -9,7 +9,7 @@ describe('Testing autoqueue page', () => {
     });
 
     it('should have right top title', () => {
-        expect(page.getTopTitle()).toEqual("AutoQueue");
+        expect(page.getTopTitle()).toEqual("Settings");
     });
 
 
