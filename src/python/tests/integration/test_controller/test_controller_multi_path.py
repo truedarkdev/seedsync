@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import shlex
+import time
 from unittest.mock import PropertyMock, patch
 
 import pytest
@@ -188,16 +189,19 @@ class TestControllerMultiPath(unittest.TestCase):
             self.controller.process()
             if predicate():
                 return
+            time.sleep(0.05)
         self.fail(message)
 
     def _wait_for_duplicate_roots(self):
-        self._process_until(
-            lambda: len([
+        for _ in range(400):
+            self.controller.process()
+            if len([
                 file for file in self.controller.get_model_files()
                 if file.name == self.duplicate_name
-            ]) == 2,
-            "Timed out waiting for duplicate multi-path roots to scan",
-        )
+            ]) == 2:
+                return
+            time.sleep(0.05)
+        self.fail("Timed out waiting for duplicate multi-path roots to scan")
 
     def _get_model_file_by_pair(self, path_pair_id: str):
         for model_file in self.controller.get_model_files():
