@@ -139,6 +139,8 @@ class Controller:
         #       multi-threaded). Therefore it is safe to use a threading Lock for the model
         #       (the scanner processes never try to access the model)
         self.__model_lock = Lock()
+        self.__path_pair_refresh_lock = Lock()
+        self.__path_pair_refresh_requested = False
 
         # Model builder
         self.__model_builder = ModelBuilder()
@@ -173,88 +175,7 @@ class Controller:
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
         self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
 
-        enabled_path_pairs = []
-        if self.__context.path_pair_manager is not None:
-            enabled_path_pairs = self.__context.path_pair_manager.get_enabled_pairs()
-        self.__path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
-        if enabled_path_pairs:
-            self.__lftp.set_path_pairs([
-                PathPair(
-                    remote_path=pair.remote_path,
-                    local_path=self.__build_staging_path(pair.local_path),
-                    name=pair.name,
-                    id=pair.id,
-                    enabled=pair.enabled,
-                    auto_queue=pair.auto_queue
-                )
-                for pair in enabled_path_pairs
-            ])
-
-        # Setup the scanners and scanner processes
-        if enabled_path_pairs:
-            for pair in enabled_path_pairs:
-                pair_staging_path = self.__build_staging_path(pair.local_path)
-                self.__path_pair_staging_paths[pair.id] = pair_staging_path
-            self.__active_scanner = MultiPathActiveScanner({
-                pair.id: self.__path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
-            }, use_temp_file=self.__context.config.lftp.use_temp_file)
-            self.__local_scanner = MultiPathLocalScanner([
-                LocalScanner(
-                    local_path=pair.local_path,
-                    use_temp_file=self.__context.config.lftp.use_temp_file,
-                    staging_path=self.__path_pair_staging_paths[pair.id],
-                    managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
-                    path_pair_id=pair.id,
-                    path_pair_name=pair.name
-                ) for pair in enabled_path_pairs
-            ])
-            self.__remote_scanner = MultiPathRemoteScanner([
-                RemoteScanner(
-                    remote_address=self.__context.config.lftp.remote_address,
-                    remote_username=self.__context.config.lftp.remote_username,
-                    remote_password=self.__password,
-                    remote_port=self.__context.config.lftp.remote_port,
-                    remote_path_to_scan=pair.remote_path,
-                    local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
-                    remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script,
-                    path_pair_id=pair.id,
-                    path_pair_name=pair.name
-                ) for pair in enabled_path_pairs
-            ])
-        else:
-            self.__active_scanner = ActiveScanner(
-                self.__staging_path,
-                use_temp_file=self.__context.config.lftp.use_temp_file
-            )
-            self.__local_scanner = LocalScanner(
-                local_path=self.__context.config.lftp.local_path,
-                use_temp_file=self.__context.config.lftp.use_temp_file,
-                staging_path=self.__staging_path,
-                managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
-            )
-            self.__remote_scanner = RemoteScanner(
-                remote_address=self.__context.config.lftp.remote_address,
-                remote_username=self.__context.config.lftp.remote_username,
-                remote_password=self.__password,
-                remote_port=self.__context.config.lftp.remote_port,
-                remote_path_to_scan=self.__context.config.lftp.remote_path,
-                local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
-                remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
-            )
-
-        self.__active_scan_process = ScannerProcess(
-            scanner=self.__active_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_downloading_scan,
-            verbose=False
-        )
-        self.__local_scan_process = ScannerProcess(
-            scanner=self.__local_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_local_scan,
-        )
-        self.__remote_scan_process = ScannerProcess(
-            scanner=self.__remote_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_remote_scan,
-        )
+        self.__refresh_path_pair_runtime_state()
 
         # Setup extract process
         if self.__context.config.controller.use_local_path_as_extract_path:
@@ -305,6 +226,154 @@ class Controller:
 
         self.__started = False
 
+    def __get_enabled_path_pairs(self) -> List[PathPair]:
+        if self.__context.path_pair_manager is None:
+            return []
+        return self.__context.path_pair_manager.get_enabled_pairs()
+
+    def __refresh_path_pair_runtime_state(self):
+        enabled_path_pairs = self.__get_enabled_path_pairs()
+        self.__path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
+        self.__path_pair_staging_paths = {
+            pair.id: self.__build_staging_path(pair.local_path)
+            for pair in enabled_path_pairs
+        }
+        self.__lftp.set_path_pairs([
+            PathPair(
+                remote_path=pair.remote_path,
+                local_path=self.__path_pair_staging_paths[pair.id],
+                name=pair.name,
+                id=pair.id,
+                enabled=pair.enabled,
+                auto_queue=pair.auto_queue
+            )
+            for pair in enabled_path_pairs
+        ])
+        self.__refresh_model_builder_local_paths()
+        self.__active_scanner = self.__build_active_scanner(enabled_path_pairs)
+        self.__local_scanner = self.__build_local_scanner(enabled_path_pairs)
+        self.__remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
+        self.__active_scan_process = ScannerProcess(
+            scanner=self.__active_scanner,
+            interval_in_ms=self.__context.config.controller.interval_ms_downloading_scan,
+            verbose=False
+        )
+        self.__local_scan_process = ScannerProcess(
+            scanner=self.__local_scanner,
+            interval_in_ms=self.__context.config.controller.interval_ms_local_scan,
+        )
+        self.__remote_scan_process = ScannerProcess(
+            scanner=self.__remote_scanner,
+            interval_in_ms=self.__context.config.controller.interval_ms_remote_scan,
+        )
+
+    def __refresh_model_builder_local_paths(self):
+        local_root_paths = {None: self.__context.config.lftp.local_path}
+        local_staging_paths = {None: self.__staging_path}
+        for pair_id, pair in self.__path_pairs_by_id.items():
+            local_root_paths[pair_id] = pair.local_path
+            local_staging_paths[pair_id] = self.__path_pair_staging_paths.get(pair_id)
+        self.__model_builder.set_local_root_paths(local_root_paths, local_staging_paths)
+
+    def __build_active_scanner(self, enabled_path_pairs: List[PathPair]):
+        if enabled_path_pairs:
+            return MultiPathActiveScanner({
+                pair.id: self.__path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
+            }, use_temp_file=self.__context.config.lftp.use_temp_file)
+        return ActiveScanner(
+            self.__staging_path,
+            use_temp_file=self.__context.config.lftp.use_temp_file
+        )
+
+    def __build_local_scanner(self, enabled_path_pairs: List[PathPair]):
+        if enabled_path_pairs:
+            return MultiPathLocalScanner([
+                LocalScanner(
+                    local_path=pair.local_path,
+                    use_temp_file=self.__context.config.lftp.use_temp_file,
+                    staging_path=self.__path_pair_staging_paths[pair.id],
+                    managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
+                    path_pair_id=pair.id,
+                    path_pair_name=pair.name
+                ) for pair in enabled_path_pairs
+            ])
+        return LocalScanner(
+            local_path=self.__context.config.lftp.local_path,
+            use_temp_file=self.__context.config.lftp.use_temp_file,
+            staging_path=self.__staging_path,
+            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
+        )
+
+    def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]):
+        if enabled_path_pairs:
+            return MultiPathRemoteScanner([
+                RemoteScanner(
+                    remote_address=self.__context.config.lftp.remote_address,
+                    remote_username=self.__context.config.lftp.remote_username,
+                    remote_password=self.__password,
+                    remote_port=self.__context.config.lftp.remote_port,
+                    remote_path_to_scan=pair.remote_path,
+                    local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
+                    remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script,
+                    path_pair_id=pair.id,
+                    path_pair_name=pair.name
+                ) for pair in enabled_path_pairs
+            ])
+        return RemoteScanner(
+            remote_address=self.__context.config.lftp.remote_address,
+            remote_username=self.__context.config.lftp.remote_username,
+            remote_password=self.__password,
+            remote_port=self.__context.config.lftp.remote_port,
+            remote_path_to_scan=self.__context.config.lftp.remote_path,
+            local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
+            remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
+        )
+
+    def refresh_path_pairs(self):
+        if not self.__started:
+            self.__apply_path_pair_refresh()
+            return
+        with self.__path_pair_refresh_lock:
+            self.__path_pair_refresh_requested = True
+
+    def __consume_path_pair_refresh_request(self) -> bool:
+        with self.__path_pair_refresh_lock:
+            refresh_requested = self.__path_pair_refresh_requested
+            self.__path_pair_refresh_requested = False
+        return refresh_requested
+
+    def __apply_path_pair_refresh(self):
+        active_files = list(
+            getattr(self, "_Controller__active_downloading_file_names", []) +
+            getattr(self, "_Controller__active_extracting_file_names", [])
+        )
+        was_started = self.__started
+        if was_started:
+            self.__active_scan_process.terminate()
+            self.__local_scan_process.terminate()
+            self.__remote_scan_process.terminate()
+            self.__active_scan_process.join()
+            self.__local_scan_process.join()
+            self.__remote_scan_process.join()
+
+        self.__refresh_path_pair_runtime_state()
+        self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
+        self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
+        self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
+        self.__validate_process.set_path_pairs_by_id(self.__path_pairs_by_id)
+
+        if was_started:
+            for staging_path in self.__path_pair_staging_paths.values():
+                os.makedirs(staging_path, exist_ok=True)
+            self.__active_scan_process.start()
+            self.__local_scan_process.start()
+            self.__remote_scan_process.start()
+            self.__set_active_scanner_files(active_files)
+            self.__active_scan_process.force_scan()
+            self.__local_scan_process.force_scan()
+            self.__remote_scan_process.force_scan()
+            self.__next_lftp_status_poll_at = None
+
     def start(self):
         """
         Start the controller
@@ -334,6 +403,8 @@ class Controller:
         self.__propagate_exceptions()
         self.__cleanup_commands()
         self.__process_commands()
+        if self.__consume_path_pair_refresh_request():
+            self.__apply_path_pair_refresh()
         self.__update_model()
         self.__log_memory_usage()
 

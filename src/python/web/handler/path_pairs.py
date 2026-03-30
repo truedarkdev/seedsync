@@ -11,8 +11,9 @@ from ..web_app import IHandler, WebApp
 
 
 class PathPairsHandler(IHandler):
-    def __init__(self, path_pair_manager: PathPairManager):
+    def __init__(self, path_pair_manager: PathPairManager, controller=None):
         self.__path_pair_manager = path_pair_manager
+        self.__controller = controller
 
     @staticmethod
     def __json_response(payload, status: int = 200):
@@ -65,6 +66,8 @@ class PathPairsHandler(IHandler):
                 auto_queue=data.get("auto_queue", True)
             )
             warnings = self.__path_pair_manager.add_pair(pair)
+            if self.__controller is not None and pair.enabled:
+                self.__controller.refresh_path_pairs()
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
@@ -92,6 +95,8 @@ class PathPairsHandler(IHandler):
                 auto_queue=data.get("auto_queue", existing.auto_queue)
             )
             warnings = self.__path_pair_manager.update_pair(pair)
+            if self.__controller is not None and self.__update_affects_runtime(existing, pair):
+                self.__controller.refresh_path_pairs()
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
@@ -102,7 +107,10 @@ class PathPairsHandler(IHandler):
 
     def __handle_delete(self, pair_id: str):
         try:
+            existing = self.__path_pair_manager.get_pair_by_id(pair_id)
             self.__path_pair_manager.remove_pair(pair_id)
+            if self.__controller is not None and existing is not None and existing.enabled:
+                self.__controller.refresh_path_pairs()
             return self.__json_response({"success": True, "data": {"deleted": pair_id}})
         except PathPairError as exc:
             return self.__json_response({"success": False, "error": str(exc)}, status=404)
@@ -128,3 +136,15 @@ class PathPairsHandler(IHandler):
             return self.__json_response({"success": False, "error": str(exc)}, status=400)
         except PersistError as exc:
             return self.__json_response({"success": False, "error": "Failed to save: {}".format(exc)}, status=500)
+
+    @staticmethod
+    def __update_affects_runtime(existing: PathPair, updated: PathPair) -> bool:
+        if existing.enabled != updated.enabled:
+            return True
+        if not existing.enabled and not updated.enabled:
+            return False
+        return any((
+            existing.name != updated.name,
+            existing.remote_path != updated.remote_path,
+            existing.local_path != updated.local_path,
+        ))

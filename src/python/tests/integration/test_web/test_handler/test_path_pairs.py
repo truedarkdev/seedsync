@@ -76,6 +76,7 @@ class TestPathPairsHandler(BaseTestWebApp):
             "remote_path": "/remote/movies",
             "local_path": "/local/movies"
         }).text)["data"]
+        self.controller.refresh_path_pairs.reset_mock()
 
         response = self.test_app.put_json("/server/path-pairs/{}".format(created["id"]), {
             "name": "Films",
@@ -88,6 +89,24 @@ class TestPathPairsHandler(BaseTestWebApp):
         self.assertEqual(False, updated["enabled"])
         self.assertEqual("/remote/movies", updated["remote_path"])
         self.assertEqual("/local/movies", updated["local_path"])
+        self.controller.refresh_path_pairs.assert_called_once_with()
+
+    def test_update_non_runtime_field_does_not_refresh_controller(self):
+        created = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies",
+            "enabled": False,
+            "auto_queue": True
+        }).text)["data"]
+        self.controller.refresh_path_pairs.reset_mock()
+
+        response = self.test_app.put_json("/server/path-pairs/{}".format(created["id"]), {
+            "auto_queue": False
+        })
+
+        self.assertEqual(200, response.status_int)
+        self.controller.refresh_path_pairs.assert_not_called()
 
     def test_create_returns_validation_warnings(self):
         with patch("common.path_pair.is_running_in_docker", return_value=True):
