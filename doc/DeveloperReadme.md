@@ -451,21 +451,24 @@ make run-remote-server
 make stop-remote-server
 ```
 
-By default, the service mounts the repo-root-relative directory
-`build/docker-local/remote-files` into `/home/remoteuser/files`. That keeps the
-manual helper files alongside the local SeedSync Docker setup while leaving the
-checked-in e2e fixture data untouched.
+The supported startup path is `make run-remote-server`. That target sets
+`SEEDSYNC_REMOTE_FILES_DIR` to the repo-root canonical directory
+`build/docker-local/remote-files` unless you override it, so the remote test
+server always mounts the intended host folder into `/home/remoteuser/files`.
 
-To point the server at a different host folder, set `SEEDSYNC_REMOTE_FILES_DIR`
-before starting it:
+To point the server at a different host folder, override
+`SEEDSYNC_REMOTE_FILES_DIR` when starting the supported make target:
 
 ```bash
 SEEDSYNC_REMOTE_FILES_DIR=/path/to/local/files make run-remote-server
 ```
 
-If you want to use the default without an override, drop the files you want the
-SSH test server to expose into `build/docker-local/remote-files` at the repo
-root.
+If you bypass the make target and call Compose directly with this file set,
+set `SEEDSYNC_REMOTE_FILES_DIR` explicitly for those direct Compose
+invocations.
+
+To use the default manual folder, point `SEEDSYNC_REMOTE_FILES_DIR` at
+`build/docker-local/remote-files` in the repo root.
 
 The connection parameters for the remote server are:
 
