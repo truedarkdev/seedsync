@@ -187,6 +187,9 @@ git push origin gh-pages
 
 # Run tests
 
+For the current lane inventory, minimum-evidence ladder, durable artifact
+guidance, and open gaps, see [doc/testing-confidence.md](testing-confidence.md).
+
 ## Manual
 
 ### Python Unit Tests
