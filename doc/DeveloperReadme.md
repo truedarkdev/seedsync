@@ -187,8 +187,9 @@ git push origin gh-pages
 
 # Run tests
 
-For the current lane inventory, minimum-evidence ladder, durable artifact
-guidance, and open gaps, see [doc/testing-confidence.md](testing-confidence.md).
+For the current lane inventory, minimum-evidence ladder, per-task update
+rules, durable artifact guidance, freshness rules, and known gaps, see
+[doc/testing-confidence.md](testing-confidence.md).
 
 ## Manual
 
@@ -349,8 +350,11 @@ npm test -- --watch=false --single-run --browsers=ChromeHeadless
 
 Set `CHROME_BIN` explicitly when Chrome is installed but not on `PATH`. The
 headless launcher configured in `karma.conf.js` works without a GUI Chrome
-session. If you want an interactive browser run for local debugging, override
-the browser explicitly, for example:
+session. Use this lane for host-level Angular/Karma proof. If the behavior is
+runtime-visible in the live app shell, browser, or Docker-served runtime, pair
+it with live UI/runtime proof; host smoke alone is not enough. If you want an
+interactive browser run for local debugging, override the browser explicitly,
+for example:
 
 ```bash
 npm test -- --browsers Chrome
