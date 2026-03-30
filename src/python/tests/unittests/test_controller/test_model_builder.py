@@ -1150,7 +1150,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.clear()
         file_name = "verifier-stop-regression-1g.bin"
         self.model_builder.set_remote_files([SystemFile(file_name, 1073741824, False)])
-        self.model_builder.set_local_files([SystemFile(file_name, 1044601281, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 1067800592, False)])
         self.model_builder.set_stopped_files({file_name})
 
         stopped_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
@@ -1222,6 +1222,70 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADING, file_bin.state)
         self.assertEqual(1058013184, file_bin.transferred_size)
         self.assertEqual(99, file_bin.download_progress)
+
+    def test_build_resumed_running_state_keeps_retained_stopped_snapshot_through_missing_remote_window(self):
+        self.model_builder.clear()
+        file_name = "verifier-stop-regression-1g.bin"
+        self.model_builder.set_remote_files([SystemFile(file_name, 1073741824, False)])
+        self.model_builder.set_local_files([SystemFile(file_name, 1044601281, False)])
+        self.model_builder.set_stopped_files({file_name})
+
+        stopped_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        stopped_status.total_transfer_state = LftpJobStatus.TransferState(1044601281, 1073741824, 97, 1000, 5)
+        self.model_builder.set_lftp_statuses([stopped_status])
+
+        model = self.model_builder.build_model()
+        file_bin = model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DEFAULT, file_bin.state)
+        self.assertEqual(1044601281, file_bin.transferred_size)
+        self.assertEqual(97, file_bin.download_progress)
+
+        self.model_builder.set_remote_files([])
+        self.model_builder.set_lftp_statuses([])
+
+        missing_remote_model = self.model_builder.build_model()
+        missing_remote_file = missing_remote_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DEFAULT, missing_remote_file.state)
+        self.assertEqual(1044601281, missing_remote_file.local_size)
+        self.assertEqual(1044601281, missing_remote_file.transferred_size)
+        self.assertEqual(97, missing_remote_file.download_progress)
+        self.assertFalse(self.model_builder.has_changes())
+
+        self.model_builder.set_remote_files([SystemFile(file_name, 1073741824, False)])
+        self.model_builder.set_stopped_files(set())
+
+        queued_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file_name, "")
+        self.model_builder.set_lftp_statuses([queued_status])
+
+        queued_model = self.model_builder.build_model()
+        queued_file = queued_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.QUEUED, queued_file.state)
+        self.assertEqual(1044601281, queued_file.local_size)
+        self.assertEqual(1044601281, queued_file.transferred_size)
+        self.assertEqual(97, queued_file.download_progress)
+
+        regressing_resume_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        regressing_resume_status.total_transfer_state = LftpJobStatus.TransferState(1033895936, 1073741824, 96, 1000, 5)
+        self.model_builder.set_lftp_statuses([regressing_resume_status])
+
+        resumed_model = self.model_builder.build_model()
+        resumed_file = resumed_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, resumed_file.state)
+        self.assertEqual(1044601281, resumed_file.transferred_size)
+        self.assertEqual(97, resumed_file.download_progress)
+        self.assertEqual(1000, resumed_file.downloading_speed)
+        self.assertEqual(5, resumed_file.eta)
+
+        caught_up_resume_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        caught_up_resume_status.total_transfer_state = LftpJobStatus.TransferState(1058013184, 1073741824, 99, 1000, 5)
+        self.model_builder.set_lftp_statuses([caught_up_resume_status])
+
+        caught_up_model = self.model_builder.build_model()
+        caught_up_file = caught_up_model.get_file(file_name)
+        self.assertEqual(ModelFile.State.DOWNLOADING, caught_up_file.state)
+        self.assertEqual(1058013184, caught_up_file.transferred_size)
+        self.assertEqual(99, caught_up_file.download_progress)
+        self.assertNotIn(file_name, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
 
     def test_build_resumed_running_state_keeps_retained_floor_when_resume_uses_equivalent_root_alias(self):
         self.model_builder.clear()

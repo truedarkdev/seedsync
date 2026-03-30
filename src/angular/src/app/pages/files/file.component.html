@@ -1,4 +1,4 @@
-<div class="file" [class.selected]="file.isSelected || isBulkSelected" #fileElement>
+<div class="file" [class.selected]="file.isSelected || isBulkSelected" [attr.data-file-id]="file.fileId" #fileElement>
     <div class="content">
         <div class="select">
             <input type="checkbox"
