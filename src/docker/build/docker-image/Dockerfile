@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
 COPY src/angular/package*.json /app/
 WORKDIR /app
 ENV NODE_OPTIONS=--openssl-legacy-provider
-RUN npm install --legacy-peer-deps
+RUN npm ci --legacy-peer-deps
 
 
 # Builds angular app into html
