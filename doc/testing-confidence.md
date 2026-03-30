@@ -1,26 +1,31 @@
 # Testing Confidence
 
-This document is the tracked, canonical home for local test-suite confidence
-notes in this repo.
+This document is the tracked, canonical operating guide for local test-suite
+confidence in this repo.
 
-It records:
+Use it during substantive tasks, not just planning:
 
-- which lanes have fresh local evidence
-- what each lane proves
-- the minimum evidence ladder to use for each change class
-- durable artifact guidance for exact-result runs
-- the current open gaps that remain future work
+- identify the minimum evidence lane set before changing code or docs
+- consult the lane rows below that match the touched area
+- record any new lane run, failure, or freshness downgrade in the task notes
+  or tracker
+- if the task exposes a repeat gap, update this doc before you call the task
+  done
 
-It is intentionally conservative. A lane being listed here as healthy does not
-mean the whole repo is fully covered, only that the specific evidence below was
-gathered and is still useful as a baseline.
+Lane status shorthand:
+
+- Healthy: fresh evidence exists and still matches the current environment
+- Unknown: the lane exists, but there is no current proof in this workspace
+- Blocked: the lane cannot be treated as proof on this machine
+- Flaky: the lane has been unreliable enough that it should not stand alone
 
 Freshness rule:
 
 - lane statuses are point-in-time evidence, not evergreen certification
-- revalidate a lane after major environment changes, after a relevant
-  regression, or when the evidence date is no longer recent enough for the
-  decision at hand
+- refresh a lane after toolchain, image, browser, Compose, or repo changes that
+  can affect it
+- if the evidence is stale for the decision at hand, downgrade the lane until
+  it is rerun
 
 ## Current Lane Inventory
 
@@ -28,7 +33,7 @@ Freshness rule:
 | --- | --- | --- | --- | --- |
 | Python unit/backend | Healthy as of 2026-03-30 | The targeted backend controller path still passes on the supported WSL/Linux Python lane. | `src/python` pytest lane; targeted nodeid `tests/unittests/test_controller/test_controller.py::TestController::test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan` | 2026-03-30 local WSL run |
 | Python integration/controller | Healthy as of 2026-03-30 | The controller integration path still passes on the supported WSL/Linux lane. | `src/python` pytest lane; targeted nodeid `tests/integration/test_controller/test_controller.py::TestController::test_initial_model` | 2026-03-30 local WSL run |
-| Frontend host harness | Healthy as of 2026-03-30 | The Angular/Karma host harness still boots and runs the smoke suite successfully. | `src/angular` headless Karma lane; smoke run `291/291 SUCCESS` | 2026-03-30 local host run |
+| Frontend host harness | Healthy as of 2026-03-30 for host-level smoke only | The Angular/Karma host harness still boots and runs the smoke suite successfully, but that only proves the host harness. | `src/angular` headless Karma lane; smoke run `291/291 SUCCESS` | 2026-03-30 local host run |
 | Docker/browser/e2e | Unknown at runtime | The Compose files still parse, but the live browser-backed runtime path was not exercised today. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-03-30 local compose parse only |
 | Native Windows Poetry path | Blocked on this machine | The local Windows Python environment is outside the repo-supported Poetry range, so this host path cannot be treated as a valid confidence lane here. | `src/python` Poetry environment | 2026-03-30 local host check; Python 3.13.12 vs supported `>=3.11,<3.13` |
 
@@ -40,12 +45,33 @@ when the change crosses layers or runtime surfaces.
 | Change class | Minimum evidence | Notes |
 | --- | --- | --- |
 | Backend-only | One targeted unit test or narrow controller/integration slice that covers the touched backend path | If the change touches controller state, filesystem state, or path-pair handling, prefer a controller integration slice over unit-only proof. |
-| Frontend-only | Headless Angular/Karma smoke over the touched area | If the change affects browser rendering, served assets, or Docker-built frontend output, add a live UI/runtime check instead of relying on host-only smoke. |
-| Mixed API/UI | Backend proof plus frontend smoke | Add browser/runtime evidence if the user-visible path depends on the live app shell. |
-| Transfer / stop-resume / scan / path-pair regression | Targeted backend proof plus WSL/Linux controller integration | If the change can be exercised through the Docker-served app, do not close it without live Docker validation. |
+| Frontend-only | Targeted frontend spec/component coverage, plus a browser smoke check when the behavior is only observable in the DOM/runtime | If the change affects browser rendering, served assets, or Docker-built frontend output, add live UI/runtime proof instead of relying on host-only smoke. |
+| Runtime-visible UI behavior | Host Angular/Karma smoke plus browser or Docker/live proof when the live app decides the outcome | Host smoke alone is supportive evidence only; it does not close the task by itself. |
+| Mixed API/UI | Backend proof plus frontend/browser proof of render or interaction | Add browser/runtime evidence if the user-visible path depends on the live app shell. |
+| Transfer / stop-resume / scan / path-pair regression | Targeted backend proof plus WSL/Linux controller integration | If the change can be exercised through the Docker-served app, require live Docker validation before closing. |
 
 The ladder is a floor, not a ceiling. Broader regressions can and should add
 more evidence, but the minimum should always be visible and specific.
+
+## Freshness And Lifecycle
+
+- Treat lane health as a working status, not a permanent label.
+- If a lane fails, starts flaking, or is blocked by environment or tooling
+  drift, downgrade it immediately and note the blocker.
+- If a task depends on runtime-visible proof and the live lane has not been
+  exercised in the current environment, do not treat host smoke as a
+  substitute.
+- When a lane is no longer the best proof path for a task, keep it listed but
+  stop relying on it as closure evidence.
+
+## Gap Escalation
+
+- If the minimum lane set does not prove the task, record the gap here or in
+  the tracker instead of leaving it in memory.
+- If the same gap keeps showing up across tasks, convert it into follow-up
+  work.
+- If live Docker or browser proof is required but blocked, name the blocker and
+  stop short of claiming the task is closed.
 
 ## Durable Artifacts
 
@@ -60,7 +86,7 @@ keep the artifact name descriptive.
 - Save the nodeid or lane label in the filename so later evidence can be
   matched back to the exact command quickly.
 
-## Open Gaps
+## Known Gaps
 
 These items are deliberately left as future work. They are not missing
 documentation.
@@ -76,12 +102,3 @@ documentation.
   Python version is 3.13.12, outside the repo-supported `>=3.11,<3.13` range.
   If Windows host validation becomes necessary, it needs a supported Python
   environment first.
-
-## Closure Note
-
-This task is complete as a documentation and process deliverable because the
-tracked canonical artifact now exists and the open gaps are explicitly named
-above.
-
-The gaps remain open future work, but they are no longer hidden in a local
-planning note.
