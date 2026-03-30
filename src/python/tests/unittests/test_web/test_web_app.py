@@ -1,5 +1,6 @@
 import unittest
 import os
+import tempfile
 from unittest.mock import MagicMock, patch
 
 from common import Config
@@ -62,6 +63,20 @@ class TestWebAppStream(unittest.TestCase):
             stream.close()
 
         sleep.assert_called_once_with(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
+
+    def test_dashboard_path_pair_deep_link_serves_index_html(self):
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+
+            self.context.args.html_path = html_path
+            web_app = WebApp(self.context, MagicMock())
+            web_app.add_default_routes()
+            client = TestApp(web_app)
+            response = client.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("<html></html>", response.text)
 
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []

@@ -103,6 +103,7 @@ class WebApp(bottle.Bottle):
         # Front-end routes
         self.route("/")(self.__index)
         self.route("/dashboard")(self.__index)
+        self.route("/dashboard/<pathPairId>")(self.__dashboard_index)
         self.route("/settings")(self.__index)
         self.route("/autoqueue")(self.__index)
         self.route("/logs")(self.__index)
@@ -176,6 +177,14 @@ class WebApp(bottle.Bottle):
         :return:
         """
         return self.__static("index.html")
+
+    def __dashboard_index(self, pathPairId: str):
+        """
+        Serves the index.html static file for dashboard deep links.
+        :param pathPairId:
+        :return:
+        """
+        return self.__index()
 
     # noinspection PyMethodMayBeStatic
     def __static(self, file_path: str):

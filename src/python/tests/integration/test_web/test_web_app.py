@@ -91,6 +91,12 @@ class TestWebApp(BaseTestWebApp):
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
 
+    def test_dashboard_path_pair_deep_link_serves_index_html(self):
+        response = self.test_app.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("<html></html>", response.text)
+
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):
             def __init__(self, values):
