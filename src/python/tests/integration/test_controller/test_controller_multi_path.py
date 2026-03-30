@@ -273,6 +273,45 @@ class TestControllerMultiPath(unittest.TestCase):
         )
         self.assertTrue(os.path.exists(os.path.join(self.remote_movies, self.duplicate_name)))
 
+    def test_refresh_path_pairs_picks_up_newly_enabled_pair_without_restart(self):
+        self.context.path_pair_manager.update_pair(
+            PathPair(
+                id=self.tv_pair_id,
+                name="TV",
+                remote_path=self.remote_tv,
+                local_path=self.local_tv,
+                enabled=False,
+                auto_queue=False,
+            )
+        )
+
+        self._start_controller()
+        self._process_until(
+            lambda: len([
+                file for file in self.controller.get_model_files()
+                if file.name == self.duplicate_name
+            ]) == 1,
+            "Timed out waiting for single enabled path pair to scan",
+        )
+        self.assertIsNone(self._get_model_file_by_pair(self.tv_pair_id))
+
+        self.context.path_pair_manager.update_pair(
+            PathPair(
+                id=self.tv_pair_id,
+                name="TV",
+                remote_path=self.remote_tv,
+                local_path=self.local_tv,
+                enabled=True,
+                auto_queue=False,
+            )
+        )
+
+        self.controller.refresh_path_pairs()
+        self._wait_for_duplicate_roots()
+
+        self.assertIsNotNone(self._get_model_file_by_pair(self.movies_pair_id))
+        self.assertIsNotNone(self._get_model_file_by_pair(self.tv_pair_id))
+
 
 if __name__ == "__main__":
     unittest.main()

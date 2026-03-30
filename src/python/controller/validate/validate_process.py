@@ -65,6 +65,15 @@ class ValidateProcess(AppProcess):
     def clear(self, file_id: str):
         self.__command_queue.put(("clear", file_id))
 
+    def set_path_pairs_by_id(self, path_pairs_by_id: Dict[str, object]):
+        self.__path_pairs_by_id = {
+            pair_id: {
+                "local_path": getattr(pair, "local_path", None),
+                "remote_path": getattr(pair, "remote_path", None)
+            } for pair_id, pair in path_pairs_by_id.items()
+        }
+        self.__command_queue.put(("set_path_pairs_by_id", self.__path_pairs_by_id))
+
     def pop_latest_statuses(self) -> Optional[ValidateStatusResult]:
         latest_result = None
         try:
@@ -89,6 +98,10 @@ class ValidateProcess(AppProcess):
         if command == "clear":
             self.__statuses.pop(payload, None)
             self.__publish_statuses()
+            return
+
+        if command == "set_path_pairs_by_id":
+            self.__path_pairs_by_id = payload
             return
 
         if command != "validate":

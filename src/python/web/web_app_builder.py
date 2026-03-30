@@ -37,7 +37,7 @@ class WebAppBuilder:
         self.status_handler = StatusHandler(context.status)
         self.path_pairs_handler = None
         if getattr(context, "path_pair_manager", None) is not None:
-            self.path_pairs_handler = PathPairsHandler(context.path_pair_manager)
+            self.path_pairs_handler = PathPairsHandler(context.path_pair_manager, controller=self.__controller)
 
     def build(self) -> WebApp:
         web_app = WebApp(context=self.__context,

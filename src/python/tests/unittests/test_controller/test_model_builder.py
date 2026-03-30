@@ -3364,6 +3364,21 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual({"name": file_name, "path": selected_local_path}, payload["matched_local"])
         self.assertEqual("presence", payload["local_data_role"])
 
+    def test_set_local_root_paths_invalidates_cached_model_when_paths_change(self):
+        remote_file = SystemFile("a", 1000, False)
+        self.model_builder.set_remote_files([remote_file])
+
+        self.assertTrue(self.model_builder.has_changes())
+        self.model_builder.build_model()
+        self.assertFalse(self.model_builder.has_changes())
+
+        self.model_builder.set_local_root_paths(
+            {None: os.path.join("C:\\seedsync", "local")},
+            {None: os.path.join("C:\\seedsync", "local", "incomplete")}
+        )
+
+        self.assertTrue(self.model_builder.has_changes())
+
     def test_stop_resume_trace_logs_arbitration_for_qualified_root_file_id_selected_by_root_name(self):
         remote_file = SystemFile("backup.zip", 1000, False)
         remote_file.path_pair_id = "homeserver"

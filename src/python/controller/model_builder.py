@@ -392,10 +392,14 @@ class ModelBuilder:
     def set_local_root_paths(self,
                              local_root_paths: Dict[Optional[str], str],
                              local_staging_paths: Optional[Dict[Optional[str], str]] = None):
-        self.__local_root_paths = {path_pair_id: path for path_pair_id, path in local_root_paths.items() if path}
-        self.__local_staging_paths = {
+        next_local_root_paths = {path_pair_id: path for path_pair_id, path in local_root_paths.items() if path}
+        next_local_staging_paths = {
             path_pair_id: path for path_pair_id, path in (local_staging_paths or {}).items() if path
         }
+        if next_local_root_paths != self.__local_root_paths or next_local_staging_paths != self.__local_staging_paths:
+            self.__cached_model = None
+        self.__local_root_paths = next_local_root_paths
+        self.__local_staging_paths = next_local_staging_paths
 
     def __resolve_local_disk_path(self,
                                   model_file: ModelFile,

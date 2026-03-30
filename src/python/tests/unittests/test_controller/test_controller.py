@@ -3,12 +3,14 @@ import os
 import json
 import unittest
 from queue import Queue
+from threading import Lock
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from controller import Controller
 from controller.scan import MultiPathActiveScanner
 from common import AppError
+from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelError, ModelFile
 
@@ -25,6 +27,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context = MagicMock()
         self.controller._Controller__context.status.controller = MagicMock()
         self.controller._Controller__context.config.lftp.local_path = "/local"
+        self.controller._Controller__password = None
         self.controller._Controller__persist = MagicMock()
         self.controller._Controller__persist.downloaded_file_names = set()
         self.controller._Controller__persist.extracted_file_names = set()
@@ -33,6 +36,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder = MagicMock()
         self.controller._Controller__model_builder.has_changes.return_value = False
         self.controller._Controller__model_lock = MagicMock()
+        self.controller._Controller__path_pair_refresh_lock = Lock()
+        self.controller._Controller__path_pair_refresh_requested = False
         self.controller._Controller__lftp = MagicMock()
         self.controller._Controller__active_scan_process = MagicMock()
         self.controller._Controller__local_scan_process = MagicMock()
@@ -214,6 +219,109 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+
+    @patch("controller.controller.ScannerProcess")
+    def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
+        movies_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/local/movies",
+            enabled=True,
+            auto_queue=False,
+        )
+        old_active_process = self.controller._Controller__active_scan_process
+        old_local_process = self.controller._Controller__local_scan_process
+        old_remote_process = self.controller._Controller__remote_scan_process
+        validate_process = self.controller._Controller__validate_process
+        model_builder = self.controller._Controller__model_builder
+
+        self.controller._Controller__context.path_pair_manager = MagicMock()
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [movies_pair]
+        self.controller._Controller__context.config.lftp.staging_path = None
+        self.controller._Controller__context.config.lftp.use_temp_file = False
+        self.controller._Controller__context.config.controller.managed_extract_folders_enabled = False
+        self.controller._Controller__context.config.controller.interval_ms_downloading_scan = 100
+        self.controller._Controller__context.config.controller.interval_ms_local_scan = 200
+        self.controller._Controller__context.config.controller.interval_ms_remote_scan = 300
+        self.controller._Controller__context.config.lftp.remote_address = "host"
+        self.controller._Controller__context.config.lftp.remote_port = 22
+        self.controller._Controller__context.config.lftp.remote_username = "user"
+        self.controller._Controller__context.config.lftp.remote_path_to_scan_script = "/scanfs"
+        self.controller._Controller__context.args.local_path_to_scanfs = "/local-scanfs"
+        self.controller._Controller__started = True
+        self.controller._Controller__active_downloading_file_names = [("dup", "movies", "Movies")]
+        self.controller._Controller__active_extracting_file_names = []
+        self.controller._Controller__set_active_scanner_files = MagicMock()
+        new_active_process = MagicMock()
+        new_local_process = MagicMock()
+        new_remote_process = MagicMock()
+        scanner_process_cls.side_effect = [new_active_process, new_local_process, new_remote_process]
+
+        self.controller._Controller__apply_path_pair_refresh()
+
+        old_active_process.terminate.assert_called_once_with()
+        old_local_process.terminate.assert_called_once_with()
+        old_remote_process.terminate.assert_called_once_with()
+        old_active_process.join.assert_called_once_with()
+        old_local_process.join.assert_called_once_with()
+        old_remote_process.join.assert_called_once_with()
+
+        new_active_process.start.assert_called_once_with()
+        new_local_process.start.assert_called_once_with()
+        new_remote_process.start.assert_called_once_with()
+        new_active_process.force_scan.assert_called_once_with()
+        new_local_process.force_scan.assert_called_once_with()
+        new_remote_process.force_scan.assert_called_once_with()
+        self.controller._Controller__set_active_scanner_files.assert_called_once_with(
+            [("dup", "movies", "Movies")]
+        )
+
+        validate_process.set_path_pairs_by_id.assert_called_once()
+        refreshed_pairs = validate_process.set_path_pairs_by_id.call_args.args[0]
+        self.assertEqual(["movies"], list(refreshed_pairs.keys()))
+        self.assertIs(movies_pair, refreshed_pairs["movies"])
+
+        self.controller._Controller__lftp.set_path_pairs.assert_called_once()
+        lftp_pairs = self.controller._Controller__lftp.set_path_pairs.call_args.args[0]
+        self.assertEqual(1, len(lftp_pairs))
+        self.assertEqual(os.path.join("/local/movies", "incomplete"), lftp_pairs[0].local_path)
+
+        model_builder.set_local_root_paths.assert_called_once_with(
+            {None: "/local", "movies": "/local/movies"},
+            {
+                None: "/local/incomplete",
+                "movies": os.path.join("/local/movies", "incomplete")
+            }
+        )
+        self.assertEqual({"movies"}, set(self.controller._Controller__path_pairs_by_id.keys()))
+        self.assertEqual(
+            os.path.join("/local/movies", "incomplete"),
+            self.controller._Controller__path_pair_staging_paths["movies"]
+        )
+
+    def test_refresh_path_pairs_marks_pending_refresh_when_started(self):
+        self.controller._Controller__started = True
+
+        self.controller.refresh_path_pairs()
+
+        self.assertTrue(self.controller._Controller__path_pair_refresh_requested)
+
+    def test_process_applies_pending_path_pair_refresh_before_model_update(self):
+        call_order = []
+        self.controller._Controller__started = True
+        self.controller._Controller__path_pair_refresh_requested = True
+        self.controller._Controller__propagate_exceptions = MagicMock(side_effect=lambda: call_order.append("propagate"))
+        self.controller._Controller__cleanup_commands = MagicMock(side_effect=lambda: call_order.append("cleanup"))
+        self.controller._Controller__process_commands = MagicMock(side_effect=lambda: call_order.append("commands"))
+        self.controller._Controller__apply_path_pair_refresh = MagicMock(side_effect=lambda: call_order.append("refresh"))
+        self.controller._Controller__update_model = MagicMock(side_effect=lambda: call_order.append("update"))
+        self.controller._Controller__log_memory_usage = MagicMock(side_effect=lambda: call_order.append("memory"))
+
+        self.controller.process()
+
+        self.assertEqual(["propagate", "cleanup", "commands", "refresh", "update", "memory"], call_order)
+        self.assertFalse(self.controller._Controller__path_pair_refresh_requested)
 
     def test_update_model_preserves_stale_lftp_statuses_after_cache_age_expires_during_unhealthy_poll(self):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
