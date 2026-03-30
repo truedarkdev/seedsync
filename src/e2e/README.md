@@ -28,6 +28,8 @@ fixture bootstrap step separate from the host-side SSH probe.
 
 See [doc/DeveloperReadme.md](../../doc/DeveloperReadme.md) for the shared lane
 breakdown and the archive-backed prerequisites.
+See [doc/testing-confidence.md](../../doc/testing-confidence.md) for the
+canonical lane inventory and minimum-evidence ladder.
 
 ### To run e2e tests in dev mode:
 
