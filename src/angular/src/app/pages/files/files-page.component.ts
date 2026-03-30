@@ -4,6 +4,7 @@ import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
 
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
+import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
 import {ViewFileFilterService} from "../../services/files/view-file-filter.service";
 
 @Component({
@@ -64,7 +65,16 @@ export class FilesPageComponent implements OnInit, OnDestroy {
         }
 
         if (this._pathPairId != null) {
-            return enabledPathPairs.find(pair => pair.id === this._pathPairId) || enabledPathPairs[0] || null;
+            const pathPairRouteMatch = resolvePathPairRouteSegment(this._pathPairId, enabledPathPairs);
+            if (pathPairRouteMatch.type === "id" || pathPairRouteMatch.type === "slug") {
+                return pathPairRouteMatch.pathPair;
+            }
+
+            if (pathPairRouteMatch.type === "ambiguous") {
+                return null;
+            }
+
+            return enabledPathPairs[0] || null;
         }
 
         return null;

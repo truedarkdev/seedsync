@@ -6,6 +6,7 @@ import {ROUTE_INFOS} from "../../routes";
 
 import {DomService} from "../../services/utils/dom.service";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
+import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
 
 @Component({
     selector: "app-root",
@@ -87,10 +88,10 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
         const pathPairMatch = currentUrl.match(/^\/dashboard\/([^/]+)$/);
         if (pathPairMatch != null && this._hasMultipleEnabledPathPairs()) {
-            const pathPairId = this._decodePathPairId(pathPairMatch[1]);
-            if (pathPairId != null) {
-                const enabledPathPair = this._pathPairs.find(pair => pair.enabled && pair.id === pathPairId);
-                this.activeTitle = enabledPathPair != null ? enabledPathPair.name : "Dashboard";
+            const enabledPathPairs = this._pathPairs.filter(pair => pair.enabled);
+            const pathPairRouteMatch = resolvePathPairRouteSegment(pathPairMatch[1], enabledPathPairs);
+            if (pathPairRouteMatch.type === "id" || pathPairRouteMatch.type === "slug") {
+                this.activeTitle = pathPairRouteMatch.pathPair.name;
             } else {
                 this.activeTitle = "Dashboard";
             }
@@ -104,11 +105,4 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         return this._pathPairs.filter(pair => pair.enabled).length > 1;
     }
 
-    private _decodePathPairId(encodedPathPairId: string): string {
-        try {
-            return decodeURIComponent(encodedPathPairId);
-        } catch (error) {
-            return null;
-        }
-    }
 }
