@@ -67,9 +67,13 @@
              [class.disabled]="!pair.enabled">
             <div class="pair-body">
                 <div class="pair-header">
-                    <span class="pair-name">{{pair.name}}</span>
-                    <span class="pair-status">{{pair.enabled ? 'Enabled' : 'Disabled'}}</span>
-                    <span class="pair-autoqueue" *ngIf="pair.auto_queue">AutoQueue</span>
+                    <div class="pair-title-row">
+                        <span class="pair-name">{{pair.name}}</span>
+                    </div>
+                    <div class="pair-badges">
+                        <span class="pair-status">{{pair.enabled ? 'Enabled' : 'Disabled'}}</span>
+                        <span class="pair-autoqueue" *ngIf="pair.auto_queue">AutoQueue</span>
+                    </div>
                 </div>
 
                 <div class="path-line">

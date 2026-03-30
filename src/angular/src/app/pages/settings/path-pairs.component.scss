@@ -98,20 +98,39 @@
 
         .pair-header {
             display: flex;
-            gap: 10px;
             align-items: center;
+            gap: 12px;
             flex-wrap: wrap;
-            margin-bottom: 8px;
+            margin-bottom: 10px;
+
+            .pair-title-row {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                min-width: 0;
+            }
 
             .pair-name {
-                font-weight: 700;
+                font-size: 1.9rem;
+                line-height: 1.05;
+                font-weight: 800;
+                letter-spacing: -0.03em;
+                color: rgba(0, 0, 0, 0.78);
+            }
+
+            .pair-badges {
+                display: flex;
+                gap: 8px;
+                align-items: center;
+                flex-wrap: wrap;
             }
 
             .pair-status,
             .pair-autoqueue {
-                font-size: 80%;
-                padding: 2px 8px;
-                border-radius: 10px;
+                font-size: 85%;
+                font-weight: 600;
+                padding: 4px 10px;
+                border-radius: 999px;
                 background: rgba(0, 0, 0, 0.08);
             }
 
