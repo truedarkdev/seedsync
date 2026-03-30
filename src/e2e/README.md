@@ -8,13 +8,27 @@ If you are debugging the local Linux/WSL lanes, run the shared preflight first:
 make preflight-linux-wsl
 ```
 
-This helper checks:
+The helper runs the full baseline by default, but the direct script can target
+individual slices when you only need one lane:
 
-* Python 3.11 or 3.12
-* OpenSSH client (`ssh`)
-* `lftp`
-* `rar` and `unrar`
-* a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
+```bash
+bash src/docker/test/check_linux_wsl_baseline.sh --live-ssh-lftp
+bash src/docker/test/check_linux_wsl_baseline.sh --archive-backed
+bash src/docker/test/check_linux_wsl_baseline.sh --reusable-remote-fixture
+```
+
+The helper checks the live SSH/LFTP lane, the archive-backed lane, and the
+reusable remote fixture lane in separate buckets:
+
+* Live SSH/LFTP lane:
+  * Python 3.11 or 3.12
+  * OpenSSH client (`ssh`)
+  * `lftp`
+  * a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
+
+* Archive-backed lane:
+  * `rar`
+  * `unrar`
 
 The helper does not start the remote fixture for you. If you need the
 Compose-managed reusable remote SSH lane, bootstrap it separately with:
@@ -24,7 +38,8 @@ make run-remote-server
 ```
 
 That service publishes SSH on `127.0.0.1:1234`. The baseline helper keeps that
-fixture bootstrap step separate from the host-side SSH probe.
+fixture bootstrap step separate from the host-side SSH probe, and it keeps the
+archive-backed prerequisites separate from the live SSH/LFTP lane.
 
 See [doc/DeveloperReadme.md](../../doc/DeveloperReadme.md) for the shared lane
 breakdown and the archive-backed prerequisites.

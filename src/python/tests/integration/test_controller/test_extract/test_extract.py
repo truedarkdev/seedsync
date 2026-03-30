@@ -10,6 +10,8 @@ import zipfile
 from common import overrides
 from controller.extract import Extract, ExtractError
 
+HAS_RAR = shutil.which("rar") is not None and shutil.which("unrar") is not None
+
 
 class TestExtract(unittest.TestCase):
     temp_root = None
@@ -45,27 +47,28 @@ class TestExtract(unittest.TestCase):
         zf.write(temp_file, os.path.basename(temp_file))
         zf.close()
 
-        # rar
-        TestExtract.ar_rar = os.path.join(archive_dir, "file.rar")
-        with open(os.devnull, 'w') as fnull:
-            subprocess.run(["rar",
-                            "a",
-                            "-ep",
-                            TestExtract.ar_rar,
-                            temp_file],
-                           stdout=fnull,
-                           check=True)
+        if HAS_RAR:
+            # rar
+            TestExtract.ar_rar = os.path.join(archive_dir, "file.rar")
+            with open(os.devnull, 'w') as fnull:
+                subprocess.run(["rar",
+                                "a",
+                                "-ep",
+                                TestExtract.ar_rar,
+                                temp_file],
+                               stdout=fnull,
+                               check=True)
 
-            # rar split
-            subprocess.run(["rar",
-                            "a",
-                            "-ep", "-m0", "-v50k",
-                            os.path.join(archive_dir, "file.split.rar"),
-                            temp_file],
-                           stdout=fnull,
-                           check=True)
-        TestExtract.ar_rar_split_p1 = os.path.join(archive_dir, "file.split.part1.rar")
-        TestExtract.ar_rar_split_p2 = os.path.join(archive_dir, "file.split.part2.rar")
+                # rar split
+                subprocess.run(["rar",
+                                "a",
+                                "-ep", "-m0", "-v50k",
+                                os.path.join(archive_dir, "file.split.rar"),
+                                temp_file],
+                               stdout=fnull,
+                               check=True)
+            TestExtract.ar_rar_split_p1 = os.path.join(archive_dir, "file.split.part1.rar")
+            TestExtract.ar_rar_split_p2 = os.path.join(archive_dir, "file.split.part2.rar")
 
         # tar.gz
         TestExtract.ar_tar_gz = os.path.join(archive_dir, "file.tar.gz")
@@ -137,9 +140,11 @@ class TestExtract(unittest.TestCase):
     def test_is_archive_zip(self):
         self.assertTrue(Extract.is_archive(TestExtract.ar_zip))
 
+    @unittest.skipUnless(HAS_RAR, "rar and unrar executables not available")
     def test_is_archive_rar(self):
         self.assertTrue(Extract.is_archive(TestExtract.ar_rar))
 
+    @unittest.skipUnless(HAS_RAR, "rar and unrar executables not available")
     def test_is_archive_rar_split(self):
         self.assertTrue(Extract.is_archive(TestExtract.ar_rar_split_p1))
         self.assertTrue(Extract.is_archive(TestExtract.ar_rar_split_p2))
@@ -169,6 +174,7 @@ class TestExtract(unittest.TestCase):
                                     out_dir_path=TestExtract.temp_dir)
         self.assertTrue(str(ctx.exception).startswith("Path is not a valid archive"))
 
+    @unittest.skipUnless(HAS_RAR, "rar and unrar executables not available")
     def test_extract_archive_creates_sub_directories(self):
         out_path = os.path.join(TestExtract.temp_dir, "bunch", "of", "sub", "dir")
         Extract.extract_archive(archive_path=TestExtract.ar_rar,
@@ -188,11 +194,13 @@ class TestExtract(unittest.TestCase):
                                 out_dir_path=TestExtract.temp_dir)
         self._assert_extracted_files(TestExtract.temp_dir)
 
+    @unittest.skipUnless(HAS_RAR, "rar and unrar executables not available")
     def test_extract_archive_rar(self):
         Extract.extract_archive(archive_path=TestExtract.ar_rar,
                                 out_dir_path=TestExtract.temp_dir)
         self._assert_extracted_files(TestExtract.temp_dir)
 
+    @unittest.skipUnless(HAS_RAR, "rar and unrar executables not available")
     def test_extract_archive_rar_split(self):
         Extract.extract_archive(archive_path=TestExtract.ar_rar_split_p1,
                                 out_dir_path=TestExtract.temp_dir)
