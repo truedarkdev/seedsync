@@ -50,11 +50,11 @@ class MockChangeDetectorRef {
     markForCheck = jasmine.createSpy("markForCheck");
 }
 
-function createViewFile(): ViewFile {
+function createViewFile(props: any = {}): ViewFile {
     return new ViewFile({
-        fileId: "file-1",
-        name: "sample",
-        isStoppable: true
+        fileId: props.fileId || "file-1",
+        name: props.name || "sample",
+        isStoppable: props.isStoppable != null ? props.isStoppable : true
     });
 }
 
@@ -100,6 +100,35 @@ describe("Testing file list component", () => {
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
         expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+    });
+
+    it("should reset stop loading on the matching row when duplicate display names are re-instantiated with the same file id", () => {
+        const matchingFile = createViewFile();
+        const matchingFileComponent = {
+            file: matchingFile,
+            resetActiveAction: jasmine.createSpy("matchingResetActiveAction")
+        } as any;
+        const otherFileComponent = {
+            file: createViewFile({
+                fileId: "file-2",
+                name: matchingFile.name,
+                isStoppable: true
+            }),
+            resetActiveAction: jasmine.createSpy("otherResetActiveAction")
+        } as any;
+        (component as any).fileComponents = {
+            toArray: () => [otherFileComponent, matchingFileComponent]
+        };
+
+        component.onStop(createViewFile({
+            fileId: matchingFile.fileId,
+            name: matchingFile.name,
+            isStoppable: true
+        }));
+
+        expect(mockViewFileService.stop).toHaveBeenCalled();
+        expect(matchingFileComponent.resetActiveAction).toHaveBeenCalledTimes(1);
+        expect(otherFileComponent.resetActiveAction).not.toHaveBeenCalled();
     });
 
     it("should clear the stop loading state when the stop request errors", () => {

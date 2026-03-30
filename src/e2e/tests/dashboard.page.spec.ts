@@ -1,4 +1,4 @@
-import {DashboardPage, File, FileActionButtonState} from "./dashboard.page";
+import {DashboardPage, File} from "./dashboard.page";
 
 describe('Testing dashboard page', () => {
     let page: DashboardPage;
@@ -51,12 +51,13 @@ describe('Testing dashboard page', () => {
 
     it('should have all the action buttons', async () => {
         await page.getFileActions(1).then(states => {
-            expect(states.length).toBe(5);
-            expect(states[0].title).toBe("Queue");
-            expect(states[1].title).toBe("Stop");
-            expect(states[2].title).toBe("Extract");
-            expect(states[3].title).toBe("Delete Local");
-            expect(states[4].title).toBe("Delete Remote");
+            expect(states.map(state => state.title)).toEqual([
+                "Queue",
+                "Stop",
+                "Extract",
+                "Delete Local",
+                "Delete Remote"
+            ]);
         });
     });
 
@@ -64,19 +65,83 @@ describe('Testing dashboard page', () => {
         await page.getFiles().then(files => {
             expect(files[1].status).toEqual("");
         });
-        await page.getFileActions(1).then(states => {
-            expect(states[0].title).toBe("Queue");
-            expect(states[0].isEnabled).toBe(true);
-        });
+        const fileId = await page.getFileIdByIndex(1);
+        const queueAction = await page.getFileActionByTitle(fileId, "Queue");
+        expect(queueAction.title).toBe("Queue");
+        expect(queueAction.isEnabled).toBe(true);
     });
 
     it('should have Stop action disabled for Default state', async () => {
         await page.getFiles().then(files => {
             expect(files[1].status).toEqual("");
         });
-        await page.getFileActions(1).then(states => {
-            expect(states[1].title).toBe("Stop");
-            expect(states[1].isEnabled).toBe(false);
-        });
+        const fileId = await page.getFileIdByIndex(1);
+        const stopAction = await page.getFileActionByTitle(fileId, "Stop");
+        expect(stopAction.title).toBe("Stop");
+        expect(stopAction.isEnabled).toBe(false);
+    });
+
+    it('should preserve stopped progress across reload and requeue the same row intentionally', async () => {
+        const downloadingIndex = await page.findFileIndexByStatus("Downloading");
+        expect(downloadingIndex).toBeGreaterThan(-1);
+        if (downloadingIndex < 0) {
+            return;
+        }
+
+        const fileId = await page.getFileIdByIndex(downloadingIndex);
+        const initialProgress = await page.getFileProgressById(fileId);
+        const initialSpeed = await page.getFileSpeedById(fileId);
+        const initialEta = await page.getFileEtaById(fileId);
+
+        expect(initialSpeed).not.toEqual("");
+        expect(initialEta).not.toEqual("");
+
+        await page.selectFileById(fileId);
+        await page.stopFileById(fileId);
+        await page.waitForFileStatusById(fileId, "Stopped");
+
+        const stoppedProgress = await page.getFileProgressById(fileId);
+        expect(stoppedProgress).toBeGreaterThanOrEqual(initialProgress);
+        expect(await page.getFileSpeedById(fileId)).toEqual("");
+        expect(await page.getFileEtaById(fileId)).toEqual("");
+
+        const stoppedQueueAction = await page.getFileActionByTitle(fileId, "Queue");
+        const stoppedStopAction = await page.getFileActionByTitle(fileId, "Stop");
+        expect(stoppedQueueAction.title).toBe("Queue");
+        expect(stoppedQueueAction.isEnabled).toBe(true);
+        expect(stoppedStopAction.title).toBe("Stop");
+        expect(stoppedStopAction.isEnabled).toBe(false);
+
+        await page.reload();
+
+        expect(await page.getFileProgressById(fileId)).toEqual(stoppedProgress);
+        expect(await page.getFileSpeedById(fileId)).toEqual("");
+        expect(await page.getFileEtaById(fileId)).toEqual("");
+        expect(await page.getFileStatusById(fileId)).toEqual("Stopped");
+
+        await page.selectFileById(fileId);
+        const reloadedQueueAction = await page.getFileActionByTitle(fileId, "Queue");
+        const reloadedStopAction = await page.getFileActionByTitle(fileId, "Stop");
+        expect(reloadedQueueAction.title).toBe("Queue");
+        expect(reloadedQueueAction.isEnabled).toBe(true);
+        expect(reloadedStopAction.title).toBe("Stop");
+        expect(reloadedStopAction.isEnabled).toBe(false);
+
+        await page.queueFileById(fileId);
+        await page.waitForFileStatusNotById(fileId, "Stopped");
+
+        expect(await page.getFileStatusById(fileId)).not.toEqual("Stopped");
+
+        const requeuedQueueAction = await page.getFileActionByTitle(fileId, "Queue");
+        const requeuedStopAction = await page.getFileActionByTitle(fileId, "Stop");
+        expect(requeuedQueueAction.title).toBe("Queue");
+        expect(requeuedQueueAction.isEnabled).toBe(false);
+        expect(requeuedStopAction.title).toBe("Stop");
+        expect(requeuedStopAction.isEnabled).toBe(true);
+
+        if (await page.getFileStatusById(fileId) === "Downloading") {
+            expect(await page.getFileSpeedById(fileId)).not.toEqual("");
+            expect(await page.getFileEtaById(fileId)).not.toEqual("");
+        }
     });
 });

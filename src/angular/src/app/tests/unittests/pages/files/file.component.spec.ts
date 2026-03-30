@@ -215,4 +215,45 @@ describe("Testing file component", () => {
         expect(fixture.componentInstance.activeAction).toBe(FileAction.STOP);
         expect(stopSpy).toHaveBeenCalledWith(fixture.componentInstance.file);
     });
+
+    it("should transition the stop action from enabled to loading and then settle disabled for a stopped row", () => {
+        const stopSpy = spyOn(fixture.componentInstance.stopEvent, "emit");
+        const downloadingFile = createViewFile({
+            status: ViewFile.Status.DOWNLOADING,
+            isStoppable: true
+        });
+        fixture.componentInstance.file = downloadingFile;
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = Observable.of(null) as any;
+
+        fixture.detectChanges();
+
+        const stopButton = fixture.debugElement.query(By.css("button.stop-action")).nativeElement as HTMLButtonElement;
+
+        expect(stopButton.disabled).toBe(false);
+
+        stopButton.click();
+        fixture.detectChanges();
+
+        expect(fixture.componentInstance.activeAction).toBe(FileAction.STOP);
+        expect(stopButton.disabled).toBe(true);
+        expect(stopButton.classList.contains("loading")).toBe(true);
+        expect(stopSpy).toHaveBeenCalledWith(downloadingFile);
+
+        fixture.componentInstance.file = createViewFile({
+            fileId: downloadingFile.fileId,
+            name: downloadingFile.name,
+            status: ViewFile.Status.STOPPED,
+            isStoppable: false
+        });
+        fixture.componentInstance.ngOnChanges({
+            file: new SimpleChange(downloadingFile, fixture.componentInstance.file, false)
+        });
+        fixture.detectChanges();
+
+        expect(fixture.componentInstance.activeAction).toBe(null);
+        expect(stopButton.disabled).toBe(true);
+        expect(stopButton.classList.contains("loading")).toBe(false);
+        expect(stopButton.getAttribute("aria-disabled")).toBe("true");
+    });
 });

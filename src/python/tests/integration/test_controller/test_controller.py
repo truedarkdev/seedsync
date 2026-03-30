@@ -2564,6 +2564,221 @@ class TestController(unittest.TestCase):
             final_target
         ))
 
+    def test_stop_requeue_stop_preserves_retained_progress_floor_across_repeat_cycles(self):
+        remote_name = "repeat-stop.bin"
+        remote_size = 256 * 1024
+        TestController.my_sparse_touch(remote_size, "remote", remote_name)
+
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+        # noinspection PyUnresolvedReferences
+        self.controller._Controller__lftp.rate_limit = 64 * 1024
+
+        self.__wait_for_initial_model()
+
+        listener = DummyListener()
+        self.controller.add_model_listener(listener)
+        self.controller.process()
+        listener.file_added = MagicMock()
+        listener.file_updated = MagicMock()
+        listener.file_removed = MagicMock()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
+
+        partial_file = None
+        sidecar_seeded = False
+        for _ in range(300):
+            self.controller.process()
+            partial_file = self.__find_model_file(remote_name)
+            if partial_file is not None and \
+                    partial_file.state == ModelFile.State.DOWNLOADING and \
+                    partial_file.local_size is not None and \
+                    partial_file.local_size > 0:
+                if not sidecar_seeded:
+                    local_incomplete_dir = os.path.join(TestController.temp_dir, "local", "incomplete")
+                    os.makedirs(local_incomplete_dir, exist_ok=True)
+                    status_payload = "size=262144\n0.pos=131072\n0.limit=262144\n"
+                    for status_name in (
+                        "{}.lftp-pget-status".format(remote_name),
+                        "{}.lftp.lftp-pget-status".format(remote_name),
+                    ):
+                        with open(os.path.join(local_incomplete_dir, status_name), "w") as handle:
+                            handle.write(status_payload)
+                    self.controller._Controller__local_scan_process.force_scan()
+                    self.controller._Controller__active_scan_process.force_scan()
+                    sidecar_seeded = True
+                if partial_file.is_stoppable:
+                    break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for download to become stoppable before first stop")
+
+        stable_file_id = partial_file.file_id
+        first_partial_size = partial_file.local_size
+        self.assertIsNotNone(first_partial_size)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
+
+        first_stopped_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and
+            file.local_size is not None and file.local_size >= first_partial_size,
+            "Timed out waiting for first stop to retain progress floor",
+        )
+        self.assertEqual(stable_file_id, first_stopped_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, first_stopped_file.state)
+        self.assertIsNotNone(first_stopped_file.local_size)
+        self.assertGreaterEqual(first_stopped_file.local_size, first_partial_size)
+        self.__process_until(
+            lambda: self.controller._Controller__active_downloading_file_names == [],
+            "Timed out waiting for active downloading files to clear after first stop",
+        )
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+        first_requeue_call_count = len(listener.file_updated.call_args_list)
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, stable_file_id))
+
+        requeued_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.file_id == stable_file_id and
+            file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING) and
+            file.local_size is not None and file.local_size >= first_stopped_file.local_size,
+            "Timed out waiting for requeue to preserve retained progress floor",
+            max_iterations=4000,
+        )
+        self.assertEqual(stable_file_id, requeued_file.file_id)
+        self.assertIsNotNone(requeued_file.local_size)
+        self.assertGreaterEqual(requeued_file.local_size, first_stopped_file.local_size)
+        for call in listener.file_updated.call_args_list[first_requeue_call_count:]:
+            new_file = call[0][1]
+            if new_file.name == remote_name:
+                self.assertIsNotNone(new_file.local_size)
+                self.assertGreaterEqual(new_file.local_size, first_stopped_file.local_size)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, stable_file_id))
+
+        second_stopped_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and
+            file.local_size is not None and file.local_size >= requeued_file.local_size,
+            "Timed out waiting for second stop to retain progress floor",
+        )
+        self.assertEqual(stable_file_id, second_stopped_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, second_stopped_file.state)
+        self.assertIsNotNone(second_stopped_file.local_size)
+        self.assertGreaterEqual(second_stopped_file.local_size, requeued_file.local_size)
+        self.__process_until(
+            lambda: self.controller._Controller__active_downloading_file_names == [],
+            "Timed out waiting for active downloading files to clear after second stop",
+        )
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+    def test_stop_refresh_missing_remote_window_preserves_retained_stopped_state(self):
+        remote_name = "refresh-missing.bin"
+        remote_size = 256 * 1024
+        TestController.my_sparse_touch(remote_size, "remote", remote_name)
+
+        self.controller = Controller(self.context, self.controller_persist)
+        self.controller.start()
+        # noinspection PyUnresolvedReferences
+        self.controller._Controller__lftp.rate_limit = 64 * 1024
+
+        self.__wait_for_initial_model()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, remote_name))
+
+        partial_file = None
+        sidecar_seeded = False
+        for _ in range(300):
+            self.controller.process()
+            partial_file = self.__find_model_file(remote_name)
+            if partial_file is not None and \
+                    partial_file.state == ModelFile.State.DOWNLOADING and \
+                    partial_file.local_size is not None and \
+                    partial_file.local_size > 0:
+                if not sidecar_seeded:
+                    local_incomplete_dir = os.path.join(TestController.temp_dir, "local", "incomplete")
+                    os.makedirs(local_incomplete_dir, exist_ok=True)
+                    status_payload = "size=262144\n0.pos=131072\n0.limit=262144\n"
+                    for status_name in (
+                        "{}.lftp-pget-status".format(remote_name),
+                        "{}.lftp.lftp-pget-status".format(remote_name),
+                    ):
+                        with open(os.path.join(local_incomplete_dir, status_name), "w") as handle:
+                            handle.write(status_payload)
+                    self.controller._Controller__local_scan_process.force_scan()
+                    self.controller._Controller__active_scan_process.force_scan()
+                    sidecar_seeded = True
+                if partial_file.is_stoppable:
+                    break
+            time.sleep(0.05)
+        else:
+            self.fail("Timed out waiting for download to become stoppable before stop")
+
+        stable_file_id = partial_file.file_id
+        partial_size = partial_file.local_size
+        self.assertIsNotNone(partial_size)
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, remote_name))
+
+        stopped_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and
+            file.local_size is not None and file.local_size >= partial_size,
+            "Timed out waiting for stopped transfer state",
+        )
+        self.assertEqual(stable_file_id, stopped_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, stopped_file.state)
+        self.assertIsNotNone(stopped_file.local_size)
+        self.assertGreaterEqual(stopped_file.local_size, partial_size)
+        self.__process_until(
+            lambda: self.controller._Controller__active_downloading_file_names == [],
+            "Timed out waiting for active downloading files to clear after stop",
+        )
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+        remote_path = os.path.join(TestController.temp_dir, "remote", remote_name)
+        remote_backup_path = remote_path + ".missing-window"
+        shutil.move(remote_path, remote_backup_path)
+        self.addCleanup(
+            lambda: shutil.move(remote_backup_path, remote_path)
+            if os.path.exists(remote_backup_path) and not os.path.exists(remote_path)
+            else None
+        )
+
+        self.controller._Controller__remote_scan_process.force_scan()
+        missing_remote_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and
+            file.local_size is not None and file.local_size >= stopped_file.local_size,
+            "Timed out waiting for stopped state to survive missing remote refresh window",
+        )
+        self.assertEqual(stable_file_id, missing_remote_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, missing_remote_file.state)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertEqual(stopped_file.local_size, missing_remote_file.local_size)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
+        shutil.move(remote_backup_path, remote_path)
+        self.controller._Controller__remote_scan_process.force_scan()
+        self.controller._Controller__local_scan_process.force_scan()
+        self.controller._Controller__active_scan_process.force_scan()
+
+        restored_remote_file = self.__wait_for_model_file(
+            remote_name,
+            lambda file: file.state == ModelFile.State.DEFAULT and
+            file.local_size is not None and file.local_size >= missing_remote_file.local_size,
+            "Timed out waiting for stopped state to survive remote data return",
+        )
+        self.assertEqual(stable_file_id, restored_remote_file.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, restored_remote_file.state)
+        self.assertEqual([], self.controller._Controller__active_downloading_file_names)
+        self.assertEqual(stopped_file.local_size, restored_remote_file.local_size)
+        self.assertIn(stable_file_id, self.controller_persist.stopped_file_names)
+
     def test_stop_persisted_across_controller_restart_resumes_with_same_identity(self):
         remote_name = "resume-restart.bin"
         remote_size = 256 * 1024
