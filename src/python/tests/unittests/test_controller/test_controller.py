@@ -7,12 +7,13 @@ from threading import Lock
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from controller import Controller
+from controller import Controller, ModelBuilder
 from controller.scan import MultiPathActiveScanner
 from common import AppError
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelError, ModelFile
+from system import SystemFile
 
 
 class TestController(unittest.TestCase):
@@ -561,11 +562,20 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_not_called()
         self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
 
-    def test_process_commands_stop_rejects_non_stoppable_downloads(self):
-        file = ModelFile("example", False)
-        file.state = ModelFile.State.DOWNLOADING
-        file.is_stoppable = False
-        self.controller._Controller__model.get_file.return_value = file
+    def test_process_commands_stop_rejects_downloads_without_status_sidecar(self):
+        model_builder = ModelBuilder()
+        model_builder.set_remote_files([SystemFile("example", 100, False)])
+        local_file = SystemFile("example", 10, False, is_staging=True)
+        local_file.status_sidecar_ready = False
+        model_builder.set_local_files([local_file])
+        downloading_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "example", "")
+        downloading_status.total_transfer_state = LftpJobStatus.TransferState(10, 100, 10, 100, 10)
+        model_builder.set_lftp_statuses([downloading_status])
+        self.controller._Controller__model = model_builder.build_model()
+        file = self.controller._Controller__model.get_file("example")
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, file.state)
+        self.assertFalse(file.is_stoppable)
 
         command = Controller.Command(Controller.Command.Action.STOP, "example")
         callback = MagicMock()
@@ -576,6 +586,8 @@ class TestController(unittest.TestCase):
 
         callback.on_failure.assert_called_once_with("File 'example' could not be stopped", 409)
         callback.on_success.assert_not_called()
+        self.assertEqual(ModelFile.State.DOWNLOADING, file.state)
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
         self.controller._Controller__lftp.kill.assert_not_called()
 
     def test_process_commands_reports_not_found_as_404(self):
