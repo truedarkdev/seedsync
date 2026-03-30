@@ -62,6 +62,27 @@ PY
   info "  ${host}:${port}: reachable"
 }
 
+check_ssh_login() {
+  local host="$1"
+  local port="$2"
+  local user="$3"
+
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=5 \
+    -o KbdInteractiveAuthentication=no \
+    -o LogLevel=error \
+    -o NumberOfPasswordPrompts=0 \
+    -o PasswordAuthentication=no \
+    -o PreferredAuthentications=publickey \
+    -o StrictHostKeyChecking=accept-new \
+    -p "${port}" \
+    "${user}@${host}" \
+    true
+
+  info "  ${user}@${host}:${port}: login-style SSH probe passed"
+}
+
 info "WSL/Linux baseline preflight"
 info "Checking host-side prerequisites used by SSH-backed and archive-backed lanes"
 
@@ -71,7 +92,9 @@ check_command ssh
 check_command lftp
 check_command rar
 check_command unrar
-check_tcp_port 127.0.0.1 22
+check_ssh_login 127.0.0.1 22 seedsynctest
+
+info "  remote fixture bootstrap is separate; run make run-remote-server to bring up 127.0.0.1:1234"
 check_tcp_port 127.0.0.1 1234
 
 info "WSL/Linux baseline preflight passed"

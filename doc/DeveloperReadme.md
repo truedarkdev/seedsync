@@ -236,12 +236,24 @@ make preflight-linux-wsl
 bash src/docker/test/check_linux_wsl_baseline.sh
 ```
 
-The helper checks the current repo-supported Python range (`>=3.11,<3.13`),
-the OpenSSH client, `lftp`, `rar`, `unrar`, and the two local SSH endpoints we
-rely on during WSL/Linux verification:
+The helper checks host-side prerequisites:
 
-* `127.0.0.1:22` for the Python integration SSH lane
-* `127.0.0.1:1234` for the Compose-managed reusable remote fixture lane
+* the current repo-supported Python range (`>=3.11,<3.13`)
+* the OpenSSH client
+* `lftp`
+* `rar`
+* `unrar`
+* a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
+
+That SSH probe proves the host can complete a command over SSH without
+interactive prompts while still accepting new host keys. It does not start or
+validate the reusable remote fixture.
+
+Remote-fixture bootstrap expectations are separate:
+
+* `127.0.0.1:1234` is the Compose-managed reusable remote fixture lane
+* start it with `make run-remote-server` before you expect that endpoint to be
+  reachable
 
 Lane-specific notes:
 
@@ -259,8 +271,9 @@ Lane-specific notes:
   make run-remote-server
   ```
 
-  That service publishes SSH on port 1234, which is the endpoint checked by
-  the preflight helper.
+  That service publishes SSH on port 1234. The preflight helper keeps the
+  1234 reachability check separate from the host tool and SSH login probe so
+  the host prerequisites and fixture bootstrap expectations stay distinct.
 
 * Archive-backed extraction coverage depends on `rar` and `unrar` being
   installed on the Linux/WSL host. The extractor shells out to archive tooling,
