@@ -10,6 +10,7 @@ import {StreamServiceRegistry} from "../../services/base/stream-service.registry
 import {Notification} from "../../services/utils/notification";
 import {NotificationService} from "../../services/utils/notification.service";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
+import {getPathPairRouteSegment} from "../../services/settings/path-pair-route";
 
 interface SidebarPathPairRoute {
     path: string;
@@ -58,7 +59,7 @@ export class SidebarComponent implements OnInit, OnDestroy {
                     const enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);
                     this.hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
                     this.pathPairRoutes = enabledPathPairs.map(pair => ({
-                        path: `dashboard/${encodeURIComponent(pair.id)}`,
+                        path: `dashboard/${encodeURIComponent(getPathPairRouteSegment(pair, enabledPathPairs))}`,
                         name: pair.name,
                         icon: "assets/icons/directory.svg"
                     }));

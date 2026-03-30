@@ -70,13 +70,20 @@ describe("Testing app component", () => {
         fixture.destroy();
     });
 
-    it("should resolve dashboard detail titles from enabled path pairs and keep static route titles working", () => {
+    it("should resolve dashboard detail titles from either the slug or the ID and keep static route titles working", () => {
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies"),
-            createPathPair("tv", "TV")
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
         ]);
 
         router.url = "/dashboard/movies";
+        fixture.detectChanges();
+
+        expect(component.activeTitle).toBe("Movies");
+        expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies");
+
+        router.url = "/dashboard/movies-id";
+        router.events.next(new NavigationEnd(1, "/dashboard/movies-id", "/dashboard/movies-id"));
         fixture.detectChanges();
 
         expect(component.activeTitle).toBe("Movies");
@@ -100,7 +107,7 @@ describe("Testing app component", () => {
     it("should keep Dashboard as the title for a dashboard path-pair route when only one enabled path pair exists", () => {
         router.url = "/dashboard/movies";
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies")
+            createPathPair("movies-id", "Movies")
         ]);
 
         fixture.detectChanges();
@@ -114,13 +121,39 @@ describe("Testing app component", () => {
 
         expect(() => {
             pathPairService.setPathPairs([
-                createPathPair("movies", "Movies"),
-                createPathPair("tv", "TV")
+                createPathPair("movies-id", "Movies"),
+                createPathPair("tv-id", "TV")
             ]);
             fixture.detectChanges();
         }).not.toThrow();
 
         expect(component.activeTitle).toBe("Dashboard");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
+    });
+
+    it("should keep Dashboard as the title when two enabled path pairs normalize to the same slug", () => {
+        router.url = "/dashboard/my-movies";
+        pathPairService.setPathPairs([
+            createPathPair("movies-one", "My Movies"),
+            createPathPair("movies-two", "My-Movies")
+        ]);
+
+        fixture.detectChanges();
+
+        expect(component.activeTitle).toBe("Dashboard");
+        expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
+    });
+
+    it("should resolve dashboard detail titles when the path-pair ID contains a percent sign", () => {
+        router.url = "/dashboard/movies%25cut";
+        pathPairService.setPathPairs([
+            createPathPair("movies%cut", "Movies Cut"),
+            createPathPair("tv-id", "TV")
+        ]);
+
+        fixture.detectChanges();
+
+        expect(component.activeTitle).toBe("Movies Cut");
+        expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies Cut");
     });
 });

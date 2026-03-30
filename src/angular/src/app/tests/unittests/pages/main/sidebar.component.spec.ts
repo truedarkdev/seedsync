@@ -89,14 +89,18 @@ describe("Testing sidebar component", () => {
 
     it("should show path pair tabs when multiple enabled path pairs exist", () => {
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies"),
-            createPathPair("tv", "TV")
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
         ]);
 
         fixture.detectChanges();
 
         expect(component.hasMultipleEnabledPathPairs).toBe(true);
         expect(component.pathPairRoutes.length).toBe(2);
+        expect(component.pathPairRoutes.map(route => route.path)).toEqual([
+            "dashboard/movies",
+            "dashboard/tv"
+        ]);
 
         const buttons = Array.from(fixture.nativeElement.querySelectorAll("#sidebar a.button"));
         const labels = buttons.map((button: HTMLElement) => button.textContent.trim());
@@ -105,15 +109,31 @@ describe("Testing sidebar component", () => {
         expect(labels).toContain("TV");
     });
 
+    it("should fall back to IDs when two enabled path pairs normalize to the same slug", () => {
+        pathPairService.setPathPairs([
+            createPathPair("movies-one", "My Movies"),
+            createPathPair("movies-two", "My-Movies")
+        ]);
+
+        fixture.detectChanges();
+
+        expect(component.hasMultipleEnabledPathPairs).toBe(true);
+        expect(component.pathPairRoutes.map(route => route.path)).toEqual([
+            "dashboard/movies-one",
+            "dashboard/movies-two"
+        ]);
+    });
+
     it("should hide path pair tabs when only one enabled path pair exists", () => {
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies")
+            createPathPair("movies-id", "Movies")
         ]);
 
         fixture.detectChanges();
 
         expect(component.hasMultipleEnabledPathPairs).toBe(false);
         expect(component.pathPairRoutes.length).toBe(1);
+        expect(component.pathPairRoutes[0].path).toBe("dashboard/movies");
 
         const buttons = Array.from(fixture.nativeElement.querySelectorAll("#sidebar a.button"));
         const labels = buttons.map((button: HTMLElement) => button.textContent.trim());

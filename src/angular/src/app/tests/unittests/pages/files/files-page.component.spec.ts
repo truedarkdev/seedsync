@@ -117,34 +117,75 @@ describe("Testing files page component", () => {
         expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
     });
 
-    it("shows the selected path pair detail view for dashboard path pair routes", () => {
-        route.setParams({pathPairId: "movies"});
+    it("resolves dashboard detail routes from either the slug or the ID", () => {
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies"),
-            createPathPair("tv", "TV")
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
+        ]);
+
+        route.setParams({pathPairId: "movies"});
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(true);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies-id");
+        expect(fixture.nativeElement.querySelector("app-path-pair-stats")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
+
+        route.setParams({pathPairId: "movies-id"});
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(true);
+        expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe("movies-id");
+    });
+
+    it("resolves dashboard detail routes when the path-pair ID contains a percent sign", () => {
+        route.setParams({pathPairId: "movies%cut"});
+        pathPairService.setPathPairs([
+            createPathPair("movies%cut", "Movies Cut"),
+            createPathPair("tv-id", "TV")
         ]);
 
         fixture.detectChanges();
 
         expect(component.showOverview).toBe(false);
         expect(component.showDetailView).toBe(true);
-        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies");
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies%cut");
         expect(fixture.nativeElement.querySelector("app-path-pair-stats")).toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
     });
 
+    it("keeps the overview when two enabled path pairs normalize to the same slug", () => {
+        route.setParams({pathPairId: "my-movies"});
+        pathPairService.setPathPairs([
+            createPathPair("movies-one", "My Movies"),
+            createPathPair("movies-two", "My-Movies")
+        ]);
+
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(true);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith(null);
+        expect(fixture.nativeElement.querySelector("app-path-pair-stats")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
+    });
+
     it("keeps the original dashboard detail view when only one enabled path pair exists", () => {
         route.setParams({pathPairId: "movies"});
         pathPairService.setPathPairs([
-            createPathPair("movies", "Movies")
+            createPathPair("movies-id", "Movies")
         ]);
 
         fixture.detectChanges();
 
         expect(component.showOverview).toBe(false);
         expect(component.showDetailView).toBe(true);
-        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies");
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies-id");
         expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
     });
