@@ -33,8 +33,9 @@ Freshness rule:
 | --- | --- | --- | --- | --- |
 | Python unit/backend | Healthy as of 2026-03-30 | The targeted backend controller path still passes on the supported WSL/Linux Python lane. | `src/python` pytest lane; targeted nodeid `tests/unittests/test_controller/test_controller.py::TestController::test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan` | 2026-03-30 local WSL run |
 | Python integration/controller | Healthy as of 2026-03-30 | The controller integration path still passes on the supported WSL/Linux lane. | `src/python` pytest lane; targeted nodeid `tests/integration/test_controller/test_controller.py::TestController::test_initial_model` | 2026-03-30 local WSL run |
+| WSL backend stop-state integration | Healthy as of 2026-03-30 | The stop-state backend contract now has fresh WSL/Linux proof, so the regression is no longer an open implementation gap. | Targeted `src/python` pytest slice for stop-state coverage | 2026-03-30 local WSL run; 4 targeted tests passed in 26.56s; artifact `tmp/pytest/wsl-backend.junit.xml` |
 | Frontend host harness | Healthy as of 2026-03-30 for host-level smoke only | The Angular/Karma host harness still boots and runs the smoke suite successfully, but that only proves the host harness. | `src/angular` headless Karma lane; smoke run `291/291 SUCCESS` | 2026-03-30 local host run |
-| Docker/browser/e2e | Unknown at runtime | The Compose files still parse, but the live browser-backed runtime path was not exercised today. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-03-30 local compose parse only |
+| Docker/browser/e2e | Blocked by harness/env on this machine | The Compose files still parse, but the live browser-backed runtime path cannot be treated as proof here until the Selenium/Chrome lane builds and the localhost:4444/default-bridge assumptions are fixed. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-03-30 local compose parse only; browser lane build failure in `src/docker/test/e2e/chrome/Dockerfile` (`libgconf-2-4`); current e2e network assumptions around `localhost:4444` and the default bridge |
 | Native Windows Poetry path | Blocked on this machine | The local Windows Python environment is outside the repo-supported Poetry range, so this host path cannot be treated as a valid confidence lane here. | `src/python` Poetry environment | 2026-03-30 local host check; Python 3.13.12 vs supported `>=3.11,<3.13` |
 
 ## Minimum Evidence Ladder
@@ -71,7 +72,7 @@ more evidence, but the minimum should always be visible and specific.
 - If the same gap keeps showing up across tasks, convert it into follow-up
   work.
 - If live Docker or browser proof is required but blocked, name the blocker and
-  stop short of claiming the task is closed.
+  treat it as lane confidence debt, not as unfinished product implementation.
 
 ## Durable Artifacts
 
@@ -91,13 +92,12 @@ keep the artifact name descriptive.
 These items are deliberately left as future work. They are not missing
 documentation.
 
-- Docker/browser/e2e runtime lane: still unproven at runtime. Today only the
-  Compose configuration parse was exercised, so the browser-backed lane still
-  needs a real live run before it can be called healthy.
-- Controller/transfer regression breadth: the current evidence is targeted and
-  narrow. Wider stop-resume, path-remap, and transfer-state scenarios still need
-  broader coverage before this lane can be treated as fully confidence-building
-  for those behaviors.
+- Stop-resume browser/e2e lane: the backend stop-state slice now has fresh
+  WSL/Linux proof, but the live browser-backed lane is still blocked here by
+  the Selenium/Chrome build failure in `src/docker/test/e2e/chrome/Dockerfile`
+  (`libgconf-2-4`) and the current `localhost:4444` / default bridge
+  assumptions. That is a lane-confidence blocker, not an open stop-state
+  implementation task.
 - Native Windows Poetry validation: blocked on this machine because the local
   Python version is 3.13.12, outside the repo-supported `>=3.11,<3.13` range.
   If Windows host validation becomes necessary, it needs a supported Python
