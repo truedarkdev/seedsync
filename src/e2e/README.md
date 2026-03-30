@@ -14,14 +14,17 @@ This helper checks:
 * OpenSSH client (`ssh`)
 * `lftp`
 * `rar` and `unrar`
-* `127.0.0.1:22` for the Python integration SSH lane
-* `127.0.0.1:1234` for the Compose-managed reusable remote fixture lane
+* a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
 
-The reusable remote SSH fixture is started with:
+The helper does not start the remote fixture for you. If you need the
+Compose-managed reusable remote SSH lane, bootstrap it separately with:
 
 ```bash
 make run-remote-server
 ```
+
+That service publishes SSH on `127.0.0.1:1234`. The baseline helper keeps that
+fixture bootstrap step separate from the host-side SSH probe.
 
 See [doc/DeveloperReadme.md](../../doc/DeveloperReadme.md) for the shared lane
 breakdown and the archive-backed prerequisites.
@@ -86,6 +89,6 @@ Notes:
    make run-remote-server
    ```
 
-   That service publishes SSH on `localhost:1234`, which is the endpoint used
-   by the Linux/WSL baseline helper and by the Compose-backed remote fixture
-   path.
+   That service publishes SSH on `localhost:1234`. The Linux/WSL baseline
+   helper only treats that endpoint as a separately bootstrapped fixture, not
+   as a host prerequisite.
