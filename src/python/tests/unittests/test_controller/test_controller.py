@@ -258,8 +258,10 @@ class TestController(unittest.TestCase):
         new_remote_process = MagicMock()
         scanner_process_cls.side_effect = [new_active_process, new_local_process, new_remote_process]
 
-        self.controller._Controller__apply_path_pair_refresh()
+        with patch("controller.controller.os.makedirs") as makedirs_mock:
+            self.controller._Controller__apply_path_pair_refresh()
 
+        makedirs_mock.assert_called_once_with(os.path.join("/local/movies", "incomplete"), exist_ok=True)
         old_active_process.terminate.assert_called_once_with()
         old_local_process.terminate.assert_called_once_with()
         old_remote_process.terminate.assert_called_once_with()
