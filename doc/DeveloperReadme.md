@@ -230,8 +230,9 @@ poetry run pytest --junitxml=../../tmp/pytest/python-unit.xml
 
 ### Linux/WSL SSH and Archive Baseline
 
-Before chasing failures in the local Linux/WSL SSH-backed or archive-backed
-lanes, run the shared preflight helper from the repo root:
+Before chasing failures in the local Linux/WSL live SSH/LFTP, archive-backed,
+or reusable remote fixture lanes, run the shared preflight helper from the
+repo root:
 
 ```bash
 make preflight-linux-wsl
@@ -239,28 +240,46 @@ make preflight-linux-wsl
 bash src/docker/test/check_linux_wsl_baseline.sh
 ```
 
-The helper checks host-side prerequisites:
+The helper defaults to the full baseline, but the direct script also accepts
+lane flags when you only want one slice:
 
-* the current repo-supported Python range (`>=3.11,<3.13`)
-* the OpenSSH client
-* `lftp`
-* `rar`
-* `unrar`
-* a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
+```bash
+bash src/docker/test/check_linux_wsl_baseline.sh --live-ssh-lftp
+bash src/docker/test/check_linux_wsl_baseline.sh --archive-backed
+bash src/docker/test/check_linux_wsl_baseline.sh --reusable-remote-fixture
+```
 
-That SSH probe proves the host can complete a command over SSH without
+The helper checks host-side prerequisites in separate buckets:
+
+* Live SSH/LFTP lane:
+  * the current repo-supported Python range (`>=3.11,<3.13`)
+  * the OpenSSH client
+  * `lftp`
+  * a non-interactive SSH login-style probe against `seedsynctest@127.0.0.1:22`
+
+* Archive-backed lane:
+  * `rar`
+  * `unrar`
+
+That SSH probe proves the live lane can complete a command over SSH without
 interactive prompts while still accepting new host keys. It does not start or
-validate the reusable remote fixture.
+validate the reusable remote fixture, and it does not need archive tooling.
 
 Remote-fixture bootstrap expectations are separate:
 
 * `127.0.0.1:1234` is the Compose-managed reusable remote fixture lane
+* `--reusable-remote-fixture` only checks that the host-side endpoint is
+  reachable; it does not bootstrap the fixture for you
 * start it with `make run-remote-server` before you expect that endpoint to be
   reachable
 
 Lane-specific notes:
 
-* Python integration tests use the localhost SSH target on port 22.
+* Python integration tests use the localhost SSH target on port 22. They need
+  the live SSH/LFTP lane prerequisites above, but they do not need the archive
+  tooling unless the test path actually creates or extracts rar-backed
+  archives.
+
   The current host-side command remains:
 
   ```bash
@@ -281,6 +300,7 @@ Lane-specific notes:
 * Archive-backed extraction coverage depends on `rar` and `unrar` being
   installed on the Linux/WSL host. The extractor shells out to archive tooling,
   so a missing binary is an environment problem rather than a repo regression.
+  The live SSH/LFTP lane does not depend on those archive tools.
 
 See [src/e2e/README.md](../src/e2e/README.md) for the e2e lane-specific
 command summary.
