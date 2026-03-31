@@ -1,6 +1,6 @@
 import {Injectable} from "@angular/core";
-import {BehaviorSubject} from "rxjs/Rx";
-import {Observable} from "rxjs/Observable";
+import {BehaviorSubject, combineLatest, Observable} from "rxjs";
+import {map, shareReplay} from "rxjs/operators";
 
 import * as Immutable from "immutable";
 
@@ -17,9 +17,10 @@ export class FileSelectionService {
     }
 
     get selectedNames(): Observable<Immutable.Set<string>> {
-        return this.selectedFiles.map(
-            (files: Immutable.List<ViewFile>) => Immutable.Set<string>(files.map(file => file.name).toArray())
-        ).shareReplay(1);
+        return this.selectedFiles.pipe(
+            map((files: Immutable.List<ViewFile>) => Immutable.Set<string>(files.map(file => file.name).toArray())),
+            shareReplay(1)
+        );
     }
 
     get selectedFileIds(): Observable<Immutable.Set<string>> {
@@ -27,21 +28,21 @@ export class FileSelectionService {
     }
 
     get selectedFiles(): Observable<Immutable.List<ViewFile>> {
-        return Observable.combineLatest(
-            this._visibleFiles,
-            this._selectedFileIds,
-            (files: Immutable.List<ViewFile>, selectedFileIds: Immutable.Set<string>) =>
+        return combineLatest([this._visibleFiles, this._selectedFileIds]).pipe(
+            map(([files, selectedFileIds]: [Immutable.List<ViewFile>, Immutable.Set<string>]) =>
                 files.filter(file => selectedFileIds.has(FileSelectionService.getFileKey(file))).toList()
-        ).shareReplay(1);
+            ),
+            shareReplay(1)
+        );
     }
 
     get areAllVisibleSelected(): Observable<boolean> {
-        return Observable.combineLatest(
-            this._visibleFiles,
-            this._selectedFileIds,
-            (files: Immutable.List<ViewFile>, selectedFileIds: Immutable.Set<string>) =>
+        return combineLatest([this._visibleFiles, this._selectedFileIds]).pipe(
+            map(([files, selectedFileIds]: [Immutable.List<ViewFile>, Immutable.Set<string>]) =>
                 files.size > 0 && files.every(file => selectedFileIds.has(FileSelectionService.getFileKey(file)))
-        ).shareReplay(1);
+            ),
+            shareReplay(1)
+        );
     }
 
     public setVisibleFiles(files: Immutable.List<ViewFile>) {

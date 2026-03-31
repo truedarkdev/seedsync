@@ -4,13 +4,16 @@ Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
 upgrade execution is active with Angular 21 on Node 24 LTS as the intended
 destination for the frontend modernization / compatibility migration task.
 
-Current Phase 4 checkpoint: slices 1-2 completed.
+Current Phase 4 checkpoint: slices 1-3 completed.
 Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
 Docker/frontend lane alignment, Docker build/test command modernization, and
 narrow compatibility bridges for legacy modal/storage usage.
 Slice 2 modernized the page-layer RxJS imports/operators and directly related
 page specs while keeping service-layer RxJS APIs and bridge retirement deferred
 to later Phase 4 slices.
+Slice 3 modernized the service/runtime RxJS imports/APIs while still staying on
+RxJS 6.6.7 and explicitly deferred the RxJS 7 bump, `rxjs-compat` removal, and
+bridge retirement to later slices.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -100,6 +103,24 @@ was resolved by proof on 2026-03-31.
   --abort-on-container-exit --exit-code-from tests`
 - The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
 
+## 2026-04-01 Phase 4 Slice 3 Proof
+
+- Service/runtime RxJS imports were modernized from legacy forms like
+  `rxjs/Observable`, `rxjs/Subject`, `rxjs/Subscription`, `rxjs/Rx`, and
+  `rxjs/add/...` to canonical imports from `rxjs` plus `rxjs/operators`.
+- Runtime `Observable.create(...)` call sites were replaced with
+  `new Observable(...)` while preserving the existing service behavior.
+- Remaining static `Observable.combineLatest(...)` service usage was updated to
+  canonical RxJS 6-style `combineLatest([...])` usage in the touched runtime
+  layer.
+- The slice intentionally stayed on `rxjs` `6.6.7` and did not remove
+  `rxjs-compat`.
+- The exact default Angular Docker verifier path passed again on the final
+  candidate:
+  `docker compose -f src/docker/test/angular/compose.yml up --build
+  --abort-on-container-exit --exit-code-from tests`
+- The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
+
 ## Phase 4 Upgrade Investigation
 
 - The current frontend still uses a legacy Angular CLI workspace shape:
@@ -114,8 +135,13 @@ was resolved by proof on 2026-03-31.
 - The first two upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
-- The next upgrade slice should stay runtime/service-focused: remove legacy
-  service-layer RxJS API usage without regressing the Dockerized Karma lane.
+- The first three upgrade slices are now complete:
+  - slice 1: workspace/toolchain + Docker lane modernization
+  - slice 2: page-layer RxJS modernization
+  - slice 3: service/runtime RxJS modernization on RxJS 6.6.7
+- The next upgrade slice should raise the RxJS floor itself: bump to RxJS 7,
+  remove `rxjs-compat`, and fix any remaining breakage without regressing the
+  Dockerized Karma lane.
 
 ## Supported Compatibility Target
 
@@ -144,16 +170,16 @@ modern floor.
 | Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
-| What is the next coherent Angular 21 runtime modernization slice after page-layer RxJS cleanup? | Phase 4 | Slice 2 is now complete; next slices should focus on service-layer RxJS modernization without regressing the green Dockerized Karma lane. |
-| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint is stable? | Phase 4 | Revisit the temporary modal/storage and `rxjs-compat` bridges once the Angular 21 lane has stayed green through follow-on app updates. |
+| When should the Angular frontend itself move from RxJS 6.6.7 plus `rxjs-compat` to RxJS 7? | Phase 4 | Slice 3 is now complete; the next slice should raise the RxJS floor and remove `rxjs-compat` once the service/runtime migration is safely landed. |
+| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint and RxJS floor are stable? | Phase 4 | Revisit the temporary modal/storage bridges after the Angular 21 lane has stayed green through the RxJS version bump and follow-on app updates. |
 | When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Continue Phase 4 from the now-green Angular 21 / Node 24 slices 1-2 baseline
-by taking the next bounded runtime modernization slice, most likely
-service-layer RxJS cleanup, while preserving the Dockerized Karma lane as the
-closure gate. Do not treat the current nested CLI `node-sass` 4.x lockfile
-subtree as cleanup-by-default; revisit it only through a controlled
-lockfile-refresh decision if the warning/noise reduction is worth the churn.
+Continue Phase 4 from the now-green Angular 21 / Node 24 slices 1-3 baseline
+by taking the next bounded dependency-floor slice: upgrade to RxJS 7, remove
+`rxjs-compat`, and preserve the Dockerized Karma lane as the closure gate. Do
+not treat the current nested CLI `node-sass` 4.x lockfile subtree as
+cleanup-by-default; revisit it only through a controlled lockfile-refresh
+decision if the warning/noise reduction is worth the churn.
