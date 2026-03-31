@@ -1,6 +1,7 @@
 # Frontend Compatibility Baseline
 
-Status: Phase 0 complete; Phase 1 in progress for the frontend modernization /
+Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
+Angular upgrade investigation is now active for the frontend modernization /
 compatibility migration task.
 
 This note captures the current contract before any toolchain or dependency
@@ -28,10 +29,11 @@ was resolved by proof on 2026-03-31.
   same install behavior for the Debian packaging path.
 - `src/docker/test/angular/Dockerfile` reuses the Angular build environment,
   adds Chromium, and runs the headless Karma lane with
-  `--browsers ChromeHeadlessCI --single-run`.
-- `src/docker/test/angular/compose.yml` mounts `src/angular/src` read-only into
-  the test container, so the Angular test lane is effectively exercising the
-  live workspace tree.
+  `--browsers ChromeHeadlessCI --single-run` from `/app`.
+- `src/docker/test/angular/compose.yml` now mounts the full `src/angular` tree
+  read-only at `/app` and preserves image-installed dependencies through an
+  `/app/node_modules` volume, so the Angular test lane uses a tree shape closer
+  to the build and Debian lanes.
 - `Makefile` exposes the primary local Angular gate through `run-tests-angular`,
   which builds `seedsync/build/angular/env` and then runs the compose-based
   test service.
@@ -44,6 +46,24 @@ was resolved by proof on 2026-03-31.
 - Dockerized Angular test lane passed with `TOTAL: 293 SUCCESS`.
 - `src/docker/build/deb/Dockerfile` Angular env stage built successfully.
 - `src/docker/build/docker-image/Dockerfile` Angular path built successfully.
+- Fresh-volume Angular test bootstrap passed after the full-tree `/app` mount
+  change.
+- Read-only `/app` probe passed while `ng test --browsers ChromeHeadlessCI
+  --single-run` still completed successfully.
+
+## Phase 4 Upgrade Investigation
+
+- The current frontend still uses a legacy Angular CLI workspace shape:
+  `.angular-cli.json`, Protractor-era config, and TSLint/Codelyzer.
+- The runtime contract is already anchored to Node 20 / npm 10 in Docker, so
+  the upgrade path should preserve that container baseline rather than adding a
+  second Node compatibility track.
+- The gap from Angular 4 / CLI 1.3 to a Node-20-compatible modern Angular
+  stack is large enough that this should be treated as a multi-slice program,
+  not a one-shot package bump.
+- The first upgrade slice should stay toolchain-first: identify the smallest
+  coherent Angular / Angular CLI checkpoint that can keep the Dockerized Karma
+  lane alive before we attempt broader app-code or Sass migration work.
 
 ## Supported Compatibility Target
 
@@ -70,15 +90,16 @@ Node 20 Docker images used by the Angular build and test lanes.
 | --- | --- | --- |
 | Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
-| Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Pipeline hardening should happen after the contract is documented and the install path is stable. |
-| What is the smallest Angular / Angular CLI upgrade path that preserves the Dockerized frontend lane? | Phase 4 | Angular modernization is part of this task, but it should happen as its own explicit phase after the current compatibility floor is stable. |
+| Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
+| What is the smallest coherent Angular / Angular CLI checkpoint that preserves the Dockerized frontend lane on Node 20? | Phase 4 | This is the active investigation question for the upgrade phase. |
+| Which config migrations must move with the first Angular / Angular CLI checkpoint? | Phase 4 | Expect `.angular-cli.json` to `angular.json`, build-command updates, and test-tooling alignment to move together with the first checkpoint. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Finish the current compatibility-hardening slices first, then treat Angular /
-Angular CLI upgrade as the next explicit modernization phase before planning the
-move from `node-sass` to Dart Sass. Do not treat the current nested CLI
-`node-sass` 4.x lockfile subtree as cleanup-by-default; revisit it only through
-a controlled lockfile-refresh decision if the warning/noise reduction is worth
-the churn.
+Start Phase 4 by identifying the first coherent Angular / Angular CLI upgrade
+checkpoint that can keep the Dockerized frontend lane alive on Node 20, then
+plan config migration and later Sass migration from that upgraded floor. Do not
+treat the current nested CLI `node-sass` 4.x lockfile subtree as
+cleanup-by-default; revisit it only through a controlled lockfile-refresh
+decision if the warning/noise reduction is worth the churn.
