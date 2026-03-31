@@ -1,6 +1,5 @@
 import {ChangeDetectorRef, ChangeDetectionStrategy, Component, OnDestroy, OnInit, QueryList, ViewChildren} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {Subscription} from "rxjs/Subscription";
+import {combineLatest, Observable, Subscription} from "rxjs";
 
 import {List} from "immutable";
 import * as Immutable from "immutable";
@@ -59,18 +58,17 @@ export class FileListComponent implements OnInit, OnDestroy {
             this.viewFileService.setPageSize(this.pageSize);
         }
 
-        this._paginationSubscription = Observable.combineLatest(
+        this._paginationSubscription = combineLatest([
             this.viewFileService.totalFilteredCount,
             this.viewFileService.currentPage,
-            this.viewFileService.pageSize,
-            (totalCount: number, currentPage: number, pageSize: number) => {
-                this.totalCount = totalCount;
-                this.currentPage = currentPage;
-                this.pageSize = pageSize;
-                this.totalPages = pageSize > 0 ? Math.ceil(totalCount / pageSize) : 1;
-                this._changeDetector.markForCheck();
-            }
-        ).subscribe();
+            this.viewFileService.pageSize
+        ]).subscribe(([totalCount, currentPage, pageSize]: [number, number, number]) => {
+            this.totalCount = totalCount;
+            this.currentPage = currentPage;
+            this.pageSize = pageSize;
+            this.totalPages = pageSize > 0 ? Math.ceil(totalCount / pageSize) : 1;
+            this._changeDetector.markForCheck();
+        });
     }
 
     static identify(index: number, item: ViewFile): string {

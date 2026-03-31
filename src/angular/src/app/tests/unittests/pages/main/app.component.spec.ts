@@ -1,7 +1,7 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {NavigationEnd, Router} from "@angular/router";
-import {BehaviorSubject, Subject} from "rxjs/Rx";
+import {BehaviorSubject, Subject} from "rxjs";
 
 import {AppComponent} from "../../../../pages/main/app.component";
 import {DomService} from "../../../../services/utils/dom.service";

@@ -2,10 +2,7 @@ import {ChangeDetectionStrategy, Component} from "@angular/core";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
 import {By} from "@angular/platform-browser";
-import {Observable} from "rxjs/Observable";
-import {BehaviorSubject} from "rxjs/Rx";
-import "rxjs/add/observable/of";
-import "rxjs/add/observable/throw";
+import {BehaviorSubject, of} from "rxjs";
 import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {PathPairsComponent} from "../../../../pages/settings/path-pairs.component";
@@ -29,7 +26,7 @@ class MockPathPairService {
         this._pathPairs.next(pathPairs);
     }
 
-    create = jasmine.createSpy("create").and.returnValue(Observable.of({
+    create = jasmine.createSpy("create").and.returnValue(of({
         pathPair: {
             id: "movies",
             name: "Movies",
@@ -40,7 +37,7 @@ class MockPathPairService {
         },
         warnings: ["warning"]
     }));
-    update = jasmine.createSpy("update").and.returnValue(Observable.of({
+    update = jasmine.createSpy("update").and.returnValue(of({
         pathPair: {
             id: "movies",
             name: "Movies",
@@ -51,8 +48,8 @@ class MockPathPairService {
         },
         warnings: []
     }));
-    delete = jasmine.createSpy("delete").and.returnValue(Observable.of(null));
-    reorder = jasmine.createSpy("reorder").and.returnValue(Observable.of([]));
+    delete = jasmine.createSpy("delete").and.returnValue(of(null));
+    reorder = jasmine.createSpy("reorder").and.returnValue(of([]));
 }
 
 class MockNotificationService {

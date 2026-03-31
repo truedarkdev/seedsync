@@ -1,7 +1,7 @@
 import {CommonModule} from "@angular/common";
 import {Component} from "@angular/core";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject} from "rxjs";
 
 import {FilesPageComponent} from "../../../../pages/files/files-page.component";
 import {ActivatedRoute} from "@angular/router";

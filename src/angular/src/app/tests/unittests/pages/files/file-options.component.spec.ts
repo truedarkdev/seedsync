@@ -1,7 +1,7 @@
 import {CommonModule} from "@angular/common";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject} from "rxjs";
 
 import * as Immutable from "immutable";
 

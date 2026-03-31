@@ -1,4 +1,4 @@
-import {BehaviorSubject, Observable} from "rxjs/Rx";
+import {BehaviorSubject, of, throwError} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -18,10 +18,10 @@ class MockLoggerService {
 class MockViewFileService {
     private _filteredFiles = new BehaviorSubject(Immutable.List<ViewFile>());
     stop = jasmine.createSpy("stop").and.returnValue(
-        Observable.of(new WebReaction(false, null, "Operation timed out"))
+        of(new WebReaction(false, null, "Operation timed out"))
     );
     deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
-        Observable.of(new WebReaction(true, "ok", null))
+        of(new WebReaction(true, "ok", null))
     );
 
     get filteredFiles() {
@@ -93,7 +93,7 @@ describe("Testing file list component", () => {
 
     it("should clear the stop loading state when the stop request succeeds", () => {
         mockViewFileService.stop.and.returnValue(
-            Observable.of(new WebReaction(true, "ok", null))
+            of(new WebReaction(true, "ok", null))
         );
 
         component.onStop(createViewFile());
@@ -132,7 +132,7 @@ describe("Testing file list component", () => {
     });
 
     it("should clear the stop loading state when the stop request errors", () => {
-        mockViewFileService.stop.and.returnValue(Observable.throw("boom"));
+        mockViewFileService.stop.and.returnValue(throwError("boom"));
 
         component.onStop(createViewFile());
 
@@ -149,7 +149,7 @@ describe("Testing file list component", () => {
 
     it("should clear the delete local loading state when the delete request fails", () => {
         mockViewFileService.deleteLocal.and.returnValue(
-            Observable.of(new WebReaction(false, null, "Operation timed out"))
+            of(new WebReaction(false, null, "Operation timed out"))
         );
 
         component.onDeleteLocal(createViewFile());

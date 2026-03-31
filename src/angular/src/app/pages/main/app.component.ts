@@ -1,7 +1,7 @@
 import {AfterViewInit, Component, ElementRef, OnDestroy, OnInit, ViewChild} from "@angular/core";
 import {NavigationEnd, Router} from "@angular/router";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 import {ROUTE_INFOS} from "../../routes";
 
 import {DomService} from "../../services/utils/dom.service";
@@ -27,7 +27,7 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
                 private _domService: DomService) {}
 
     ngOnInit() {
-        this._pathPairService.pathPairs.takeUntil(this._destroy$).subscribe({
+        this._pathPairService.pathPairs.pipe(takeUntil(this._destroy$)).subscribe({
             next: (pathPairs: PathPair[]) => {
                 this._pathPairs = pathPairs || [];
             }
@@ -36,12 +36,12 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         // Navigation listener
         //    Close the sidebar
         //    Store the active route
-        this.router.events.takeUntil(this._destroy$).subscribe((evt) => {
+        this.router.events.pipe(takeUntil(this._destroy$)).subscribe((evt) => {
             this.showSidebar = false;
         });
 
         // Scroll to top on route changes
-        this.router.events.takeUntil(this._destroy$).subscribe((evt) => {
+        this.router.events.pipe(takeUntil(this._destroy$)).subscribe((evt) => {
             if (!(evt instanceof NavigationEnd)) {
                 return;
             }

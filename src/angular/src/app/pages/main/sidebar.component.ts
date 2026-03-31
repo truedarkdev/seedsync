@@ -1,6 +1,6 @@
 import {Component, OnDestroy, OnInit} from "@angular/core";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 
 import {ROUTE_INFOS} from "../../routes";
 import {ServerCommandService} from "../../services/server/server-command.service";
@@ -54,7 +54,7 @@ export class SidebarComponent implements OnInit, OnDestroy {
         });
 
         this._pathPairService.pathPairs
-            .takeUntil(this._destroy$)
+            .pipe(takeUntil(this._destroy$))
             .subscribe({
                 next: (pathPairs: PathPair[]) => {
                     const enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);

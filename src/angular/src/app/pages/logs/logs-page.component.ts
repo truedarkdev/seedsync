@@ -3,8 +3,8 @@ import {
     ChangeDetectionStrategy, ChangeDetectorRef, Component, ElementRef, HostListener,
     OnDestroy, OnInit, ViewChild
 } from "@angular/core";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Observable, Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 
 import {LogService} from "../../services/logs/log.service";
 import {LogRecord} from "../../services/logs/log-record";
@@ -12,7 +12,6 @@ import {StreamServiceRegistry} from "../../services/base/stream-service.registry
 import {ConnectedService} from "../../services/utils/connected.service";
 import {Localization} from "../../common/localization";
 import {DomService} from "../../services/utils/dom.service";
-import {Observable} from "rxjs/Observable";
 
 @Component({
     selector: "app-logs-page",
@@ -65,14 +64,14 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
         this.hasReceivedLogs = this._records.length > 0;
         this.updateVisibleRecords(false);
 
-        this._connectedService.connected.takeUntil(this._destroy$).subscribe({
+        this._connectedService.connected.pipe(takeUntil(this._destroy$)).subscribe({
             next: connected => {
                 this.isConnected = connected;
                 this._changeDetector.detectChanges();
             }
         });
 
-        this._logService.logs.takeUntil(this._destroy$).subscribe({
+        this._logService.logs.pipe(takeUntil(this._destroy$)).subscribe({
             next: record => {
                 this.enqueueRecord(record);
             }
