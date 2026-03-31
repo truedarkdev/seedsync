@@ -69,9 +69,11 @@ Node 20 Docker images used by the Angular build and test lanes.
 | How much more cleanup is safe around the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; the remaining question is how far we can safely reduce the lockfile mismatch. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit after the install strategy is settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Pipeline hardening should happen after the contract is documented and the install path is stable. |
-| Does a broader Angular framework migration belong in this task? | Phase 4 or a separate task | If Angular 4 or CLI 1.x becomes the real blocker, reopen it as a dedicated modernization effort. |
+| What is the smallest Angular / Angular CLI upgrade path that preserves the Dockerized frontend lane? | Phase 4 | Angular modernization is part of this task, but it should happen as its own explicit phase after the current compatibility floor is stable. |
+| When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Start the next slice by deciding how much of the `node-sass` metadata mismatch
-can be cleaned up safely now that the runtime copy is pinned and proven.
+Finish the current compatibility-hardening slices first, then treat Angular /
+Angular CLI upgrade as the next explicit modernization phase before planning the
+move from `node-sass` to Dart Sass.
