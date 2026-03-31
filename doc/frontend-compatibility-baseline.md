@@ -17,7 +17,9 @@ was resolved by proof on 2026-03-31.
   `9.0.0`.
 - The Angular CLI subtree still names `node-sass` 4.14.1 in lockfile metadata,
   but that legacy 4.x expectation is not a second installed runtime copy in the
-  current built image.
+  current built image. Treat the nested CLI `node-sass` 4.x subtree as
+  intentional transitive metadata debt for now, not as an active second runtime
+  dependency, until a controlled lockfile refresh is justified.
 - `typescript` is split between the app-level `^3.2.2` and older CLI
   compatibility ranges inside the lockfile.
 - `src/docker/build/docker-image/Dockerfile` builds the Angular layer from
@@ -66,8 +68,8 @@ Node 20 Docker images used by the Angular build and test lanes.
 
 | Open question | Later phase | Why it waits |
 | --- | --- | --- |
-| How much more cleanup is safe around the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; the remaining question is how far we can safely reduce the lockfile mismatch. |
-| Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit after the install strategy is settled. |
+| Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
+| Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Pipeline hardening should happen after the contract is documented and the install path is stable. |
 | What is the smallest Angular / Angular CLI upgrade path that preserves the Dockerized frontend lane? | Phase 4 | Angular modernization is part of this task, but it should happen as its own explicit phase after the current compatibility floor is stable. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
@@ -76,4 +78,7 @@ Node 20 Docker images used by the Angular build and test lanes.
 
 Finish the current compatibility-hardening slices first, then treat Angular /
 Angular CLI upgrade as the next explicit modernization phase before planning the
-move from `node-sass` to Dart Sass.
+move from `node-sass` to Dart Sass. Do not treat the current nested CLI
+`node-sass` 4.x lockfile subtree as cleanup-by-default; revisit it only through
+a controlled lockfile-refresh decision if the warning/noise reduction is worth
+the churn.
