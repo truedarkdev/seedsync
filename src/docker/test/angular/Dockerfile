@@ -10,17 +10,7 @@ RUN apt-get update && \
 
 ENV CHROME_BIN=/usr/bin/google-chrome-stable
 
-COPY \
-    src/angular/tsconfig.json \
-    src/angular/tslint.json \
-    src/angular/karma.conf.js \
-    src/angular/.angular-cli.json \
-    /app/
-
-RUN ls -l /app/
-
-# ng src needs to be mounted on /app/src
-WORKDIR /app/src
+WORKDIR /app
 
 CMD ["/app/node_modules/@angular/cli/bin/ng", "test", \
      "--browsers", "ChromeHeadlessCI", \
