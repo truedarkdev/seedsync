@@ -3,7 +3,7 @@ import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/co
 import {BehaviorSubject} from "rxjs/Rx";
 import {Observable} from "rxjs/Observable";
 import "rxjs/add/observable/of";
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {SettingsPageComponent} from "../../../../pages/settings/settings-page.component";
 import {ConfigService} from "../../../../services/settings/config.service";

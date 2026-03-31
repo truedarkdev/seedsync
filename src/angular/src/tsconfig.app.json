@@ -1,14 +1,18 @@
 {
-    "extends": "../tsconfig.json",
-    "compilerOptions": {
-        "outDir": "../out-tsc/app",
-        "baseUrl": "./",
-        "module": "commonjs",
-        "types": []
-    },
-    "exclude": [
-        "test.ts",
-        "app/tests/**/*",
-        "**/*.spec.ts"
-    ]
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../out-tsc/app",
+    "types": []
+  },
+  "files": [
+    "main.ts"
+  ],
+  "include": [
+    "**/*.d.ts"
+  ],
+  "exclude": [
+    "test.ts",
+    "app/tests/**/*",
+    "**/*.spec.ts"
+  ]
 }

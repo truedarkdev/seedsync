@@ -52,7 +52,7 @@ RUN	pyinstaller /python/scan_fs.py \
 
 
 # Creates environment for angular
-FROM node:20-bookworm-slim AS seedsync_build_angular_env
+FROM node:24-bookworm-slim AS seedsync_build_angular_env
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3 \
@@ -67,7 +67,7 @@ FROM seedsync_build_angular_env AS seedsync_build_angular
 COPY src/angular /app
 WORKDIR /app
 RUN mkdir -p /build/dist
-RUN node_modules/@angular/cli/bin/ng build -prod --output-path /build/dist/
+RUN npx ng build --configuration production --output-path /build/dist/
 
 
 # Creates environment to build deb packages

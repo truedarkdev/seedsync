@@ -1,7 +1,7 @@
 import {ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../services/utils/modal-compat.service";
 
 import {
     PathPair,
@@ -17,6 +17,7 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-path-pairs",
+    standalone: false,
     templateUrl: "./path-pairs.component.html",
     styleUrls: ["./path-pairs.component.scss"]
 })

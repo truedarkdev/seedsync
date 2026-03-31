@@ -22,6 +22,7 @@ export interface PathPairStat {
 
 @Component({
     selector: "app-path-pair-stats",
+    standalone: false,
     templateUrl: "./path-pair-stats.component.html",
     styleUrls: ["./path-pair-stats.component.scss"],
     changeDetection: ChangeDetectionStrategy.OnPush

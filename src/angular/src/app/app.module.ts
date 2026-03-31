@@ -4,9 +4,6 @@ import {HttpClientModule} from "@angular/common/http";
 import {FormsModule} from "@angular/forms";
 import {RouteReuseStrategy, RouterModule} from "@angular/router";
 
-import {ModalModule} from "ngx-modialog";
-import {bootstrap4Mode, BootstrapModalModule} from "ngx-modialog/plugins/bootstrap";
-
 import {AppComponent} from "./pages/main/app.component";
 import {environment} from "../environments/environment";
 import {LoggerService} from "./services/utils/logger.service";
@@ -43,7 +40,6 @@ import {ROUTES} from "./routes";
 import {ViewFileOptionsService} from "./services/files/view-file-options.service";
 import {ViewFileSortService} from "./services/files/view-file-sort.service";
 import {DomService} from "./services/utils/dom.service";
-import {StorageServiceModule} from "angular-webstorage-service";
 import {VersionCheckService} from "./services/utils/version-check.service";
 import {BulkActionsBarComponent} from "./pages/files/bulk-actions-bar.component";
 import {PathPairStatsComponent} from "./pages/files/path-pair-stats.component";
@@ -51,6 +47,8 @@ import {FileSelectionService} from "./services/files/file-selection.service";
 import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
 import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
 import {PathPairServiceProvider} from "./services/settings/path-pair.service";
+import {Modal} from "./services/utils/modal-compat.service";
+import {StorageServiceModule} from "./services/utils/storage-compat.service";
 
 @NgModule({
     declarations: [
@@ -79,9 +77,6 @@ import {PathPairServiceProvider} from "./services/settings/path-pair.service";
         HttpClientModule,
         FormsModule,
         RouterModule.forRoot(ROUTES),
-
-        ModalModule.forRoot(),
-        BootstrapModalModule,
         StorageServiceModule
     ],
     providers: [
@@ -96,6 +91,7 @@ import {PathPairServiceProvider} from "./services/settings/path-pair.service";
         FileSelectionService,
         DomService,
         VersionCheckService,
+        Modal,
         ModalAccessibilityService,
 
         // Stream services
@@ -144,6 +140,3 @@ export class AppModule {
 export function dummyFactory(s) {
     return () => null;
 }
-
-// Run the ngx-modialog plugin to work with version 4 of bootstrap
-bootstrap4Mode();

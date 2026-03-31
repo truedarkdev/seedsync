@@ -11,18 +11,21 @@ import {ViewFileFilterService} from "../../../../services/files/view-file-filter
 
 @Component({
     selector: "app-path-pair-stats",
+    standalone: false,
     template: ""
 })
 class StubPathPairStatsComponent {}
 
 @Component({
     selector: "app-file-options",
+    standalone: false,
     template: ""
 })
 class StubFileOptionsComponent {}
 
 @Component({
     selector: "app-file-list",
+    standalone: false,
     template: ""
 })
 class StubFileListComponent {}

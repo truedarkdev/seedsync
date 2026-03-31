@@ -16,6 +16,7 @@ import {Observable} from "rxjs/Observable";
 
 @Component({
     selector: "app-logs-page",
+    standalone: false,
     templateUrl: "./logs-page.component.html",
     styleUrls: ["./logs-page.component.scss"],
     providers: [],
@@ -106,7 +107,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
     }
 
     @HostListener("window:scroll", ["$event"])
-    checkScroll() {
+    checkScroll(_event?: Event) {
         this.refreshScrollButtonVisibility();
     }
 

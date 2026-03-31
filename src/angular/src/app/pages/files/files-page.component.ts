@@ -9,6 +9,7 @@ import {ViewFileFilterService} from "../../services/files/view-file-filter.servi
 
 @Component({
     selector: "app-files-page",
+    standalone: false,
     templateUrl: "./files-page.component.html"
 })
 

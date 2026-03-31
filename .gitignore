@@ -17,3 +17,4 @@ doc/maintainer-policy.md
 /.backupignore
 /tmp/
 src/python/tmp
+src/angular/.angular

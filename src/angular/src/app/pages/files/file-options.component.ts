@@ -12,6 +12,7 @@ import {DomService} from "../../services/utils/dom.service";
 
 @Component({
     selector: "app-file-options",
+    standalone: false,
     providers: [],
     templateUrl: "./file-options.component.html",
     styleUrls: ["./file-options.component.scss"],

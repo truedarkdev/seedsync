@@ -4,7 +4,7 @@ import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {By} from "@angular/platform-browser";
 import {Observable} from "rxjs/Rx";
 
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {FileAction, FileComponent} from "../../../../pages/files/file.component";
 import {ViewFile} from "../../../../services/files/view-file";
@@ -20,25 +20,26 @@ class MockChangeDetectorRef {
 }
 
 @Directive({
-    selector: "[appClickStopPropagation]"
+    selector: "[appClickStopPropagation]",
+    standalone: false
 })
 class MockClickStopPropagationDirective {}
 
-@Pipe({name: "capitalize"})
+@Pipe({name: "capitalize", standalone: false})
 class MockCapitalizePipe implements PipeTransform {
     transform(value: any): any {
         return value;
     }
 }
 
-@Pipe({name: "fileSize"})
+@Pipe({name: "fileSize", standalone: false})
 class MockFileSizePipe implements PipeTransform {
     transform(value: any): any {
         return value;
     }
 }
 
-@Pipe({name: "eta"})
+@Pipe({name: "eta", standalone: false})
 class MockEtaPipe implements PipeTransform {
     transform(value: any): any {
         return value;

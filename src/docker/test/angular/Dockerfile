@@ -9,9 +9,8 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ENV CHROME_BIN=/usr/bin/google-chrome-stable
+ENV NG_BUILD_CACHE=/app/.angular/cache
 
 WORKDIR /app
 
-CMD ["/app/node_modules/@angular/cli/bin/ng", "test", \
-     "--browsers", "ChromeHeadlessCI", \
-     "--single-run"]
+CMD ["npx", "ng", "test", "seedsync", "--browsers", "ChromeHeadlessCI", "--watch=false"]

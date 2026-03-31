@@ -70,35 +70,61 @@ describe("Testing app component", () => {
         fixture.destroy();
     });
 
-    it("should resolve dashboard detail titles from either the slug or the ID and keep static route titles working", () => {
+    function detectSettledChanges() {
+        fixture.detectChanges();
+        fixture.detectChanges();
+    }
+
+    it("should resolve the dashboard detail title from the path-pair slug", () => {
         pathPairService.setPathPairs([
             createPathPair("movies-id", "Movies"),
             createPathPair("tv-id", "TV")
         ]);
 
         router.url = "/dashboard/movies";
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Movies");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies");
+    });
+
+    it("should resolve the dashboard detail title from the path-pair ID", () => {
+        pathPairService.setPathPairs([
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
+        ]);
 
         router.url = "/dashboard/movies-id";
         router.events.next(new NavigationEnd(1, "/dashboard/movies-id", "/dashboard/movies-id"));
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Movies");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies");
+    });
+
+    it("should keep Dashboard as the title for the dashboard root route", () => {
+        pathPairService.setPathPairs([
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
+        ]);
 
         router.url = "/dashboard";
         router.events.next(new NavigationEnd(1, "/dashboard", "/dashboard"));
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Dashboard");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
+    });
+
+    it("should keep static route titles working after dashboard detail routes", () => {
+        pathPairService.setPathPairs([
+            createPathPair("movies-id", "Movies"),
+            createPathPair("tv-id", "TV")
+        ]);
 
         router.url = "/settings";
         router.events.next(new NavigationEnd(2, "/settings", "/settings"));
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Settings");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Settings");
@@ -110,7 +136,7 @@ describe("Testing app component", () => {
             createPathPair("movies-id", "Movies")
         ]);
 
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Dashboard");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
@@ -124,7 +150,7 @@ describe("Testing app component", () => {
                 createPathPair("movies-id", "Movies"),
                 createPathPair("tv-id", "TV")
             ]);
-            fixture.detectChanges();
+            detectSettledChanges();
         }).not.toThrow();
 
         expect(component.activeTitle).toBe("Dashboard");
@@ -138,7 +164,7 @@ describe("Testing app component", () => {
             createPathPair("movies-two", "My-Movies")
         ]);
 
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Dashboard");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Dashboard");
@@ -151,7 +177,7 @@ describe("Testing app component", () => {
             createPathPair("tv-id", "TV")
         ]);
 
-        fixture.detectChanges();
+        detectSettledChanges();
 
         expect(component.activeTitle).toBe("Movies Cut");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies Cut");
