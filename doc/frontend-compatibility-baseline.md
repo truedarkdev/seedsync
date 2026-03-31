@@ -1,10 +1,11 @@
 # Frontend Compatibility Baseline
 
-Status: tracked baseline note for the frontend modernization / compatibility
-migration task.
+Status: Phase 0 complete; Phase 1 in progress for the frontend modernization /
+compatibility migration task.
 
 This note captures the current contract before any toolchain or dependency
-changes are attempted.
+changes are attempted. The global OpenSSL legacy-provider workaround question
+was resolved by proof on 2026-03-31.
 
 ## Current Frontend Contract
 
@@ -18,8 +19,7 @@ changes are attempted.
   - `typescript` is split between the app-level `^3.2.2` and older CLI
     compatibility ranges inside the lockfile
 - `src/docker/build/docker-image/Dockerfile` builds the Angular layer from
-  `node:20-bookworm-slim`, installs with `npm install --legacy-peer-deps`, and
-  still sets `NODE_OPTIONS=--openssl-legacy-provider`.
+  `node:20-bookworm-slim` and installs with `npm install --legacy-peer-deps`.
 - `src/docker/build/deb/Dockerfile` uses the same Angular build image and the
   same install behavior for the Debian packaging path.
 - `src/docker/test/angular/Dockerfile` reuses the Angular build environment,
@@ -34,6 +34,12 @@ changes are attempted.
 - `.github/workflows/master.yml` wires CI to the same contract by calling
   `make run-tests-angular` in the `unittests-angular` job before the build jobs
   consume Angular artifacts.
+
+## 2026-03-31 Proof
+
+- Dockerized Angular test lane passed with `TOTAL: 293 SUCCESS`.
+- `src/docker/build/deb/Dockerfile` Angular env stage built successfully.
+- `src/docker/build/docker-image/Dockerfile` Angular path built successfully.
 
 ## Supported Compatibility Target
 
@@ -58,7 +64,6 @@ Node 20 Docker images used by the Angular build and test lanes.
 
 | Open question | Later phase | Why it waits |
 | --- | --- | --- |
-| Does `NODE_OPTIONS=--openssl-legacy-provider` remain necessary? | Phase 1 | Test this after the baseline is locked, then either keep it isolated or remove it with proof. |
 | What is the smallest safe `node-sass` strategy? | Phase 2 | The dependency shape is still mixed, so this needs a dedicated compatibility pass. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit after the install strategy is settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Pipeline hardening should happen after the contract is documented and the install path is stable. |
@@ -66,6 +71,5 @@ Node 20 Docker images used by the Angular build and test lanes.
 
 ## Resume Sentence
 
-Start the next slice by stabilizing the install and build contract, then verify
-whether the legacy Angular stack still needs the OpenSSL workaround before any
-dependency cleanup is attempted.
+Start the next slice by tightening the `node-sass` compatibility strategy, then
+revisit lockfile regeneration only if the install contract changes.

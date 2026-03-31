@@ -39,7 +39,6 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 COPY src/angular/package*.json /app/
 WORKDIR /app
-ENV NODE_OPTIONS=--openssl-legacy-provider
 RUN npm ci --legacy-peer-deps
 
 
