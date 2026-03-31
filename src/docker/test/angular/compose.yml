@@ -10,6 +10,8 @@ services:
       target: seedsync_test_angular
     volumes:
       - type: bind
-        source: ../../../angular/src
-        target: /app/src
+        source: ../../../angular
+        target: /app
         read_only: true
+      - type: volume
+        target: /app/node_modules
