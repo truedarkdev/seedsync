@@ -1,6 +1,5 @@
 import {Injectable} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject, Observable} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -591,7 +590,7 @@ export class ViewFileService {
     private createAction(file: ViewFile,
                          action: (file: ModelFile) => Observable<WebReaction>)
             : Observable<WebReaction> {
-        return Observable.create(observer => {
+        return new Observable<WebReaction>(observer => {
             const fileKey = file.fileId || file.name;
             if (!this._prevModelFiles.has(fileKey)) {
                 // File not found, exit early
@@ -599,7 +598,7 @@ export class ViewFileService {
                 observer.next(new WebReaction(false, null, `File '${file.name}' not found`));
             } else {
                 const modelFile = this._prevModelFiles.get(fileKey);
-                action(modelFile).subscribe(reaction => {
+                return action(modelFile).subscribe(reaction => {
                     this._logger.debug("Received model reaction: %O", reaction);
                     observer.next(reaction);
                 });

@@ -1,6 +1,5 @@
 import {Injectable, NgZone} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {Subscription} from "rxjs/Subscription";
+import {Observable, Subscription} from "rxjs";
 
 import {ModelFileService} from "../files/model-file.service";
 import {ServerStatusService} from "../server/server-status.service";
@@ -107,7 +106,7 @@ export class StreamDispatchService {
         this.clearRetryTimeout();
         this.clearStreamSubscription();
 
-        const observable = Observable.create(observer => {
+        const observable = new Observable<{event: string; data: string}>(observer => {
             const eventSource = EventSourceFactory.createEventSource(this.STREAM_URL);
             for (let eventName of Array.from(this._eventNameToServiceMap.keys())) {
                 eventSource.addEventListener(eventName, event => observer.next(

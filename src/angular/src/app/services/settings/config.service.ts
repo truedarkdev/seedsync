@@ -1,6 +1,5 @@
 import {Injectable} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject, Observable} from "rxjs";
 
 import {Config, IConfig} from "./config";
 import {LoggerService} from "../utils/logger.service";
@@ -48,11 +47,11 @@ export class ConfigService extends BaseWebService {
         const valueStr: string = String(value);
         const currentConfig = this._config.getValue();
         if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
-            return Observable.create(observer => {
+            return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(false, null, `Config has no option named ${section}.${option}`));
             });
         } else if (valueStr.length === 0) {
-            return Observable.create(observer => {
+            return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(
                     false, null, Localization.Notification.CONFIG_VALUE_BLANK(section, option))
                 );

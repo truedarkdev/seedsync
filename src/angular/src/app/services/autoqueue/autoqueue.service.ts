@@ -1,6 +1,5 @@
 import {Injectable} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject, Observable} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -49,7 +48,7 @@ export class AutoQueueService extends BaseWebService {
 
         // Value check
         if (pattern == null || pattern.trim().length === 0) {
-            return Observable.create(observer => {
+            return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(false, null, Localization.Notification.AUTOQUEUE_PATTERN_EMPTY));
             });
         }
@@ -57,7 +56,7 @@ export class AutoQueueService extends BaseWebService {
         const currentPatterns = this._patterns.getValue();
         const index = currentPatterns.findIndex(pat => pat.pattern === pattern);
         if (index >= 0) {
-            return Observable.create(observer => {
+            return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(false, null, `Pattern '${pattern}' already exists.`));
             });
         } else {
@@ -94,7 +93,7 @@ export class AutoQueueService extends BaseWebService {
         const currentPatterns = this._patterns.getValue();
         const index = currentPatterns.findIndex(pat => pat.pattern === pattern);
         if (index < 0) {
-            return Observable.create(observer => {
+            return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(false, null, `Pattern '${pattern}' not found.`));
             });
         } else {
