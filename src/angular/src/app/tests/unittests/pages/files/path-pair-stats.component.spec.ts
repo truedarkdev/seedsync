@@ -1,6 +1,6 @@
 import {ComponentFixture, TestBed, fakeAsync, tick} from "@angular/core/testing";
 import * as Immutable from "immutable";
-import {BehaviorSubject} from "rxjs/Rx";
+import {BehaviorSubject} from "rxjs";
 
 import {FileSizePipe} from "../../../../common/file-size.pipe";
 import {PathPairStatsComponent} from "../../../../pages/files/path-pair-stats.component";

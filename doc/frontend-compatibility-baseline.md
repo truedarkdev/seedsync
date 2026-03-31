@@ -4,11 +4,13 @@ Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
 upgrade execution is active with Angular 21 on Node 24 LTS as the intended
 destination for the frontend modernization / compatibility migration task.
 
-Current Phase 4 checkpoint: slice 1 completed as a toolchain-first Angular 21
-workspace migration with Node 24 Docker/frontend lane alignment, Docker
-build/test command modernization, and narrow compatibility bridges for legacy
-modal/storage usage. Broad RxJS import cleanup and page/component rewrites
-remain deferred to later Phase 4 slices.
+Current Phase 4 checkpoint: slices 1-2 completed.
+Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
+Docker/frontend lane alignment, Docker build/test command modernization, and
+narrow compatibility bridges for legacy modal/storage usage.
+Slice 2 modernized the page-layer RxJS imports/operators and directly related
+page specs while keeping service-layer RxJS APIs and bridge retirement deferred
+to later Phase 4 slices.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -80,6 +82,24 @@ was resolved by proof on 2026-03-31.
   `file.component.spec.ts`, and `notification.service.spec.ts` were exercised
   and passed in the full green Dockerized run.
 
+## 2026-04-01 Phase 4 Slice 2 Proof
+
+- Page-layer RxJS imports were modernized from legacy deep imports like
+  `rxjs/Observable`, `rxjs/Subject`, and `rxjs/add/...` to root imports from
+  `rxjs` plus pipeable operators from `rxjs/operators`.
+- `takeUntil` call sites in page components now use `pipe(takeUntil(...))`
+  instead of legacy chained side-effect operator wiring.
+- The `file-list` pagination stream now uses `combineLatest([...])` instead of
+  the legacy static `Observable.combineLatest(...)` pattern in the page layer.
+- Directly related page specs were updated in lockstep to use modern RxJS
+  helper imports such as `of` and the RxJS 6-compatible `throwError("boom")`
+  form where needed.
+- The exact default Angular Docker verifier path passed again on the final
+  candidate:
+  `docker compose -f src/docker/test/angular/compose.yml up --build
+  --abort-on-container-exit --exit-code-from tests`
+- The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
+
 ## Phase 4 Upgrade Investigation
 
 - The current frontend still uses a legacy Angular CLI workspace shape:
@@ -91,10 +111,11 @@ was resolved by proof on 2026-03-31.
   plus Node 24 LTS is the target to steer every Phase 4 slice toward.
 - The gap from Angular 4 / CLI 1.3 to Angular 21 is large enough that this
   should be treated as a multi-slice program, not a one-shot package bump.
-- The first upgrade slice should stay toolchain-first: identify the smallest
-  coherent Angular / Angular CLI checkpoint that moves the workspace toward the
-  Angular 21 / Node 24 destination while keeping the Dockerized Karma lane
-  alive before we attempt broader app-code or Sass migration work.
+- The first two upgrade slices are now complete:
+  - slice 1: workspace/toolchain + Docker lane modernization
+  - slice 2: page-layer RxJS modernization
+- The next upgrade slice should stay runtime/service-focused: remove legacy
+  service-layer RxJS API usage without regressing the Dockerized Karma lane.
 
 ## Supported Compatibility Target
 
@@ -123,16 +144,16 @@ modern floor.
 | Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
-| What is the next coherent Angular 21 app-code modernization slice after the workspace/toolchain checkpoint? | Phase 4 | Slice 1 is now complete; next slices should focus on app/runtime modernization without regressing the green Dockerized Karma lane. |
+| What is the next coherent Angular 21 runtime modernization slice after page-layer RxJS cleanup? | Phase 4 | Slice 2 is now complete; next slices should focus on service-layer RxJS modernization without regressing the green Dockerized Karma lane. |
 | Which legacy compatibility bridges can be retired after the Angular 21 checkpoint is stable? | Phase 4 | Revisit the temporary modal/storage and `rxjs-compat` bridges once the Angular 21 lane has stayed green through follow-on app updates. |
 | When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Continue Phase 4 from the now-green Angular 21 / Node 24 workspace checkpoint
-by taking the next bounded app/runtime modernization slice while preserving the
-Dockerized Karma lane as the closure gate. Do not treat the current nested CLI
-`node-sass` 4.x lockfile subtree as cleanup-by-default; revisit it only
-through a controlled lockfile-refresh decision if the warning/noise reduction
-is worth the churn.
+Continue Phase 4 from the now-green Angular 21 / Node 24 slices 1-2 baseline
+by taking the next bounded runtime modernization slice, most likely
+service-layer RxJS cleanup, while preserving the Dockerized Karma lane as the
+closure gate. Do not treat the current nested CLI `node-sass` 4.x lockfile
+subtree as cleanup-by-default; revisit it only through a controlled
+lockfile-refresh decision if the warning/noise reduction is worth the churn.

@@ -1,7 +1,7 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import * as Immutable from "immutable";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 
 import {ViewFileService} from "../../services/files/view-file.service";
 import {ViewFile} from "../../services/files/view-file";
@@ -43,7 +43,7 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
 
     ngOnInit(): void {
         this._pathPairService.pathPairs$
-            .takeUntil(this._destroy$)
+            .pipe(takeUntil(this._destroy$))
             .subscribe({
                 next: (pathPairs: PathPair[]) => {
                     this._pathPairs = pathPairs || [];
@@ -53,7 +53,7 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             });
 
         this._viewFileService.files
-            .takeUntil(this._destroy$)
+            .pipe(takeUntil(this._destroy$))
             .subscribe({
                 next: (files: Immutable.List<ViewFile>) => {
                     this._files = files || Immutable.List<ViewFile>();

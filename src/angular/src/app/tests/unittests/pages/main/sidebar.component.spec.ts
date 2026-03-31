@@ -1,7 +1,7 @@
 import {CommonModule} from "@angular/common";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {RouterTestingModule} from "@angular/router/testing";
-import {BehaviorSubject, Observable} from "rxjs/Rx";
+import {BehaviorSubject, of} from "rxjs";
 
 import {SidebarComponent} from "../../../../pages/main/sidebar.component";
 import {LoggerService} from "../../../../services/utils/logger.service";
@@ -31,7 +31,7 @@ class MockLoggerService {
 
 class MockServerCommandService {
     restart = jasmine.createSpy("restart").and.returnValue(
-        Observable.of({success: true, data: "ok", errorMessage: null})
+        of({success: true, data: "ok", errorMessage: null})
     );
 }
 

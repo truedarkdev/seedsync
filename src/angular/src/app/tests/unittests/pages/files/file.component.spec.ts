@@ -2,7 +2,7 @@ import {CommonModule} from "@angular/common";
 import {ChangeDetectorRef, Directive, Input, Pipe, PipeTransform, SimpleChange} from "@angular/core";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {By} from "@angular/platform-browser";
-import {Observable} from "rxjs/Rx";
+import {of} from "rxjs";
 
 import {Modal} from "../../../../services/utils/modal-compat.service";
 
@@ -186,7 +186,7 @@ describe("Testing file component", () => {
             isStoppable: false
         });
         fixture.componentInstance.showActions = true;
-        fixture.componentInstance.options = Observable.of(null) as any;
+        fixture.componentInstance.options = of(null) as any;
 
         fixture.detectChanges();
 
@@ -205,7 +205,7 @@ describe("Testing file component", () => {
             isStoppable: true
         });
         fixture.componentInstance.showActions = true;
-        fixture.componentInstance.options = Observable.of(null) as any;
+        fixture.componentInstance.options = of(null) as any;
 
         fixture.detectChanges();
 
@@ -225,7 +225,7 @@ describe("Testing file component", () => {
         });
         fixture.componentInstance.file = downloadingFile;
         fixture.componentInstance.showActions = true;
-        fixture.componentInstance.options = Observable.of(null) as any;
+        fixture.componentInstance.options = of(null) as any;
 
         fixture.detectChanges();
 

@@ -1,8 +1,6 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
-import {BehaviorSubject} from "rxjs/Rx";
-import {Observable} from "rxjs/Observable";
-import "rxjs/add/observable/of";
+import {BehaviorSubject, of} from "rxjs";
 import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {SettingsPageComponent} from "../../../../pages/settings/settings-page.component";
@@ -44,7 +42,7 @@ class MockNotificationService {
 }
 
 class MockServerCommandService {
-    restart = jasmine.createSpy("restart").and.returnValue(Observable.of({
+    restart = jasmine.createSpy("restart").and.returnValue(of({
         success: true,
         data: "ok",
         errorMessage: null

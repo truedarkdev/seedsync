@@ -1,7 +1,6 @@
 import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Observable, Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 import {Modal} from "../../services/utils/modal-compat.service";
 
 import {LoggerService} from "../../services/utils/logger.service";
@@ -66,7 +65,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
 
     // noinspection JSUnusedGlobalSymbols
     ngOnInit() {
-        this._connectedService.connected.takeUntil(this._destroy$).subscribe({
+        this._connectedService.connected.pipe(takeUntil(this._destroy$)).subscribe({
             next: (connected: boolean) => {
                 if (!connected) {
                     // Server went down, hide the config restart notification
@@ -86,7 +85,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     }
 
     onSetConfig(section: string, option: string, value: any) {
-        this._configService.set(section, option, value).takeUntil(this._destroy$).subscribe({
+        this._configService.set(section, option, value).pipe(takeUntil(this._destroy$)).subscribe({
             next: reaction => {
                 const notifKey = section + "." + option;
                 if (reaction.success) {
@@ -140,7 +139,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                     if (this._destroyed) {
                         return;
                     }
-                    this._commandService.restart().takeUntil(this._destroy$).subscribe({
+                    this._commandService.restart().pipe(takeUntil(this._destroy$)).subscribe({
                         next: reaction => {
                             if (reaction.success) {
                                 this._logger.info(reaction.data);

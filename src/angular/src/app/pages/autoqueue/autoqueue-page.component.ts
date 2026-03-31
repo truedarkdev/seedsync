@@ -1,7 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
-import {Observable} from "rxjs/Observable";
-import {Subject} from "rxjs/Subject";
-import "rxjs/add/operator/takeUntil";
+import {Observable, Subject} from "rxjs";
+import {takeUntil} from "rxjs/operators";
 
 import * as Immutable from "immutable";
 
@@ -53,7 +52,7 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
 
     // noinspection JSUnusedGlobalSymbols
     ngOnInit() {
-        this._connectedService.connected.takeUntil(this._destroy$).subscribe({
+        this._connectedService.connected.pipe(takeUntil(this._destroy$)).subscribe({
             next: (connected: boolean) => {
                 this.connected = connected;
                 if (!this.connected) {
@@ -63,7 +62,7 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
             }
         });
 
-        this._configService.config.takeUntil(this._destroy$).subscribe({
+        this._configService.config.pipe(takeUntil(this._destroy$)).subscribe({
             next: config => {
                 if(config != null) {
                     this.enabled = config.autoqueue.enabled;

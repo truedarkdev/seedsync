@@ -9,8 +9,7 @@ import {ViewFile} from "../../../../services/files/view-file";
 import {BulkCommandService} from "../../../../services/server/bulk-command.service";
 import {FileSelectionService} from "../../../../services/files/file-selection.service";
 import {LoggerService} from "../../../../services/utils/logger.service";
-import {Observable} from "rxjs/Observable";
-import "rxjs/add/observable/of";
+import {of} from "rxjs";
 import {WebReaction} from "../../../../services/utils/rest.service";
 import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
 
@@ -39,7 +38,7 @@ class MockModal {
 
 class MockBulkCommandService {
     deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
-        Observable.of(new WebReaction(true, "ok", null))
+        of(new WebReaction(true, "ok", null))
     );
 }
 

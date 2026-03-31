@@ -1,7 +1,5 @@
 import {ComponentFixture, TestBed, fakeAsync, tick} from "@angular/core/testing";
-import {BehaviorSubject, Subject} from "rxjs/Rx";
-import {Observable} from "rxjs/Observable";
-import "rxjs/add/observable/of";
+import {BehaviorSubject, Subject, of} from "rxjs";
 
 import {LogsPageComponent} from "../../../../pages/logs/logs-page.component";
 import {LogService} from "../../../../services/logs/log.service";
@@ -42,7 +40,7 @@ class MockConnectedService {
 }
 
 class MockDomService {
-    headerHeight = Observable.of(0);
+    headerHeight = of(0);
 }
 
 class MockStreamServiceRegistry {

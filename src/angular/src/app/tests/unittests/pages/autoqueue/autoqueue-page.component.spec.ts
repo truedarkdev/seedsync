@@ -1,8 +1,6 @@
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
-import {BehaviorSubject} from "rxjs/Rx";
-import {Observable} from "rxjs/Observable";
-import "rxjs/add/observable/of";
+import {BehaviorSubject, of} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -24,8 +22,8 @@ class MockAutoQueueService {
         return this._patterns.asObservable();
     }
 
-    add = jasmine.createSpy("add").and.returnValue(Observable.of(new WebReaction(true, "ok", null)));
-    remove = jasmine.createSpy("remove").and.returnValue(Observable.of(new WebReaction(true, "ok", null)));
+    add = jasmine.createSpy("add").and.returnValue(of(new WebReaction(true, "ok", null)));
+    remove = jasmine.createSpy("remove").and.returnValue(of(new WebReaction(true, "ok", null)));
 }
 
 class MockNotificationService {
