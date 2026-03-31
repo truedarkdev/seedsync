@@ -4,7 +4,7 @@ Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
 upgrade execution is active with Angular 21 on Node 24 LTS as the intended
 destination for the frontend modernization / compatibility migration task.
 
-Current Phase 4 checkpoint: slices 1-3 completed.
+Current Phase 4 checkpoint: slices 1-4 completed.
 Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
 Docker/frontend lane alignment, Docker build/test command modernization, and
 narrow compatibility bridges for legacy modal/storage usage.
@@ -14,6 +14,9 @@ to later Phase 4 slices.
 Slice 3 modernized the service/runtime RxJS imports/APIs while still staying on
 RxJS 6.6.7 and explicitly deferred the RxJS 7 bump, `rxjs-compat` removal, and
 bridge retirement to later slices.
+Slice 4 raised the tracked frontend manifest to RxJS 7, removed
+`rxjs-compat`, and fixed the remaining legacy deep-import breakpoints in
+tests/mocks while keeping broader bridge cleanup deferred.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -121,6 +124,25 @@ was resolved by proof on 2026-03-31.
   --abort-on-container-exit --exit-code-from tests`
 - The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
 
+## 2026-04-01 Phase 4 Slice 4 Proof
+
+- `src/angular/package.json` now targets `rxjs` `^7.8.2`.
+- `rxjs-compat` has been removed from the tracked frontend manifest.
+- The remaining legacy deep imports that would break after removing
+  `rxjs-compat` were updated in the affected tests/mocks to use root imports
+  from `rxjs`.
+- A repo-wide grep over `src/angular` no longer found `rxjs-compat`,
+  `rxjs/Observable`, `rxjs/Subject`, `rxjs/Subscription`, `rxjs/Rx`, or
+  `rxjs/add/...` references.
+- The exact default Angular Docker verifier path passed again on the final
+  candidate:
+  `docker compose -f src/docker/test/angular/compose.yml up --build
+  --abort-on-container-exit --exit-code-from tests`
+- The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
+- `src/angular/package-lock.json` was regenerated locally for the slice, but it
+  remains gitignored in this workspace, so the tracked repo still relies on the
+  manifest plus Docker verification rather than a committed frontend lockfile.
+
 ## Phase 4 Upgrade Investigation
 
 - The current frontend still uses a legacy Angular CLI workspace shape:
@@ -135,13 +157,14 @@ was resolved by proof on 2026-03-31.
 - The first two upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
-- The first three upgrade slices are now complete:
+- The first four upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
   - slice 3: service/runtime RxJS modernization on RxJS 6.6.7
-- The next upgrade slice should raise the RxJS floor itself: bump to RxJS 7,
-  remove `rxjs-compat`, and fix any remaining breakage without regressing the
-  Dockerized Karma lane.
+  - slice 4: RxJS 7 manifest bump + `rxjs-compat` removal
+- The next upgrade slice should revisit the remaining temporary bridges and
+  compatibility debt from the now-upgraded Angular 21 / Node 24 / RxJS 7
+  baseline.
 
 ## Supported Compatibility Target
 
@@ -170,16 +193,16 @@ modern floor.
 | Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
-| When should the Angular frontend itself move from RxJS 6.6.7 plus `rxjs-compat` to RxJS 7? | Phase 4 | Slice 3 is now complete; the next slice should raise the RxJS floor and remove `rxjs-compat` once the service/runtime migration is safely landed. |
-| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint and RxJS floor are stable? | Phase 4 | Revisit the temporary modal/storage bridges after the Angular 21 lane has stayed green through the RxJS version bump and follow-on app updates. |
+| Should the ignored `src/angular/package-lock.json` remain an untracked local artifact now that the manifest is on RxJS 7? | Phase 4 | Slice 4 regenerated the lockfile locally, but the repo still ignores it. Decide later whether frontend dependency reproducibility should continue to rely on Docker verification plus manifest only. |
+| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint and RxJS floor are stable? | Phase 4 | Revisit the temporary modal/storage bridges after the Angular 21 / Node 24 / RxJS 7 lane has stayed green through follow-on app updates. |
 | When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Continue Phase 4 from the now-green Angular 21 / Node 24 slices 1-3 baseline
-by taking the next bounded dependency-floor slice: upgrade to RxJS 7, remove
-`rxjs-compat`, and preserve the Dockerized Karma lane as the closure gate. Do
-not treat the current nested CLI `node-sass` 4.x lockfile subtree as
-cleanup-by-default; revisit it only through a controlled lockfile-refresh
-decision if the warning/noise reduction is worth the churn.
+Continue Phase 4 from the now-green Angular 21 / Node 24 / RxJS 7 slices 1-4
+baseline by taking the next bounded compatibility-debt slice, most likely
+bridge retirement or related cleanup, while preserving the Dockerized Karma
+lane as the closure gate. Do not treat the current nested CLI `node-sass` 4.x
+lockfile subtree as cleanup-by-default; revisit it only through a controlled
+lockfile-refresh decision if the warning/noise reduction is worth the churn.
