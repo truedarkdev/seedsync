@@ -13,6 +13,11 @@ class TestNotificationService extends NotificationService {
 describe("Testing notification service", () => {
     let notificationService: TestNotificationService;
 
+    function createNotification(level: Notification.Level, text: string, timestamp?: number): Notification {
+        const notification = new Notification({level: level, text: text});
+        return timestamp == null ? notification : notification.set("timestamp", timestamp) as Notification;
+    }
+
     beforeEach(() => {
         TestBed.configureTestingModule({
             providers: [
@@ -30,7 +35,7 @@ describe("Testing notification service", () => {
     });
 
     it("should show notification", fakeAsync(() => {
-        const expectedNotification = new Notification({level: Notification.Level.DANGER, text: "danger"});
+        const expectedNotification = createNotification(Notification.Level.DANGER, "danger");
 
         notificationService.show(expectedNotification);
 
@@ -48,7 +53,7 @@ describe("Testing notification service", () => {
     }));
 
     it("should hide notification", fakeAsync(() => {
-        const expectedNotification = new Notification({level: Notification.Level.DANGER, text: "danger"});
+        const expectedNotification = createNotification(Notification.Level.DANGER, "danger");
 
         notificationService.show(expectedNotification);
         tick();
@@ -68,7 +73,7 @@ describe("Testing notification service", () => {
 
 
     it("should only send one update if show is called twice", fakeAsync(() => {
-        const expectedNotification = new Notification({level: Notification.Level.DANGER, text: "danger"});
+        const expectedNotification = createNotification(Notification.Level.DANGER, "danger");
 
         notificationService.show(expectedNotification);
 
@@ -87,7 +92,7 @@ describe("Testing notification service", () => {
     }));
 
     it("should only send one update if hide is called twice", fakeAsync(() => {
-        const expectedNotification = new Notification({level: Notification.Level.DANGER, text: "danger"});
+        const expectedNotification = createNotification(Notification.Level.DANGER, "danger");
 
         notificationService.show(expectedNotification);
         tick();
@@ -109,10 +114,10 @@ describe("Testing notification service", () => {
     }));
 
     it("should sort notifications by level", fakeAsync(() => {
-        const noteDanger = new Notification({level: Notification.Level.DANGER, text: "danger"});
-        const noteInfo = new Notification({level: Notification.Level.INFO, text: "info"});
-        const noteWarning = new Notification({level: Notification.Level.WARNING, text: "warning"});
-        const noteSuccess = new Notification({level: Notification.Level.SUCCESS, text: "success"});
+        const noteDanger = createNotification(Notification.Level.DANGER, "danger");
+        const noteInfo = createNotification(Notification.Level.INFO, "info");
+        const noteWarning = createNotification(Notification.Level.WARNING, "warning");
+        const noteSuccess = createNotification(Notification.Level.SUCCESS, "success");
 
         notificationService.show(noteDanger);
         notificationService.show(noteInfo);
@@ -136,17 +141,9 @@ describe("Testing notification service", () => {
     }));
 
     it("should sort notifications by timestamp", fakeAsync(() => {
-        function sleepFor( sleepDuration ) {
-            const now = new Date().getTime();
-            while (new Date().getTime() < now + sleepDuration) { /* do nothing */ }
-        }
-
-        // Sleep a little between inits
-        const noteOlder = new Notification({level: Notification.Level.DANGER, text: "older"});
-        sleepFor(10);
-        const noteNewer = new Notification({level: Notification.Level.DANGER, text: "newer"});
-        sleepFor(10);
-        const noteNewest = new Notification({level: Notification.Level.DANGER, text: "newest"});
+        const noteOlder = createNotification(Notification.Level.DANGER, "older", 100);
+        const noteNewer = createNotification(Notification.Level.DANGER, "newer", 200);
+        const noteNewest = createNotification(Notification.Level.DANGER, "newest", 300);
 
         notificationService.show(noteNewer);
         notificationService.show(noteNewest);
@@ -168,17 +165,9 @@ describe("Testing notification service", () => {
     }));
 
     it("should sort notifications by level first, then timestamp", fakeAsync(() => {
-        function sleepFor( sleepDuration ) {
-            const now = new Date().getTime();
-            while (new Date().getTime() < now + sleepDuration) { /* do nothing */ }
-        }
-
-        // Sleep a little between inits
-        const noteOlder = new Notification({level: Notification.Level.DANGER, text: "older"});
-        sleepFor(10);
-        const noteNewer = new Notification({level: Notification.Level.INFO, text: "newer"});
-        sleepFor(10);
-        const noteNewest = new Notification({level: Notification.Level.INFO, text: "newest"});
+        const noteOlder = createNotification(Notification.Level.DANGER, "older", 100);
+        const noteNewer = createNotification(Notification.Level.INFO, "newer", 200);
+        const noteNewest = createNotification(Notification.Level.INFO, "newest", 300);
 
         notificationService.show(noteNewer);
         notificationService.show(noteNewest);

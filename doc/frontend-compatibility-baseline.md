@@ -1,8 +1,14 @@
 # Frontend Compatibility Baseline
 
 Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
-Angular upgrade investigation is now active for the frontend modernization /
-compatibility migration task.
+upgrade execution is active with Angular 21 on Node 24 LTS as the intended
+destination for the frontend modernization / compatibility migration task.
+
+Current Phase 4 checkpoint: slice 1 completed as a toolchain-first Angular 21
+workspace migration with Node 24 Docker/frontend lane alignment, Docker
+build/test command modernization, and narrow compatibility bridges for legacy
+modal/storage usage. Broad RxJS import cleanup and page/component rewrites
+remain deferred to later Phase 4 slices.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -41,7 +47,7 @@ was resolved by proof on 2026-03-31.
   `make run-tests-angular` in the `unittests-angular` job before the build jobs
   consume Angular artifacts.
 
-## 2026-03-31 Proof
+## 2026-03-31 Phase 3 Proof
 
 - Dockerized Angular test lane passed with `TOTAL: 293 SUCCESS`.
 - `src/docker/build/deb/Dockerfile` Angular env stage built successfully.
@@ -51,26 +57,52 @@ was resolved by proof on 2026-03-31.
 - Read-only `/app` probe passed while `ng test --browsers ChromeHeadlessCI
   --single-run` still completed successfully.
 
+## 2026-03-31 Phase 4 Slice 1 Proof
+
+- `src/angular/package.json` now targets Angular 21.x / Angular CLI 21.x with
+  the accompanying Angular build/test toolchain floor.
+- `src/angular/angular.json` now replaces the legacy `.angular-cli.json`
+  workspace shape.
+- `src/docker/build/docker-image/Dockerfile` and
+  `src/docker/build/deb/Dockerfile` now build the Angular layer from
+  `node:24-bookworm-slim`.
+- `src/docker/test/angular/Dockerfile` now runs the Angular 21 Karma lane on
+  Node 24 with a bounded writable Angular cache path.
+- `src/docker/test/angular/compose.yml` now drives the exact Angular 21 test
+  command directly and preserves writable `/app/node_modules` and
+  `/app/.angular` volumes for the Dockerized Karma lane.
+- The exact default Angular Docker verifier path passed cleanly:
+  `docker compose -f src/docker/test/angular/compose.yml up --build
+  --abort-on-container-exit --exit-code-from tests`
+- The full suite reported `TOTAL: 296 SUCCESS` on that exact path.
+- Prior Angular 21 migration blockers in `app.component.spec.ts`,
+  `path-pairs.component.spec.ts`, `files-page.component.spec.ts`,
+  `file.component.spec.ts`, and `notification.service.spec.ts` were exercised
+  and passed in the full green Dockerized run.
+
 ## Phase 4 Upgrade Investigation
 
 - The current frontend still uses a legacy Angular CLI workspace shape:
   `.angular-cli.json`, Protractor-era config, and TSLint/Codelyzer.
-- The runtime contract is already anchored to Node 20 / npm 10 in Docker, so
-  the upgrade path should preserve that container baseline rather than adding a
-  second Node compatibility track.
-- The gap from Angular 4 / CLI 1.3 to a Node-20-compatible modern Angular
-  stack is large enough that this should be treated as a multi-slice program,
-  not a one-shot package bump.
+- The current Dockerized frontend lane has now been lifted to a Node 24-based
+  Angular 21 workspace/toolchain checkpoint.
+- The intended Phase 4 destination is Angular 21 on Node 24 LTS.
+- Temporary bridge slices are acceptable during the migration, but Angular 21
+  plus Node 24 LTS is the target to steer every Phase 4 slice toward.
+- The gap from Angular 4 / CLI 1.3 to Angular 21 is large enough that this
+  should be treated as a multi-slice program, not a one-shot package bump.
 - The first upgrade slice should stay toolchain-first: identify the smallest
-  coherent Angular / Angular CLI checkpoint that can keep the Dockerized Karma
-  lane alive before we attempt broader app-code or Sass migration work.
+  coherent Angular / Angular CLI checkpoint that moves the workspace toward the
+  Angular 21 / Node 24 destination while keeping the Dockerized Karma lane
+  alive before we attempt broader app-code or Sass migration work.
 
 ## Supported Compatibility Target
 
-Keep the legacy frontend on a clearly supported Node 20 / npm 10 baseline with
-reproducible installs and tests. On this machine, that means the documented
-local host baseline of Node `v20.18.3` and npm `10.8.2`, mirrored by the
-Node 20 Docker images used by the Angular build and test lanes.
+Keep the active Phase 4 frontend lane on a clearly supported Angular 21 / Node
+24 LTS baseline with reproducible Dockerized installs and tests. The local host
+fallback remains the documented Node `v20.18.3` / npm `10.8.2` legacy harness
+for comparison only until the host tooling is deliberately lifted to the same
+modern floor.
 
 ## First Validation Gates To Protect
 
@@ -91,15 +123,16 @@ Node 20 Docker images used by the Angular build and test lanes.
 | Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
-| What is the smallest coherent Angular / Angular CLI checkpoint that preserves the Dockerized frontend lane on Node 20? | Phase 4 | This is the active investigation question for the upgrade phase. |
-| Which config migrations must move with the first Angular / Angular CLI checkpoint? | Phase 4 | Expect `.angular-cli.json` to `angular.json`, build-command updates, and test-tooling alignment to move together with the first checkpoint. |
+| What is the next coherent Angular 21 app-code modernization slice after the workspace/toolchain checkpoint? | Phase 4 | Slice 1 is now complete; next slices should focus on app/runtime modernization without regressing the green Dockerized Karma lane. |
+| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint is stable? | Phase 4 | Revisit the temporary modal/storage and `rxjs-compat` bridges once the Angular 21 lane has stayed green through follow-on app updates. |
+| When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Start Phase 4 by identifying the first coherent Angular / Angular CLI upgrade
-checkpoint that can keep the Dockerized frontend lane alive on Node 20, then
-plan config migration and later Sass migration from that upgraded floor. Do not
-treat the current nested CLI `node-sass` 4.x lockfile subtree as
-cleanup-by-default; revisit it only through a controlled lockfile-refresh
-decision if the warning/noise reduction is worth the churn.
+Continue Phase 4 from the now-green Angular 21 / Node 24 workspace checkpoint
+by taking the next bounded app/runtime modernization slice while preserving the
+Dockerized Karma lane as the closure gate. Do not treat the current nested CLI
+`node-sass` 4.x lockfile subtree as cleanup-by-default; revisit it only
+through a controlled lockfile-refresh decision if the warning/noise reduction
+is worth the churn.

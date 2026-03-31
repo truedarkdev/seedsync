@@ -1,7 +1,7 @@
 import {Component, Input, ChangeDetectionStrategy} from "@angular/core";
 
 import {List} from "immutable";
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../services/utils/modal-compat.service";
 
 import {ViewFile} from "../../services/files/view-file";
 import {BulkCommandService} from "../../services/server/bulk-command.service";
@@ -14,6 +14,7 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-bulk-actions-bar",
+    standalone: false,
     providers: [],
     templateUrl: "./bulk-actions-bar.component.html",
     styleUrls: ["./bulk-actions-bar.component.scss"],

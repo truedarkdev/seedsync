@@ -1,9 +1,15 @@
-version: "3.4"
 services:
   tests:
     image: seedsync/test/angular
     container_name: seedsync_test_angular
-    tty: true
+    command:
+      - npx
+      - ng
+      - test
+      - seedsync
+      - --browsers
+      - ChromeHeadlessCI
+      - --watch=false
     build:
       context: ../../../../
       dockerfile: src/docker/test/angular/Dockerfile
@@ -14,4 +20,12 @@ services:
         target: /app
         read_only: true
       - type: volume
+        source: angular_test_node_modules
         target: /app/node_modules
+      - type: volume
+        source: angular_test_cache
+        target: /app/.angular
+
+volumes:
+  angular_test_node_modules:
+  angular_test_cache:

@@ -1,6 +1,6 @@
 import {Injectable} from "@angular/core";
 
-import * as compareVersions from "compare-versions";
+import compareVersions from "compare-versions";
 
 import {RestService} from "./rest.service";
 import {LoggerService} from "./logger.service";

@@ -2,7 +2,7 @@ import {ComponentFixture, TestBed} from "@angular/core/testing";
 
 import * as Immutable from "immutable";
 
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {BulkActionsBarComponent} from "../../../../pages/files/bulk-actions-bar.component";
 import {ViewFile} from "../../../../services/files/view-file";

@@ -3,6 +3,7 @@ import {Subject} from "rxjs/Subject";
 
 @Component({
     selector: "app-option",
+    standalone: false,
     providers: [],
     templateUrl: "./option.component.html",
     styleUrls: ["./option.component.scss"],

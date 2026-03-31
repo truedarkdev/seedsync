@@ -1,7 +1,6 @@
 import {Injectable, NgZone} from "@angular/core";
 import {Observable} from "rxjs/Observable";
 import {Subscription} from "rxjs/Subscription";
-import EventSource = require("eventsource");
 
 import {ModelFileService} from "../files/model-file.service";
 import {ServerStatusService} from "../server/server-status.service";
@@ -10,8 +9,15 @@ import {ConnectedService} from "../utils/connected.service";
 import {LogService} from "../logs/log.service";
 
 
+export interface EventSourceLike {
+    addEventListener(type: string, listener: EventListener): void;
+    close(): void;
+    onopen: ((event: Event) => void) | null;
+    onerror: ((event: Event) => void) | null;
+}
+
 export class EventSourceFactory {
-    static createEventSource(url: string) {
+    static createEventSource(url: string): EventSourceLike {
         return new EventSource(url);
     }
 }

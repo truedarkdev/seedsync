@@ -10,6 +10,7 @@ import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-rou
 
 @Component({
     selector: "app-root",
+    standalone: false,
     templateUrl: "./app.component.html",
     styleUrls: ["./app.component.scss"]
 })
@@ -17,7 +18,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     @ViewChild("topHeader") topHeader: ElementRef;
 
     showSidebar = false;
-    activeTitle = "";
     private _destroy$: Subject<void> = new Subject<void>();
     private _resizeObserver: any = null;
     private _pathPairs: PathPair[] = [];
@@ -30,7 +30,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         this._pathPairService.pathPairs.takeUntil(this._destroy$).subscribe({
             next: (pathPairs: PathPair[]) => {
                 this._pathPairs = pathPairs || [];
-                this._updateActiveTitle();
             }
         });
 
@@ -39,9 +38,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
         //    Store the active route
         this.router.events.takeUntil(this._destroy$).subscribe((evt) => {
             this.showSidebar = false;
-            if (evt instanceof NavigationEnd) {
-                this._updateActiveTitle();
-            }
         });
 
         // Scroll to top on route changes
@@ -52,7 +48,6 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             window.scrollTo(0, 0);
         });
 
-        this._updateActiveTitle();
     }
 
     ngAfterViewInit() {
@@ -78,12 +73,11 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
 
     title = "app";
 
-    private _updateActiveTitle(): void {
+    get activeTitle(): string {
         const currentUrl = (this.router.url || "").split(/[?#]/)[0];
         const routeInfo = ROUTE_INFOS.find(value => `/${value.path}` === currentUrl);
         if (routeInfo != null) {
-            this.activeTitle = routeInfo.name;
-            return;
+            return routeInfo.name;
         }
 
         const pathPairMatch = currentUrl.match(/^\/dashboard\/([^/]+)$/);
@@ -91,14 +85,13 @@ export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
             const enabledPathPairs = this._pathPairs.filter(pair => pair.enabled);
             const pathPairRouteMatch = resolvePathPairRouteSegment(pathPairMatch[1], enabledPathPairs);
             if (pathPairRouteMatch.type === "id" || pathPairRouteMatch.type === "slug") {
-                this.activeTitle = pathPairRouteMatch.pathPair.name;
+                return pathPairRouteMatch.pathPair.name;
             } else {
-                this.activeTitle = "Dashboard";
+                return "Dashboard";
             }
-            return;
         }
 
-        this.activeTitle = currentUrl.indexOf("/dashboard") === 0 ? "Dashboard" : "";
+        return currentUrl.indexOf("/dashboard") === 0 ? "Dashboard" : "";
     }
 
     private _hasMultipleEnabledPathPairs(): boolean {

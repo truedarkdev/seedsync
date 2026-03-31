@@ -5,7 +5,7 @@ import {BehaviorSubject} from "rxjs/Rx";
 import {LoggerService} from "../utils/logger.service";
 import {ViewFileOptions} from "./view-file-options";
 import {ViewFile} from "./view-file";
-import {LOCAL_STORAGE, StorageService} from "angular-webstorage-service";
+import {LOCAL_STORAGE, StorageService} from "../utils/storage-compat.service";
 import {StorageKeys} from "../../common/storage-keys";
 
 

@@ -17,6 +17,7 @@ import {ConfigService} from "../../services/settings/config.service";
 
 @Component({
     selector: "app-autoqueue-page",
+    standalone: false,
     templateUrl: "./autoqueue-page.component.html",
     styleUrls: ["./autoqueue-page.component.scss"],
     providers: [],

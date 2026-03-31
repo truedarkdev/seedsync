@@ -3,7 +3,7 @@ import {
     EventEmitter, OnChanges, SimpleChanges, ViewChild, ChangeDetectorRef
 } from "@angular/core";
 
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../services/utils/modal-compat.service";
 
 import {ViewFile} from "../../services/files/view-file";
 import {Localization} from "../../common/localization";
@@ -12,6 +12,7 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-file",
+    standalone: false,
     providers: [],
     templateUrl: "./file.component.html",
     styleUrls: ["./file.component.scss"],

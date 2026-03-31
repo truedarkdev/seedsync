@@ -15,6 +15,7 @@ import {FileComponent} from "./file.component";
 
 @Component({
     selector: "app-file-list",
+    standalone: false,
     providers: [],
     templateUrl: "./file-list.component.html",
     styleUrls: ["./file-list.component.scss"],

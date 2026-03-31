@@ -2,7 +2,7 @@ import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/co
 import {Observable} from "rxjs/Observable";
 import {Subject} from "rxjs/Subject";
 import "rxjs/add/operator/takeUntil";
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../services/utils/modal-compat.service";
 
 import {LoggerService} from "../../services/utils/logger.service";
 import {ConfigService} from "../../services/settings/config.service";
@@ -21,6 +21,7 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-settings-page",
+    standalone: false,
     templateUrl: "./settings-page.component.html",
     styleUrls: ["./settings-page.component.scss"],
     providers: [],

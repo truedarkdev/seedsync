@@ -6,7 +6,7 @@ import {Observable} from "rxjs/Observable";
 import {BehaviorSubject} from "rxjs/Rx";
 import "rxjs/add/observable/of";
 import "rxjs/add/observable/throw";
-import {Modal} from "ngx-modialog/plugins/bootstrap";
+import {Modal} from "../../../../services/utils/modal-compat.service";
 
 import {PathPairsComponent} from "../../../../pages/settings/path-pairs.component";
 import {
@@ -105,6 +105,7 @@ class MockModalAccessibilityService {
 
 @Component({
     changeDetection: ChangeDetectionStrategy.OnPush,
+    standalone: false,
     template: "<app-path-pairs></app-path-pairs>"
 })
 class PathPairsHostComponent {
