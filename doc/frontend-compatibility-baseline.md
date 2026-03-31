@@ -13,11 +13,13 @@ was resolved by proof on 2026-03-31.
   with `@angular/cli` 1.3.2.
 - `src/angular/package-lock.json` is `lockfileVersion: 3`, so the repo already
   relies on a newer npm lockfile format than the Angular 4-era codebase.
-- The lockfile keeps a mixed dependency shape:
-  - root `node-sass` is pinned at `^9.0.0`
-  - the Angular CLI subtree still carries `node-sass` 4.14.1
-  - `typescript` is split between the app-level `^3.2.2` and older CLI
-    compatibility ranges inside the lockfile
+- The proven Dockerized runtime currently resolves root `node-sass` to
+  `9.0.0`.
+- The Angular CLI subtree still names `node-sass` 4.14.1 in lockfile metadata,
+  but that legacy 4.x expectation is not a second installed runtime copy in the
+  current built image.
+- `typescript` is split between the app-level `^3.2.2` and older CLI
+  compatibility ranges inside the lockfile.
 - `src/docker/build/docker-image/Dockerfile` builds the Angular layer from
   `node:20-bookworm-slim` and installs with `npm install --legacy-peer-deps`.
 - `src/docker/build/deb/Dockerfile` uses the same Angular build image and the
@@ -64,12 +66,12 @@ Node 20 Docker images used by the Angular build and test lanes.
 
 | Open question | Later phase | Why it waits |
 | --- | --- | --- |
-| What is the smallest safe `node-sass` strategy? | Phase 2 | The dependency shape is still mixed, so this needs a dedicated compatibility pass. |
+| How much more cleanup is safe around the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; the remaining question is how far we can safely reduce the lockfile mismatch. |
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit after the install strategy is settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Pipeline hardening should happen after the contract is documented and the install path is stable. |
 | Does a broader Angular framework migration belong in this task? | Phase 4 or a separate task | If Angular 4 or CLI 1.x becomes the real blocker, reopen it as a dedicated modernization effort. |
 
 ## Resume Sentence
 
-Start the next slice by tightening the `node-sass` compatibility strategy, then
-revisit lockfile regeneration only if the install contract changes.
+Start the next slice by deciding how much of the `node-sass` metadata mismatch
+can be cleaned up safely now that the runtime copy is pinned and proven.
