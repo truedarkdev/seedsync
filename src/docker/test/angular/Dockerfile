@@ -9,7 +9,6 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 ENV CHROME_BIN=/usr/bin/google-chrome-stable
-ENV NODE_OPTIONS=--openssl-legacy-provider
 
 COPY \
     src/angular/tsconfig.json \
