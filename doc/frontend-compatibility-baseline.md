@@ -2,9 +2,9 @@
 
 Status: compatibility-hardening groundwork complete through Phase 3; Phase 4 is
 complete based on the supported Angular 21 / Node 24 / RxJS 7 Dockerized
-Angular/Karma closure lane and completed slices 1-6.
+Angular/Karma closure lane and completed slices 1-7.
 
-Current Phase 4 checkpoint: slices 1-6 completed and closed.
+Current Phase 4 checkpoint: slices 1-7 completed and closed.
 Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
 Docker/frontend lane alignment, Docker build/test command modernization, and
 narrow compatibility bridges for legacy modal/storage usage.
@@ -201,15 +201,39 @@ was resolved by proof on 2026-03-31.
 - The first two upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
-- The first six upgrade slices are now complete:
+- The first seven upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
   - slice 3: service/runtime RxJS modernization on RxJS 6.6.7
   - slice 4: RxJS 7 manifest bump + `rxjs-compat` removal
   - slice 5: modal/storage bridge retirement + verified-unused legacy config
     removal
+  - slice 6: legacy Angular 4-era e2e scaffold retirement under
+    `src/angular/e2e`
+  - slice 7: app-owned Sass `@import` modernization under `src/angular/src/`
 - Any later cleanup follow-up should focus on newly discovered Angular 4-era
   leftovers that are still separately justified by current repo usage.
+
+## 2026-04-01 Phase 4 Slice 7 Proof
+
+- App-owned Sass consumers under `src/angular/src/` were migrated from
+  deprecated `@import` usage to Dart Sass-friendly `@use ... as *` imports.
+- `src/angular/src/styles.scss` no longer imports the shared common partial,
+  because it does not consume the shared Sass symbols itself.
+- Shared variables and placeholders from `src/angular/src/app/common/_common.scss`
+  still resolve in the affected component styles through the module import
+  path.
+- The exact default Angular Docker verifier path passed again on the final
+  candidate:
+  `docker compose -f src/docker/test/angular/compose.yml up --build
+  --abort-on-container-exit --exit-code-from tests`
+- The full suite reported `TOTAL: 296 SUCCESS` on that exact path.
+- The production Angular build stage also passed:
+  `docker build -f src/docker/build/docker-image/Dockerfile --target
+  seedsync_build_angular .`
+- Remaining Sass deprecation warnings in that build now come from
+  `node_modules/font-awesome/scss/font-awesome.scss`, so the open Sass warning
+  debt is third-party/transitive rather than app-owned `@import` usage.
 
 ## Supported Compatibility Target
 
@@ -240,13 +264,13 @@ not open blockers to Phase 4 completion.
 | Item | Later phase | Why it stays later |
 | --- | --- | --- |
 | Legacy `src/e2e` Protractor modernization | Phase 4+ | This is active legacy test infrastructure, but it is outside the Angular workspace upgrade closure path and belongs to a later modernization track. |
-| `node-sass` to Dart Sass migration | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the supported frontend floor. |
+| Third-party Sass deprecation cleanup (`font-awesome`) | Phase 5 | The app-owned Sass `@import` migration is complete; the remaining warnings come from vendored `font-awesome` SCSS in `node_modules`, so any follow-up now targets third-party/transitive debt rather than app-owned import usage. |
 | Final live-app Playwright full UI/UX sweep | Final close gate, last | Run this last after the rest of the frontend closeout sequence is settled. It is the last overall frontend closeout gate, not a blocker to Phase 4 completion. |
 
 ## Closure Note
 
 Phase 4 is complete on the supported Angular 21 / Node 24 / RxJS 7
-Dockerized Karma lane after slices 1-6. The host Angular/Karma path has now
+Dockerized Karma lane after slices 1-7. The host Angular/Karma path has now
 been exercised successfully on Node 24 locally as comparison evidence, and
 the final live-app Playwright sweep remains the last overall frontend closeout
 gate. Treat the
@@ -255,3 +279,6 @@ completion. Do not treat the current nested CLI `node-sass` 4.x lockfile
 metadata as cleanup-by-default; the controlled lockfile-refresh check did not
 change it, so revisit it only through a Sass migration or broader frontend
 modernization slice if the warning/noise reduction is worth the churn.
+App-owned Sass `@import` usage under `src/angular/src/` has now been migrated;
+the remaining Sass warnings are from vendored `font-awesome` SCSS and are a
+separate third-party follow-up, not unresolved app-owned Sass debt.
