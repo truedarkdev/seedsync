@@ -1,4 +1,4 @@
-@import "../../common/common";
+@use '../../common/common' as *;
 
 .path-pair-stats-container {
     margin: 0 15px 15px 15px;
