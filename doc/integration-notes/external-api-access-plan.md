@@ -1,8 +1,8 @@
 # Staged Plan - Scoped API Keys for External API Access
 
-Status: staged plan with backend foundation and the browser/bootstrap follow-up now implemented locally. The next work should focus on the Settings follow-up slice, not on reopening the backend auth boundary or the browser bootstrap boundary that the first two slices established.
+Status: staged plan with backend foundation, the browser/bootstrap follow-up, and the Settings UI slice now implemented locally. The next work should focus on Slice 4 write-path hardening, not on reopening the backend auth boundary or the browser bootstrap boundary that the first three slices established.
 
-Immediate next step: start the Settings UI slice on top of the already-landed backend auth and loopback UI-session foundation. The app shell/static routes now fail closed off-loopback, loopback browser access still issues the built-in UI session cookie, and `/server/stream` remains aligned with that session flow.
+Immediate next step: start Slice 4 write-path hardening on top of the already-landed backend auth, browser bootstrap, and Settings UI foundation. The app shell/static routes now fail closed outside loopback or the explicit trusted local Docker runtime source, local browser access still issues the built-in UI session cookie, and `/server/stream` remains aligned with that session flow. That trusted bootstrap source is operationally sensitive and is not intended to be writable through the generic write-scoped config setter.
 
 ## Core Direction
 
@@ -78,9 +78,11 @@ Completed locally:
 
 ### Slice 3: Settings UI
 
-- Add an API Access section inside the existing Settings page.
-- Provide key CRUD, scope selection, rotation, revocation, and migration controls.
-- Surface the migration banner while legacy compatibility remains active.
+- Completed locally:
+  - Added an API Access section inside the existing Settings page.
+  - Provided key CRUD, scope selection, rotation, revocation, and migration controls.
+  - Surfaced the migration banner while legacy compatibility remains active.
+  - Consumed the existing admin/API-key JSON endpoints through a dedicated Angular service.
 
 ### Slice 4: Write-path hardening
 

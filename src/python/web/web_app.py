@@ -72,6 +72,7 @@ class WebApp(bottle.Bottle):
         self.__status = context.status
         self.__config = getattr(context, "config", None)
         self.__auth_store = auth_store
+        self.__trusted_browser_bootstrap_networks = self.__load_trusted_browser_bootstrap_networks()
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
         self.__streaming_handlers = []  # list of (handler, kwargs) pairs
@@ -204,6 +205,14 @@ class WebApp(bottle.Bottle):
         return allowed_hostname if isinstance(allowed_hostname, str) else ""
 
     @staticmethod
+    def __get_trusted_browser_bootstrap_remote_addrs(config) -> str:
+        general_config = getattr(config, "general", None)
+        if general_config is None:
+            return ""
+        remote_addrs = getattr(general_config, "trusted_browser_bootstrap_remote_addrs", "")
+        return remote_addrs if isinstance(remote_addrs, str) else ""
+
+    @staticmethod
     def __is_server_path(path: str) -> bool:
         return path == "/server" or path.startswith("/server/")
 
@@ -297,6 +306,23 @@ class WebApp(bottle.Bottle):
             return False
 
     @staticmethod
+    def __parse_trusted_browser_bootstrap_networks(raw_value: str):
+        networks = []
+        invalid_entries = []
+
+        for candidate in raw_value.split(","):
+            candidate = candidate.strip()
+            if not candidate:
+                continue
+
+            try:
+                networks.append(ipaddress.ip_network(candidate, strict=False))
+            except ValueError:
+                invalid_entries.append(candidate)
+
+        return tuple(networks), tuple(invalid_entries)
+
+    @staticmethod
     def __is_same_origin_browser_request() -> bool:
         host = WebApp.__request_host()
         if not host:
@@ -325,6 +351,40 @@ class WebApp(bottle.Bottle):
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
             WebApp.__is_loopback_remote_addr() and
+            WebApp.__is_loopback_host(WebApp.__request_host())
+        )
+
+    def __load_trusted_browser_bootstrap_networks(self):
+        configured_value = WebApp.__get_trusted_browser_bootstrap_remote_addrs(self.__config)
+        networks, invalid_entries = WebApp.__parse_trusted_browser_bootstrap_networks(configured_value)
+        for invalid_entry in invalid_entries:
+            self.logger.warning(
+                "Ignoring invalid General.trusted_browser_bootstrap_remote_addrs entry '%s'",
+                invalid_entry
+            )
+        return networks
+
+    def __is_trusted_browser_bootstrap_remote_addr(self) -> bool:
+        remote_addr = WebApp.__request_remote_addr()
+        if not remote_addr:
+            return False
+
+        try:
+            remote_ip = ipaddress.ip_address(remote_addr)
+        except ValueError:
+            return False
+
+        for trusted_network in self.__trusted_browser_bootstrap_networks:
+            if remote_ip in trusted_network:
+                return True
+        return False
+
+    def __is_trusted_browser_bootstrap_request(self) -> bool:
+        if WebApp.__is_loopback_remote_addr():
+            return True
+
+        return (
+            self.__is_trusted_browser_bootstrap_remote_addr() and
             WebApp.__is_loopback_host(WebApp.__request_host())
         )
 
@@ -376,7 +436,7 @@ class WebApp(bottle.Bottle):
         bottle.abort(401, "Invalid API token")
 
     def __get_ui_session_scopes(self):
-        if self.__auth_store is None or not WebApp.__is_loopback_remote_addr():
+        if self.__auth_store is None or not self.__is_trusted_browser_bootstrap_request():
             return None
 
         ui_session_secret = bottle.request.get_cookie(self._UI_SESSION_COOKIE_NAME)
@@ -401,7 +461,7 @@ class WebApp(bottle.Bottle):
             bottle.abort(403, forbidden_message or "Session lacks scope '{}'".format(required_scope))
 
     def __create_ui_session_secret(self) -> Optional[str]:
-        if self.__auth_store is None or not WebApp.__is_loopback_remote_addr():
+        if self.__auth_store is None or not self.__is_trusted_browser_bootstrap_request():
             return None
 
         current_scopes = self.__get_ui_session_scopes()
@@ -416,10 +476,10 @@ class WebApp(bottle.Bottle):
         return ui_session.secret
 
     def __authorize_browser_bootstrap(self) -> None:
-        if WebApp.__is_loopback_remote_addr():
+        if self.__is_trusted_browser_bootstrap_request():
             return
 
-        bottle.abort(403, "Browser shell and static asset access is limited to loopback")
+        bottle.abort(403, "Browser shell and static asset access is limited to loopback or explicit trusted local runtime sources")
 
     def __index(self):
         """

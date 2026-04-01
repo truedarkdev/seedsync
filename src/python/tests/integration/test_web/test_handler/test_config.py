@@ -78,6 +78,20 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(True, self.context.config.general.config_api_redact_remote_details)
         self.assertNotIn("False", str(resp.html))
 
+    def test_set_trusted_browser_bootstrap_remote_addrs_via_url_is_forbidden(self):
+        self.assertEqual(None, self.context.config.general.trusted_browser_bootstrap_remote_addrs)
+        resp = self.test_app.get(
+            "/server/config/set/general/trusted_browser_bootstrap_remote_addrs/172.25.0.1%2F32",
+            expect_errors=True
+        )
+        self.assertEqual(403, resp.status_int)
+        self.assertEqual(
+            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via URL",
+            str(resp.html)
+        )
+        self.assertEqual(None, self.context.config.general.trusted_browser_bootstrap_remote_addrs)
+        self.assertNotIn("172.25.0.1/32", str(resp.html))
+
     def test_set_missing_section(self):
         self.assertFalse(self.context.config.has_section("bad_section"))
         resp = self.test_app.get("/server/config/set/bad_section/option/value", expect_errors=True)

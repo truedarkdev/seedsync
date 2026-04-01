@@ -139,6 +139,23 @@ class TestConfigHandlerSet(unittest.TestCase):
         )
         inner.set_property.assert_not_called()
 
+    def test_set_trusted_browser_bootstrap_remote_addrs_via_url_is_forbidden(self):
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.general = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "general", "trusted_browser_bootstrap_remote_addrs", quote("172.25.0.1/32")
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(
+            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via URL",
+            response.body
+        )
+        inner.set_property.assert_not_called()
+
 
 class TestConfigHandlerRoutes(unittest.TestCase):
     def setUp(self):
@@ -191,6 +208,23 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual(403, status_code)
         self.assertEqual(
             "Section 'general' option 'config_api_redact_remote_details' cannot be set via URL",
+            body
+        )
+
+    def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+        ui_session = self.auth_store.create_ui_session(["admin"])
+
+        status_code, body = _invoke_get_route(
+            self.web_app,
+            "/server/config/set/general/trusted_browser_bootstrap_remote_addrs/172.25.0.1%2F32",
+            ui_session_secret=ui_session.secret,
+        )
+
+        self.assertEqual(403, status_code)
+        self.assertEqual(
+            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via URL",
             body
         )
 
