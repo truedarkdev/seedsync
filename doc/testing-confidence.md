@@ -76,8 +76,13 @@ more evidence, but the minimum should always be visible and specific.
   treat it as lane confidence debt, not as unfinished product implementation.
 - Host Angular/Karma Node 24 proof is now available on this machine, but it
   remains comparison evidence rather than the supported closure lane.
-- The final live-app Playwright UI/UX sweep remains the last closeout gate;
-  it is not a blocker to the Phase 4 closure record.
+- The final live-app Playwright UI/UX sweep completed on 2026-04-01 after a
+  corrected rerun against the live Docker baseline.
+- The earlier sweep was invalidated by stale runtime state because the local
+  app had been started before the remote test server was ready, and `/files`
+  was not a valid route target for this app.
+- The corrected rerun on valid routes passed with stable screenshots and no
+  remote-scan error banner, so this item is no longer an open closeout gate.
 
 ## Durable Artifacts
 

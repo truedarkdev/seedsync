@@ -1,7 +1,7 @@
 # Frontend Compatibility Baseline
 
 Status: compatibility-hardening groundwork complete through Phase 3; Phase 4 is
-complete based on the supported Angular 21 / Node 24 / RxJS 7 Dockerized
+closed based on the supported Angular 21 / Node 24 / RxJS 7 Dockerized
 Angular/Karma closure lane and completed slices 1-7.
 
 Current Phase 4 checkpoint: slices 1-7 completed and closed.
@@ -21,6 +21,20 @@ Slice 5 retired the modal/storage compatibility bridge from the active frontend
 path and removed verified-unused Angular 4-era config artifacts.
 Slice 6 retired the legacy Angular 4-era e2e scaffold under `src/angular/e2e`
 after proving the active Angular workspace no longer references it.
+
+## Post-Phase-4 Follow-Ups
+
+The following frontend follow-up slices landed after Phase 4 closed:
+
+- `1c641bc5` `fix(e2e): stabilize legacy webdriver lane`
+- `5d55b78b` `fix(e2e): contain legacy angular sync loss on navigation`
+- `c935538e` `fix(e2e): stabilize dashboard legacy fixture assumptions`
+- `dc65d44f` `fix(e2e): await legacy matcher work before teardown`
+
+These slices stabilized the legacy `src/e2e` lane. The live-app Playwright
+UI/UX sweep was later rerun on the correct live Docker baseline, so it is no
+longer an open follow-up.
+Host and WSL are now aligned to Node `v24.0.0` / npm `11.3.0`.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -193,6 +207,8 @@ was resolved by proof on 2026-03-31.
 - The host Angular/Karma path has now been exercised successfully on Node 24
   on this machine, but the Dockerized lane remains the supported closure
   lane.
+- The live-app Playwright UI/UX sweep has now been completed on the correct
+  live Docker baseline and is not a remaining closeout gate.
 - The intended Phase 4 destination is Angular 21 on Node 24 LTS.
 - Temporary bridge slices are acceptable during the migration, but Angular 21
   plus Node 24 LTS is the target to steer every Phase 4 slice toward.
@@ -235,6 +251,23 @@ was resolved by proof on 2026-03-31.
   `node_modules/font-awesome/scss/font-awesome.scss`, so the open Sass warning
   debt is third-party/transitive rather than app-owned `@import` usage.
 
+## 2026-04-01 Live-App Playwright UI/UX Sweep Proof
+
+- The earlier live-app Playwright sweep was invalidated by stale runtime state
+  because the local app had been started before the remote test server was
+  ready.
+- `/files` was not a valid route target in this app, so it should not be cited
+  as a supported sweep route.
+- After the correct Docker baseline was established and the local app was
+  restarted, the final rerun on valid routes passed with stable screenshots
+  and no remote-scan error banner.
+- Evidence artifacts: `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-summary.json`,
+  `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-dashboard.png`,
+  `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-dashboard-series.png`,
+  `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-settings.png`,
+  `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-logs.png`,
+  `C:\Users\johan\AppData\Local\Temp\codex-playwright-tools\ui-sweep-final-2026-04-01-about.png`.
+
 ## Supported Compatibility Target
 
 The supported closure lane for the upgraded frontend is the Dockerized
@@ -258,27 +291,27 @@ closure-grade proof.
 
 ## Later Follow-Ups
 
-These items remain tracked for later modernization or cleanup work. They are
-not open blockers to Phase 4 completion.
+These items remain tracked for later modernization or cleanup work. Phase 4 is
+closed, and the remaining frontend-modernization items are the ones listed
+below.
 
 | Item | Later phase | Why it stays later |
 | --- | --- | --- |
 | Legacy `src/e2e` Protractor modernization | Phase 4+ | This is active legacy test infrastructure, but it is outside the Angular workspace upgrade closure path and belongs to a later modernization track. |
 | Third-party Sass deprecation cleanup (`font-awesome`) | Phase 5 | The app-owned Sass `@import` migration is complete; the remaining warnings come from vendored `font-awesome` SCSS in `node_modules`, so any follow-up now targets third-party/transitive debt rather than app-owned import usage. |
-| Final live-app Playwright full UI/UX sweep | Final close gate, last | Run this last after the rest of the frontend closeout sequence is settled. It is the last overall frontend closeout gate, not a blocker to Phase 4 completion. |
 
 ## Closure Note
 
-Phase 4 is complete on the supported Angular 21 / Node 24 / RxJS 7
-Dockerized Karma lane after slices 1-7. The host Angular/Karma path has now
-been exercised successfully on Node 24 locally as comparison evidence, and
-the final live-app Playwright sweep remains the last overall frontend closeout
-gate. Treat the
-items listed above as later follow-ups, not as open blockers to Phase 4
-completion. Do not treat the current nested CLI `node-sass` 4.x lockfile
-metadata as cleanup-by-default; the controlled lockfile-refresh check did not
-change it, so revisit it only through a Sass migration or broader frontend
-modernization slice if the warning/noise reduction is worth the churn.
+Phase 4 is closed on the supported Angular 21 / Node 24 / RxJS 7 Dockerized
+Karma lane after slices 1-7. The host Angular/Karma path has now been
+exercised successfully on Node 24 locally as comparison evidence. The live-app
+Playwright UI/UX sweep is complete, so it is no longer a closeout gate or a
+later follow-up. Treat the items listed above as later follow-ups, not as open
+blockers to the closed Phase 4 work. Do not treat the current nested CLI
+`node-sass` 4.x lockfile metadata as cleanup-by-default; the controlled
+lockfile-refresh check did not change it, so revisit it only through a Sass
+migration or broader frontend modernization slice if the warning/noise
+reduction is worth the churn.
 App-owned Sass `@import` usage under `src/angular/src/` has now been migrated;
 the remaining Sass warnings are from vendored `font-awesome` SCSS and are a
 separate third-party follow-up, not unresolved app-owned Sass debt.
