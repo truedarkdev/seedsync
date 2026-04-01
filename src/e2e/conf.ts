@@ -16,9 +16,10 @@ let SpecReporter = require('jasmine-spec-reporter').SpecReporter;
 
 export let config: Config = {
     framework: 'jasmine',
+    SELENIUM_PROMISE_MANAGER: false,
     capabilities: {
         browserName: 'chrome',
-        chromeOptions: { args: [
+        'goog:chromeOptions': { args: [
                 '--headless',
                 '--disable-gpu',
                 '--no-sandbox',

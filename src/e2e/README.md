@@ -52,7 +52,7 @@ canonical lane inventory and minimum-evidence ladder.
 
    ```bash
    cd src/e2e
-   npm install
+   npm ci --legacy-peer-deps
    ```
 
 2. Choose which dev image to run: deb install or docker image
@@ -74,8 +74,7 @@ canonical lane inventory and minimum-evidence ladder.
     ```bash
     cd src/e2e/
     rm -rf tmp && \
-        ./node_modules/typescript/bin/tsc && \
-        ./node_modules/protractor/bin/protractor tmp/conf.js
+        npm test
     ```
 
 ### About
@@ -93,8 +92,17 @@ The automated e2e tests additionally have:
 Notes:
 
 1. In dev mode, the app is visible at [http://localhost:8800](http://localhost:8800).
-   However the url used in test is still [http://myapp:8800](http://myapp:8800)
-   as that's how the selenium server accesses it.
+   The shared Protractor URL source now defaults to the Docker service names
+   used by the containerized lane:
+
+   - app: `http://myapp:8800/`
+   - Selenium: `http://chrome:4444/wd/hub`
+
+   If you need to run the legacy harness against host-exposed services,
+   override both URLs explicitly:
+
+   - `SEEDSYNC_E2E_APP_BASE_URL` for the app base URL
+   - `SEEDSYNC_E2E_SELENIUM_ADDRESS` for the Selenium endpoint
 
 2. The app requires a fully configured settings.cfg.
    This is done automatically during the start of the docker image that runs
@@ -106,6 +114,8 @@ Notes:
    make run-remote-server
    ```
 
-   That service publishes SSH on `localhost:1234`. The Linux/WSL baseline
+   That service publishes SSH on `127.0.0.1:1234`. The Linux/WSL baseline
    helper only treats that endpoint as a separately bootstrapped fixture, not
-   as a host prerequisite.
+   as a host prerequisite. The Dockerized e2e lane now waits for that fixture
+   before starting Protractor, but it still expects the remote service to be
+   reachable on the Compose network as `remote:1234`.

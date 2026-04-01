@@ -1,5 +1,11 @@
 version: "3.4"
 services:
   myapp:
-    image: ${STAGING_REGISTRY}/seedsync:${STAGING_VERSION}
+    image: ${STAGING_REGISTRY:-localhost:5000}/seedsync:${STAGING_VERSION:-latest}
     container_name: seedsync_test_e2e_myapp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8800/server/status >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
