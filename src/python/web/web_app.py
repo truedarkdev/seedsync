@@ -324,6 +324,7 @@ class WebApp(bottle.Bottle):
         return (
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
+            WebApp.__is_loopback_remote_addr() and
             WebApp.__is_loopback_host(WebApp.__request_host())
         )
 
@@ -414,6 +415,12 @@ class WebApp(bottle.Bottle):
         ui_session = create_session(["admin"])
         return ui_session.secret
 
+    def __authorize_browser_bootstrap(self) -> None:
+        if WebApp.__is_loopback_remote_addr():
+            return
+
+        bottle.abort(403, "Browser shell and static asset access is limited to loopback")
+
     def __index(self):
         """
         Serves the index.html static file
@@ -436,6 +443,7 @@ class WebApp(bottle.Bottle):
         :param file_path:
         :return:
         """
+        self.__authorize_browser_bootstrap()
         response = static_file(file_path, root=self.__html_path)
         if file_path == "index.html":
             ui_session_secret = self.__create_ui_session_secret()

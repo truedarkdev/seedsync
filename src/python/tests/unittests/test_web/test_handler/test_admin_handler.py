@@ -63,26 +63,49 @@ class TestAdminHandler(unittest.TestCase):
         rejected = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "remote-admin"},
-            extra_environ={"HTTP_HOST": "seed.example:8800"},
+            extra_environ={"HTTP_HOST": "seed.example:8800", "REMOTE_ADDR": "203.0.113.10"},
             expect_errors=True
         )
         self.assertEqual(401, rejected.status_int)
 
+        rejected_host_only = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "spoofed-loopback-host"},
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "203.0.113.10"},
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected_host_only.status_int)
+
         allowed = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "first-admin"},
-            extra_environ={"HTTP_HOST": "localhost:8800"}
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"}
         )
         allowed_payload = json.loads(allowed.text)
         self.assertEqual(201, allowed.status_int)
         self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
         self.assertIn("secret", allowed_payload)
 
+    def test_first_admin_bootstrap_rejects_loopback_transport_with_non_loopback_host(self):
+        empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-mismatch.json"))
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        AdminHandler(self.context.config, empty_store).add_routes(web_app)
+        test_app = TestApp(web_app)
+
+        rejected = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "host-mismatch-admin"},
+            extra_environ={"HTTP_HOST": "seed.example:8800", "REMOTE_ADDR": "127.0.0.1"},
+            expect_errors=True
+        )
+
+        self.assertEqual(401, rejected.status_int)
+
     def test_first_admin_bootstrap_is_not_available_after_admin_exists(self):
         resp = self.test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "another-admin"},
-            extra_environ={"HTTP_HOST": "localhost:8800"},
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"},
             expect_errors=True
         )
 
