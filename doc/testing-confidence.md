@@ -36,7 +36,7 @@ Freshness rule:
 | WSL backend stop-state integration | Healthy as of 2026-03-30 | The stop-state backend contract now has fresh WSL/Linux proof, so the regression is no longer an open implementation gap. | Targeted `src/python` pytest slice for stop-state coverage | 2026-03-30 local WSL run; 4 targeted tests passed in 26.56s; artifact `tmp/pytest/wsl-backend.junit.xml` |
 | Host Angular/Karma full-suite proof | Healthy as of 2026-04-01 for Node 24 host proof | The Angular/Karma host harness now boots and runs the full suite successfully on the Node 24 host path. That is comparison evidence only; the supported frontend closure lane remains the Dockerized Angular/Karma path on Angular 21 / Node 24 / RxJS 7. | `src/angular` headless Karma lane; host log `C:\Git\seedsync\tmp\pytest\host-angular-node24-smoke.log` | 2026-04-01 local host run; Node `v24.0.0` via nvm4w, npm `11.3.0`, Chrome at `C:\Program Files\Google\Chrome\Application\chrome.exe`, attempted `--include` filter ignored by npm (`npm warn invalid config include=...`), suite reported `TOTAL: 592 SUCCESS` |
 | Dockerized Angular build/test | Healthy as of 2026-04-01 | The Dockerized Angular lane still passes cleanly after the RxJS 7 manifest bump, `rxjs-compat` removal, and app-owned Sass `@import` migration, so the Angular 21 / Node 24 Docker verifier path remains the supported frontend closure lane. | `src/docker/test/angular/compose.yml` default verifier path plus Angular build images | 2026-04-01 local Docker proof; exact `docker compose -f src/docker/test/angular/compose.yml up --build --abort-on-container-exit --exit-code-from tests` exited `0` with `TOTAL: 296 SUCCESS`; the subsequent `docker build -f src/docker/build/docker-image/Dockerfile --target seedsync_build_angular .` also passed; remaining Sass warnings were from vendored `font-awesome` SCSS in `node_modules`, not app-owned `@import` usage |
-| Legacy Protractor/e2e | Blocked on Angular testability sync after the WebDriver 4 bridge | The Dockerized lane now gets through compose startup, configure, remote/Selenium readiness, and browser session bootstrap. A bounded shim now lets the legacy Protractor stack run on `selenium-webdriver@4`, and the live lane executes all 17 specs instead of dying at session creation. The remaining blocker has moved to page sync behavior: the dashboard and one settings flow now fail with Protractor reporting that Angular testability is undefined after navigation. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-04-01 local Docker rerun: `seedsync_test_e2e` reached spec execution, 9 specs passed, 8 failed, exit `199`; remaining failures centered on `Error while waiting for Protractor to sync with the page: "both angularJS testability and angular testability are undefined"` |
+| Legacy Protractor/e2e | Blocked on downstream dashboard selector/data brittleness and teardown noise | The Dockerized lane now gets through compose startup, configure, remote/Selenium readiness, and browser session bootstrap. A bounded WebDriver 4 bridge and route-bootstrap helper now contain the earlier Angular testability-sync failure on the targeted dashboard/settings navigation path. The remaining verified failures are later dashboard selector/data issues plus noisy session teardown on the targeted settings run, so the lane is no longer blocked at the old Angular bootstrap boundary. | `src/docker/test/e2e/compose.yml` plus targeted legacy Protractor specs under `src/e2e/tests` | 2026-04-01 targeted local Docker reruns: settings spec assertion passed without the old `both angularJS testability and angular testability are undefined` failure, but teardown still exited `199`; dashboard targeted rerun also avoided the old sync failure and instead failed later with `NoSuchElementError`, `StaleElementReferenceError`, and row-count/index assumptions; artifacts `tmp/pytest/e2e-rerun-settings-spec.log`, `tmp/pytest/e2e-rerun-dashboard-spec.log`, and `tmp/pytest/e2e-rerun-route-bootstrap-restore-probe.log` |
 | Native Windows Poetry path | Blocked on this machine | The local Windows Python environment is outside the repo-supported Poetry range, so this host path cannot be treated as a valid confidence lane here. | `src/python` Poetry environment | 2026-03-30 local host check; Python 3.13.12 vs supported `>=3.11,<3.13` |
 
 ## Minimum Evidence Ladder
@@ -99,12 +99,13 @@ documentation.
 
 - Stop-resume browser/e2e lane: the backend stop-state slice now has fresh
   WSL/Linux proof, but the legacy browser-backed lane remains separate from
-  the Angular workspace upgrade closure path. The current slice has
-  normalized the Selenium/Chrome wiring, made configure deterministic, and
-  moved the remaining blocker past browser-session bootstrap into Angular
-  testability synchronization on the dashboard/settings flows; keep any
-  remaining work in the dedicated e2e modernization track rather than as an
-  open stop-state implementation task or a Phase 4 blocker.
+  the Angular workspace upgrade closure path. The current slices have
+  normalized the Selenium/Chrome wiring, made configure deterministic,
+  bridged the legacy WebDriver bootstrap, and contained the old Angular
+  testability-sync failure on the targeted dashboard/settings path; keep the
+  remaining dashboard selector/data brittleness and teardown noise in the
+  dedicated e2e modernization track rather than as an open stop-state
+  implementation task or a Phase 4 blocker.
 - Native Windows Poetry validation: blocked on this machine because the local
   Python version is 3.13.12, outside the repo-supported `>=3.11,<3.13` range.
   If Windows host validation becomes necessary, it needs a supported Python
