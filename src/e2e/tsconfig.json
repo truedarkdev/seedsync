@@ -4,6 +4,11 @@
     "target": "es6",
     "module": "commonjs",
     "moduleResolution": "node",
+    "types": [
+      "node",
+      "jasmine",
+      "jasminewd2"
+    ],
     "inlineSourceMap": true,
     "declaration": false,
     "noImplicitAny": false,

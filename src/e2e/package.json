@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "description": "end to end tests",
   "author": "",
+  "scripts": {
+    "build": "tsc --outDir ./tmp",
+    "test": "npm run build && node -r ./selenium-webdriver-promise-shim.cjs ./node_modules/protractor/bin/protractor tmp/conf.js"
+  },
   "dependencies": {
     "@types/jasminewd2": "^2.0.6",
     "@types/node": "^14.0.1",
@@ -15,5 +19,14 @@
     "@types/jasmine": "^3.5.10",
     "@types/jasminewd2": "^2.0.6",
     "ts-node": "^8.10.1"
+  },
+  "overrides": {
+    "selenium-webdriver": "^4.41.0",
+    "webdriver-js-extender": {
+      "selenium-webdriver": "^4.41.0"
+    },
+    "protractor": {
+      "selenium-webdriver": "^4.41.0"
+    }
   }
 }
