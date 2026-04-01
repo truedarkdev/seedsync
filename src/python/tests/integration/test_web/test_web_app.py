@@ -99,7 +99,7 @@ class TestWebApp(BaseTestWebApp):
         self.web_app.process()
 
     def test_index_sets_connect_src_csp_header(self):
-        response = self.test_app.get("/")
+        response = self.build_browser_test_app().get("/")
 
         self.assertEqual(
             "connect-src 'self' https://api.github.com",
@@ -107,16 +107,30 @@ class TestWebApp(BaseTestWebApp):
         )
 
     def test_index_html_is_served_directly(self):
-        response = self.test_app.get("/index.html")
+        response = self.build_browser_test_app().get("/index.html")
 
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
 
     def test_dashboard_path_pair_deep_link_serves_index_html(self):
-        response = self.test_app.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+        response = self.build_browser_test_app().get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
 
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
+
+    def test_dashboard_path_pair_deep_link_issues_ui_session_cookie(self):
+        browser_app = TestApp(
+            self.web_app,
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+            }
+        )
+
+        response = browser_app.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):

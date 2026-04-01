@@ -1,6 +1,8 @@
 # Staged Plan - Scoped API Keys for External API Access
 
-Status: staged plan with backend foundation now implemented locally. The next work should focus on the remaining browser/bootstrap and Settings follow-up slices, not on reopening the backend auth boundary that this first slice established.
+Status: staged plan with backend foundation and the browser/bootstrap follow-up now implemented locally. The next work should focus on the Settings follow-up slice, not on reopening the backend auth boundary or the browser bootstrap boundary that the first two slices established.
+
+Immediate next step: start the Settings UI slice on top of the already-landed backend auth and loopback UI-session foundation. The app shell/static routes now fail closed off-loopback, loopback browser access still issues the built-in UI session cookie, and `/server/stream` remains aligned with that session flow.
 
 ## Core Direction
 
@@ -67,10 +69,12 @@ Backend foundation only:
 
 ### Slice 2: UI bootstrap and SSE session path
 
-- Add the backend-issued browser session cookie.
-- Cover the app shell and static asset routes with an explicit bootstrap boundary.
-- Split bootstrap into the existing two modes: loopback and non-loopback.
-- Keep SSE aligned with the browser session cookie so the built-in UI works without bearer headers in `EventSource`.
+Completed locally:
+
+- The app shell and static asset routes now use an explicit loopback browser-bootstrap boundary.
+- Non-loopback browser shell/static requests fail closed; there is no new remote-browser login flow.
+- Loopback browser access still issues the built-in UI session cookie, including deep links.
+- `/server/stream` remains aligned with the browser session cookie so the built-in UI works without bearer headers in `EventSource`.
 
 ### Slice 3: Settings UI
 
@@ -83,6 +87,16 @@ Backend foundation only:
 - Convert or block the legacy mutating GET routes.
 - Add same-origin and CSRF enforcement for cookie-auth writes.
 - Keep legacy token compatibility only where the rollout still requires it.
+
+### Final follow-up: security regression lane
+
+- Add a small dedicated security-regression test lane for the external API access model.
+- Cover negative cases that should stay blocked, especially:
+  - reverse-proxy or same-host topology assumptions around passwordless local-browser trust
+  - mixed auth precedence across bearer, cookie, and irrelevant `Authorization` headers
+  - revoked or rotated key behavior on protected routes
+  - admin bootstrap boundary checks
+- Keep this at the end of the API access work plan rather than treating it as a blocker for the earlier backend/browser slices.
 
 ## Notes To Preserve
 

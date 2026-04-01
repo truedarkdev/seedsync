@@ -78,7 +78,13 @@ class TestWebAppStream(unittest.TestCase):
             web_app = WebApp(self.context, MagicMock())
             web_app.add_default_routes()
             client = TestApp(web_app)
-            response = client.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+            response = client.get(
+                "/dashboard/123e4567-e89b-12d3-a456-426614174000",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+            )
 
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
@@ -374,7 +380,26 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
-    def test_loopback_host_alone_does_not_issue_ui_session_cookie(self):
+    def test_loopback_dashboard_deep_link_issues_ui_session_cookie(self):
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            response = client.get(
+                "/dashboard/123e4567-e89b-12d3-a456-426614174000",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+            )
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+
+    def test_non_loopback_index_rejects_browser_bootstrap(self):
         self.web_app.add_default_routes()
 
         with tempfile.TemporaryDirectory() as html_path:
@@ -387,11 +412,54 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 extra_environ={
                     "HTTP_HOST": "localhost:8800",
                     "REMOTE_ADDR": "203.0.113.10",
-                }
+                },
+                expect_errors=True,
             )
 
-        self.assertEqual(200, response.status_int)
-        self.assertNotIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertEqual(403, response.status_int)
+        self.assertIn("loopback", response.text)
+
+    def test_non_loopback_dashboard_deep_link_rejects_browser_bootstrap(self):
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            response = client.get(
+                "/dashboard/123e4567-e89b-12d3-a456-426614174000",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "203.0.113.10",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("loopback", response.text)
+
+    def test_non_loopback_static_asset_request_rejects_browser_bootstrap(self):
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            with open(os.path.join(html_path, "main.js"), "w") as asset_file:
+                asset_file.write("console.log('hello');")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            response = client.get(
+                "/main.js",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "203.0.113.10",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("loopback", response.text)
 
     def test_non_loopback_transport_rejects_ui_session_cookie(self):
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
