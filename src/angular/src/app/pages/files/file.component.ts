@@ -3,7 +3,7 @@ import {
     EventEmitter, OnChanges, SimpleChanges, ViewChild, ChangeDetectorRef
 } from "@angular/core";
 
-import {Modal} from "../../services/utils/modal-compat.service";
+import {Modal} from "../../services/utils/modal.service";
 
 import {ViewFile} from "../../services/files/view-file";
 import {Localization} from "../../common/localization";

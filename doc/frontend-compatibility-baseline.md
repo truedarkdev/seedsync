@@ -4,7 +4,7 @@ Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
 upgrade execution is active with Angular 21 on Node 24 LTS as the intended
 destination for the frontend modernization / compatibility migration task.
 
-Current Phase 4 checkpoint: slices 1-4 completed.
+Current Phase 4 checkpoint: slices 1-5 completed.
 Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
 Docker/frontend lane alignment, Docker build/test command modernization, and
 narrow compatibility bridges for legacy modal/storage usage.
@@ -17,6 +17,8 @@ bridge retirement to later slices.
 Slice 4 raised the tracked frontend manifest to RxJS 7, removed
 `rxjs-compat`, and fixed the remaining legacy deep-import breakpoints in
 tests/mocks while keeping broader bridge cleanup deferred.
+Slice 5 retired the modal/storage compatibility bridge from the active frontend
+path and removed verified-unused Angular 4-era config artifacts.
 
 This note captures the current contract before any toolchain or dependency
 changes are attempted. The global OpenSSL legacy-provider workaround question
@@ -24,8 +26,8 @@ was resolved by proof on 2026-03-31.
 
 ## Current Frontend Contract
 
-- `src/angular/package.json` still defines the legacy frontend as Angular 4.2.4
-  with `@angular/cli` 1.3.2.
+- `src/angular/package.json` targets Angular 21.2.5 with `@angular/cli`
+  21.2.5.
 - `src/angular/package-lock.json` is `lockfileVersion: 3`, so the repo already
   relies on a newer npm lockfile format than the Angular 4-era codebase.
 - The proven Dockerized runtime currently resolves root `node-sass` to
@@ -139,14 +141,34 @@ was resolved by proof on 2026-03-31.
   `docker compose -f src/docker/test/angular/compose.yml up --build
   --abort-on-container-exit --exit-code-from tests`
 - The full suite again reported `TOTAL: 296 SUCCESS` on that exact path.
+
+## 2026-04-01 Phase 4 Slice 5 Proof
+
+- The modal compat bridge was retired from the active frontend path by moving
+  the implementation into `modal.service.ts` and updating the app module,
+  page-layer consumers, and unit specs to the new service path.
+- The storage compat bridge was retired from the active frontend path by
+  moving the implementation into `storage.service.ts` and updating the file
+  options service plus its unit coverage to the new provider path.
+- The modal overlay/dialog internals no longer advertise the legacy compat
+  class names.
+- `src/angular/tslint.json` and `src/angular/protractor.conf.js` were removed
+  after verifying that current `package.json`, `angular.json`, Makefile, and
+  active Angular/Docker build-test paths do not reference them.
+- `src/angular/src/environments/environment.ts` no longer points at the removed
+  `.angular-cli.json` workspace comment and now references `angular.json`.
+- The narrow Angular unit lane for the touched service/component specs passed
+  after the import updates.
 - `src/angular/package-lock.json` was regenerated locally for the slice, but it
   remains gitignored in this workspace, so the tracked repo still relies on the
   manifest plus Docker verification rather than a committed frontend lockfile.
 
 ## Phase 4 Upgrade Investigation
 
-- The current frontend still uses a legacy Angular CLI workspace shape:
-  `.angular-cli.json`, Protractor-era config, and TSLint/Codelyzer.
+- The current frontend has retired the modal/storage compatibility bridge from
+  the active runtime path, but the repo still carries other historical
+  Angular 4-era/deprecated scaffolding only where it is separately proven
+  unused.
 - The current Dockerized frontend lane has now been lifted to a Node 24-based
   Angular 21 workspace/toolchain checkpoint.
 - The intended Phase 4 destination is Angular 21 on Node 24 LTS.
@@ -157,14 +179,15 @@ was resolved by proof on 2026-03-31.
 - The first two upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
-- The first four upgrade slices are now complete:
+- The first five upgrade slices are now complete:
   - slice 1: workspace/toolchain + Docker lane modernization
   - slice 2: page-layer RxJS modernization
   - slice 3: service/runtime RxJS modernization on RxJS 6.6.7
   - slice 4: RxJS 7 manifest bump + `rxjs-compat` removal
-- The next upgrade slice should revisit the remaining temporary bridges and
-  compatibility debt from the now-upgraded Angular 21 / Node 24 / RxJS 7
-  baseline.
+  - slice 5: modal/storage bridge retirement + verified-unused legacy config
+    removal
+- The next upgrade slice should focus on any remaining Angular 4-era cleanup
+  that is still separately justified by current repo usage.
 
 ## Supported Compatibility Target
 
@@ -194,15 +217,15 @@ modern floor.
 | Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
 | Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
 | Should the ignored `src/angular/package-lock.json` remain an untracked local artifact now that the manifest is on RxJS 7? | Phase 4 | Slice 4 regenerated the lockfile locally, but the repo still ignores it. Decide later whether frontend dependency reproducibility should continue to rely on Docker verification plus manifest only. |
-| Which legacy compatibility bridges can be retired after the Angular 21 checkpoint and RxJS floor are stable? | Phase 4 | Revisit the temporary modal/storage bridges after the Angular 21 / Node 24 / RxJS 7 lane has stayed green through follow-on app updates. |
+| Should any remaining legacy Angular 4-era e2e scaffold under `src/angular/e2e` be retired once the Docker e2e lane is fully independent? | Phase 4 | Keep that cleanup separate until the current Dockerized e2e path is explicitly re-homed and proven not to depend on the old Protractor-era tree. |
 | When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
 | When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
 
 ## Resume Sentence
 
-Continue Phase 4 from the now-green Angular 21 / Node 24 / RxJS 7 slices 1-4
-baseline by taking the next bounded compatibility-debt slice, most likely
-bridge retirement or related cleanup, while preserving the Dockerized Karma
-lane as the closure gate. Do not treat the current nested CLI `node-sass` 4.x
+Continue Phase 4 from the now-green Angular 21 / Node 24 / RxJS 7 slices 1-5
+baseline by taking the next bounded cleanup slice only when current repo usage
+proves it is still warranted, while preserving the Dockerized Karma lane as
+the closure gate. Do not treat the current nested CLI `node-sass` 4.x
 lockfile subtree as cleanup-by-default; revisit it only through a controlled
 lockfile-refresh decision if the warning/noise reduction is worth the churn.

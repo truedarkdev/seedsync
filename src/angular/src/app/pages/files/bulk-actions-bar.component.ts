@@ -1,7 +1,7 @@
 import {Component, Input, ChangeDetectionStrategy} from "@angular/core";
 
 import {List} from "immutable";
-import {Modal} from "../../services/utils/modal-compat.service";
+import {Modal} from "../../services/utils/modal.service";
 
 import {ViewFile} from "../../services/files/view-file";
 import {BulkCommandService} from "../../services/server/bulk-command.service";

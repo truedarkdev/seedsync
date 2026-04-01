@@ -47,8 +47,8 @@ import {FileSelectionService} from "./services/files/file-selection.service";
 import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
 import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
 import {PathPairServiceProvider} from "./services/settings/path-pair.service";
-import {Modal} from "./services/utils/modal-compat.service";
-import {StorageServiceModule} from "./services/utils/storage-compat.service";
+import {Modal} from "./services/utils/modal.service";
+import {StorageServiceModule} from "./services/utils/storage.service";
 
 @NgModule({
     declarations: [

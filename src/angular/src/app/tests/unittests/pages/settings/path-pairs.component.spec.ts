@@ -3,7 +3,7 @@ import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angu
 import {FormsModule} from "@angular/forms";
 import {By} from "@angular/platform-browser";
 import {BehaviorSubject, of} from "rxjs";
-import {Modal} from "../../../../services/utils/modal-compat.service";
+import {Modal} from "../../../../services/utils/modal.service";
 
 import {PathPairsComponent} from "../../../../pages/settings/path-pairs.component";
 import {

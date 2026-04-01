@@ -4,7 +4,7 @@ import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {By} from "@angular/platform-browser";
 import {of} from "rxjs";
 
-import {Modal} from "../../../../services/utils/modal-compat.service";
+import {Modal} from "../../../../services/utils/modal.service";
 
 import {FileAction, FileComponent} from "../../../../pages/files/file.component";
 import {ViewFile} from "../../../../services/files/view-file";
