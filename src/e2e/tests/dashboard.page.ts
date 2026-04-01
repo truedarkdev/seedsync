@@ -1,10 +1,11 @@
 import {browser, by, element, ExpectedConditions} from 'protractor';
-import {promise} from "selenium-webdriver";
-import Promise = promise.Promise;
+import {promise as webdriverPromise} from "selenium-webdriver";
 
 import {Urls} from "../urls";
 import {App} from "./app";
 import {loadAngularRoute} from "./route-bootstrap";
+
+type WebdriverPromise<T> = webdriverPromise.Promise<T>;
 
 export class File {
     constructor(public name,
@@ -23,22 +24,40 @@ export class FileActionButtonState {
 }
 
 export class DashboardPage extends App {
+    private getFileRows() {
+        return element.all(by.css("#file-list .file"));
+    }
+
     private getFileRow(index: number) {
-        return element.all(by.css("#file-list .file")).get(index);
+        return this.getFileRows().get(index);
     }
 
     private getFileRowById(fileId: string) {
-        return element.all(by.css("#file-list .file"))
+        return this.getFileRows()
             .filter(row => {
                 return row.getAttribute("data-file-id").then(value => value === fileId);
             })
             .first();
     }
 
-    private getActionButtonByTitle(row, title: string) {
-        return row
-            .element(by.css(".actions"))
-            .all(by.css(".button"))
+    private getActionButtons(row) {
+        return row.element(by.css(".actions")).all(by.css(".button"));
+    }
+
+    private waitForActionButtons(row) {
+        const actions = row.element(by.css(".actions"));
+        return browser.wait(ExpectedConditions.presenceOf(actions), 10000);
+    }
+
+    private waitForFileRowCount(minimumCount: number) {
+        return browser.wait(() => {
+            return this.getFileRows().count().then(count => count >= minimumCount);
+        }, 10000);
+    }
+
+    private async getActionButtonByTitle(row, title: string) {
+        await this.waitForActionButtons(row);
+        return this.getActionButtons(row)
             .filter(buttonElm => {
                 return browser.executeScript(
                     "return arguments[0].innerHTML;",
@@ -95,7 +114,7 @@ export class DashboardPage extends App {
                 ), 10000).then(() => {
                     return browser.wait(ExpectedConditions.visibilityOf(
                         element.all(by.css("#file-list .file")).first()
-                    ), 10000);
+                    ), 10000).then(() => this.waitForFileRowCount(1));
                 });
             });
     }
@@ -107,12 +126,12 @@ export class DashboardPage extends App {
             ), 10000).then(() => {
                 return browser.wait(ExpectedConditions.visibilityOf(
                     element.all(by.css("#file-list .file")).first()
-                ), 10000);
+                ), 10000).then(() => this.waitForFileRowCount(1));
             });
         });
     }
 
-    getFiles(): Promise<Array<File>> {
+    getFiles(): WebdriverPromise<Array<File>> {
         return element.all(by.css("#file-list .file")).map(function (elm) {
             let name = browser.executeScript(
                 "return arguments[0].firstChild && arguments[0].firstChild.textContent;",
@@ -142,6 +161,10 @@ export class DashboardPage extends App {
 
     getFileIdByIndex(index: number) {
         return this.getFileRow(index).getAttribute("data-file-id");
+    }
+
+    getFileIdByName(name: string) {
+        return this.findFileIndexByName(name).then(index => this.getFileIdByIndex(this.requireFileIndex(name, index)));
     }
 
     getFileNameByIndex(index: number) {
@@ -261,14 +284,24 @@ export class DashboardPage extends App {
     }
 
     isFileActionsVisible(index: number) {
-        return this.getFileRow(index)
-                            .element(by.css(".actions")).isDisplayed();
+        const actions = this.getFileRow(index).element(by.css(".actions"));
+        return actions.isPresent().then(present => {
+            if (!present) {
+                return false;
+            }
+
+            return actions.isDisplayed();
+        });
     }
 
-    getFileActions(index: number): Promise<Array<FileActionButtonState>> {
-        return this.getFileRow(index)
-            .element(by.css(".actions"))
-            .all(by.css(".button"))
+    isFileActionsVisibleByName(name: string) {
+        return this.findFileIndexByName(name).then(index => this.isFileActionsVisible(this.requireFileIndex(name, index)));
+    }
+
+    async getFileActions(index: number): Promise<Array<FileActionButtonState>> {
+        const row = this.getFileRow(index);
+        await this.waitForActionButtons(row);
+        return this.getActionButtons(row)
             .map(buttonElm => {
                 let title = browser.executeScript(
                     "return arguments[0].innerHTML;",
@@ -286,14 +319,24 @@ export class DashboardPage extends App {
     }
 
     stopFileById(fileId: string) {
-        return this.getActionButtonByTitle(this.getFileRowById(this.requireFileId(fileId)), "Stop").click().then(() => {
-            return browser.waitForAngular();
+        const row = this.getFileRowById(this.requireFileId(fileId));
+        return this.getActionButtonByTitle(row, "Stop").then(button => {
+            return browser.wait(ExpectedConditions.elementToBeClickable(button), 10000).then(() => {
+                return button.click().then(() => {
+                    return browser.waitForAngular();
+                });
+            });
         });
     }
 
     queueFileById(fileId: string) {
-        return this.getActionButtonByTitle(this.getFileRowById(this.requireFileId(fileId)), "Queue").click().then(() => {
-            return browser.waitForAngular();
+        const row = this.getFileRowById(this.requireFileId(fileId));
+        return this.getActionButtonByTitle(row, "Queue").then(button => {
+            return browser.wait(ExpectedConditions.elementToBeClickable(button), 10000).then(() => {
+                return button.click().then(() => {
+                    return browser.waitForAngular();
+                });
+            });
         });
     }
 
@@ -321,10 +364,10 @@ export class DashboardPage extends App {
         }, 20000);
     }
 
-    private getActionStateByTitle(row, title: string) {
-        return this.getActionButtonByTitle(row, title)
-            .getAttribute("disabled")
-            .then(value => new FileActionButtonState(title, value == null));
+    private async getActionStateByTitle(row, title: string) {
+        const button = await this.getActionButtonByTitle(row, title);
+        const value = await button.getAttribute("disabled");
+        return new FileActionButtonState(title, value == null);
     }
 
     getFileActionByTitle(fileId: string, title: string) {
