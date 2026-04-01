@@ -1,6 +1,6 @@
 # Staged Plan - Scoped API Keys for External API Access
 
-Status: staged planning note. The first execution slice is backend-first and should land before any UI bootstrap or Settings work.
+Status: staged plan with backend foundation now implemented locally. The next work should focus on the remaining browser/bootstrap and Settings follow-up slices, not on reopening the backend auth boundary that this first slice established.
 
 ## Core Direction
 

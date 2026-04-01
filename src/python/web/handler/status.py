@@ -13,7 +13,12 @@ class StatusHandler(IHandler):
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
-        web_app.add_handler("/server/status", self.__handle_get_status)
+        web_app.add_handler(
+            "/server/status",
+            self.__handle_get_status,
+            required_scope="read",
+            allow_legacy_api_token=True
+        )
 
     def __handle_get_status(self):
         out_json = SerializeStatusJson.status(self.__status)

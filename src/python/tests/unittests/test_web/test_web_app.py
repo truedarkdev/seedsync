@@ -1,12 +1,17 @@
 import unittest
 import os
 import tempfile
+from threading import Timer
 from unittest.mock import MagicMock, patch
 
 from common import Config
+from web.auth_store import ApiKeyStore
 from webtest import TestApp
 from web.web_app import IStreamHandler, WebApp
 from web.web_app_builder import WebAppBuilder
+
+
+LEGACY_TEST_API_TOKEN = "legacy-test-token"
 
 
 class QueueStreamHandler(IStreamHandler):
@@ -138,6 +143,7 @@ class TestWebAppHostValidation(unittest.TestCase):
         context.status = MagicMock()
         context.config = Config()
         context.config.general.allowed_hostname = allowed_hostname
+        context.config.general.api_token = LEGACY_TEST_API_TOKEN
         return WebApp(context, MagicMock())
 
     def test_normalizes_hostname_values_for_compare(self):
@@ -146,66 +152,66 @@ class TestWebAppHostValidation(unittest.TestCase):
     def test_allows_localhost_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("  MyApp.Local.  ")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "localhost:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_exact_server_path_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("myapp.local")
 
-        @web_app.route("/server")
+        @web_app.route("/server", required_scope="read", allow_legacy_api_token=True)
         def _server_root():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server", extra_environ={"HTTP_HOST": "myapp.local:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_configured_hostname_with_normalization(self):
         web_app = self._make_web_app("  MyApp.Local.  ")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "MYAPP.LOCAL.:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_ipv6_literal_when_configured_without_brackets(self):
         web_app = self._make_web_app("::1")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_ipv6_literal_when_configured_with_brackets(self):
         web_app = self._make_web_app("[::1]")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_rejects_unlisted_hostname_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("myapp.local")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get(
             "/server/ping",
             extra_environ={"HTTP_HOST": "evil.example:8800"},
@@ -216,10 +222,216 @@ class TestWebAppHostValidation(unittest.TestCase):
     def test_allows_any_hostname_when_not_configured(self):
         web_app = self._make_web_app("")
 
-        @web_app.route("/server/ping")
+        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
         def _ping():
             return "pong"
 
-        client = TestApp(web_app)
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "evil.example:8800"})
+        self.assertEqual(200, response.status_int)
+
+    def test_unregistered_server_path_fails_closed(self):
+        web_app = self._make_web_app("")
+        web_app.add_default_routes()
+
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        response = client.get("/server/not-registered", expect_errors=True)
+
+        self.assertEqual(404, response.status_int)
+
+
+class TestWebAppAuthCompatibility(unittest.TestCase):
+    def setUp(self):
+        self.context = MagicMock()
+        self.context.logger.getChild.return_value = MagicMock()
+        self.context.args.html_path = "/tmp"
+        self.context.status = MagicMock()
+        self.context.config = Config()
+        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
+        self.auth_store = ApiKeyStore()
+        self.auth_store.create_api_key("unit-admin", ["admin"])
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+
+    @staticmethod
+    def _same_origin_headers(host: str = "localhost:8800"):
+        return {
+            "HTTP_HOST": host,
+            "HTTP_REFERER": "http://{}/dashboard".format(host),
+            "REMOTE_ADDR": "127.0.0.1",
+        }
+
+    def _issue_browser_session(self, client: TestApp, host: str = "localhost:8800"):
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            response = client.get("/", extra_environ={"HTTP_HOST": host, "REMOTE_ADDR": "127.0.0.1"})
+        return response
+
+    def test_same_origin_browser_request_can_use_sessionless_route(self):
+        @self.web_app.route("/server/ping", required_scope="read", allow_sessionless_ui=True)
+        def _ping():
+            return "pong"
+
+        client = TestApp(self.web_app)
+        response = client.get("/server/ping", extra_environ=self._same_origin_headers())
+
+        self.assertEqual(200, response.status_int)
+
+    def test_write_route_requires_cookie_backed_ui_session(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+        response = client.post(
+            "/server/ping",
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"}
+        )
+
+        self.assertEqual(200, response.status_int)
+
+    def test_sessionless_ui_flag_is_rejected_for_write_routes(self):
+        with self.assertRaisesRegex(ValueError, "allow_sessionless_ui is only supported for read/stream /server routes"):
+            @self.web_app.route("/server/ping", method="POST", required_scope="write", allow_sessionless_ui=True)
+            def _ping():
+                return "pong"
+
+    def test_same_origin_browser_request_can_use_stream_with_ui_session_cookie(self):
+        self.web_app.add_streaming_handler(QueueStreamHandler, values=["event\n"], cleanup_log=[])
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+        Timer(0.1, self.web_app.stop).start()
+
+        response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"}
+        )
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("text/event-stream", response.headers["Content-Type"])
+
+    def test_stream_rejects_legacy_token_when_compatibility_is_disabled(self):
+        self.web_app.add_default_routes()
+        self.auth_store.set_legacy_api_token_compatibility_enabled(False)
+        client = TestApp(self.web_app)
+
+        response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)},
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("compatibility has been disabled", response.text)
+
+    def test_legacy_token_is_rejected_for_sensitive_config_get(self):
+        @self.web_app.route("/server/config/get", required_scope="read")
+        def _get_config():
+            return "secret"
+
+        client = TestApp(self.web_app)
+        response = client.get(
+            "/server/config/get",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)},
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("cannot access this route", response.text)
+
+    def test_legacy_token_is_allowed_only_when_route_opted_in(self):
+        @self.web_app.route("/server/status", required_scope="read", allow_legacy_api_token=True)
+        def _status():
+            return "ok"
+
+        client = TestApp(self.web_app)
+        response = client.get(
+            "/server/status",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)}
+        )
+
+        self.assertEqual(200, response.status_int)
+
+    def test_server_routes_still_require_auth_when_allowed_hostname_is_blank(self):
+        @self.web_app.route("/server/ping", required_scope="read")
+        def _ping():
+            return "pong"
+
+        client = TestApp(self.web_app)
+        response = client.get("/server/ping", expect_errors=True)
+
+        self.assertEqual(401, response.status_int)
+
+    def test_loopback_index_issues_ui_session_cookie(self):
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        response = self._issue_browser_session(client)
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+
+    def test_loopback_host_alone_does_not_issue_ui_session_cookie(self):
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "203.0.113.10",
+                }
+            )
+
+        self.assertEqual(200, response.status_int)
+        self.assertNotIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+
+    def test_non_loopback_transport_rejects_ui_session_cookie(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        ui_session = self.auth_store.create_ui_session(["write"])
+        client = TestApp(self.web_app)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "203.0.113.10",
+                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(401, response.status_int)
+        self.assertIn("Missing API token", response.text)
+
+    def test_non_bearer_authorization_header_does_not_block_ui_session_cookie_auth(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        ui_session = self.auth_store.create_ui_session(["write"])
+        client = TestApp(self.web_app)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz",
+                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            }
+        )
+
         self.assertEqual(200, response.status_int)

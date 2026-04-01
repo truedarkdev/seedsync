@@ -18,9 +18,17 @@ class ConfigHandler(IHandler):
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
-        web_app.add_handler("/server/config/get", self.__handle_get_config)
+        web_app.add_handler(
+            "/server/config/get",
+            self.__handle_get_config,
+            required_scope="read"
+        )
         # The regex allows slashes in values
-        web_app.add_handler("/server/config/set/<section>/<key>/<value:re:.+>", self.__handle_set_config)
+        web_app.add_handler(
+            "/server/config/set/<section>/<key>/<value:re:.+>",
+            self.__handle_set_config,
+            required_scope="write"
+        )
 
     def __handle_get_config(self):
         out_json = SerializeConfig.config(self.__config)

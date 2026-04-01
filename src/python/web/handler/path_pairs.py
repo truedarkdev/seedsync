@@ -29,12 +29,37 @@ class PathPairsHandler(IHandler):
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
-        web_app.add_handler("/server/path-pairs", self.__handle_get_all)
-        web_app.get("/server/path-pairs/<pair_id>")(self.__handle_get_one)
-        web_app.add_post_handler("/server/path-pairs", self.__handle_create)
-        web_app.add_put_handler("/server/path-pairs/<pair_id>", self.__handle_update)
-        web_app.add_delete_handler("/server/path-pairs/<pair_id>", self.__handle_delete)
-        web_app.add_post_handler("/server/path-pairs/reorder", self.__handle_reorder)
+        web_app.add_handler(
+            "/server/path-pairs",
+            self.__handle_get_all,
+            required_scope="read",
+            allow_legacy_api_token=True
+        )
+        web_app.get(
+            "/server/path-pairs/<pair_id>",
+            required_scope="read",
+            allow_legacy_api_token=True
+        )(self.__handle_get_one)
+        web_app.add_post_handler(
+            "/server/path-pairs",
+            self.__handle_create,
+            required_scope="write"
+        )
+        web_app.add_put_handler(
+            "/server/path-pairs/<pair_id>",
+            self.__handle_update,
+            required_scope="write"
+        )
+        web_app.add_delete_handler(
+            "/server/path-pairs/<pair_id>",
+            self.__handle_delete,
+            required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/path-pairs/reorder",
+            self.__handle_reorder,
+            required_scope="write"
+        )
 
     def __handle_get_all(self):
         pairs = [asdict(pair) for pair in self.__path_pair_manager.get_all_pairs()]

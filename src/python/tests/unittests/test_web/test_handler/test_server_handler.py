@@ -18,6 +18,7 @@ class TestServerHandler(unittest.TestCase):
 
         mock_web_app.add_post_handler.assert_called_once_with(
             "/server/command/restart",
-            unittest.mock.ANY
+            unittest.mock.ANY,
+            required_scope="write"
         )
         mock_web_app.add_handler.assert_not_called()
