@@ -339,11 +339,11 @@ tests that can run on Windows.
 
 ### Angular Unit Tests
 
-On Windows, the Node 20 harness is the legacy host smoke path. The supported
-frontend closure lane is the Dockerized Angular/Karma path on Angular 21 / Node
-24 / RxJS 7.
+On this machine, the host Angular/Karma path has now been exercised
+successfully on Node 24. The supported frontend closure lane is still the
+Dockerized Angular/Karma path on Angular 21 / Node 24 / RxJS 7.
 
-The validated local command path on Node 20 is:
+The validated local command path on Node 24 is:
 
 ```powershell
 Set-Location C:\Git\seedsync\src\angular
@@ -354,11 +354,13 @@ npm test -- --watch=false --single-run --browsers=ChromeHeadless
 
 Set `CHROME_BIN` explicitly when Chrome is installed but not on `PATH`. The
 headless launcher configured in `karma.conf.js` works without a GUI Chrome
-session. Use this lane for host-level Angular/Karma proof. If the behavior is
-runtime-visible in the live app shell, browser, or Docker-served runtime, pair
-it with live UI/runtime proof; host smoke alone is not enough. If you want an
-interactive browser run for local debugging, override the browser explicitly,
-for example:
+session. This host run exercised the full Angular/Karma suite because the
+attempted `--include` selection was ignored by the npm test path
+(`npm warn invalid config include=...`). Use host proof as comparison evidence;
+if the behavior is runtime-visible in the live app shell, browser, or
+Docker-served runtime, pair it with live UI/runtime proof because host smoke
+alone is not enough. If you want an interactive browser run for local
+debugging, override the browser explicitly, for example:
 
 ```bash
 npm test -- --browsers Chrome

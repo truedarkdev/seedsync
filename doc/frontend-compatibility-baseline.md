@@ -187,6 +187,9 @@ was resolved by proof on 2026-03-31.
   unused.
 - The current Dockerized frontend lane has now been lifted to a Node 24-based
   Angular 21 workspace/toolchain checkpoint.
+- The host Angular/Karma path has now been exercised successfully on Node 24
+  on this machine, but the Dockerized lane remains the supported closure
+  lane.
 - The intended Phase 4 destination is Angular 21 on Node 24 LTS.
 - Temporary bridge slices are acceptable during the migration, but Angular 21
   plus Node 24 LTS is the target to steer every Phase 4 slice toward.
@@ -209,9 +212,10 @@ was resolved by proof on 2026-03-31.
 
 The supported closure lane for the upgraded frontend is the Dockerized
 Angular/Karma path on Angular 21 / Node 24 / RxJS 7 with reproducible installs
-and tests. The local host fallback remains the documented Node `v20.18.3` /
-npm `10.8.2` legacy smoke harness for comparison only and is not closure-grade
-proof.
+and tests. The local host Angular/Karma path has now been exercised
+successfully on Node 24 on this machine; the older Node `v20.18.3` /
+npm `10.8.2` harness remains the documented legacy comparison path and is not
+closure-grade proof.
 
 ## First Validation Gates To Protect
 
@@ -233,15 +237,18 @@ not open blockers to Phase 4 completion.
 | Item | Later phase | Why it stays later |
 | --- | --- | --- |
 | Controlled lockfile refresh for `src/angular/package-lock.json` | Phase 2 | The file remains intentionally ignored for now; revisit only as a separate lockfile-refresh/policy slice. |
-| Host harness lift from Node 20 to Node 24 | Phase 4 | The Node 20 path is retained as legacy smoke only; lifting it is separate host-tooling follow-up work. |
 | Legacy `src/e2e` Protractor modernization | Phase 4+ | This is active legacy test infrastructure, but it is outside the Angular workspace upgrade closure path and belongs to a later modernization track. |
 | `node-sass` to Dart Sass migration | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the supported frontend floor. |
+| Final live-app Playwright full UI/UX sweep | Final close gate, last | Run this last after the rest of the frontend closeout sequence is settled. It is the last overall frontend closeout gate, not a blocker to Phase 4 completion. |
 
 ## Closure Note
 
 Phase 4 is complete on the supported Angular 21 / Node 24 / RxJS 7
-Dockerized Karma lane after slices 1-6. Treat the items listed above as later
-follow-ups, not as open blockers to Phase 4 completion. Do not treat the
-current nested CLI `node-sass` 4.x lockfile subtree as cleanup-by-default;
-revisit it only through a controlled lockfile-refresh decision if the
-warning/noise reduction is worth the churn.
+Dockerized Karma lane after slices 1-6. The host Angular/Karma path has now
+been exercised successfully on Node 24 locally as comparison evidence, and
+the final live-app Playwright sweep remains the last overall frontend closeout
+gate. Treat the
+items listed above as later follow-ups, not as open blockers to Phase 4
+completion. Do not treat the current nested CLI `node-sass` 4.x lockfile
+subtree as cleanup-by-default; revisit it only through a controlled
+lockfile-refresh decision if the warning/noise reduction is worth the churn.
