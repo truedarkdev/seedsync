@@ -339,7 +339,11 @@ tests that can run on Windows.
 
 ### Angular Unit Tests
 
-On Windows, the validated local command path on Node 20 is:
+On Windows, the Node 20 harness is the legacy host smoke path. The supported
+frontend closure lane is the Dockerized Angular/Karma path on Angular 21 / Node
+24 / RxJS 7.
+
+The validated local command path on Node 20 is:
 
 ```powershell
 Set-Location C:\Git\seedsync\src\angular

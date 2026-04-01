@@ -1,10 +1,10 @@
 # Frontend Compatibility Baseline
 
-Status: compatibility-hardening groundwork complete through Phase 3; Phase 4
-upgrade execution is active with Angular 21 on Node 24 LTS as the intended
-destination for the frontend modernization / compatibility migration task.
+Status: compatibility-hardening groundwork complete through Phase 3; Phase 4 is
+complete based on the supported Angular 21 / Node 24 / RxJS 7 Dockerized
+Angular/Karma closure lane and completed slices 1-6.
 
-Current Phase 4 checkpoint: slices 1-6 completed.
+Current Phase 4 checkpoint: slices 1-6 completed and closed.
 Slice 1 landed the toolchain-first Angular 21 workspace migration with Node 24
 Docker/frontend lane alignment, Docker build/test command modernization, and
 narrow compatibility bridges for legacy modal/storage usage.
@@ -42,7 +42,7 @@ was resolved by proof on 2026-03-31.
 - `typescript` is split between the app-level `^3.2.2` and older CLI
   compatibility ranges inside the lockfile.
 - `src/docker/build/docker-image/Dockerfile` builds the Angular layer from
-  `node:20-bookworm-slim` and installs with `npm install --legacy-peer-deps`.
+  `node:24-bookworm-slim` and installs with `npm install --legacy-peer-deps`.
 - `src/docker/build/deb/Dockerfile` uses the same Angular build image and the
   same install behavior for the Debian packaging path.
 - `src/docker/test/angular/Dockerfile` reuses the Angular build environment,
@@ -179,7 +179,7 @@ was resolved by proof on 2026-03-31.
 - The active frontend verification path remains the Dockerized Karma lane, so
   this retirement is isolated from the live Angular runtime contract.
 
-## Phase 4 Upgrade Investigation
+## Phase 4 Closure Record
 
 - The current frontend has retired the modal/storage compatibility bridge from
   the active runtime path, but the repo still carries other historical
@@ -202,16 +202,16 @@ was resolved by proof on 2026-03-31.
   - slice 4: RxJS 7 manifest bump + `rxjs-compat` removal
   - slice 5: modal/storage bridge retirement + verified-unused legacy config
     removal
-- The next upgrade slice should focus on any newly discovered Angular 4-era
-  cleanup that is still separately justified by current repo usage.
+- Any later cleanup follow-up should focus on newly discovered Angular 4-era
+  leftovers that are still separately justified by current repo usage.
 
 ## Supported Compatibility Target
 
-Keep the active Phase 4 frontend lane on a clearly supported Angular 21 / Node
-24 LTS baseline with reproducible Dockerized installs and tests. The local host
-fallback remains the documented Node `v20.18.3` / npm `10.8.2` legacy harness
-for comparison only until the host tooling is deliberately lifted to the same
-modern floor.
+The supported closure lane for the upgraded frontend is the Dockerized
+Angular/Karma path on Angular 21 / Node 24 / RxJS 7 with reproducible installs
+and tests. The local host fallback remains the documented Node `v20.18.3` /
+npm `10.8.2` legacy smoke harness for comparison only and is not closure-grade
+proof.
 
 ## First Validation Gates To Protect
 
@@ -225,23 +225,23 @@ modern floor.
 4. If frontend assets or Docker build inputs change, the lane must be rebuilt
    rather than assuming a restart is enough.
 
-## Resume Notes By Later Phase
+## Later Follow-Ups
 
-| Open question | Later phase | Why it waits |
+These items remain tracked for later modernization or cleanup work. They are
+not open blockers to Phase 4 completion.
+
+| Item | Later phase | Why it stays later |
 | --- | --- | --- |
-| Should we investigate a controlled lockfile refresh to reduce warning/noise from the `node-sass` runtime/metadata mismatch? | Phase 2 | The active runtime shape is now proven; only decide on refresh churn if the warning/noise reduction is worth it. |
-| Should the lockfile be regenerated around the current install contract? | Phase 2 | Only revisit as a controlled refresh decision after the install strategy and churn tradeoff are both settled. |
-| Are Docker, Makefile, and CI fully aligned on the same effective Angular lane? | Phase 3 | Substantially improved by the `/app` test-lane parity change; keep watching for new drift as upgrade work begins. |
-| Should the ignored `src/angular/package-lock.json` remain an untracked local artifact now that the manifest is on RxJS 7? | Phase 4 | Slice 4 regenerated the lockfile locally, but the repo still ignores it. Decide later whether frontend dependency reproducibility should continue to rely on Docker verification plus manifest only. |
-| Legacy Angular 4-era e2e scaffold under `src/angular/e2e` | Phase 4 | Retired in Slice 6 after confirming the active Angular workspace no longer depends on it; only revisit if a future workspace change reintroduces a reference or a new obsolete leftover is discovered. |
-| When should the local host frontend harness be lifted from the old Node 20 host baseline to the same Node 24 floor as Docker? | Phase 4 | Docker is now the supported proof lane for the upgraded frontend; decide on host-floor lift separately once the Angular 21 Docker lane has settled. |
-| When should we migrate from `node-sass` to Dart Sass? | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the new supported toolchain floor. |
+| Controlled lockfile refresh for `src/angular/package-lock.json` | Phase 2 | The file remains intentionally ignored for now; revisit only as a separate lockfile-refresh/policy slice. |
+| Host harness lift from Node 20 to Node 24 | Phase 4 | The Node 20 path is retained as legacy smoke only; lifting it is separate host-tooling follow-up work. |
+| Legacy `src/e2e` Protractor modernization | Phase 4+ | This is active legacy test infrastructure, but it is outside the Angular workspace upgrade closure path and belongs to a later modernization track. |
+| `node-sass` to Dart Sass migration | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the supported frontend floor. |
 
-## Resume Sentence
+## Closure Note
 
-Continue Phase 4 from the now-green Angular 21 / Node 24 / RxJS 7 slices 1-6
-baseline by taking the next bounded cleanup slice only when current repo usage
-proves it is still warranted, while preserving the Dockerized Karma lane as
-the closure gate. Do not treat the current nested CLI `node-sass` 4.x
-lockfile subtree as cleanup-by-default; revisit it only through a controlled
-lockfile-refresh decision if the warning/noise reduction is worth the churn.
+Phase 4 is complete on the supported Angular 21 / Node 24 / RxJS 7
+Dockerized Karma lane after slices 1-6. Treat the items listed above as later
+follow-ups, not as open blockers to Phase 4 completion. Do not treat the
+current nested CLI `node-sass` 4.x lockfile subtree as cleanup-by-default;
+revisit it only through a controlled lockfile-refresh decision if the
+warning/noise reduction is worth the churn.

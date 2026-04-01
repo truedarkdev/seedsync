@@ -34,9 +34,9 @@ Freshness rule:
 | Python unit/backend | Healthy as of 2026-03-30 | The targeted backend controller path still passes on the supported WSL/Linux Python lane. | `src/python` pytest lane; targeted nodeid `tests/unittests/test_controller/test_controller.py::TestController::test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan` | 2026-03-30 local WSL run |
 | Python integration/controller | Healthy as of 2026-03-30 | The controller integration path still passes on the supported WSL/Linux lane. | `src/python` pytest lane; targeted nodeid `tests/integration/test_controller/test_controller.py::TestController::test_initial_model` | 2026-03-30 local WSL run |
 | WSL backend stop-state integration | Healthy as of 2026-03-30 | The stop-state backend contract now has fresh WSL/Linux proof, so the regression is no longer an open implementation gap. | Targeted `src/python` pytest slice for stop-state coverage | 2026-03-30 local WSL run; 4 targeted tests passed in 26.56s; artifact `tmp/pytest/wsl-backend.junit.xml` |
-| Frontend host harness | Healthy as of 2026-03-30 for host-level smoke only | The Angular/Karma host harness still boots and runs the smoke suite successfully, but that only proves the host harness. | `src/angular` headless Karma lane; smoke run `291/291 SUCCESS` | 2026-03-30 local host run |
+| Frontend host harness | Healthy as of 2026-03-30 for host-level smoke only | The Angular/Karma host harness still boots and runs the smoke suite successfully, but that only proves the legacy host fallback. It is not closure-grade proof for the supported Angular 21 / Node 24 / RxJS 7 Docker lane. | `src/angular` headless Karma lane; smoke run `291/291 SUCCESS` | 2026-03-30 local host run |
 | Dockerized Angular build/test | Healthy as of 2026-04-01 | The Dockerized Angular lane still passes cleanly after the RxJS 7 manifest bump and `rxjs-compat` removal slice, so the Angular 21 / Node 24 Docker verifier path remains the supported frontend closure lane. | `src/docker/test/angular/compose.yml` default verifier path plus Angular build images | 2026-04-01 local Docker proof; exact `docker compose -f src/docker/test/angular/compose.yml up --build --abort-on-container-exit --exit-code-from tests` exited `0` with `TOTAL: 296 SUCCESS`; RxJS 7 / no-`rxjs-compat` candidate verified on that lane |
-| Docker/browser/e2e | Blocked by harness/env on this machine | The Compose files still parse, but the live browser-backed runtime path cannot be treated as proof here until the Selenium/Chrome lane builds and the localhost:4444/default-bridge assumptions are fixed. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-03-30 local compose parse only; browser lane build failure in `src/docker/test/e2e/chrome/Dockerfile` (`libgconf-2-4`); current e2e network assumptions around `localhost:4444` and the default bridge |
+| Legacy Protractor/e2e | Blocked by harness/env on this machine | The Compose files still parse, but the live browser-backed runtime path is separate legacy test infrastructure, not part of the Angular workspace upgrade closure path. It remains a later modernization track until the Selenium/Chrome lane builds and the `localhost:4444` / default-bridge assumptions are fixed. | `src/docker/test/e2e/compose.yml` plus `src/docker/test/e2e/compose-remote-dev.yml` | 2026-03-30 local compose parse only; browser lane build failure in `src/docker/test/e2e/chrome/Dockerfile` (`libgconf-2-4`); current e2e network assumptions around `localhost:4444` and the default bridge |
 | Native Windows Poetry path | Blocked on this machine | The local Windows Python environment is outside the repo-supported Poetry range, so this host path cannot be treated as a valid confidence lane here. | `src/python` Poetry environment | 2026-03-30 local host check; Python 3.13.12 vs supported `>=3.11,<3.13` |
 
 ## Minimum Evidence Ladder
@@ -94,11 +94,11 @@ These items are deliberately left as future work. They are not missing
 documentation.
 
 - Stop-resume browser/e2e lane: the backend stop-state slice now has fresh
-  WSL/Linux proof, but the live browser-backed lane is still blocked here by
+  WSL/Linux proof, but the legacy browser-backed lane is still blocked here by
   the Selenium/Chrome build failure in `src/docker/test/e2e/chrome/Dockerfile`
   (`libgconf-2-4`) and the current `localhost:4444` / default bridge
-  assumptions. That is a lane-confidence blocker, not an open stop-state
-  implementation task.
+  assumptions. That is separate legacy e2e modernization work, not an open
+  stop-state implementation task or a Phase 4 blocker.
 - Native Windows Poetry validation: blocked on this machine because the local
   Python version is 3.13.12, outside the repo-supported `>=3.11,<3.13` range.
   If Windows host validation becomes necessary, it needs a supported Python
