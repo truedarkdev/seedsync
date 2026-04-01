@@ -4,6 +4,7 @@ import Promise = promise.Promise;
 
 import {Urls} from "../urls";
 import {App} from "./app";
+import {loadAngularRoute} from "./route-bootstrap";
 
 export class File {
     constructor(public name,
@@ -86,8 +87,8 @@ export class DashboardPage extends App {
     }
 
     navigateTo() {
-        return browser.get(Urls.APP_BASE_URL + "dashboard").then(value => {
-            return browser.waitForAngular().then(() => {
+        return loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "dashboard"), "#file-list .file")
+            .then(() => {
                 // Wait for the files list to show up
                 return browser.wait(ExpectedConditions.presenceOf(
                     element.all(by.css("#file-list .file")).first()
@@ -97,19 +98,16 @@ export class DashboardPage extends App {
                     ), 10000);
                 });
             });
-        })
     }
 
     reload() {
-        return browser.refresh().then(() => {
-            return browser.waitForAngular().then(() => {
-                return browser.wait(ExpectedConditions.presenceOf(
+        return loadAngularRoute(() => browser.refresh(), "#file-list .file").then(() => {
+            return browser.wait(ExpectedConditions.presenceOf(
+                element.all(by.css("#file-list .file")).first()
+            ), 10000).then(() => {
+                return browser.wait(ExpectedConditions.visibilityOf(
                     element.all(by.css("#file-list .file")).first()
-                ), 10000).then(() => {
-                    return browser.wait(ExpectedConditions.visibilityOf(
-                        element.all(by.css("#file-list .file")).first()
-                    ), 10000);
-                });
+                ), 10000);
             });
         });
     }
