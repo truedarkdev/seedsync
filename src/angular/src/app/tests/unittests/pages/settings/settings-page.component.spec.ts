@@ -1,7 +1,7 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
 import {BehaviorSubject, of} from "rxjs";
-import {Modal} from "../../../../services/utils/modal-compat.service";
+import {Modal} from "../../../../services/utils/modal.service";
 
 import {SettingsPageComponent} from "../../../../pages/settings/settings-page.component";
 import {ConfigService} from "../../../../services/settings/config.service";

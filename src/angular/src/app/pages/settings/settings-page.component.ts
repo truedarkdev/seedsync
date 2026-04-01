@@ -1,7 +1,7 @@
 import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable, Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
-import {Modal} from "../../services/utils/modal-compat.service";
+import {Modal} from "../../services/utils/modal.service";
 
 import {LoggerService} from "../../services/utils/logger.service";
 import {ConfigService} from "../../services/settings/config.service";

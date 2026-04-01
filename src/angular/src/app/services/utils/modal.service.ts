@@ -155,7 +155,7 @@ class ConfirmDialogBuilder {
 
   private _createOverlay(): HTMLElement {
     const overlayRoot = document.createElement("div");
-    overlayRoot.className = "modal-compat-overlay";
+    overlayRoot.className = "modal-overlay";
     overlayRoot.tabIndex = -1;
     overlayRoot.setAttribute("role", "presentation");
     Object.assign(overlayRoot.style, {
@@ -172,7 +172,7 @@ class ConfirmDialogBuilder {
 
   private _createDialog(): HTMLElement {
     const dialogRoot = document.createElement("div");
-    dialogRoot.className = "modal-compat-dialog";
+    dialogRoot.className = "modal-dialog";
     dialogRoot.setAttribute("role", "dialog");
     dialogRoot.setAttribute("aria-modal", "true");
     Object.assign(dialogRoot.style, {

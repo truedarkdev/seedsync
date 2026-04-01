@@ -1,6 +1,6 @@
 import {Injectable} from "@angular/core";
 
-import {DialogRef} from "./modal-compat.service";
+import {DialogRef} from "./modal.service";
 
 @Injectable()
 export class ModalAccessibilityService {
