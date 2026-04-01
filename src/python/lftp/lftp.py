@@ -626,17 +626,18 @@ class Lftp:
         remote_dir = remote_base_dir_path if remote_base_dir_path is not None else self.__base_remote_dir_path
         local_dir = local_base_dir_path if local_base_dir_path is not None else self.__base_local_dir_path
 
-        command = " ".join([
+        parts = [
             "queue",
             "'",
             "pget" if not is_dir else "mirror",
             "-c",
             "\"{remote_dir}/{filename}\"".format(remote_dir=escape(remote_dir),
                                                  filename=escape(name)),
-            "-o" if not is_dir else "",
+            "-o" if not is_dir else None,
             "\"{local_dir}/\"".format(local_dir=escape(local_dir)),
             "'"
-        ])
+        ]
+        command = " ".join(part for part in parts if part is not None)
         self.__run_command(command, require_prompt_ready=False)
 
     def kill(self,

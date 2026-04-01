@@ -161,6 +161,16 @@ class TestLftp(unittest.TestCase):
             require_prompt_ready=False
         )
 
+    def test_queue_dir_uses_override_paths(self):
+        lftp = self._build_test_lftp()
+
+        lftp.queue("dup", True, remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies")
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "queue ' mirror -c \"/remote/movies/dup\" \"/local/movies/\" '",
+            require_prompt_ready=False
+        )
+
     def test_kill_matches_duplicate_names_by_remote_path(self):
         lftp = self._build_test_lftp()
         status_movies = LftpJobStatus(

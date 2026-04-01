@@ -61,16 +61,16 @@ Refresh rule:
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
-- Last fully processed upstream commit: `d9a3e882dd2680f7db146de092de3fa586ea1d86`
-- Fork tip at last full review: `d9a3e882dd2680f7db146de092de3fa586ea1d86`
-- Last full review date: `2026-03-18`
-- Status: refresh needed
+- Last fully processed upstream commit: `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`
+- Fork tip at last full review: `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`
+- Last full review date: `2026-04-01`
+- Status: caught up through this tip
 - Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, and targeted reliability fixes, while branding, theme-system, and other identity-shifting changes remain intentionally out.
-- Resume when new upstream appears: fetch `rapidcopy`, then continue the active frozen ledger in strict oldest-to-newest order from [doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md](/mnt/c/Git/seedsync/doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md). After that ledger is fully dispositioned, update `Last fully processed upstream commit` and `Fork tip at last full review` to the frozen-range tip.
+- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` in strict oldest-to-newest order.
 - Notes:
-  - Active frozen refresh started on `2026-04-01`; the frozen range is `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
-  - Review ledger: [doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md](/mnt/c/Git/seedsync/doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md)
-  - Each commit in the frozen range is listed in that ledger and starts at `not yet reviewed`.
+  - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
+  - Completed audit record: [doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md](/mnt/c/Git/seedsync/doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md)
+  - Commit `c766bd96366a1da7ffbf8f65df05a6bd904c3106` was adapted locally by hardening `lftp.queue()` command construction and adding targeted queue test coverage; WSL verification covered that adaptation.
   - Adapted rapidcopy commit `674992ac09857dc6fa8ca9642bd6a50597e2bb29` as a local `.select-all` header-checkbox alignment fix; did not take its Python `WebApp.stop()` hunk because local code already uses a consistent private stop flag implementation.
   - `thejuran` now has a new active frozen refresh ledger beyond its prior processed checkpoint.
 
