@@ -32,13 +32,19 @@ was resolved by proof on 2026-03-31.
   21.2.5.
 - `src/angular/package-lock.json` is `lockfileVersion: 3`, so the repo already
   relies on a newer npm lockfile format than the Angular 4-era codebase.
+- A controlled Node 24 lockfile-refresh check left
+  `src/angular/package-lock.json` byte-for-byte identical
+  (`560692` bytes, same SHA-256, still `lockfileVersion: 3`, still no
+  `packageManager` field), so it did not create a tracked lockfile-policy
+  change.
 - The proven Dockerized runtime currently resolves root `node-sass` to
   `9.0.0`.
 - The Angular CLI subtree still names `node-sass` 4.14.1 in lockfile metadata,
   but that legacy 4.x expectation is not a second installed runtime copy in the
   current built image. Treat the nested CLI `node-sass` 4.x subtree as
   intentional transitive metadata debt for now, not as an active second runtime
-  dependency, until a controlled lockfile refresh is justified.
+  dependency; the controlled lockfile-refresh check did not change it, so
+  revisit it through Sass modernization rather than lockfile-policy churn.
 - `typescript` is split between the app-level `^3.2.2` and older CLI
   compatibility ranges inside the lockfile.
 - `src/docker/build/docker-image/Dockerfile` builds the Angular layer from
@@ -161,9 +167,6 @@ was resolved by proof on 2026-03-31.
   `.angular-cli.json` workspace comment and now references `angular.json`.
 - The narrow Angular unit lane for the touched service/component specs passed
   after the import updates.
-- `src/angular/package-lock.json` was regenerated locally for the slice, but it
-  remains gitignored in this workspace, so the tracked repo still relies on the
-  manifest plus Docker verification rather than a committed frontend lockfile.
 
 ## 2026-04-01 Phase 4 Slice 6 Proof
 
@@ -236,7 +239,6 @@ not open blockers to Phase 4 completion.
 
 | Item | Later phase | Why it stays later |
 | --- | --- | --- |
-| Controlled lockfile refresh for `src/angular/package-lock.json` | Phase 2 | The file remains intentionally ignored for now; revisit only as a separate lockfile-refresh/policy slice. |
 | Legacy `src/e2e` Protractor modernization | Phase 4+ | This is active legacy test infrastructure, but it is outside the Angular workspace upgrade closure path and belongs to a later modernization track. |
 | `node-sass` to Dart Sass migration | Phase 5 | Plan the Sass migration after the Angular upgrade phase has established the supported frontend floor. |
 | Final live-app Playwright full UI/UX sweep | Final close gate, last | Run this last after the rest of the frontend closeout sequence is settled. It is the last overall frontend closeout gate, not a blocker to Phase 4 completion. |
@@ -250,5 +252,6 @@ the final live-app Playwright sweep remains the last overall frontend closeout
 gate. Treat the
 items listed above as later follow-ups, not as open blockers to Phase 4
 completion. Do not treat the current nested CLI `node-sass` 4.x lockfile
-subtree as cleanup-by-default; revisit it only through a controlled
-lockfile-refresh decision if the warning/noise reduction is worth the churn.
+metadata as cleanup-by-default; the controlled lockfile-refresh check did not
+change it, so revisit it only through a Sass migration or broader frontend
+modernization slice if the warning/noise reduction is worth the churn.
