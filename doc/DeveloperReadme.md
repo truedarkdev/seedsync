@@ -5,7 +5,7 @@
 # Environment Setup
 
 ## Install dependencies
-1. Install [Node.js 20 LTS](https://nodejs.org/en/download) (comes with npm). The Angular toolchain here is validated against the Docker baseline, not the old Node 12-era setup.
+1. Install [Node.js 24.x](https://nodejs.org/en/download) (comes with npm). The Angular toolchain here is validated against the current Node `v24.0.0` / npm `11.3.0` baseline, not the old Node 12-era setup.
 
 2. Install [Poetry](https://python-poetry.org/docs/#installation):
 
@@ -457,10 +457,10 @@ make run-remote-server
 make stop-remote-server
 ```
 
-The supported startup path is `make run-remote-server`. That target sets
-`SEEDSYNC_REMOTE_FILES_DIR` to the repo-root canonical directory
-`build/docker-local/remote-files` unless you override it, so the remote test
-server always mounts the intended host folder into `/home/remoteuser/files`.
+The supported startup path is `make run-remote-server`. That target
+auto-supplies `SEEDSYNC_REMOTE_FILES_DIR` as the repo-root convenience
+directory `build/docker-local/remote-files` unless you override it, so the
+remote test server mounts the intended host folder into `/home/remoteuser/files`.
 
 To point the server at a different host folder, override
 `SEEDSYNC_REMOTE_FILES_DIR` when starting the supported make target:
@@ -470,11 +470,13 @@ SEEDSYNC_REMOTE_FILES_DIR=/path/to/local/files make run-remote-server
 ```
 
 If you bypass the make target and call Compose directly with this file set,
-set `SEEDSYNC_REMOTE_FILES_DIR` explicitly for those direct Compose
-invocations.
+set `SEEDSYNC_REMOTE_FILES_DIR` explicitly. Direct Compose runs require the
+variable, and it should point at the host directory you want mounted as
+`/home/remoteuser/files`.
 
-To use the default manual folder, point `SEEDSYNC_REMOTE_FILES_DIR` at
-`build/docker-local/remote-files` in the repo root.
+On this workspace, the common local convenience choice is
+`build/docker-local/remote-files` in the repo root, but it is a local choice,
+not a global public default.
 
 The connection parameters for the remote server are:
 
