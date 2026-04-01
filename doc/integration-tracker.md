@@ -69,7 +69,8 @@ Refresh rule:
 - Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` in strict oldest-to-newest order.
 - Notes:
   - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
-  - Completed audit record: [doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md](/mnt/c/Git/seedsync/doc/integration-notes/rapidcopy-2026-04-01-frozen-refresh.md)
+  - Per-commit explorer re-audit finalized the disputed frozen-range dispositions as `cb20dc899ccabce453c2ae4d44e9e0153f7a74ea` `intentionally skipped` because the current workflow shape has moved past that exact `if:` guard pattern, plus `acf1a0c64eb4becb14ffec3104613238bd8cbbd5` and `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` as `needs new integration task` because both are stale failure-cleanup items that should only be revived on fresh repro.
+  - The temporary frozen-refresh ledger was removed after all 13 commits in the pass received individual explorer audits, so the unresolved follow-up work now lives only in this tracker.
   - Commit `c766bd96366a1da7ffbf8f65df05a6bd904c3106` was adapted locally by hardening `lftp.queue()` command construction and adding targeted queue test coverage; WSL verification covered that adaptation.
   - Adapted rapidcopy commit `674992ac09857dc6fa8ca9642bd6a50597e2bb29` as a local `.select-all` header-checkbox alignment fix; did not take its Python `WebApp.stop()` hunk because local code already uses a consistent private stop flag implementation.
   - `thejuran` now has a new active frozen refresh ledger beyond its prior processed checkpoint.
