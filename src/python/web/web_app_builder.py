@@ -2,6 +2,7 @@
 
 from common import Context
 from controller import Controller, AutoQueuePersist
+from .auth_store import ApiKeyStore
 from .web_app import WebApp
 from .handler.stream_model import ModelStreamHandler
 from .handler.stream_status import StatusStreamHandler
@@ -9,6 +10,7 @@ from .handler.controller import ControllerHandler
 from .handler.server import ServerHandler
 from .handler.config import ConfigHandler
 from .handler.auto_queue import AutoQueueHandler
+from .handler.admin import AdminHandler
 from .handler.stream_log import LogStreamHandler
 from .handler.stream_heartbeat import HeartbeatStreamHandler
 from .handler.status import StatusHandler
@@ -22,9 +24,11 @@ class WebAppBuilder:
     def __init__(self,
                  context: Context,
                  controller: Controller,
-                 auto_queue_persist: AutoQueuePersist):
+                 auto_queue_persist: AutoQueuePersist,
+                 auth_store: ApiKeyStore = None):
         self.__context = context
         self.__controller = controller
+        self.__auth_store = auth_store
 
         local_path = None
         if getattr(context, "config", None) is not None and getattr(context.config, "lftp", None) is not None:
@@ -35,13 +39,17 @@ class WebAppBuilder:
         self.config_handler = ConfigHandler(context.config)
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
+        self.admin_handler = None
+        if self.__auth_store is not None:
+            self.admin_handler = AdminHandler(context.config, self.__auth_store)
         self.path_pairs_handler = None
         if getattr(context, "path_pair_manager", None) is not None:
             self.path_pairs_handler = PathPairsHandler(context.path_pair_manager, controller=self.__controller)
 
     def build(self) -> WebApp:
         web_app = WebApp(context=self.__context,
-                         controller=self.__controller)
+                         controller=self.__controller,
+                         auth_store=self.__auth_store)
 
         StatusStreamHandler.register(web_app=web_app,
                                      status=self.__context.status)
@@ -59,6 +67,8 @@ class WebAppBuilder:
         self.config_handler.add_routes(web_app)
         self.auto_queue_handler.add_routes(web_app)
         self.status_handler.add_routes(web_app)
+        if self.admin_handler is not None:
+            self.admin_handler.add_routes(web_app)
         if self.path_pairs_handler is not None:
             self.path_pairs_handler.add_routes(web_app)
 

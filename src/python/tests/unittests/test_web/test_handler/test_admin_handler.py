@@ -1,0 +1,158 @@
+import json
+import os
+import shutil
+import tempfile
+import unittest
+from unittest.mock import MagicMock
+
+from common import Config
+from web.auth_store import ApiKeyStore
+from web.handler.admin import AdminHandler
+from web.web_app import WebApp
+from webtest import TestApp
+
+
+LEGACY_TEST_API_TOKEN = "legacy-test-token"
+
+
+class TestAdminHandler(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="test_admin_handler")
+        self.store_path = os.path.join(self.temp_dir, "api-keys.json")
+
+        self.context = MagicMock()
+        self.context.logger.getChild.return_value = MagicMock()
+        self.context.args.html_path = self.temp_dir
+        self.context.status = MagicMock()
+        self.context.config = Config()
+        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
+
+        self.auth_store = ApiKeyStore(file_path=self.store_path)
+        created = self.auth_store.create_api_key("admin", ["admin"])
+        self.admin_secret = created["secret"]
+        self.admin_key_id = created["record"].id
+
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
+        self.test_app = TestApp(self.web_app)
+
+    def tearDown(self):
+        if os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+
+    @staticmethod
+    def _auth_headers(secret: str):
+        return {"HTTP_AUTHORIZATION": "Bearer {}".format(secret)}
+
+    def test_legacy_token_is_rejected_for_admin_routes(self):
+        resp = self.test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ=self._auth_headers(LEGACY_TEST_API_TOKEN),
+            expect_errors=True
+        )
+
+        self.assertEqual(403, resp.status_int)
+        self.assertIn("Legacy general.api_token cannot access admin endpoints", str(resp.html))
+
+    def test_first_admin_bootstrap_requires_loopback_and_no_existing_admin_key(self):
+        empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys.json"))
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        AdminHandler(self.context.config, empty_store).add_routes(web_app)
+        test_app = TestApp(web_app)
+
+        rejected = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "remote-admin"},
+            extra_environ={"HTTP_HOST": "seed.example:8800"},
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected.status_int)
+
+        allowed = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "first-admin"},
+            extra_environ={"HTTP_HOST": "localhost:8800"}
+        )
+        allowed_payload = json.loads(allowed.text)
+        self.assertEqual(201, allowed.status_int)
+        self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
+        self.assertIn("secret", allowed_payload)
+
+    def test_first_admin_bootstrap_is_not_available_after_admin_exists(self):
+        resp = self.test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "another-admin"},
+            extra_environ={"HTTP_HOST": "localhost:8800"},
+            expect_errors=True
+        )
+
+        self.assertEqual(401, resp.status_int)
+
+    def test_migration_state_reports_legacy_compatibility(self):
+        resp = self.test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+
+        payload = json.loads(resp.text)
+        self.assertEqual(200, resp.status_int)
+        self.assertTrue(payload["legacy_api_token"]["configured"])
+        self.assertTrue(payload["legacy_api_token"]["compatibility_enabled"])
+        self.assertEqual("enabled", payload["legacy_api_token"]["state"])
+        self.assertEqual(1, payload["api_keys"]["active"])
+
+    def test_create_update_rotate_revoke_key_routes_work(self):
+        create_resp = self.test_app.post_json(
+            "/server/admin/api-keys/v1",
+            {"name": "reader", "scopes": ["read"]},
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        created = json.loads(create_resp.text)
+        key_id = created["key"]["id"]
+        secret = created["secret"]
+
+        self.assertEqual(201, create_resp.status_int)
+        self.assertIn(secret, create_resp.text)
+
+        update_resp = self.test_app.put_json(
+            "/server/admin/api-keys/v1/{}".format(key_id),
+            {"name": "reader-updated", "scopes": ["read", "write"]},
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        updated = json.loads(update_resp.text)
+        self.assertEqual("reader-updated", updated["key"]["name"])
+        self.assertEqual(["read", "write"], updated["key"]["scopes"])
+
+        rotate_resp = self.test_app.post(
+            "/server/admin/api-keys/v1/{}/rotate".format(key_id),
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        rotated = json.loads(rotate_resp.text)
+        self.assertEqual(200, rotate_resp.status_int)
+        self.assertNotEqual(secret, rotated["secret"])
+        self.assertTrue(rotated["key"]["active"])
+
+        revoke_resp = self.test_app.post(
+            "/server/admin/api-keys/v1/{}/revoke".format(key_id),
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        revoked = json.loads(revoke_resp.text)
+        self.assertEqual(200, revoke_resp.status_int)
+        self.assertFalse(revoked["key"]["active"])
+
+    def test_disable_and_clear_legacy_token_routes_update_state(self):
+        disable_resp = self.test_app.post(
+            "/server/admin/migration/v1/legacy-api-token/disable",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        disabled = json.loads(disable_resp.text)
+        self.assertFalse(disabled["legacy_api_token"]["compatibility_enabled"])
+
+        clear_resp = self.test_app.post(
+            "/server/admin/migration/v1/legacy-api-token/clear",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        cleared = json.loads(clear_resp.text)
+        self.assertFalse(cleared["legacy_api_token"]["configured"])
+        self.assertFalse(cleared["legacy_api_token"]["compatibility_enabled"])
+        self.assertEqual("", self.context.config.general.api_token)

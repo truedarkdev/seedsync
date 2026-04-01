@@ -6,16 +6,27 @@ from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
 from common import Config, ConfigError
+from web.auth_store import ApiKeyStore
 from web.handler.config import ConfigHandler
 from web.web_app import WebApp
 
 
-def _invoke_get_route(web_app, path):
+LEGACY_TEST_API_TOKEN = "legacy-test-token"
+
+
+def _invoke_get_route(web_app, path, api_token: str = None, ui_session_secret: str = None):
     environ = {}
     setup_testing_defaults(environ)
     environ["REQUEST_METHOD"] = "GET"
     environ["PATH_INFO"] = path
     environ["wsgi.input"] = BytesIO(b"")
+    environ["HTTP_HOST"] = "localhost:8800"
+    environ["REMOTE_ADDR"] = "127.0.0.1"
+    environ["HTTP_REFERER"] = "http://localhost:8800/settings"
+    if api_token is not None:
+        environ["HTTP_AUTHORIZATION"] = "Bearer {}".format(api_token)
+    if ui_session_secret is not None:
+        environ["HTTP_COOKIE"] = "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session_secret)
 
     captured = {}
 
@@ -135,7 +146,10 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.context.logger.getChild.return_value = MagicMock()
         self.context.args.html_path = "C:\\Git\\seedsync\\src\\python\\tests"
         self.context.status = MagicMock()
-        self.web_app = WebApp(self.context, MagicMock())
+        self.context.config = Config()
+        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
+        self.auth_store = ApiKeyStore()
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
 
     def test_get_route_honors_remote_detail_redaction_opt_out(self):
         config = Config()
@@ -147,8 +161,13 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
         ConfigHandler(config).add_routes(self.web_app)
+        ui_session = self.auth_store.create_ui_session(["admin"])
 
-        status_code, body = _invoke_get_route(self.web_app, "/server/config/get")
+        status_code, body = _invoke_get_route(
+            self.web_app,
+            "/server/config/get",
+            ui_session_secret=ui_session.secret,
+        )
         out_dict = json.loads(body)
 
         self.assertEqual(200, status_code)
@@ -161,10 +180,12 @@ class TestConfigHandlerRoutes(unittest.TestCase):
     def test_set_route_blocks_redaction_toggle(self):
         config = Config()
         ConfigHandler(config).add_routes(self.web_app)
+        ui_session = self.auth_store.create_ui_session(["admin"])
 
         status_code, body = _invoke_get_route(
             self.web_app,
-            "/server/config/set/general/config_api_redact_remote_details/False"
+            "/server/config/set/general/config_api_redact_remote_details/False",
+            ui_session_secret=ui_session.secret,
         )
 
         self.assertEqual(403, status_code)
@@ -172,3 +193,13 @@ class TestConfigHandlerRoutes(unittest.TestCase):
             "Section 'general' option 'config_api_redact_remote_details' cannot be set via URL",
             body
         )
+
+    def test_get_route_rejects_legacy_token_even_when_compatibility_is_enabled(self):
+        auth_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=auth_store)
+        ConfigHandler(Config()).add_routes(web_app)
+
+        status_code, body = _invoke_get_route(web_app, "/server/config/get", api_token=LEGACY_TEST_API_TOKEN)
+
+        self.assertEqual(403, status_code)
+        self.assertIn("Legacy general.api_token cannot access this route", body)

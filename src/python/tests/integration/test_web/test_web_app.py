@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch, call
 import logging
 import sys
+import os
 import shutil
 import tempfile
 
@@ -11,6 +12,7 @@ from webtest import TestApp
 
 from common import overrides, Status, Config, PathPairManager
 from controller import AutoQueuePersist
+from web.auth_store import ApiKeyStore
 from web import WebAppBuilder
 from web.web_app import IStreamHandler, WebApp
 
@@ -52,6 +54,10 @@ class BaseTestWebApp(unittest.TestCase):
         # Real auto-queue persist
         self.auto_queue_persist = AutoQueuePersist()
 
+        self.auth_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "api-keys.json"))
+        created = self.auth_store.create_api_key("integration-admin", ["admin"])
+        self.integration_admin_secret = created["secret"]
+
         # Capture the model listener
         def capture_listener(listener):
             self.model_listener = listener
@@ -64,9 +70,24 @@ class BaseTestWebApp(unittest.TestCase):
         # noinspection PyTypeChecker
         self.web_app_builder = WebAppBuilder(self.context,
                                              self.controller,
-                                             self.auto_queue_persist)
+                                             self.auto_queue_persist,
+                                             self.auth_store)
         self.web_app = self.web_app_builder.build()
-        self.test_app = TestApp(self.web_app)
+        self.test_app = TestApp(
+            self.web_app,
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.integration_admin_secret)}
+        )
+
+    def build_browser_test_app(self):
+        browser_app = TestApp(
+            self.web_app,
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+            }
+        )
+        browser_app.get("/")
+        return browser_app
 
     @overrides(unittest.TestCase)
     def tearDown(self):

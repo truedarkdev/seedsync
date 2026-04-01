@@ -15,9 +15,22 @@ class AutoQueueHandler(IHandler):
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
-        web_app.add_handler("/server/autoqueue/get", self.__handle_get_autoqueue)
-        web_app.add_handler("/server/autoqueue/add/<pattern>", self.__handle_add_autoqueue)
-        web_app.add_handler("/server/autoqueue/remove/<pattern>", self.__handle_remove_autoqueue)
+        web_app.add_handler(
+            "/server/autoqueue/get",
+            self.__handle_get_autoqueue,
+            required_scope="read",
+            allow_legacy_api_token=True
+        )
+        web_app.add_handler(
+            "/server/autoqueue/add/<pattern>",
+            self.__handle_add_autoqueue,
+            required_scope="write"
+        )
+        web_app.add_handler(
+            "/server/autoqueue/remove/<pattern>",
+            self.__handle_remove_autoqueue,
+            required_scope="write"
+        )
 
     def __handle_get_autoqueue(self):
         patterns = list(self.__auto_queue_persist.patterns)

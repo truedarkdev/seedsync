@@ -19,6 +19,7 @@ from common import Localization, Status, ConfigError, Persist, PersistError
 from common import PathPairManager
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
 from web import WebAppJob, WebAppBuilder
+from web.auth_store import ApiKeyStore
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
@@ -32,6 +33,7 @@ class Seedsync:
     __FILE_CONFIG = "settings.cfg"
     __FILE_AUTO_QUEUE_PERSIST = "autoqueue.persist"
     __FILE_CONTROLLER_PERSIST = "controller.persist"
+    __FILE_API_KEY_STORE = "api-keys.json"
     __CONFIG_DUMMY_VALUE = "<replace me>"
 
     # This logger is used to print any exceptions caught at top module
@@ -114,10 +116,18 @@ class Seedsync:
         self.auto_queue_persist_path = os.path.join(args.config_dir, Seedsync.__FILE_AUTO_QUEUE_PERSIST)
         self.auto_queue_persist = self._load_persist(AutoQueuePersist, self.auto_queue_persist_path)
 
+        self.api_key_store_path = os.path.join(args.config_dir, Seedsync.__FILE_API_KEY_STORE)
+        self.api_key_store = self._load_persist(ApiKeyStore, self.api_key_store_path)
+        self.api_key_store.bind_file_path(self.api_key_store_path)
+
     def run(self):
         self.context.logger.info("Starting SeedSync")
         self.context.logger.info("Platform: {}".format(platform.machine()))
-        Seedsync._emit_startup_warnings(self.context.logger, self.context.config)
+        Seedsync._emit_startup_warnings(
+            self.context.logger,
+            self.context.config,
+            getattr(self, "api_key_store", None)
+        )
 
         if self.context.args.exit:
             self.context.logger.info("Bootstrap mode requested; persisting defaults and exiting before startup")
@@ -131,7 +141,12 @@ class Seedsync:
         auto_queue = AutoQueue(self.context, self.auto_queue_persist, controller)
 
         # Create web app
-        web_app_builder = WebAppBuilder(self.context, controller, self.auto_queue_persist)
+        web_app_builder = WebAppBuilder(
+            self.context,
+            controller,
+            self.auto_queue_persist,
+            getattr(self, "api_key_store", None)
+        )
         web_app = web_app_builder.build()
 
         # Define child threads
@@ -243,6 +258,8 @@ class Seedsync:
         self.context.logger.debug("Persisting states to file")
         self.controller_persist.to_file(self.controller_persist_path)
         self.auto_queue_persist.to_file(self.auto_queue_persist_path)
+        if hasattr(self, "api_key_store") and hasattr(self, "api_key_store_path"):
+            self.api_key_store.to_file(self.api_key_store_path)
         new_config_str = self.context.config.to_str()
         try:
             with open(self.config_path, "r") as f:
@@ -456,10 +473,22 @@ class Seedsync:
         return value is None or (isinstance(value, str) and value.strip() == "")
 
     @staticmethod
-    def _emit_startup_warnings(logger: logging.Logger, config: Config, web_bind_host: str = "0.0.0.0") -> None:
+    def _emit_startup_warnings(
+        logger: logging.Logger,
+        config: Config,
+        auth_store: ApiKeyStore = None,
+        web_bind_host: str = "0.0.0.0"
+    ) -> None:
         general_config = getattr(config, "general", None)
         if general_config is None:
             return
+
+        active_api_key_count = 0
+        if auth_store is not None:
+            active_api_key_count = len([
+                key for key in auth_store.api_keys
+                if not getattr(key, "is_revoked", False)
+            ])
 
         # webhook_secret is not part of all local config models; only warn when present.
         webhook_secret = getattr(general_config, "webhook_secret", None)
@@ -469,21 +498,48 @@ class Seedsync:
             )
 
         api_token = getattr(general_config, "api_token", None)
-        if Seedsync._is_blank_config_value(api_token):
-            logger.warning(
-                "Security: general.api_token is not configured. In this build, general.api_token is only stored in "
-                "config and is not enforced by the API. API requests are unauthenticated."
-            )
-        if web_bind_host == "0.0.0.0":
-            if Seedsync._is_blank_config_value(api_token):
+        token_is_configured = not Seedsync._is_blank_config_value(api_token)
+        if token_is_configured:
+            if auth_store is not None and not auth_store.legacy_api_token_compatibility_enabled:
                 logger.warning(
-                    "Security: Application is bound to 0.0.0.0 and API requests are unauthenticated. "
-                    "Any host on the network can access the API."
+                    "Security: general.api_token is configured, but legacy compatibility has been disabled. "
+                    "External non-admin /server/* requests now require scoped API keys."
                 )
             else:
                 logger.warning(
-                    "Security: Application is bound to 0.0.0.0. general.api_token is currently only stored in "
-                    "config and is not enforced by the API in this build. Any host on the network can access the API."
+                    "Security: general.api_token is configured as rollout compatibility only. "
+                    "Only selected compatibility /server/* routes can still use it. Built-in loopback browser access "
+                    "uses an internal UI session, while admin endpoints for external clients require scoped API keys. "
+                    "Create scoped API keys and then disable or clear general.api_token."
+                )
+        else:
+            if active_api_key_count > 0:
+                logger.warning(
+                    "Security: scoped API keys are configured and general.api_token is blank. "
+                    "External /server/* access uses scoped API keys only."
+                )
+            else:
+                logger.warning(
+                    "Security: no scoped API keys are configured and general.api_token is blank. "
+                    "External /server/* access is not enabled until you create a scoped API key."
+                )
+        if web_bind_host == "0.0.0.0":
+            if not token_is_configured:
+                if active_api_key_count > 0:
+                    logger.warning(
+                        "Security: Application is bound to 0.0.0.0. Scoped API keys are configured, so external "
+                        "/server/* access depends on them."
+                    )
+                else:
+                    logger.warning(
+                        "Security: Application is bound to 0.0.0.0 and external /server/* access is not enabled yet. "
+                        "Create a scoped API key before exposing the API to the network."
+                    )
+            else:
+                logger.warning(
+                    "Security: Application is bound to 0.0.0.0. general.api_token is only a rollout compatibility "
+                    "token for selected compatibility /server/* requests; admin endpoints still require scoped API "
+                    "keys."
                 )
 
     @staticmethod

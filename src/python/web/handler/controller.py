@@ -80,13 +80,41 @@ class ControllerHandler(IHandler):
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
-        web_app.add_post_handler("/server/command/queue/<file_name>", self.__handle_action_queue)
-        web_app.add_post_handler("/server/command/stop/<file_name>", self.__handle_action_stop)
-        web_app.add_post_handler("/server/command/extract/<file_name>", self.__handle_action_extract)
-        web_app.add_post_handler("/server/command/validate/<file_name>", self.__handle_action_validate)
-        web_app.add_delete_handler("/server/command/delete_local/<file_name>", self.__handle_action_delete_local)
-        web_app.add_delete_handler("/server/command/delete_remote/<file_name>", self.__handle_action_delete_remote)
-        web_app.add_post_handler("/server/command/bulk/<action>", self.__handle_action_bulk)
+        web_app.add_post_handler(
+            "/server/command/queue/<file_name>",
+            self.__handle_action_queue,
+            required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/command/stop/<file_name>",
+            self.__handle_action_stop,
+            required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/command/extract/<file_name>",
+            self.__handle_action_extract,
+            required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/command/validate/<file_name>",
+            self.__handle_action_validate,
+            required_scope="write"
+        )
+        web_app.add_delete_handler(
+            "/server/command/delete_local/<file_name>",
+            self.__handle_action_delete_local,
+            required_scope="write"
+        )
+        web_app.add_delete_handler(
+            "/server/command/delete_remote/<file_name>",
+            self.__handle_action_delete_remote,
+            required_scope="write"
+        )
+        web_app.add_post_handler(
+            "/server/command/bulk/<action>",
+            self.__handle_action_bulk,
+            required_scope="write"
+        )
 
     @staticmethod
     def __get_action(action: str):
