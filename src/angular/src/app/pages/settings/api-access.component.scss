@@ -1,0 +1,313 @@
+@use '../../common/common' as *;
+
+:host {
+    display: block;
+}
+
+.api-access-container {
+    padding: 15px;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+
+    .header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: flex-start;
+        justify-content: space-between;
+        margin-bottom: 15px;
+
+        h3 {
+            margin: 0 0 5px;
+        }
+
+        .description {
+            margin-bottom: 0;
+            color: rgba(0, 0, 0, 0.65);
+            max-width: 50rem;
+        }
+    }
+
+    .summary-strip {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        align-items: stretch;
+
+        .summary-item {
+            min-width: 220px;
+            padding: 10px 12px;
+            border: 1px solid rgba(0, 0, 0, 0.1);
+            border-radius: 4px;
+            background: #fff;
+        }
+
+        .summary-label {
+            display: block;
+            font-size: 78%;
+            font-weight: 700;
+            letter-spacing: .03em;
+            text-transform: uppercase;
+            color: rgba(0, 0, 0, 0.5);
+            margin-bottom: 4px;
+        }
+
+        .summary-value {
+            font-weight: 700;
+            color: rgba(0, 0, 0, 0.82);
+
+            &.active {
+                color: #8a5a00;
+            }
+
+            &.disabled {
+                color: #6c757d;
+            }
+        }
+    }
+
+    .loading-state,
+    .empty-state {
+        padding: 14px 15px;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 4px;
+        background: #fff;
+        color: rgba(0, 0, 0, 0.65);
+    }
+
+    .migration-banner,
+    .create-card,
+    .secret-callout,
+    .key-item,
+    .edit-card {
+        background: #fff;
+        border: 1px solid rgba(0, 0, 0, 0.1);
+        border-radius: 4px;
+    }
+
+    .migration-banner {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 14px 15px;
+        margin-bottom: 12px;
+        background: #fff9e6;
+        border-color: rgba(255, 193, 7, 0.45);
+
+        .banner-copy {
+            flex: 1;
+            min-width: 0;
+
+            strong {
+                display: block;
+                margin-bottom: 4px;
+            }
+
+            p {
+                margin: 0;
+                color: rgba(0, 0, 0, 0.7);
+            }
+        }
+
+        .banner-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: flex-start;
+        }
+    }
+
+    .create-card,
+    .secret-callout,
+    .edit-card {
+        padding: 15px;
+        margin-bottom: 12px;
+    }
+
+    .section-heading {
+        margin-bottom: 14px;
+
+        h4, h5 {
+            margin: 0 0 4px;
+        }
+
+        p {
+            margin: 0;
+            color: rgba(0, 0, 0, 0.65);
+        }
+    }
+
+    .form-row {
+        display: block;
+        margin-bottom: 14px;
+
+        .label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+    }
+
+    .scope-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+        gap: 8px 12px;
+        margin-bottom: 14px;
+    }
+
+    .scope-option {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 0;
+        padding: 9px 10px;
+        border-radius: 4px;
+        background: rgba(0, 0, 0, 0.03);
+        border: 1px solid rgba(0, 0, 0, 0.07);
+        cursor: pointer;
+        user-select: none;
+
+        input {
+            margin: 0;
+        }
+    }
+
+    .actions {
+        display: flex;
+        justify-content: flex-end;
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .secret-callout {
+        border-color: rgba(0, 123, 255, 0.25);
+        background: #f8fbff;
+
+        .secret-header {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 10px;
+
+            h4 {
+                margin: 0 0 4px;
+            }
+
+            p {
+                margin: 0;
+                color: rgba(0, 0, 0, 0.7);
+            }
+        }
+
+        .secret-value {
+            font-family: monospace;
+            min-height: 72px;
+            resize: vertical;
+        }
+
+        .secret-hint {
+            margin: 8px 0 0;
+            color: rgba(0, 0, 0, 0.6);
+            font-size: 86%;
+        }
+    }
+
+    .key-list {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+    }
+
+    .key-item {
+        padding: 15px;
+
+        &.revoked {
+            opacity: 0.78;
+        }
+    }
+
+    .key-body {
+        margin-bottom: 12px;
+    }
+
+    .key-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 12px;
+        margin-bottom: 10px;
+
+        .key-title-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: baseline;
+            min-width: 0;
+        }
+
+        .key-name {
+            font-size: 1.6rem;
+            line-height: 1.05;
+            font-weight: 800;
+            letter-spacing: -0.03em;
+            color: rgba(0, 0, 0, 0.82);
+        }
+
+        .key-id {
+            font-size: 82%;
+            color: rgba(0, 0, 0, 0.52);
+            word-break: break-all;
+        }
+    }
+
+    .key-status {
+        font-size: 82%;
+        font-weight: 700;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(0, 123, 255, 0.12);
+        color: #0f5d8f;
+
+        &.revoked {
+            background: rgba(108, 117, 125, 0.13);
+            color: #5a6268;
+        }
+    }
+
+    .scope-line {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        margin-bottom: 8px;
+    }
+
+    .scope-chip {
+        font-size: 82%;
+        font-weight: 700;
+        padding: 4px 10px;
+        border-radius: 999px;
+        background: rgba(0, 0, 0, 0.08);
+        color: rgba(0, 0, 0, 0.72);
+
+        &.muted {
+            background: rgba(0, 0, 0, 0.05);
+            color: rgba(0, 0, 0, 0.55);
+        }
+    }
+
+    .meta-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 16px;
+        color: rgba(0, 0, 0, 0.6);
+        font-size: 88%;
+    }
+
+    .key-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 12px;
+    }
+}

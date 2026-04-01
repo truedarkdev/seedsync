@@ -10,7 +10,11 @@ from ..serialize import SerializeConfig
 
 class ConfigHandler(IHandler):
     __URL_SET_BLOCKED_FIELDS = {
-        "general": {"api_token", "config_api_redact_remote_details"},
+        "general": {
+            "api_token",
+            "config_api_redact_remote_details",
+            "trusted_browser_bootstrap_remote_addrs",
+        },
     }
 
     def __init__(self, config: Config):

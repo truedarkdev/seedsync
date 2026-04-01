@@ -198,6 +198,7 @@ class TestConfig(unittest.TestCase):
             "verbose": "False",
             "api_token": "token-value",
             "allowed_hostname": "",
+            "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -205,6 +206,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(False, general.verbose)
         self.assertEqual("token-value", general.api_token)
         self.assertEqual("", general.allowed_hostname)
+        self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -470,6 +472,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(True, config.general.verbose)
             self.assertEqual("", config.general.api_token)
             self.assertEqual("", config.general.allowed_hostname)
+            self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
             self.assertEqual(True, config.general.config_api_redact_remote_details)
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
@@ -524,6 +527,7 @@ class TestConfig(unittest.TestCase):
             config.general.verbose = False
             config.general.api_token = "api-token-value"
             config.general.allowed_hostname = ""
+            config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
@@ -560,6 +564,7 @@ class TestConfig(unittest.TestCase):
             verbose = False
             api_token = api-token-value
             allowed_hostname =
+            trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32
             config_api_redact_remote_details = True
 
             [Lftp]

@@ -252,6 +252,9 @@ class Config(Persist):
         verbose = PROP("verbose", Checkers.null, Converters.bool)
         api_token = PROP("api_token", Checkers.null, Converters.null)
         allowed_hostname = PROP("allowed_hostname", Checkers.null, Converters.null)
+        trusted_browser_bootstrap_remote_addrs = PROP("trusted_browser_bootstrap_remote_addrs",
+                                                      Checkers.null,
+                                                      Converters.null)
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -262,6 +265,7 @@ class Config(Persist):
             self.verbose = None
             self.api_token = None
             self.allowed_hostname = None
+            self.trusted_browser_bootstrap_remote_addrs = None
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -272,6 +276,9 @@ class Config(Persist):
             if "allowed_hostname" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["allowed_hostname"] = ""
+            if "trusted_browser_bootstrap_remote_addrs" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["trusted_browser_bootstrap_remote_addrs"] = ""
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True

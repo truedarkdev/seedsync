@@ -21,6 +21,7 @@ import {FilesPageComponent} from "./pages/files/files-page.component";
 import {HeaderComponent} from "./pages/main/header.component";
 import {SidebarComponent} from "./pages/main/sidebar.component";
 import {SettingsPageComponent} from "./pages/settings/settings-page.component";
+import {ApiAccessComponent} from "./pages/settings/api-access.component";
 import {ServerStatusService} from "./services/server/server-status.service";
 import {ConfigServiceProvider} from "./services/settings/config.service";
 import {OptionComponent} from "./pages/settings/option.component";
@@ -47,6 +48,7 @@ import {FileSelectionService} from "./services/files/file-selection.service";
 import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
 import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
 import {PathPairServiceProvider} from "./services/settings/path-pair.service";
+import {ApiAccessServiceProvider} from "./services/settings/api-access.service";
 import {Modal} from "./services/utils/modal.service";
 import {StorageServiceModule} from "./services/utils/storage.service";
 
@@ -66,6 +68,7 @@ import {StorageServiceModule} from "./services/utils/storage.service";
         HeaderComponent,
         SidebarComponent,
         SettingsPageComponent,
+        ApiAccessComponent,
         OptionComponent,
         PathPairsComponent,
         AutoQueuePageComponent,
@@ -105,6 +108,7 @@ import {StorageServiceModule} from "./services/utils/storage.service";
         AutoQueueServiceProvider,
         ConfigServiceProvider,
         PathPairServiceProvider,
+        ApiAccessServiceProvider,
         ServerCommandServiceProvider,
         BulkCommandServiceProvider,
 

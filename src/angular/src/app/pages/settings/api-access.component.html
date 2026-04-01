@@ -1,0 +1,185 @@
+<div class="api-access-container">
+    <div class="header">
+        <div class="header-copy">
+            <h3>API Access</h3>
+            <p class="description">
+                Manage scoped API keys and the legacy token migration state for external clients.
+            </p>
+        </div>
+
+        <div class="summary-strip" *ngIf="(migrationState | async) as state; else loadingState">
+            <div class="summary-item">
+                <span class="summary-label">Legacy compatibility</span>
+                <span class="summary-value" [class.active]="state.legacy_api_token.compatibility_enabled"
+                      [class.disabled]="!state.legacy_api_token.compatibility_enabled">
+                    {{getLegacyStateLabel(state.legacy_api_token)}}
+                </span>
+            </div>
+            <div class="summary-item">
+                <span class="summary-label">API keys</span>
+                <span class="summary-value">{{state.api_keys.active}} active · {{state.api_keys.revoked}} revoked</span>
+            </div>
+        </div>
+    </div>
+
+    <ng-template #loadingState>
+        <div class="loading-state">
+            Loading API access state...
+        </div>
+    </ng-template>
+
+    <ng-container *ngIf="(migrationState | async) as state">
+        <div class="migration-banner"
+             *ngIf="state.legacy_api_token.configured">
+            <div class="banner-copy">
+                <strong>{{state.legacy_api_token.compatibility_enabled ? 'Legacy token compatibility is active.' : 'Legacy token compatibility is disabled.'}}</strong>
+                <p>{{getLegacyStateDescription(state.legacy_api_token)}}</p>
+            </div>
+            <div class="banner-actions">
+                <button class="btn btn-warning btn-sm disable-legacy-btn"
+                        type="button"
+                        *ngIf="state.legacy_api_token.compatibility_enabled"
+                        (click)="disableLegacyApiToken()">
+                    Disable compatibility
+                </button>
+                <button class="btn btn-danger btn-sm clear-legacy-btn"
+                        type="button"
+                        (click)="clearLegacyApiToken()">
+                    Clear token
+                </button>
+            </div>
+        </div>
+
+        <div class="create-card">
+            <div class="section-heading">
+                <h4>Create API Key</h4>
+                <p>Choose a name and the scopes this key should receive.</p>
+            </div>
+
+            <label class="form-row">
+                <span class="label">Name</span>
+                <input type="text"
+                       class="form-control"
+                       [(ngModel)]="createName"
+                       placeholder="Media scanner" />
+            </label>
+
+            <div class="scope-grid">
+                <label class="scope-option" *ngFor="let scope of scopeOptions">
+                    <input type="checkbox"
+                           [(ngModel)]="createScopes[scope.value]" />
+                    <span>{{scope.label}}</span>
+                </label>
+            </div>
+
+            <div class="actions">
+                <button class="btn btn-primary create-key-btn"
+                        type="button"
+                        (click)="createApiKey()">
+                    Create key
+                </button>
+            </div>
+        </div>
+
+        <div class="secret-callout" *ngIf="secretReveal">
+            <div class="secret-header">
+                <div>
+                    <h4>{{secretReveal.title}}</h4>
+                    <p>{{secretReveal.message}}</p>
+                </div>
+                <button class="btn btn-secondary btn-sm dismiss-secret-btn"
+                        type="button"
+                        (click)="dismissSecret()">
+                    Dismiss
+                </button>
+            </div>
+            <textarea class="form-control secret-value" rows="2" readonly>{{secretReveal.secret}}</textarea>
+            <p class="secret-hint">This secret is shown once. Copy it before closing the panel.</p>
+        </div>
+
+        <div class="key-list" *ngIf="(apiKeys | async) as apiKeys; else loadingState">
+            <div class="empty-state" *ngIf="apiKeys.length === 0">
+                No API keys configured yet.
+            </div>
+
+            <div class="key-item" *ngFor="let key of apiKeys" [class.revoked]="!key.active">
+                <div class="key-body">
+                    <div class="key-header">
+                        <div class="key-title-row">
+                            <span class="key-name">{{key.name}}</span>
+                            <span class="key-status" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
+                        </div>
+                        <span class="key-id">{{key.id}}</span>
+                    </div>
+
+                    <div class="scope-line">
+                        <span class="scope-chip" *ngFor="let scope of key.scopes">{{scope}}</span>
+                        <span class="scope-chip muted" *ngIf="key.scopes.length === 0">No scopes</span>
+                    </div>
+
+                    <div class="meta-line">
+                        <span>Created {{key.created_at}}</span>
+                        <span>Updated {{key.updated_at}}</span>
+                        <span *ngIf="key.revoked_at">Revoked {{key.revoked_at}}</span>
+                    </div>
+                </div>
+
+                <div class="key-actions">
+                    <button class="btn btn-secondary btn-sm edit-key-btn"
+                            type="button"
+                            (click)="startEdit(key)">
+                        Edit
+                    </button>
+                    <button class="btn btn-warning btn-sm rotate-key-btn"
+                            type="button"
+                            [disabled]="!key.active"
+                            (click)="rotateApiKey(key)">
+                        Rotate
+                    </button>
+                    <button class="btn btn-danger btn-sm revoke-key-btn"
+                            type="button"
+                            [disabled]="!key.active"
+                            (click)="revokeApiKey(key)">
+                        Revoke
+                    </button>
+                </div>
+
+                <div class="edit-card" *ngIf="isEditing(key)">
+                    <div class="section-heading">
+                        <h5>Edit API Key</h5>
+                        <p>Update the name or tighten the scopes for this key.</p>
+                    </div>
+
+                    <label class="form-row">
+                        <span class="label">Name</span>
+                        <input type="text"
+                               class="form-control"
+                               [(ngModel)]="editingName"
+                               placeholder="Media scanner" />
+                    </label>
+
+                    <div class="scope-grid">
+                        <label class="scope-option" *ngFor="let scope of scopeOptions">
+                            <input type="checkbox"
+                                   [(ngModel)]="editingScopes[scope.value]" />
+                            <span>{{scope.label}}</span>
+                        </label>
+                    </div>
+
+                    <div class="actions">
+                        <button class="btn btn-secondary btn-sm cancel-edit-key-btn"
+                                type="button"
+                                (click)="cancelEdit()">
+                            Cancel
+                        </button>
+                        <button class="btn btn-primary btn-sm save-key-btn"
+                                type="button"
+                                (click)="saveApiKey(key)">
+                            Save changes
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </ng-container>
+</div>
