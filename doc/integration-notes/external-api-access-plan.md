@@ -1,8 +1,8 @@
 # Staged Plan - Scoped API Keys for External API Access
 
-Status: staged plan with backend foundation, the browser/bootstrap follow-up, and the Settings UI slice now implemented locally. The next work should focus on Slice 4 write-path hardening, not on reopening the backend auth boundary or the browser bootstrap boundary that the first three slices established.
+Status: staged plan with backend foundation, the browser/bootstrap follow-up, the Settings UI slice, Slice 4 write-path hardening, and the Slice 5 live-browser UI debug pass now completed locally. The next work should focus on Slice 6 post-hardening follow-ups, then the final security regression lane, rather than reopening the already-landed backend auth boundary or browser bootstrap boundary.
 
-Immediate next step: start Slice 4 write-path hardening on top of the already-landed backend auth, browser bootstrap, and Settings UI foundation. The app shell/static routes now fail closed outside loopback or the explicit trusted local Docker runtime source, local browser access still issues the built-in UI session cookie, and `/server/stream` remains aligned with that session flow. That trusted bootstrap source is operationally sensitive and is not intended to be writable through the generic write-scoped config setter.
+Immediate next step: start Slice 6 post-hardening follow-ups on top of the already-landed backend auth, browser bootstrap, Settings UI, Slice 4 write-path hardening, and Slice 5 live-browser verification. The main remaining work is the follow-up hardening around URL-path config writes, the first-admin bootstrap exception, and reverse-proxy / TLS-offload handling for strict origin checks.
 
 ## Core Direction
 
@@ -84,7 +84,61 @@ Completed locally:
   - Surfaced the migration banner while legacy compatibility remains active.
   - Consumed the existing admin/API-key JSON endpoints through a dedicated Angular service.
 
+### Slice 5: Full Playwright UI debug pass for API Access
+
+Completed locally:
+
+- Exercised the API Access UI against the live Docker-served app, including:
+  - create
+  - update/edit
+  - rotate
+  - revoke
+  - legacy disable
+  - legacy clear
+- Checked non-happy-path browser behavior for blank-name and no-scope validation errors.
+- Captured live screenshots for the key management flow, secret reveal, and legacy migration banner states.
+- Did not uncover a blocking API Access UI bug in the live browser pass, so no follow-up UI patch was required for this slice.
+
+- Run a full live-browser Playwright debugging pass over the new API Access UI, not just targeted happy-path checks.
+- Exercise every primary action end-to-end:
+  - create
+  - update/edit
+  - rotate
+  - revoke
+  - legacy disable
+  - legacy clear
+- Check important non-happy-path UX and correctness details:
+  - labeling clarity, especially `Key ID` vs secret
+  - loading, empty, and error states
+  - secret reveal wording and behavior
+  - confirmation dialog copy
+  - layout/spacing/readability in the real Settings page
+- Fix the issues found in that browser pass as one follow-up batch before treating the API Access UI as fully polished.
+
+### Slice 6: Post-hardening follow-ups
+
+- Move `/server/config/set/<section>/<key>/<value>` away from URL-path values and into a POST body so secrets and other sensitive config values no longer travel in the request path.
+- Decide and implement the intended protection for the first-admin bootstrap route so the one-time localhost bootstrap flow is not left as a cross-site-triggerable exception by accident.
+- Decide and document the supported reverse-proxy / TLS-offload behavior for strict origin matching, and add proxy-aware handling if those deployments are expected to work with cookie-authenticated write/admin requests.
+- Treat this as follow-up hardening work after Slice 4, not as a blocker for the write-path hardening already landed.
+
+### Slice 7: Revoked key lifecycle polish
+
+- Keep revoked API keys available for audit/history, but do not show them by default in the API Access list.
+- Add an explicit UI affordance, such as a button or toggle, to reveal previously revoked keys when needed.
+- Fully lock revoked key records in the UI so they cannot be edited after revocation.
+- Add an explicit remove/delete path for revoked keys so operators can permanently dismiss old revoked entries from the visible history when they no longer want to keep them around.
+- Implement the backend/API contract needed for that delete path if it does not already exist, and cover the new behavior in both UI and backend verification.
+- After the implementation lands, run a full live-browser / Playwright debug pass over the revoked-key flow to confirm the buttons are actually clickable, the behavior works end-to-end, and the visual style still reads correctly in the real Settings page.
+
 ### Slice 4: Write-path hardening
+
+Completed locally:
+
+- Converted the legacy config and autoqueue write-by-GET routes to POST-only handlers and updated the in-repo callers that still depended on those routes.
+- Added same-origin browser gating for cookie-authenticated non-read server writes, including `admin`-scoped actions.
+- Tightened the origin check to compare the full origin tuple rather than hostname alone.
+- Verified the slice with targeted Python tests plus rebuilt live Docker probes for same-origin and cross-origin cookie-auth write/admin behavior.
 
 - Convert or block the legacy mutating GET routes.
 - Add same-origin and CSRF enforcement for cookie-auth writes.
@@ -98,6 +152,13 @@ Completed locally:
   - mixed auth precedence across bearer, cookie, and irrelevant `Authorization` headers
   - revoked or rotated key behavior on protected routes
   - admin bootstrap boundary checks
+- Do a full security audit of the four access categories (`read`, `write`, `stream`, `admin`) and verify that no privilege leaks or unintended capability overlaps exist between them.
+- Run that audit with one dedicated security subagent per access category, with each subagent responsible for checking the security boundary and wrapping for its own category before the results are merged.
+- Check specifically for cross-scope leaks such as:
+  - write-capable actions reachable from read-only access
+  - API-key or migration-management actions reachable from non-admin scopes
+  - stream access accidentally exposing admin-only or write-capable data paths
+  - any route or UI/session behavior where combined lower scopes accidentally behave like `admin`
 - Keep this at the end of the API access work plan rather than treating it as a blocker for the earlier backend/browser slices.
 
 ## Notes To Preserve
