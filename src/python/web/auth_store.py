@@ -156,8 +156,12 @@ class ApiKeyStore(Persist):
             if not record.is_revoked and "admin" in record.scopes
         ])
 
-    def list_api_keys(self) -> List[Dict[str, object]]:
-        return [record.to_public_dict() for record in self.__api_keys]
+    def list_api_keys(self, include_revoked: bool = False) -> List[Dict[str, object]]:
+        if include_revoked:
+            records = self.__api_keys
+        else:
+            records = [record for record in self.__api_keys if not record.is_revoked]
+        return [record.to_public_dict() for record in records]
 
     def get_api_key(self, key_id: str) -> Optional[ApiKeyRecord]:
         for record in self.__api_keys:
@@ -227,6 +231,8 @@ class ApiKeyStore(Persist):
         record = self.get_api_key(key_id)
         if record is None:
             raise KeyError("API key '{}' not found".format(key_id))
+        if record.is_revoked:
+            raise ValueError("Cannot update a revoked API key")
 
         if name is not None:
             if not isinstance(name, str) or not name.strip():
@@ -240,16 +246,28 @@ class ApiKeyStore(Persist):
         self.save()
         return record
 
+    def delete_api_key(self, key_id: str) -> ApiKeyRecord:
+        record = self.get_api_key(key_id)
+        if record is None:
+            raise KeyError("API key '{}' not found".format(key_id))
+        if not record.is_revoked:
+            raise ValueError("Cannot delete an active API key")
+
+        self.__api_keys.remove(record)
+        self.save()
+        return record
+
     def revoke_api_key(self, key_id: str) -> ApiKeyRecord:
         record = self.get_api_key(key_id)
         if record is None:
             raise KeyError("API key '{}' not found".format(key_id))
+        if record.is_revoked:
+            raise ValueError("Cannot revoke a revoked API key")
 
-        if record.revoked_at is None:
-            now = _utc_now_iso()
-            record.revoked_at = now
-            record.updated_at = now
-            self.save()
+        now = _utc_now_iso()
+        record.revoked_at = now
+        record.updated_at = now
+        self.save()
         return record
 
     def rotate_api_key(self, key_id: str) -> Dict[str, object]:

@@ -1,5 +1,5 @@
 import {Injectable} from "@angular/core";
-import {HttpClient} from "@angular/common/http";
+import {HttpClient, HttpParams} from "@angular/common/http";
 import {BehaviorSubject, Observable} from "rxjs";
 import {map, tap} from "rxjs/operators";
 
@@ -52,6 +52,7 @@ export class ApiAccessService extends BaseWebService {
 
     private _migrationState = new BehaviorSubject<ApiAccessMigrationState>(null);
     private _apiKeys = new BehaviorSubject<ApiKeyRecord[]>(null);
+    private _includeRevokedApiKeys = false;
 
     constructor(_streamServiceRegistry: StreamServiceRegistry,
                 private _http: HttpClient,
@@ -72,8 +73,17 @@ export class ApiAccessService extends BaseWebService {
         this.loadApiKeys();
     }
 
-    public listApiKeys(): Observable<ApiKeyRecord[]> {
-        return this._http.get<ApiKeyListResponse>(this.API_KEYS_URL).pipe(
+    public setIncludeRevokedApiKeys(includeRevokedApiKeys: boolean) {
+        if (this._includeRevokedApiKeys === includeRevokedApiKeys) {
+            return;
+        }
+        this._includeRevokedApiKeys = includeRevokedApiKeys;
+        this.loadApiKeys();
+    }
+
+    public listApiKeys(includeRevokedApiKeys: boolean = this._includeRevokedApiKeys): Observable<ApiKeyRecord[]> {
+        const params = includeRevokedApiKeys ? new HttpParams().set("include_revoked", "1") : undefined;
+        return this._http.get<ApiKeyListResponse>(this.API_KEYS_URL, params ? {params} : undefined).pipe(
             map(response => {
                 if (response && Array.isArray(response.keys)) {
                     return response.keys;
@@ -144,6 +154,12 @@ export class ApiAccessService extends BaseWebService {
                 }
                 throw new Error("Failed to revoke API key");
             }),
+            tap(() => this.refresh())
+        );
+    }
+
+    public deleteApiKey(keyId: string): Observable<void> {
+        return this._http.delete<void>(`${this.API_KEYS_URL}/${keyId}`).pipe(
             tap(() => this.refresh())
         );
     }
