@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from common import Config
 from web.auth_store import ApiKeyStore
+from web.handler.admin import AdminHandler
 from webtest import TestApp
 from web.web_app import IStreamHandler, WebApp
 from web.web_app_builder import WebAppBuilder
@@ -90,14 +91,15 @@ class TestWebAppStream(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
 
-    def test_bootstrap_page_serves_exchange_bootstrap_script(self):
+    def test_bootstrap_page_serves_browser_remember_form(self):
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
         response = client.get("/bootstrap")
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("/server/admin/bootstrap/v1/exchange", response.text)
+        self.assertIn("/server/browser/v1/remember", response.text)
+        self.assertIn("Remember this browser", response.text)
 
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []
@@ -268,6 +270,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         created_admin = self.auth_store.create_api_key("unit-admin", ["admin"])
         self.admin_secret = created_admin["secret"]
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
 
     @staticmethod
     def _same_origin_headers(origin: str = "http://localhost:8800"):
@@ -292,11 +295,16 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         }
 
     def _issue_browser_session(self, client: TestApp, host: str = "localhost:8800"):
-        with tempfile.TemporaryDirectory() as html_path:
-            with open(os.path.join(html_path, "index.html"), "w") as html_file:
-                html_file.write("<html></html>")
-            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
-            response = client.get("/", extra_environ={"HTTP_HOST": host, "REMOTE_ADDR": "127.0.0.1"})
+        response = client.post_json(
+            "/server/browser/v1/remember",
+            {"secret": self.admin_secret},
+            extra_environ={
+                "HTTP_HOST": host,
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "http://{}".format(host),
+                "HTTP_REFERER": "http://{}/dashboard".format(host),
+            },
+        )
         return response
 
     def _issue_trusted_browser_session(
@@ -314,8 +322,25 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 "/",
                 extra_environ={"HTTP_HOST": host, "REMOTE_ADDR": remote_addr},
                 expect_errors=expect_errors
-            )
+        )
         return response
+
+    def _remember_trusted_browser_session(
+        self,
+        client: TestApp,
+        remote_addr: str,
+        host: str = "localhost:8800",
+    ):
+        return client.post_json(
+            "/server/browser/v1/remember",
+            {"secret": self.admin_secret},
+            extra_environ={
+                "HTTP_HOST": host,
+                "REMOTE_ADDR": remote_addr,
+                "HTTP_ORIGIN": "http://{}".format(host),
+                "HTTP_REFERER": "http://{}/dashboard".format(host),
+            },
+        )
 
     def test_same_origin_browser_request_cannot_use_sessionless_route_after_admin_exists(self):
         @self.web_app.route("/server/ping", required_scope="read", allow_sessionless_ui=True)
@@ -463,7 +488,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         client = TestApp(self.web_app)
         response = self._issue_browser_session(client)
 
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(201, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
     def test_loopback_index_does_not_issue_ui_session_cookie_before_first_admin_exists(self):
@@ -517,7 +542,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, stream_response.status_int)
         self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
 
-    def test_bootstrap_page_sets_http_only_exchange_cookie_for_loopback_before_first_admin_exists(self):
+    def test_bootstrap_page_serves_first_run_claim_form_for_loopback_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         web_app.add_default_routes()
@@ -532,8 +557,9 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("seedsync_bootstrap_exchange=", response.headers.get("Set-Cookie", ""))
-        self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
+        self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
+        self.assertIn("Claim initial admin access", response.text)
 
     def test_bootstrap_page_rejects_untrusted_remote_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
@@ -551,7 +577,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(403, response.status_int)
-        self.assertIn("Bootstrap proof redemption is limited", response.text)
+        self.assertIn("Bootstrap access is limited", response.text)
 
     def test_trusted_bootstrap_remote_can_use_sessionless_status_and_stream_before_first_admin_exists(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
@@ -700,6 +726,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 html_file.write("<html></html>")
             object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
             client = TestApp(self.web_app)
+            self._issue_browser_session(client)
             response = client.get(
                 "/dashboard/123e4567-e89b-12d3-a456-426614174000",
                 extra_environ={
@@ -709,7 +736,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertIn("<html></html>", response.text)
 
     def test_non_loopback_index_rejects_browser_bootstrap(self):
         self.web_app.add_default_routes()
@@ -822,20 +849,22 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertIn("loopback", response.text)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
 
-    def test_trusted_bootstrap_remote_addr_allows_index_and_ui_session_cookie_for_loopback_host(self):
+    def test_trusted_bootstrap_remote_addr_allows_remember_browser_route_for_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
-        response = self._issue_trusted_browser_session(client, remote_addr="172.25.0.1")
+        response = self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
 
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(201, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
     def test_trusted_bootstrap_remote_addr_allows_dashboard_deep_link_for_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
 
         with tempfile.TemporaryDirectory() as html_path:
@@ -843,6 +872,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 html_file.write("<html></html>")
             object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
             client = TestApp(self.web_app)
+            self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
             response = client.get(
                 "/dashboard/123e4567-e89b-12d3-a456-426614174000",
                 extra_environ={
@@ -852,11 +882,11 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
     def test_trusted_bootstrap_remote_addr_allows_static_asset_for_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
 
         with tempfile.TemporaryDirectory() as html_path:
@@ -866,6 +896,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 asset_file.write("console.log('hello');")
             object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
             client = TestApp(self.web_app)
+            self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
             response = client.get(
                 "/main.js",
                 extra_environ={
@@ -880,6 +911,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_trusted_bootstrap_remote_addr_rejects_forwarded_non_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
 
         with tempfile.TemporaryDirectory() as html_path:
@@ -905,6 +937,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_trusted_bootstrap_remote_addr_still_rejects_non_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
@@ -921,6 +954,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_malformed_trusted_bootstrap_remote_addrs_fail_closed(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "definitely-not-a-network"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
@@ -980,6 +1014,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_trusted_bootstrap_remote_addr_can_use_cookie_backed_ui_session(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
 
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
         def _ping():
@@ -987,7 +1022,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
-        self._issue_trusted_browser_session(client, remote_addr="172.25.0.1")
+        self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
 
         response = client.post(
             "/server/ping",
@@ -1018,8 +1053,9 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             "HTTP_REFERER": "http://localhost:8800/dashboard",
         }
 
-        rejected = client.get("/server/admin/bootstrap-check", extra_environ=trusted_headers, expect_errors=True)
-        self.assertEqual(401, rejected.status_int)
+        allowed = client.get("/server/admin/bootstrap-check", extra_environ=trusted_headers)
+        self.assertEqual(200, allowed.status_int)
+        self.assertEqual("ok", allowed.text)
 
     def test_non_bearer_authorization_header_does_not_block_ui_session_cookie_auth(self):
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
@@ -1046,6 +1082,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_write_route_accepts_cookie_backed_ui_session_through_trusted_forwarded_origin(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
 
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
         def _ping():
@@ -1068,6 +1105,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_write_route_rejects_unsafe_forwarded_proto_for_cookie_backed_ui_session(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
 
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
         def _ping():

@@ -255,6 +255,9 @@ class Config(Persist):
         trusted_browser_bootstrap_remote_addrs = PROP("trusted_browser_bootstrap_remote_addrs",
                                                       Checkers.null,
                                                       Converters.null)
+        browser_handover_recovery_version = PROP("browser_handover_recovery_version",
+                                                 Checkers.null,
+                                                 Converters.null)
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -266,6 +269,7 @@ class Config(Persist):
             self.api_token = None
             self.allowed_hostname = None
             self.trusted_browser_bootstrap_remote_addrs = None
+            self.browser_handover_recovery_version = None
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -279,6 +283,9 @@ class Config(Persist):
             if "trusted_browser_bootstrap_remote_addrs" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["trusted_browser_bootstrap_remote_addrs"] = ""
+            if "browser_handover_recovery_version" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["browser_handover_recovery_version"] = ""
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True
