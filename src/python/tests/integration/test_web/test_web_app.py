@@ -132,8 +132,9 @@ class TestWebApp(BaseTestWebApp):
         self.assertEqual(200, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
-    def test_trusted_docker_gateway_can_bootstrap_local_browser_session(self):
+    def test_trusted_docker_gateway_requires_bootstrap_limited_session_before_first_admin_exists(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        self.auth_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "empty-api-keys.json"))
         self.web_app = WebAppBuilder(
             self.context,
             self.controller,
@@ -148,10 +149,10 @@ class TestWebApp(BaseTestWebApp):
             }
         )
 
-        response = browser_app.get("/")
+        response = browser_app.get("/", expect_errors=True)
 
-        self.assertEqual(200, response.status_int)
-        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertEqual(403, response.status_int)
+        self.assertIn("bootstrap-limited UI session", response.text)
 
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):

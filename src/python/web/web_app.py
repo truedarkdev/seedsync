@@ -63,6 +63,7 @@ class WebApp(bottle.Bottle):
     _STREAM_EVENT_YIELD_INTERVAL_IN_MS = 10
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
     _UI_SESSION_COOKIE_NAME = "seedsync_ui_session"
+    _BOOTSTRAP_EXCHANGE_COOKIE_NAME = "seedsync_bootstrap_exchange"
 
     def __init__(self, context: Context, controller: Controller, auth_store: Optional[object] = None):
         super().__init__()
@@ -116,6 +117,7 @@ class WebApp(bottle.Bottle):
                 bool(route.config.get("allow_legacy_api_token", False)),
                 bool(route.config.get("allow_sessionless_ui", False)),
                 bool(route.config.get("allow_first_admin_bootstrap", False)),
+                bool(route.config.get("allow_bootstrap_proof_exchange", False)),
             )
 
     def add_default_routes(self):
@@ -124,6 +126,11 @@ class WebApp(bottle.Bottle):
         been added.
         :return:
         """
+        # Bootstrap landing page. It is intentionally tiny and same-origin so the
+        # browser can redeem the one-time bootstrap proof without exposing the
+        # session secret to the helper process.
+        self.route("/bootstrap")(self.__bootstrap)
+
         # Streaming route
         self.get(
             "/server/stream",
@@ -177,6 +184,7 @@ class WebApp(bottle.Bottle):
               allow_legacy_api_token: bool = False,
               allow_sessionless_ui: bool = False,
               allow_first_admin_bootstrap: bool = False,
+              allow_bootstrap_proof_exchange: bool = False,
               **config):
         if path is not None and WebApp.__is_server_path(path):
             if required_scope is None:
@@ -191,6 +199,7 @@ class WebApp(bottle.Bottle):
                 "allow_legacy_api_token": allow_legacy_api_token,
                 "allow_sessionless_ui": allow_sessionless_ui,
                 "allow_first_admin_bootstrap": allow_first_admin_bootstrap,
+                "allow_bootstrap_proof_exchange": allow_bootstrap_proof_exchange,
             }.items():
                 if type(flag_value) is not bool:
                     raise ValueError("{} must be a boolean for /server routes".format(flag_name))
@@ -499,21 +508,43 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None or getattr(self.__auth_store, "active_admin_key_count", 0) != 0:
             return False
 
-        if self.__is_loopback_remote_addr():
-            return (
-                WebApp.__is_loopback_host(WebApp.__request_host()) and
-                self.__is_direct_same_origin_browser_request()
-            )
+        if self.__has_bootstrap_ui_session() and self.__is_same_origin_browser_request():
+            return True
 
-        return self.__is_trusted_browser_bootstrap_request() and self.__is_same_origin_browser_request()
+        return (
+            self.__is_loopback_remote_addr() and
+            WebApp.__is_loopback_host(WebApp.__request_host()) and
+            self.__is_direct_same_origin_browser_request()
+        )
 
     def __allow_sessionless_ui_route(self) -> bool:
         return (
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
-            self.__is_trusted_browser_bootstrap_request() and
-            self.__is_same_origin_browser_request()
+            self.__is_loopback_remote_addr() and
+            WebApp.__is_loopback_host(WebApp.__request_host()) and
+            self.__is_direct_same_origin_browser_request()
         )
+
+    def __allow_bootstrap_proof_exchange(self) -> bool:
+        if (
+            self.__auth_store is None or
+            getattr(self.__auth_store, "active_admin_key_count", 0) != 0 or
+            not WebApp.__is_loopback_host(WebApp.__request_host()) or
+            not self.__is_same_origin_browser_request() or
+            not self.__is_trusted_browser_bootstrap_request()
+        ):
+            return False
+
+        exchange_secret = bottle.request.get_cookie(self._BOOTSTRAP_EXCHANGE_COOKIE_NAME)
+        if not isinstance(exchange_secret, str) or not exchange_secret.strip():
+            return False
+
+        peek_exchange = getattr(self.__auth_store, "peek_bootstrap_exchange", None)
+        if peek_exchange is None:
+            return False
+
+        return bool(peek_exchange(exchange_secret.strip()))
 
     def __get_browser_ui_session_scopes(self):
         if self.__auth_store is None:
@@ -568,11 +599,14 @@ class WebApp(bottle.Bottle):
         required_scope: str,
         allow_legacy_api_token: bool,
         allow_sessionless_ui: bool,
-        allow_first_admin_bootstrap: bool
+        allow_first_admin_bootstrap: bool,
+        allow_bootstrap_proof_exchange: bool
     ) -> None:
         token = WebApp.__extract_bearer_token()
         if token is None:
             if not WebApp.__has_bearer_authorization_header():
+                if allow_bootstrap_proof_exchange and self.__allow_bootstrap_proof_exchange():
+                    return
                 if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
                     return
                 ui_session_scopes = self.__get_ui_session_scopes()
@@ -613,7 +647,14 @@ class WebApp(bottle.Bottle):
         bottle.abort(401, "Invalid API token")
 
     def __get_ui_session_scopes(self):
-        if self.__auth_store is None or not self.__is_trusted_browser_bootstrap_request():
+        session = self.__get_ui_session()
+        if session is None:
+            return None
+
+        return getattr(session, "scopes", None)
+
+    def __get_ui_session(self):
+        if self.__auth_store is None:
             return None
 
         ui_session_secret = bottle.request.get_cookie(self._UI_SESSION_COOKIE_NAME)
@@ -628,7 +669,17 @@ class WebApp(bottle.Bottle):
         if session is None:
             return None
 
-        return getattr(session, "scopes", None)
+        if getattr(session, "bootstrap", False):
+            return session
+
+        if not self.__is_trusted_browser_bootstrap_request():
+            return None
+
+        return session
+
+    def __has_bootstrap_ui_session(self) -> bool:
+        session = self.__get_ui_session()
+        return bool(session is not None and getattr(session, "bootstrap", False))
 
     def __authorize_scopes(self, required_scope: str, scopes, forbidden_message: Optional[str] = None) -> None:
         allowed_scopes = set(scopes or [])
@@ -656,7 +707,82 @@ class WebApp(bottle.Bottle):
         ui_session = create_session(target_scopes)
         return ui_session.secret
 
+    def __bootstrap(self):
+        if self.__auth_store is not None:
+            if not self.__is_trusted_browser_bootstrap_request():
+                bottle.abort(
+                    403,
+                    "Bootstrap proof redemption is limited to loopback or explicit trusted local runtime sources"
+                )
+
+            if getattr(self.__auth_store, "active_admin_key_count", 0) != 0:
+                bottle.abort(409, "Bootstrap proof redemption is only available before the first admin API key exists")
+
+            ensure_exchange = getattr(self.__auth_store, "ensure_bootstrap_exchange", None)
+            if ensure_exchange is not None:
+                exchange = ensure_exchange()
+                if exchange is not None:
+                    bottle.response.set_cookie(
+                        self._BOOTSTRAP_EXCHANGE_COOKIE_NAME,
+                        exchange.secret,
+                        path="/",
+                        httponly=True,
+                        samesite="strict",
+                    )
+
+        bottle.response.content_type = "text/html; charset=utf-8"
+        bottle.response.cache_control = "no-store"
+        return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SeedSync Bootstrap</title>
+</head>
+<body>
+<script>
+(function () {
+  const rawHash = window.location.hash ? window.location.hash.substring(1) : "";
+  const rawQuery = window.location.search ? window.location.search.substring(1) : "";
+  const params = new URLSearchParams(rawHash || rawQuery);
+  const proof = params.get("proof");
+  if (!proof) {
+    document.body.textContent = "Missing bootstrap proof.";
+    return;
+  }
+
+  fetch("/server/admin/bootstrap/v1/exchange", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ proof }),
+  }).then(function (response) {
+    if (!response.ok) {
+      return response.text().then(function (text) {
+        throw new Error(text || "Bootstrap exchange failed");
+      });
+    }
+    window.location.replace("/");
+  }).catch(function (error) {
+    document.body.textContent = error.message || String(error);
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
     def __authorize_browser_bootstrap(self) -> None:
+        if self.__auth_store is not None and getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
+            if self.__is_loopback_remote_addr() and WebApp.__is_loopback_host(WebApp.__request_host()):
+                return
+            if self.__has_bootstrap_ui_session():
+                return
+            bottle.abort(
+                403,
+                "First-admin browser bootstrap requires direct loopback access or a bootstrap-limited UI session."
+            )
+
         if self.__is_trusted_browser_bootstrap_request():
             return
 

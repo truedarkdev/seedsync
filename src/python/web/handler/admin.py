@@ -33,6 +33,12 @@ class AdminHandler(IHandler):
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
         web_app.add_post_handler(
+            "/server/admin/bootstrap/v1/exchange",
+            self.__handle_exchange_bootstrap_proof,
+            required_scope="read",
+            allow_bootstrap_proof_exchange=True
+        )
+        web_app.add_post_handler(
             "/server/admin/bootstrap/v1/first-api-key",
             self.__handle_bootstrap_first_api_key,
             required_scope="admin",
@@ -72,6 +78,47 @@ class AdminHandler(IHandler):
 
     def __handle_get_migration_state(self):
         return self.__json_response(self.__auth_store.get_migration_state(self.__config))
+
+    def __handle_exchange_bootstrap_proof(self):
+        if self.__auth_store.active_admin_key_count > 0:
+            return self.__json_response({"error": "Bootstrap proof exchange is only available before the first admin API key exists"}, status=409)
+
+        try:
+            data = self.__load_request_json()
+            proof = data.get("proof", "")
+            if not isinstance(proof, str) or not proof.strip():
+                return self.__json_response({"error": "Bootstrap proof is required"}, status=400)
+
+            proof = proof.strip()
+            exchange_secret = bottle.request.get_cookie(WebApp._BOOTSTRAP_EXCHANGE_COOKIE_NAME)
+            peek_exchange = getattr(self.__auth_store, "peek_bootstrap_exchange", None)
+            consume_exchange = getattr(self.__auth_store, "consume_bootstrap_exchange", None)
+            if peek_exchange is None or consume_exchange is None or not peek_exchange(exchange_secret):
+                return self.__json_response({"error": "Bootstrap exchange grant is invalid or has expired"}, status=401)
+
+            if not self.__auth_store.peek_bootstrap_proof(proof):
+                return self.__json_response({"error": "Bootstrap proof is invalid or has already been used"}, status=401)
+
+            if not consume_exchange(exchange_secret):
+                return self.__json_response({"error": "Bootstrap exchange grant is invalid or has expired"}, status=401)
+            if not self.__auth_store.consume_bootstrap_proof(proof):
+                return self.__json_response({"error": "Bootstrap proof is invalid or has already been used"}, status=401)
+
+            ui_session = self.__auth_store.create_ui_session(["bootstrap"], bootstrap=True)
+            response = self.__json_response({
+                "expires_at": ui_session.expires_at,
+            })
+            response.delete_cookie(WebApp._BOOTSTRAP_EXCHANGE_COOKIE_NAME, path="/")
+            response.set_cookie(
+                WebApp._UI_SESSION_COOKIE_NAME,
+                ui_session.secret,
+                path="/",
+                httponly=True,
+                samesite="strict",
+            )
+            return response
+        except (TypeError, ValueError) as exc:
+            return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_bootstrap_first_api_key(self):
         if self.__auth_store.active_admin_key_count > 0:
