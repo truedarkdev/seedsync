@@ -163,6 +163,71 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, revoke_resp.status_int)
         self.assertFalse(revoked["key"]["active"])
 
+        repeat_revoke_resp = self.test_app.post(
+            "/server/admin/api-keys/v1/{}/revoke".format(key_id),
+            extra_environ=self._auth_headers(self.admin_secret),
+            expect_errors=True
+        )
+        self.assertEqual(400, repeat_revoke_resp.status_int)
+        self.assertIn("Cannot revoke a revoked API key", repeat_revoke_resp.text)
+
+        update_revoked_resp = self.test_app.put_json(
+            "/server/admin/api-keys/v1/{}".format(key_id),
+            {"name": "reader-should-not-update"},
+            extra_environ=self._auth_headers(self.admin_secret),
+            expect_errors=True
+        )
+        self.assertEqual(400, update_revoked_resp.status_int)
+        self.assertIn("Cannot update a revoked API key", update_revoked_resp.text)
+
+        visible_keys_resp = self.test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        visible_keys = json.loads(visible_keys_resp.text)
+        self.assertEqual(200, visible_keys_resp.status_int)
+        self.assertEqual(1, len(visible_keys["keys"]))
+        self.assertEqual("admin", visible_keys["keys"][0]["name"])
+
+        all_keys_resp = self.test_app.get(
+            "/server/admin/api-keys/v1?include_revoked=1",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        all_keys = json.loads(all_keys_resp.text)
+        self.assertEqual(200, all_keys_resp.status_int)
+        self.assertEqual(2, len(all_keys["keys"]))
+        self.assertTrue(any(key["name"] == "admin" and key["active"] for key in all_keys["keys"]))
+        self.assertTrue(any(key["name"] == "reader-updated" and not key["active"] for key in all_keys["keys"]))
+
+        delete_resp = self.test_app.delete(
+            "/server/admin/api-keys/v1/{}".format(key_id),
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        self.assertEqual(204, delete_resp.status_int)
+
+        remaining_keys_resp = self.test_app.get(
+            "/server/admin/api-keys/v1?include_revoked=1",
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        remaining_keys = json.loads(remaining_keys_resp.text)
+        self.assertEqual(1, len(remaining_keys["keys"]))
+        self.assertEqual("admin", remaining_keys["keys"][0]["name"])
+
+        second_key_resp = self.test_app.post_json(
+            "/server/admin/api-keys/v1",
+            {"name": "writer", "scopes": ["write"]},
+            extra_environ=self._auth_headers(self.admin_secret)
+        )
+        second_key = json.loads(second_key_resp.text)["key"]["id"]
+
+        delete_active_resp = self.test_app.delete(
+            "/server/admin/api-keys/v1/{}".format(second_key),
+            extra_environ=self._auth_headers(self.admin_secret),
+            expect_errors=True
+        )
+        self.assertEqual(400, delete_active_resp.status_int)
+        self.assertIn("Cannot delete an active API key", delete_active_resp.text)
+
     def test_disable_and_clear_legacy_token_routes_update_state(self):
         disable_resp = self.test_app.post(
             "/server/admin/migration/v1/legacy-api-token/disable",

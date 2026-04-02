@@ -50,6 +50,20 @@
             </div>
         </div>
 
+        <div class="revoked-visibility" *ngIf="state.api_keys.revoked > 0">
+            <div class="revoked-visibility-copy">
+                <strong *ngIf="!showRevokedKeys">{{state.api_keys.revoked}} revoked key{{state.api_keys.revoked === 1 ? '' : 's'}} hidden</strong>
+                <strong *ngIf="showRevokedKeys">Revoked keys are visible</strong>
+                <p *ngIf="!showRevokedKeys">Use the toggle to review or permanently remove previously revoked keys.</p>
+                <p *ngIf="showRevokedKeys">Hide them again when you are done auditing or deleting them.</p>
+            </div>
+            <button class="btn btn-secondary btn-sm toggle-revoked-keys-btn"
+                    type="button"
+                    (click)="toggleRevokedKeys()">
+                {{showRevokedKeys ? 'Hide revoked keys' : 'Show revoked keys'}}
+            </button>
+        </div>
+
         <div class="create-card">
             <div class="section-heading">
                 <h4>Create API Key</h4>
@@ -99,7 +113,12 @@
 
         <div class="key-list" *ngIf="(apiKeys | async) as apiKeys; else loadingState">
             <div class="empty-state" *ngIf="apiKeys.length === 0">
-                No API keys configured yet.
+                <ng-container *ngIf="state.api_keys.revoked > 0 && !showRevokedKeys; else noVisibleKeys">
+                    No active API keys are visible right now. {{state.api_keys.revoked}} revoked key{{state.api_keys.revoked === 1 ? '' : 's'}} are hidden.
+                </ng-container>
+                <ng-template #noVisibleKeys>
+                    No API keys configured yet.
+                </ng-template>
             </div>
 
             <div class="key-item" *ngFor="let key of apiKeys" [class.revoked]="!key.active">
@@ -122,26 +141,36 @@
                         <span>Updated {{key.updated_at}}</span>
                         <span *ngIf="key.revoked_at">Revoked {{key.revoked_at}}</span>
                     </div>
+                    <div class="revoked-note" *ngIf="!key.active">
+                        Revoked keys are locked. They cannot be edited, rotated, or revoked again.
+                    </div>
                 </div>
 
                 <div class="key-actions">
-                    <button class="btn btn-secondary btn-sm edit-key-btn"
-                            type="button"
-                            (click)="startEdit(key)">
-                        Edit
-                    </button>
-                    <button class="btn btn-warning btn-sm rotate-key-btn"
-                            type="button"
-                            [disabled]="!key.active"
-                            (click)="rotateApiKey(key)">
-                        Rotate
-                    </button>
-                    <button class="btn btn-danger btn-sm revoke-key-btn"
-                            type="button"
-                            [disabled]="!key.active"
-                            (click)="revokeApiKey(key)">
-                        Revoke
-                    </button>
+                    <ng-container *ngIf="key.active; else revokedActions">
+                        <button class="btn btn-secondary btn-sm edit-key-btn"
+                                type="button"
+                                (click)="startEdit(key)">
+                            Edit
+                        </button>
+                        <button class="btn btn-warning btn-sm rotate-key-btn"
+                                type="button"
+                                (click)="rotateApiKey(key)">
+                            Rotate
+                        </button>
+                        <button class="btn btn-danger btn-sm revoke-key-btn"
+                                type="button"
+                                (click)="revokeApiKey(key)">
+                            Revoke
+                        </button>
+                    </ng-container>
+                    <ng-template #revokedActions>
+                        <button class="btn btn-danger btn-sm delete-key-btn"
+                                type="button"
+                                (click)="deleteRevokedApiKey(key)">
+                            Delete permanently
+                        </button>
+                    </ng-template>
                 </div>
 
                 <div class="edit-card" *ngIf="isEditing(key)">

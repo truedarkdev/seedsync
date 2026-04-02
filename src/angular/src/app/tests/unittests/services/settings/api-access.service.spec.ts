@@ -41,6 +41,16 @@ describe("Testing API access service", () => {
         active: true
     }];
 
+    const revokedApiKeys: ApiKeyRecord[] = [{
+        id: "revoked-reader",
+        name: "Revoked Reader",
+        scopes: ["read"],
+        created_at: "2026-04-01T00:00:00+00:00",
+        updated_at: "2026-04-01T00:04:00+00:00",
+        revoked_at: "2026-04-01T00:04:00+00:00",
+        active: false
+    }];
+
     beforeEach(() => {
         TestBed.configureTestingModule({
             imports: [
@@ -121,6 +131,36 @@ describe("Testing API access service", () => {
 
         expect(result.key.name).toBe("Writer");
         expect(result.secret).toBe("secret-value");
+        httpMock.verify();
+    });
+
+    it("should reveal revoked keys only when requested and delete revoked keys", () => {
+        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
+
+        apiAccessService.setIncludeRevokedApiKeys(true);
+
+        const revokedListRequest = httpMock.expectOne(request => {
+            return request.url === "/server/admin/api-keys/v1" && request.params.get("include_revoked") === "1";
+        });
+        revokedListRequest.flush({keys: revokedApiKeys});
+
+        let deleted = false;
+        apiAccessService.deleteApiKey("revoked-reader").subscribe({
+            next: () => deleted = true
+        });
+
+        const deleteRequest = httpMock.expectOne("/server/admin/api-keys/v1/revoked-reader");
+        expect(deleteRequest.request.method).toBe("DELETE");
+        deleteRequest.flush(null, {status: 204, statusText: "No Content"});
+
+        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
+        const refreshedRequest = httpMock.expectOne(request => {
+            return request.url === "/server/admin/api-keys/v1" && request.params.get("include_revoked") === "1";
+        });
+        refreshedRequest.flush({keys: baseApiKeys});
+
+        expect(deleted).toBeTrue();
         httpMock.verify();
     });
 

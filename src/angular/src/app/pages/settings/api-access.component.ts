@@ -46,6 +46,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
 
     public migrationState = this._apiAccessService.migrationState;
     public apiKeys = this._apiAccessService.apiKeys;
+    public showRevokedKeys = false;
 
     public createName = "";
     public createScopes: ScopeSelection = this.defaultScopeSelection();
@@ -67,6 +68,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     ngOnInit() {
+        this._apiAccessService.setIncludeRevokedApiKeys(this.showRevokedKeys);
         this._apiAccessService.migrationState.pipe(takeUntil(this._destroy$)).subscribe({
             next: () => this._changeDetector.markForCheck()
         });
@@ -82,6 +84,9 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     public startEdit(key: ApiKeyRecord) {
+        if (!key.active) {
+            return;
+        }
         this.editingKeyId = key.id;
         this.editingName = key.name;
         this.editingScopes = this.scopeSelectionFromList(key.scopes);
@@ -118,6 +123,10 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     public saveApiKey(key: ApiKeyRecord) {
+        if (!key.active) {
+            this.showError("Revoked API keys cannot be edited");
+            return;
+        }
         const name = this.editingName.trim();
         const scopes = this.getSelectedScopes(this.editingScopes);
         if (!name) {
@@ -140,6 +149,9 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     public rotateApiKey(key: ApiKeyRecord) {
+        if (!key.active) {
+            return;
+        }
         this.confirmAction(
             "Rotate API Key",
             `Rotation reveals a new secret for ${key.name} and immediately retires the old one.`,
@@ -157,6 +169,9 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     public revokeApiKey(key: ApiKeyRecord) {
+        if (!key.active) {
+            return;
+        }
         this.confirmAction(
             "Revoke API Key",
             `Are you sure you want to revoke ${key.name}? The secret will stop working immediately.`,
@@ -171,6 +186,34 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
                     this._changeDetector.markForCheck();
                 },
                 error: error => this.showError(`Failed to revoke API key: ${this.describeError(error)}`)
+            })
+        );
+    }
+
+    public toggleRevokedKeys() {
+        this.showRevokedKeys = !this.showRevokedKeys;
+        this._apiAccessService.setIncludeRevokedApiKeys(this.showRevokedKeys);
+        this._changeDetector.markForCheck();
+    }
+
+    public deleteRevokedApiKey(key: ApiKeyRecord) {
+        if (key.active) {
+            return;
+        }
+        this.confirmAction(
+            "Delete Revoked API Key",
+            `Permanently remove revoked key ${key.name}? This cannot be undone.`,
+            "Delete",
+            "btn btn-danger",
+            () => this._apiAccessService.deleteApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
+                next: () => {
+                    this.showSuccess("Deleted revoked API key");
+                    if (this.editingKeyId === key.id) {
+                        this.cancelEdit();
+                    }
+                    this._changeDetector.markForCheck();
+                },
+                error: error => this.showError(`Failed to delete revoked API key: ${this.describeError(error)}`)
             })
         );
     }

@@ -53,6 +53,7 @@ class AdminHandler(IHandler):
         web_app.add_handler("/server/admin/api-keys/v1", self.__handle_list_api_keys, required_scope="admin")
         web_app.add_post_handler("/server/admin/api-keys/v1", self.__handle_create_api_key, required_scope="admin")
         web_app.add_put_handler("/server/admin/api-keys/v1/<key_id>", self.__handle_update_api_key, required_scope="admin")
+        web_app.add_delete_handler("/server/admin/api-keys/v1/<key_id>", self.__handle_delete_api_key, required_scope="admin")
         web_app.add_post_handler(
             "/server/admin/api-keys/v1/<key_id>/revoke",
             self.__handle_revoke_api_key,
@@ -94,7 +95,8 @@ class AdminHandler(IHandler):
         return self.__json_response(self.__auth_store.get_migration_state(self.__config))
 
     def __handle_list_api_keys(self):
-        return self.__json_response({"keys": self.__auth_store.list_api_keys()})
+        include_revoked = AdminHandler.__query_flag("include_revoked")
+        return self.__json_response({"keys": self.__auth_store.list_api_keys(include_revoked=include_revoked)})
 
     def __handle_create_api_key(self):
         try:
@@ -125,12 +127,23 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
+    def __handle_delete_api_key(self, key_id: str):
+        try:
+            self.__auth_store.delete_api_key(key_id)
+            return HTTPResponse(status=204)
+        except KeyError as exc:
+            return self.__json_response({"error": str(exc)}, status=404)
+        except ValueError as exc:
+            return self.__json_response({"error": str(exc)}, status=400)
+
     def __handle_revoke_api_key(self, key_id: str):
         try:
             record = self.__auth_store.revoke_api_key(key_id)
             return self.__json_response({"key": record.to_public_dict()})
         except KeyError as exc:
             return self.__json_response({"error": str(exc)}, status=404)
+        except ValueError as exc:
+            return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_rotate_api_key(self, key_id: str):
         try:
@@ -143,3 +156,10 @@ class AdminHandler(IHandler):
             return self.__json_response({"error": str(exc)}, status=404)
         except ValueError as exc:
             return self.__json_response({"error": str(exc)}, status=400)
+
+    @staticmethod
+    def __query_flag(name: str) -> bool:
+        value = bottle.request.query.get(name)
+        if value is None:
+            return False
+        return value.strip().lower() in {"1", "true", "yes", "on"}

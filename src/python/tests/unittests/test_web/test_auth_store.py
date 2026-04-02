@@ -36,12 +36,36 @@ class TestApiKeyStore(unittest.TestCase):
             revoked = store.revoke_api_key(record.id)
             self.assertIsNotNone(revoked.revoked_at)
             with self.assertRaises(ValueError):
+                store.revoke_api_key(record.id)
+            with self.assertRaises(ValueError):
                 store.rotate_api_key(record.id)
+            with self.assertRaises(ValueError):
+                store.update_api_key(record.id, name="revoked-admin")
+
+            self.assertEqual(0, len(store.list_api_keys()))
+            self.assertEqual(1, len(store.list_api_keys(include_revoked=True)))
+            self.assertFalse(store.list_api_keys(include_revoked=True)[0]["active"])
+
+            deleted = store.delete_api_key(record.id)
+            self.assertEqual(record.id, deleted.id)
 
             reloaded = ApiKeyStore.from_file(store_path)
-            self.assertEqual(1, len(reloaded.list_api_keys()))
-            self.assertFalse(reloaded.list_api_keys()[0]["active"])
+            self.assertEqual(0, len(reloaded.list_api_keys()))
+            self.assertEqual(0, len(reloaded.list_api_keys(include_revoked=True)))
             self.assertTrue(reloaded.legacy_api_token_compatibility_enabled)
+
+    def test_delete_api_key_rejects_active_keys(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ApiKeyStore(file_path=os.path.join(temp_dir, "api-keys.json"))
+
+            created = store.create_api_key("reader", ["read"])
+            with self.assertRaises(ValueError):
+                store.delete_api_key(created["record"].id)
+
+            store.revoke_api_key(created["record"].id)
+            deleted = store.delete_api_key(created["record"].id)
+            self.assertEqual(created["record"].id, deleted.id)
+            self.assertIsNone(store.get_api_key(created["record"].id))
 
     def test_legacy_compatibility_flag_is_persisted(self):
         with tempfile.TemporaryDirectory() as temp_dir:

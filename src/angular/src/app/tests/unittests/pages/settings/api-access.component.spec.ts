@@ -15,9 +15,37 @@ import {ModalAccessibilityService} from "../../../../services/utils/modal-access
 import {Notification} from "../../../../services/utils/notification";
 
 
+const activeApiKeys: ApiKeyRecord[] = [{
+    id: "reader",
+    name: "Reader",
+    scopes: ["read"],
+    created_at: "2026-04-01T00:00:00+00:00",
+    updated_at: "2026-04-01T00:00:00+00:00",
+    revoked_at: null,
+    active: true
+}];
+
+const revokedApiKey: ApiKeyRecord = {
+    id: "revoked-reader",
+    name: "Revoked Reader",
+    scopes: ["read"],
+    created_at: "2026-04-01T00:05:00+00:00",
+    updated_at: "2026-04-01T00:06:00+00:00",
+    revoked_at: "2026-04-01T00:06:00+00:00",
+    active: false
+};
+
+
 class MockApiAccessService {
     migrationState = new BehaviorSubject<ApiAccessMigrationState>(null);
     apiKeys = new BehaviorSubject<ApiKeyRecord[]>(null);
+    setIncludeRevokedApiKeys = jasmine.createSpy("setIncludeRevokedApiKeys").and.callFake((includeRevoked: boolean) => {
+        if (includeRevoked) {
+            this.apiKeys.next([activeApiKeys[0], revokedApiKey]);
+        } else {
+            this.apiKeys.next(activeApiKeys);
+        }
+    });
 
     createApiKey = jasmine.createSpy("createApiKey").and.returnValue(of({
         key: {
@@ -61,6 +89,12 @@ class MockApiAccessService {
         revoked_at: "2026-04-01T00:13:00+00:00",
         active: false
     }));
+    deleteApiKey = jasmine.createSpy("deleteApiKey").and.callFake((keyId: string) => {
+        if (keyId === revokedApiKey.id) {
+            this.apiKeys.next(activeApiKeys);
+        }
+        return of(void 0);
+    });
     disableLegacyApiToken = jasmine.createSpy("disableLegacyApiToken").and.returnValue(of({
         legacy_api_token: {
             configured: true,
@@ -140,21 +174,11 @@ describe("Testing API access component", () => {
             accepted_for_external_non_admin: true
         },
         api_keys: {
-            total: 1,
+            total: 2,
             active: 1,
-            revoked: 0
+            revoked: 1
         }
     };
-
-    const apiKeys: ApiKeyRecord[] = [{
-        id: "reader",
-        name: "Reader",
-        scopes: ["read"],
-        created_at: "2026-04-01T00:00:00+00:00",
-        updated_at: "2026-04-01T00:00:00+00:00",
-        revoked_at: null,
-        active: true
-    }];
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -176,7 +200,7 @@ describe("Testing API access component", () => {
         apiAccessService = TestBed.get(ApiAccessService);
         notificationService = TestBed.get(NotificationService);
         apiAccessService.migrationState.next(migrationState);
-        apiAccessService.apiKeys.next(apiKeys);
+        apiAccessService.apiKeys.next(activeApiKeys);
         fixture.detectChanges();
     });
 
@@ -186,9 +210,37 @@ describe("Testing API access component", () => {
         expect(host.textContent).toContain("API Access");
         expect(host.textContent).toContain("Legacy token compatibility is active.");
         expect(host.textContent).toContain("Reader");
+        expect(host.querySelector(".key-item:not(.revoked) .delete-key-btn")).toBeNull();
+        expect(host.textContent).toContain("1 revoked key hidden");
+        expect(host.querySelector(".toggle-revoked-keys-btn")).not.toBeNull();
         expect(host.querySelector(".disable-legacy-btn")).not.toBeNull();
         expect(host.querySelector(".clear-legacy-btn")).not.toBeNull();
     });
+
+    it("should reveal revoked keys on demand and allow permanent deletion", fakeAsync(() => {
+        const host: HTMLElement = fixture.nativeElement;
+
+        expect(host.textContent).not.toContain("Revoked Reader");
+
+        const revealButton = host.querySelector(".toggle-revoked-keys-btn") as HTMLButtonElement;
+        revealButton.click();
+        fixture.detectChanges();
+
+        expect(apiAccessService.setIncludeRevokedApiKeys).toHaveBeenCalledWith(true);
+        expect(host.textContent).toContain("Revoked Reader");
+        expect(host.querySelector(".key-item.revoked .edit-key-btn")).toBeNull();
+        expect(host.querySelector(".key-item.revoked .rotate-key-btn")).toBeNull();
+        expect(host.querySelector(".key-item.revoked .revoke-key-btn")).toBeNull();
+
+        const deleteButton = host.querySelector(".key-item.revoked .delete-key-btn") as HTMLButtonElement;
+        deleteButton.click();
+        flushMicrotasks();
+        fixture.detectChanges();
+
+        expect(apiAccessService.deleteApiKey).toHaveBeenCalledWith("revoked-reader");
+        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Deleted revoked API key");
+        expect(host.textContent).not.toContain("Revoked Reader");
+    }));
 
     it("should create a key and reveal the returned secret", () => {
         apiAccessService.createApiKey.and.returnValue(of({
@@ -236,7 +288,7 @@ describe("Testing API access component", () => {
             revoked_at: null,
             active: true
         }));
-        component.startEdit(apiKeys[0]);
+        component.startEdit(activeApiKeys[0]);
         fixture.detectChanges();
 
         component.editingName = "Reader updated";
@@ -248,7 +300,7 @@ describe("Testing API access component", () => {
         };
         fixture.detectChanges();
 
-        component.saveApiKey(apiKeys[0]);
+        component.saveApiKey(activeApiKeys[0]);
         fixture.detectChanges();
 
         expect(apiAccessService.updateApiKey).toHaveBeenCalledWith(
