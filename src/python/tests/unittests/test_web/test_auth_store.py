@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import json
 
 from web.auth_store import ApiKeyStore
 from common import PersistError
@@ -84,3 +85,59 @@ class TestApiKeyStore(unittest.TestCase):
               "api_keys": []
             }
             """)
+
+    def test_bootstrap_proof_is_created_published_consumed_and_not_replayed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proof_path = os.path.join(temp_dir, "bootstrap", "browser-bootstrap.json")
+            store = ApiKeyStore(file_path=os.path.join(temp_dir, "api-keys.json"))
+            store.bind_bootstrap_proof_path(proof_path)
+
+            proof = store.ensure_bootstrap_proof()
+
+            self.assertIsNotNone(proof)
+            self.assertTrue(os.path.isfile(proof_path))
+            self.assertTrue(store.peek_bootstrap_proof(proof.secret))
+
+            with open(proof_path, "r", encoding="utf-8") as handle:
+                artifact = json.load(handle)
+            self.assertEqual(proof.secret, artifact["proof"])
+
+            self.assertTrue(store.consume_bootstrap_proof(proof.secret))
+            self.assertFalse(store.peek_bootstrap_proof(proof.secret))
+            self.assertFalse(store.consume_bootstrap_proof(proof.secret))
+            self.assertFalse(os.path.exists(proof_path))
+
+    def test_bootstrap_exchange_is_created_consumed_and_cleared_by_admin_creation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ApiKeyStore(file_path=os.path.join(temp_dir, "api-keys.json"))
+
+            exchange = store.ensure_bootstrap_exchange()
+
+            self.assertIsNotNone(exchange)
+            self.assertTrue(store.peek_bootstrap_exchange(exchange.secret))
+            self.assertTrue(store.consume_bootstrap_exchange(exchange.secret))
+            self.assertFalse(store.peek_bootstrap_exchange(exchange.secret))
+
+            recreated = store.ensure_bootstrap_exchange()
+            self.assertIsNotNone(recreated)
+            self.assertNotEqual(exchange.secret, recreated.secret)
+
+            store.create_api_key("admin", ["admin"])
+
+            self.assertIsNone(store.ensure_bootstrap_exchange())
+            self.assertFalse(store.peek_bootstrap_exchange(recreated.secret))
+
+    def test_admin_key_creation_clears_bootstrap_proof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            proof_path = os.path.join(temp_dir, "bootstrap", "browser-bootstrap.json")
+            store = ApiKeyStore(file_path=os.path.join(temp_dir, "api-keys.json"))
+            store.bind_bootstrap_proof_path(proof_path)
+
+            proof = store.ensure_bootstrap_proof()
+            self.assertIsNotNone(proof)
+            self.assertTrue(os.path.isfile(proof_path))
+
+            store.create_api_key("admin", ["admin"])
+
+            self.assertFalse(store.peek_bootstrap_proof(proof.secret))
+            self.assertFalse(os.path.exists(proof_path))

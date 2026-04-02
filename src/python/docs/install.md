@@ -36,7 +36,7 @@ Select the section for your platform:
 
         :::bash
         docker run \
-           -p 8800:8800 \
+           -p 127.0.0.1:8800:8800 \
            -v <downloads directory>:/downloads \
            [-v <mounts directory>:/mounts] \
            -v <config directory>:/config \
@@ -82,39 +82,18 @@ SeedSync supports Windows via the Docker container.
 
 2. Make sure you can successfully run the [Hello World](https://docs.docker.com/get-started/#test-docker-installation) app in Docker.
 
-3. Open the Docker terminal and run the SeedSync image with the following command:
+3. From this repository, start the local Docker app with the Windows helper:
 
-        :::bash
-        docker run \
-           -p 8800:8800 \
-           -v <downloads directory>:/downloads \
-           [-v <mounts directory>:/mounts] \
-           -v <config directory>:/config \
-           ipsingh06/seedsync
+        :::powershell
+        .\scripts\start-seedsync-secure-bootstrap.ps1
 
     where
 
-    * `<downloads directory>` refers to the location on host machine where downloaded files will be placed
-    * `<mounts directory>` is optional and refers to an additional mounted or network-backed host location you want to expose inside the container
-    * `<config directory>` refers to the location on host machine where config files will be placed
-    * any host directories you mount must already exist
+    * the helper starts the repo-owned local Docker Compose path
+    * the helper reads SeedSync's one-time bootstrap proof from inside the running container
+    * the helper opens the browser automatically on SeedSync's local bootstrap page with no manual token copy or config edits
 
-    !!! note
-        The Windows host machine path is specified as `/c/Users/...`
-
-4. Access application GUI to verify SeedSync is running.
-   Docker on Windows may not forward port to the local host. We need to find the IP address of the container.
-
-   1. Open a new Docker terminal and run the command:
-
-        :::bash
-        docker-machine ip
-        192.168.100.17
-
-   2. Open &lt;ip address&gt;:8800 in your browser.
-      In this example that would be [http://192.168.100.17:8800](http://192.168.100.17:8800)
-
-   3. Verify that SeedSync dashboard loads.
+4. Access application GUI to verify SeedSync is running by opening [http://localhost:8800](http://localhost:8800) in your browser if it is not already open.
 
 5. Go to the Settings page and fill out the required information.
    Under the Local Directory setting, enter `/downloads` for ordinary local storage.

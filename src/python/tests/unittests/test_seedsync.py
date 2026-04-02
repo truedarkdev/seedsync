@@ -65,6 +65,22 @@ class TestSeedsync(unittest.TestCase):
         self.assertIsNotNone(args)
         self.assertEqual("/path/to/scanfs", args.scanfs)
 
+    def test_args_web_bind_host(self):
+        args = Seedsync._parse_args([
+            "-c", "/path/to/config",
+            "--html", "/path/to/html",
+            "--scanfs", "/path/to/scanfs",
+            "--web-bind-host", "127.0.0.1",
+        ])
+        self.assertEqual("127.0.0.1", args.web_bind_host)
+
+        args = Seedsync._parse_args([
+            "-c", "/path/to/config",
+            "--html", "/path/to/html",
+            "--scanfs", "/path/to/scanfs",
+        ])
+        self.assertEqual("0.0.0.0", args.web_bind_host)
+
     def test_args_logdir(self):
         argv = []
         argv.append("-c")
@@ -387,7 +403,7 @@ class TestSeedsync(unittest.TestCase):
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
         self.assertTrue(any("rollout compatibility only" in message for message in warning_messages))
-        self.assertTrue(any("Admin endpoints require scoped API keys" in message for message in warning_messages))
+        self.assertTrue(any("admin endpoints still require scoped API keys" in message for message in warning_messages))
         self.assertTrue(any("selected compatibility /server/* routes" in message for message in warning_messages))
         self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
         self.assertEqual(2, logger.warning.call_count)

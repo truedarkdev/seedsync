@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Optional, Type, TypeVar
 import shutil
 import platform
+import tempfile
 
 # my libs
 from common import ServiceExit, Context, Constants, Config, Args, AppError
@@ -34,6 +35,7 @@ class Seedsync:
     __FILE_AUTO_QUEUE_PERSIST = "autoqueue.persist"
     __FILE_CONTROLLER_PERSIST = "controller.persist"
     __FILE_API_KEY_STORE = "api-keys.json"
+    __FILE_BOOTSTRAP_PROOF = os.path.join("seedsync-bootstrap", "browser-bootstrap.json")
     __CONFIG_DUMMY_VALUE = "<replace me>"
 
     # This logger is used to print any exceptions caught at top module
@@ -71,6 +73,7 @@ class Seedsync:
         ctx_args.html_path = args.html
         ctx_args.debug = is_debug
         ctx_args.exit = args.exit
+        ctx_args.web_bind_host = args.web_bind_host
 
         # Logger setup
         # We separate the main log from the web-access log
@@ -119,14 +122,21 @@ class Seedsync:
         self.api_key_store_path = os.path.join(args.config_dir, Seedsync.__FILE_API_KEY_STORE)
         self.api_key_store = self._load_persist(ApiKeyStore, self.api_key_store_path)
         self.api_key_store.bind_file_path(self.api_key_store_path)
+        self.api_key_store.bind_bootstrap_proof_path(
+            os.path.join(tempfile.gettempdir(), Seedsync.__FILE_BOOTSTRAP_PROOF)
+        )
 
     def run(self):
         self.context.logger.info("Starting SeedSync")
         self.context.logger.info("Platform: {}".format(platform.machine()))
+        api_key_store = getattr(self, "api_key_store", None)
+        if api_key_store is not None:
+            api_key_store.ensure_bootstrap_proof()
         Seedsync._emit_startup_warnings(
             self.context.logger,
             self.context.config,
-            getattr(self, "api_key_store", None)
+            getattr(self, "api_key_store", None),
+            web_bind_host=getattr(self.context.args, "web_bind_host", "0.0.0.0")
         )
 
         if self.context.args.exit:
@@ -376,6 +386,9 @@ class Seedsync:
                             required=not is_frozen,
                             default=default_scanfs_path,
                             help="Path to scanfs executable")
+        parser.add_argument("--web-bind-host",
+                            default="0.0.0.0",
+                            help="Host/IP address for the web server to bind to")
 
         return parser.parse_args(args)
 
@@ -418,6 +431,7 @@ class Seedsync:
         config.general.verbose = False
         config.general.api_token = ""
         config.general.allowed_hostname = ""
+        config.general.trusted_browser_bootstrap_remote_addrs = ""
 
         config.lftp.remote_address = Seedsync.__CONFIG_DUMMY_VALUE
         config.lftp.remote_username = Seedsync.__CONFIG_DUMMY_VALUE

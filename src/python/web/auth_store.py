@@ -15,11 +15,13 @@ from typing import Dict, List, Optional, Sequence
 from common import Persist, PersistError
 
 
-_ALLOWED_SCOPES = {"read", "write", "stream", "admin"}
+_ALLOWED_SCOPES = {"read", "write", "stream", "admin", "bootstrap"}
 _HASH_ALGORITHM = "pbkdf2_sha256"
 _HASH_ITERATIONS = 200000
 _HASH_SALT_BYTES = 16
 _UI_SESSION_TTL = timedelta(hours=12)
+_BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
+_BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
 
 
 def _utc_now_iso() -> str:
@@ -115,6 +117,21 @@ class UiSessionRecord:
     scopes: List[str] = field(default_factory=list)
     created_at: str = ""
     expires_at: str = ""
+    bootstrap: bool = False
+
+
+@dataclass
+class BootstrapProofRecord:
+    secret: str
+    created_at: str = ""
+    expires_at: str = ""
+
+
+@dataclass
+class BootstrapExchangeRecord:
+    secret: str
+    created_at: str = ""
+    expires_at: str = ""
 
 
 class ApiKeyStore(Persist):
@@ -127,6 +144,9 @@ class ApiKeyStore(Persist):
         self.__api_keys: List[ApiKeyRecord] = []
         self.__legacy_api_token_compatibility_enabled = True
         self.__ui_sessions: Dict[str, UiSessionRecord] = {}
+        self.__bootstrap_proof_path: Optional[str] = None
+        self.__bootstrap_proof: Optional[BootstrapProofRecord] = None
+        self.__bootstrap_exchange: Optional[BootstrapExchangeRecord] = None
 
     @property
     def file_path(self) -> Optional[str]:
@@ -134,6 +154,10 @@ class ApiKeyStore(Persist):
 
     def bind_file_path(self, file_path: str) -> None:
         self.__file_path = file_path
+
+    def bind_bootstrap_proof_path(self, file_path: str) -> None:
+        self.__bootstrap_proof_path = file_path
+        self.__sync_bootstrap_proof_artifact()
 
     @property
     def legacy_api_token_compatibility_enabled(self) -> bool:
@@ -175,14 +199,17 @@ class ApiKeyStore(Persist):
                 return record
         return None
 
-    def create_ui_session(self, scopes: Sequence[str]) -> UiSessionRecord:
+    def create_ui_session(self, scopes: Sequence[str], bootstrap: bool = False) -> UiSessionRecord:
         normalized_scopes = _normalize_scopes(scopes)
+        if type(bootstrap) is not bool:
+            raise ValueError("Bootstrap session flag must be a boolean")
         now = datetime.now(timezone.utc)
         record = UiSessionRecord(
             secret=secrets.token_urlsafe(32),
             scopes=normalized_scopes,
             created_at=now.isoformat(timespec="seconds"),
             expires_at=(now + _UI_SESSION_TTL).isoformat(timespec="seconds"),
+            bootstrap=bootstrap,
         )
         self.__ui_sessions[record.secret] = record
         self.__prune_expired_ui_sessions(now)
@@ -203,6 +230,85 @@ class ApiKeyStore(Persist):
             return None
         return record
 
+    def ensure_bootstrap_proof(self) -> Optional[BootstrapProofRecord]:
+        now = datetime.now(timezone.utc)
+        self.__prune_bootstrap_proof(now)
+        self.__prune_bootstrap_exchange(now)
+        if self.active_admin_key_count > 0:
+            self.clear_bootstrap_proof()
+            self.clear_bootstrap_exchange()
+            return None
+
+        if self.__bootstrap_proof is None:
+            self.__bootstrap_proof = BootstrapProofRecord(
+                secret=secrets.token_urlsafe(32),
+                created_at=now.isoformat(timespec="seconds"),
+                expires_at=(now + _BOOTSTRAP_PROOF_TTL).isoformat(timespec="seconds"),
+            )
+            self.__sync_bootstrap_proof_artifact()
+
+        return self.__bootstrap_proof
+
+    def peek_bootstrap_proof(self, secret: str) -> bool:
+        if not isinstance(secret, str) or not secret.strip():
+            return False
+
+        now = datetime.now(timezone.utc)
+        self.__prune_bootstrap_proof(now)
+        if self.__bootstrap_proof is None:
+            return False
+
+        return hmac.compare_digest(self.__bootstrap_proof.secret, secret.strip())
+
+    def consume_bootstrap_proof(self, secret: str) -> bool:
+        if not self.peek_bootstrap_proof(secret):
+            return False
+
+        self.__bootstrap_proof = None
+        self.__sync_bootstrap_proof_artifact()
+        return True
+
+    def clear_bootstrap_proof(self) -> None:
+        self.__bootstrap_proof = None
+        self.__sync_bootstrap_proof_artifact()
+
+    def ensure_bootstrap_exchange(self) -> Optional[BootstrapExchangeRecord]:
+        now = datetime.now(timezone.utc)
+        self.__prune_bootstrap_exchange(now)
+        if self.active_admin_key_count > 0:
+            self.clear_bootstrap_exchange()
+            return None
+
+        if self.__bootstrap_exchange is None:
+            self.__bootstrap_exchange = BootstrapExchangeRecord(
+                secret=secrets.token_urlsafe(32),
+                created_at=now.isoformat(timespec="seconds"),
+                expires_at=(now + _BOOTSTRAP_EXCHANGE_TTL).isoformat(timespec="seconds"),
+            )
+
+        return self.__bootstrap_exchange
+
+    def peek_bootstrap_exchange(self, secret: str) -> bool:
+        if not isinstance(secret, str) or not secret.strip():
+            return False
+
+        now = datetime.now(timezone.utc)
+        self.__prune_bootstrap_exchange(now)
+        if self.__bootstrap_exchange is None:
+            return False
+
+        return hmac.compare_digest(self.__bootstrap_exchange.secret, secret.strip())
+
+    def consume_bootstrap_exchange(self, secret: str) -> bool:
+        if not self.peek_bootstrap_exchange(secret):
+            return False
+
+        self.__bootstrap_exchange = None
+        return True
+
+    def clear_bootstrap_exchange(self) -> None:
+        self.__bootstrap_exchange = None
+
     def create_api_key(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
         scopes = _normalize_scopes(scopes)
         if not isinstance(name, str) or not name.strip():
@@ -219,6 +325,9 @@ class ApiKeyStore(Persist):
             updated_at=now,
         )
         self.__api_keys.append(record)
+        if "admin" in scopes:
+            self.clear_bootstrap_proof()
+            self.clear_bootstrap_exchange()
         self.save()
         return {"record": record, "secret": secret}
 
@@ -387,3 +496,49 @@ class ApiKeyStore(Persist):
                 expired_session_ids.append(secret)
         for secret in expired_session_ids:
             self.__ui_sessions.pop(secret, None)
+
+    def __prune_bootstrap_proof(self, now: datetime) -> None:
+        if self.__bootstrap_proof is None:
+            return
+
+        try:
+            if datetime.fromisoformat(self.__bootstrap_proof.expires_at) > now:
+                return
+        except ValueError:
+            pass
+
+        self.__bootstrap_proof = None
+        self.__sync_bootstrap_proof_artifact()
+
+    def __prune_bootstrap_exchange(self, now: datetime) -> None:
+        if self.__bootstrap_exchange is None:
+            return
+
+        try:
+            if datetime.fromisoformat(self.__bootstrap_exchange.expires_at) > now:
+                return
+        except ValueError:
+            pass
+
+        self.__bootstrap_exchange = None
+
+    def __sync_bootstrap_proof_artifact(self) -> None:
+        if not self.__bootstrap_proof_path:
+            return
+
+        artifact_dir = os.path.dirname(self.__bootstrap_proof_path)
+        if artifact_dir:
+            os.makedirs(artifact_dir, exist_ok=True)
+
+        if self.__bootstrap_proof is None:
+            if os.path.exists(self.__bootstrap_proof_path):
+                os.remove(self.__bootstrap_proof_path)
+            return
+
+        payload = {
+            "proof": self.__bootstrap_proof.secret,
+            "created_at": self.__bootstrap_proof.created_at,
+            "expires_at": self.__bootstrap_proof.expires_at,
+        }
+        with open(self.__bootstrap_proof_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)

@@ -90,6 +90,15 @@ class TestWebAppStream(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
 
+    def test_bootstrap_page_serves_exchange_bootstrap_script(self):
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        response = client.get("/bootstrap")
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("/server/admin/bootstrap/v1/exchange", response.text)
+
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []
         self.web_app.add_streaming_handler(
@@ -508,6 +517,42 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, stream_response.status_int)
         self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
 
+    def test_bootstrap_page_sets_http_only_exchange_cookie_for_loopback_before_first_admin_exists(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        response = client.get(
+            "/bootstrap?proof=test-proof",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+            },
+        )
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("seedsync_bootstrap_exchange=", response.headers.get("Set-Cookie", ""))
+        self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
+
+    def test_bootstrap_page_rejects_untrusted_remote_before_first_admin_exists(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        response = client.get(
+            "/bootstrap?proof=test-proof",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "203.0.113.10",
+            },
+            expect_errors=True,
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Bootstrap proof redemption is limited", response.text)
+
     def test_trusted_bootstrap_remote_can_use_sessionless_status_and_stream_before_first_admin_exists(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         empty_store = ApiKeyStore()
@@ -528,15 +573,124 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             "HTTP_REFERER": "http://localhost:8800/settings",
         }
 
-        status_response = client.get("/server/status", extra_environ=trusted_headers)
+        status_response = client.get("/server/status", extra_environ=trusted_headers, expect_errors=True)
+        self.assertEqual(401, status_response.status_int)
 
         Timer(0.1, web_app.stop).start()
-        stream_response = client.get("/server/stream", extra_environ=trusted_headers)
+        stream_response = client.get("/server/stream", extra_environ=trusted_headers, expect_errors=True)
+        self.assertEqual(401, stream_response.status_int)
 
-        self.assertEqual(200, status_response.status_int)
-        self.assertEqual("ok", status_response.text)
-        self.assertEqual(200, stream_response.status_int)
-        self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
+    def test_bootstrap_limited_ui_session_allows_only_trusted_remote_shell_and_bootstrap_routes(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/status", required_scope="read")
+        def _status():
+            return "ok"
+
+        @web_app.route("/server/admin/bootstrap-check", required_scope="admin", allow_first_admin_bootstrap=True)
+        def _bootstrap_check():
+            return "ok"
+
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+        bootstrap_session = empty_store.create_ui_session(["bootstrap"], bootstrap=True)
+        bootstrap_cookie = "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, bootstrap_session.secret)
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            shell_response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "172.25.0.1",
+                    "HTTP_COOKIE": bootstrap_cookie,
+                }
+            )
+        self.assertEqual(200, shell_response.status_int)
+
+        bootstrap_check = client.get(
+            "/server/admin/bootstrap-check",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "172.25.0.1",
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
+                "HTTP_COOKIE": bootstrap_cookie,
+            }
+        )
+        self.assertEqual(200, bootstrap_check.status_int)
+        self.assertEqual("ok", bootstrap_check.text)
+
+        denied_status = client.get(
+            "/server/status",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "172.25.0.1",
+                "HTTP_COOKIE": bootstrap_cookie,
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
+            },
+            expect_errors=True,
+        )
+        self.assertEqual(403, denied_status.status_int)
+        self.assertIn("Session lacks scope", denied_status.text)
+        self.assertIn("read", denied_status.text)
+
+    def test_bootstrap_limited_ui_session_is_denied_on_ordinary_stream_routes(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        web_app.add_streaming_handler(QueueStreamHandler, values=["event\n"], cleanup_log=[])
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+        bootstrap_session = empty_store.create_ui_session(["bootstrap"], bootstrap=True)
+        bootstrap_cookie = "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, bootstrap_session.secret)
+
+        Timer(0.1, web_app.stop).start()
+        denied_stream = client.get(
+            "/server/stream",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "172.25.0.1",
+                "HTTP_COOKIE": bootstrap_cookie,
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
+            },
+            expect_errors=True,
+        )
+
+        self.assertEqual(403, denied_stream.status_int)
+        self.assertIn("Session lacks scope", denied_stream.text)
+        self.assertIn("stream", denied_stream.text)
+
+    def test_bootstrap_limited_ui_session_is_denied_on_ordinary_admin_routes(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/admin/ping", required_scope="admin")
+        def _admin_ping():
+            return "pong"
+
+        client = TestApp(web_app)
+        bootstrap_session = empty_store.create_ui_session(["bootstrap"], bootstrap=True)
+        bootstrap_cookie = "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, bootstrap_session.secret)
+
+        denied_admin = client.get(
+            "/server/admin/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "172.25.0.1",
+                "HTTP_COOKIE": bootstrap_cookie,
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
+            },
+            expect_errors=True,
+        )
+
+        self.assertEqual(403, denied_admin.status_int)
+        self.assertIn("Session lacks scope", denied_admin.text)
+        self.assertIn("admin", denied_admin.text)
 
     def test_loopback_dashboard_deep_link_issues_ui_session_cookie(self):
         self.web_app.add_default_routes()
@@ -845,6 +999,27 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_int)
+
+    def test_trusted_bootstrap_remote_cannot_access_admin_bootstrap_routes_before_first_admin_exists(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/admin/bootstrap-check", required_scope="admin", allow_first_admin_bootstrap=True)
+        def _bootstrap_check():
+            return "ok"
+
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        trusted_headers = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "172.25.0.1",
+            "HTTP_REFERER": "http://localhost:8800/dashboard",
+        }
+
+        rejected = client.get("/server/admin/bootstrap-check", extra_environ=trusted_headers, expect_errors=True)
+        self.assertEqual(401, rejected.status_int)
 
     def test_non_bearer_authorization_header_does_not_block_ui_session_cookie_auth(self):
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
