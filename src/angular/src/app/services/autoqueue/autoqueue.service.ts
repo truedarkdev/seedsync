@@ -63,7 +63,7 @@ export class AutoQueueService extends BaseWebService {
             // Double-encode the value
             const patternEncoded = encodeURIComponent(encodeURIComponent(pattern));
             const url = this.AUTOQUEUE_ADD_URL(patternEncoded);
-            const obs = this._restService.sendRequest(url);
+            const obs = this._restService.post(url);
             obs.subscribe({
                 next: reaction => {
                     if (reaction.success) {
@@ -100,7 +100,7 @@ export class AutoQueueService extends BaseWebService {
             // Double-encode the value
             const patternEncoded = encodeURIComponent(encodeURIComponent(pattern));
             const url = this.AUTOQUEUE_REMOVE_URL(patternEncoded);
-            const obs = this._restService.sendRequest(url);
+            const obs = this._restService.post(url);
             obs.subscribe({
                 next: reaction => {
                     if (reaction.success) {

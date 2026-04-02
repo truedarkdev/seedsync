@@ -14,10 +14,16 @@ from web.web_app import WebApp
 LEGACY_TEST_API_TOKEN = "legacy-test-token"
 
 
-def _invoke_get_route(web_app, path, api_token: str = None, ui_session_secret: str = None):
+def _invoke_route(
+    web_app,
+    path,
+    method: str = "GET",
+    api_token: str = None,
+    ui_session_secret: str = None
+):
     environ = {}
     setup_testing_defaults(environ)
-    environ["REQUEST_METHOD"] = "GET"
+    environ["REQUEST_METHOD"] = method
     environ["PATH_INFO"] = path
     environ["wsgi.input"] = BytesIO(b"")
     environ["HTTP_HOST"] = "localhost:8800"
@@ -36,6 +42,14 @@ def _invoke_get_route(web_app, path, api_token: str = None, ui_session_secret: s
 
     body = b"".join(web_app(environ, start_response)).decode("utf-8")
     return int(captured["status"].split()[0]), body
+
+
+def _invoke_get_route(web_app, path, api_token: str = None, ui_session_secret: str = None):
+    return _invoke_route(web_app, path, method="GET", api_token=api_token, ui_session_secret=ui_session_secret)
+
+
+def _invoke_post_route(web_app, path, api_token: str = None, ui_session_secret: str = None):
+    return _invoke_route(web_app, path, method="POST", api_token=api_token, ui_session_secret=ui_session_secret)
 
 
 class TestConfigHandlerGet(unittest.TestCase):
@@ -199,7 +213,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         ConfigHandler(config).add_routes(self.web_app)
         ui_session = self.auth_store.create_ui_session(["admin"])
 
-        status_code, body = _invoke_get_route(
+        status_code, body = _invoke_post_route(
             self.web_app,
             "/server/config/set/general/config_api_redact_remote_details/False",
             ui_session_secret=ui_session.secret,
@@ -216,7 +230,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         ConfigHandler(config).add_routes(self.web_app)
         ui_session = self.auth_store.create_ui_session(["admin"])
 
-        status_code, body = _invoke_get_route(
+        status_code, body = _invoke_post_route(
             self.web_app,
             "/server/config/set/general/trusted_browser_bootstrap_remote_addrs/172.25.0.1%2F32",
             ui_session_secret=ui_session.secret,

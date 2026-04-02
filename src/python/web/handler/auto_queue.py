@@ -21,12 +21,12 @@ class AutoQueueHandler(IHandler):
             required_scope="read",
             allow_legacy_api_token=True
         )
-        web_app.add_handler(
+        web_app.add_post_handler(
             "/server/autoqueue/add/<pattern>",
             self.__handle_add_autoqueue,
             required_scope="write"
         )
-        web_app.add_handler(
+        web_app.add_post_handler(
             "/server/autoqueue/remove/<pattern>",
             self.__handle_remove_autoqueue,
             required_scope="write"

@@ -3,6 +3,7 @@ import os
 import tempfile
 from threading import Timer
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 from common import Config
 from web.auth_store import ApiKeyStore
@@ -255,14 +256,17 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.context.config = Config()
         self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
         self.auth_store = ApiKeyStore()
-        self.auth_store.create_api_key("unit-admin", ["admin"])
+        created_admin = self.auth_store.create_api_key("unit-admin", ["admin"])
+        self.admin_secret = created_admin["secret"]
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
 
     @staticmethod
-    def _same_origin_headers(host: str = "localhost:8800"):
+    def _same_origin_headers(origin: str = "http://localhost:8800"):
+        parsed = urlparse(origin)
         return {
-            "HTTP_HOST": host,
-            "HTTP_REFERER": "http://{}/dashboard".format(host),
+            "HTTP_HOST": parsed.netloc,
+            "HTTP_ORIGIN": origin,
+            "HTTP_REFERER": "{}/dashboard".format(origin),
             "REMOTE_ADDR": "127.0.0.1",
         }
 
@@ -312,10 +316,52 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self._issue_browser_session(client)
         response = client.post(
             "/server/ping",
-            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"}
+            extra_environ=self._same_origin_headers()
         )
 
         self.assertEqual(200, response.status_int)
+
+    def test_write_route_rejects_cookie_backed_ui_session_with_cross_origin_signal(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "http://localhost:3000",
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Browser-origin signal required", response.text)
+
+    def test_admin_write_route_requires_cookie_backed_ui_session_same_origin_signal(self):
+        @self.web_app.route("/server/admin/ping", method="POST", required_scope="admin")
+        def _admin_ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+        response = client.post(
+            "/server/admin/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "http://localhost:3000",
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Browser-origin signal required", response.text)
 
     def test_sessionless_ui_flag_is_rejected_for_write_routes(self):
         with self.assertRaisesRegex(ValueError, "allow_sessionless_ui is only supported for read/stream /server routes"):
@@ -604,6 +650,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             extra_environ={
                 "HTTP_HOST": "localhost:8800",
                 "REMOTE_ADDR": "172.25.0.1",
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
             }
         )
 
@@ -624,7 +671,27 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 "HTTP_HOST": "localhost:8800",
                 "REMOTE_ADDR": "127.0.0.1",
                 "HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz",
+                "HTTP_REFERER": "http://localhost:8800/dashboard",
                 "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            }
+        )
+
+        self.assertEqual(200, response.status_int)
+
+    def test_admin_write_route_accepts_bearer_api_key_without_same_origin_signal(self):
+        @self.web_app.route("/server/admin/ping", method="POST", required_scope="admin")
+        def _admin_ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        response = client.post(
+            "/server/admin/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret),
             }
         )
 

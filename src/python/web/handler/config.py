@@ -28,7 +28,7 @@ class ConfigHandler(IHandler):
             required_scope="read"
         )
         # The regex allows slashes in values
-        web_app.add_handler(
+        web_app.add_post_handler(
             "/server/config/set/<section>/<key>/<value:re:.+>",
             self.__handle_set_config,
             required_scope="write"
