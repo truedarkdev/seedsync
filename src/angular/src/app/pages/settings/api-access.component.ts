@@ -112,7 +112,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
 
         this._apiAccessService.createApiKey(name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
             next: result => {
-                this.showSuccess("Created API key");
                 this.revealSecret("API key created", `Copy the new secret for ${result.key.name} now.`, result.secret);
                 this.createName = "";
                 this.createScopes = this.defaultScopeSelection();
@@ -140,7 +139,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
 
         this._apiAccessService.updateApiKey(key.id, name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
             next: updated => {
-                this.showSuccess("Updated API key");
                 this.cancelEdit();
                 this._changeDetector.markForCheck();
             },
@@ -159,7 +157,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             "btn btn-warning",
             () => this._apiAccessService.rotateApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
                 next: result => {
-                    this.showSuccess("Rotated API key");
                     this.revealSecret("API key rotated", `Copy the new secret for ${result.key.name} now.`, result.secret);
                     this._changeDetector.markForCheck();
                 },
@@ -179,7 +176,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             "btn btn-danger",
             () => this._apiAccessService.revokeApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
                 next: revoked => {
-                    this.showSuccess("Revoked API key");
                     if (this.editingKeyId === revoked.id) {
                         this.cancelEdit();
                     }
@@ -207,7 +203,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             "btn btn-danger",
             () => this._apiAccessService.deleteApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
                 next: () => {
-                    this.showSuccess("Deleted revoked API key");
                     if (this.editingKeyId === key.id) {
                         this.cancelEdit();
                     }
