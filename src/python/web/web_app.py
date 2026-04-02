@@ -530,12 +530,17 @@ class WebApp(bottle.Bottle):
 
     def __is_trusted_browser_bootstrap_request(self) -> bool:
         if WebApp.__is_loopback_remote_addr():
-            return True
+            return WebApp.__is_loopback_host(WebApp.__request_host())
 
-        return (
-            self.__is_trusted_browser_bootstrap_remote_addr() and
-            WebApp.__is_loopback_host(WebApp.__request_host())
-        )
+        if not self.__is_trusted_browser_bootstrap_remote_addr():
+            return False
+
+        effective_origin = self.__effective_request_origin()
+        if effective_origin is None:
+            return False
+
+        _, host, _ = effective_origin
+        return WebApp.__is_loopback_host(host)
 
     def __authorize_server_route(
         self,
@@ -613,6 +618,9 @@ class WebApp(bottle.Bottle):
 
     def __create_ui_session_secret(self) -> Optional[str]:
         if self.__auth_store is None or not self.__is_trusted_browser_bootstrap_request():
+            return None
+
+        if getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
             return None
 
         current_scopes = self.__get_ui_session_scopes()

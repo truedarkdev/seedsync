@@ -32,13 +32,11 @@ class PathPairsHandler(IHandler):
         web_app.add_handler(
             "/server/path-pairs",
             self.__handle_get_all,
-            required_scope="read",
-            allow_legacy_api_token=True
+            required_scope="read"
         )
         web_app.get(
             "/server/path-pairs/<pair_id>",
-            required_scope="read",
-            allow_legacy_api_token=True
+            required_scope="read"
         )(self.__handle_get_one)
         web_app.add_post_handler(
             "/server/path-pairs",

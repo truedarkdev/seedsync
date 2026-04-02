@@ -456,6 +456,27 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
+    def test_loopback_index_does_not_issue_ui_session_cookie_before_first_admin_exists(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+            )
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
+
     def test_loopback_dashboard_deep_link_issues_ui_session_cookie(self):
         self.web_app.add_default_routes()
 
@@ -490,10 +511,11 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                     "REMOTE_ADDR": "203.0.113.10",
                 },
                 expect_errors=True,
-            )
+        )
 
         self.assertEqual(403, response.status_int)
         self.assertIn("loopback", response.text)
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
 
     def test_non_loopback_dashboard_deep_link_rejects_browser_bootstrap(self):
         self.web_app.add_default_routes()
@@ -536,6 +558,54 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(403, response.status_int)
         self.assertIn("loopback", response.text)
+
+    def test_loopback_transport_rejects_non_loopback_host_for_browser_bootstrap(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "seed.example:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("loopback", response.text)
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
+
+    def test_loopback_transport_ignores_forwarded_loopback_host_for_browser_bootstrap(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "seed.example:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                    "HTTP_X_FORWARDED_HOST": "localhost:8800",
+                    "HTTP_X_FORWARDED_PROTO": "https",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("loopback", response.text)
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
 
     def test_trusted_bootstrap_remote_addr_allows_index_and_ui_session_cookie_for_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
@@ -591,6 +661,31 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(200, response.status_int)
         self.assertIn("console.log('hello');", response.text)
+
+    def test_trusted_bootstrap_remote_addr_rejects_forwarded_non_loopback_host(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "172.25.0.1",
+                    "HTTP_X_FORWARDED_HOST": "seed.example:8800",
+                    "HTTP_X_FORWARDED_PROTO": "https",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("trusted local runtime", response.text)
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
 
     def test_trusted_bootstrap_remote_addr_still_rejects_non_loopback_host(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
