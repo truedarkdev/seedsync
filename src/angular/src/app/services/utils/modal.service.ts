@@ -177,6 +177,8 @@ class ConfirmDialogBuilder {
     dialogRoot.setAttribute("aria-modal", "true");
     Object.assign(dialogRoot.style, {
       position: "relative",
+      zIndex: "1",
+      pointerEvents: "auto",
       width: "100%",
       maxWidth: "32rem",
       margin: "1rem",
