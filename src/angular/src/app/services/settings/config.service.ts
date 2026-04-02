@@ -60,7 +60,7 @@ export class ConfigService extends BaseWebService {
             // Double-encode the value
             const valueEncoded = encodeURIComponent(encodeURIComponent(valueStr));
             const url = this.CONFIG_SET_URL(section, option, valueEncoded);
-            const obs = this._restService.sendRequest(url);
+            const obs = this._restService.post(url);
             obs.subscribe({
                 next: reaction => {
                     if (reaction.success) {

@@ -38,15 +38,15 @@ call_api() {
 }
 
 wait_for_app_ready "Seedsync app is up (before configuring)"
-call_api "${base_url}/server/config/set/general/debug/true"
-call_api "${base_url}/server/config/set/general/verbose/true"
-call_api "${base_url}/server/config/set/lftp/local_path/%252Fdownloads"
-call_api "${base_url}/server/config/set/lftp/remote_address/remote"
-call_api "${base_url}/server/config/set/lftp/remote_username/remoteuser"
-call_api "${base_url}/server/config/set/lftp/remote_password/remotepass"
-call_api "${base_url}/server/config/set/lftp/remote_port/1234"
-call_api "${base_url}/server/config/set/lftp/remote_path/%252Fhome%252Fremoteuser%252Ffiles"
-call_api "${base_url}/server/config/set/autoqueue/patterns_only/true"
+call_api "${base_url}/server/config/set/general/debug/true" POST
+call_api "${base_url}/server/config/set/general/verbose/true" POST
+call_api "${base_url}/server/config/set/lftp/local_path/%252Fdownloads" POST
+call_api "${base_url}/server/config/set/lftp/remote_address/remote" POST
+call_api "${base_url}/server/config/set/lftp/remote_username/remoteuser" POST
+call_api "${base_url}/server/config/set/lftp/remote_password/remotepass" POST
+call_api "${base_url}/server/config/set/lftp/remote_port/1234" POST
+call_api "${base_url}/server/config/set/lftp/remote_path/%252Fhome%252Fremoteuser%252Ffiles" POST
+call_api "${base_url}/server/config/set/autoqueue/patterns_only/true" POST
 
 wait_for_app_ready "Seedsync app is up (before restart)"
 call_api "${base_url}/server/command/restart" POST
