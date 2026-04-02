@@ -295,6 +295,7 @@ class ApiKeyStore(Persist):
             legacy_state = "disabled"
 
         active_keys = [record for record in self.__api_keys if not record.is_revoked]
+        active_admin_keys = [record for record in active_keys if "admin" in record.scopes]
         return {
             "legacy_api_token": {
                 "configured": legacy_configured,
@@ -305,6 +306,7 @@ class ApiKeyStore(Persist):
             "api_keys": {
                 "total": len(self.__api_keys),
                 "active": len(active_keys),
+                "active_admin": len(active_admin_keys),
                 "revoked": len(self.__api_keys) - len(active_keys),
             },
         }

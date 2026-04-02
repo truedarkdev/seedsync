@@ -27,6 +27,37 @@ describe("Testing API access service", () => {
         api_keys: {
             total: 1,
             active: 1,
+            active_admin: 1,
+            revoked: 0
+        }
+    };
+
+    const bootstrapMigrationState: ApiAccessMigrationState = {
+        legacy_api_token: {
+            configured: false,
+            compatibility_enabled: false,
+            state: "cleared",
+            accepted_for_external_non_admin: false
+        },
+        api_keys: {
+            total: 0,
+            active: 0,
+            active_admin: 0,
+            revoked: 0
+        }
+    };
+
+    const noAdminMigrationState: ApiAccessMigrationState = {
+        legacy_api_token: {
+            configured: false,
+            compatibility_enabled: false,
+            state: "cleared",
+            accepted_for_external_non_admin: false
+        },
+        api_keys: {
+            total: 1,
+            active: 1,
+            active_admin: 0,
             revoked: 0
         }
     };
@@ -95,6 +126,92 @@ describe("Testing API access service", () => {
         expect(latestMigrationState.legacy_api_token.state).toBe("enabled");
         expect(latestKeys.length).toBe(1);
         expect(latestKeys[0].name).toBe("Reader");
+        httpMock.verify();
+    });
+
+    it("should load only migration state when no active admin key exists", () => {
+        let latestMigrationState: ApiAccessMigrationState = null;
+        let latestKeys: ApiKeyRecord[] = null;
+
+        apiAccessService.migrationState.subscribe({
+            next: state => latestMigrationState = state
+        });
+        apiAccessService.apiKeys.subscribe({
+            next: keys => latestKeys = keys
+        });
+
+        httpMock.expectOne("/server/admin/migration/v1").flush(bootstrapMigrationState);
+        httpMock.expectNone("/server/admin/api-keys/v1");
+
+        expect(latestMigrationState.api_keys.active).toBe(0);
+        expect(latestKeys).toEqual([]);
+        httpMock.verify();
+    });
+
+    it("should not load admin api keys when only non-admin keys exist", () => {
+        let latestMigrationState: ApiAccessMigrationState = null;
+        let latestKeys: ApiKeyRecord[] = null;
+
+        apiAccessService.migrationState.subscribe({
+            next: state => latestMigrationState = state
+        });
+        apiAccessService.apiKeys.subscribe({
+            next: keys => latestKeys = keys
+        });
+
+        httpMock.expectOne("/server/admin/migration/v1").flush(noAdminMigrationState);
+        httpMock.expectNone("/server/admin/api-keys/v1");
+
+        expect(latestMigrationState.api_keys.active).toBe(1);
+        expect(latestMigrationState.api_keys.active_admin).toBe(0);
+        expect(latestKeys).toEqual([]);
+        httpMock.verify();
+    });
+
+    it("should bootstrap the first admin key and refresh into normal state", () => {
+        let latestMigrationState: ApiAccessMigrationState = null;
+        let latestKeys: ApiKeyRecord[] = null;
+
+        apiAccessService.migrationState.subscribe({
+            next: state => latestMigrationState = state
+        });
+        apiAccessService.apiKeys.subscribe({
+            next: keys => latestKeys = keys
+        });
+
+        httpMock.expectOne("/server/admin/migration/v1").flush(bootstrapMigrationState);
+        httpMock.expectNone("/server/admin/api-keys/v1");
+
+        let result = null;
+        apiAccessService.bootstrapFirstApiKey("Bootstrap Admin").subscribe({
+            next: created => result = created
+        });
+
+        const bootstrapRequest = httpMock.expectOne("/server/admin/bootstrap/v1/first-api-key");
+        expect(bootstrapRequest.request.method).toBe("POST");
+        expect(bootstrapRequest.request.body).toEqual({
+            name: "Bootstrap Admin"
+        });
+        bootstrapRequest.flush({
+            key: {
+                id: "bootstrap-admin",
+                name: "Bootstrap Admin",
+                scopes: ["admin"],
+                created_at: "2026-04-01T00:15:00+00:00",
+                updated_at: "2026-04-01T00:15:00+00:00",
+                revoked_at: null,
+                active: true
+            },
+            secret: "bootstrap-secret"
+        });
+
+        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
+
+        expect(result.key.name).toBe("Bootstrap Admin");
+        expect(result.secret).toBe("bootstrap-secret");
+        expect(latestMigrationState.api_keys.active).toBe(1);
+        expect(latestKeys.length).toBe(1);
         httpMock.verify();
     });
 
@@ -261,6 +378,7 @@ describe("Testing API access service", () => {
             api_keys: {
                 total: 1,
                 active: 1,
+                active_admin: 1,
                 revoked: 0
             }
         });
@@ -275,9 +393,11 @@ describe("Testing API access service", () => {
             api_keys: {
                 total: 1,
                 active: 1,
+                active_admin: 1,
                 revoked: 0
             }
         });
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         expect(disabledState.legacy_api_token.compatibility_enabled).toBe(false);
 
@@ -298,6 +418,7 @@ describe("Testing API access service", () => {
             api_keys: {
                 total: 1,
                 active: 1,
+                active_admin: 1,
                 revoked: 0
             }
         });
@@ -312,9 +433,11 @@ describe("Testing API access service", () => {
             api_keys: {
                 total: 1,
                 active: 1,
+                active_admin: 1,
                 revoked: 0
             }
         });
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         expect(clearedState.legacy_api_token.configured).toBe(false);
         httpMock.verify();
@@ -343,6 +466,7 @@ describe("Testing API access service", () => {
             api_keys: {
                 total: 1,
                 active: 1,
+                active_admin: 1,
                 revoked: 0
             }
         });

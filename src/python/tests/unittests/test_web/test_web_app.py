@@ -308,15 +308,16 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
         return response
 
-    def test_same_origin_browser_request_can_use_sessionless_route(self):
+    def test_same_origin_browser_request_cannot_use_sessionless_route_after_admin_exists(self):
         @self.web_app.route("/server/ping", required_scope="read", allow_sessionless_ui=True)
         def _ping():
             return "pong"
 
         client = TestApp(self.web_app)
-        response = client.get("/server/ping", extra_environ=self._same_origin_headers())
+        response = client.get("/server/ping", extra_environ=self._same_origin_headers(), expect_errors=True)
 
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(401, response.status_int)
+        self.assertIn("Missing API token", response.text)
 
     def test_write_route_requires_cookie_backed_ui_session(self):
         @self.web_app.route("/server/ping", method="POST", required_scope="write")
@@ -459,6 +460,16 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
     def test_loopback_index_does_not_issue_ui_session_cookie_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/ping", required_scope="read")
+        def _ping():
+            return "pong"
+
+        @web_app.route("/server/status", required_scope="read", allow_sessionless_ui=True)
+        def _status():
+            return "ok"
+
+        web_app.add_streaming_handler(QueueStreamHandler, values=["event\n"], cleanup_log=[])
         web_app.add_default_routes()
 
         with tempfile.TemporaryDirectory() as html_path:
@@ -467,15 +478,65 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             object.__setattr__(web_app, "_WebApp__html_path", html_path)
             client = TestApp(web_app)
             response = client.get(
-                "/",
-                extra_environ={
-                    "HTTP_HOST": "localhost:8800",
-                    "REMOTE_ADDR": "127.0.0.1",
-                },
+                "/dashboard/123e4567-e89b-12d3-a456-426614174000",
+                extra_environ=self._same_origin_headers(),
+            )
+
+            status_response = client.get(
+                "/server/status",
+                extra_environ=self._same_origin_headers(),
+            )
+
+            rejected_read = client.get(
+                "/server/ping",
+                extra_environ=self._same_origin_headers(),
+                expect_errors=True,
+            )
+
+            Timer(0.1, web_app.stop).start()
+            stream_response = client.get(
+                "/server/stream",
+                extra_environ=self._same_origin_headers(),
             )
 
         self.assertEqual(200, response.status_int)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
+        self.assertEqual(200, status_response.status_int)
+        self.assertEqual("ok", status_response.text)
+        self.assertEqual(401, rejected_read.status_int)
+        self.assertIn("Missing API token", rejected_read.text)
+        self.assertEqual(200, stream_response.status_int)
+        self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
+
+    def test_trusted_bootstrap_remote_can_use_sessionless_status_and_stream_before_first_admin_exists(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/status", required_scope="read", allow_sessionless_ui=True)
+        def _status():
+            return "ok"
+
+        web_app.add_streaming_handler(QueueStreamHandler, values=["event\n"], cleanup_log=[])
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        trusted_headers = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "172.25.0.1",
+            "HTTP_ORIGIN": "http://localhost:8800",
+            "HTTP_REFERER": "http://localhost:8800/settings",
+        }
+
+        status_response = client.get("/server/status", extra_environ=trusted_headers)
+
+        Timer(0.1, web_app.stop).start()
+        stream_response = client.get("/server/stream", extra_environ=trusted_headers)
+
+        self.assertEqual(200, status_response.status_int)
+        self.assertEqual("ok", status_response.text)
+        self.assertEqual(200, stream_response.status_int)
+        self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
 
     def test_loopback_dashboard_deep_link_issues_ui_session_cookie(self):
         self.web_app.add_default_routes()
@@ -739,6 +800,28 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(401, response.status_int)
         self.assertIn("Missing API token", response.text)
+
+    def test_first_admin_bootstrap_route_ignores_stale_prebootstrap_ui_session_scopes(self):
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+
+        @web_app.route("/server/admin/bootstrap-check", required_scope="admin", allow_first_admin_bootstrap=True)
+        def _bootstrap_check():
+            return "ok"
+
+        client = TestApp(web_app)
+        ui_session = empty_store.create_ui_session(["write"])
+
+        response = client.get(
+            "/server/admin/bootstrap-check",
+            extra_environ={
+                **self._same_origin_headers(),
+                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            }
+        )
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("ok", response.text)
 
     def test_trusted_bootstrap_remote_addr_can_use_cookie_backed_ui_session(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
