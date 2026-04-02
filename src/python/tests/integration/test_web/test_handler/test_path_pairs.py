@@ -6,12 +6,26 @@ from unittest.mock import patch
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
+LEGACY_TEST_API_TOKEN = "legacy-test-token"
+
+
 class TestPathPairsHandler(BaseTestWebApp):
     def test_get_all_initially_empty(self):
         response = self.test_app.get("/server/path-pairs")
 
         self.assertEqual(200, response.status_int)
         self.assertEqual({"success": True, "data": []}, json.loads(response.text))
+
+    def test_legacy_token_cannot_read_path_pairs_list(self):
+        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
+        legacy_client = type(self.test_app)(self.web_app, extra_environ={
+            "HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)
+        })
+
+        response = legacy_client.get("/server/path-pairs", expect_errors=True)
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("cannot access this route", response.text)
 
     def test_create_and_get_one(self):
         response = self.test_app.post_json("/server/path-pairs", {
@@ -32,6 +46,24 @@ class TestPathPairsHandler(BaseTestWebApp):
         fetched = self.test_app.get("/server/path-pairs/{}".format(created["id"]))
         self.assertEqual(200, fetched.status_int)
         self.assertEqual(created, json.loads(fetched.text)["data"])
+
+    def test_legacy_token_cannot_read_single_path_pair(self):
+        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
+        created = json.loads(self.test_app.post_json("/server/path-pairs", {
+            "name": "Movies",
+            "remote_path": "/remote/movies",
+            "local_path": "/local/movies",
+            "enabled": True,
+            "auto_queue": False
+        }).text)["data"]
+        legacy_client = type(self.test_app)(self.web_app, extra_environ={
+            "HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)
+        })
+
+        response = legacy_client.get("/server/path-pairs/{}".format(created["id"]), expect_errors=True)
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("cannot access this route", response.text)
 
     def test_create_requires_remote_and_local_paths(self):
         response = self.test_app.post_json(
