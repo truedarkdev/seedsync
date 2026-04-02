@@ -48,6 +48,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     public apiKeys = this._apiAccessService.apiKeys;
     public showRevokedKeys = false;
 
+    public bootstrapName = "bootstrap-admin";
     public createName = "";
     public createScopes: ScopeSelection = this.defaultScopeSelection();
 
@@ -118,6 +119,19 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
                 this._changeDetector.markForCheck();
             },
             error: error => this.showError(`Failed to create API key: ${this.describeError(error)}`)
+        });
+    }
+
+    public bootstrapFirstApiKey() {
+        const name = this.bootstrapName.trim() || "bootstrap-admin";
+
+        this._apiAccessService.bootstrapFirstApiKey(name).pipe(takeUntil(this._destroy$)).subscribe({
+            next: result => {
+                this.revealSecret("First admin API key created", `Copy the new secret for ${result.key.name} now.`, result.secret);
+                this.bootstrapName = "bootstrap-admin";
+                this._changeDetector.markForCheck();
+            },
+            error: error => this.showError(`Failed to bootstrap first admin API key: ${this.describeError(error)}`)
         });
     }
 
@@ -243,6 +257,10 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
                 error: error => this.showError(`Failed to clear legacy API token: ${this.describeError(error)}`)
             })
         );
+    }
+
+    public isBootstrapMode(state: ApiAccessMigrationState): boolean {
+        return !!state && !!state.api_keys && state.api_keys.active_admin === 0;
     }
 
     public dismissSecret() {

@@ -38,7 +38,12 @@ class AdminHandler(IHandler):
             required_scope="admin",
             allow_first_admin_bootstrap=True
         )
-        web_app.add_handler("/server/admin/migration/v1", self.__handle_get_migration_state, required_scope="admin")
+        web_app.add_handler(
+            "/server/admin/migration/v1",
+            self.__handle_get_migration_state,
+            required_scope="admin",
+            allow_first_admin_bootstrap=True
+        )
         web_app.add_post_handler(
             "/server/admin/migration/v1/legacy-api-token/disable",
             self.__handle_disable_legacy_token,
@@ -78,10 +83,21 @@ class AdminHandler(IHandler):
                 name=data.get("name", "bootstrap-admin"),
                 scopes=["admin"]
             )
-            return self.__json_response({
+            response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],
             }, status=201)
+            create_session = getattr(self.__auth_store, "create_ui_session", None)
+            if create_session is not None:
+                ui_session = create_session(["admin"])
+                response.set_cookie(
+                    WebApp._UI_SESSION_COOKIE_NAME,
+                    ui_session.secret,
+                    path="/",
+                    httponly=True,
+                    samesite="strict",
+                )
+            return response
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 

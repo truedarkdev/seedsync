@@ -63,7 +63,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(403, resp.status_int)
         self.assertIn("Legacy general.api_token cannot access admin endpoints", str(resp.html))
 
-    def test_first_admin_bootstrap_requires_loopback_and_same_origin_browser_signal(self):
+    def test_first_admin_bootstrap_requires_trusted_local_browser_and_same_origin_signal(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -139,6 +139,162 @@ class TestAdminHandler(unittest.TestCase):
 
         self.assertEqual(401, rejected.status_int)
 
+    def test_prebootstrap_browser_can_bootstrap_first_admin_and_unlock_admin_routes(self):
+        empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-limited.json"))
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        AdminHandler(self.context.config, empty_store).add_routes(web_app)
+
+        with open(os.path.join(self.temp_dir, "index.html"), "w") as html_file:
+            html_file.write("<html></html>")
+
+        web_app.add_default_routes()
+        test_app = TestApp(web_app)
+
+        issued = test_app.get("/", extra_environ=self._same_origin_headers())
+        limited_cookie = issued.headers.get("Set-Cookie", "")
+        self.assertEqual("", limited_cookie)
+
+        stale_bootstrap_session = empty_store.create_ui_session(["write"])
+        stale_bootstrap_cookie = "seedsync_ui_session={}".format(stale_bootstrap_session.secret)
+
+        rejected_remote = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "203.0.113.10"},
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected_remote.status_int)
+
+        prebootstrap_migration = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ=self._same_origin_headers(),
+        )
+        prebootstrap_payload = json.loads(prebootstrap_migration.text)
+        self.assertEqual(200, prebootstrap_migration.status_int)
+        self.assertEqual(0, prebootstrap_payload["api_keys"]["active"])
+
+        prebootstrap_migration_with_stale_cookie = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": stale_bootstrap_cookie},
+        )
+        prebootstrap_stale_payload = json.loads(prebootstrap_migration_with_stale_cookie.text)
+        self.assertEqual(200, prebootstrap_migration_with_stale_cookie.status_int)
+        self.assertEqual(0, prebootstrap_stale_payload["api_keys"]["active"])
+
+        rejected_admin_list = test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ=self._same_origin_headers(),
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected_admin_list.status_int)
+        self.assertIn("Missing API token", rejected_admin_list.text)
+
+        allowed = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "first-admin"},
+            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": stale_bootstrap_cookie}
+        )
+        allowed_payload = json.loads(allowed.text)
+        upgraded_cookie = allowed.headers.get("Set-Cookie", "").split(";", 1)[0]
+        self.assertEqual(201, allowed.status_int)
+        self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
+        self.assertIn("secret", allowed_payload)
+        self.assertIn("seedsync_ui_session=", upgraded_cookie)
+        self.assertNotEqual("", upgraded_cookie)
+        self.assertNotEqual(limited_cookie, upgraded_cookie)
+
+        refreshed_migration = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": upgraded_cookie}
+        )
+        payload = json.loads(refreshed_migration.text)
+        self.assertEqual(200, refreshed_migration.status_int)
+        self.assertEqual(1, payload["api_keys"]["active"])
+
+        authorized_admin_list = test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": upgraded_cookie}
+        )
+        authorized_payload = json.loads(authorized_admin_list.text)
+        self.assertEqual(200, authorized_admin_list.status_int)
+        self.assertEqual(1, len(authorized_payload["keys"]))
+
+    def test_trusted_bootstrap_remote_can_read_migration_state_and_bootstrap_first_admin(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-trusted-remote.json"))
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        AdminHandler(self.context.config, empty_store).add_routes(web_app)
+        test_app = TestApp(web_app)
+
+        trusted_browser_headers = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "172.25.0.1",
+            "HTTP_ORIGIN": "http://localhost:8800",
+            "HTTP_REFERER": "http://localhost:8800/settings",
+        }
+
+        migration_response = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ=trusted_browser_headers,
+        )
+        migration_payload = json.loads(migration_response.text)
+        self.assertEqual(200, migration_response.status_int)
+        self.assertEqual(0, migration_payload["api_keys"]["active"])
+        self.assertEqual(0, migration_payload["api_keys"]["active_admin"])
+
+        bootstrap_response = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "trusted-remote-admin"},
+            extra_environ=trusted_browser_headers,
+        )
+        bootstrap_payload = json.loads(bootstrap_response.text)
+        upgraded_cookie = bootstrap_response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        self.assertEqual(201, bootstrap_response.status_int)
+        self.assertEqual(["admin"], bootstrap_payload["key"]["scopes"])
+        self.assertIn("secret", bootstrap_payload)
+        self.assertIn("seedsync_ui_session=", upgraded_cookie)
+        self.assertNotEqual("", upgraded_cookie)
+
+        refreshed_migration = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ={**trusted_browser_headers, "HTTP_COOKIE": upgraded_cookie}
+        )
+        payload = json.loads(refreshed_migration.text)
+        self.assertEqual(200, refreshed_migration.status_int)
+        self.assertEqual(1, payload["api_keys"]["active"])
+        self.assertEqual(1, payload["api_keys"]["active_admin"])
+
+        authorized_admin_list = test_app.get(
+            "/server/admin/api-keys/v1",
+            extra_environ={**trusted_browser_headers, "HTTP_COOKIE": upgraded_cookie}
+        )
+        authorized_payload = json.loads(authorized_admin_list.text)
+        self.assertEqual(200, authorized_admin_list.status_int)
+        self.assertEqual(1, len(authorized_payload["keys"]))
+
+    def test_migration_state_reports_non_admin_keys_without_exiting_bootstrap_mode(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-non-admin.json"))
+        store.create_api_key("reader-writer", ["read", "write", "stream"])
+        web_app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(web_app)
+        test_app = TestApp(web_app)
+
+        trusted_browser_headers = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "172.25.0.1",
+            "HTTP_ORIGIN": "http://localhost:8800",
+            "HTTP_REFERER": "http://localhost:8800/settings",
+        }
+
+        migration_response = test_app.get(
+            "/server/admin/migration/v1",
+            extra_environ=trusted_browser_headers,
+        )
+        migration_payload = json.loads(migration_response.text)
+        self.assertEqual(200, migration_response.status_int)
+        self.assertEqual(1, migration_payload["api_keys"]["active"])
+        self.assertEqual(0, migration_payload["api_keys"]["active_admin"])
+
     def test_first_admin_bootstrap_is_not_available_after_admin_exists(self):
         resp = self.test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
@@ -161,6 +317,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertTrue(payload["legacy_api_token"]["compatibility_enabled"])
         self.assertEqual("enabled", payload["legacy_api_token"]["state"])
         self.assertEqual(1, payload["api_keys"]["active"])
+        self.assertEqual(1, payload["api_keys"]["active_admin"])
 
     def test_create_update_rotate_revoke_key_routes_work(self):
         create_resp = self.test_app.post_json(

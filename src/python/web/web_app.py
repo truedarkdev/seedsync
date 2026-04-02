@@ -129,6 +129,7 @@ class WebApp(bottle.Bottle):
             "/server/stream",
             required_scope="stream",
             allow_legacy_api_token=True,
+            allow_sessionless_ui=True,
         )(self.__web_stream)
 
         # Front-end routes
@@ -495,13 +496,33 @@ class WebApp(bottle.Bottle):
         return tuple(networks), tuple(invalid_entries)
 
     def __allow_first_admin_bootstrap(self) -> bool:
+        if self.__auth_store is None or getattr(self.__auth_store, "active_admin_key_count", 0) != 0:
+            return False
+
+        if self.__is_loopback_remote_addr():
+            return (
+                WebApp.__is_loopback_host(WebApp.__request_host()) and
+                self.__is_direct_same_origin_browser_request()
+            )
+
+        return self.__is_trusted_browser_bootstrap_request() and self.__is_same_origin_browser_request()
+
+    def __allow_sessionless_ui_route(self) -> bool:
         return (
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
-            WebApp.__is_loopback_remote_addr() and
-            WebApp.__is_loopback_host(WebApp.__request_host()) and
-            self.__is_direct_same_origin_browser_request()
+            self.__is_trusted_browser_bootstrap_request() and
+            self.__is_same_origin_browser_request()
         )
+
+    def __get_browser_ui_session_scopes(self):
+        if self.__auth_store is None:
+            return None
+
+        if getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
+            return None
+
+        return ["admin"]
 
     def __load_trusted_browser_bootstrap_networks(self):
         configured_value = WebApp.__get_trusted_browser_bootstrap_remote_addrs(self.__config)
@@ -552,15 +573,15 @@ class WebApp(bottle.Bottle):
         token = WebApp.__extract_bearer_token()
         if token is None:
             if not WebApp.__has_bearer_authorization_header():
+                if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
+                    return
                 ui_session_scopes = self.__get_ui_session_scopes()
                 if ui_session_scopes is not None:
                     if required_scope in {"write", "admin"} and not self.__is_same_origin_browser_request():
                         bottle.abort(403, "Browser-origin signal required for cookie-authenticated write requests")
                     self.__authorize_scopes(required_scope, ui_session_scopes)
                     return
-                if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
-                    return
-                if allow_sessionless_ui and self.__is_same_origin_browser_request():
+                if allow_sessionless_ui and self.__allow_sessionless_ui_route():
                     return
             bottle.abort(401, "Missing API token")
 
@@ -620,18 +641,19 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None or not self.__is_trusted_browser_bootstrap_request():
             return None
 
-        if getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
+        target_scopes = self.__get_browser_ui_session_scopes()
+        if target_scopes is None:
             return None
 
         current_scopes = self.__get_ui_session_scopes()
-        if current_scopes is not None:
+        if current_scopes is not None and set(current_scopes) == set(target_scopes):
             return None
 
         create_session = getattr(self.__auth_store, "create_ui_session", None)
         if create_session is None:
             return None
 
-        ui_session = create_session(["admin"])
+        ui_session = create_session(target_scopes)
         return ui_session.secret
 
     def __authorize_browser_bootstrap(self) -> None:

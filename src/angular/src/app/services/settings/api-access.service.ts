@@ -30,6 +30,7 @@ export interface ApiAccessMigrationState {
     api_keys: {
         total: number;
         active: number;
+        active_admin: number;
         revoked: number;
     };
 }
@@ -46,6 +47,7 @@ interface ApiKeyActionResponse {
 @Injectable()
 export class ApiAccessService extends BaseWebService {
     private readonly MIGRATION_STATE_URL = "/server/admin/migration/v1";
+    private readonly FIRST_API_KEY_BOOTSTRAP_URL = "/server/admin/bootstrap/v1/first-api-key";
     private readonly LEGACY_TOKEN_DISABLE_URL = "/server/admin/migration/v1/legacy-api-token/disable";
     private readonly LEGACY_TOKEN_CLEAR_URL = "/server/admin/migration/v1/legacy-api-token/clear";
     private readonly API_KEYS_URL = "/server/admin/api-keys/v1";
@@ -69,8 +71,7 @@ export class ApiAccessService extends BaseWebService {
     }
 
     public refresh() {
-        this.loadMigrationState();
-        this.loadApiKeys();
+        this.loadMigrationState(false, true);
     }
 
     public setIncludeRevokedApiKeys(includeRevokedApiKeys: boolean) {
@@ -101,6 +102,21 @@ export class ApiAccessService extends BaseWebService {
                 }
                 throw new Error("Failed to load API access migration state");
             })
+        );
+    }
+
+    public bootstrapFirstApiKey(name: string): Observable<{key: ApiKeyRecord; secret: string}> {
+        return this._http.post<ApiKeyActionResponse>(this.FIRST_API_KEY_BOOTSTRAP_URL, {name}).pipe(
+            map(response => {
+                if (response && response.key && response.secret) {
+                    return {
+                        key: response.key,
+                        secret: response.secret
+                    };
+                }
+                throw new Error("Failed to bootstrap first API key");
+            }),
+            tap(() => this.refresh())
         );
     }
 
@@ -167,14 +183,14 @@ export class ApiAccessService extends BaseWebService {
     public disableLegacyApiToken(): Observable<ApiAccessMigrationState> {
         return this._http.post<ApiAccessMigrationState>(this.LEGACY_TOKEN_DISABLE_URL, null).pipe(
             tap(response => this._migrationState.next(response)),
-            tap(() => this.loadMigrationState(true))
+            tap(() => this.loadMigrationState(true, true))
         );
     }
 
     public clearLegacyApiToken(): Observable<ApiAccessMigrationState> {
         return this._http.post<ApiAccessMigrationState>(this.LEGACY_TOKEN_CLEAR_URL, null).pipe(
             tap(response => this._migrationState.next(response)),
-            tap(() => this.loadMigrationState(true))
+            tap(() => this.loadMigrationState(true, true))
         );
     }
 
@@ -187,13 +203,25 @@ export class ApiAccessService extends BaseWebService {
         this._apiKeys.next(null);
     }
 
-    private loadMigrationState(preserveCurrentOnError: boolean = false) {
+    private loadMigrationState(preserveCurrentOnError: boolean = false, loadApiKeysWhenLoaded: boolean = false) {
         this.getMigrationState().subscribe({
-            next: migrationState => this._migrationState.next(migrationState),
+            next: migrationState => {
+                this._migrationState.next(migrationState);
+                if (loadApiKeysWhenLoaded) {
+                    if (migrationState.api_keys && migrationState.api_keys.active_admin > 0) {
+                        this.loadApiKeys();
+                    } else {
+                        this._apiKeys.next([]);
+                    }
+                }
+            },
             error: error => {
                 this._logger.error(error);
                 if (!preserveCurrentOnError) {
                     this._migrationState.next(null);
+                    if (loadApiKeysWhenLoaded) {
+                        this._apiKeys.next(null);
+                    }
                 }
             }
         });
