@@ -12,7 +12,6 @@ import {
 } from "../../../../services/settings/api-access.service";
 import {NotificationService} from "../../../../services/utils/notification.service";
 import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
-import {Notification} from "../../../../services/utils/notification";
 
 
 const activeApiKeys: ApiKeyRecord[] = [{
@@ -238,7 +237,7 @@ describe("Testing API access component", () => {
         fixture.detectChanges();
 
         expect(apiAccessService.deleteApiKey).toHaveBeenCalledWith("revoked-reader");
-        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Deleted revoked API key");
+        expect(notificationService.show).not.toHaveBeenCalled();
         expect(host.textContent).not.toContain("Revoked Reader");
     }));
 
@@ -271,8 +270,7 @@ describe("Testing API access component", () => {
             "Writer",
             ["read", "write", "stream"]
         );
-        expect(notificationService.show).toHaveBeenCalled();
-        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Created API key");
+        expect(notificationService.show).not.toHaveBeenCalled();
         expect(component.secretReveal.secret).toBe("writer-secret");
         expect(fixture.nativeElement.textContent).toContain("API key created");
         expect(component.createName).toBe("");
@@ -308,7 +306,7 @@ describe("Testing API access component", () => {
             "Reader updated",
             ["read", "stream"]
         );
-        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Updated API key");
+        expect(notificationService.show).not.toHaveBeenCalled();
         expect(component.editingKeyId).toBe(null);
     });
 
@@ -342,7 +340,7 @@ describe("Testing API access component", () => {
         fixture.detectChanges();
 
         expect(apiAccessService.rotateApiKey).toHaveBeenCalledWith("reader");
-        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Rotated API key");
+        expect(notificationService.show).not.toHaveBeenCalled();
         expect(component.secretReveal.secret).toBe("rotated-secret");
 
         const revokeButton = host.querySelector(".revoke-key-btn") as HTMLButtonElement;
@@ -351,7 +349,7 @@ describe("Testing API access component", () => {
         fixture.detectChanges();
 
         expect(apiAccessService.revokeApiKey).toHaveBeenCalledWith("reader");
-        expect((notificationService.show.calls.mostRecent().args[0] as Notification).text).toBe("Revoked API key");
+        expect(notificationService.show).not.toHaveBeenCalled();
     }));
 
     it("should trigger the legacy token controls", fakeAsync(() => {
