@@ -82,24 +82,32 @@ SeedSync supports Windows via the Docker container.
 
 2. Make sure you can successfully run the [Hello World](https://docs.docker.com/get-started/#test-docker-installation) app in Docker.
 
-3. From this repository, start the local Docker app with the Windows helper:
+3. From this repository, start the local Docker app with Docker Compose:
 
         :::powershell
-        .\scripts\start-seedsync-secure-bootstrap.ps1
+        docker compose -f compose.local.yml up -d --build seedsync
 
-    where
+    This starts the repo-owned local Docker path, binds the web UI to
+    `http://localhost:8800`, and prepares the trusted local bootstrap source
+    used by the browser bootstrap flow.
 
-    * the helper starts the repo-owned local Docker Compose path
-    * the helper reads SeedSync's one-time bootstrap proof from inside the running container
-    * the helper opens the browser automatically on SeedSync's local bootstrap page with no manual token copy or config edits
+4. Read the one-time bootstrap proof from the running container:
 
-4. Access application GUI to verify SeedSync is running by opening [http://localhost:8800](http://localhost:8800) in your browser if it is not already open.
+        :::powershell
+        docker compose -f compose.local.yml exec seedsync cat /tmp/seedsync-bootstrap/browser-bootstrap.json
 
-5. Go to the Settings page and fill out the required information.
+    Copy the `proof` value from the JSON output, then open the bootstrap page
+    in your browser at `http://localhost:8800/bootstrap?proof=<proof>` and
+    replace `<proof>` with the copied value. The bootstrap page redeems the
+    proof and redirects to the normal SeedSync UI.
+
+5. Access the application GUI to verify SeedSync is running by opening [http://localhost:8800](http://localhost:8800) in your browser if it is not already open.
+
+6. Go to the Settings page and fill out the required information.
    Under the Local Directory setting, enter `/downloads` for ordinary local storage.
    If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
 
-6. **While password-based login is supported, key-based authentication is highly recommended!**
+7. **While password-based login is supported, key-based authentication is highly recommended!**
    See the [Key-Based Authentication Setup](#key-auth) section for details.
 
 
