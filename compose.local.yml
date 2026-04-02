@@ -12,6 +12,7 @@ services:
       SEEDSYNC_STOP_RESUME_TRACE_FILE_ID: "${SEEDSYNC_STOP_RESUME_TRACE_FILE_ID:-}"
       SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID: "${SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID:-}"
       SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES: "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}"
+      SEEDSYNC_WEB_BIND_HOST: "${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}"
     command:
       - /bin/bash
       - -lc
@@ -43,7 +44,7 @@ services:
         /scripts/setup_default_config.sh &&
         set_general_option config_api_redact_remote_details False &&
         set_general_option trusted_browser_bootstrap_remote_addrs "$$TRUSTED_BOOTSTRAP_SOURCES" &&
-        exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/scanfs
+        exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/scanfs --web-bind-host "$$SEEDSYNC_WEB_BIND_HOST"
     ports:
       - "127.0.0.1:8800:8800"
     volumes:
