@@ -21,6 +21,13 @@ describe("Testing config service", () => {
     let httpMock: HttpTestingController;
     let configService: ConfigService;
 
+    const expectConfigSetRequest = (section: string, option: string, value: any, response: string = "{}") => {
+        const request = httpMock.expectOne(`/server/config/set/${section}/${option}`);
+        expect(request.request.method).toBe("POST");
+        expect(request.request.body).toEqual({value});
+        request.flush(response);
+    };
+
     beforeEach(() => {
         TestBed.configureTestingModule({
             imports: [
@@ -186,7 +193,7 @@ describe("Testing config service", () => {
         httpMock.verify();
     }));
 
-    it("should send a GET on a set config option", () => {
+    it("should send a POST on a set config option", () => {
         // first connect
         httpMock.expectOne("/server/config/get").flush("{}");
 
@@ -199,7 +206,7 @@ describe("Testing config service", () => {
         });
 
         // set request
-        httpMock.expectOne("/server/config/set/general/debug/true").flush("{}");
+        expectConfigSetRequest("general", "debug", true);
 
         expect(configSubscriberIndex).toBe(1);
         httpMock.verify();
@@ -209,45 +216,45 @@ describe("Testing config service", () => {
         httpMock.expectOne("/server/config/get").flush({general: {debug: false}});
 
         configService.set("general", "debug", true).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/true").flush("{}");
+        expectConfigSetRequest("general", "debug", true);
 
         configService.set("general", "debug", false).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/false").flush("{}");
+        expectConfigSetRequest("general", "debug", false);
 
         httpMock.verify();
     });
 
-    it("should send correct GET requests on setting config options", () => {
+    it("should send correct POST requests on setting config options", () => {
         // first connect
         httpMock.expectOne("/server/config/get").flush("{}");
 
         // boolean
         configService.set("general", "debug", true).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/true").flush("{}");
+        expectConfigSetRequest("general", "debug", true);
         configService.set("general", "debug", false).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/false").flush("{}");
+        expectConfigSetRequest("general", "debug", false);
 
         // integer
         configService.set("general", "debug", 0).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/0").flush("{}");
+        expectConfigSetRequest("general", "debug", 0);
         configService.set("general", "debug", 1000).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/1000").flush("{}");
+        expectConfigSetRequest("general", "debug", 1000);
         configService.set("general", "debug", -1000).subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/-1000").flush("{}");
+        expectConfigSetRequest("general", "debug", -1000);
 
         // string
         configService.set("general", "debug", "test").subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/test").flush("{}");
+        expectConfigSetRequest("general", "debug", "test");
         configService.set("general", "debug", "test space").subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/test%2520space").flush("{}");
+        expectConfigSetRequest("general", "debug", "test space");
         configService.set("general", "debug", "test/slash").subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/test%252Fslash").flush("{}");
+        expectConfigSetRequest("general", "debug", "test/slash");
         configService.set("general", "debug", "test\"doublequote").subscribe(
             DoNothing
         );
-        httpMock.expectOne("/server/config/set/general/debug/test%2522doublequote").flush("{}");
+        expectConfigSetRequest("general", "debug", "test\"doublequote");
         configService.set("general", "debug", "/test/leadingslash").subscribe(DoNothing);
-        httpMock.expectOne("/server/config/set/general/debug/%252Ftest%252Fleadingslash").flush("{}");
+        expectConfigSetRequest("general", "debug", "/test/leadingslash");
 
         httpMock.verify();
     });
@@ -323,7 +330,7 @@ describe("Testing config service", () => {
         configService.set("general", "debug", true).subscribe(DoNothing);
 
         // set request
-        httpMock.expectOne("/server/config/set/general/debug/true").flush("");
+        expectConfigSetRequest("general", "debug", true, "");
 
         expect(configSubscriberIndex).toBe(2);
         httpMock.verify();
@@ -348,7 +355,10 @@ describe("Testing config service", () => {
         configService.set("general", "debug", true).subscribe(DoNothing);
 
         // set request
-        httpMock.expectOne("/server/config/set/general/debug/true").flush(
+        const request = httpMock.expectOne("/server/config/set/general/debug");
+        expect(request.request.method).toBe("POST");
+        expect(request.request.body).toEqual({value: true});
+        request.flush(
             "Not found",
             {status: 404, statusText: "Bad Request"}
         );

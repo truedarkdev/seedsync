@@ -1,7 +1,9 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import json
+
+import bottle
 from bottle import HTTPResponse
-from urllib.parse import unquote
 
 from common import overrides, Config, ConfigError
 from ..web_app import IHandler, WebApp
@@ -9,7 +11,7 @@ from ..serialize import SerializeConfig
 
 
 class ConfigHandler(IHandler):
-    __URL_SET_BLOCKED_FIELDS = {
+    __BODY_SET_BLOCKED_FIELDS = {
         "general": {
             "api_token",
             "config_api_redact_remote_details",
@@ -27,9 +29,8 @@ class ConfigHandler(IHandler):
             self.__handle_get_config,
             required_scope="read"
         )
-        # The regex allows slashes in values
         web_app.add_post_handler(
-            "/server/config/set/<section>/<key>/<value:re:.+>",
+            "/server/config/set/<section>/<key>",
             self.__handle_set_config,
             required_scope="write"
         )
@@ -38,18 +39,34 @@ class ConfigHandler(IHandler):
         out_json = SerializeConfig.config(self.__config)
         return HTTPResponse(body=out_json)
 
-    def __handle_set_config(self, section: str, key: str, value: str):
-        # value is double encoded
-        value = unquote(value)
+    @staticmethod
+    def __load_request_json():
+        raw_body = bottle.request.body.read().decode("utf-8")
+        if not raw_body.strip():
+            raise ValueError("Missing config value")
+        return json.loads(raw_body)
+
+    def __handle_set_config(self, section: str, key: str, value=None):
+        if value is None:
+            try:
+                data = ConfigHandler.__load_request_json()
+            except (TypeError, ValueError) as exc:
+                return HTTPResponse(body=str(exc), status=400)
+            if not isinstance(data, dict) or "value" not in data:
+                return HTTPResponse(body="Missing config value", status=400)
+            value = data["value"]
 
         if not self.__config.has_section(section):
             return HTTPResponse(body="There is no section '{}' in config".format(section), status=404)
         inner_config = getattr(self.__config, section)
         if not inner_config.has_property(key):
             return HTTPResponse(body="Section '{}' in config has no option '{}'".format(section, key), status=404)
-        if section in ConfigHandler.__URL_SET_BLOCKED_FIELDS and key in ConfigHandler.__URL_SET_BLOCKED_FIELDS[section]:
+        if (
+            section in ConfigHandler.__BODY_SET_BLOCKED_FIELDS and
+            key in ConfigHandler.__BODY_SET_BLOCKED_FIELDS[section]
+        ):
             return HTTPResponse(
-                body="Section '{}' option '{}' cannot be set via URL".format(section, key),
+                body="Section '{}' option '{}' cannot be set via request body".format(section, key),
                 status=403
             )
         try:

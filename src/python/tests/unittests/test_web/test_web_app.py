@@ -270,6 +270,18 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             "REMOTE_ADDR": "127.0.0.1",
         }
 
+    @staticmethod
+    def _proxied_same_origin_headers(origin: str = "https://localhost:8800", forwarded_proto: str = "https"):
+        parsed = urlparse(origin)
+        return {
+            "HTTP_HOST": parsed.netloc,
+            "HTTP_ORIGIN": origin,
+            "HTTP_REFERER": "{}/dashboard".format(origin),
+            "HTTP_X_FORWARDED_HOST": parsed.netloc,
+            "HTTP_X_FORWARDED_PROTO": forwarded_proto,
+            "REMOTE_ADDR": "172.25.0.1",
+        }
+
     def _issue_browser_session(self, client: TestApp, host: str = "localhost:8800"):
         with tempfile.TemporaryDirectory() as html_path:
             with open(os.path.join(html_path, "index.html"), "w") as html_file:
@@ -677,6 +689,52 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_int)
+
+    def test_write_route_accepts_cookie_backed_ui_session_through_trusted_forwarded_origin(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        ui_session = self.auth_store.create_ui_session(["write"])
+        client = TestApp(self.web_app)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                **self._proxied_same_origin_headers(),
+                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            }
+        )
+
+        self.assertEqual(200, response.status_int)
+
+    def test_write_route_rejects_unsafe_forwarded_proto_for_cookie_backed_ui_session(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        ui_session = self.auth_store.create_ui_session(["write"])
+        client = TestApp(self.web_app)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                **self._proxied_same_origin_headers(forwarded_proto="ftp"),
+                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Browser-origin signal required", response.text)
 
     def test_admin_write_route_accepts_bearer_api_key_without_same_origin_signal(self):
         @self.web_app.route("/server/admin/ping", method="POST", required_scope="admin")

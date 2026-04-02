@@ -44,6 +44,15 @@ class TestAdminHandler(unittest.TestCase):
     def _auth_headers(secret: str):
         return {"HTTP_AUTHORIZATION": "Bearer {}".format(secret)}
 
+    @staticmethod
+    def _same_origin_headers(origin: str = "http://localhost:8800"):
+        return {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "127.0.0.1",
+            "HTTP_ORIGIN": origin,
+            "HTTP_REFERER": "{}/dashboard".format(origin),
+        }
+
     def test_legacy_token_is_rejected_for_admin_routes(self):
         resp = self.test_app.get(
             "/server/admin/migration/v1",
@@ -54,7 +63,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(403, resp.status_int)
         self.assertIn("Legacy general.api_token cannot access admin endpoints", str(resp.html))
 
-    def test_first_admin_bootstrap_requires_loopback_and_no_existing_admin_key(self):
+    def test_first_admin_bootstrap_requires_loopback_and_same_origin_browser_signal(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -76,10 +85,39 @@ class TestAdminHandler(unittest.TestCase):
         )
         self.assertEqual(401, rejected_host_only.status_int)
 
+        rejected_proxied = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "proxied-loopback-admin"},
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "https://seed.example:8800",
+                "HTTP_REFERER": "https://seed.example:8800/bootstrap",
+                "HTTP_X_FORWARDED_HOST": "seed.example:8800",
+                "HTTP_X_FORWARDED_PROTO": "https",
+            },
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected_proxied.status_int)
+
+        rejected_cross_origin = test_app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {"name": "cross-site-admin"},
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "http://evil.example:8800",
+                "HTTP_REFERER": "http://evil.example:8800/bootstrap",
+            },
+            expect_errors=True
+        )
+        self.assertEqual(401, rejected_cross_origin.status_int)
+        self.assertEqual(0, empty_store.active_admin_key_count)
+
         allowed = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "first-admin"},
-            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"}
+            extra_environ=self._same_origin_headers()
         )
         allowed_payload = json.loads(allowed.text)
         self.assertEqual(201, allowed.status_int)
