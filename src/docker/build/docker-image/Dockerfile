@@ -159,7 +159,7 @@ RUN /scripts/setup_default_config.sh
 CMD [ \
     "/bin/bash", \
     "-lc", \
-    "/scripts/setup_default_config.sh && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs" \
+    "/scripts/setup_default_config.sh && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs --web-bind-host \"${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}\"" \
 ]
 
 EXPOSE 8800
