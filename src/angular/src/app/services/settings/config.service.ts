@@ -16,9 +16,8 @@ import {RestService, WebReaction} from "../utils/rest.service";
 export class ConfigService extends BaseWebService {
     private readonly CONFIG_GET_URL = "/server/config/get";
 
-    // noinspection UnterminatedStatementJS
     private readonly CONFIG_SET_URL =
-        (section, option, value) => `/server/config/set/${section}/${option}/${value}`
+        (section, option) => `/server/config/set/${section}/${option}`
 
     private _config: BehaviorSubject<Config> = new BehaviorSubject(null);
 
@@ -57,10 +56,8 @@ export class ConfigService extends BaseWebService {
                 );
             });
         } else {
-            // Double-encode the value
-            const valueEncoded = encodeURIComponent(encodeURIComponent(valueStr));
-            const url = this.CONFIG_SET_URL(section, option, valueEncoded);
-            const obs = this._restService.post(url);
+            const url = this.CONFIG_SET_URL(section, option);
+            const obs = this._restService.sendPostRequest(url, {value});
             obs.subscribe({
                 next: reaction => {
                     if (reaction.success) {

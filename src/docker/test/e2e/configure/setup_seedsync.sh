@@ -37,16 +37,27 @@ call_api() {
   echo
 }
 
+call_api_json() {
+  local url="$1"
+  local json_body="$2"
+  curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" \
+    --request POST \
+    --header "Content-Type: application/json" \
+    --data "${json_body}" \
+    "${url}"
+  echo
+}
+
 wait_for_app_ready "Seedsync app is up (before configuring)"
-call_api "${base_url}/server/config/set/general/debug/true" POST
-call_api "${base_url}/server/config/set/general/verbose/true" POST
-call_api "${base_url}/server/config/set/lftp/local_path/%252Fdownloads" POST
-call_api "${base_url}/server/config/set/lftp/remote_address/remote" POST
-call_api "${base_url}/server/config/set/lftp/remote_username/remoteuser" POST
-call_api "${base_url}/server/config/set/lftp/remote_password/remotepass" POST
-call_api "${base_url}/server/config/set/lftp/remote_port/1234" POST
-call_api "${base_url}/server/config/set/lftp/remote_path/%252Fhome%252Fremoteuser%252Ffiles" POST
-call_api "${base_url}/server/config/set/autoqueue/patterns_only/true" POST
+call_api_json "${base_url}/server/config/set/general/debug" '{"value":true}'
+call_api_json "${base_url}/server/config/set/general/verbose" '{"value":true}'
+call_api_json "${base_url}/server/config/set/lftp/local_path" '{"value":"/downloads"}'
+call_api_json "${base_url}/server/config/set/lftp/remote_address" '{"value":"remote"}'
+call_api_json "${base_url}/server/config/set/lftp/remote_username" '{"value":"remoteuser"}'
+call_api_json "${base_url}/server/config/set/lftp/remote_password" '{"value":"remotepass"}'
+call_api_json "${base_url}/server/config/set/lftp/remote_port" '{"value":1234}'
+call_api_json "${base_url}/server/config/set/lftp/remote_path" '{"value":"/home/remoteuser/files"}'
+call_api_json "${base_url}/server/config/set/autoqueue/patterns_only" '{"value":true}'
 
 wait_for_app_ready "Seedsync app is up (before restart)"
 call_api "${base_url}/server/command/restart" POST

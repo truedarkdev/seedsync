@@ -291,6 +291,143 @@ class WebApp(bottle.Bottle):
         )
 
     @staticmethod
+    def __request_forwarded_proto() -> Optional[str]:
+        raw_value = bottle.request.get_header("X-Forwarded-Proto", "")
+        if not isinstance(raw_value, str):
+            return None
+
+        raw_value = raw_value.strip().lower()
+        if not raw_value or "," in raw_value:
+            return None
+
+        if raw_value not in {"http", "https"}:
+            return None
+
+        return raw_value
+
+    @staticmethod
+    def __request_forwarded_host() -> Optional[str]:
+        raw_value = bottle.request.get_header("X-Forwarded-Host", "")
+        if not isinstance(raw_value, str):
+            return None
+
+        raw_value = raw_value.strip()
+        if not raw_value or "," in raw_value or "://" in raw_value:
+            return None
+
+        parsed = urlparse("//{}".format(raw_value))
+        if (
+            not parsed.hostname or
+            parsed.username is not None or
+            parsed.password is not None or
+            parsed.path or
+            parsed.params or
+            parsed.query or
+            parsed.fragment
+        ):
+            return None
+
+        return raw_value
+
+    @staticmethod
+    def __request_forwarded_origin() -> Optional[Tuple[str, str, int]]:
+        forwarded_proto = WebApp.__request_forwarded_proto()
+        forwarded_host = WebApp.__request_forwarded_host()
+        if forwarded_proto is None or forwarded_host is None:
+            return None
+
+        parsed = urlparse("{}://{}".format(forwarded_proto, forwarded_host))
+        if not parsed.scheme or not parsed.hostname:
+            return None
+
+        if parsed.username is not None or parsed.password is not None or parsed.path or parsed.params or parsed.query or parsed.fragment:
+            return None
+
+        scheme = parsed.scheme.strip().lower()
+        if scheme not in {"http", "https"}:
+            return None
+
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+
+        if port is None:
+            port = 80 if scheme == "http" else 443
+
+        return scheme, WebApp.__normalize_hostname(parsed.hostname), port
+
+    def __is_trusted_forwarded_origin_source(self) -> bool:
+        return self.__is_loopback_remote_addr() or self.__is_trusted_browser_bootstrap_remote_addr()
+
+    def __effective_request_origin(self) -> Optional[Tuple[str, str, int]]:
+        request_origin = WebApp.__request_origin()
+        if request_origin is None:
+            return None
+
+        if not self.__is_trusted_forwarded_origin_source():
+            return request_origin
+
+        forwarded_origin = WebApp.__request_forwarded_origin()
+        if forwarded_origin is not None:
+            return forwarded_origin
+
+        return request_origin
+
+    @staticmethod
+    def __request_local_origin() -> Optional[Tuple[str, str, int]]:
+        scheme = bottle.request.environ.get("wsgi.url_scheme", "")
+        if not isinstance(scheme, str):
+            return None
+        scheme = scheme.strip().lower()
+        if scheme not in {"http", "https"}:
+            return None
+
+        host = bottle.request.get_header("Host", "")
+        if not isinstance(host, str) or host.strip() == "":
+            return None
+
+        return WebApp.__parse_origin("{}://{}".format(scheme, host.strip()))
+
+    def __is_direct_same_origin_browser_request(self) -> bool:
+        request_origin = WebApp.__request_local_origin()
+        if request_origin is None:
+            return False
+
+        origin = WebApp.__parse_origin(bottle.request.get_header("Origin", ""))
+        if origin is not None:
+            return origin == request_origin
+
+        referer = WebApp.__parse_origin(bottle.request.get_header("Referer", ""))
+        if referer is not None:
+            return referer == request_origin
+
+        return False
+
+    def __is_same_origin_browser_request(self) -> bool:
+        request_origin = self.__effective_request_origin()
+        if request_origin is None:
+            return False
+
+        sec_fetch_site = bottle.request.get_header("Sec-Fetch-Site", "")
+        if isinstance(sec_fetch_site, str) and sec_fetch_site.strip():
+            sec_fetch_site = sec_fetch_site.strip().lower()
+            if sec_fetch_site not in {"same-origin", "none"}:
+                return False
+            if sec_fetch_site == "same-origin":
+                return True
+
+        origin = WebApp.__parse_origin(bottle.request.get_header("Origin", ""))
+        if origin is not None:
+            return origin == request_origin
+
+        referer = WebApp.__parse_origin(bottle.request.get_header("Referer", ""))
+        if referer is not None:
+            return referer == request_origin
+
+        return False
+
+    @staticmethod
     def __request_origin() -> Optional[Tuple[str, str, int]]:
         raw_url = bottle.request.url
         if not isinstance(raw_url, str) or raw_url.strip() == "":
@@ -357,36 +494,13 @@ class WebApp(bottle.Bottle):
 
         return tuple(networks), tuple(invalid_entries)
 
-    @staticmethod
-    def __is_same_origin_browser_request() -> bool:
-        request_origin = WebApp.__request_origin()
-        if request_origin is None:
-            return False
-
-        sec_fetch_site = bottle.request.get_header("Sec-Fetch-Site", "")
-        if isinstance(sec_fetch_site, str) and sec_fetch_site.strip():
-            sec_fetch_site = sec_fetch_site.strip().lower()
-            if sec_fetch_site not in {"same-origin", "none"}:
-                return False
-            if sec_fetch_site == "same-origin":
-                return True
-
-        origin = WebApp.__parse_origin(bottle.request.get_header("Origin", ""))
-        if origin is not None:
-            return origin == request_origin
-
-        referer = WebApp.__parse_origin(bottle.request.get_header("Referer", ""))
-        if referer is not None:
-            return referer == request_origin
-
-        return False
-
     def __allow_first_admin_bootstrap(self) -> bool:
         return (
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
             WebApp.__is_loopback_remote_addr() and
-            WebApp.__is_loopback_host(WebApp.__request_host())
+            WebApp.__is_loopback_host(WebApp.__request_host()) and
+            self.__is_direct_same_origin_browser_request()
         )
 
     def __load_trusted_browser_bootstrap_networks(self):
@@ -435,13 +549,13 @@ class WebApp(bottle.Bottle):
             if not WebApp.__has_bearer_authorization_header():
                 ui_session_scopes = self.__get_ui_session_scopes()
                 if ui_session_scopes is not None:
-                    if required_scope in {"write", "admin"} and not WebApp.__is_same_origin_browser_request():
+                    if required_scope in {"write", "admin"} and not self.__is_same_origin_browser_request():
                         bottle.abort(403, "Browser-origin signal required for cookie-authenticated write requests")
                     self.__authorize_scopes(required_scope, ui_session_scopes)
                     return
                 if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
                     return
-                if allow_sessionless_ui and WebApp.__is_same_origin_browser_request():
+                if allow_sessionless_ui and self.__is_same_origin_browser_request():
                     return
             bottle.abort(401, "Missing API token")
 

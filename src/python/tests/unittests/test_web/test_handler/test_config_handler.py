@@ -2,7 +2,6 @@ import json
 from io import BytesIO
 import unittest
 from unittest.mock import MagicMock, patch
-from urllib.parse import quote
 from wsgiref.util import setup_testing_defaults
 
 from common import Config, ConfigError
@@ -19,16 +18,22 @@ def _invoke_route(
     path,
     method: str = "GET",
     api_token: str = None,
-    ui_session_secret: str = None
+    ui_session_secret: str = None,
+    body: str = None,
+    content_type: str = None
 ):
     environ = {}
     setup_testing_defaults(environ)
     environ["REQUEST_METHOD"] = method
     environ["PATH_INFO"] = path
-    environ["wsgi.input"] = BytesIO(b"")
+    body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+    environ["wsgi.input"] = BytesIO(body_bytes)
+    environ["CONTENT_LENGTH"] = str(len(body_bytes))
     environ["HTTP_HOST"] = "localhost:8800"
     environ["REMOTE_ADDR"] = "127.0.0.1"
     environ["HTTP_REFERER"] = "http://localhost:8800/settings"
+    if content_type is not None:
+        environ["CONTENT_TYPE"] = content_type
     if api_token is not None:
         environ["HTTP_AUTHORIZATION"] = "Bearer {}".format(api_token)
     if ui_session_secret is not None:
@@ -50,6 +55,24 @@ def _invoke_get_route(web_app, path, api_token: str = None, ui_session_secret: s
 
 def _invoke_post_route(web_app, path, api_token: str = None, ui_session_secret: str = None):
     return _invoke_route(web_app, path, method="POST", api_token=api_token, ui_session_secret=ui_session_secret)
+
+
+def _invoke_post_json_route(
+    web_app,
+    path,
+    json_body,
+    api_token: str = None,
+    ui_session_secret: str = None
+):
+    return _invoke_route(
+        web_app,
+        path,
+        method="POST",
+        api_token=api_token,
+        ui_session_secret=ui_session_secret,
+        body=json.dumps(json_body),
+        content_type="application/json"
+    )
 
 
 class TestConfigHandlerGet(unittest.TestCase):
@@ -79,7 +102,7 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.config.lftp = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "lftp", "remote_path", quote("/path/with spaces")
+            "lftp", "remote_path", "/path/with spaces"
         )
 
         self.assertEqual(200, response.status_code)
@@ -89,7 +112,7 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.config.has_section.return_value = False
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "missing", "key", quote("value")
+            "missing", "key", "value"
         )
 
         self.assertEqual(404, response.status_code)
@@ -101,7 +124,7 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.config.general = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "general", "badkey", quote("value")
+            "general", "badkey", "value"
         )
 
         self.assertEqual(404, response.status_code)
@@ -114,58 +137,60 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.config.lftp = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "lftp", "remote_address", quote("bad")
+            "lftp", "remote_address", "bad"
         )
 
         self.assertEqual(400, response.status_code)
 
-    def test_set_api_token_via_url_is_forbidden(self):
+    def test_set_api_token_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
         inner.has_property.return_value = True
         self.config.general = inner
 
-        response = self.handler._ConfigHandler__handle_set_config(
-            "general", "api_token", quote("super-secret-token")
-        )
+        response = self.handler._ConfigHandler__handle_set_config("general", "api_token", "super-secret-token")
 
         self.assertEqual(403, response.status_code)
         self.assertEqual(
-            "Section 'general' option 'api_token' cannot be set via URL",
+            "Section 'general' option 'api_token' cannot be set via request body",
             response.body
         )
         inner.set_property.assert_not_called()
 
-    def test_set_config_api_redaction_via_url_is_forbidden(self):
+    def test_set_config_api_redaction_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
         inner.has_property.return_value = True
         self.config.general = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "general", "config_api_redact_remote_details", quote("False")
+            "general",
+            "config_api_redact_remote_details",
+            False
         )
 
         self.assertEqual(403, response.status_code)
         self.assertEqual(
-            "Section 'general' option 'config_api_redact_remote_details' cannot be set via URL",
+            "Section 'general' option 'config_api_redact_remote_details' cannot be set via request body",
             response.body
         )
         inner.set_property.assert_not_called()
 
-    def test_set_trusted_browser_bootstrap_remote_addrs_via_url_is_forbidden(self):
+    def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
         inner.has_property.return_value = True
         self.config.general = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
-            "general", "trusted_browser_bootstrap_remote_addrs", quote("172.25.0.1/32")
+            "general",
+            "trusted_browser_bootstrap_remote_addrs",
+            "172.25.0.1/32"
         )
 
         self.assertEqual(403, response.status_code)
         self.assertEqual(
-            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via URL",
+            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via request body",
             response.body
         )
         inner.set_property.assert_not_called()
@@ -208,39 +233,57 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
-    def test_set_route_blocks_redaction_toggle(self):
+    def test_set_route_blocks_redaction_toggle_from_body(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+        ui_session = self.auth_store.create_ui_session(["admin"])
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/general/config_api_redact_remote_details",
+            {"value": False},
+            ui_session_secret=ui_session.secret,
+        )
+
+        self.assertEqual(403, status_code)
+        self.assertEqual(True, config.general.config_api_redact_remote_details)
+        self.assertIn(
+            "Section 'general' option 'config_api_redact_remote_details' cannot be set via request body",
+            body
+        )
+
+    def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs_from_body(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+        ui_session = self.auth_store.create_ui_session(["admin"])
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/general/trusted_browser_bootstrap_remote_addrs",
+            {"value": "172.25.0.1/32"},
+            ui_session_secret=ui_session.secret,
+        )
+
+        self.assertEqual(403, status_code)
+        self.assertIsNone(config.general.trusted_browser_bootstrap_remote_addrs)
+        self.assertIn(
+            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via request body",
+            body
+        )
+
+    def test_set_route_rejects_old_url_value_shape(self):
         config = Config()
         ConfigHandler(config).add_routes(self.web_app)
         ui_session = self.auth_store.create_ui_session(["admin"])
 
         status_code, body = _invoke_post_route(
             self.web_app,
-            "/server/config/set/general/config_api_redact_remote_details/False",
+            "/server/config/set/general/debug/True",
             ui_session_secret=ui_session.secret,
         )
 
-        self.assertEqual(403, status_code)
-        self.assertEqual(
-            "Section 'general' option 'config_api_redact_remote_details' cannot be set via URL",
-            body
-        )
-
-    def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs(self):
-        config = Config()
-        ConfigHandler(config).add_routes(self.web_app)
-        ui_session = self.auth_store.create_ui_session(["admin"])
-
-        status_code, body = _invoke_post_route(
-            self.web_app,
-            "/server/config/set/general/trusted_browser_bootstrap_remote_addrs/172.25.0.1%2F32",
-            ui_session_secret=ui_session.secret,
-        )
-
-        self.assertEqual(403, status_code)
-        self.assertEqual(
-            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via URL",
-            body
-        )
+        self.assertEqual(404, status_code)
+        self.assertIsNone(config.general.debug)
 
     def test_get_route_rejects_legacy_token_even_when_compatibility_is_enabled(self):
         auth_store = ApiKeyStore()
