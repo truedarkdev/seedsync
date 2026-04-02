@@ -44,6 +44,12 @@ class AdminHandler(IHandler):
             required_scope="admin",
             allow_first_admin_bootstrap=True
         )
+        web_app.add_post_handler(
+            "/server/browser/v1/remember",
+            self.__handle_remember_browser_session,
+            required_scope="read",
+            allow_browser_api_key_entry=True
+        )
         web_app.add_handler(
             "/server/admin/migration/v1",
             self.__handle_get_migration_state,
@@ -121,31 +127,63 @@ class AdminHandler(IHandler):
             return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_bootstrap_first_api_key(self):
-        if self.__auth_store.active_admin_key_count > 0:
-            return self.__json_response({"error": "Bootstrap is only available before the first admin API key exists"}, status=409)
-
         try:
+            handover_version = self.__browser_handover_version()
             data = self.__load_request_json()
-            result = self.__auth_store.create_api_key(
+            result = self.__auth_store.create_initial_admin_api_key_if_available(
+                browser_handover_version=handover_version,
                 name=data.get("name", "bootstrap-admin"),
-                scopes=["admin"]
             )
+            if result is None:
+                return self.__json_response({
+                    "error": "First-admin browser bootstrap is only available when the initial handover window is open"
+                }, status=409)
+
+            ui_session = self.__auth_store.create_browser_session_for_api_key(result["record"].id)
             response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],
+                "browser_handover": self.__auth_store.get_browser_handover_state(self.__config),
             }, status=201)
-            create_session = getattr(self.__auth_store, "create_ui_session", None)
-            if create_session is not None:
-                ui_session = create_session(["admin"])
-                response.set_cookie(
-                    WebApp._UI_SESSION_COOKIE_NAME,
-                    ui_session.secret,
-                    path="/",
-                    httponly=True,
-                    samesite="strict",
-                )
+            response.set_cookie(
+                WebApp._UI_SESSION_COOKIE_NAME,
+                ui_session.secret,
+                path="/",
+                httponly=True,
+                samesite="strict",
+            )
             return response
         except (TypeError, ValueError) as exc:
+            return self.__json_response({"error": str(exc)}, status=400)
+
+    def __handle_remember_browser_session(self):
+        try:
+            data = self.__load_request_json()
+            api_key_secret = data.get("secret", "")
+            if not isinstance(api_key_secret, str) or not api_key_secret.strip():
+                return self.__json_response({"error": "API key secret is required"}, status=400)
+
+            auth_record = self.__auth_store.find_api_key_by_secret(api_key_secret.strip())
+            if auth_record is None:
+                return self.__json_response({"error": "API key secret is invalid or has been revoked"}, status=401)
+            if getattr(auth_record, "revoked_at", None) is not None:
+                return self.__json_response({"error": "API key has been revoked"}, status=403)
+
+            ui_session = self.__auth_store.create_browser_session_for_api_key(auth_record.id)
+            response = self.__json_response({
+                "key": auth_record.to_public_dict(),
+                "browser_handover": self.__auth_store.get_browser_handover_state(self.__config),
+                "expires_at": ui_session.expires_at,
+            }, status=201)
+            response.set_cookie(
+                WebApp._UI_SESSION_COOKIE_NAME,
+                ui_session.secret,
+                path="/",
+                httponly=True,
+                samesite="strict",
+            )
+            return response
+        except (TypeError, ValueError, KeyError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_disable_legacy_token(self):
@@ -219,6 +257,13 @@ class AdminHandler(IHandler):
             return self.__json_response({"error": str(exc)}, status=404)
         except ValueError as exc:
             return self.__json_response({"error": str(exc)}, status=400)
+
+    def __browser_handover_version(self) -> str:
+        general_config = getattr(self.__config, "general", None)
+        if general_config is None:
+            return ""
+        handover_version = getattr(general_config, "browser_handover_recovery_version", "")
+        return handover_version if isinstance(handover_version, str) else ""
 
     @staticmethod
     def __query_flag(name: str) -> bool:

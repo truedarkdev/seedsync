@@ -118,6 +118,7 @@ class WebApp(bottle.Bottle):
                 bool(route.config.get("allow_sessionless_ui", False)),
                 bool(route.config.get("allow_first_admin_bootstrap", False)),
                 bool(route.config.get("allow_bootstrap_proof_exchange", False)),
+                bool(route.config.get("allow_browser_api_key_entry", False)),
             )
 
     def add_default_routes(self):
@@ -127,8 +128,8 @@ class WebApp(bottle.Bottle):
         :return:
         """
         # Bootstrap landing page. It is intentionally tiny and same-origin so the
-        # browser can redeem the one-time bootstrap proof without exposing the
-        # session secret to the helper process.
+        # browser can claim first-run admin access or remember an API key without
+        # exposing credentials to the helper process.
         self.route("/bootstrap")(self.__bootstrap)
 
         # Streaming route
@@ -185,6 +186,7 @@ class WebApp(bottle.Bottle):
               allow_sessionless_ui: bool = False,
               allow_first_admin_bootstrap: bool = False,
               allow_bootstrap_proof_exchange: bool = False,
+              allow_browser_api_key_entry: bool = False,
               **config):
         if path is not None and WebApp.__is_server_path(path):
             if required_scope is None:
@@ -200,6 +202,7 @@ class WebApp(bottle.Bottle):
                 "allow_sessionless_ui": allow_sessionless_ui,
                 "allow_first_admin_bootstrap": allow_first_admin_bootstrap,
                 "allow_bootstrap_proof_exchange": allow_bootstrap_proof_exchange,
+                "allow_browser_api_key_entry": allow_browser_api_key_entry,
             }.items():
                 if type(flag_value) is not bool:
                     raise ValueError("{} must be a boolean for /server routes".format(flag_name))
@@ -221,6 +224,13 @@ class WebApp(bottle.Bottle):
             return ""
         remote_addrs = getattr(general_config, "trusted_browser_bootstrap_remote_addrs", "")
         return remote_addrs if isinstance(remote_addrs, str) else ""
+
+    def __get_browser_handover_version(self) -> str:
+        general_config = getattr(self.__config, "general", None)
+        if general_config is None:
+            return ""
+        browser_handover_version = getattr(general_config, "browser_handover_recovery_version", "")
+        return browser_handover_version if isinstance(browser_handover_version, str) else ""
 
     @staticmethod
     def __is_server_path(path: str) -> bool:
@@ -505,16 +515,24 @@ class WebApp(bottle.Bottle):
         return tuple(networks), tuple(invalid_entries)
 
     def __allow_first_admin_bootstrap(self) -> bool:
-        if self.__auth_store is None or getattr(self.__auth_store, "active_admin_key_count", 0) != 0:
+        if self.__auth_store is None:
             return False
 
-        if self.__has_bootstrap_ui_session() and self.__is_same_origin_browser_request():
-            return True
+        can_claim = getattr(self.__auth_store, "can_claim_initial_admin", None)
+        if can_claim is None:
+            return False
+        if not can_claim(self.__get_browser_handover_version()):
+            return False
 
         return (
-            self.__is_loopback_remote_addr() and
-            WebApp.__is_loopback_host(WebApp.__request_host()) and
-            self.__is_direct_same_origin_browser_request()
+            self.__is_trusted_browser_bootstrap_request() and
+            self.__is_same_origin_browser_request()
+        )
+
+    def __allow_browser_api_key_entry(self) -> bool:
+        return (
+            self.__is_trusted_browser_bootstrap_request() and
+            self.__is_same_origin_browser_request()
         )
 
     def __allow_sessionless_ui_route(self) -> bool:
@@ -600,7 +618,8 @@ class WebApp(bottle.Bottle):
         allow_legacy_api_token: bool,
         allow_sessionless_ui: bool,
         allow_first_admin_bootstrap: bool,
-        allow_bootstrap_proof_exchange: bool
+        allow_bootstrap_proof_exchange: bool,
+        allow_browser_api_key_entry: bool
     ) -> None:
         token = WebApp.__extract_bearer_token()
         if token is None:
@@ -616,6 +635,8 @@ class WebApp(bottle.Bottle):
                     self.__authorize_scopes(required_scope, ui_session_scopes)
                     return
                 if allow_sessionless_ui and self.__allow_sessionless_ui_route():
+                    return
+                if allow_browser_api_key_entry and self.__allow_browser_api_key_entry():
                     return
             bottle.abort(401, "Missing API token")
 
@@ -651,6 +672,14 @@ class WebApp(bottle.Bottle):
         if session is None:
             return None
 
+        resolved_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
+        if resolved_api_key is not None:
+            auth_record = resolved_api_key(session)
+            if auth_record is not None:
+                return list(getattr(auth_record, "scopes", []) or [])
+            if getattr(session, "api_key_id", None):
+                return None
+
         return getattr(session, "scopes", None)
 
     def __get_ui_session(self):
@@ -668,6 +697,17 @@ class WebApp(bottle.Bottle):
         session = find_session(ui_session_secret)
         if session is None:
             return None
+
+        if getattr(session, "api_key_id", None):
+            resolve_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
+            if resolve_api_key is None:
+                return None
+            if resolve_api_key(session) is None:
+                invalidate_session = getattr(self.__auth_store, "invalidate_ui_session", None)
+                if invalidate_session is not None:
+                    invalidate_session(ui_session_secret)
+                return None
+            return session
 
         if getattr(session, "bootstrap", False):
             return session
@@ -712,23 +752,41 @@ class WebApp(bottle.Bottle):
             if not self.__is_trusted_browser_bootstrap_request():
                 bottle.abort(
                     403,
-                    "Bootstrap proof redemption is limited to loopback or explicit trusted local runtime sources"
+                    "Bootstrap access is limited to loopback or explicit trusted local runtime sources"
                 )
 
-            if getattr(self.__auth_store, "active_admin_key_count", 0) != 0:
-                bottle.abort(409, "Bootstrap proof redemption is only available before the first admin API key exists")
+        if self.__get_ui_session() is not None:
+            bottle.redirect("/")
 
-            ensure_exchange = getattr(self.__auth_store, "ensure_bootstrap_exchange", None)
-            if ensure_exchange is not None:
-                exchange = ensure_exchange()
-                if exchange is not None:
-                    bottle.response.set_cookie(
-                        self._BOOTSTRAP_EXCHANGE_COOKIE_NAME,
-                        exchange.secret,
-                        path="/",
-                        httponly=True,
-                        samesite="strict",
-                    )
+        browser_handover_state = {
+            "configured_version": "",
+            "claimed_version": "",
+            "open": False,
+        }
+        if self.__auth_store is not None:
+            browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
+
+        can_claim_initial_admin = bool(browser_handover_state.get("open", False))
+        if can_claim_initial_admin:
+            page_title = "SeedSync first-run setup"
+            page_heading = "Claim initial admin access"
+            page_description = "The current browser can claim the first admin key for this SeedSync install."
+            primary_action_label = "Create first admin key"
+            primary_action_url = "/server/admin/bootstrap/v1/first-api-key"
+            primary_action_payload = 'name: document.getElementById("bootstrap-name").value || "bootstrap-admin"'
+            primary_placeholder = "bootstrap-admin"
+            primary_field_id = "bootstrap-name"
+            primary_field_label = "Admin key name"
+        else:
+            page_title = "SeedSync browser access"
+            page_heading = "Remember this browser"
+            page_description = "Enter an API key once to remember this browser and tie its access to that key's current scopes."
+            primary_action_label = "Remember browser"
+            primary_action_url = "/server/browser/v1/remember"
+            primary_action_payload = 'secret: document.getElementById("browser-secret").value'
+            primary_placeholder = "Paste an API key secret"
+            primary_field_id = "browser-secret"
+            primary_field_label = "API key secret"
 
         bottle.response.content_type = "text/html; charset=utf-8"
         bottle.response.cache_control = "no-store"
@@ -737,54 +795,129 @@ class WebApp(bottle.Bottle):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SeedSync Bootstrap</title>
+  <title>{page_title}</title>
+  <style>
+    body {{
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: #f5f7fb;
+      color: #1f2937;
+    }}
+    main {{
+      width: min(42rem, calc(100vw - 2rem));
+      background: white;
+      border: 1px solid rgba(31, 41, 55, 0.1);
+      border-radius: 12px;
+      padding: 1.5rem;
+      box-shadow: 0 20px 60px rgba(15, 23, 42, 0.12);
+    }}
+    h1 {{ margin: 0 0 0.5rem; font-size: 1.6rem; }}
+    p {{ line-height: 1.5; color: rgba(31, 41, 55, 0.8); }}
+    label {{ display: block; font-weight: 700; margin: 1rem 0 0.35rem; }}
+    input {{
+      width: 100%;
+      padding: 0.8rem 0.9rem;
+      border-radius: 8px;
+      border: 1px solid rgba(31, 41, 55, 0.18);
+      font: inherit;
+      box-sizing: border-box;
+    }}
+    button {{
+      margin-top: 1rem;
+      padding: 0.8rem 1rem;
+      border-radius: 8px;
+      border: 0;
+      background: #2563eb;
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .hint {{
+      margin-top: 0.75rem;
+      font-size: 0.9rem;
+      color: rgba(31, 41, 55, 0.62);
+    }}
+    .error {{
+      margin-top: 0.75rem;
+      color: #b91c1c;
+      white-space: pre-wrap;
+    }}
+  </style>
 </head>
 <body>
+<main>
+  <h1>{page_heading}</h1>
+  <p>{page_description}</p>
+  <form id="bootstrap-form">
+    <label for="{primary_field_id}">{primary_field_label}</label>
+    <input id="{primary_field_id}" type="password" autocomplete="off" placeholder="{primary_placeholder}">
+    <button type="submit">{primary_action_label}</button>
+  </form>
+  <p class="hint">This page stays local and same-origin. It only sends the entered credential to this SeedSync instance.</p>
+  <p id="error" class="error" hidden></p>
+</main>
 <script>
-(function () {
-  const rawHash = window.location.hash ? window.location.hash.substring(1) : "";
-  const rawQuery = window.location.search ? window.location.search.substring(1) : "";
-  const params = new URLSearchParams(rawHash || rawQuery);
-  const proof = params.get("proof");
-  if (!proof) {
-    document.body.textContent = "Missing bootstrap proof.";
-    return;
-  }
-
-  fetch("/server/admin/bootstrap/v1/exchange", {
-    method: "POST",
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ proof }),
-  }).then(function (response) {
-    if (!response.ok) {
-      return response.text().then(function (text) {
-        throw new Error(text || "Bootstrap exchange failed");
-      });
-    }
-    window.location.replace("/");
-  }).catch(function (error) {
-    document.body.textContent = error.message || String(error);
-  });
-})();
+(function () {{
+  const form = document.getElementById("bootstrap-form");
+  const error = document.getElementById("error");
+  form.addEventListener("submit", function (event) {{
+    event.preventDefault();
+    error.hidden = true;
+    error.textContent = "";
+    const payload = {{ {primary_action_payload} }};
+    fetch("{primary_action_url}", {{
+      method: "POST",
+      credentials: "same-origin",
+      headers: {{ "Content-Type": "application/json" }},
+      body: JSON.stringify(payload),
+    }}).then(function (response) {{
+      if (!response.ok) {{
+        return response.text().then(function (text) {{
+          throw new Error(text || "Request failed");
+        }});
+      }}
+      window.location.replace("/");
+    }}).catch(function (err) {{
+      error.hidden = false;
+      error.textContent = err.message || String(err);
+    }});
+  }});
+}})();
 </script>
 </body>
 </html>
-"""
+""".format(
+            page_title=page_title,
+            page_heading=page_heading,
+            page_description=page_description,
+            primary_action_label=primary_action_label,
+            primary_action_url=primary_action_url,
+            primary_action_payload=primary_action_payload,
+            primary_placeholder=primary_placeholder,
+            primary_field_id=primary_field_id,
+            primary_field_label=primary_field_label,
+        )
 
     def __authorize_browser_bootstrap(self) -> None:
-        if self.__auth_store is not None and getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
+        if self.__auth_store is None:
+            return
+
+        if self.__get_ui_session() is not None:
+            return
+
+        if getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
             if self.__is_loopback_remote_addr() and WebApp.__is_loopback_host(WebApp.__request_host()):
                 return
-            if self.__has_bootstrap_ui_session():
+            if self.__is_trusted_browser_bootstrap_request():
                 return
             bottle.abort(
                 403,
-                "First-admin browser bootstrap requires direct loopback access or a bootstrap-limited UI session."
+                "First-admin browser bootstrap requires direct loopback access or an approved local browser request."
             )
-
-        if self.__is_trusted_browser_bootstrap_request():
-            return
 
         bottle.abort(403, "Browser shell and static asset access is limited to loopback or explicit trusted local runtime sources")
 
@@ -812,16 +945,6 @@ class WebApp(bottle.Bottle):
         """
         self.__authorize_browser_bootstrap()
         response = static_file(file_path, root=self.__html_path)
-        if file_path == "index.html":
-            ui_session_secret = self.__create_ui_session_secret()
-            if ui_session_secret is not None:
-                response.set_cookie(
-                    self._UI_SESSION_COOKIE_NAME,
-                    ui_session_secret,
-                    path="/",
-                    httponly=True,
-                    samesite="strict",
-                )
         response.set_header("Content-Security-Policy", self._CONTENT_SECURITY_POLICY)
         return response
 

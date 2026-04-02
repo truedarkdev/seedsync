@@ -199,6 +199,7 @@ class TestConfig(unittest.TestCase):
             "api_token": "token-value",
             "allowed_hostname": "",
             "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
+            "browser_handover_recovery_version": "2026.04.03",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -207,6 +208,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("token-value", general.api_token)
         self.assertEqual("", general.allowed_hostname)
         self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
+        self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -428,6 +430,7 @@ class TestConfig(unittest.TestCase):
         [General]
         debug=False
         verbose=True
+        browser_handover_recovery_version=2026.04.03
 
         [Lftp]
         remote_address=remote.server.com
@@ -473,6 +476,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("", config.general.api_token)
             self.assertEqual("", config.general.allowed_hostname)
             self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
+            self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
             self.assertEqual(True, config.general.config_api_redact_remote_details)
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
@@ -528,6 +532,7 @@ class TestConfig(unittest.TestCase):
             config.general.api_token = "api-token-value"
             config.general.allowed_hostname = ""
             config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+            config.general.browser_handover_recovery_version = "2026.04.03"
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
@@ -565,6 +570,7 @@ class TestConfig(unittest.TestCase):
             api_token = api-token-value
             allowed_hostname =
             trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32
+            browser_handover_recovery_version = 2026.04.03
             config_api_redact_remote_details = True
 
             [Lftp]

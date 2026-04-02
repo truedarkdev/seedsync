@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 import json
+import threading
 
 from web.auth_store import ApiKeyStore
 from common import PersistError
@@ -141,3 +142,80 @@ class TestApiKeyStore(unittest.TestCase):
 
             self.assertFalse(store.peek_bootstrap_proof(proof.secret))
             self.assertFalse(os.path.exists(proof_path))
+
+    def test_browser_session_is_persisted_and_tracks_current_api_key_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+
+            created = store.create_api_key("admin", ["admin", "read"])
+            record = created["record"]
+            session = store.create_browser_session_for_api_key(record.id)
+
+            self.assertTrue(os.path.isfile(store_path))
+            self.assertIsNotNone(store.find_ui_session_by_secret(session.secret))
+            self.assertEqual(record.id, store.resolve_ui_session_api_key(session).id)
+
+            updated = store.update_api_key(record.id, scopes=["admin", "read", "stream"])
+            self.assertEqual(["admin", "read", "stream"], updated.scopes)
+            self.assertEqual(["admin", "read", "stream"], store.resolve_ui_session_api_key(session).scopes)
+
+            rotated = store.rotate_api_key(record.id)
+            self.assertIsNone(store.resolve_ui_session_api_key(session))
+
+            replacement_session = store.create_browser_session_for_api_key(record.id)
+            self.assertEqual(record.id, store.resolve_ui_session_api_key(replacement_session).id)
+
+            store.revoke_api_key(record.id)
+            self.assertIsNone(store.resolve_ui_session_api_key(replacement_session))
+
+    def test_initial_admin_claim_reopens_when_handover_version_changes(self):
+        store = ApiKeyStore()
+
+        self.assertTrue(store.can_claim_initial_admin(""))
+
+        store.create_api_key("admin", ["admin"])
+
+        self.assertFalse(store.can_claim_initial_admin(""))
+        self.assertTrue(store.can_claim_initial_admin("2026.04.03"))
+
+        store.claim_initial_admin("2026.04.03")
+
+        self.assertFalse(store.can_claim_initial_admin("2026.04.03"))
+        self.assertTrue(store.can_claim_initial_admin("2026.04.04"))
+
+    def test_initial_admin_claim_is_atomic_across_concurrent_requests(self):
+        store = ApiKeyStore()
+        store.create_api_key("admin", ["admin"])
+        store.claim_initial_admin("2026.04.03")
+
+        gate = threading.Barrier(2)
+        results = []
+
+        def _claim():
+            gate.wait()
+            results.append(store.claim_initial_admin_if_available("2026.04.04"))
+
+        first = threading.Thread(target=_claim)
+        second = threading.Thread(target=_claim)
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+
+        self.assertEqual(1, results.count(True))
+        self.assertEqual(1, results.count(False))
+        self.assertFalse(store.can_claim_initial_admin("2026.04.04"))
+
+    def test_version_1_payload_without_browser_handover_state_still_loads(self):
+        payload = {
+            "version": 1,
+            "legacy_api_token_compatibility_enabled": True,
+            "api_keys": [],
+        }
+
+        store = ApiKeyStore.from_str(json.dumps(payload))
+
+        self.assertTrue(store.legacy_api_token_compatibility_enabled)
+        self.assertEqual(0, store.active_admin_key_count)
+        self.assertTrue(store.can_claim_initial_admin(""))

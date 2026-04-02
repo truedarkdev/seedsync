@@ -98,12 +98,10 @@ class TestAdminHandler(unittest.TestCase):
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "proxied-loopback-admin"},
             extra_environ={
-                "HTTP_HOST": "localhost:8800",
-                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_HOST": "seed.example:8800",
+                "REMOTE_ADDR": "172.25.0.1",
                 "HTTP_ORIGIN": "https://seed.example:8800",
                 "HTTP_REFERER": "https://seed.example:8800/bootstrap",
-                "HTTP_X_FORWARDED_HOST": "seed.example:8800",
-                "HTTP_X_FORWARDED_PROTO": "https",
             },
             expect_errors=True
         )
@@ -189,13 +187,13 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, prebootstrap_migration_with_stale_cookie.status_int)
         self.assertEqual(0, prebootstrap_stale_payload["api_keys"]["active"])
 
-        rejected_admin_list = test_app.get(
-            "/server/admin/api-keys/v1",
+        bootstrap_page = test_app.get(
+            "/bootstrap",
             extra_environ=self._same_origin_headers(),
-            expect_errors=True
         )
-        self.assertEqual(401, rejected_admin_list.status_int)
-        self.assertIn("Missing API token", rejected_admin_list.text)
+        self.assertEqual(200, bootstrap_page.status_int)
+        self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
+        self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
 
         allowed = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
@@ -210,6 +208,8 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIn("seedsync_ui_session=", upgraded_cookie)
         self.assertNotEqual("", upgraded_cookie)
         self.assertNotEqual(limited_cookie, upgraded_cookie)
+        self.assertIn("browser_handover", allowed_payload)
+        self.assertFalse(allowed_payload["browser_handover"]["open"])
 
         refreshed_migration = test_app.get(
             "/server/admin/migration/v1",
@@ -241,64 +241,56 @@ class TestAdminHandler(unittest.TestCase):
 
         trusted_browser_headers = self._trusted_remote_same_origin_headers()
         bootstrap_page = test_app.get(
-            "/bootstrap?proof=placeholder",
+            "/bootstrap",
             extra_environ={
                 "HTTP_HOST": "localhost:8800",
                 "REMOTE_ADDR": "172.25.0.1",
             },
         )
-        self.assertIn("seedsync_bootstrap_exchange=", bootstrap_page.headers.get("Set-Cookie", ""))
-
-        migration_rejected = test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ=trusted_browser_headers,
-            expect_errors=True,
-        )
-        self.assertEqual(401, migration_rejected.status_int)
-
-        bootstrap_rejected = test_app.post_json(
-            "/server/admin/bootstrap/v1/first-api-key",
-            {"name": "trusted-remote-admin"},
-            extra_environ=trusted_browser_headers,
-            expect_errors=True,
-        )
-        self.assertEqual(401, bootstrap_rejected.status_int)
-        self.assertEqual(0, empty_store.active_admin_key_count)
-
-        proof = empty_store.ensure_bootstrap_proof()
-        exchanged = test_app.post_json(
-            "/server/admin/bootstrap/v1/exchange",
-            {"proof": proof.secret},
-            extra_environ=trusted_browser_headers,
-        )
-        exchanged_payload = json.loads(exchanged.text)
-        self.assertEqual(200, exchanged.status_int)
-        self.assertIn("expires_at", exchanged_payload)
-        self.assertNotIn("session_secret", exchanged_payload)
-        upgraded_cookie = exchanged.headers.get("Set-Cookie", "").split(";", 1)[0]
-        self.assertIn("seedsync_ui_session=", upgraded_cookie)
+        self.assertEqual(200, bootstrap_page.status_int)
+        self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
+        self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
 
         migration_response = test_app.get(
             "/server/admin/migration/v1",
-            extra_environ={**trusted_browser_headers, "HTTP_COOKIE": upgraded_cookie},
+            extra_environ=trusted_browser_headers,
         )
         migration_payload = json.loads(migration_response.text)
         self.assertEqual(200, migration_response.status_int)
-        self.assertEqual(0, migration_payload["api_keys"]["active_admin"])
+        self.assertEqual(0, migration_payload["api_keys"]["active"])
+        self.assertTrue(migration_payload["browser_handover"]["open"])
 
         bootstrap_response = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "trusted-remote-admin"},
-            extra_environ={**trusted_browser_headers, "HTTP_COOKIE": upgraded_cookie},
+            extra_environ=trusted_browser_headers,
         )
         bootstrap_payload = json.loads(bootstrap_response.text)
         admin_cookie = bootstrap_response.headers.get("Set-Cookie", "").split(";", 1)[0]
         self.assertEqual(201, bootstrap_response.status_int)
         self.assertEqual(["admin"], bootstrap_payload["key"]["scopes"])
         self.assertIn("secret", bootstrap_payload)
+        self.assertIn("browser_handover", bootstrap_payload)
+        self.assertFalse(bootstrap_payload["browser_handover"]["open"])
         self.assertIn("seedsync_ui_session=", admin_cookie)
-        self.assertNotEqual(upgraded_cookie, admin_cookie)
         self.assertEqual(1, empty_store.active_admin_key_count)
+
+    def test_remember_browser_session_route_issues_cookie_for_existing_api_key(self):
+        trusted_headers = self._same_origin_headers()
+
+        response = self.test_app.post_json(
+            "/server/browser/v1/remember",
+            {"secret": self.admin_secret},
+            extra_environ=trusted_headers,
+        )
+        payload = json.loads(response.text)
+
+        self.assertEqual(201, response.status_int)
+        self.assertEqual(self.admin_key_id, payload["key"]["id"])
+        self.assertEqual(["admin"], payload["key"]["scopes"])
+        self.assertIn("browser_handover", payload)
+        self.assertFalse(payload["browser_handover"]["open"])
+        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
 
     def test_bootstrap_proof_exchange_rejects_non_same_origin_requests(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-reject-non-origin.json"))
@@ -332,20 +324,23 @@ class TestAdminHandler(unittest.TestCase):
         test_app = TestApp(web_app)
 
         proof = empty_store.ensure_bootstrap_proof()
+        exchange = empty_store.ensure_bootstrap_exchange()
         same_origin_headers = {
             "HTTP_HOST": "localhost:8800",
             "REMOTE_ADDR": "127.0.0.1",
             "HTTP_ORIGIN": "http://localhost:8800",
             "HTTP_REFERER": "http://localhost:8800/bootstrap",
+            "HTTP_COOKIE": "seedsync_bootstrap_exchange={}".format(exchange.secret),
         }
         bootstrap_page = test_app.get(
-            "/bootstrap?proof=placeholder",
+            "/bootstrap",
             extra_environ={
                 "HTTP_HOST": "localhost:8800",
                 "REMOTE_ADDR": "127.0.0.1",
             },
         )
-        self.assertIn("seedsync_bootstrap_exchange=", bootstrap_page.headers.get("Set-Cookie", ""))
+        self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
+        self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
 
         first_exchange = test_app.post_json(
             "/server/admin/bootstrap/v1/exchange",
@@ -360,8 +355,8 @@ class TestAdminHandler(unittest.TestCase):
         )
 
         self.assertEqual(200, first_exchange.status_int)
-        self.assertEqual(403, replay_exchange.status_int)
-        self.assertIn("Session lacks scope", replay_exchange.text)
+        self.assertEqual(401, replay_exchange.status_int)
+        self.assertIn("Missing API token", replay_exchange.text)
         self.assertIn("seedsync_ui_session=", first_exchange.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", first_exchange.headers.get("Set-Cookie", ""))
         self.assertNotIn("session_secret", json.loads(first_exchange.text))
@@ -375,7 +370,6 @@ class TestAdminHandler(unittest.TestCase):
         web_app.add_default_routes()
         test_app = TestApp(web_app)
 
-        proof = empty_store.ensure_bootstrap_proof()
         bootstrap_headers = {
             "HTTP_HOST": "localhost:8800",
             "REMOTE_ADDR": "127.0.0.1",
@@ -383,25 +377,19 @@ class TestAdminHandler(unittest.TestCase):
             "HTTP_REFERER": "http://localhost:8800/bootstrap",
         }
         bootstrap_page = test_app.get(
-            "/bootstrap?proof=placeholder",
+            "/bootstrap",
             extra_environ={
                 "HTTP_HOST": "localhost:8800",
                 "REMOTE_ADDR": "127.0.0.1",
             },
         )
-        self.assertIn("seedsync_bootstrap_exchange=", bootstrap_page.headers.get("Set-Cookie", ""))
-
-        exchanged = test_app.post_json(
-            "/server/admin/bootstrap/v1/exchange",
-            {"proof": proof.secret},
-            extra_environ=bootstrap_headers,
-        )
-        bootstrap_cookie = exchanged.headers.get("Set-Cookie", "").split(";", 1)[0]
+        self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
+        self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
 
         bootstrap_response = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "untrusted-bootstrap-admin"},
-            extra_environ={**bootstrap_headers, "HTTP_COOKIE": bootstrap_cookie},
+            extra_environ=bootstrap_headers,
         )
         bootstrap_payload = json.loads(bootstrap_response.text)
 
@@ -428,9 +416,11 @@ class TestAdminHandler(unittest.TestCase):
         migration_response = test_app.get(
             "/server/admin/migration/v1",
             extra_environ=trusted_browser_headers,
-            expect_errors=True,
         )
-        self.assertEqual(401, migration_response.status_int)
+        migration_payload = json.loads(migration_response.text)
+        self.assertEqual(200, migration_response.status_int)
+        self.assertEqual(1, migration_payload["api_keys"]["active"])
+        self.assertTrue(migration_payload["browser_handover"]["open"])
 
     def test_first_admin_bootstrap_is_not_available_after_admin_exists(self):
         resp = self.test_app.post_json(

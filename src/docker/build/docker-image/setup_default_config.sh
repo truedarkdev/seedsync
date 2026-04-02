@@ -6,6 +6,7 @@ CONFIG_DIR="/config"
 SETTINGS_FILE="${CONFIG_DIR}/settings.cfg"
 SCRIPT_PATH="/app/python/seedsync.py"
 DEFAULT_LOCAL_PATH="/downloads/"
+DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION="${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"
 
 generate_default_config() {
     python "${SCRIPT_PATH}" \
@@ -17,6 +18,10 @@ generate_default_config() {
 
 replace_local_path() {
     sed -i -E "s|^[[:space:]]*local_path[[:space:]]*=.*$|local_path = ${DEFAULT_LOCAL_PATH}|" "${SETTINGS_FILE}"
+}
+
+replace_browser_handover_recovery_version() {
+    sed -i -E "s|^[[:space:]]*browser_handover_recovery_version[[:space:]]*=.*$|browser_handover_recovery_version = ${DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION}|" "${SETTINGS_FILE}"
 }
 
 append_local_path_to_lftp_section() {
@@ -76,3 +81,10 @@ case "${CURRENT_LOCAL_PATH}" in
         echo "Keeping existing local_path from settings.cfg"
         ;;
 esac
+
+if [ -n "${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}" ]; then
+    if grep -Eq '^[[:space:]]*browser_handover_recovery_version[[:space:]]*=' "${SETTINGS_FILE}"; then
+        echo "Setting browser_handover_recovery_version to ${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION}"
+        replace_browser_handover_recovery_version
+    fi
+fi

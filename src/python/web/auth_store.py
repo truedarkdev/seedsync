@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import uuid
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence
@@ -118,6 +119,8 @@ class UiSessionRecord:
     created_at: str = ""
     expires_at: str = ""
     bootstrap: bool = False
+    api_key_id: Optional[str] = None
+    api_key_secret_hash: Optional[str] = None
 
 
 @dataclass
@@ -137,13 +140,17 @@ class BootstrapExchangeRecord:
 class ApiKeyStore(Persist):
     __KEY_VERSION = "version"
     __KEY_API_KEYS = "api_keys"
+    __KEY_UI_SESSIONS = "ui_sessions"
     __KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED = "legacy_api_token_compatibility_enabled"
+    __KEY_BROWSER_HANDOVER_CLAIMED_VERSION = "browser_handover_claimed_version"
 
     def __init__(self, file_path: Optional[str] = None):
         self.__file_path = file_path
         self.__api_keys: List[ApiKeyRecord] = []
         self.__legacy_api_token_compatibility_enabled = True
         self.__ui_sessions: Dict[str, UiSessionRecord] = {}
+        self.__browser_handover_claimed_version = ""
+        self.__state_lock = threading.RLock()
         self.__bootstrap_proof_path: Optional[str] = None
         self.__bootstrap_proof: Optional[BootstrapProofRecord] = None
         self.__bootstrap_exchange: Optional[BootstrapExchangeRecord] = None
@@ -199,10 +206,20 @@ class ApiKeyStore(Persist):
                 return record
         return None
 
-    def create_ui_session(self, scopes: Sequence[str], bootstrap: bool = False) -> UiSessionRecord:
+    def create_ui_session(
+        self,
+        scopes: Sequence[str],
+        bootstrap: bool = False,
+        api_key_id: Optional[str] = None,
+        api_key_secret_hash: Optional[str] = None
+    ) -> UiSessionRecord:
         normalized_scopes = _normalize_scopes(scopes)
         if type(bootstrap) is not bool:
             raise ValueError("Bootstrap session flag must be a boolean")
+        if api_key_id is not None and (not isinstance(api_key_id, str) or not api_key_id.strip()):
+            raise ValueError("API key id cannot be blank")
+        if api_key_secret_hash is not None and (not isinstance(api_key_secret_hash, str) or not api_key_secret_hash.strip()):
+            raise ValueError("API key secret hash cannot be blank")
         now = datetime.now(timezone.utc)
         record = UiSessionRecord(
             secret=secrets.token_urlsafe(32),
@@ -210,10 +227,47 @@ class ApiKeyStore(Persist):
             created_at=now.isoformat(timespec="seconds"),
             expires_at=(now + _UI_SESSION_TTL).isoformat(timespec="seconds"),
             bootstrap=bootstrap,
+            api_key_id=api_key_id.strip() if isinstance(api_key_id, str) else None,
+            api_key_secret_hash=api_key_secret_hash.strip() if isinstance(api_key_secret_hash, str) else None,
         )
         self.__ui_sessions[record.secret] = record
         self.__prune_expired_ui_sessions(now)
+        self.save()
         return record
+
+    def __create_api_key_record(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
+        scopes = _normalize_scopes(scopes)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("API key name cannot be blank")
+
+        secret = secrets.token_urlsafe(32)
+        now = _utc_now_iso()
+        record = ApiKeyRecord(
+            id=str(uuid.uuid4()),
+            name=name.strip(),
+            scopes=scopes,
+            secret_hash=_hash_secret(secret),
+            created_at=now,
+            updated_at=now,
+        )
+        self.__api_keys.append(record)
+        return {"record": record, "secret": secret}
+
+    def create_browser_session_for_api_key(self, key_id: str) -> UiSessionRecord:
+        if not isinstance(key_id, str) or not key_id.strip():
+            raise ValueError("API key id cannot be blank")
+
+        record = self.get_api_key(key_id)
+        if record is None:
+            raise KeyError("API key '{}' not found".format(key_id))
+        if record.is_revoked:
+            raise ValueError("Cannot create a browser session for a revoked API key")
+
+        return self.create_ui_session(
+            record.scopes,
+            api_key_id=record.id,
+            api_key_secret_hash=record.secret_hash
+        )
 
     def find_ui_session_by_secret(self, secret: str) -> Optional[UiSessionRecord]:
         now = datetime.now(timezone.utc)
@@ -229,6 +283,72 @@ class ApiKeyStore(Persist):
             self.__ui_sessions.pop(secret, None)
             return None
         return record
+
+    def invalidate_ui_session(self, secret: str) -> None:
+        if not isinstance(secret, str) or not secret.strip():
+            return
+        if self.__ui_sessions.pop(secret, None) is not None:
+            self.save()
+
+    def resolve_ui_session_api_key(self, session: UiSessionRecord) -> Optional[ApiKeyRecord]:
+        api_key_id = getattr(session, "api_key_id", None)
+        api_key_secret_hash = getattr(session, "api_key_secret_hash", None)
+        if not isinstance(api_key_id, str) or not api_key_id.strip():
+            return None
+        if not isinstance(api_key_secret_hash, str) or not api_key_secret_hash.strip():
+            return None
+
+        record = self.get_api_key(api_key_id)
+        if record is None or record.is_revoked:
+            return None
+
+        if not hmac.compare_digest(record.secret_hash, api_key_secret_hash):
+            return None
+
+        return record
+
+    def can_claim_initial_admin(self, browser_handover_version: str) -> bool:
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        if self.active_admin_key_count == 0:
+            return True
+        return self.__browser_handover_claimed_version != version
+
+    def claim_initial_admin_if_available(self, browser_handover_version: str) -> bool:
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        with self.__state_lock:
+            if not self.can_claim_initial_admin(version):
+                return False
+            self.__browser_handover_claimed_version = version
+            self.save()
+            return True
+
+    def create_initial_admin_api_key_if_available(
+        self,
+        browser_handover_version: str,
+        name: str,
+    ) -> Optional[Dict[str, object]]:
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        with self.__state_lock:
+            if not self.can_claim_initial_admin(version):
+                return None
+
+            result = self.__create_api_key_record(name, ["admin"])
+            self.__browser_handover_claimed_version = version
+            self.clear_bootstrap_proof()
+            self.clear_bootstrap_exchange()
+            self.save()
+            return result
+
+    def claim_initial_admin(self, browser_handover_version: str) -> None:
+        self.claim_initial_admin_if_available(browser_handover_version)
+
+    def get_browser_handover_state(self, config) -> Dict[str, object]:
+        version = self.__get_browser_handover_version(config)
+        return {
+            "configured_version": version,
+            "claimed_version": self.__browser_handover_claimed_version,
+            "open": self.can_claim_initial_admin(version),
+        }
 
     def ensure_bootstrap_proof(self) -> Optional[BootstrapProofRecord]:
         now = datetime.now(timezone.utc)
@@ -310,26 +430,13 @@ class ApiKeyStore(Persist):
         self.__bootstrap_exchange = None
 
     def create_api_key(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
-        scopes = _normalize_scopes(scopes)
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("API key name cannot be blank")
-
-        secret = secrets.token_urlsafe(32)
-        now = _utc_now_iso()
-        record = ApiKeyRecord(
-            id=str(uuid.uuid4()),
-            name=name.strip(),
-            scopes=scopes,
-            secret_hash=_hash_secret(secret),
-            created_at=now,
-            updated_at=now,
-        )
-        self.__api_keys.append(record)
-        if "admin" in scopes:
-            self.clear_bootstrap_proof()
-            self.clear_bootstrap_exchange()
-        self.save()
-        return {"record": record, "secret": secret}
+        with self.__state_lock:
+            result = self.__create_api_key_record(name, scopes)
+            if "admin" in result["record"].scopes:
+                self.clear_bootstrap_proof()
+                self.clear_bootstrap_exchange()
+            self.save()
+            return result
 
     def update_api_key(
         self,
@@ -395,6 +502,7 @@ class ApiKeyStore(Persist):
     def get_migration_state(self, config) -> Dict[str, object]:
         general_config = getattr(config, "general", None)
         legacy_api_token = getattr(general_config, "api_token", None) if general_config is not None else None
+        browser_handover_state = self.get_browser_handover_state(config)
         legacy_configured = isinstance(legacy_api_token, str) and legacy_api_token.strip() != ""
         if not legacy_configured:
             legacy_state = "cleared"
@@ -418,6 +526,7 @@ class ApiKeyStore(Persist):
                 "active_admin": len(active_admin_keys),
                 "revoked": len(self.__api_keys) - len(active_keys),
             },
+            "browser_handover": browser_handover_state,
         }
 
     def save(self):
@@ -445,12 +554,27 @@ class ApiKeyStore(Persist):
         if not isinstance(payload, dict):
             raise PersistError("Invalid API key store JSON: expected an object")
 
+        version = payload.get(cls.__KEY_VERSION, 1)
+        if type(version) is not int:
+            raise PersistError("Invalid API key store JSON: version must be an integer")
+        if version < 1:
+            raise PersistError("Invalid API key store JSON: version must be at least 1")
+
         legacy_compatibility = payload.get(cls.__KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED, True)
         if type(legacy_compatibility) is not bool:
             raise PersistError(
                 "Invalid API key store JSON: legacy_api_token_compatibility_enabled must be a boolean"
             )
         store.__legacy_api_token_compatibility_enabled = legacy_compatibility
+
+        claimed_version = payload.get(cls.__KEY_BROWSER_HANDOVER_CLAIMED_VERSION, "")
+        if claimed_version is None:
+            claimed_version = ""
+        if not isinstance(claimed_version, str):
+            raise PersistError(
+                "Invalid API key store JSON: browser_handover_claimed_version must be a string"
+            )
+        store.__browser_handover_claimed_version = claimed_version
 
         records = payload.get(cls.__KEY_API_KEYS, [])
         if not isinstance(records, list):
@@ -476,13 +600,53 @@ class ApiKeyStore(Persist):
             except ValueError as exc:
                 raise PersistError("Invalid API key store JSON: {}".format(exc)) from exc
 
+        ui_sessions = payload.get(cls.__KEY_UI_SESSIONS, [])
+        if not isinstance(ui_sessions, list):
+            raise PersistError("Invalid API key store JSON: ui_sessions must be a list")
+
+        for raw_session in ui_sessions:
+            if not isinstance(raw_session, dict):
+                raise PersistError("Invalid API key store JSON: ui session record must be an object")
+            try:
+                api_key_id = raw_session.get("api_key_id")
+                api_key_secret_hash = raw_session.get("api_key_secret_hash")
+                if api_key_id is not None and not isinstance(api_key_id, str):
+                    raise ValueError("API key session api_key_id must be a string")
+                if api_key_secret_hash is not None and not isinstance(api_key_secret_hash, str):
+                    raise ValueError("API key session api_key_secret_hash must be a string")
+                store.__ui_sessions[raw_session["secret"]] = UiSessionRecord(
+                    secret=raw_session["secret"],
+                    scopes=_normalize_scopes(raw_session.get("scopes", [])),
+                    created_at=raw_session["created_at"],
+                    expires_at=raw_session["expires_at"],
+                    bootstrap=raw_session.get("bootstrap", False),
+                    api_key_id=api_key_id,
+                    api_key_secret_hash=api_key_secret_hash,
+                )
+            except KeyError as exc:
+                raise PersistError("Invalid API key store JSON: missing field {}".format(exc)) from exc
+            except ValueError as exc:
+                raise PersistError("Invalid API key store JSON: {}".format(exc)) from exc
+
         return store
 
     def to_str(self) -> str:
+        now = datetime.now(timezone.utc)
+        self.__prune_expired_ui_sessions(now)
+        self.__prune_bootstrap_proof(now)
+        self.__prune_bootstrap_exchange(now)
         payload = {
-            self.__KEY_VERSION: 1,
+            self.__KEY_VERSION: 2,
             self.__KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED: self.__legacy_api_token_compatibility_enabled,
             self.__KEY_API_KEYS: [asdict(record) for record in self.__api_keys],
+            self.__KEY_UI_SESSIONS: [
+                asdict(record)
+                for record in sorted(
+                    self.__ui_sessions.values(),
+                    key=lambda record: (record.created_at, record.secret)
+                )
+            ],
+            self.__KEY_BROWSER_HANDOVER_CLAIMED_VERSION: self.__browser_handover_claimed_version,
         }
         return json.dumps(payload, indent=2)
 
@@ -542,3 +706,11 @@ class ApiKeyStore(Persist):
         }
         with open(self.__bootstrap_proof_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
+
+    @staticmethod
+    def __get_browser_handover_version(config) -> str:
+        general_config = getattr(config, "general", None)
+        if general_config is None:
+            return ""
+        browser_handover_version = getattr(general_config, "browser_handover_recovery_version", "")
+        return browser_handover_version if isinstance(browser_handover_version, str) else ""
