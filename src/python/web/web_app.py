@@ -744,46 +744,35 @@ class WebApp(bottle.Bottle):
 """
 
         if can_claim_initial_admin:
-            page_heading = "Finish browser setup"
+            eyebrow_label = "First-run browser access"
+            page_heading = "Claim the first local session"
             page_description = (
-                "This first local browser can claim SeedSync's initial admin access. "
-                "Click continue when you want this browser to take over."
+                "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. "
+                "After that, any other browser will need an API key once to become remembered."
             )
-            brand_copy = "SeedSync keeps the first browser handoff local. Continue below to claim the initial admin session."
-            primary_action_label = "Continue"
+            brand_copy = (
+                "SeedSync uses this page to hand the browser session back to the app. "
+                "When the handoff is open, this first local browser can step in and continue straight into the UI."
+            )
+            primary_action_label = "Claim session"
             primary_action_url = "/server/admin/bootstrap/v1/first-api-key"
             primary_action_payload = ""
             form_fields_html = ""
-            brand_facts = [
-                ("Mode", "Initial admin handover"),
-                ("Scope", "Trusted local runtime only"),
-                ("Result", "Claim the first browser session"),
-            ]
+            form_variant_class = "form-panel form-panel-initial"
         else:
-            page_heading = "Remember this browser"
-            page_description = "Enter an API key once to remember this browser and tie its access to that key's current scopes."
-            brand_copy = "SeedSync keeps browser access tied to the local runtime. Paste an API key below once to remember this browser."
+            eyebrow_label = "Remembered browser"
+            page_heading = "Save this browser for next time"
+            page_description = (
+                "Enter one API key once so SeedSync can recognize this browser and return to the same scoped access on the next visit."
+            )
+            brand_copy = (
+                "SeedSync keeps browser access tied to the local runtime. "
+                "One API-key entry is enough to remember this browser, so the app opens faster next time without another prompt."
+            )
             primary_action_label = "Remember browser"
             primary_action_url = "/server/browser/v1/remember"
             primary_action_payload = 'secret: document.getElementById("browser-secret").value'
-            brand_facts = [
-                ("Mode", "Remembered browser"),
-                ("Scope", "API-key-derived access"),
-                ("Result", "Reuse this browser next time"),
-            ]
-
-        brand_facts_html = "\n".join(
-            """
-    <div class="brand-note">
-      <span class="brand-note-icon" aria-hidden="true"></span>
-      <div class="brand-note-copy">
-        <span class="brand-note-label">{label}</span>
-        <span class="brand-note-value">{value}</span>
-      </div>
-    </div>
-""".format(label=label, value=value)
-            for label, value in brand_facts
-        )
+            form_variant_class = "form-panel"
 
         bottle.response.content_type = "text/html; charset=utf-8"
         bottle.response.cache_control = "no-store"
@@ -865,69 +854,75 @@ class WebApp(bottle.Bottle):
     }}
     .brand-message {{
       margin-top: 1rem;
-      padding: 1rem 1rem 0.9rem;
+      padding: 1rem 1rem 0.95rem;
       border-radius: 14px;
-      background: rgba(255, 255, 255, 0.74);
+      background: rgba(255, 255, 255, 0.78);
       border: 1px solid rgba(17, 130, 71, 0.12);
       box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
       text-align: left;
     }}
+    .brand-story-copy {{
+      display: grid;
+      gap: 0.85rem;
+    }}
     .brand-copy {{
       margin: 0;
-      line-height: 1.5;
+      line-height: 1.55;
       color: rgba(31, 41, 55, 0.78);
+      max-width: 34rem;
     }}
-    .brand-notes {{
-      display: grid;
-      gap: 0.8rem;
-      margin-top: 1rem;
-    }}
-    .brand-note {{
+    .brand-flow {{
       display: flex;
-      align-items: flex-start;
-      gap: 0.75rem;
-    }}
-    .brand-note + .brand-note {{
-      padding-top: 0.8rem;
-      border-top: 1px solid rgba(17, 130, 71, 0.08);
-    }}
-    .brand-note-icon {{
-      position: relative;
-      flex: 0 0 auto;
-      width: 1.15rem;
-      height: 1.15rem;
-      margin-top: 0.18rem;
-      border-radius: 999px;
-      border: 1px solid rgba(17, 130, 71, 0.25);
-      background: rgba(17, 130, 71, 0.08);
-    }}
-    .brand-note-icon::after {{
-      content: "";
-      position: absolute;
-      inset: 50% auto auto 50%;
-      width: 0.4rem;
-      height: 0.4rem;
-      border-radius: 999px;
-      background: #118247;
-      transform: translate(-50%, -50%);
-    }}
-    .brand-note-copy {{
-      display: grid;
-      gap: 0.15rem;
-    }}
-    .brand-note-label {{
+      align-items: center;
+      flex-wrap: nowrap;
+      gap: 0.32rem;
+      color: #0d6b39;
       font-size: 0.76rem;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: rgba(31, 41, 55, 0.54);
-    }}
-    .brand-note-value {{
       font-weight: 700;
-      color: #1f2937;
-      line-height: 1.35;
+      letter-spacing: 0.01em;
+    }}
+    .brand-flow-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.32rem;
+      padding: 0.3rem 0.48rem;
+      border-radius: 999px;
+      background: rgba(17, 130, 71, 0.08);
+      border: 1px solid rgba(17, 130, 71, 0.11);
+      white-space: nowrap;
+    }}
+    .brand-flow-mark {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1rem;
+      height: 1rem;
+      border-radius: 999px;
+      border: 1px solid rgba(17, 130, 71, 0.18);
+      background: rgba(255, 255, 255, 0.82);
+      color: #118247;
+      font-size: 0.68rem;
+      line-height: 1;
+      flex: 0 0 auto;
     }}
     .form-panel {{
       padding: 1.5rem;
+    }}
+    .form-panel-initial form {{
+      margin-top: 1.25rem;
+      max-width: 34rem;
+    }}
+    .form-panel-initial button {{
+      width: min(100%, 15rem);
+      min-height: 46px;
+      margin-top: 0;
+      padding: 0.45rem 0.55rem;
+      font-size: 1.14rem;
+      line-height: 1.05;
+      font-weight: 700;
+    }}
+    .form-panel-initial .hint {{
+      margin-top: 1.5rem;
     }}
     .eyebrow {{
       display: inline-flex;
@@ -980,27 +975,41 @@ class WebApp(bottle.Bottle):
       box-shadow: 0 0 0 3px rgba(51, 123, 183, 0.14);
     }}
     button {{
-      margin-top: 1rem;
-      min-height: 36px;
-      padding: 0.55rem 0.95rem;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: fit-content;
+      margin: 1rem auto 0;
+      min-height: 32px;
+      min-width: 8.5rem;
+      padding: 0.44rem 1rem;
       border-radius: 4px;
       border: 1px solid #2e6da4;
       background: #337BB7;
       color: white;
       font: inherit;
-      font-weight: 700;
+      font-size: 0.95rem;
+      font-weight: 600;
+      line-height: 1.2;
+      text-align: center;
+      appearance: none;
       cursor: pointer;
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.45),
+        0 1px 2px rgba(15, 23, 42, 0.08);
       transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
     }}
     button:hover {{
-      background: #2f72a9;
-      border-color: #275f8e;
+      background: #2e6da4;
+      border-color: #245580;
     }}
     button:active {{
       background: #286090;
       border-color: #204d74;
-      transform: translateY(1px);
+      box-shadow:
+        inset 0 2px 5px rgba(0, 0, 0, 0.18),
+        0 1px 1px rgba(15, 23, 42, 0.06);
+      transform: translateY(1px) scale(0.99);
     }}
     button:focus-visible {{
       outline: 3px solid rgba(51, 123, 183, 0.28);
@@ -1055,6 +1064,9 @@ class WebApp(bottle.Bottle):
         line-height: 0.98;
         white-space: normal;
       }}
+      .brand-flow {{
+        flex-wrap: wrap;
+      }}
     }}
   </style>
 </head>
@@ -1067,14 +1079,20 @@ class WebApp(bottle.Bottle):
     </div>
     <div class="brand-kicker">Browser access</div>
     <div class="brand-message">
-    <p class="brand-copy">{brand_copy}</p>
-    <div class="brand-notes">
-{brand_facts_html}
-    </div>
+      <div class="brand-story">
+        <div class="brand-story-copy">
+          <p class="brand-copy">{brand_copy}</p>
+          <div class="brand-flow" aria-hidden="true">
+            <span class="brand-flow-item"><span class="brand-flow-mark">&#8962;</span>local handoff</span>
+            <span class="brand-flow-item"><span class="brand-flow-mark">&#9675;</span>one-time key</span>
+            <span class="brand-flow-item"><span class="brand-flow-mark">&#10132;</span>open SeedSync</span>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
-  <section class="form-panel" aria-label="Bootstrap form">
-  <div class="eyebrow">Bootstrap</div>
+  <section class="{form_variant_class}" aria-label="Bootstrap form">
+  <div class="eyebrow">{eyebrow_label}</div>
   <h1>{page_heading}</h1>
   <p class="lede">{page_description}</p>
   <form id="bootstrap-form">
@@ -1128,11 +1146,12 @@ class WebApp(bottle.Bottle):
 </html>
 """.format(
             page_title=page_title,
+            eyebrow_label=eyebrow_label,
+            form_variant_class=form_variant_class,
             page_heading=page_heading,
             page_description=page_description,
             brand_copy=brand_copy,
             form_fields_html=form_fields_html,
-            brand_facts_html=brand_facts_html,
             primary_action_label=primary_action_label,
             primary_action_url=primary_action_url,
             primary_action_payload=primary_action_payload,

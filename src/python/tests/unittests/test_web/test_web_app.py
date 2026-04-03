@@ -100,7 +100,7 @@ class TestWebAppStream(unittest.TestCase):
 
         self.assertEqual(200, response.status_int)
         self.assertIn("/server/browser/v1/remember", response.text)
-        self.assertIn("Remember this browser", response.text)
+        self.assertIn("Save this browser for next time", response.text)
 
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []
@@ -533,9 +533,12 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, bootstrap_response.status_int)
-        self.assertIn("Finish browser setup", bootstrap_response.text)
+        self.assertIn("Claim the first local session", bootstrap_response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_response.text)
-        self.assertIn("Click continue when you want this browser to take over.", bootstrap_response.text)
+        self.assertIn(
+            "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. After that, any other browser will need an API key once to become remembered.",
+            bootstrap_response.text,
+        )
         self.assertNotIn("submitBootstrapRequest();", bootstrap_response.text)
         self.assertEqual("", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertEqual(201, bootstrap_claim_response.status_int)
@@ -652,7 +655,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, bootstrap_response.status_int)
-        self.assertIn("Remember this browser", bootstrap_response.text)
+        self.assertIn("Save this browser for next time", bootstrap_response.text)
         self.assertEqual("", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertEqual(401, rejected_read.status_int)
         self.assertIn("Missing API token", rejected_read.text)
@@ -718,7 +721,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, bootstrap_response.status_int)
-        self.assertIn("Remember this browser", bootstrap_response.text)
+        self.assertIn("Save this browser for next time", bootstrap_response.text)
         self.assertEqual("", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertEqual(401, rejected_admin.status_int)
         self.assertIn("Missing API token", rejected_admin.text)
@@ -755,7 +758,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, bootstrap_response.status_int)
         self.assertIn("/server/browser/v1/remember", bootstrap_response.text)
-        self.assertIn("Remember this browser", bootstrap_response.text)
+        self.assertIn("Save this browser for next time", bootstrap_response.text)
 
     def test_bootstrap_page_requires_explicit_first_admin_claim_for_loopback_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
@@ -805,9 +808,12 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("Finish browser setup", response.text)
+        self.assertIn("Claim the first local session", response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
-        self.assertIn("Click continue when you want this browser to take over.", response.text)
+        self.assertIn(
+            "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. After that, any other browser will need an API key once to become remembered.",
+            response.text,
+        )
         self.assertNotIn("submitBootstrapRequest();", response.text)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertTrue(handover_state_after_get["open"])
@@ -869,9 +875,12 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("Finish browser setup", response.text)
+        self.assertIn("Claim the first local session", response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
-        self.assertIn("Click continue when you want this browser to take over.", response.text)
+        self.assertIn(
+            "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. After that, any other browser will need an API key once to become remembered.",
+            response.text,
+        )
         self.assertNotIn("submitBootstrapRequest();", response.text)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertTrue(handover_state_after_get["open"])
@@ -1276,7 +1285,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("Finish browser setup", response.text)
+        self.assertIn("Claim the first local session", response.text)
         self.assertEqual(0, empty_store.active_admin_key_count)
         self.assertTrue(empty_store.get_browser_handover_state(self.context.config)["open"])
 
