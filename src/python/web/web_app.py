@@ -774,9 +774,12 @@ class WebApp(bottle.Bottle):
 
         brand_facts_html = "\n".join(
             """
-    <div class="fact">
-      <dt>{label}</dt>
-      <dd>{value}</dd>
+    <div class="brand-note">
+      <span class="brand-note-icon" aria-hidden="true"></span>
+      <div class="brand-note-copy">
+        <span class="brand-note-label">{label}</span>
+        <span class="brand-note-value">{value}</span>
+      </div>
     </div>
 """.format(label=label, value=value)
             for label, value in brand_facts
@@ -823,33 +826,34 @@ class WebApp(bottle.Bottle):
     }}
     .brand-panel {{
       padding: 1.5rem;
-      background: #fafafa;
+      background: linear-gradient(180deg, #fbfdfb 0%, #f4f9f5 100%);
       border-right: 1px solid rgba(31, 41, 55, 0.08);
     }}
     .brand-lockup {{
       display: flex;
       align-items: center;
-      gap: 0.85rem;
+      justify-content: center;
+      gap: 10px;
     }}
     .brand-lockup img {{
-      width: 58px;
-      height: 58px;
+      width: auto;
+      height: auto;
+      max-width: 80px;
+      max-height: 80px;
       flex: 0 0 auto;
     }}
     .brand-wordmark {{
       color: #118247;
       font-family: "Arial Black", Gadget, sans-serif;
-      font-size: 2rem;
-      line-height: 0.95;
+      font-size: clamp(2rem, 3vw, 2.6rem);
+      line-height: 1;
       letter-spacing: -0.04em;
       user-select: none;
-    }}
-    .brand-wordmark span {{
-      display: block;
+      white-space: nowrap;
     }}
     .brand-kicker {{
       display: inline-flex;
-      margin-top: 0.9rem;
+      margin-top: 1rem;
       padding: 0.32rem 0.65rem;
       border-radius: 999px;
       background: rgba(17, 130, 71, 0.08);
@@ -859,30 +863,68 @@ class WebApp(bottle.Bottle):
       text-transform: uppercase;
       letter-spacing: 0.06em;
     }}
+    .brand-message {{
+      margin-top: 1rem;
+      padding: 1rem 1rem 0.9rem;
+      border-radius: 14px;
+      background: rgba(255, 255, 255, 0.74);
+      border: 1px solid rgba(17, 130, 71, 0.12);
+      box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
+      text-align: left;
+    }}
     .brand-copy {{
-      margin: 1rem 0 0;
+      margin: 0;
       line-height: 1.5;
       color: rgba(31, 41, 55, 0.78);
     }}
-    .facts {{
+    .brand-notes {{
       display: grid;
-      gap: 0.75rem;
+      gap: 0.8rem;
       margin-top: 1rem;
     }}
-    .fact {{
-      padding-top: 0.75rem;
-      border-top: 1px solid rgba(31, 41, 55, 0.08);
+    .brand-note {{
+      display: flex;
+      align-items: flex-start;
+      gap: 0.75rem;
     }}
-    .fact dt {{
+    .brand-note + .brand-note {{
+      padding-top: 0.8rem;
+      border-top: 1px solid rgba(17, 130, 71, 0.08);
+    }}
+    .brand-note-icon {{
+      position: relative;
+      flex: 0 0 auto;
+      width: 1.15rem;
+      height: 1.15rem;
+      margin-top: 0.18rem;
+      border-radius: 999px;
+      border: 1px solid rgba(17, 130, 71, 0.25);
+      background: rgba(17, 130, 71, 0.08);
+    }}
+    .brand-note-icon::after {{
+      content: "";
+      position: absolute;
+      inset: 50% auto auto 50%;
+      width: 0.4rem;
+      height: 0.4rem;
+      border-radius: 999px;
+      background: #118247;
+      transform: translate(-50%, -50%);
+    }}
+    .brand-note-copy {{
+      display: grid;
+      gap: 0.15rem;
+    }}
+    .brand-note-label {{
       font-size: 0.76rem;
       text-transform: uppercase;
       letter-spacing: 0.06em;
-      color: rgba(31, 41, 55, 0.52);
+      color: rgba(31, 41, 55, 0.54);
     }}
-    .fact dd {{
-      margin: 0.3rem 0 0;
+    .brand-note-value {{
       font-weight: 700;
       color: #1f2937;
+      line-height: 1.35;
     }}
     .form-panel {{
       padding: 1.5rem;
@@ -939,9 +981,9 @@ class WebApp(bottle.Bottle):
     }}
     button {{
       margin-top: 1rem;
-      min-height: 44px;
-      padding: 0.8rem 1.15rem;
-      border-radius: 8px;
+      min-height: 36px;
+      padding: 0.55rem 0.95rem;
+      border-radius: 4px;
       border: 1px solid #2e6da4;
       background: #337BB7;
       color: white;
@@ -949,13 +991,15 @@ class WebApp(bottle.Bottle):
       font-weight: 700;
       cursor: pointer;
       box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
-      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
     }}
     button:hover {{
       background: #2f72a9;
       border-color: #275f8e;
     }}
     button:active {{
+      background: #286090;
+      border-color: #204d74;
       transform: translateY(1px);
     }}
     button:focus-visible {{
@@ -993,6 +1037,25 @@ class WebApp(bottle.Bottle):
         width: 100%;
       }}
     }}
+    @media (max-width: 420px) {{
+      .brand-panel {{
+        padding: 1.25rem;
+      }}
+      .brand-lockup {{
+        flex-direction: column;
+        gap: 0.35rem;
+        text-align: center;
+      }}
+      .brand-lockup img {{
+        max-width: 64px;
+        max-height: 64px;
+      }}
+      .brand-wordmark {{
+        font-size: clamp(1.65rem, 12vw, 2rem);
+        line-height: 0.98;
+        white-space: normal;
+      }}
+    }}
   </style>
 </head>
 <body class="bootstrap-page">
@@ -1000,13 +1063,15 @@ class WebApp(bottle.Bottle):
   <section class="brand-panel" aria-label="SeedSync branding">
     <div class="brand-lockup">
       <img src="/assets/logo.png" alt="SeedSync" />
-      <div class="brand-wordmark"><span>Seed</span>Sync</div>
+      <div class="brand-wordmark"><b>Seed</b>Sync</div>
     </div>
     <div class="brand-kicker">Browser access</div>
+    <div class="brand-message">
     <p class="brand-copy">{brand_copy}</p>
-    <dl class="facts">
+    <div class="brand-notes">
 {brand_facts_html}
-    </dl>
+    </div>
+    </div>
   </section>
   <section class="form-panel" aria-label="Bootstrap form">
   <div class="eyebrow">Bootstrap</div>
