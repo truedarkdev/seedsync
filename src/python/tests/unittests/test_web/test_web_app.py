@@ -535,7 +535,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, bootstrap_response.status_int)
         self.assertIn("Finish browser setup", bootstrap_response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_response.text)
-        self.assertIn("submitBootstrapRequest()", bootstrap_response.text)
+        self.assertIn("Click continue when you want this browser to take over.", bootstrap_response.text)
+        self.assertNotIn("submitBootstrapRequest();", bootstrap_response.text)
         self.assertEqual("", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertEqual(201, bootstrap_claim_response.status_int)
         self.assertIn("seedsync_ui_session=", bootstrap_claim_response.headers.get("Set-Cookie", ""))
@@ -756,7 +757,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertIn("/server/browser/v1/remember", bootstrap_response.text)
         self.assertIn("Remember this browser", bootstrap_response.text)
 
-    def test_bootstrap_page_auto_grants_first_admin_access_for_loopback_before_first_admin_exists(self):
+    def test_bootstrap_page_requires_explicit_first_admin_claim_for_loopback_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -775,6 +776,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                     "REMOTE_ADDR": "127.0.0.1",
                 },
             )
+            handover_state_after_get = empty_store.get_browser_handover_state(self.context.config)
             bootstrap_claim_response = client.post_json(
                 "/server/admin/bootstrap/v1/first-api-key",
                 {},
@@ -805,7 +807,10 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("Finish browser setup", response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
+        self.assertIn("Click continue when you want this browser to take over.", response.text)
+        self.assertNotIn("submitBootstrapRequest();", response.text)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
+        self.assertTrue(handover_state_after_get["open"])
         self.assertEqual(201, bootstrap_claim_response.status_int)
         self.assertIn("seedsync_ui_session=", bootstrap_claim_response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, shell_response.status_int)
@@ -835,6 +840,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                     "REMOTE_ADDR": "127.0.0.1",
                 },
             )
+            handover_state_after_get = store.get_browser_handover_state(self.context.config)
             bootstrap_claim_response = client.post_json(
                 "/server/admin/bootstrap/v1/first-api-key",
                 {},
@@ -865,7 +871,10 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("Finish browser setup", response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
+        self.assertIn("Click continue when you want this browser to take over.", response.text)
+        self.assertNotIn("submitBootstrapRequest();", response.text)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
+        self.assertTrue(handover_state_after_get["open"])
         self.assertEqual(201, bootstrap_claim_response.status_int)
         self.assertIn("seedsync_ui_session=", bootstrap_claim_response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, shell_response.status_int)

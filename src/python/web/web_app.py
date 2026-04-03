@@ -738,7 +738,6 @@ class WebApp(bottle.Bottle):
 
         page_title = "SeedSync browser access"
         can_claim_initial_admin = bool(browser_handover_state.get("open", False))
-        auto_submit_on_load = "false"
         form_fields_html = """
     <label for="browser-secret">API key secret</label>
     <input id="browser-secret" type="password" autocomplete="off" placeholder="Paste an API key secret">
@@ -747,13 +746,12 @@ class WebApp(bottle.Bottle):
         if can_claim_initial_admin:
             page_heading = "Finish browser setup"
             page_description = (
-                "This first local browser can claim SeedSync's initial admin access automatically. "
-                "The browser will continue as soon as it confirms this request came from the local SeedSync page."
+                "This first local browser can claim SeedSync's initial admin access. "
+                "Click continue when you want this browser to take over."
             )
             primary_action_label = "Continue"
             primary_action_url = "/server/admin/bootstrap/v1/first-api-key"
             primary_action_payload = ""
-            auto_submit_on_load = "true"
             form_fields_html = ""
         else:
             page_heading = "Remember this browser"
@@ -870,10 +868,6 @@ class WebApp(bottle.Bottle):
   }}
 
   form.addEventListener("submit", submitBootstrapRequest);
-
-  if ({auto_submit_on_load}) {{
-    submitBootstrapRequest();
-  }}
 }})();
 </script>
 </body>
@@ -886,7 +880,6 @@ class WebApp(bottle.Bottle):
             primary_action_label=primary_action_label,
             primary_action_url=primary_action_url,
             primary_action_payload=primary_action_payload,
-            auto_submit_on_load=auto_submit_on_load,
         )
 
     def __authorize_browser_bootstrap(self) -> None:
