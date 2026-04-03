@@ -4,6 +4,7 @@ import unittest
 import tempfile
 import shutil
 import os
+from unittest.mock import patch
 
 from common import overrides, Persist, AppError, Localization
 
@@ -87,6 +88,17 @@ class TestPersist(unittest.TestCase):
         DummyPersist.from_file(file_path)
         mode = os.stat(file_path).st_mode & 0o777
         self.assertEqual(0o600, mode, f"Expected 0600 permissions after from_file(), got {oct(mode)}")
+
+    @unittest.skipUnless(os.name == "posix", "permission mode checks require POSIX semantics")
+    def test_from_file_ignores_permission_errors_when_chmod_is_unsupported(self):
+        file_path = os.path.join(self.temp_dir, "persist_unportable")
+        with open(file_path, "w") as f:
+            f.write("some content")
+
+        with patch("common.persist.os.chmod", side_effect=PermissionError("chmod unsupported")):
+            persist = DummyPersist.from_file(file_path)
+
+        self.assertEqual("some content", persist.my_content)
 
     @unittest.skipUnless(os.name == "posix", "permission mode checks require POSIX semantics")
     def test_to_file_overwrite_preserves_0600_permissions(self):
