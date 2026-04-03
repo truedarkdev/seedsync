@@ -749,16 +749,38 @@ class WebApp(bottle.Bottle):
                 "This first local browser can claim SeedSync's initial admin access. "
                 "Click continue when you want this browser to take over."
             )
+            brand_copy = "SeedSync keeps the first browser handoff local. Continue below to claim the initial admin session."
             primary_action_label = "Continue"
             primary_action_url = "/server/admin/bootstrap/v1/first-api-key"
             primary_action_payload = ""
             form_fields_html = ""
+            brand_facts = [
+                ("Mode", "Initial admin handover"),
+                ("Scope", "Trusted local runtime only"),
+                ("Result", "Claim the first browser session"),
+            ]
         else:
             page_heading = "Remember this browser"
             page_description = "Enter an API key once to remember this browser and tie its access to that key's current scopes."
+            brand_copy = "SeedSync keeps browser access tied to the local runtime. Paste an API key below once to remember this browser."
             primary_action_label = "Remember browser"
             primary_action_url = "/server/browser/v1/remember"
             primary_action_payload = 'secret: document.getElementById("browser-secret").value'
+            brand_facts = [
+                ("Mode", "Remembered browser"),
+                ("Scope", "API-key-derived access"),
+                ("Result", "Reuse this browser next time"),
+            ]
+
+        brand_facts_html = "\n".join(
+            """
+    <div class="fact">
+      <dt>{label}</dt>
+      <dd>{value}</dd>
+    </div>
+""".format(label=label, value=value)
+            for label, value in brand_facts
+        )
 
         bottle.response.content_type = "text/html; charset=utf-8"
         bottle.response.cache_control = "no-store"
@@ -769,67 +791,234 @@ class WebApp(bottle.Bottle):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{page_title}</title>
   <style>
+    :root {{
+      color-scheme: light;
+    }}
+    * {{
+      box-sizing: border-box;
+    }}
     body {{
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       margin: 0;
       min-height: 100vh;
-      display: grid;
-      place-items: center;
-      background: #f5f7fb;
+      background: #f5f5f5;
       color: #1f2937;
     }}
-    main {{
-      width: min(42rem, calc(100vw - 2rem));
-      background: white;
-      border: 1px solid rgba(31, 41, 55, 0.1);
-      border-radius: 12px;
-      padding: 1.5rem;
-      box-shadow: 0 20px 60px rgba(15, 23, 42, 0.12);
+    .bootstrap-page {{
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 1rem;
     }}
-    h1 {{ margin: 0 0 0.5rem; font-size: 1.6rem; }}
-    p {{ line-height: 1.5; color: rgba(31, 41, 55, 0.8); }}
-    label {{ display: block; font-weight: 700; margin: 1rem 0 0.35rem; }}
+    main {{
+      width: min(68rem, calc(100vw - 2rem));
+      display: grid;
+      grid-template-columns: minmax(16rem, 0.95fr) minmax(20rem, 1.05fr);
+      background: #ffffff;
+      border: 1px solid rgba(17, 130, 71, 0.14);
+      border-top: 4px solid #118247;
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+    }}
+    .brand-panel {{
+      padding: 1.5rem;
+      background: #fafafa;
+      border-right: 1px solid rgba(31, 41, 55, 0.08);
+    }}
+    .brand-lockup {{
+      display: flex;
+      align-items: center;
+      gap: 0.85rem;
+    }}
+    .brand-lockup img {{
+      width: 58px;
+      height: 58px;
+      flex: 0 0 auto;
+    }}
+    .brand-wordmark {{
+      color: #118247;
+      font-family: "Arial Black", Gadget, sans-serif;
+      font-size: 2rem;
+      line-height: 0.95;
+      letter-spacing: -0.04em;
+      user-select: none;
+    }}
+    .brand-wordmark span {{
+      display: block;
+    }}
+    .brand-kicker {{
+      display: inline-flex;
+      margin-top: 0.9rem;
+      padding: 0.32rem 0.65rem;
+      border-radius: 999px;
+      background: rgba(17, 130, 71, 0.08);
+      color: #0d6b39;
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }}
+    .brand-copy {{
+      margin: 1rem 0 0;
+      line-height: 1.5;
+      color: rgba(31, 41, 55, 0.78);
+    }}
+    .facts {{
+      display: grid;
+      gap: 0.75rem;
+      margin-top: 1rem;
+    }}
+    .fact {{
+      padding-top: 0.75rem;
+      border-top: 1px solid rgba(31, 41, 55, 0.08);
+    }}
+    .fact dt {{
+      font-size: 0.76rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: rgba(31, 41, 55, 0.52);
+    }}
+    .fact dd {{
+      margin: 0.3rem 0 0;
+      font-weight: 700;
+      color: #1f2937;
+    }}
+    .form-panel {{
+      padding: 1.5rem;
+    }}
+    .eyebrow {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.32rem 0.65rem;
+      border-radius: 999px;
+      background: rgba(51, 123, 183, 0.09);
+      color: #2e6da4;
+      font-size: 0.76rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }}
+    h1 {{
+      margin: 0.85rem 0 0.45rem;
+      font-size: clamp(1.8rem, 3vw, 2.35rem);
+      line-height: 1.08;
+      letter-spacing: -0.03em;
+    }}
+    .lede {{
+      margin: 0;
+      max-width: 34rem;
+      line-height: 1.6;
+      color: rgba(31, 41, 55, 0.78);
+    }}
+    form {{
+      margin-top: 1.25rem;
+      max-width: 30rem;
+    }}
+    label {{
+      display: block;
+      font-weight: 700;
+      margin: 1rem 0 0.35rem;
+      color: #1f2937;
+    }}
     input {{
       width: 100%;
       padding: 0.8rem 0.9rem;
       border-radius: 8px;
       border: 1px solid rgba(31, 41, 55, 0.18);
+      background: #ffffff;
       font: inherit;
       box-sizing: border-box;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }}
+    input:focus {{
+      outline: none;
+      border-color: #337BB7;
+      box-shadow: 0 0 0 3px rgba(51, 123, 183, 0.14);
     }}
     button {{
       margin-top: 1rem;
-      padding: 0.8rem 1rem;
+      min-height: 44px;
+      padding: 0.8rem 1.15rem;
       border-radius: 8px;
-      border: 0;
-      background: #2563eb;
+      border: 1px solid #2e6da4;
+      background: #337BB7;
       color: white;
       font: inherit;
       font-weight: 700;
       cursor: pointer;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+      transition: background-color 0.15s ease, border-color 0.15s ease, transform 0.15s ease;
+    }}
+    button:hover {{
+      background: #2f72a9;
+      border-color: #275f8e;
+    }}
+    button:active {{
+      transform: translateY(1px);
+    }}
+    button:focus-visible {{
+      outline: 3px solid rgba(51, 123, 183, 0.28);
+      outline-offset: 2px;
     }}
     .hint {{
       margin-top: 0.75rem;
       font-size: 0.9rem;
       color: rgba(31, 41, 55, 0.62);
+      line-height: 1.5;
+      max-width: 34rem;
     }}
     .error {{
       margin-top: 0.75rem;
       color: #b91c1c;
       white-space: pre-wrap;
     }}
+    @media (max-width: 760px) {{
+      .bootstrap-page {{
+        padding: 0.75rem;
+      }}
+      main {{
+        width: min(100%, 52rem);
+        grid-template-columns: 1fr;
+      }}
+      .brand-panel {{
+        border-right: 0;
+        border-bottom: 1px solid rgba(31, 41, 55, 0.08);
+      }}
+      form {{
+        max-width: none;
+      }}
+      button {{
+        width: 100%;
+      }}
+    }}
   </style>
 </head>
-<body>
+<body class="bootstrap-page">
 <main>
+  <section class="brand-panel" aria-label="SeedSync branding">
+    <div class="brand-lockup">
+      <img src="/assets/logo.png" alt="SeedSync" />
+      <div class="brand-wordmark"><span>Seed</span>Sync</div>
+    </div>
+    <div class="brand-kicker">Browser access</div>
+    <p class="brand-copy">{brand_copy}</p>
+    <dl class="facts">
+{brand_facts_html}
+    </dl>
+  </section>
+  <section class="form-panel" aria-label="Bootstrap form">
+  <div class="eyebrow">Bootstrap</div>
   <h1>{page_heading}</h1>
-  <p>{page_description}</p>
+  <p class="lede">{page_description}</p>
   <form id="bootstrap-form">
 {form_fields_html}
     <button type="submit">{primary_action_label}</button>
   </form>
   <p class="hint">This page stays local and same-origin. It only sends the entered credential to this SeedSync instance.</p>
   <p id="error" class="error" hidden></p>
+  </section>
 </main>
 <script>
 (function () {{
@@ -876,7 +1065,9 @@ class WebApp(bottle.Bottle):
             page_title=page_title,
             page_heading=page_heading,
             page_description=page_description,
+            brand_copy=brand_copy,
             form_fields_html=form_fields_html,
+            brand_facts_html=brand_facts_html,
             primary_action_label=primary_action_label,
             primary_action_url=primary_action_url,
             primary_action_payload=primary_action_payload,
