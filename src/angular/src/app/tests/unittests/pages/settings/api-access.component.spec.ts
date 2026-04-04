@@ -1,7 +1,7 @@
 import {CommonModule} from "@angular/common";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
-import {BehaviorSubject, Observable, of} from "rxjs";
+import {BehaviorSubject, Observable, of, Subject} from "rxjs";
 import {Modal} from "../../../../services/utils/modal.service";
 
 import {ApiAccessComponent} from "../../../../pages/settings/api-access.component";
@@ -43,6 +43,16 @@ const revokedApiKey: ApiKeyRecord = {
     active: false
 };
 
+const secondRevokedApiKey: ApiKeyRecord = {
+    id: "revoked-writer",
+    name: "Revoked Writer",
+    scopes: ["write"],
+    created_at: "2026-04-01T00:07:00+00:00",
+    updated_at: "2026-04-01T00:08:00+00:00",
+    revoked_at: "2026-04-01T00:08:00+00:00",
+    active: false
+};
+
 const nonAdminApiKeys: ApiKeyRecord[] = [{
     id: "writer",
     name: "Writer",
@@ -57,7 +67,14 @@ const nonAdminApiKeys: ApiKeyRecord[] = [{
 class MockApiAccessService {
     apiKeys = new BehaviorSubject<ApiKeyRecord[]>(null);
     refresh = jasmine.createSpy("refresh").and.callFake(() => {
-        this.apiKeys.next([adminApiKey]);
+        const currentKeys = this.apiKeys.getValue();
+
+        if (!currentKeys || currentKeys.length === 0) {
+            this.apiKeys.next([adminApiKey]);
+            return;
+        }
+
+        this.apiKeys.next(currentKeys);
     });
     setIncludeRevokedApiKeys = jasmine.createSpy("setIncludeRevokedApiKeys").and.callFake((includeRevoked: boolean) => {
         const currentKeys = this.apiKeys.getValue() || [];
@@ -138,10 +155,14 @@ class MockApiAccessService {
         revoked_at: "2026-04-01T00:13:00+00:00",
         active: false
     }));
-    deleteApiKey = jasmine.createSpy("deleteApiKey").and.callFake((keyId: string) => {
-        if (keyId === revokedApiKey.id) {
-            this.apiKeys.next(activeApiKeys);
+    deleteApiKey = jasmine.createSpy("deleteApiKey").and.callFake((keyId: string, refresh = true) => {
+        const currentKeys = this.apiKeys.getValue() || [];
+        this.apiKeys.next(currentKeys.filter(key => key.id !== keyId));
+
+        if (refresh) {
+            this.refresh();
         }
+
         return of(void 0);
     });
 }
@@ -220,6 +241,7 @@ describe("Testing API access component", () => {
         expect(host.querySelector(".section-header")).toBeNull();
         expect(host.querySelector(".key-item:not(.revoked) .delete-key-btn")).toBeNull();
         expect(host.querySelector(".toggle-revoked-keys-btn")).not.toBeNull();
+        expect(host.querySelector(".delete-revoked-keys-btn")).toBeNull();
         expect(host.querySelector(".disable-legacy-btn")).toBeNull();
         expect(host.querySelector(".clear-legacy-btn")).toBeNull();
     });
@@ -293,6 +315,113 @@ describe("Testing API access component", () => {
         expect(apiAccessService.deleteApiKey).toHaveBeenCalledWith("revoked-reader");
         expect(notificationService.show).not.toHaveBeenCalled();
         expect(host.textContent).not.toContain("Revoked Reader");
+    }));
+
+    it("should delete all currently visible revoked keys with one confirmation", fakeAsync(() => {
+        apiAccessService.apiKeys.next([adminApiKey, activeApiKeys[0], revokedApiKey, secondRevokedApiKey]);
+        fixture.detectChanges();
+
+        const host: HTMLElement = fixture.nativeElement;
+        const revealButton = host.querySelector(".toggle-revoked-keys-btn") as HTMLButtonElement;
+
+        revealButton.click();
+        fixture.detectChanges();
+
+        const deleteAllButton = host.querySelector(".delete-revoked-keys-btn") as HTMLButtonElement;
+        expect(deleteAllButton).not.toBeNull();
+
+        deleteAllButton.click();
+        flushMicrotasks();
+        fixture.detectChanges();
+
+        expect(apiAccessService.deleteApiKey).toHaveBeenCalledTimes(2);
+        expect(apiAccessService.deleteApiKey.calls.argsFor(0)).toEqual(["revoked-reader", false]);
+        expect(apiAccessService.deleteApiKey.calls.argsFor(1)).toEqual(["revoked-writer", false]);
+        expect(apiAccessService.refresh).toHaveBeenCalledTimes(1);
+        expect(host.textContent).not.toContain("Revoked Reader");
+        expect(host.textContent).not.toContain("Revoked Writer");
+    }));
+
+    it("should refresh and re-enable the bulk delete action after a partial failure", fakeAsync(() => {
+        apiAccessService.apiKeys.next([adminApiKey, activeApiKeys[0], revokedApiKey, secondRevokedApiKey]);
+        fixture.detectChanges();
+
+        const revokedReaderDelete$ = new Subject<void>();
+        const revokedWriterDelete$ = new Subject<void>();
+
+        apiAccessService.deleteApiKey.and.callFake((keyId: string, refresh = true) => {
+            if (keyId === revokedApiKey.id) {
+                return revokedReaderDelete$.asObservable();
+            }
+            if (keyId === secondRevokedApiKey.id) {
+                return revokedWriterDelete$.asObservable();
+            }
+            return of(void 0);
+        });
+
+        const host: HTMLElement = fixture.nativeElement;
+        (host.querySelector(".toggle-revoked-keys-btn") as HTMLButtonElement).click();
+        fixture.detectChanges();
+
+        const deleteAllButton = host.querySelector(".delete-revoked-keys-btn") as HTMLButtonElement;
+        deleteAllButton.click();
+        flushMicrotasks();
+        fixture.detectChanges();
+
+        expect(deleteAllButton.disabled).toBeTrue();
+        expect(component.isDeletingRevokedApiKeys).toBeTrue();
+        expect(apiAccessService.deleteApiKey.calls.count()).toBe(1);
+
+        revokedReaderDelete$.next();
+        revokedReaderDelete$.complete();
+        fixture.detectChanges();
+
+        expect(apiAccessService.deleteApiKey.calls.count()).toBe(2);
+
+        revokedWriterDelete$.error(new Error("revoked writer delete failed"));
+        fixture.detectChanges();
+
+        expect(apiAccessService.refresh).toHaveBeenCalledTimes(1);
+        expect(component.isDeletingRevokedApiKeys).toBeFalse();
+        expect(deleteAllButton.disabled).toBeFalse();
+        expect(notificationService.show).toHaveBeenCalled();
+    }));
+
+    it("should ignore overlapping bulk delete attempts while one is already running", fakeAsync(() => {
+        apiAccessService.apiKeys.next([adminApiKey, activeApiKeys[0], revokedApiKey]);
+        fixture.detectChanges();
+
+        const revokedDelete$ = new Subject<void>();
+        apiAccessService.deleteApiKey.and.callFake((keyId: string, refresh = true) => {
+            if (keyId === revokedApiKey.id) {
+                return revokedDelete$.asObservable();
+            }
+            return of(void 0);
+        });
+
+        const host: HTMLElement = fixture.nativeElement;
+        (host.querySelector(".toggle-revoked-keys-btn") as HTMLButtonElement).click();
+        fixture.detectChanges();
+
+        const deleteAllButton = host.querySelector(".delete-revoked-keys-btn") as HTMLButtonElement;
+        deleteAllButton.click();
+        flushMicrotasks();
+        fixture.detectChanges();
+
+        expect(component.isDeletingRevokedApiKeys).toBeTrue();
+        expect(apiAccessService.deleteApiKey.calls.count()).toBe(1);
+
+        component.deleteAllRevokedApiKeys(apiAccessService.apiKeys.getValue());
+        fixture.detectChanges();
+
+        expect(apiAccessService.deleteApiKey.calls.count()).toBe(1);
+
+        revokedDelete$.next();
+        revokedDelete$.complete();
+        fixture.detectChanges();
+
+        expect(apiAccessService.refresh).toHaveBeenCalledTimes(1);
+        expect(component.isDeletingRevokedApiKeys).toBeFalse();
     }));
 
     it("should create a key and reveal the returned secret", () => {
