@@ -17,6 +17,7 @@ export interface PathPairStat {
     totalRemoteSize: number;
     totalLocalSize: number;
     totalSpeed: number;
+    etaSeconds: number | null;
     overallProgress: number;
 }
 
@@ -29,8 +30,6 @@ export interface PathPairStat {
 })
 export class PathPairStatsComponent implements OnInit, OnDestroy {
     public stats: PathPairStat[] = [];
-    public isExpanded = true;
-    public hasMultiplePathPairs = false;
 
     private readonly _destroy$ = new Subject<void>();
     private _pathPairs: PathPair[] = [];
@@ -47,7 +46,6 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             .subscribe({
                 next: (pathPairs: PathPair[]) => {
                     this._pathPairs = pathPairs || [];
-                    this.hasMultiplePathPairs = this._pathPairs.filter(pair => pair.enabled).length > 1;
                     this._updateStats();
                 }
             });
@@ -67,13 +65,29 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         this._destroy$.complete();
     }
 
-    toggleExpanded(): void {
-        this.isExpanded = !this.isExpanded;
-        this._changeDetector.markForCheck();
-    }
-
     hasActiveTransfers(stat: PathPairStat): boolean {
         return stat.downloadingCount > 0 || stat.queuedCount > 0;
+    }
+
+    formatEta(etaSeconds: number | null): string {
+        if (etaSeconds === null || !isFinite(etaSeconds) || etaSeconds <= 0) {
+            return "";
+        }
+
+        const totalSeconds = Math.ceil(etaSeconds);
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const seconds = totalSeconds % 60;
+
+        if (hours > 0) {
+            return `${hours}h ${minutes}m`;
+        }
+
+        if (minutes > 0) {
+            return `${minutes}m ${seconds}s`;
+        }
+
+        return `${seconds}s`;
     }
 
     private _updateStats(): void {
@@ -122,6 +136,8 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         });
 
         const completedSize = totalRemoteSize > 0 ? Math.min(totalLocalSize, totalRemoteSize) : 0;
+        const remainingSize = Math.max(totalRemoteSize - completedSize, 0);
+        const etaSeconds = totalSpeed > 0 && remainingSize > 0 ? Math.ceil(remainingSize / totalSpeed) : null;
 
         return {
             pathPairId: pathPair.id,
@@ -133,6 +149,7 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             totalRemoteSize: totalRemoteSize,
             totalLocalSize: completedSize,
             totalSpeed: totalSpeed,
+            etaSeconds: etaSeconds,
             overallProgress: totalRemoteSize > 0 ? Math.round((completedSize / totalRemoteSize) * 100) : 0
         };
     }

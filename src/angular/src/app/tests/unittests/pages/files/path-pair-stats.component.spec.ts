@@ -145,7 +145,6 @@ describe("Testing path-pair stats component", () => {
         tick();
         fixture.detectChanges();
 
-        expect(component.hasMultiplePathPairs).toBe(true);
         expect(component.stats.length).toBe(2);
 
         expect(component.stats[0].pathPairId).toBe("movies");
@@ -153,6 +152,7 @@ describe("Testing path-pair stats component", () => {
         expect(component.stats[0].downloadingCount).toBe(1);
         expect(component.stats[0].downloadedCount).toBe(1);
         expect(component.stats[0].totalSpeed).toBe(250);
+        expect(component.stats[0].etaSeconds).toBe(2);
         expect(component.stats[0].overallProgress).toBe(75);
 
         expect(component.stats[1].pathPairId).toBe("tv");
@@ -160,6 +160,7 @@ describe("Testing path-pair stats component", () => {
 
         const cards = fixture.nativeElement.querySelectorAll(".path-pair-card");
         expect(cards.length).toBe(2);
+        expect(fixture.nativeElement.querySelector(".path-pair-stats-container")).toBeNull();
     }));
 
     it("should cap aggregate progress and completed size when local totals exceed remote totals", fakeAsync(() => {
@@ -193,6 +194,7 @@ describe("Testing path-pair stats component", () => {
         expect(component.stats.length).toBe(1);
         expect(component.stats[0].totalRemoteSize).toBe(800);
         expect(component.stats[0].totalLocalSize).toBe(800);
+        expect(component.stats[0].etaSeconds).toBeNull();
         expect(component.stats[0].overallProgress).toBe(100);
     }));
 
@@ -218,10 +220,48 @@ describe("Testing path-pair stats component", () => {
         expect(component.stats.length).toBe(1);
         expect(component.stats[0].totalRemoteSize).toBe(0);
         expect(component.stats[0].totalLocalSize).toBe(0);
+        expect(component.stats[0].etaSeconds).toBeNull();
         expect(component.stats[0].overallProgress).toBe(0);
     }));
 
-    it("should hide the container when fewer than two enabled path pairs exist", fakeAsync(() => {
+    it("should render eta for active downloads and suppress it when nothing remains", fakeAsync(() => {
+        pathPairService.setPathPairs([
+            createPathPair("movies", "Movies"),
+            createPathPair("done", "Done")
+        ]);
+        viewFileService.setFiles([
+            createViewFile({
+                name: "movie1.mkv",
+                pathPairId: "movies",
+                pathPairName: "Movies",
+                localSize: 500,
+                remoteSize: 1000,
+                status: ViewFile.Status.DOWNLOADING,
+                downloadingSpeed: 250
+            }),
+            createViewFile({
+                name: "movie2.mkv",
+                pathPairId: "done",
+                pathPairName: "Done",
+                localSize: 1000,
+                remoteSize: 1000,
+                status: ViewFile.Status.DOWNLOADED
+            })
+        ]);
+
+        fixture.detectChanges();
+        tick();
+        fixture.detectChanges();
+
+        const cards = fixture.nativeElement.querySelectorAll(".path-pair-card");
+        expect(cards.length).toBe(2);
+
+        const cardsText = Array.from(cards).map((card: HTMLElement) => card.textContent.replace(/\s+/g, " ").trim());
+        expect(cardsText[0]).toContain("ETA 2s");
+        expect(cardsText[1]).not.toContain("ETA");
+    }));
+
+    it("should render the stats grid even when only one enabled path pair exists", fakeAsync(() => {
         pathPairService.setPathPairs([
             createPathPair("movies", "Movies")
         ]);
@@ -239,29 +279,8 @@ describe("Testing path-pair stats component", () => {
         tick();
         fixture.detectChanges();
 
-        expect(component.hasMultiplePathPairs).toBe(false);
-        expect(fixture.nativeElement.querySelector(".path-pair-stats-container")).toBeNull();
-    }));
-
-    it("should toggle the expanded state", fakeAsync(() => {
-        pathPairService.setPathPairs([
-            createPathPair("movies", "Movies"),
-            createPathPair("tv", "TV")
-        ]);
-        viewFileService.setFiles([
-            createViewFile({pathPairId: "movies", pathPairName: "Movies", localSize: 1, remoteSize: 1}),
-            createViewFile({pathPairId: "tv", pathPairName: "TV", localSize: 1, remoteSize: 1})
-        ]);
-
-        fixture.detectChanges();
-        tick();
-        fixture.detectChanges();
-
-        expect(component.isExpanded).toBe(true);
-        component.toggleExpanded();
-        fixture.detectChanges();
-
-        expect(component.isExpanded).toBe(false);
-        expect(fixture.nativeElement.querySelector(".stats-grid")).toBeNull();
+        expect(component.stats.length).toBe(1);
+        expect(fixture.nativeElement.querySelector(".stats-grid")).not.toBeNull();
+        expect(fixture.nativeElement.querySelectorAll(".path-pair-card").length).toBe(1);
     }));
 });
