@@ -209,6 +209,7 @@ describe("Testing path pairs component", () => {
 
     it("should replace the empty state when path pairs refresh", fakeAsync(() => {
         expect(fixture.nativeElement.querySelector(".empty-state")).not.toBeNull();
+        expect(fixture.nativeElement.querySelector(".list-surface")).not.toBeNull();
         expect(fixture.nativeElement.querySelectorAll(".path-pair-item").length).toBe(0);
 
         pathPairService.push([
@@ -227,6 +228,55 @@ describe("Testing path pairs component", () => {
         const items = fixture.nativeElement.querySelectorAll(".path-pair-item");
         expect(items.length).toBe(1);
         expect(items[0].querySelector(".pair-name").textContent.trim()).toBe("Movies");
+        expect(items[0].querySelector(".pair-status").textContent.trim()).toBe("Enabled");
+        expect(items[0].querySelector(".pair-status").classList.contains("enabled")).toBe(true);
+    }));
+
+    it("should keep path details hidden until the user expands them", fakeAsync(() => {
+        pathPairService.push([
+            {
+                id: "movies",
+                name: "Movies",
+                remote_path: "/remote/movies",
+                local_path: "/downloads/movies",
+                enabled: true,
+                auto_queue: true
+            }
+        ]);
+        fixture.detectChanges();
+
+        const item = fixture.nativeElement.querySelector(".path-pair-item");
+
+        expect(item.querySelector(".pair-details")).toBeNull();
+        const detailsToggle = item.querySelector(".pair-details-toggle");
+        expect(detailsToggle.textContent.trim()).toBe("+");
+        expect(item.querySelector(".pair-autoqueue").textContent.trim()).toBe("AQ");
+
+        detailsToggle.click();
+        fixture.detectChanges();
+
+        expect(item.querySelector(".pair-details")).not.toBeNull();
+        expect(item.querySelector(".path-line .path-value").textContent.trim()).toBe("/remote/movies");
+        expect(detailsToggle.textContent.trim()).toBe("-");
+    }));
+
+    it("should render a fallback title when a path pair name is empty", fakeAsync(() => {
+        pathPairService.push([
+            {
+                id: "movies",
+                name: "",
+                remote_path: "/remote/movies",
+                local_path: "/downloads/movies",
+                enabled: true,
+                auto_queue: true
+            }
+        ]);
+        fixture.detectChanges();
+
+        const items = fixture.nativeElement.querySelectorAll(".path-pair-item");
+
+        expect(items.length).toBe(1);
+        expect(items[0].querySelector(".pair-name").textContent.trim()).toBe("Unnamed path pair");
     }));
 
     it("should delete a path pair after confirmation", fakeAsync(() => {

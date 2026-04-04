@@ -1,52 +1,15 @@
 <div class="api-access-container">
-    <div class="header">
-        <div class="header-copy">
-            <h3>API Access</h3>
-            <p class="description">
-                Manage scoped API keys and the legacy token migration state for external clients.
-            </p>
-        </div>
-
-        <div class="summary-strip" *ngIf="(migrationState | async) as state; else loadingState">
-            <div class="summary-item">
-                <span class="summary-label">Legacy compatibility</span>
-                <span class="summary-value" [class.active]="state.legacy_api_token.compatibility_enabled"
-                      [class.disabled]="!state.legacy_api_token.compatibility_enabled">
-                    {{getLegacyStateLabel(state.legacy_api_token)}}
-                </span>
-            </div>
-            <div class="summary-item">
-                <span class="summary-label">API keys</span>
-                <span class="summary-value">{{state.api_keys.active}} active / {{state.api_keys.revoked}} revoked</span>
-            </div>
-        </div>
-    </div>
-
-    <ng-template #loadingState>
-        <div class="loading-state">
-            Loading API access state...
-        </div>
-    </ng-template>
-
-    <ng-container *ngIf="(migrationState | async) as state">
-        <div class="migration-banner"
-             *ngIf="state.legacy_api_token.configured">
-            <div class="banner-copy">
-                <strong>{{state.legacy_api_token.compatibility_enabled ? 'Legacy token compatibility is active.' : 'Legacy token compatibility is disabled.'}}</strong>
-                <p>{{getLegacyStateDescription(state.legacy_api_token)}}</p>
-            </div>
-            <div class="banner-actions">
-                <button class="btn btn-warning btn-sm disable-legacy-btn"
-                        type="button"
-                        *ngIf="state.legacy_api_token.compatibility_enabled"
-                        (click)="disableLegacyApiToken()">
-                    Disable compatibility
-                </button>
-                <button class="btn btn-danger btn-sm clear-legacy-btn"
-                        type="button"
-                        (click)="clearLegacyApiToken()">
-                    Clear token
-                </button>
+    <ng-container *ngIf="apiKeys | async as apiKeys; else loadingState">
+        <div class="api-access-overview">
+            <div class="summary-line">
+                <div class="summary-item">
+                    <span class="summary-label">API keys</span>
+                    <span class="summary-value">{{getActiveApiKeyCount(apiKeys)}} active / {{getRevokedApiKeyCount(apiKeys)}} revoked</span>
+                </div>
+                <div class="summary-item">
+                    <span class="summary-label">Admin access</span>
+                    <span class="summary-value">{{isBootstrapMode(apiKeys) ? 'Bootstrap needed' : 'Ready'}}</span>
+                </div>
             </div>
         </div>
 
@@ -66,172 +29,177 @@
             <p class="secret-hint">This secret is shown once. Copy it before closing the panel.</p>
         </div>
 
-        <ng-container *ngIf="isBootstrapMode(state); else adminApiAccess">
-            <div class="create-card bootstrap-card">
-                <div class="section-heading">
-                    <h4>Bootstrap First Admin</h4>
-                    <p>No active admin key exists yet. Create the first admin key to unlock API key management.</p>
+        <ng-container *ngIf="isBootstrapMode(apiKeys); else adminApiAccess">
+            <div class="form-card bootstrap-card">
+                <div class="form-header">
+                    <div class="form-heading-copy">
+                        <h4>Bootstrap First Admin</h4>
+                        <p>Create the first admin key to unlock the rest of the API access controls.</p>
+                    </div>
                 </div>
 
-                <label class="form-row">
-                    <span class="label">Name</span>
-                    <input type="text"
-                           class="form-control"
-                           [(ngModel)]="bootstrapName"
-                           placeholder="bootstrap-admin" />
-                </label>
+                <div class="form-grid">
+                    <label class="form-row">
+                        <span class="label">Name</span>
+                        <input type="text"
+                               class="form-control"
+                               [(ngModel)]="bootstrapName"
+                               placeholder="bootstrap-admin" />
+                    </label>
 
-                <div class="actions">
-                    <button class="btn btn-primary bootstrap-first-admin-btn"
-                            type="button"
-                            (click)="bootstrapFirstApiKey()">
-                        Create first admin key
-                    </button>
+                    <div class="form-footer">
+                        <div class="footer-controls"></div>
+                        <div class="actions">
+                            <button class="btn btn-primary btn-sm bootstrap-first-admin-btn"
+                                    type="button"
+                                    (click)="bootstrapFirstApiKey()">
+                                Create
+                            </button>
+                        </div>
+                    </div>
                 </div>
             </div>
         </ng-container>
 
         <ng-template #adminApiAccess>
-            <div class="revoked-visibility" *ngIf="state.api_keys.revoked > 0">
-                <div class="revoked-visibility-copy">
-                    <strong *ngIf="!showRevokedKeys">{{state.api_keys.revoked}} revoked key{{state.api_keys.revoked === 1 ? '' : 's'}} hidden</strong>
-                    <strong *ngIf="showRevokedKeys">Revoked keys are visible</strong>
-                    <p *ngIf="!showRevokedKeys">Use the toggle to review or permanently remove previously revoked keys.</p>
-                    <p *ngIf="showRevokedKeys">Hide them again when you are done auditing or deleting them.</p>
-                </div>
-                <button class="btn btn-secondary btn-sm toggle-revoked-keys-btn"
-                        type="button"
-                        (click)="toggleRevokedKeys()">
-                    {{showRevokedKeys ? 'Hide revoked keys' : 'Show revoked keys'}}
-                </button>
-            </div>
-
-            <div class="create-card">
-                <div class="section-heading">
-                    <h4>Create API Key</h4>
-                    <p>Choose a name and the scopes this key should receive.</p>
-                </div>
-
-                <label class="form-row">
-                    <span class="label">Name</span>
-                    <input type="text"
-                           class="form-control"
-                           [(ngModel)]="createName"
-                           placeholder="Media scanner" />
-                </label>
-
-                <div class="scope-grid">
-                    <label class="scope-option" *ngFor="let scope of scopeOptions">
-                        <input type="checkbox"
-                               [(ngModel)]="createScopes[scope.value]" />
-                        <span>{{scope.label}}</span>
-                    </label>
-                </div>
-
-                <div class="actions">
-                    <button class="btn btn-primary create-key-btn"
+            <div class="api-access-tooling-stack">
+                <div class="api-access-toolbar">
+                    <div class="api-access-toolbar-copy">
+                        <span class="api-access-toolbar-label">API keys</span>
+                        <span class="api-access-toolbar-detail">Create scoped keys for SeedSync clients.</span>
+                    </div>
+                    <button class="btn btn-primary btn-sm add-key-btn"
                             type="button"
-                            (click)="createApiKey()">
-                        Create key
+                            [disabled]="isFormOpen"
+                            (click)="startCreate()">
+                        Add API Key
+                    </button>
+                </div>
+
+                <div class="form-card api-access-form-card" *ngIf="isFormOpen">
+                    <div class="form-header">
+                        <div class="form-heading-copy">
+                            <h4>{{isEditing ? 'Edit API Key' : 'New API Key'}}</h4>
+                        </div>
+                    </div>
+
+                    <div class="form-grid">
+                        <label class="form-row name-row">
+                            <span class="label">Name</span>
+                            <input type="text"
+                                   class="form-control"
+                                   [(ngModel)]="formName"
+                                   placeholder="Media scanner" />
+                        </label>
+
+                        <div class="form-footer">
+                            <div class="footer-controls">
+                                <label class="scope-option" *ngFor="let scope of scopeOptions">
+                                    <input type="checkbox"
+                                           [(ngModel)]="formScopes[scope.value]" />
+                                    <span>{{scope.label}}</span>
+                                </label>
+                            </div>
+
+                            <div class="actions">
+                                <button class="btn btn-secondary btn-sm cancel-edit-key-btn"
+                                        type="button"
+                                        (click)="cancelForm()">
+                                    Cancel
+                                </button>
+                                <button class="btn btn-primary btn-sm save-key-btn"
+                                        type="button"
+                                        (click)="saveForm()">
+                                    {{isEditing ? 'Save changes' : 'Create key'}}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="revoked-visibility" *ngIf="getRevokedApiKeyCount(apiKeys) > 0">
+                    <div class="revoked-visibility-copy">
+                        <span class="revoked-visibility-label" *ngIf="!showRevokedKeys">{{getRevokedApiKeyCount(apiKeys)}} revoked key{{getRevokedApiKeyCount(apiKeys) === 1 ? '' : 's'}} hidden</span>
+                        <span class="revoked-visibility-label" *ngIf="showRevokedKeys">Revoked keys visible</span>
+                        <span class="revoked-visibility-detail" *ngIf="!showRevokedKeys">Toggle to review or delete them.</span>
+                        <span class="revoked-visibility-detail" *ngIf="showRevokedKeys">Hide them when you are done.</span>
+                    </div>
+                    <button class="btn btn-secondary btn-sm toggle-revoked-keys-btn"
+                            type="button"
+                            (click)="toggleRevokedKeys()">
+                        {{showRevokedKeys ? 'Hide revoked' : 'Show revoked'}}
                     </button>
                 </div>
             </div>
 
-            <div class="key-list" *ngIf="(apiKeys | async) as apiKeys; else loadingKeys">
-                <div class="empty-state" *ngIf="apiKeys.length === 0">
-                    <ng-container *ngIf="state.api_keys.revoked > 0 && !showRevokedKeys; else noVisibleKeys">
-                        No active API keys are visible right now. {{state.api_keys.revoked}} revoked key{{state.api_keys.revoked === 1 ? '' : 's'}} are hidden.
+            <div class="key-list">
+                <div class="empty-state" *ngIf="getVisibleApiKeyCount(apiKeys) === 0">
+                    <ng-container *ngIf="getRevokedApiKeyCount(apiKeys) > 0 && !showRevokedKeys; else noVisibleKeys">
+                        No active API keys are visible right now. {{getRevokedApiKeyCount(apiKeys)}} revoked key{{getRevokedApiKeyCount(apiKeys) === 1 ? '' : 's'}} are hidden.
                     </ng-container>
                     <ng-template #noVisibleKeys>
                         No API keys configured yet.
                     </ng-template>
                 </div>
 
-                <div class="key-item" *ngFor="let key of apiKeys" [class.revoked]="!key.active">
+                <div class="key-item" *ngFor="let key of getVisibleApiKeys(apiKeys)" [class.revoked]="!key.active">
                     <div class="key-body">
                         <div class="key-header">
-                            <div class="key-title-row">
-                                <span class="key-name">{{key.name}}</span>
-                                <span class="key-status" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
+                            <div class="key-title-stack">
+                                <div class="key-title-row">
+                                    <span class="key-name">{{key.name}}</span>
+                                    <span class="key-status" [class.revoked]="!key.active">{{key.active ? 'Active' : 'Revoked'}}</span>
+                                    <span class="key-id" [attr.title]="key.id">{{key.id}}</span>
+                                </div>
                             </div>
-                            <span class="key-id">{{key.id}}</span>
+                            <div class="key-actions">
+                                <button class="btn btn-secondary btn-sm key-icon-btn key-details-toggle"
+                                        type="button"
+                                        [attr.aria-label]="isDetailsVisible(key) ? 'Hide API key details' : 'Show API key details'"
+                                        [attr.title]="isDetailsVisible(key) ? 'Hide details' : 'Show details'"
+                                        (click)="toggleDetails(key)">
+                                    <span aria-hidden="true">{{isDetailsVisible(key) ? '-' : '+'}}</span>
+                                </button>
+                                <ng-container *ngIf="key.active; else revokedActions">
+                                    <button class="btn btn-secondary btn-sm edit-key-btn"
+                                            type="button"
+                                            [disabled]="isFormOpen"
+                                            (click)="startEdit(key)">
+                                        Edit
+                                    </button>
+                                    <button class="btn btn-warning btn-sm rotate-key-btn"
+                                            type="button"
+                                            [disabled]="isFormOpen"
+                                            (click)="rotateApiKey(key)">
+                                        Rotate
+                                    </button>
+                                    <button class="btn btn-danger btn-sm revoke-key-btn"
+                                            type="button"
+                                            [disabled]="isFormOpen"
+                                            (click)="revokeApiKey(key)">
+                                        Revoke
+                                    </button>
+                                </ng-container>
+                                <ng-template #revokedActions>
+                                    <button class="btn btn-danger btn-sm delete-key-btn"
+                                            type="button"
+                                            [disabled]="isFormOpen"
+                                            (click)="deleteRevokedApiKey(key)">
+                                        Delete
+                                    </button>
+                                </ng-template>
+                            </div>
                         </div>
 
-                        <div class="scope-line">
-                            <span class="scope-chip" *ngFor="let scope of key.scopes">{{scope}}</span>
-                            <span class="scope-chip muted" *ngIf="key.scopes.length === 0">No scopes</span>
-                        </div>
-
-                        <div class="meta-line">
-                            <span>Created {{key.created_at}}</span>
-                            <span>Updated {{key.updated_at}}</span>
-                            <span *ngIf="key.revoked_at">Revoked {{key.revoked_at}}</span>
-                        </div>
-                        <div class="revoked-note" *ngIf="!key.active">
-                            Revoked keys are locked. They cannot be edited, rotated, or revoked again.
-                        </div>
-                    </div>
-
-                    <div class="key-actions">
-                        <ng-container *ngIf="key.active; else revokedActions">
-                            <button class="btn btn-secondary btn-sm edit-key-btn"
-                                    type="button"
-                                    (click)="startEdit(key)">
-                                Edit
-                            </button>
-                            <button class="btn btn-warning btn-sm rotate-key-btn"
-                                    type="button"
-                                    (click)="rotateApiKey(key)">
-                                Rotate
-                            </button>
-                            <button class="btn btn-danger btn-sm revoke-key-btn"
-                                    type="button"
-                                    (click)="revokeApiKey(key)">
-                                Revoke
-                            </button>
-                        </ng-container>
-                        <ng-template #revokedActions>
-                            <button class="btn btn-danger btn-sm delete-key-btn"
-                                    type="button"
-                                    (click)="deleteRevokedApiKey(key)">
-                                Delete permanently
-                            </button>
-                        </ng-template>
-                    </div>
-
-                    <div class="edit-card" *ngIf="isEditing(key)">
-                        <div class="section-heading">
-                            <h5>Edit API Key</h5>
-                            <p>Update the name or tighten the scopes for this key.</p>
-                        </div>
-
-                        <label class="form-row">
-                            <span class="label">Name</span>
-                            <input type="text"
-                                   class="form-control"
-                                   [(ngModel)]="editingName"
-                                   placeholder="Media scanner" />
-                        </label>
-
-                        <div class="scope-grid">
-                            <label class="scope-option" *ngFor="let scope of scopeOptions">
-                                <input type="checkbox"
-                                       [(ngModel)]="editingScopes[scope.value]" />
-                                <span>{{scope.label}}</span>
-                            </label>
-                        </div>
-
-                        <div class="actions">
-                            <button class="btn btn-secondary btn-sm cancel-edit-key-btn"
-                                    type="button"
-                                    (click)="cancelEdit()">
-                                Cancel
-                            </button>
-                            <button class="btn btn-primary btn-sm save-key-btn"
-                                    type="button"
-                                    (click)="saveApiKey(key)">
-                                Save changes
-                            </button>
+                        <div class="key-details" *ngIf="isDetailsVisible(key)">
+                            <div class="details-line">
+                                <span class="scope-chip" *ngFor="let scope of key.scopes">{{scope}}</span>
+                                <span class="scope-chip muted" *ngIf="key.scopes.length === 0">No scopes</span>
+                                <span class="meta-chip"><span class="meta-label">C</span><span class="meta-value">{{formatTimestamp(key.created_at)}}</span></span>
+                                <span class="meta-chip"><span class="meta-label">U</span><span class="meta-value">{{formatTimestamp(key.updated_at)}}</span></span>
+                                <span class="meta-chip" *ngIf="key.revoked_at"><span class="meta-label">R</span><span class="meta-value">{{formatTimestamp(key.revoked_at)}}</span></span>
+                                <span class="revoked-note" *ngIf="!key.active">Locked</span>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -239,9 +207,10 @@
         </ng-template>
     </ng-container>
 
-    <ng-template #loadingKeys>
+    <ng-template #loadingState>
         <div class="loading-state">
-            Loading API keys...
+            Loading API access state...
         </div>
     </ng-template>
+
 </div>

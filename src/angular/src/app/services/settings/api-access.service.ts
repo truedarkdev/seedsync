@@ -18,23 +18,6 @@ export interface ApiKeyRecord {
     active: boolean;
 }
 
-export interface LegacyApiTokenState {
-    configured: boolean;
-    compatibility_enabled: boolean;
-    state: "enabled" | "disabled" | "cleared";
-    accepted_for_external_non_admin: boolean;
-}
-
-export interface ApiAccessMigrationState {
-    legacy_api_token: LegacyApiTokenState;
-    api_keys: {
-        total: number;
-        active: number;
-        active_admin: number;
-        revoked: number;
-    };
-}
-
 interface ApiKeyListResponse {
     keys: ApiKeyRecord[];
 }
@@ -46,13 +29,9 @@ interface ApiKeyActionResponse {
 
 @Injectable()
 export class ApiAccessService extends BaseWebService {
-    private readonly MIGRATION_STATE_URL = "/server/admin/migration/v1";
     private readonly FIRST_API_KEY_BOOTSTRAP_URL = "/server/admin/bootstrap/v1/first-api-key";
-    private readonly LEGACY_TOKEN_DISABLE_URL = "/server/admin/migration/v1/legacy-api-token/disable";
-    private readonly LEGACY_TOKEN_CLEAR_URL = "/server/admin/migration/v1/legacy-api-token/clear";
     private readonly API_KEYS_URL = "/server/admin/api-keys/v1";
 
-    private _migrationState = new BehaviorSubject<ApiAccessMigrationState>(null);
     private _apiKeys = new BehaviorSubject<ApiKeyRecord[]>(null);
     private _includeRevokedApiKeys = false;
 
@@ -62,16 +41,12 @@ export class ApiAccessService extends BaseWebService {
         super(_streamServiceRegistry);
     }
 
-    get migrationState(): Observable<ApiAccessMigrationState> {
-        return this._migrationState.asObservable();
-    }
-
     get apiKeys(): Observable<ApiKeyRecord[]> {
         return this._apiKeys.asObservable();
     }
 
     public refresh() {
-        this.loadMigrationState(false, true);
+        this.loadApiKeys();
     }
 
     public setIncludeRevokedApiKeys(includeRevokedApiKeys: boolean) {
@@ -90,17 +65,6 @@ export class ApiAccessService extends BaseWebService {
                     return response.keys;
                 }
                 throw new Error("Failed to load API keys");
-            })
-        );
-    }
-
-    public getMigrationState(): Observable<ApiAccessMigrationState> {
-        return this._http.get<ApiAccessMigrationState>(this.MIGRATION_STATE_URL).pipe(
-            map(response => {
-                if (response && response.legacy_api_token && response.api_keys) {
-                    return response;
-                }
-                throw new Error("Failed to load API access migration state");
             })
         );
     }
@@ -180,51 +144,12 @@ export class ApiAccessService extends BaseWebService {
         );
     }
 
-    public disableLegacyApiToken(): Observable<ApiAccessMigrationState> {
-        return this._http.post<ApiAccessMigrationState>(this.LEGACY_TOKEN_DISABLE_URL, null).pipe(
-            tap(response => this._migrationState.next(response)),
-            tap(() => this.loadMigrationState(true, true))
-        );
-    }
-
-    public clearLegacyApiToken(): Observable<ApiAccessMigrationState> {
-        return this._http.post<ApiAccessMigrationState>(this.LEGACY_TOKEN_CLEAR_URL, null).pipe(
-            tap(response => this._migrationState.next(response)),
-            tap(() => this.loadMigrationState(true, true))
-        );
-    }
-
     protected onConnected() {
         this.refresh();
     }
 
     protected onDisconnected() {
-        this._migrationState.next(null);
         this._apiKeys.next(null);
-    }
-
-    private loadMigrationState(preserveCurrentOnError: boolean = false, loadApiKeysWhenLoaded: boolean = false) {
-        this.getMigrationState().subscribe({
-            next: migrationState => {
-                this._migrationState.next(migrationState);
-                if (loadApiKeysWhenLoaded) {
-                    if (migrationState.api_keys && migrationState.api_keys.active_admin > 0) {
-                        this.loadApiKeys();
-                    } else {
-                        this._apiKeys.next([]);
-                    }
-                }
-            },
-            error: error => {
-                this._logger.error(error);
-                if (!preserveCurrentOnError) {
-                    this._migrationState.next(null);
-                    if (loadApiKeysWhenLoaded) {
-                        this._apiKeys.next(null);
-                    }
-                }
-            }
-        });
     }
 
     private loadApiKeys() {

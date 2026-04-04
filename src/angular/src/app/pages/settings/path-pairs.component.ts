@@ -34,6 +34,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
     public formAutoQueue = true;
 
     private _destroy$ = new Subject<void>();
+    private _expandedPairIds = new Set<string>();
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private _pathPairService: PathPairService,
@@ -167,6 +168,19 @@ export class PathPairsComponent implements OnInit, OnDestroy {
             next: result => this.showWarnings(result.warnings),
             error: error => this.showError("Failed to toggle: " + error.message)
         });
+    }
+
+    toggleDetails(pair: PathPair) {
+        if (this._expandedPairIds.has(pair.id)) {
+            this._expandedPairIds.delete(pair.id);
+            return;
+        }
+
+        this._expandedPairIds.add(pair.id);
+    }
+
+    isDetailsVisible(pair: PathPair): boolean {
+        return this._expandedPairIds.has(pair.id);
     }
 
     moveUp(index: number) {

@@ -36,18 +36,28 @@
 
 
 <div id="settings">
-    <div id="path-pairs-section">
-        <app-path-pairs></app-path-pairs>
-    </div>
-
-    <app-api-access></app-api-access>
-
     <div id="accordion">
         <div id="left">
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_SERVER">
             </ng-container>
+
+            <div class="card custom-section-card">
+                <h3 class="card-header" id="heading-api-access">
+                    <button class="btn"
+                            type="button"
+                            data-toggle="collapse"
+                            attr.data-target="#collapse-api-access">
+                        API Access
+                    </button>
+                </h3>
+                <div id="collapse-api-access" class="collapse" data-parent="#accordion">
+                    <div class="card-body">
+                        <app-api-access></app-api-access>
+                    </div>
+                </div>
+            </div>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
@@ -60,6 +70,34 @@
             </ng-container>
         </div>
         <div id="right">
+            <div class="card custom-section-card">
+                <h3 class="card-header" id="heading-path-pairs">
+                    <button class="btn"
+                            type="button"
+                            data-toggle="collapse"
+                            attr.data-target="#collapse-path-pairs">
+                        Path Pairs
+                    </button>
+                </h3>
+                <div id="collapse-path-pairs" class="collapse" data-parent="#accordion">
+                    <div class="card-body">
+                        <div class="path-pairs-header">
+                            <p class="custom-section-intro">
+                                Configure remote and local directory pairs for downloads. Existing SeedSync single-path
+                                settings migrate into this list automatically.
+                            </p>
+                            <button class="btn btn-primary path-pairs-add-btn"
+                                    type="button"
+                                    [disabled]="pathPairsComponent?.isCreating || pathPairsComponent?.isEditing"
+                                    (click)="pathPairsComponent?.startCreate()">
+                                Add Path Pair
+                            </button>
+                        </div>
+                        <app-path-pairs #pathPairsComponent></app-path-pairs>
+                    </div>
+                </div>
+            </div>
+
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_CONNECTIONS">
