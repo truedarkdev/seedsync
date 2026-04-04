@@ -15,10 +15,11 @@ import {ViewFileFilterService} from "../../services/files/view-file-filter.servi
 
 export class FilesPageComponent implements OnInit, OnDestroy {
     public showOverview = false;
-    public showDetailView = true;
+    public showDetailView = false;
 
     private readonly _destroy$ = new Subject<void>();
     private _pathPairs: PathPair[] = [];
+    private _pathPairsLoaded = false;
     private _pathPairId: string = null;
 
     constructor(private _route: ActivatedRoute,
@@ -36,7 +37,10 @@ export class FilesPageComponent implements OnInit, OnDestroy {
 
         this._pathPairService.pathPairs.pipe(takeUntil(this._destroy$)).subscribe({
             next: (pathPairs: PathPair[]) => {
-                this._pathPairs = pathPairs || [];
+                this._pathPairs = pathPairs;
+                if ((this._pathPairs || []).length > 0) {
+                    this._pathPairsLoaded = true;
+                }
                 this._updateRouteMode();
             }
         });
@@ -51,7 +55,14 @@ export class FilesPageComponent implements OnInit, OnDestroy {
     }
 
     private _updateRouteMode(): void {
-        const enabledPathPairs = this._pathPairs.filter(pair => pair.enabled);
+        if (!this._pathPairsLoaded) {
+            this.showOverview = false;
+            this.showDetailView = false;
+            this._viewFileFilterService.setPathPairFilter(null);
+            return;
+        }
+
+        const enabledPathPairs = (this._pathPairs || []).filter(pair => pair.enabled);
         const selectedPathPair = this._resolveSelectedPathPair(enabledPathPairs);
         const hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
 
