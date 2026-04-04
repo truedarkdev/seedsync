@@ -111,3 +111,15 @@ class TestControllerPersist(unittest.TestCase):
         content = "{"
         with self.assertRaises(PersistError):
             ControllerPersist.from_str(content)
+
+    def test_from_str_rejects_malformed_shapes(self):
+        with self.assertRaises(PersistError):
+            ControllerPersist.from_str("""
+            {
+                "downloaded": null,
+                "extracted": []
+            }
+            """)
+
+        with self.assertRaises(PersistError):
+            ControllerPersist.from_str("[]")

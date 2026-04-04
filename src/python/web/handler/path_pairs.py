@@ -90,7 +90,13 @@ class PathPairsHandler(IHandler):
             )
             warnings = self.__path_pair_manager.add_pair(pair)
             if self.__controller is not None and pair.enabled:
-                self.__controller.refresh_path_pairs()
+                try:
+                    self.__controller.refresh_path_pairs(wait=True)
+                except Exception as exc:
+                    return self.__json_response(
+                        {"success": False, "error": "Failed to apply path pair changes: {}".format(exc)},
+                        status=500
+                    )
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
@@ -119,7 +125,13 @@ class PathPairsHandler(IHandler):
             )
             warnings = self.__path_pair_manager.update_pair(pair)
             if self.__controller is not None and self.__update_affects_runtime(existing, pair):
-                self.__controller.refresh_path_pairs()
+                try:
+                    self.__controller.refresh_path_pairs(wait=True)
+                except Exception as exc:
+                    return self.__json_response(
+                        {"success": False, "error": "Failed to apply path pair changes: {}".format(exc)},
+                        status=500
+                    )
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
@@ -133,7 +145,13 @@ class PathPairsHandler(IHandler):
             existing = self.__path_pair_manager.get_pair_by_id(pair_id)
             self.__path_pair_manager.remove_pair(pair_id)
             if self.__controller is not None and existing is not None and existing.enabled:
-                self.__controller.refresh_path_pairs()
+                try:
+                    self.__controller.refresh_path_pairs(wait=True)
+                except Exception as exc:
+                    return self.__json_response(
+                        {"success": False, "error": "Failed to apply path pair changes: {}".format(exc)},
+                        status=500
+                    )
             return self.__json_response({"success": True, "data": {"deleted": pair_id}})
         except PathPairError as exc:
             return self.__json_response({"success": False, "error": str(exc)}, status=404)

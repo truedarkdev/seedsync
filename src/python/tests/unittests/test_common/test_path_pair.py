@@ -58,6 +58,16 @@ class TestPathPairManager(unittest.TestCase):
         with self.assertRaises(PathPairError):
             self.manager.reorder_pairs([first.id])
 
+    def test_load_backs_up_and_recovers_from_malformed_file(self):
+        with open(self.manager.file_path, "w", encoding="utf-8") as handle:
+            handle.write("{\"path_pairs\": [null]}")
+
+        recovered = PathPairManager(self.temp_dir)
+        recovered.load()
+
+        self.assertEqual([], recovered.get_all_pairs())
+        self.assertTrue(os.path.isfile(self.manager.file_path + ".1.bak"))
+
     def test_validate_rejects_non_string_paths(self):
         with self.assertRaises(PathPairError):
             PathPair(name="Invalid", remote_path=123, local_path="/local").validate()
