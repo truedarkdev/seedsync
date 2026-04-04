@@ -1,4 +1,4 @@
-import {Component, OnDestroy, OnInit} from "@angular/core";
+import {ChangeDetectorRef, Component, NgZone, OnDestroy, OnInit} from "@angular/core";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
@@ -39,6 +39,8 @@ export class SidebarComponent implements OnInit, OnDestroy {
     constructor(private _logger: LoggerService,
                 _streamServiceRegistry: StreamServiceRegistry,
                 private _pathPairService: PathPairService,
+                private _changeDetector: ChangeDetectorRef,
+                private _zone: NgZone,
                 private _commandService: ServerCommandService,
                 private _notificationService: NotificationService) {
         this._connectedService = _streamServiceRegistry.connectedService;
@@ -57,13 +59,16 @@ export class SidebarComponent implements OnInit, OnDestroy {
             .pipe(takeUntil(this._destroy$))
             .subscribe({
                 next: (pathPairs: PathPair[]) => {
-                    const enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);
-                    this.hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
-                    this.pathPairRoutes = enabledPathPairs.map(pair => ({
-                        path: `dashboard/${encodeURIComponent(getPathPairRouteSegment(pair, enabledPathPairs))}`,
-                        name: pair.name,
-                        icon: "assets/icons/directory.svg"
-                    }));
+                    this._zone.run(() => {
+                        const enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);
+                        this.hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
+                        this.pathPairRoutes = enabledPathPairs.map(pair => ({
+                            path: `dashboard/${encodeURIComponent(getPathPairRouteSegment(pair, enabledPathPairs))}`,
+                            name: pair.name,
+                            icon: "assets/icons/directory.svg"
+                        }));
+                        this._changeDetector.markForCheck();
+                    });
                 }
             });
     }
