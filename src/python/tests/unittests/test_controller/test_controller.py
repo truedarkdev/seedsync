@@ -27,6 +27,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__pending_auto_purge_file_ids = set()
         self.controller._Controller__context = MagicMock()
         self.controller._Controller__context.status.controller = MagicMock()
+        self.controller._Controller__context.status.server = SimpleNamespace(up=True, error_msg=None)
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__password = None
         self.controller._Controller__persist = MagicMock()
@@ -39,11 +40,16 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_lock = MagicMock()
         self.controller._Controller__path_pair_refresh_lock = Lock()
         self.controller._Controller__path_pair_refresh_requested = False
+        self.controller._Controller__path_pair_refresh_generation = 0
+        self.controller._Controller__path_pair_refresh_completed_generation = 0
+        self.controller._Controller__path_pair_runtime_error = None
         self.controller._Controller__lftp = MagicMock()
         self.controller._Controller__active_scan_process = MagicMock()
         self.controller._Controller__local_scan_process = MagicMock()
         self.controller._Controller__remote_scan_process = MagicMock()
         self.controller._Controller__active_scanner = MagicMock()
+        self.controller._Controller__local_scanner = MagicMock()
+        self.controller._Controller__remote_scanner = MagicMock()
         self.controller._Controller__extract_process = MagicMock()
         self.controller._Controller__validate_process = MagicMock()
         self.controller._Controller__mp_logger = MagicMock()
@@ -324,6 +330,60 @@ class TestController(unittest.TestCase):
         self.controller.refresh_path_pairs()
 
         self.assertTrue(self.controller._Controller__path_pair_refresh_requested)
+
+    def test_process_keeps_running_after_path_pair_refresh_failure(self):
+        self.controller._Controller__started = True
+        self.controller.refresh_path_pairs()
+        self.controller._Controller__refresh_path_pair_runtime_state = MagicMock(side_effect=RuntimeError("activation failed"))
+        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        self.controller.process()
+
+        self.assertFalse(self.controller._Controller__context.status.server.up)
+        self.assertIn("activation failed", self.controller._Controller__context.status.server.error_msg)
+        self.assertEqual(1, self.controller._Controller__path_pair_refresh_completed_generation)
+        self.controller._Controller__update_model.assert_called_once()
+        self.controller._Controller__log_memory_usage.assert_called_once()
+
+    def test_process_marks_refresh_completed_for_consumed_generation_only(self):
+        self.controller._Controller__started = True
+        self.controller.refresh_path_pairs()
+
+        def bump_generation():
+            self.controller.refresh_path_pairs()
+
+        self.controller._Controller__apply_path_pair_refresh = MagicMock(side_effect=bump_generation)
+        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        self.controller.process()
+
+        self.assertEqual(2, self.controller._Controller__path_pair_refresh_generation)
+        self.assertEqual(1, self.controller._Controller__path_pair_refresh_completed_generation)
+        self.assertTrue(self.controller._Controller__path_pair_refresh_requested)
+
+    def test_refresh_path_pairs_clears_runtime_error_after_recovery(self):
+        self.controller._Controller__started = True
+        self.controller.refresh_path_pairs()
+        self.controller._Controller__refresh_path_pair_runtime_state = MagicMock(side_effect=[
+            RuntimeError("activation failed"),
+            None,
+        ])
+        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        self.controller.process()
+
+        self.assertFalse(self.controller._Controller__context.status.server.up)
+        self.assertIn("activation failed", self.controller._Controller__context.status.server.error_msg)
+
+        self.controller.refresh_path_pairs()
+        self.controller.process()
+
+        self.assertTrue(self.controller._Controller__context.status.server.up)
+        self.assertIsNone(self.controller._Controller__context.status.server.error_msg)
+        self.assertIsNone(self.controller._Controller__path_pair_runtime_error)
 
     def test_process_applies_pending_path_pair_refresh_before_model_update(self):
         call_order = []

@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import List, Optional
@@ -161,10 +162,26 @@ class PathPairManager:
         try:
             with open(self._file_path, "r", encoding="utf-8") as handle:
                 self._collection = self.from_str(handle.read())
-        except (OSError, ValueError) as exc:
-            raise PersistError("Failed to load path pairs: {}".format(exc)) from exc
+        except (OSError, ValueError, PersistError):
+            self.__backup_file()
+            self._collection = PathPairCollection()
+            return self._collection
 
         return self._collection
+
+    def __backup_file(self):
+        file_name = os.path.basename(self._file_path)
+        file_dir = os.path.dirname(self._file_path)
+        i = 1
+        while True:
+            backup_path = os.path.join(file_dir, "{}.{}.bak".format(file_name, i))
+            if not os.path.exists(backup_path):
+                break
+            i += 1
+        try:
+            shutil.copy(self._file_path, backup_path)
+        except OSError:
+            pass
 
     def save(self):
         if self._collection is None:
@@ -207,12 +224,19 @@ class PathPairManager:
     def from_str(self, content: str) -> PathPairCollection:
         try:
             data = json.loads(content)
-        except ValueError as exc:
-            raise PersistError("Invalid JSON: {}".format(exc)) from exc
+            if not isinstance(data, dict):
+                raise TypeError("top-level path pair data must be a JSON object")
 
-        path_pairs = []
-        for pair_data in data.get("path_pairs", []):
-            try:
+            raw_path_pairs = data.get("path_pairs", [])
+            if raw_path_pairs is None:
+                raw_path_pairs = []
+            if not isinstance(raw_path_pairs, list):
+                raise TypeError("path_pairs must be a list")
+
+            path_pairs = []
+            for pair_data in raw_path_pairs:
+                if not isinstance(pair_data, dict):
+                    raise TypeError("path pair entries must be JSON objects")
                 path_pairs.append(
                     PathPair(
                         id=pair_data.get("id", str(uuid.uuid4())),
@@ -223,13 +247,17 @@ class PathPairManager:
                         auto_queue=pair_data.get("auto_queue", True),
                     )
                 )
-            except KeyError as exc:
-                raise PersistError("Missing required field in path pair: {}".format(exc)) from exc
 
-        return PathPairCollection(
-            path_pairs=path_pairs,
-            version=data.get("version", 1),
-        )
+            version = data.get("version", 1)
+            if not isinstance(version, int):
+                raise TypeError("version must be an integer")
+
+            return PathPairCollection(
+                path_pairs=path_pairs,
+                version=version,
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise PersistError("Invalid path pairs JSON: {}".format(exc)) from exc
 
     def to_str(self) -> str:
         if self._collection is None:

@@ -30,8 +30,8 @@ class ControllerPersist(Persist):
             persist.extracted_file_names = set(dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES])
             persist.stopped_file_names = set(dct.get(ControllerPersist.__KEY_STOPPED_FILE_NAMES, []))
             return persist
-        except (json.decoder.JSONDecodeError, KeyError) as e:
-            raise PersistError("Error parsing AutoQueuePersist - {}: {}".format(
+        except (ValueError, TypeError, KeyError) as e:
+            raise PersistError("Error parsing ControllerPersist - {}: {}".format(
                 type(e).__name__, str(e))
             )
 

@@ -279,6 +279,17 @@ class TestAutoQueuePersist(unittest.TestCase):
         with self.assertRaises(PersistError):
             AutoQueuePersist.from_str(content)
 
+    def test_from_str_rejects_malformed_shapes(self):
+        with self.assertRaises(PersistError):
+            AutoQueuePersist.from_str("""
+            {
+                "patterns": null
+            }
+            """)
+
+        with self.assertRaises(PersistError):
+            AutoQueuePersist.from_str("[]")
+
 
 class TestAutoQueue(unittest.TestCase):
     def setUp(self):

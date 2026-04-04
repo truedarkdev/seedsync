@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import copy
 import json
 import os
+import time
 import shutil
 
 # my libs
@@ -142,6 +143,9 @@ class Controller:
         self.__model_lock = Lock()
         self.__path_pair_refresh_lock = Lock()
         self.__path_pair_refresh_requested = False
+        self.__path_pair_refresh_generation = 0
+        self.__path_pair_refresh_completed_generation = 0
+        self.__path_pair_runtime_error = None
 
         # Model builder
         self.__model_builder = ModelBuilder()
@@ -176,7 +180,17 @@ class Controller:
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
         self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
 
-        self.__refresh_path_pair_runtime_state()
+        try:
+            self.__refresh_path_pair_runtime_state()
+        except Exception as exc:
+            self.__record_path_pair_runtime_error(
+                "Path pair runtime activation failed: {}".format(exc)
+            )
+            self.logger.exception(
+                "Path pair runtime activation failed during controller initialization; "
+                "continuing without enabled path pairs"
+            )
+            self.__refresh_path_pair_runtime_state([])
 
         # Setup extract process
         if self.__context.config.controller.use_local_path_as_extract_path:
@@ -232,67 +246,110 @@ class Controller:
             return []
         return self.__context.path_pair_manager.get_enabled_pairs()
 
-    def __refresh_path_pair_runtime_state(self):
-        enabled_path_pairs = self.__get_enabled_path_pairs()
-        self.__path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
-        self.__path_pair_staging_paths = {
+    def __refresh_path_pair_runtime_state(self, enabled_path_pairs: List[PathPair] = None):
+        if enabled_path_pairs is None:
+            enabled_path_pairs = self.__get_enabled_path_pairs()
+
+        path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
+        path_pair_staging_paths = {
             pair.id: self.__build_staging_path(pair.local_path)
             for pair in enabled_path_pairs
         }
-        self.__lftp.set_path_pairs([
+        lftp_path_pairs = [
             PathPair(
                 remote_path=pair.remote_path,
-                local_path=self.__path_pair_staging_paths[pair.id],
+                local_path=path_pair_staging_paths[pair.id],
                 name=pair.name,
                 id=pair.id,
                 enabled=pair.enabled,
                 auto_queue=pair.auto_queue
             )
             for pair in enabled_path_pairs
-        ])
-        self.__refresh_model_builder_local_paths()
-        self.__active_scanner = self.__build_active_scanner(enabled_path_pairs)
-        self.__local_scanner = self.__build_local_scanner(enabled_path_pairs)
-        self.__remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
-        self.__active_scan_process = ScannerProcess(
-            scanner=self.__active_scanner,
+        ]
+        active_scanner = self.__build_active_scanner(enabled_path_pairs, path_pair_staging_paths)
+        local_scanner = self.__build_local_scanner(enabled_path_pairs, path_pair_staging_paths)
+        remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
+        active_scan_process = ScannerProcess(
+            scanner=active_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_downloading_scan,
             verbose=False
         )
-        self.__local_scan_process = ScannerProcess(
-            scanner=self.__local_scanner,
+        local_scan_process = ScannerProcess(
+            scanner=local_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_local_scan,
         )
-        self.__remote_scan_process = ScannerProcess(
-            scanner=self.__remote_scanner,
+        remote_scan_process = ScannerProcess(
+            scanner=remote_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_remote_scan,
         )
 
-    def __refresh_model_builder_local_paths(self):
+        self.__lftp.set_path_pairs(lftp_path_pairs)
+        self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
+        self.__path_pairs_by_id = path_pairs_by_id
+        self.__path_pair_staging_paths = path_pair_staging_paths
+        self.__active_scanner = active_scanner
+        self.__local_scanner = local_scanner
+        self.__remote_scanner = remote_scanner
+        self.__active_scan_process = active_scan_process
+        self.__local_scan_process = local_scan_process
+        self.__remote_scan_process = remote_scan_process
+
+    def __build_lftp_path_pairs(self, path_pairs_by_id, path_pair_staging_paths):
+        return [
+            PathPair(
+                remote_path=pair.remote_path,
+                local_path=path_pair_staging_paths[pair.id],
+                name=pair.name,
+                id=pair.id,
+                enabled=pair.enabled,
+                auto_queue=pair.auto_queue
+            )
+            for pair in path_pairs_by_id.values()
+        ]
+
+    def __refresh_model_builder_local_paths(self, path_pairs_by_id=None, path_pair_staging_paths=None):
+        if path_pairs_by_id is None:
+            path_pairs_by_id = self.__path_pairs_by_id
+        if path_pair_staging_paths is None:
+            path_pair_staging_paths = self.__path_pair_staging_paths
+
         local_root_paths = {None: self.__context.config.lftp.local_path}
         local_staging_paths = {None: self.__staging_path}
-        for pair_id, pair in self.__path_pairs_by_id.items():
+        for pair_id, pair in path_pairs_by_id.items():
             local_root_paths[pair_id] = pair.local_path
-            local_staging_paths[pair_id] = self.__path_pair_staging_paths.get(pair_id)
+            local_staging_paths[pair_id] = path_pair_staging_paths.get(pair_id)
         self.__model_builder.set_local_root_paths(local_root_paths, local_staging_paths)
 
-    def __build_active_scanner(self, enabled_path_pairs: List[PathPair]):
+    def __record_path_pair_runtime_error(self, error_msg: str):
+        self.__path_pair_runtime_error = error_msg
+        self.__context.status.server.up = False
+        self.__context.status.server.error_msg = error_msg
+
+    def __clear_path_pair_runtime_error(self):
+        if self.__path_pair_runtime_error is None:
+            return
+        if self.__context.status.server.error_msg == self.__path_pair_runtime_error:
+            self.__context.status.server.up = True
+            self.__context.status.server.error_msg = None
+        self.__path_pair_runtime_error = None
+
+    def __build_active_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
         if enabled_path_pairs:
             return MultiPathActiveScanner({
-                pair.id: self.__path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
+                pair.id: path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
             }, use_temp_file=self.__context.config.lftp.use_temp_file)
         return ActiveScanner(
             self.__staging_path,
             use_temp_file=self.__context.config.lftp.use_temp_file
         )
 
-    def __build_local_scanner(self, enabled_path_pairs: List[PathPair]):
+    def __build_local_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
         if enabled_path_pairs:
             return MultiPathLocalScanner([
                 LocalScanner(
                     local_path=pair.local_path,
                     use_temp_file=self.__context.config.lftp.use_temp_file,
-                    staging_path=self.__path_pair_staging_paths[pair.id],
+                    staging_path=path_pair_staging_paths[pair.id],
                     managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
@@ -330,18 +387,72 @@ class Controller:
             remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
         )
 
-    def refresh_path_pairs(self):
+    def __mark_path_pair_refresh_completed(self, generation: int = None):
+        if generation is None:
+            generation = self.__path_pair_refresh_generation
+        with self.__path_pair_refresh_lock:
+            self.__path_pair_refresh_completed_generation = max(
+                self.__path_pair_refresh_completed_generation,
+                generation
+            )
+
+    def refresh_path_pairs(self, wait: bool = False, timeout_secs: float = None):
         if not self.__started:
             self.__apply_path_pair_refresh()
+            self.__mark_path_pair_refresh_completed(self.__path_pair_refresh_generation)
+            if self.__path_pair_runtime_error is not None:
+                raise ControllerError(self.__path_pair_runtime_error)
             return
         with self.__path_pair_refresh_lock:
             self.__path_pair_refresh_requested = True
+            self.__path_pair_refresh_generation += 1
+            requested_generation = self.__path_pair_refresh_generation
 
-    def __consume_path_pair_refresh_request(self) -> bool:
+        if not wait:
+            return
+
+        if timeout_secs is None:
+            timeout_secs = Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        deadline = time.monotonic() + timeout_secs
+        while time.monotonic() < deadline:
+            with self.__path_pair_refresh_lock:
+                if self.__path_pair_refresh_completed_generation >= requested_generation:
+                    break
+            time.sleep(Constants.MAIN_THREAD_SLEEP_INTERVAL_IN_SECS)
+        else:
+            raise ControllerError("Timed out waiting for path pair refresh")
+
+        if self.__path_pair_runtime_error is not None:
+            raise ControllerError(self.__path_pair_runtime_error)
+
+    def __consume_path_pair_refresh_request(self):
         with self.__path_pair_refresh_lock:
-            refresh_requested = self.__path_pair_refresh_requested
+            if not self.__path_pair_refresh_requested:
+                return None
             self.__path_pair_refresh_requested = False
-        return refresh_requested
+            return self.__path_pair_refresh_generation
+
+    def __restore_path_pair_runtime_state(
+            self,
+            path_pairs_by_id,
+            path_pair_staging_paths,
+            active_scanner,
+            local_scanner,
+            remote_scanner,
+            active_scan_process,
+            local_scan_process,
+            remote_scan_process):
+        self.__lftp.set_path_pairs(self.__build_lftp_path_pairs(path_pairs_by_id, path_pair_staging_paths))
+        self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
+        self.__validate_process.set_path_pairs_by_id(path_pairs_by_id)
+        self.__path_pairs_by_id = path_pairs_by_id
+        self.__path_pair_staging_paths = path_pair_staging_paths
+        self.__active_scanner = active_scanner
+        self.__local_scanner = local_scanner
+        self.__remote_scanner = remote_scanner
+        self.__active_scan_process = active_scan_process
+        self.__local_scan_process = local_scan_process
+        self.__remote_scan_process = remote_scan_process
 
     def __apply_path_pair_refresh(self):
         active_files = list(
@@ -349,31 +460,62 @@ class Controller:
             getattr(self, "_Controller__active_extracting_file_names", [])
         )
         was_started = self.__started
-        if was_started:
-            self.__active_scan_process.terminate()
-            self.__local_scan_process.terminate()
-            self.__remote_scan_process.terminate()
-            self.__active_scan_process.join()
-            self.__local_scan_process.join()
-            self.__remote_scan_process.join()
+        old_active_scan_process = self.__active_scan_process
+        old_local_scan_process = self.__local_scan_process
+        old_remote_scan_process = self.__remote_scan_process
+        old_path_pairs_by_id = self.__path_pairs_by_id
+        old_path_pair_staging_paths = self.__path_pair_staging_paths
+        old_active_scanner = self.__active_scanner
+        old_local_scanner = self.__local_scanner
+        old_remote_scanner = self.__remote_scanner
+        new_state_applied = False
 
-        self.__refresh_path_pair_runtime_state()
-        self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__validate_process.set_path_pairs_by_id(self.__path_pairs_by_id)
+        def stop_process_if_alive(process):
+            if process is not None and process.is_alive():
+                process.terminate()
+                process.join()
 
-        if was_started:
-            for staging_path in self.__path_pair_staging_paths.values():
-                os.makedirs(staging_path, exist_ok=True)
-            self.__active_scan_process.start()
-            self.__local_scan_process.start()
-            self.__remote_scan_process.start()
-            self.__set_active_scanner_files(active_files)
-            self.__active_scan_process.force_scan()
-            self.__local_scan_process.force_scan()
-            self.__remote_scan_process.force_scan()
-            self.__next_lftp_status_poll_at = None
+        try:
+            self.__refresh_path_pair_runtime_state()
+            new_state_applied = True
+            if was_started:
+                self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
+                self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
+                self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
+                self.__validate_process.set_path_pairs_by_id(self.__path_pairs_by_id)
+
+            if was_started:
+                for staging_path in self.__path_pair_staging_paths.values():
+                    os.makedirs(staging_path, exist_ok=True)
+                self.__active_scan_process.start()
+                self.__local_scan_process.start()
+                self.__remote_scan_process.start()
+                self.__set_active_scanner_files(active_files)
+                self.__active_scan_process.force_scan()
+                self.__local_scan_process.force_scan()
+                self.__remote_scan_process.force_scan()
+                self.__next_lftp_status_poll_at = None
+                stop_process_if_alive(old_active_scan_process)
+                stop_process_if_alive(old_local_scan_process)
+                stop_process_if_alive(old_remote_scan_process)
+            self.__clear_path_pair_runtime_error()
+        except Exception as exc:
+            if new_state_applied:
+                stop_process_if_alive(self.__active_scan_process)
+                stop_process_if_alive(self.__local_scan_process)
+                stop_process_if_alive(self.__remote_scan_process)
+                self.__restore_path_pair_runtime_state(
+                    old_path_pairs_by_id,
+                    old_path_pair_staging_paths,
+                    old_active_scanner,
+                    old_local_scanner,
+                    old_remote_scanner,
+                    old_active_scan_process,
+                    old_local_scan_process,
+                    old_remote_scan_process
+                )
+            self.logger.exception("Path pair runtime activation failed")
+            self.__record_path_pair_runtime_error("Path pair runtime activation failed: {}".format(exc))
 
     def start(self):
         """
@@ -404,8 +546,14 @@ class Controller:
         self.__propagate_exceptions()
         self.__cleanup_commands()
         self.__process_commands()
-        if self.__consume_path_pair_refresh_request():
-            self.__apply_path_pair_refresh()
+        refresh_generation = self.__consume_path_pair_refresh_request()
+        if refresh_generation is not None:
+            try:
+                self.__apply_path_pair_refresh()
+            except Exception:
+                self.logger.exception("Ignoring path pair refresh failure")
+            finally:
+                self.__mark_path_pair_refresh_completed(refresh_generation)
         self.__update_model()
         self.__log_memory_usage()
 

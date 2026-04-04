@@ -103,7 +103,7 @@ class AutoQueuePersist(Persist):
             for pattern in pattern_list:
                 persist.add_pattern(AutoQueuePattern.from_str(pattern))
             return persist
-        except (json.decoder.JSONDecodeError, KeyError) as e:
+        except (ValueError, TypeError, KeyError) as e:
             raise PersistError("Error parsing AutoQueuePersist - {}: {}".format(
                 type(e).__name__, str(e))
             )
