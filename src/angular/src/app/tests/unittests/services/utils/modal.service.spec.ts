@@ -1,6 +1,7 @@
 import {fakeAsync, flushMicrotasks, TestBed} from "@angular/core/testing";
 
 import {DialogRef, Modal} from "../../../../services/utils/modal.service";
+import {Localization} from "../../../../common/localization";
 
 
 describe("Testing modal service", () => {
@@ -51,5 +52,32 @@ describe("Testing modal service", () => {
         flushMicrotasks();
 
         expect(document.body.querySelector(".modal-overlay")).toBeNull();
+    }));
+
+    it("should render formatted body markup while escaping dynamic names", fakeAsync(() => {
+        modal.confirm()
+            .title("Delete Files")
+            .body(Localization.Modal.DELETE_LOCAL_BULK_MESSAGE([
+                "Alpha <unsafe>",
+                "Beta",
+                "Gamma",
+                "Delta",
+                "Epsilon",
+                "Zeta"
+            ]))
+            .okBtn("Delete")
+            .cancelBtn("Cancel")
+            .open();
+
+        flushMicrotasks();
+
+        const body = document.body.querySelector(".modal-body") as HTMLElement;
+
+        expect(body).not.toBeNull();
+        expect(body.querySelectorAll("ul").length).toBe(1);
+        expect(body.querySelectorAll("li").length).toBe(5);
+        expect(body.querySelectorAll("br").length).toBe(1);
+        expect(body.innerHTML).toContain("<b>Alpha &lt;unsafe&gt;</b>");
+        expect(body.innerHTML).toContain("And 1 more file(s).");
     }));
 });

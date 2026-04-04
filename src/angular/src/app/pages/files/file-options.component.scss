@@ -256,6 +256,10 @@
     #sort-status {
         @extend %dropdown;
 
+        .dropdown-menu {
+            width: max-content;
+        }
+
         // Applies to both button and menu images
         .icon {
         }

@@ -12,6 +12,8 @@ export interface DialogRef<T = void> {
 }
 
 class ConfirmDialogBuilder {
+  private static readonly _allowedBodyTags = new Set(["b", "strong", "br", "ul", "ol", "li"]);
+
   private _title = "";
   private _body = "";
   private _okLabel = "OK";
@@ -206,10 +208,11 @@ class ConfirmDialogBuilder {
       return null;
     }
 
-    const bodyElement = document.createElement("p");
-    bodyElement.textContent = this._body;
+    const bodyElement = document.createElement("div");
+    bodyElement.className = "modal-body";
     bodyElement.style.margin = "0 0 1rem 0";
     bodyElement.style.whiteSpace = "pre-wrap";
+    this._appendSafeBodyContent(bodyElement, this._body);
     return bodyElement;
   }
 
@@ -244,6 +247,38 @@ class ConfirmDialogBuilder {
       right: "0.75rem"
     });
     return button;
+  }
+
+  private _appendSafeBodyContent(target: HTMLElement, body: string): void {
+    const template = document.createElement("template");
+    template.innerHTML = body;
+
+    Array.from(template.content.childNodes).forEach(node => {
+      target.appendChild(this._sanitizeBodyNode(node));
+    });
+  }
+
+  private _sanitizeBodyNode(node: Node): Node {
+    if (node.nodeType === Node.TEXT_NODE) {
+      return document.createTextNode(node.textContent || "");
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) {
+      return document.createTextNode(node.textContent || "");
+    }
+
+    const element = node as HTMLElement;
+    const tagName = element.tagName.toLowerCase();
+
+    if (!ConfirmDialogBuilder._allowedBodyTags.has(tagName)) {
+      return document.createTextNode(element.outerHTML);
+    }
+
+    const safeElement = document.createElement(tagName);
+    Array.from(element.childNodes).forEach(child => {
+      safeElement.appendChild(this._sanitizeBodyNode(child));
+    });
+    return safeElement;
   }
 }
 
