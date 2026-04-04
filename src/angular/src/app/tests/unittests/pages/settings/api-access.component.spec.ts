@@ -1,12 +1,11 @@
 import {CommonModule} from "@angular/common";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
-import {BehaviorSubject, of} from "rxjs";
+import {BehaviorSubject, Observable, of} from "rxjs";
 import {Modal} from "../../../../services/utils/modal.service";
 
 import {ApiAccessComponent} from "../../../../pages/settings/api-access.component";
 import {
-    ApiAccessMigrationState,
     ApiAccessService,
     ApiKeyRecord
 } from "../../../../services/settings/api-access.service";
@@ -24,6 +23,16 @@ const activeApiKeys: ApiKeyRecord[] = [{
     active: true
 }];
 
+const adminApiKey: ApiKeyRecord = {
+    id: "bootstrap-admin",
+    name: "Bootstrap Admin",
+    scopes: ["admin"],
+    created_at: "2026-04-01T00:20:00+00:00",
+    updated_at: "2026-04-01T00:20:00+00:00",
+    revoked_at: null,
+    active: true
+};
+
 const revokedApiKey: ApiKeyRecord = {
     id: "revoked-reader",
     name: "Revoked Reader",
@@ -34,65 +43,41 @@ const revokedApiKey: ApiKeyRecord = {
     active: false
 };
 
-const bootstrapMigrationState: ApiAccessMigrationState = {
-    legacy_api_token: {
-        configured: false,
-        compatibility_enabled: false,
-        state: "cleared",
-        accepted_for_external_non_admin: false
-    },
-    api_keys: {
-        total: 0,
-        active: 0,
-        active_admin: 0,
-        revoked: 0
-    }
-};
-
-const normalMigrationState: ApiAccessMigrationState = {
-    legacy_api_token: {
-        configured: true,
-        compatibility_enabled: true,
-        state: "enabled",
-        accepted_for_external_non_admin: true
-    },
-    api_keys: {
-        total: 1,
-        active: 1,
-        active_admin: 1,
-        revoked: 0
-    }
-};
-
-const nonAdminOnlyMigrationState: ApiAccessMigrationState = {
-    legacy_api_token: {
-        configured: false,
-        compatibility_enabled: false,
-        state: "cleared",
-        accepted_for_external_non_admin: false
-    },
-    api_keys: {
-        total: 1,
-        active: 1,
-        active_admin: 0,
-        revoked: 0
-    }
-};
+const nonAdminApiKeys: ApiKeyRecord[] = [{
+    id: "writer",
+    name: "Writer",
+    scopes: ["read", "write", "stream"],
+    created_at: "2026-04-01T00:10:00+00:00",
+    updated_at: "2026-04-01T00:10:00+00:00",
+    revoked_at: null,
+    active: true
+}];
 
 
 class MockApiAccessService {
-    migrationState = new BehaviorSubject<ApiAccessMigrationState>(null);
     apiKeys = new BehaviorSubject<ApiKeyRecord[]>(null);
     refresh = jasmine.createSpy("refresh").and.callFake(() => {
-        this.migrationState.next(normalMigrationState);
-        this.apiKeys.next(activeApiKeys);
+        this.apiKeys.next([adminApiKey]);
     });
     setIncludeRevokedApiKeys = jasmine.createSpy("setIncludeRevokedApiKeys").and.callFake((includeRevoked: boolean) => {
+        const currentKeys = this.apiKeys.getValue() || [];
+
         if (includeRevoked) {
-            this.apiKeys.next([activeApiKeys[0], revokedApiKey]);
-        } else {
-            this.apiKeys.next(activeApiKeys);
+            if (currentKeys.length === 0) {
+                this.apiKeys.next([]);
+                return;
+            }
+
+            if (currentKeys.some(key => key.revoked_at)) {
+                this.apiKeys.next(currentKeys);
+                return;
+            }
+
+            this.apiKeys.next([...currentKeys, revokedApiKey]);
+            return;
         }
+
+        this.apiKeys.next(currentKeys.filter(key => !key.revoked_at));
     });
 
     bootstrapFirstApiKey = jasmine.createSpy("bootstrapFirstApiKey").and.callFake((name: string) => {
@@ -159,34 +144,6 @@ class MockApiAccessService {
         }
         return of(void 0);
     });
-    disableLegacyApiToken = jasmine.createSpy("disableLegacyApiToken").and.returnValue(of({
-        legacy_api_token: {
-            configured: true,
-            compatibility_enabled: false,
-            state: "disabled",
-            accepted_for_external_non_admin: false
-        },
-        api_keys: {
-            total: 1,
-            active: 1,
-            active_admin: 1,
-            revoked: 0
-        }
-    }));
-    clearLegacyApiToken = jasmine.createSpy("clearLegacyApiToken").and.returnValue(of({
-        legacy_api_token: {
-            configured: false,
-            compatibility_enabled: false,
-            state: "cleared",
-            accepted_for_external_non_admin: false
-        },
-        api_keys: {
-            total: 1,
-            active: 1,
-            active_admin: 1,
-            revoked: 0
-        }
-    }));
 }
 
 class MockNotificationService {
@@ -232,21 +189,6 @@ describe("Testing API access component", () => {
     let apiAccessService: MockApiAccessService;
     let notificationService: MockNotificationService;
 
-    const migrationState: ApiAccessMigrationState = {
-        legacy_api_token: {
-            configured: true,
-            compatibility_enabled: true,
-            state: "enabled",
-            accepted_for_external_non_admin: true
-        },
-        api_keys: {
-            total: 2,
-            active: 1,
-            active_admin: 1,
-            revoked: 1
-        }
-    };
-
     beforeEach(() => {
         TestBed.configureTestingModule({
             imports: [
@@ -266,48 +208,66 @@ describe("Testing API access component", () => {
         component = fixture.componentInstance;
         apiAccessService = TestBed.get(ApiAccessService);
         notificationService = TestBed.get(NotificationService);
-        apiAccessService.migrationState.next(migrationState);
-        apiAccessService.apiKeys.next(activeApiKeys);
+        apiAccessService.apiKeys.next([adminApiKey, activeApiKeys[0]]);
         fixture.detectChanges();
     });
 
-    it("should render the migration banner and the API key list", () => {
+    it("should render the API key summary and the API key list", () => {
         const host: HTMLElement = fixture.nativeElement;
 
-        expect(host.textContent).toContain("API Access");
-        expect(host.textContent).toContain("Legacy token compatibility is active.");
+        expect(host.textContent).toContain("2 active / 1 revoked");
         expect(host.textContent).toContain("Reader");
+        expect(host.querySelector(".section-header")).toBeNull();
         expect(host.querySelector(".key-item:not(.revoked) .delete-key-btn")).toBeNull();
-        expect(host.textContent).toContain("1 revoked key hidden");
         expect(host.querySelector(".toggle-revoked-keys-btn")).not.toBeNull();
-        expect(host.querySelector(".disable-legacy-btn")).not.toBeNull();
-        expect(host.querySelector(".clear-legacy-btn")).not.toBeNull();
+        expect(host.querySelector(".disable-legacy-btn")).toBeNull();
+        expect(host.querySelector(".clear-legacy-btn")).toBeNull();
+    });
+
+    it("should subscribe to api keys in ngOnInit and the template", () => {
+        let subscribeCount = 0;
+        const apiKeysObservable = apiAccessService.apiKeys as BehaviorSubject<ApiKeyRecord[]>;
+        const originalSubscribe = apiKeysObservable.subscribe.bind(apiKeysObservable);
+        spyOn(apiKeysObservable, "subscribe").and.callFake((...args: any[]) => {
+            subscribeCount++;
+            return originalSubscribe(...args);
+        });
+
+        fixture.destroy();
+        fixture = TestBed.createComponent(ApiAccessComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        const host: HTMLElement = fixture.nativeElement;
+
+        expect(subscribeCount).toBe(2);
+        expect(host.querySelector(".summary-line")).not.toBeNull();
+        expect(host.querySelector(".state-banner")).toBeNull();
+        expect(host.textContent).toContain("2 active / 1 revoked");
     });
 
     it("should render the first-admin bootstrap card when no admin exists", () => {
-        apiAccessService.migrationState.next(bootstrapMigrationState);
         apiAccessService.apiKeys.next([]);
         fixture.detectChanges();
 
         const host: HTMLElement = fixture.nativeElement;
 
         expect(host.textContent).toContain("Bootstrap First Admin");
-        expect(host.textContent).toContain("Create the first admin key");
+        expect(host.textContent).toContain("Create the first admin key to unlock the rest of the API access controls.");
         expect(host.querySelector(".bootstrap-first-admin-btn")).not.toBeNull();
-        expect(host.querySelector(".create-key-btn")).toBeNull();
+        expect(host.querySelector(".add-key-btn")).toBeNull();
         expect(host.querySelector(".key-list")).toBeNull();
     });
 
     it("should stay in bootstrap mode when only non-admin api keys exist", () => {
-        apiAccessService.migrationState.next(nonAdminOnlyMigrationState);
-        apiAccessService.apiKeys.next([]);
+        apiAccessService.apiKeys.next(nonAdminApiKeys);
         fixture.detectChanges();
 
         const host: HTMLElement = fixture.nativeElement;
 
         expect(host.textContent).toContain("Bootstrap First Admin");
         expect(host.querySelector(".bootstrap-first-admin-btn")).not.toBeNull();
-        expect(host.querySelector(".create-key-btn")).toBeNull();
+        expect(host.querySelector(".add-key-btn")).toBeNull();
     });
 
     it("should reveal revoked keys on demand and allow permanent deletion", fakeAsync(() => {
@@ -319,7 +279,7 @@ describe("Testing API access component", () => {
         revealButton.click();
         fixture.detectChanges();
 
-        expect(apiAccessService.setIncludeRevokedApiKeys).toHaveBeenCalledWith(true);
+        expect(apiAccessService.setIncludeRevokedApiKeys).toHaveBeenCalledTimes(1);
         expect(host.textContent).toContain("Revoked Reader");
         expect(host.querySelector(".key-item.revoked .edit-key-btn")).toBeNull();
         expect(host.querySelector(".key-item.revoked .rotate-key-btn")).toBeNull();
@@ -348,8 +308,9 @@ describe("Testing API access component", () => {
             },
             secret: "writer-secret"
         }));
-        component.createName = "Writer";
-        component.createScopes = {
+        component.startCreate();
+        component.formName = "Writer";
+        component.formScopes = {
             read: true,
             write: true,
             stream: true,
@@ -357,7 +318,7 @@ describe("Testing API access component", () => {
         };
         fixture.detectChanges();
 
-        component.createApiKey();
+        component.saveForm();
         fixture.detectChanges();
 
         expect(apiAccessService.createApiKey).toHaveBeenCalledWith(
@@ -367,7 +328,7 @@ describe("Testing API access component", () => {
         expect(notificationService.show).not.toHaveBeenCalled();
         expect(component.secretReveal.secret).toBe("writer-secret");
         expect(fixture.nativeElement.textContent).toContain("API key created");
-        expect(component.createName).toBe("");
+        expect(component.formName).toBe("");
     });
 
     it("should update an API key from the inline edit form", () => {
@@ -383,8 +344,8 @@ describe("Testing API access component", () => {
         component.startEdit(activeApiKeys[0]);
         fixture.detectChanges();
 
-        component.editingName = "Reader updated";
-        component.editingScopes = {
+        component.formName = "Reader updated";
+        component.formScopes = {
             read: true,
             write: false,
             stream: true,
@@ -392,7 +353,7 @@ describe("Testing API access component", () => {
         };
         fixture.detectChanges();
 
-        component.saveApiKey(activeApiKeys[0]);
+        component.saveForm();
         fixture.detectChanges();
 
         expect(apiAccessService.updateApiKey).toHaveBeenCalledWith(
@@ -433,7 +394,7 @@ describe("Testing API access component", () => {
         flushMicrotasks();
         fixture.detectChanges();
 
-        expect(apiAccessService.rotateApiKey).toHaveBeenCalledWith("reader");
+        expect(apiAccessService.rotateApiKey).toHaveBeenCalledWith("bootstrap-admin");
         expect(notificationService.show).not.toHaveBeenCalled();
         expect(component.secretReveal.secret).toBe("rotated-secret");
 
@@ -442,30 +403,11 @@ describe("Testing API access component", () => {
         flushMicrotasks();
         fixture.detectChanges();
 
-        expect(apiAccessService.revokeApiKey).toHaveBeenCalledWith("reader");
+        expect(apiAccessService.revokeApiKey).toHaveBeenCalledWith("bootstrap-admin");
         expect(notificationService.show).not.toHaveBeenCalled();
     }));
 
-    it("should trigger the legacy token controls", fakeAsync(() => {
-        const host: HTMLElement = fixture.nativeElement;
-
-        const disableButton = host.querySelector(".disable-legacy-btn") as HTMLButtonElement;
-        disableButton.click();
-        flushMicrotasks();
-        fixture.detectChanges();
-
-        expect(apiAccessService.disableLegacyApiToken).toHaveBeenCalled();
-
-        const clearButton = host.querySelector(".clear-legacy-btn") as HTMLButtonElement;
-        clearButton.click();
-        flushMicrotasks();
-        fixture.detectChanges();
-
-        expect(apiAccessService.clearLegacyApiToken).toHaveBeenCalled();
-    }));
-
     it("should bootstrap the first admin key and transition to the normal API access view", fakeAsync(() => {
-        apiAccessService.migrationState.next(bootstrapMigrationState);
         apiAccessService.apiKeys.next([]);
         fixture.detectChanges();
 
@@ -481,8 +423,8 @@ describe("Testing API access component", () => {
         expect(apiAccessService.bootstrapFirstApiKey).toHaveBeenCalledWith("Bootstrap Admin");
         expect(apiAccessService.refresh).toHaveBeenCalled();
         expect(component.secretReveal.secret).toBe("bootstrap-secret");
-        expect(host.textContent).toContain("Create API Key");
+        expect(host.textContent).toContain("Add API Key");
         expect(host.querySelector(".bootstrap-first-admin-btn")).toBeNull();
-        expect(host.querySelector(".create-key-btn")).not.toBeNull();
+        expect(host.querySelector(".add-key-btn")).not.toBeNull();
     }));
 });

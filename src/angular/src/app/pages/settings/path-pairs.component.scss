@@ -1,94 +1,175 @@
 @use '../../common/common' as *;
 
+:host {
+    display: block;
+}
+
 .path-pairs-container {
-    padding: 15px;
-    border-bottom: 1px solid rgba(0, 0, 0, 0.08);
-
-    .header {
-        margin-bottom: 15px;
-
-        h3 {
-            margin: 0 0 5px;
-        }
-
-        .description {
-            margin-bottom: 10px;
-            color: rgba(0, 0, 0, 0.65);
-        }
-
-        .add-btn {
-            @extend %button;
-        }
-    }
-
-    .form-card,
-    .path-pair-item,
-    .empty-state {
-        background: #fff;
-        border: 1px solid rgba(0, 0, 0, 0.1);
-        border-radius: 4px;
-        padding: 15px;
-    }
+    padding: 0;
 
     .form-card {
-        margin-bottom: 15px;
+        margin-bottom: 12px;
+        padding: 14px 15px 12px;
+        background: #fff;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 4px;
+        overflow: hidden;
 
-        h4 {
-            margin: 0 0 15px;
+        .form-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 12px;
+            padding-bottom: 10px;
+            margin-bottom: 10px;
+            border-bottom: 1px solid #e9ecef;
+
+            h4 {
+                margin: 0;
+                font-size: 96%;
+                font-weight: 700;
+                color: rgba(0, 0, 0, 0.82);
+            }
+        }
+
+        .form-grid {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .path-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 10px 12px;
         }
 
         .form-row {
             display: block;
-            margin-bottom: 12px;
+            margin: 0;
 
             .label {
                 display: block;
-                font-weight: 600;
-                margin-bottom: 5px;
+                font-weight: 700;
+                font-size: 82%;
+                letter-spacing: .02em;
+                color: rgba(0, 0, 0, 0.58);
+                margin-bottom: 4px;
             }
 
-            .help {
-                display: block;
-                font-size: 85%;
-                color: rgba(0, 0, 0, 0.6);
-                margin-top: 5px;
+            .required-marker {
+                margin-left: 3px;
+                color: #c0392b;
+                font-weight: 700;
+            }
+
+            .form-control {
+                min-height: 38px;
             }
         }
 
         .check-row {
             display: flex;
             align-items: center;
-            margin-bottom: 10px;
+            gap: 8px;
+            margin: 0;
+            padding: 8px 10px;
+            border: 1px solid rgba(0, 0, 0, 0.07);
+            border-radius: 4px;
+            background: rgba(0, 0, 0, 0.02);
+            cursor: pointer;
+            user-select: none;
 
             input {
-                margin-right: 8px;
+                margin: 0;
             }
+        }
+
+        .form-footer {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding-top: 10px;
+            margin-top: 12px;
+            border-top: 1px solid #e9ecef;
+        }
+
+        .footer-controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            min-width: 0;
         }
 
         .actions {
             display: flex;
             justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 10px;
+            margin-left: auto;
+        }
+
+        .save-btn {
+            background-color: $primary-color;
+            border-color: $primary-dark-color;
+            color: #fff;
+
+            &:hover,
+            &:focus {
+                background-color: $primary-dark-color;
+                border-color: #245580;
+                color: #fff;
+            }
+
+            &:active {
+                background-color: #286090;
+                border-color: #204d74;
+                color: #fff;
+            }
+
+            &:disabled {
+                background-color: $primary-color;
+                border-color: $primary-dark-color;
+                color: #fff;
+                opacity: .65;
+            }
         }
     }
 
+    .list-surface {
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 4px;
+        background: #fff;
+        overflow: hidden;
+    }
+
     .empty-state {
+        padding: 14px 15px;
         color: rgba(0, 0, 0, 0.65);
     }
 
     .path-pairs-list {
         display: flex;
         flex-direction: column;
-        gap: 12px;
     }
 
     .path-pair-item {
-        display: flex;
-        justify-content: space-between;
-        gap: 15px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 12px;
+        padding: 10px 15px;
+        border-top: 1px solid #e9ecef;
+        align-items: start;
 
         &.disabled {
-            opacity: 0.7;
+            opacity: 0.78;
+        }
+
+        &:first-child {
+            border-top: none;
         }
 
         .pair-body {
@@ -98,68 +179,109 @@
 
         .pair-header {
             display: flex;
-            align-items: center;
-            gap: 12px;
-            flex-wrap: wrap;
-            margin-bottom: 10px;
+            align-items: flex-start;
+            margin-bottom: 0;
+            min-width: 0;
 
             .pair-title-row {
                 display: flex;
-                align-items: baseline;
-                gap: 8px;
+                align-items: center;
+                gap: 6px;
+                flex-wrap: nowrap;
                 min-width: 0;
+                overflow: hidden;
             }
 
             .pair-name {
-                font-size: 1.9rem;
-                line-height: 1.05;
-                font-weight: 800;
-                letter-spacing: -0.03em;
-                color: rgba(0, 0, 0, 0.78);
+                flex: 1 1 auto;
+                min-width: 0;
+                font-size: 106%;
+                line-height: 1.15;
+                font-weight: 700;
+                color: rgba(0, 0, 0, 0.82);
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
             }
 
-            .pair-badges {
-                display: flex;
-                gap: 8px;
-                align-items: center;
-                flex-wrap: wrap;
-            }
-
-            .pair-status,
-            .pair-autoqueue {
-                font-size: 85%;
+            .pair-status {
+                flex: 0 0 auto;
+                font-size: 78%;
                 font-weight: 600;
-                padding: 4px 10px;
+                padding: 2px 8px;
                 border-radius: 999px;
                 background: rgba(0, 0, 0, 0.08);
+                color: rgba(0, 0, 0, 0.68);
+                white-space: nowrap;
+            }
+
+            .pair-status.enabled {
+                background: rgba(25, 135, 84, 0.16);
+                color: #0f5132;
             }
 
             .pair-autoqueue {
+                flex: 0 0 auto;
+                font-size: 74%;
+                font-weight: 700;
+                padding: 2px 7px;
+                border-radius: 999px;
                 background: rgba(0, 123, 255, 0.12);
+                color: #0f5d8f;
+                white-space: nowrap;
+                letter-spacing: 0.02em;
             }
+        }
+
+        .pair-details {
+            margin-top: 7px;
         }
 
         .path-line {
             display: flex;
             gap: 10px;
-            margin-top: 4px;
+            margin-top: 3px;
+            align-items: flex-start;
 
             .path-label {
-                min-width: 60px;
-                font-weight: 600;
+                min-width: 68px;
+                font-size: 76%;
+                font-weight: 700;
+                letter-spacing: .03em;
+                text-transform: uppercase;
+                color: rgba(0, 0, 0, 0.52);
             }
 
             .path-value {
                 word-break: break-all;
                 font-family: monospace;
+                color: rgba(0, 0, 0, 0.76);
             }
         }
 
         .pair-actions {
             display: flex;
             flex-wrap: wrap;
-            gap: 8px;
+            gap: 5px;
             align-content: flex-start;
+            justify-content: flex-end;
+
+            .btn-sm {
+                padding: 0.2rem 0.45rem;
+                font-size: 0.76rem;
+                line-height: 1.1;
+            }
+
+            .pair-icon-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                min-width: 1.9rem;
+                padding: 0.2rem 0.35rem;
+                font-size: 0.9rem;
+                font-weight: 700;
+                line-height: 1;
+            }
         }
     }
 }

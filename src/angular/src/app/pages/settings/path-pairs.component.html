@@ -1,120 +1,135 @@
 <div class="path-pairs-container">
-    <div class="header">
-        <h3>Path Pairs</h3>
-        <p class="description">
-            Configure remote and local directory pairs for downloads. Existing SeedSync single-path
-            settings migrate into this list automatically.
-        </p>
-        <button class="btn btn-primary add-btn"
-                type="button"
-                (click)="startCreate()"
-                [disabled]="isCreating || isEditing">
-            Add Path Pair
-        </button>
-    </div>
-
     <div class="form-card" *ngIf="isCreating || isEditing">
-        <h4>{{isCreating ? 'New Path Pair' : 'Edit Path Pair'}}</h4>
+        <div class="form-header">
+            <div class="form-heading-copy">
+                <h4>{{isCreating ? 'New Path Pair' : 'Edit Path Pair'}}</h4>
+            </div>
+        </div>
 
-        <label class="form-row">
-            <span class="label">Name</span>
-            <input type="text"
-                   class="form-control"
-                   [(ngModel)]="formName"
-                   placeholder="Movies" />
-            <span class="help">Optional friendly label shown in the dashboard and file list.</span>
-        </label>
+        <div class="form-grid">
+            <label class="form-row name-row">
+                <span class="label">Name</span>
+                <input type="text"
+                       class="form-control"
+                       [(ngModel)]="formName"
+                       placeholder="Movies" />
+            </label>
 
-        <label class="form-row">
-            <span class="label">Remote Path</span>
-            <input type="text"
-                   class="form-control"
-                   [(ngModel)]="formRemotePath"
-                   placeholder="/seedbox/downloads/movies" />
-        </label>
+            <div class="path-grid">
+                <label class="form-row">
+                    <span class="label">Remote Path <span class="required-marker" aria-hidden="true">*</span></span>
+                    <input type="text"
+                           class="form-control"
+                           [(ngModel)]="formRemotePath"
+                           placeholder="/seedbox/downloads/movies" />
+                </label>
 
-        <label class="form-row">
-            <span class="label">Local Path</span>
-            <input type="text"
-                   class="form-control"
-                   [(ngModel)]="formLocalPath"
-                   placeholder="/downloads/movies" />
-        </label>
+                <label class="form-row">
+                    <span class="label">Local Path <span class="required-marker" aria-hidden="true">*</span></span>
+                    <input type="text"
+                           class="form-control"
+                           [(ngModel)]="formLocalPath"
+                           placeholder="/downloads/movies" />
+                </label>
+            </div>
+        </div>
 
-        <label class="check-row">
-            <input type="checkbox" [(ngModel)]="formEnabled" />
-            <span>Enabled</span>
-        </label>
+        <div class="form-footer">
+            <div class="footer-controls">
+                <label class="check-row">
+                    <input type="checkbox" [(ngModel)]="formEnabled" />
+                    <span>Enabled</span>
+                </label>
 
-        <label class="check-row">
-            <input type="checkbox" [(ngModel)]="formAutoQueue" />
-            <span>Auto-queue new files</span>
-        </label>
+                <label class="check-row">
+                    <input type="checkbox" [(ngModel)]="formAutoQueue" />
+                    <span>Auto-queue</span>
+                </label>
+            </div>
 
-        <div class="actions">
-            <button class="btn btn-secondary" type="button" (click)="cancel()">Cancel</button>
-            <button class="btn btn-primary" type="button" (click)="save()">Save</button>
+            <div class="actions">
+                <button class="btn btn-secondary btn-sm" type="button" (click)="cancel()">Cancel</button>
+                <button class="btn btn-sm save-btn" type="button" (click)="save()">Save</button>
+            </div>
         </div>
     </div>
 
-    <div class="empty-state" *ngIf="!isCreating && pathPairs.length === 0">
-        No path pairs configured yet.
-    </div>
+    <div class="list-surface">
+        <div class="empty-state" *ngIf="!isCreating && pathPairs.length === 0">
+            No path pairs configured yet.
+        </div>
 
-    <div class="path-pairs-list" *ngIf="pathPairs.length > 0">
-        <div class="path-pair-item"
-             *ngFor="let pair of pathPairs; let i = index"
-             [class.disabled]="!pair.enabled">
-            <div class="pair-body">
-                <div class="pair-header">
-                    <div class="pair-title-row">
-                        <span class="pair-name">{{pair.name}}</span>
+        <div class="path-pairs-list" *ngIf="pathPairs.length > 0">
+            <div class="path-pair-item"
+                 *ngFor="let pair of pathPairs; let i = index"
+                 [class.disabled]="!pair.enabled"
+                 [class.details-open]="isDetailsVisible(pair)">
+                <div class="pair-body">
+                    <div class="pair-header">
+                        <div class="pair-title-row">
+                            <span class="pair-name">{{pair.name || 'Unnamed path pair'}}</span>
+                            <span class="pair-status"
+                                  [class.enabled]="pair.enabled"
+                                  [class.disabled]="!pair.enabled">
+                                {{pair.enabled ? 'Enabled' : 'Disabled'}}
+                            </span>
+                            <span class="pair-autoqueue" *ngIf="pair.auto_queue">AQ</span>
+                        </div>
                     </div>
-                    <div class="pair-badges">
-                        <span class="pair-status">{{pair.enabled ? 'Enabled' : 'Disabled'}}</span>
-                        <span class="pair-autoqueue" *ngIf="pair.auto_queue">AutoQueue</span>
+
+                    <div class="pair-details" *ngIf="isDetailsVisible(pair)">
+                        <div class="path-line">
+                            <span class="path-label">Remote</span>
+                            <span class="path-value">{{pair.remote_path}}</span>
+                        </div>
+
+                        <div class="path-line">
+                            <span class="path-label">Local</span>
+                            <span class="path-value">{{pair.local_path}}</span>
+                        </div>
                     </div>
                 </div>
 
-                <div class="path-line">
-                    <span class="path-label">Remote</span>
-                    <span class="path-value">{{pair.remote_path}}</span>
+                <div class="pair-actions">
+                    <button class="btn btn-secondary btn-sm pair-icon-btn pair-details-toggle"
+                            type="button"
+                            (click)="toggleDetails(pair)"
+                            [attr.aria-label]="isDetailsVisible(pair) ? 'Hide details' : 'Show details'"
+                            [attr.title]="isDetailsVisible(pair) ? 'Hide details' : 'Show details'">
+                        <span aria-hidden="true">{{isDetailsVisible(pair) ? '-' : '+'}}</span>
+                    </button>
+                    <button class="btn btn-secondary btn-sm pair-icon-btn pair-move-up"
+                            type="button"
+                            (click)="moveUp(i)"
+                            [disabled]="i === 0"
+                            aria-label="Move up"
+                            title="Move up">
+                        <span aria-hidden="true">&#9650;</span>
+                    </button>
+                    <button class="btn btn-secondary btn-sm pair-icon-btn pair-move-down"
+                            type="button"
+                            (click)="moveDown(i)"
+                            [disabled]="i === pathPairs.length - 1"
+                            aria-label="Move down"
+                            title="Move down">
+                        <span aria-hidden="true">&#9660;</span>
+                    </button>
+                    <button class="btn btn-secondary btn-sm" type="button" (click)="toggleEnabled(pair)">
+                        {{pair.enabled ? 'Disable' : 'Enable'}}
+                    </button>
+                    <button class="btn btn-secondary btn-sm"
+                            type="button"
+                            (click)="startEdit(pair)"
+                            [disabled]="isCreating || isEditing">
+                        Edit
+                    </button>
+                    <button class="btn btn-danger btn-sm"
+                            type="button"
+                            (click)="delete(pair)"
+                            [disabled]="isCreating || isEditing">
+                        Delete
+                    </button>
                 </div>
-
-                <div class="path-line">
-                    <span class="path-label">Local</span>
-                    <span class="path-value">{{pair.local_path}}</span>
-                </div>
-            </div>
-
-            <div class="pair-actions">
-                <button class="btn btn-secondary btn-sm"
-                        type="button"
-                        (click)="moveUp(i)"
-                        [disabled]="i === 0">
-                    Up
-                </button>
-                <button class="btn btn-secondary btn-sm"
-                        type="button"
-                        (click)="moveDown(i)"
-                        [disabled]="i === pathPairs.length - 1">
-                    Down
-                </button>
-                <button class="btn btn-secondary btn-sm" type="button" (click)="toggleEnabled(pair)">
-                    {{pair.enabled ? 'Disable' : 'Enable'}}
-                </button>
-                <button class="btn btn-secondary btn-sm"
-                        type="button"
-                        (click)="startEdit(pair)"
-                        [disabled]="isCreating || isEditing">
-                    Edit
-                </button>
-                <button class="btn btn-danger btn-sm"
-                        type="button"
-                        (click)="delete(pair)"
-                        [disabled]="isCreating || isEditing">
-                    Delete
-                </button>
             </div>
         </div>
     </div>

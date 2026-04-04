@@ -7,7 +7,6 @@ import {StreamServiceRegistry} from "../../../../services/base/stream-service.re
 import {MockStreamServiceRegistry} from "../../../mocks/mock-stream-service.registry";
 import {
     ApiAccessService,
-    ApiAccessMigrationState,
     ApiKeyRecord
 } from "../../../../services/settings/api-access.service";
 
@@ -16,51 +15,6 @@ describe("Testing API access service", () => {
     let mockRegistry: MockStreamServiceRegistry;
     let httpMock: HttpTestingController;
     let apiAccessService: ApiAccessService;
-
-    const baseMigrationState: ApiAccessMigrationState = {
-        legacy_api_token: {
-            configured: true,
-            compatibility_enabled: true,
-            state: "enabled",
-            accepted_for_external_non_admin: true
-        },
-        api_keys: {
-            total: 1,
-            active: 1,
-            active_admin: 1,
-            revoked: 0
-        }
-    };
-
-    const bootstrapMigrationState: ApiAccessMigrationState = {
-        legacy_api_token: {
-            configured: false,
-            compatibility_enabled: false,
-            state: "cleared",
-            accepted_for_external_non_admin: false
-        },
-        api_keys: {
-            total: 0,
-            active: 0,
-            active_admin: 0,
-            revoked: 0
-        }
-    };
-
-    const noAdminMigrationState: ApiAccessMigrationState = {
-        legacy_api_token: {
-            configured: false,
-            compatibility_enabled: false,
-            state: "cleared",
-            accepted_for_external_non_admin: false
-        },
-        api_keys: {
-            total: 1,
-            active: 1,
-            active_admin: 0,
-            revoked: 0
-        }
-    };
 
     const baseApiKeys: ApiKeyRecord[] = [{
         id: "reader",
@@ -107,80 +61,30 @@ describe("Testing API access service", () => {
         expect(apiAccessService).toBeDefined();
     });
 
-    it("should load migration state and API keys on connect", () => {
-        let latestMigrationState: ApiAccessMigrationState = null;
+    it("should load api keys on connect", () => {
         let latestKeys: ApiKeyRecord[] = null;
 
-        apiAccessService.migrationState.subscribe({
-            next: state => latestMigrationState = state
-        });
         apiAccessService.apiKeys.subscribe({
             next: keys => latestKeys = keys
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({
             keys: baseApiKeys
         });
 
-        expect(latestMigrationState.legacy_api_token.state).toBe("enabled");
         expect(latestKeys.length).toBe(1);
         expect(latestKeys[0].name).toBe("Reader");
         httpMock.verify();
     });
 
-    it("should load only migration state when no active admin key exists", () => {
-        let latestMigrationState: ApiAccessMigrationState = null;
+    it("should bootstrap the first admin key and refresh api keys", () => {
         let latestKeys: ApiKeyRecord[] = null;
 
-        apiAccessService.migrationState.subscribe({
-            next: state => latestMigrationState = state
-        });
         apiAccessService.apiKeys.subscribe({
             next: keys => latestKeys = keys
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(bootstrapMigrationState);
-        httpMock.expectNone("/server/admin/api-keys/v1");
-
-        expect(latestMigrationState.api_keys.active).toBe(0);
-        expect(latestKeys).toEqual([]);
-        httpMock.verify();
-    });
-
-    it("should not load admin api keys when only non-admin keys exist", () => {
-        let latestMigrationState: ApiAccessMigrationState = null;
-        let latestKeys: ApiKeyRecord[] = null;
-
-        apiAccessService.migrationState.subscribe({
-            next: state => latestMigrationState = state
-        });
-        apiAccessService.apiKeys.subscribe({
-            next: keys => latestKeys = keys
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush(noAdminMigrationState);
-        httpMock.expectNone("/server/admin/api-keys/v1");
-
-        expect(latestMigrationState.api_keys.active).toBe(1);
-        expect(latestMigrationState.api_keys.active_admin).toBe(0);
-        expect(latestKeys).toEqual([]);
-        httpMock.verify();
-    });
-
-    it("should bootstrap the first admin key and refresh into normal state", () => {
-        let latestMigrationState: ApiAccessMigrationState = null;
-        let latestKeys: ApiKeyRecord[] = null;
-
-        apiAccessService.migrationState.subscribe({
-            next: state => latestMigrationState = state
-        });
-        apiAccessService.apiKeys.subscribe({
-            next: keys => latestKeys = keys
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush(bootstrapMigrationState);
-        httpMock.expectNone("/server/admin/api-keys/v1");
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: []});
 
         let result = null;
         apiAccessService.bootstrapFirstApiKey("Bootstrap Admin").subscribe({
@@ -205,18 +109,15 @@ describe("Testing API access service", () => {
             secret: "bootstrap-secret"
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         expect(result.key.name).toBe("Bootstrap Admin");
         expect(result.secret).toBe("bootstrap-secret");
-        expect(latestMigrationState.api_keys.active).toBe(1);
         expect(latestKeys.length).toBe(1);
         httpMock.verify();
     });
 
     it("should create an API key and refresh state", () => {
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         let result = null;
@@ -243,7 +144,6 @@ describe("Testing API access service", () => {
             secret: "secret-value"
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         expect(result.key.name).toBe("Writer");
@@ -252,7 +152,6 @@ describe("Testing API access service", () => {
     });
 
     it("should reveal revoked keys only when requested and delete revoked keys", () => {
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         apiAccessService.setIncludeRevokedApiKeys(true);
@@ -271,18 +170,15 @@ describe("Testing API access service", () => {
         expect(deleteRequest.request.method).toBe("DELETE");
         deleteRequest.flush(null, {status: 204, statusText: "No Content"});
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
-        const refreshedRequest = httpMock.expectOne(request => {
+        httpMock.expectOne(request => {
             return request.url === "/server/admin/api-keys/v1" && request.params.get("include_revoked") === "1";
-        });
-        refreshedRequest.flush({keys: baseApiKeys});
+        }).flush({keys: baseApiKeys});
 
         expect(deleted).toBeTrue();
         httpMock.verify();
     });
 
     it("should update, rotate, and revoke API keys", () => {
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
         let updated = null;
@@ -304,7 +200,6 @@ describe("Testing API access service", () => {
             }
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
         expect(updated.name).toBe("Reader v2");
 
@@ -328,7 +223,6 @@ describe("Testing API access service", () => {
             secret: "new-secret-value"
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
         expect(rotated.secret).toBe("new-secret-value");
 
@@ -351,134 +245,8 @@ describe("Testing API access service", () => {
             }
         });
 
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
         expect(revoked.active).toBe(false);
-        httpMock.verify();
-    });
-
-    it("should disable and clear legacy token compatibility", () => {
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
-        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
-
-        let disabledState = null;
-        apiAccessService.disableLegacyApiToken().subscribe({
-            next: state => disabledState = state
-        });
-
-        const disableRequest = httpMock.expectOne("/server/admin/migration/v1/legacy-api-token/disable");
-        expect(disableRequest.request.method).toBe("POST");
-        disableRequest.flush({
-            legacy_api_token: {
-                configured: true,
-                compatibility_enabled: false,
-                state: "disabled",
-                accepted_for_external_non_admin: false
-            },
-            api_keys: {
-                total: 1,
-                active: 1,
-                active_admin: 1,
-                revoked: 0
-            }
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush({
-            legacy_api_token: {
-                configured: true,
-                compatibility_enabled: false,
-                state: "disabled",
-                accepted_for_external_non_admin: false
-            },
-            api_keys: {
-                total: 1,
-                active: 1,
-                active_admin: 1,
-                revoked: 0
-            }
-        });
-        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
-
-        expect(disabledState.legacy_api_token.compatibility_enabled).toBe(false);
-
-        let clearedState = null;
-        apiAccessService.clearLegacyApiToken().subscribe({
-            next: state => clearedState = state
-        });
-
-        const clearRequest = httpMock.expectOne("/server/admin/migration/v1/legacy-api-token/clear");
-        expect(clearRequest.request.method).toBe("POST");
-        clearRequest.flush({
-            legacy_api_token: {
-                configured: false,
-                compatibility_enabled: false,
-                state: "cleared",
-                accepted_for_external_non_admin: false
-            },
-            api_keys: {
-                total: 1,
-                active: 1,
-                active_admin: 1,
-                revoked: 0
-            }
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush({
-            legacy_api_token: {
-                configured: false,
-                compatibility_enabled: false,
-                state: "cleared",
-                accepted_for_external_non_admin: false
-            },
-            api_keys: {
-                total: 1,
-                active: 1,
-                active_admin: 1,
-                revoked: 0
-            }
-        });
-        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
-
-        expect(clearedState.legacy_api_token.configured).toBe(false);
-        httpMock.verify();
-    });
-
-    it("should preserve successful migration state if the follow-up refresh fails", () => {
-        let latestMigrationState: ApiAccessMigrationState = null;
-
-        apiAccessService.migrationState.subscribe({
-            next: state => latestMigrationState = state
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush(baseMigrationState);
-        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
-
-        apiAccessService.disableLegacyApiToken().subscribe();
-
-        const disableRequest = httpMock.expectOne("/server/admin/migration/v1/legacy-api-token/disable");
-        disableRequest.flush({
-            legacy_api_token: {
-                configured: true,
-                compatibility_enabled: false,
-                state: "disabled",
-                accepted_for_external_non_admin: false
-            },
-            api_keys: {
-                total: 1,
-                active: 1,
-                active_admin: 1,
-                revoked: 0
-            }
-        });
-
-        httpMock.expectOne("/server/admin/migration/v1").flush("refresh failed", {
-            status: 500,
-            statusText: "Server Error"
-        });
-
-        expect(latestMigrationState).not.toBeNull();
-        expect(latestMigrationState.legacy_api_token.state).toBe("disabled");
-        expect(latestMigrationState.legacy_api_token.compatibility_enabled).toBe(false);
         httpMock.verify();
     });
 });

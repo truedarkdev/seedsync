@@ -7,10 +7,8 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 import {Notification} from "../../services/utils/notification";
 import {NotificationService} from "../../services/utils/notification.service";
 import {
-    ApiAccessMigrationState,
     ApiKeyRecord,
-    ApiAccessService,
-    LegacyApiTokenState
+    ApiAccessService
 } from "../../services/settings/api-access.service";
 
 
@@ -37,6 +35,14 @@ interface ScopeSelection {
     changeDetection: ChangeDetectionStrategy.OnPush
 })
 export class ApiAccessComponent implements OnInit, OnDestroy {
+    private readonly _timestampFormat: Intl.DateTimeFormatOptions = {
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+    };
+
     public readonly scopeOptions: ApiAccessScopeOption[] = [
         {value: "read", label: "Read"},
         {value: "write", label: "Write"},
@@ -44,22 +50,22 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
         {value: "admin", label: "Admin"}
     ];
 
-    public migrationState = this._apiAccessService.migrationState;
     public apiKeys = this._apiAccessService.apiKeys;
     public showRevokedKeys = false;
 
+    public isCreating = false;
+    public isEditing = false;
+    public formName = "";
+    public formScopes: ScopeSelection = this.defaultScopeSelection();
     public bootstrapName = "bootstrap-admin";
-    public createName = "";
-    public createScopes: ScopeSelection = this.defaultScopeSelection();
 
     public editingKeyId: string = null;
-    public editingName = "";
-    public editingScopes: ScopeSelection = this.defaultScopeSelection();
 
     public secretReveal: ApiAccessSecretReveal = null;
 
     private _destroy$ = new Subject<void>();
     private _destroyed = false;
+    private _expandedKeyIds = new Set<string>();
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private _apiAccessService: ApiAccessService,
@@ -69,10 +75,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     ngOnInit() {
-        this._apiAccessService.setIncludeRevokedApiKeys(this.showRevokedKeys);
-        this._apiAccessService.migrationState.pipe(takeUntil(this._destroy$)).subscribe({
-            next: () => this._changeDetector.markForCheck()
-        });
+        this._apiAccessService.setIncludeRevokedApiKeys(true);
         this._apiAccessService.apiKeys.pipe(takeUntil(this._destroy$)).subscribe({
             next: () => this._changeDetector.markForCheck()
         });
@@ -84,24 +87,48 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
         this._destroy$.complete();
     }
 
-    public startEdit(key: ApiKeyRecord) {
-        if (!key.active) {
+    public get isFormOpen(): boolean {
+        return this.isCreating || this.isEditing;
+    }
+
+    public startCreate() {
+        if (this.isFormOpen) {
             return;
         }
-        this.editingKeyId = key.id;
-        this.editingName = key.name;
-        this.editingScopes = this.scopeSelectionFromList(key.scopes);
-    }
 
-    public cancelEdit() {
+        this.isCreating = true;
+        this.isEditing = false;
         this.editingKeyId = null;
-        this.editingName = "";
-        this.editingScopes = this.defaultScopeSelection();
+        this.formName = "";
+        this.formScopes = this.defaultScopeSelection();
+        this._changeDetector.markForCheck();
     }
 
-    public createApiKey() {
-        const name = this.createName.trim();
-        const scopes = this.getSelectedScopes(this.createScopes);
+    public startEdit(key: ApiKeyRecord) {
+        if (this.isFormOpen || !key.active) {
+            return;
+        }
+        this.isCreating = false;
+        this.isEditing = true;
+        this.editingKeyId = key.id;
+        this.formName = key.name;
+        this.formScopes = this.scopeSelectionFromList(key.scopes);
+        this._changeDetector.markForCheck();
+    }
+
+    public cancelForm() {
+        this.isCreating = false;
+        this.isEditing = false;
+        this.editingKeyId = null;
+        this.formName = "";
+        this.formScopes = this.defaultScopeSelection();
+        this._changeDetector.markForCheck();
+    }
+
+    public saveForm() {
+        const name = this.formName.trim();
+        const scopes = this.getSelectedScopes(this.formScopes);
+
         if (!name) {
             this.showError("API key name cannot be blank");
             return;
@@ -111,15 +138,55 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             return;
         }
 
-        this._apiAccessService.createApiKey(name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
-            next: result => {
-                this.revealSecret("API key created", `Copy the new secret for ${result.key.name} now.`, result.secret);
-                this.createName = "";
-                this.createScopes = this.defaultScopeSelection();
-                this._changeDetector.markForCheck();
-            },
-            error: error => this.showError(`Failed to create API key: ${this.describeError(error)}`)
-        });
+        if (this.isCreating) {
+            this._apiAccessService.createApiKey(name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
+                next: result => {
+                    this.revealSecret("API key created", `Copy the new secret for ${result.key.name} now.`, result.secret);
+                    this.cancelForm();
+                },
+                error: error => this.showError(`Failed to create API key: ${this.describeError(error)}`)
+            });
+            return;
+        }
+
+        if (this.isEditing && this.editingKeyId) {
+            this._apiAccessService.updateApiKey(this.editingKeyId, name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
+                next: () => {
+                    this.cancelForm();
+                },
+                error: error => this.showError(`Failed to update API key: ${this.describeError(error)}`)
+            });
+        }
+    }
+
+    public toggleDetails(key: ApiKeyRecord) {
+        if (!key || !key.id) {
+            return;
+        }
+
+        if (this._expandedKeyIds.has(key.id)) {
+            this._expandedKeyIds.delete(key.id);
+        } else {
+            this._expandedKeyIds.add(key.id);
+        }
+        this._changeDetector.markForCheck();
+    }
+
+    public isDetailsVisible(key: ApiKeyRecord): boolean {
+        return !!key && !!key.id && this._expandedKeyIds.has(key.id);
+    }
+
+    public formatTimestamp(value: string): string {
+        if (!value) {
+            return "";
+        }
+
+        const parsed = new Date(value);
+        if (isNaN(parsed.getTime())) {
+            return value;
+        }
+
+        return parsed.toLocaleString([], this._timestampFormat);
     }
 
     public bootstrapFirstApiKey() {
@@ -132,31 +199,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
                 this._changeDetector.markForCheck();
             },
             error: error => this.showError(`Failed to bootstrap first admin API key: ${this.describeError(error)}`)
-        });
-    }
-
-    public saveApiKey(key: ApiKeyRecord) {
-        if (!key.active) {
-            this.showError("Revoked API keys cannot be edited");
-            return;
-        }
-        const name = this.editingName.trim();
-        const scopes = this.getSelectedScopes(this.editingScopes);
-        if (!name) {
-            this.showError("API key name cannot be blank");
-            return;
-        }
-        if (scopes.length === 0) {
-            this.showError("Choose at least one API key scope");
-            return;
-        }
-
-        this._apiAccessService.updateApiKey(key.id, name, scopes).pipe(takeUntil(this._destroy$)).subscribe({
-            next: updated => {
-                this.cancelEdit();
-                this._changeDetector.markForCheck();
-            },
-            error: error => this.showError(`Failed to update API key: ${this.describeError(error)}`)
         });
     }
 
@@ -180,7 +222,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     }
 
     public revokeApiKey(key: ApiKeyRecord) {
-        if (!key.active) {
+        if (!key.active || this.isFormOpen) {
             return;
         }
         this.confirmAction(
@@ -191,7 +233,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             () => this._apiAccessService.revokeApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
                 next: revoked => {
                     if (this.editingKeyId === revoked.id) {
-                        this.cancelEdit();
+                        this.cancelForm();
                     }
                     this._changeDetector.markForCheck();
                 },
@@ -202,12 +244,11 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
 
     public toggleRevokedKeys() {
         this.showRevokedKeys = !this.showRevokedKeys;
-        this._apiAccessService.setIncludeRevokedApiKeys(this.showRevokedKeys);
         this._changeDetector.markForCheck();
     }
 
     public deleteRevokedApiKey(key: ApiKeyRecord) {
-        if (key.active) {
+        if (key.active || this.isFormOpen) {
             return;
         }
         this.confirmAction(
@@ -218,7 +259,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
             () => this._apiAccessService.deleteApiKey(key.id).pipe(takeUntil(this._destroy$)).subscribe({
                 next: () => {
                     if (this.editingKeyId === key.id) {
-                        this.cancelEdit();
+                        this.cancelForm();
                     }
                     this._changeDetector.markForCheck();
                 },
@@ -227,76 +268,33 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
         );
     }
 
-    public disableLegacyApiToken() {
-        this.confirmAction(
-            "Disable Legacy Compatibility",
-            "Disable compatibility for general.api_token on external non-admin requests. Existing scoped API keys will continue to work.",
-            "Disable",
-            "btn btn-warning",
-            () => this._apiAccessService.disableLegacyApiToken().pipe(takeUntil(this._destroy$)).subscribe({
-                next: state => {
-                    this.showMigrationStateMessage(state, "Disabled legacy compatibility");
-                    this._changeDetector.markForCheck();
-                },
-                error: error => this.showError(`Failed to disable legacy compatibility: ${this.describeError(error)}`)
-            })
-        );
+    public getActiveApiKeyCount(apiKeys: ApiKeyRecord[]): number {
+        return (apiKeys || []).filter(key => key.active).length;
     }
 
-    public clearLegacyApiToken() {
-        this.confirmAction(
-            "Clear Legacy API Token",
-            "Clear general.api_token and disable legacy compatibility. This removes the stored fallback token.",
-            "Clear Token",
-            "btn btn-danger",
-            () => this._apiAccessService.clearLegacyApiToken().pipe(takeUntil(this._destroy$)).subscribe({
-                next: state => {
-                    this.showMigrationStateMessage(state, "Cleared legacy API token");
-                    this._changeDetector.markForCheck();
-                },
-                error: error => this.showError(`Failed to clear legacy API token: ${this.describeError(error)}`)
-            })
-        );
+    public getRevokedApiKeyCount(apiKeys: ApiKeyRecord[]): number {
+        return (apiKeys || []).filter(key => !key.active).length;
     }
 
-    public isBootstrapMode(state: ApiAccessMigrationState): boolean {
-        return !!state && !!state.api_keys && state.api_keys.active_admin === 0;
+    public getVisibleApiKeys(apiKeys: ApiKeyRecord[]): ApiKeyRecord[] {
+        return (apiKeys || []).filter(key => key.active || this.showRevokedKeys);
+    }
+
+    public getVisibleApiKeyCount(apiKeys: ApiKeyRecord[]): number {
+        return this.getVisibleApiKeys(apiKeys).length;
+    }
+
+    public getActiveAdminApiKeyCount(apiKeys: ApiKeyRecord[]): number {
+        return (apiKeys || []).filter(key => key.active && key.scopes.indexOf("admin") >= 0).length;
+    }
+
+    public isBootstrapMode(apiKeys: ApiKeyRecord[]): boolean {
+        return this.getActiveAdminApiKeyCount(apiKeys) === 0;
     }
 
     public dismissSecret() {
         this.secretReveal = null;
         this._changeDetector.markForCheck();
-    }
-
-    public isEditing(key: ApiKeyRecord): boolean {
-        return this.editingKeyId === key.id;
-    }
-
-    public getLegacyStateLabel(state: LegacyApiTokenState): string {
-        if (!state || !state.configured) {
-            return "Cleared";
-        }
-        if (state.compatibility_enabled) {
-            return "Active";
-        }
-        return "Disabled";
-    }
-
-    public getLegacyStateDescription(state: LegacyApiTokenState): string {
-        if (!state || !state.configured) {
-            return "No legacy token stored";
-        }
-        if (state.compatibility_enabled) {
-            return "general.api_token still works for external non-admin requests";
-        }
-        return "general.api_token is stored locally but no longer accepted";
-    }
-
-    private showMigrationStateMessage(state: ApiAccessMigrationState, successMessage: string) {
-        this.showSuccess(successMessage);
-        if (state && state.legacy_api_token && state.legacy_api_token.configured && state.legacy_api_token.compatibility_enabled) {
-            this.showWarning("Legacy token compatibility is still active");
-        }
     }
 
     private revealSecret(title: string, message: string, secret: string) {
@@ -371,14 +369,6 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
     private showSuccess(message: string) {
         this._notificationService.show(new Notification({
             level: Notification.Level.SUCCESS,
-            text: message,
-            dismissible: true
-        }));
-    }
-
-    private showWarning(message: string) {
-        this._notificationService.show(new Notification({
-            level: Notification.Level.WARNING,
             text: message,
             dismissible: true
         }));
