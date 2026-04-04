@@ -1,4 +1,15 @@
 export class Localization {
+    static escapeHtml(value: string): string {
+        const replacements: Record<string, string> = {
+            "&": "&amp;",
+            "<": "&lt;",
+            ">": "&gt;",
+            "\"": "&quot;",
+            "'": "&#39;"
+        };
+        return value.replace(/[&<>"']/g, character => replacements[character]);
+    }
+
     static Error = class {
         public static readonly SERVER_DISCONNECTED = "Lost connection to the SeedSync service.";
     };
@@ -25,15 +36,15 @@ export class Localization {
     static Modal = class {
         public static readonly DELETE_LOCAL_TITLE = "Delete Local File";
         public static readonly DELETE_LOCAL_MESSAGE =
-            (name: string) => `Are you sure you want to delete <b>${name}</b> from the local server?`
+            (name: string) => `Are you sure you want to delete <b>${Localization.escapeHtml(name)}</b> from the local server?`
 
         public static readonly DELETE_REMOTE_TITLE = "Delete Remote File";
         public static readonly DELETE_REMOTE_MESSAGE =
-            (name: string) => `Are you sure you want to delete <b>${name}</b> from the remote server?`
+            (name: string) => `Are you sure you want to delete <b>${Localization.escapeHtml(name)}</b> from the remote server?`
 
         public static readonly DELETE_PATH_PAIR_TITLE = "Delete Path Pair";
         public static readonly DELETE_PATH_PAIR_MESSAGE =
-            (name: string) => `Are you sure you want to delete path pair <b>${name}</b>?`
+            (name: string) => `Are you sure you want to delete path pair <b>${Localization.escapeHtml(name)}</b>?`
 
         public static readonly DELETE_LOCAL_BULK_TITLE = "Delete Local Files";
         public static readonly DELETE_LOCAL_BULK_MESSAGE =
@@ -44,7 +55,9 @@ export class Localization {
             (names: string[]) => Localization.Modal.BULK_DELETE_MESSAGE(names, "remote server")
 
         private static readonly BULK_DELETE_MESSAGE = (names: string[], location: string) => {
-            const listedNames = names.slice(0, 5).map(name => `<li><b>${name}</b></li>`).join("");
+            const listedNames = names.slice(0, 5)
+                .map(name => `<li><b>${Localization.escapeHtml(name)}</b></li>`)
+                .join("");
             const remainingCount = names.length - Math.min(names.length, 5);
             const remainingText = remainingCount > 0 ? `<br />And ${remainingCount} more file(s).` : "";
             return `Are you sure you want to delete ${names.length} selected file(s) from the ${location}?` +
