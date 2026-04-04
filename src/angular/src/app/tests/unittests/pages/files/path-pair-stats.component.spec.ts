@@ -40,6 +40,7 @@ function createViewFile(props): ViewFile {
         isDir: false,
         localSize: props.localSize || 0,
         remoteSize: props.remoteSize || 0,
+        transferredSize: props.transferredSize != null ? props.transferredSize : (props.localSize || 0),
         percentDownloaded: 0,
         status: props.status || ViewFile.Status.DEFAULT,
         downloadingSpeed: props.downloadingSpeed || 0,
@@ -163,7 +164,7 @@ describe("Testing path-pair stats component", () => {
         expect(fixture.nativeElement.querySelector(".path-pair-stats-container")).toBeNull();
     }));
 
-    it("should cap aggregate progress and completed size when local totals exceed remote totals", fakeAsync(() => {
+    it("should aggregate progress from remote-backed transferred bytes only", fakeAsync(() => {
         pathPairService.setPathPairs([
             createPathPair("overflow", "Overflow")
         ]);
@@ -174,6 +175,7 @@ describe("Testing path-pair stats component", () => {
                 pathPairName: "Overflow",
                 localSize: 700,
                 remoteSize: 500,
+                transferredSize: 100,
                 status: ViewFile.Status.DOWNLOADING,
                 downloadingSpeed: 120
             }),
@@ -183,6 +185,16 @@ describe("Testing path-pair stats component", () => {
                 pathPairName: "Overflow",
                 localSize: 400,
                 remoteSize: 300,
+                transferredSize: 200,
+                status: ViewFile.Status.DOWNLOADED
+            }),
+            createViewFile({
+                name: "local-only.mkv",
+                pathPairId: "overflow",
+                pathPairName: "Overflow",
+                localSize: 1000,
+                remoteSize: 0,
+                transferredSize: 1000,
                 status: ViewFile.Status.DOWNLOADED
             })
         ]);
@@ -193,9 +205,9 @@ describe("Testing path-pair stats component", () => {
 
         expect(component.stats.length).toBe(1);
         expect(component.stats[0].totalRemoteSize).toBe(800);
-        expect(component.stats[0].totalLocalSize).toBe(800);
-        expect(component.stats[0].etaSeconds).toBeNull();
-        expect(component.stats[0].overallProgress).toBe(100);
+        expect(component.stats[0].totalLocalSize).toBe(300);
+        expect(component.stats[0].etaSeconds).toBe(5);
+        expect(component.stats[0].overallProgress).toBe(38);
     }));
 
     it("should keep aggregate totals at zero when remote size is zero", fakeAsync(() => {

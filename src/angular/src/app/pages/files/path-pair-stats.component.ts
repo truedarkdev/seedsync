@@ -118,12 +118,25 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         let queuedCount = 0;
         let downloadedCount = 0;
         let totalRemoteSize = 0;
-        let totalLocalSize = 0;
+        let completedSize = 0;
         let totalSpeed = 0;
 
         files.forEach((file: ViewFile) => {
-            totalRemoteSize += file.remoteSize || 0;
-            totalLocalSize += file.localSize || 0;
+            const remoteSize = file.remoteSize || 0;
+            if (remoteSize <= 0) {
+                if (file.status === ViewFile.Status.DOWNLOADING) {
+                    downloadingCount++;
+                    totalSpeed += file.downloadingSpeed || 0;
+                } else if (file.status === ViewFile.Status.QUEUED) {
+                    queuedCount++;
+                } else if (file.status === ViewFile.Status.DOWNLOADED || file.status === ViewFile.Status.EXTRACTED) {
+                    downloadedCount++;
+                }
+                return;
+            }
+
+            totalRemoteSize += remoteSize;
+            completedSize += Math.min(Math.max(file.transferredSize || 0, 0), remoteSize);
 
             if (file.status === ViewFile.Status.DOWNLOADING) {
                 downloadingCount++;
@@ -135,7 +148,7 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             }
         });
 
-        const completedSize = totalRemoteSize > 0 ? Math.min(totalLocalSize, totalRemoteSize) : 0;
+        completedSize = totalRemoteSize > 0 ? Math.min(completedSize, totalRemoteSize) : 0;
         const remainingSize = Math.max(totalRemoteSize - completedSize, 0);
         const etaSeconds = totalSpeed > 0 && remainingSize > 0 ? Math.ceil(remainingSize / totalSpeed) : null;
 
