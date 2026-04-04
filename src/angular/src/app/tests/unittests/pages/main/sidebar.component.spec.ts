@@ -1,5 +1,6 @@
 import {CommonModule} from "@angular/common";
-import {ComponentFixture, TestBed} from "@angular/core/testing";
+import {ComponentFixture, fakeAsync, TestBed, tick} from "@angular/core/testing";
+import {NgZone} from "@angular/core";
 import {RouterTestingModule} from "@angular/router/testing";
 import {BehaviorSubject, of} from "rxjs";
 
@@ -141,4 +142,24 @@ describe("Testing sidebar component", () => {
         expect(labels).not.toContain("Movies");
         expect(labels).not.toContain("TV");
     });
+
+    it("should render path pair tabs after an outside-zone refresh", fakeAsync(() => {
+        fixture.autoDetectChanges(true);
+        fixture.detectChanges();
+
+        const ngZone = TestBed.inject(NgZone);
+        ngZone.runOutsideAngular(() => {
+            pathPairService.setPathPairs([
+                createPathPair("movies-id", "Movies"),
+                createPathPair("tv-id", "TV")
+            ]);
+        });
+
+        tick();
+
+        const buttons = Array.from(fixture.nativeElement.querySelectorAll("#sidebar a.button"));
+        const labels = buttons.map((button: HTMLElement) => button.textContent.trim());
+        expect(labels).toContain("Movies");
+        expect(labels).toContain("TV");
+    }));
 });
