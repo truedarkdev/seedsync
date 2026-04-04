@@ -1,6 +1,6 @@
 <div class="stats-grid" *ngIf="stats.length > 0">
     <div class="path-pair-card"
-         *ngFor="let stat of stats"
+         *ngFor="let stat of stats; trackBy: trackByPathPairId"
          [class.active]="hasActiveTransfers(stat)">
         <div class="card-header">
             <span class="pair-name">{{ stat.pathPairName }}</span>

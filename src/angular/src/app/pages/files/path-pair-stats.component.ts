@@ -69,6 +69,10 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         return stat.downloadingCount > 0 || stat.queuedCount > 0;
     }
 
+    trackByPathPairId(index: number, stat: PathPairStat): string {
+        return stat.pathPairId;
+    }
+
     formatEta(etaSeconds: number | null): string {
         if (etaSeconds === null || !isFinite(etaSeconds) || etaSeconds <= 0) {
             return "";
