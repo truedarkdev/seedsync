@@ -1,6 +1,6 @@
 import {CommonModule} from "@angular/common";
 import {Component} from "@angular/core";
-import {ComponentFixture, TestBed} from "@angular/core/testing";
+import {ComponentFixture, fakeAsync, TestBed, tick} from "@angular/core/testing";
 import {BehaviorSubject} from "rxjs";
 
 import {FilesPageComponent} from "../../../../pages/files/files-page.component";
@@ -119,6 +119,72 @@ describe("Testing files page component", () => {
         expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
     });
+
+    it("stays empty on the dashboard until path-pair data resolves, then shows overview", fakeAsync(() => {
+        route.setParams({});
+
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith(null);
+        expect(fixture.nativeElement.querySelector("app-path-pair-stats")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
+
+        setTimeout(() => pathPairService.setPathPairs([]), 0);
+        tick();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+
+        setTimeout(() => {
+            pathPairService.setPathPairs([
+                createPathPair("movies", "Movies"),
+                createPathPair("tv", "TV")
+            ]);
+        }, 0);
+
+        tick();
+
+        expect(component.showOverview).toBe(true);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+    }));
+
+    it("stays empty on explicit dashboard path-pair routes until path-pair data resolves, then shows the filtered detail view", fakeAsync(() => {
+        route.setParams({pathPairId: "movies"});
+
+        fixture.detectChanges();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith(null);
+        expect(fixture.nativeElement.querySelector("app-path-pair-stats")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
+
+        setTimeout(() => pathPairService.setPathPairs([]), 0);
+        tick();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(false);
+        expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+
+        setTimeout(() => {
+            pathPairService.setPathPairs([
+                createPathPair("movies-id", "Movies"),
+                createPathPair("tv-id", "TV")
+            ]);
+        }, 0);
+
+        tick();
+
+        expect(component.showOverview).toBe(false);
+        expect(component.showDetailView).toBe(true);
+        expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe("movies-id");
+    }));
 
     it("resolves dashboard detail routes from either the slug or the ID", () => {
         pathPairService.setPathPairs([
