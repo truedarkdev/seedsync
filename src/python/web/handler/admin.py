@@ -50,22 +50,6 @@ class AdminHandler(IHandler):
             required_scope="read",
             allow_browser_api_key_entry=True
         )
-        web_app.add_handler(
-            "/server/admin/migration/v1",
-            self.__handle_get_migration_state,
-            required_scope="admin",
-            allow_first_admin_bootstrap=True
-        )
-        web_app.add_post_handler(
-            "/server/admin/migration/v1/legacy-api-token/disable",
-            self.__handle_disable_legacy_token,
-            required_scope="admin"
-        )
-        web_app.add_post_handler(
-            "/server/admin/migration/v1/legacy-api-token/clear",
-            self.__handle_clear_legacy_token,
-            required_scope="admin"
-        )
 
         web_app.add_handler("/server/admin/api-keys/v1", self.__handle_list_api_keys, required_scope="admin")
         web_app.add_post_handler("/server/admin/api-keys/v1", self.__handle_create_api_key, required_scope="admin")
@@ -81,9 +65,6 @@ class AdminHandler(IHandler):
             self.__handle_rotate_api_key,
             required_scope="admin"
         )
-
-    def __handle_get_migration_state(self):
-        return self.__json_response(self.__auth_store.get_migration_state(self.__config))
 
     def __handle_exchange_bootstrap_proof(self):
         if self.__auth_store.active_admin_key_count > 0:
@@ -185,15 +166,6 @@ class AdminHandler(IHandler):
             return response
         except (TypeError, ValueError, KeyError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
-
-    def __handle_disable_legacy_token(self):
-        self.__auth_store.set_legacy_api_token_compatibility_enabled(False)
-        return self.__json_response(self.__auth_store.get_migration_state(self.__config))
-
-    def __handle_clear_legacy_token(self):
-        self.__config.general.api_token = ""
-        self.__auth_store.set_legacy_api_token_compatibility_enabled(False)
-        return self.__json_response(self.__auth_store.get_migration_state(self.__config))
 
     def __handle_list_api_keys(self):
         include_revoked = AdminHandler.__query_flag("include_revoked")

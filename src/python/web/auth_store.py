@@ -141,13 +141,11 @@ class ApiKeyStore(Persist):
     __KEY_VERSION = "version"
     __KEY_API_KEYS = "api_keys"
     __KEY_UI_SESSIONS = "ui_sessions"
-    __KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED = "legacy_api_token_compatibility_enabled"
     __KEY_BROWSER_HANDOVER_CLAIMED_VERSION = "browser_handover_claimed_version"
 
     def __init__(self, file_path: Optional[str] = None):
         self.__file_path = file_path
         self.__api_keys: List[ApiKeyRecord] = []
-        self.__legacy_api_token_compatibility_enabled = True
         self.__ui_sessions: Dict[str, UiSessionRecord] = {}
         self.__browser_handover_claimed_version = ""
         self.__state_lock = threading.RLock()
@@ -165,16 +163,6 @@ class ApiKeyStore(Persist):
     def bind_bootstrap_proof_path(self, file_path: str) -> None:
         self.__bootstrap_proof_path = file_path
         self.__sync_bootstrap_proof_artifact()
-
-    @property
-    def legacy_api_token_compatibility_enabled(self) -> bool:
-        return self.__legacy_api_token_compatibility_enabled
-
-    def set_legacy_api_token_compatibility_enabled(self, enabled: bool) -> None:
-        if type(enabled) is not bool:
-            raise ValueError("Legacy API token compatibility must be a boolean value")
-        self.__legacy_api_token_compatibility_enabled = enabled
-        self.save()
 
     @property
     def api_keys(self) -> List[ApiKeyRecord]:
@@ -499,36 +487,6 @@ class ApiKeyStore(Persist):
         self.save()
         return {"record": record, "secret": secret}
 
-    def get_migration_state(self, config) -> Dict[str, object]:
-        general_config = getattr(config, "general", None)
-        legacy_api_token = getattr(general_config, "api_token", None) if general_config is not None else None
-        browser_handover_state = self.get_browser_handover_state(config)
-        legacy_configured = isinstance(legacy_api_token, str) and legacy_api_token.strip() != ""
-        if not legacy_configured:
-            legacy_state = "cleared"
-        elif self.__legacy_api_token_compatibility_enabled:
-            legacy_state = "enabled"
-        else:
-            legacy_state = "disabled"
-
-        active_keys = [record for record in self.__api_keys if not record.is_revoked]
-        active_admin_keys = [record for record in active_keys if "admin" in record.scopes]
-        return {
-            "legacy_api_token": {
-                "configured": legacy_configured,
-                "compatibility_enabled": self.__legacy_api_token_compatibility_enabled,
-                "state": legacy_state,
-                "accepted_for_external_non_admin": legacy_configured and self.__legacy_api_token_compatibility_enabled,
-            },
-            "api_keys": {
-                "total": len(self.__api_keys),
-                "active": len(active_keys),
-                "active_admin": len(active_admin_keys),
-                "revoked": len(self.__api_keys) - len(active_keys),
-            },
-            "browser_handover": browser_handover_state,
-        }
-
     def save(self):
         if self.__file_path is None:
             return
@@ -559,13 +517,6 @@ class ApiKeyStore(Persist):
             raise PersistError("Invalid API key store JSON: version must be an integer")
         if version < 1:
             raise PersistError("Invalid API key store JSON: version must be at least 1")
-
-        legacy_compatibility = payload.get(cls.__KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED, True)
-        if type(legacy_compatibility) is not bool:
-            raise PersistError(
-                "Invalid API key store JSON: legacy_api_token_compatibility_enabled must be a boolean"
-            )
-        store.__legacy_api_token_compatibility_enabled = legacy_compatibility
 
         claimed_version = payload.get(cls.__KEY_BROWSER_HANDOVER_CLAIMED_VERSION, "")
         if claimed_version is None:
@@ -637,7 +588,6 @@ class ApiKeyStore(Persist):
         self.__prune_bootstrap_exchange(now)
         payload = {
             self.__KEY_VERSION: 2,
-            self.__KEY_LEGACY_TOKEN_COMPATIBILITY_ENABLED: self.__legacy_api_token_compatibility_enabled,
             self.__KEY_API_KEYS: [asdict(record) for record in self.__api_keys],
             self.__KEY_UI_SESSIONS: [
                 asdict(record)

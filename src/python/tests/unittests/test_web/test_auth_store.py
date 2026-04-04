@@ -5,7 +5,6 @@ import json
 import threading
 
 from web.auth_store import ApiKeyStore
-from common import PersistError
 
 
 class TestApiKeyStore(unittest.TestCase):
@@ -54,7 +53,6 @@ class TestApiKeyStore(unittest.TestCase):
             reloaded = ApiKeyStore.from_file(store_path)
             self.assertEqual(0, len(reloaded.list_api_keys()))
             self.assertEqual(0, len(reloaded.list_api_keys(include_revoked=True)))
-            self.assertTrue(reloaded.legacy_api_token_compatibility_enabled)
 
     def test_delete_api_key_rejects_active_keys(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -69,23 +67,16 @@ class TestApiKeyStore(unittest.TestCase):
             self.assertEqual(created["record"].id, deleted.id)
             self.assertIsNone(store.get_api_key(created["record"].id))
 
-    def test_legacy_compatibility_flag_is_persisted(self):
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store_path = os.path.join(temp_dir, "api-keys.json")
-            store = ApiKeyStore(file_path=store_path)
-            store.set_legacy_api_token_compatibility_enabled(False)
+    def test_obsolete_token_marker_is_ignored_on_load(self):
+        store = ApiKeyStore.from_str("""
+        {
+          "obsolete_token_marker": "false",
+          "api_keys": []
+        }
+        """)
 
-            reloaded = ApiKeyStore.from_file(store_path)
-            self.assertFalse(reloaded.legacy_api_token_compatibility_enabled)
-
-    def test_legacy_compatibility_flag_loader_requires_boolean(self):
-        with self.assertRaises(PersistError):
-            ApiKeyStore.from_str("""
-            {
-              "legacy_api_token_compatibility_enabled": "false",
-              "api_keys": []
-            }
-            """)
+        self.assertEqual(0, len(store.list_api_keys()))
+        self.assertEqual(0, store.active_admin_key_count)
 
     def test_bootstrap_proof_is_created_published_consumed_and_not_replayed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -210,12 +201,11 @@ class TestApiKeyStore(unittest.TestCase):
     def test_version_1_payload_without_browser_handover_state_still_loads(self):
         payload = {
             "version": 1,
-            "legacy_api_token_compatibility_enabled": True,
+            "obsolete_token_marker": True,
             "api_keys": [],
         }
 
         store = ApiKeyStore.from_str(json.dumps(payload))
 
-        self.assertTrue(store.legacy_api_token_compatibility_enabled)
         self.assertEqual(0, store.active_admin_key_count)
         self.assertTrue(store.can_claim_initial_admin(""))

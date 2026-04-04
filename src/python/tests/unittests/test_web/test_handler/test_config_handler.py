@@ -203,7 +203,6 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.context.args.html_path = "C:\\Git\\seedsync\\src\\python\\tests"
         self.context.status = MagicMock()
         self.context.config = Config()
-        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
         self.auth_store = ApiKeyStore()
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
 
@@ -285,12 +284,12 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual(404, status_code)
         self.assertIsNone(config.general.debug)
 
-    def test_get_route_rejects_legacy_token_even_when_compatibility_is_enabled(self):
+    def test_get_route_rejects_legacy_token(self):
         auth_store = ApiKeyStore()
         web_app = WebApp(self.context, MagicMock(), auth_store=auth_store)
         ConfigHandler(Config()).add_routes(web_app)
 
         status_code, body = _invoke_get_route(web_app, "/server/config/get", api_token=LEGACY_TEST_API_TOKEN)
 
-        self.assertEqual(403, status_code)
-        self.assertIn("Legacy general.api_token cannot access this route", body)
+        self.assertEqual(401, status_code)
+        self.assertIn("Invalid API token", body)

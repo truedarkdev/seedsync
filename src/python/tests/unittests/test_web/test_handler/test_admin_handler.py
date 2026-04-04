@@ -25,7 +25,6 @@ class TestAdminHandler(unittest.TestCase):
         self.context.args.html_path = self.temp_dir
         self.context.status = MagicMock()
         self.context.config = Config()
-        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
 
         self.auth_store = ApiKeyStore(file_path=self.store_path)
         created = self.auth_store.create_api_key("admin", ["admin"])
@@ -64,13 +63,13 @@ class TestAdminHandler(unittest.TestCase):
 
     def test_legacy_token_is_rejected_for_admin_routes(self):
         resp = self.test_app.get(
-            "/server/admin/migration/v1",
+            "/server/admin/api-keys/v1",
             extra_environ=self._auth_headers(LEGACY_TEST_API_TOKEN),
             expect_errors=True
         )
 
-        self.assertEqual(403, resp.status_int)
-        self.assertIn("Legacy general.api_token cannot access admin endpoints", str(resp.html))
+        self.assertEqual(401, resp.status_int)
+        self.assertIn("Invalid API token", str(resp.html))
 
     def test_first_admin_bootstrap_requires_trusted_local_browser_and_same_origin_signal(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys.json"))
@@ -165,27 +164,11 @@ class TestAdminHandler(unittest.TestCase):
         stale_bootstrap_cookie = "seedsync_ui_session={}".format(stale_bootstrap_session.secret)
 
         rejected_remote = test_app.get(
-            "/server/admin/migration/v1",
+            "/server/admin/api-keys/v1",
             extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "203.0.113.10"},
             expect_errors=True
         )
         self.assertEqual(401, rejected_remote.status_int)
-
-        prebootstrap_migration = test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ=self._same_origin_headers(),
-        )
-        prebootstrap_payload = json.loads(prebootstrap_migration.text)
-        self.assertEqual(200, prebootstrap_migration.status_int)
-        self.assertEqual(0, prebootstrap_payload["api_keys"]["active"])
-
-        prebootstrap_migration_with_stale_cookie = test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": stale_bootstrap_cookie},
-        )
-        prebootstrap_stale_payload = json.loads(prebootstrap_migration_with_stale_cookie.text)
-        self.assertEqual(200, prebootstrap_migration_with_stale_cookie.status_int)
-        self.assertEqual(0, prebootstrap_stale_payload["api_keys"]["active"])
 
         bootstrap_page = test_app.get(
             "/bootstrap",
@@ -194,6 +177,8 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, bootstrap_page.status_int)
         self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
+        self.assertEqual(0, empty_store.active_admin_key_count)
+        self.assertTrue(empty_store.get_browser_handover_state(self.context.config)["open"])
 
         allowed = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
@@ -210,14 +195,6 @@ class TestAdminHandler(unittest.TestCase):
         self.assertNotEqual(limited_cookie, upgraded_cookie)
         self.assertIn("browser_handover", allowed_payload)
         self.assertFalse(allowed_payload["browser_handover"]["open"])
-
-        refreshed_migration = test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": upgraded_cookie}
-        )
-        payload = json.loads(refreshed_migration.text)
-        self.assertEqual(200, refreshed_migration.status_int)
-        self.assertEqual(1, payload["api_keys"]["active"])
 
         authorized_admin_list = test_app.get(
             "/server/admin/api-keys/v1",
@@ -250,15 +227,8 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, bootstrap_page.status_int)
         self.assertEqual("", bootstrap_page.headers.get("Set-Cookie", ""))
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", bootstrap_page.text)
-
-        migration_response = test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ=trusted_browser_headers,
-        )
-        migration_payload = json.loads(migration_response.text)
-        self.assertEqual(200, migration_response.status_int)
-        self.assertEqual(0, migration_payload["api_keys"]["active"])
-        self.assertTrue(migration_payload["browser_handover"]["open"])
+        self.assertEqual(0, empty_store.active_admin_key_count)
+        self.assertTrue(empty_store.get_browser_handover_state(self.context.config)["open"])
 
         bootstrap_response = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
@@ -404,6 +374,7 @@ class TestAdminHandler(unittest.TestCase):
         store.create_api_key("reader-writer", ["read", "write", "stream"])
         web_app = WebApp(self.context, MagicMock(), auth_store=store)
         AdminHandler(self.context.config, store).add_routes(web_app)
+        web_app.add_default_routes()
         test_app = TestApp(web_app)
 
         trusted_browser_headers = {
@@ -413,14 +384,13 @@ class TestAdminHandler(unittest.TestCase):
             "HTTP_REFERER": "http://localhost:8800/settings",
         }
 
-        migration_response = test_app.get(
-            "/server/admin/migration/v1",
+        bootstrap_page = test_app.get(
+            "/bootstrap",
             extra_environ=trusted_browser_headers,
         )
-        migration_payload = json.loads(migration_response.text)
-        self.assertEqual(200, migration_response.status_int)
-        self.assertEqual(1, migration_payload["api_keys"]["active"])
-        self.assertTrue(migration_payload["browser_handover"]["open"])
+        self.assertEqual(200, bootstrap_page.status_int)
+        self.assertEqual(0, store.active_admin_key_count)
+        self.assertTrue(store.get_browser_handover_state(self.context.config)["open"])
 
     def test_first_admin_bootstrap_is_not_available_after_admin_exists(self):
         resp = self.test_app.post_json(
@@ -431,20 +401,6 @@ class TestAdminHandler(unittest.TestCase):
         )
 
         self.assertEqual(401, resp.status_int)
-
-    def test_migration_state_reports_legacy_compatibility(self):
-        resp = self.test_app.get(
-            "/server/admin/migration/v1",
-            extra_environ=self._auth_headers(self.admin_secret)
-        )
-
-        payload = json.loads(resp.text)
-        self.assertEqual(200, resp.status_int)
-        self.assertTrue(payload["legacy_api_token"]["configured"])
-        self.assertTrue(payload["legacy_api_token"]["compatibility_enabled"])
-        self.assertEqual("enabled", payload["legacy_api_token"]["state"])
-        self.assertEqual(1, payload["api_keys"]["active"])
-        self.assertEqual(1, payload["api_keys"]["active_admin"])
 
     def test_create_update_rotate_revoke_key_routes_work(self):
         create_resp = self.test_app.post_json(
@@ -550,19 +506,12 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(400, delete_active_resp.status_int)
         self.assertIn("Cannot delete an active API key", delete_active_resp.text)
 
-    def test_disable_and_clear_legacy_token_routes_update_state(self):
-        disable_resp = self.test_app.post(
-            "/server/admin/migration/v1/legacy-api-token/disable",
-            extra_environ=self._auth_headers(self.admin_secret)
-        )
-        disabled = json.loads(disable_resp.text)
-        self.assertFalse(disabled["legacy_api_token"]["compatibility_enabled"])
+    def test_legacy_migration_routes_are_removed(self):
+        get_resp = self.test_app.get("/server/admin/migration/v1", expect_errors=True)
+        self.assertEqual(404, get_resp.status_int)
 
-        clear_resp = self.test_app.post(
-            "/server/admin/migration/v1/legacy-api-token/clear",
-            extra_environ=self._auth_headers(self.admin_secret)
-        )
-        cleared = json.loads(clear_resp.text)
-        self.assertFalse(cleared["legacy_api_token"]["configured"])
-        self.assertFalse(cleared["legacy_api_token"]["compatibility_enabled"])
-        self.assertEqual("", self.context.config.general.api_token)
+        disable_resp = self.test_app.post("/server/admin/migration/v1/legacy-api-token/disable", expect_errors=True)
+        self.assertEqual(404, disable_resp.status_int)
+
+        clear_resp = self.test_app.post("/server/admin/migration/v1/legacy-api-token/clear", expect_errors=True)
+        self.assertEqual(404, clear_resp.status_int)

@@ -114,7 +114,6 @@ class WebApp(bottle.Bottle):
 
             self.__authorize_server_route(
                 required_scope,
-                bool(route.config.get("allow_legacy_api_token", False)),
                 bool(route.config.get("allow_sessionless_ui", False)),
                 bool(route.config.get("allow_first_admin_bootstrap", False)),
                 bool(route.config.get("allow_bootstrap_proof_exchange", False)),
@@ -136,7 +135,6 @@ class WebApp(bottle.Bottle):
         self.get(
             "/server/stream",
             required_scope="stream",
-            allow_legacy_api_token=True,
             allow_sessionless_ui=True,
         )(self.__web_stream)
 
@@ -182,7 +180,6 @@ class WebApp(bottle.Bottle):
 
     def route(self, path=None, method="GET", callback=None, name=None, apply=None, skip=None,
               required_scope: Optional[str] = None,
-              allow_legacy_api_token: bool = False,
               allow_sessionless_ui: bool = False,
               allow_first_admin_bootstrap: bool = False,
               allow_bootstrap_proof_exchange: bool = False,
@@ -198,7 +195,6 @@ class WebApp(bottle.Bottle):
                 raise ValueError("allow_sessionless_ui is only supported for read/stream /server routes")
             config["required_scope"] = normalized_scope
             for flag_name, flag_value in {
-                "allow_legacy_api_token": allow_legacy_api_token,
                 "allow_sessionless_ui": allow_sessionless_ui,
                 "allow_first_admin_bootstrap": allow_first_admin_bootstrap,
                 "allow_bootstrap_proof_exchange": allow_bootstrap_proof_exchange,
@@ -269,13 +265,6 @@ class WebApp(bottle.Bottle):
             return None
         token = auth_header[len("Bearer "):].strip()
         return token if token else None
-
-    def __get_legacy_api_token(self) -> Optional[str]:
-        general_config = getattr(self.__config, "general", None)
-        if general_config is None:
-            return None
-        api_token = getattr(general_config, "api_token", None)
-        return api_token if isinstance(api_token, str) and api_token.strip() else None
 
     @staticmethod
     def __has_bearer_authorization_header() -> bool:
@@ -434,8 +423,6 @@ class WebApp(bottle.Bottle):
             sec_fetch_site = sec_fetch_site.strip().lower()
             if sec_fetch_site not in {"same-origin", "none"}:
                 return False
-            if sec_fetch_site == "same-origin":
-                return True
 
         origin = WebApp.__parse_origin(bottle.request.get_header("Origin", ""))
         if origin is not None:
@@ -606,7 +593,6 @@ class WebApp(bottle.Bottle):
     def __authorize_server_route(
         self,
         required_scope: str,
-        allow_legacy_api_token: bool,
         allow_sessionless_ui: bool,
         allow_first_admin_bootstrap: bool,
         allow_bootstrap_proof_exchange: bool,
@@ -619,12 +605,13 @@ class WebApp(bottle.Bottle):
                     return
                 if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
                     return
-                ui_session_scopes = self.__get_ui_session_scopes()
-                if ui_session_scopes is not None:
-                    if required_scope in {"write", "admin"} and not self.__is_same_origin_browser_request():
-                        bottle.abort(403, "Browser-origin signal required for cookie-authenticated write requests")
-                    self.__authorize_scopes(required_scope, ui_session_scopes)
-                    return
+                if self.__is_trusted_forwarded_origin_source():
+                    ui_session_scopes = self.__get_ui_session_scopes()
+                    if ui_session_scopes is not None:
+                        if required_scope in {"write", "admin"} and not self.__is_same_origin_browser_request():
+                            bottle.abort(403, "Browser-origin signal required for cookie-authenticated write requests")
+                        self.__authorize_scopes(required_scope, ui_session_scopes)
+                        return
                 if allow_sessionless_ui and self.__allow_sessionless_ui_route():
                     return
                 if allow_browser_api_key_entry and self.__allow_browser_api_key_entry():
@@ -646,16 +633,6 @@ class WebApp(bottle.Bottle):
             )
             return
 
-        legacy_token = self.__get_legacy_api_token()
-        if legacy_token is not None and token == legacy_token:
-            if not allow_legacy_api_token:
-                if required_scope == "admin":
-                    bottle.abort(403, "Legacy general.api_token cannot access admin endpoints")
-                bottle.abort(403, "Legacy general.api_token cannot access this route")
-            if self.__auth_store is not None and not self.__auth_store.legacy_api_token_compatibility_enabled:
-                bottle.abort(403, "Legacy general.api_token compatibility has been disabled")
-            return
-
         bottle.abort(401, "Invalid API token")
 
     def __get_ui_session_scopes(self):
@@ -663,15 +640,21 @@ class WebApp(bottle.Bottle):
         if session is None:
             return None
 
-        resolved_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
-        if resolved_api_key is not None:
-            auth_record = resolved_api_key(session)
-            if auth_record is not None:
-                return list(getattr(auth_record, "scopes", []) or [])
-            if getattr(session, "api_key_id", None):
+        if getattr(session, "api_key_id", None):
+            resolved_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
+            if resolved_api_key is None:
                 return None
 
-        return getattr(session, "scopes", None)
+            auth_record = resolved_api_key(session)
+            if auth_record is None:
+                return None
+
+            return list(getattr(auth_record, "scopes", []) or [])
+
+        if getattr(session, "bootstrap", False):
+            return getattr(session, "scopes", None)
+
+        return None
 
     def __get_ui_session(self):
         if self.__auth_store is None:
