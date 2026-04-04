@@ -154,6 +154,21 @@ class TestController(unittest.TestCase):
             [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
         )
 
+    @patch("controller.controller.datetime")
+    def test_update_model_schedules_healthy_status_poll_about_200ms_out(self, datetime_mock):
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        now = datetime(2026, 4, 4, 12, 0, 0)
+        datetime_mock.now.return_value = now
+        self.controller._Controller__lftp.status.return_value = [status]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(
+            now + timedelta(milliseconds=200),
+            self.controller._Controller__next_lftp_status_poll_at
+        )
+        self.assertFalse(self.controller._Controller__lftp_status_poll_retry_active)
+
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True
         self.controller._Controller__lftp.exit.side_effect = LftpError("teardown failed")
