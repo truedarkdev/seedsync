@@ -41,7 +41,7 @@ Freshness rule:
 | Host Angular/Karma full-suite proof | Healthy for host comparison only | Node 24 host Angular/Karma suite completes successfully. | Comparison evidence only; not the supported closure lane. Fresh as of 2026-04-01. |
 | Dockerized Angular build/test | Healthy | Dockerized Angular verifier path passes after the current frontend compatibility updates. | Supported frontend closure lane. Fresh as of 2026-04-01. |
 | Angular sidebar path-pair refresh UI | Healthy | Targeted Angular spec plus live Docker/Playwright proof for immediate path-pair visibility on load and reload. | Fresh as of 2026-04-04. |
-| Angular dashboard path-pair startup UI | Healthy | Targeted Angular spec plus live Docker/Playwright proof for correct dashboard startup routing and render. | Fresh as of 2026-04-04. |
+| Angular dashboard path-pair startup UI | Healthy | Targeted Angular spec plus live Docker/Playwright proof for correct dashboard startup routing and render, direct path-pair cards, responsive 3/2/1 layout, and ETA visibility on active cards only. | Fresh as of 2026-04-04. |
 | Angular API access UI/service lanes | Healthy | Targeted Angular specs plus live Docker/Playwright proof for API Access create, edit, rotate, revoke, legacy disable/clear, and revoked-key cleanup flows. | Fresh as of 2026-04-04. |
 | Legacy Protractor/e2e | Flaky | Docker compose startup and targeted legacy slices still pass, but the broader lane is not closure evidence. | Keep separate from the supported Angular closure path. |
 | Native Windows Poetry path | Blocked | Local Windows Python is outside the repo-supported Poetry range. | Do not treat this host path as proof here. |
