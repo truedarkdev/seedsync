@@ -100,8 +100,9 @@ class Controller:
 
     @staticmethod
     def __lftp_status_refresh_timing(interval_ms_downloading_scan: int):
-        # Keep the retry window close to the downloading scan cadence so a
-        # brief lftp hiccup does not pin a finished transfer in a stale state.
+        # Keep the unhealthy retry window close to the downloading scan
+        # cadence so a brief lftp hiccup does not pin a finished transfer in
+        # a stale state.
         lftp_status_poll_retry_seconds = max(1, int(interval_ms_downloading_scan / 1000))
         lftp_status_cache_max_age_seconds = max(3, lftp_status_poll_retry_seconds * 3)
         return lftp_status_poll_retry_seconds, lftp_status_cache_max_age_seconds
@@ -979,9 +980,10 @@ class Controller:
                     self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
                         seconds=self.__lftp_status_cache_max_age_seconds
                     )
-                    # Keep healthy polls from hammering lftp on every controller tick.
+                    # Keep healthy polls responsive without hammering lftp on
+                    # every controller tick.
                     self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
-                        seconds=self.__lftp_status_poll_retry_seconds
+                        milliseconds=200
                     )
                     lftp_status_source = "fresh_healthy"
                 else:
