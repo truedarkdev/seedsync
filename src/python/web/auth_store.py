@@ -122,6 +122,11 @@ class UiSessionRecord:
     api_key_id: Optional[str] = None
     api_key_secret_hash: Optional[str] = None
 
+    def cookie_max_age_seconds(self) -> int:
+        created_at = datetime.fromisoformat(self.created_at)
+        expires_at = datetime.fromisoformat(self.expires_at)
+        return max(0, int((expires_at - created_at).total_seconds()))
+
 
 @dataclass
 class BootstrapProofRecord:

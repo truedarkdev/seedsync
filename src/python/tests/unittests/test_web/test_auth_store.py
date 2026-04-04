@@ -146,6 +146,7 @@ class TestApiKeyStore(unittest.TestCase):
             self.assertTrue(os.path.isfile(store_path))
             self.assertIsNotNone(store.find_ui_session_by_secret(session.secret))
             self.assertEqual(record.id, store.resolve_ui_session_api_key(session).id)
+            self.assertEqual(12 * 60 * 60, session.cookie_max_age_seconds())
 
             updated = store.update_api_key(record.id, scopes=["admin", "read", "stream"])
             self.assertEqual(["admin", "read", "stream"], updated.scopes)

@@ -186,11 +186,13 @@ class TestAdminHandler(unittest.TestCase):
             extra_environ={**self._same_origin_headers(), "HTTP_COOKIE": stale_bootstrap_cookie}
         )
         allowed_payload = json.loads(allowed.text)
+        allowed_cookie = allowed.headers.get("Set-Cookie", "")
         upgraded_cookie = allowed.headers.get("Set-Cookie", "").split(";", 1)[0]
         self.assertEqual(201, allowed.status_int)
         self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
         self.assertIn("secret", allowed_payload)
         self.assertIn("seedsync_ui_session=", upgraded_cookie)
+        self.assertIn("Max-Age=43200", allowed_cookie)
         self.assertNotEqual("", upgraded_cookie)
         self.assertNotEqual(limited_cookie, upgraded_cookie)
         self.assertIn("browser_handover", allowed_payload)
@@ -243,6 +245,8 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIn("browser_handover", bootstrap_payload)
         self.assertFalse(bootstrap_payload["browser_handover"]["open"])
         self.assertIn("seedsync_ui_session=", admin_cookie)
+        self.assertIn("Max-Age=43200", bootstrap_response.headers.get("Set-Cookie", ""))
+        self.assertIn("HttpOnly", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertEqual(1, empty_store.active_admin_key_count)
 
     def test_remember_browser_session_route_issues_cookie_for_existing_api_key(self):
@@ -261,6 +265,8 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIn("browser_handover", payload)
         self.assertFalse(payload["browser_handover"]["open"])
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertIn("Max-Age=43200", response.headers.get("Set-Cookie", ""))
+        self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
 
     def test_bootstrap_proof_exchange_rejects_non_same_origin_requests(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-reject-non-origin.json"))
@@ -328,6 +334,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(401, replay_exchange.status_int)
         self.assertIn("Missing API token", replay_exchange.text)
         self.assertIn("seedsync_ui_session=", first_exchange.headers.get("Set-Cookie", ""))
+        self.assertIn("Max-Age=43200", first_exchange.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", first_exchange.headers.get("Set-Cookie", ""))
         self.assertNotIn("session_secret", json.loads(first_exchange.text))
 

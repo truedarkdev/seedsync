@@ -102,6 +102,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
         except (TypeError, ValueError) as exc:
@@ -132,6 +133,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
         except (TypeError, ValueError) as exc:
@@ -162,6 +164,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
         except (TypeError, ValueError, KeyError) as exc:
