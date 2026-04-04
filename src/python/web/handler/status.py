@@ -17,7 +17,6 @@ class StatusHandler(IHandler):
             "/server/status",
             self.__handle_get_status,
             required_scope="read",
-            allow_legacy_api_token=True,
             allow_sessionless_ui=True
         )
 

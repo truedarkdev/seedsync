@@ -18,8 +18,7 @@ class AutoQueueHandler(IHandler):
         web_app.add_handler(
             "/server/autoqueue/get",
             self.__handle_get_autoqueue,
-            required_scope="read",
-            allow_legacy_api_token=True
+            required_scope="read"
         )
         web_app.add_post_handler(
             "/server/autoqueue/add/<pattern>",

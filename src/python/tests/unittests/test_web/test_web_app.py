@@ -155,6 +155,11 @@ class TestWebAppStream(unittest.TestCase):
 
 
 class TestWebAppHostValidation(unittest.TestCase):
+    def setUp(self):
+        self.auth_store = ApiKeyStore()
+        created_admin = self.auth_store.create_api_key("unit-admin", ["admin"])
+        self.admin_secret = created_admin["secret"]
+
     def _make_web_app(self, allowed_hostname: str):
         context = MagicMock()
         context.logger.getChild.return_value = MagicMock()
@@ -162,8 +167,7 @@ class TestWebAppHostValidation(unittest.TestCase):
         context.status = MagicMock()
         context.config = Config()
         context.config.general.allowed_hostname = allowed_hostname
-        context.config.general.api_token = LEGACY_TEST_API_TOKEN
-        return WebApp(context, MagicMock())
+        return WebApp(context, MagicMock(), auth_store=self.auth_store)
 
     def test_normalizes_hostname_values_for_compare(self):
         self.assertEqual("myapp.local", WebApp._WebApp__normalize_hostname("  MyApp.Local.  "))
@@ -171,66 +175,66 @@ class TestWebAppHostValidation(unittest.TestCase):
     def test_allows_localhost_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("  MyApp.Local.  ")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "localhost:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_exact_server_path_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("myapp.local")
 
-        @web_app.route("/server", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server", required_scope="read")
         def _server_root():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server", extra_environ={"HTTP_HOST": "myapp.local:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_configured_hostname_with_normalization(self):
         web_app = self._make_web_app("  MyApp.Local.  ")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "MYAPP.LOCAL.:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_ipv6_literal_when_configured_without_brackets(self):
         web_app = self._make_web_app("::1")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_allows_ipv6_literal_when_configured_with_brackets(self):
         web_app = self._make_web_app("[::1]")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "[::1]:8800"})
         self.assertEqual(200, response.status_int)
 
     def test_rejects_unlisted_hostname_when_allowed_hostname_is_configured(self):
         web_app = self._make_web_app("myapp.local")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get(
             "/server/ping",
             extra_environ={"HTTP_HOST": "evil.example:8800"},
@@ -241,11 +245,11 @@ class TestWebAppHostValidation(unittest.TestCase):
     def test_allows_any_hostname_when_not_configured(self):
         web_app = self._make_web_app("")
 
-        @web_app.route("/server/ping", required_scope="read", allow_legacy_api_token=True)
+        @web_app.route("/server/ping", required_scope="read")
         def _ping():
             return "pong"
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/ping", extra_environ={"HTTP_HOST": "evil.example:8800"})
         self.assertEqual(200, response.status_int)
 
@@ -253,7 +257,7 @@ class TestWebAppHostValidation(unittest.TestCase):
         web_app = self._make_web_app("")
         web_app.add_default_routes()
 
-        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)})
+        client = TestApp(web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.admin_secret)})
         response = client.get("/server/not-registered", expect_errors=True)
 
         self.assertEqual(404, response.status_int)
@@ -266,9 +270,9 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.context.args.html_path = "/tmp"
         self.context.status = MagicMock()
         self.context.config = Config()
-        self.context.config.general.api_token = LEGACY_TEST_API_TOKEN
         self.auth_store = ApiKeyStore()
         created_admin = self.auth_store.create_api_key("unit-admin", ["admin"])
+        self.admin_key_id = created_admin["record"].id
         self.admin_secret = created_admin["secret"]
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
         AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
@@ -432,9 +436,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("text/event-stream", response.headers["Content-Type"])
 
-    def test_stream_rejects_legacy_token_when_compatibility_is_disabled(self):
+    def test_stream_rejects_legacy_token(self):
         self.web_app.add_default_routes()
-        self.auth_store.set_legacy_api_token_compatibility_enabled(False)
         client = TestApp(self.web_app)
 
         response = client.get(
@@ -443,8 +446,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             expect_errors=True
         )
 
-        self.assertEqual(403, response.status_int)
-        self.assertIn("compatibility has been disabled", response.text)
+        self.assertEqual(401, response.status_int)
+        self.assertIn("Invalid API token", response.text)
 
     def test_legacy_token_is_rejected_for_sensitive_config_get(self):
         @self.web_app.route("/server/config/get", required_scope="read")
@@ -458,21 +461,23 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             expect_errors=True
         )
 
-        self.assertEqual(403, response.status_int)
-        self.assertIn("cannot access this route", response.text)
+        self.assertEqual(401, response.status_int)
+        self.assertIn("Invalid API token", response.text)
 
-    def test_legacy_token_is_allowed_only_when_route_opted_in(self):
-        @self.web_app.route("/server/status", required_scope="read", allow_legacy_api_token=True)
+    def test_legacy_token_is_rejected_for_read_route(self):
+        @self.web_app.route("/server/status", required_scope="read")
         def _status():
             return "ok"
 
         client = TestApp(self.web_app)
         response = client.get(
             "/server/status",
-            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)}
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(LEGACY_TEST_API_TOKEN)},
+            expect_errors=True
         )
 
-        self.assertEqual(200, response.status_int)
+        self.assertEqual(401, response.status_int)
+        self.assertIn("Invalid API token", response.text)
 
     def test_server_routes_still_require_auth_when_allowed_hostname_is_blank(self):
         @self.web_app.route("/server/ping", required_scope="read")
@@ -527,7 +532,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 "/",
                 extra_environ=self._same_origin_headers(),
             )
-            admin_response = client.get("/server/admin/migration/v1", extra_environ=self._same_origin_headers())
+            admin_response = client.get("/server/admin/api-keys/v1", extra_environ=self._same_origin_headers())
 
         self.assertEqual(302, response.status_int)
         self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
@@ -546,7 +551,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, shell_response.status_int)
         self.assertIn("<html></html>", shell_response.text)
         self.assertEqual(200, admin_response.status_int)
-        self.assertEqual(1, json.loads(admin_response.text)["api_keys"]["active"])
+        self.assertEqual(1, len(json.loads(admin_response.text)["keys"]))
         self.assertFalse(empty_store.get_browser_handover_state(self.context.config)["open"])
 
     def test_loopback_index_redirects_to_bootstrap_after_first_admin_exists_until_browser_is_remembered(self):
@@ -621,7 +626,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
             authorized_admin = client.get(
-                "/server/admin/migration/v1",
+                "/server/admin/api-keys/v1",
                 extra_environ={
                     "HTTP_HOST": "localhost:8800",
                     "REMOTE_ADDR": "127.0.0.1",
@@ -666,7 +671,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, authorized_read.status_int)
         self.assertEqual("pong", authorized_read.text)
         self.assertEqual(200, authorized_admin.status_int)
-        self.assertEqual(1, json.loads(authorized_admin.text)["api_keys"]["active"])
+        self.assertEqual(1, len(json.loads(authorized_admin.text)["keys"]))
         self.assertEqual(200, status_response.status_int)
         self.assertEqual("ok", status_response.text)
         self.assertEqual(200, stream_response.status_int)
@@ -708,7 +713,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             )
 
             rejected_admin = client.get(
-                "/server/admin/migration/v1",
+                "/server/admin/api-keys/v1",
                 extra_environ={
                     "HTTP_HOST": "localhost:8800",
                     "REMOTE_ADDR": "127.0.0.1",
@@ -798,7 +803,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 },
             )
             admin_response = client.get(
-                "/server/admin/migration/v1",
+                "/server/admin/api-keys/v1",
                 extra_environ={
                     "HTTP_HOST": "localhost:8800",
                     "REMOTE_ADDR": "127.0.0.1",
@@ -822,7 +827,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, shell_response.status_int)
         self.assertIn("<html></html>", shell_response.text)
         self.assertEqual(200, admin_response.status_int)
-        self.assertEqual(1, json.loads(admin_response.text)["api_keys"]["active"])
+        self.assertEqual(1, len(json.loads(admin_response.text)["keys"]))
         self.assertFalse(empty_store.get_browser_handover_state(self.context.config)["open"])
 
     def test_bootstrap_page_reopens_first_admin_access_after_handover_version_changes(self):
@@ -865,7 +870,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 },
             )
             admin_response = client.get(
-                "/server/admin/migration/v1",
+                "/server/admin/api-keys/v1",
                 extra_environ={
                     "HTTP_HOST": "localhost:8800",
                     "REMOTE_ADDR": "127.0.0.1",
@@ -890,10 +895,11 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertIn("<html></html>", shell_response.text)
         self.assertEqual(200, admin_response.status_int)
         payload = json.loads(admin_response.text)
-        self.assertEqual(2, payload["api_keys"]["active"])
-        self.assertEqual("1", payload["browser_handover"]["configured_version"])
-        self.assertEqual("1", payload["browser_handover"]["claimed_version"])
-        self.assertFalse(payload["browser_handover"]["open"])
+        self.assertEqual(2, len(payload["keys"]))
+        browser_handover = store.get_browser_handover_state(self.context.config)
+        self.assertEqual("1", browser_handover["configured_version"])
+        self.assertEqual("1", browser_handover["claimed_version"])
+        self.assertFalse(browser_handover["open"])
 
     def test_bootstrap_page_rejects_untrusted_remote_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
@@ -1443,8 +1449,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             return "pong"
 
         self.web_app.add_default_routes()
-        ui_session = self.auth_store.create_ui_session(["write"])
         client = TestApp(self.web_app)
+        self._issue_browser_session(client)
 
         response = client.post(
             "/server/ping",
@@ -1453,7 +1459,6 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                 "REMOTE_ADDR": "127.0.0.1",
                 "HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz",
                 "HTTP_REFERER": "http://localhost:8800/dashboard",
-                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
             }
         )
 
@@ -1469,14 +1474,13 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             return "pong"
 
         self.web_app.add_default_routes()
-        ui_session = self.auth_store.create_ui_session(["write"])
         client = TestApp(self.web_app)
+        self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
 
         response = client.post(
             "/server/ping",
             extra_environ={
                 **self._proxied_same_origin_headers(),
-                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
             }
         )
 
@@ -1492,14 +1496,35 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             return "pong"
 
         self.web_app.add_default_routes()
-        ui_session = self.auth_store.create_ui_session(["write"])
         client = TestApp(self.web_app)
+        self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
 
         response = client.post(
             "/server/ping",
             extra_environ={
                 **self._proxied_same_origin_headers(forwarded_proto="ftp"),
-                "HTTP_COOKIE": "{}={}".format(WebApp._UI_SESSION_COOKIE_NAME, ui_session.secret),
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Browser-origin signal required", response.text)
+
+    def test_sec_fetch_site_same_origin_is_not_standalone_same_origin_proof(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_SEC_FETCH_SITE": "same-origin",
             },
             expect_errors=True
         )

@@ -515,18 +515,10 @@ class Seedsync:
         api_token = getattr(general_config, "api_token", None)
         token_is_configured = not Seedsync._is_blank_config_value(api_token)
         if token_is_configured:
-            if auth_store is not None and not auth_store.legacy_api_token_compatibility_enabled:
-                logger.warning(
-                    "Security: general.api_token is configured, but legacy compatibility has been disabled. "
-                    "External non-admin /server/* requests now require scoped API keys."
-                )
-            else:
-                logger.warning(
-                    "Security: general.api_token is configured as rollout compatibility only. "
-                    "Only selected compatibility /server/* routes can still use it. Built-in loopback browser access "
-                    "uses an internal UI session, while admin endpoints for external clients require scoped API keys. "
-                    "Create scoped API keys and then disable or clear general.api_token."
-                )
+            logger.warning(
+                "Security: general.api_token is configured, but SeedSync now authenticates external /server/* "
+                "requests with scoped API keys only. Clear general.api_token if you no longer need the stored value."
+            )
         else:
             if active_api_key_count > 0:
                 logger.warning(
@@ -552,9 +544,8 @@ class Seedsync:
                     )
             else:
                 logger.warning(
-                    "Security: Application is bound to 0.0.0.0. general.api_token is only a rollout compatibility "
-                    "token for selected compatibility /server/* requests; admin endpoints still require scoped API "
-                    "keys."
+                    "Security: Application is bound to 0.0.0.0. general.api_token does not grant external /server/* "
+                    "access; admin endpoints require scoped API keys."
                 )
 
     @staticmethod
