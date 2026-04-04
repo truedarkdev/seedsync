@@ -121,6 +121,8 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             }
         });
 
+        const completedSize = totalRemoteSize > 0 ? Math.min(totalLocalSize, totalRemoteSize) : 0;
+
         return {
             pathPairId: pathPair.id,
             pathPairName: pathPair.name,
@@ -129,9 +131,9 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             queuedCount: queuedCount,
             downloadedCount: downloadedCount,
             totalRemoteSize: totalRemoteSize,
-            totalLocalSize: totalLocalSize,
+            totalLocalSize: completedSize,
             totalSpeed: totalSpeed,
-            overallProgress: totalRemoteSize > 0 ? Math.round((totalLocalSize / totalRemoteSize) * 100) : 0
+            overallProgress: totalRemoteSize > 0 ? Math.round((completedSize / totalRemoteSize) * 100) : 0
         };
     }
 }

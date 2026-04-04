@@ -162,6 +162,65 @@ describe("Testing path-pair stats component", () => {
         expect(cards.length).toBe(2);
     }));
 
+    it("should cap aggregate progress and completed size when local totals exceed remote totals", fakeAsync(() => {
+        pathPairService.setPathPairs([
+            createPathPair("overflow", "Overflow")
+        ]);
+        viewFileService.setFiles([
+            createViewFile({
+                name: "movie1.mkv",
+                pathPairId: "overflow",
+                pathPairName: "Overflow",
+                localSize: 700,
+                remoteSize: 500,
+                status: ViewFile.Status.DOWNLOADING,
+                downloadingSpeed: 120
+            }),
+            createViewFile({
+                name: "movie2.mkv",
+                pathPairId: "overflow",
+                pathPairName: "Overflow",
+                localSize: 400,
+                remoteSize: 300,
+                status: ViewFile.Status.DOWNLOADED
+            })
+        ]);
+
+        fixture.detectChanges();
+        tick();
+        fixture.detectChanges();
+
+        expect(component.stats.length).toBe(1);
+        expect(component.stats[0].totalRemoteSize).toBe(800);
+        expect(component.stats[0].totalLocalSize).toBe(800);
+        expect(component.stats[0].overallProgress).toBe(100);
+    }));
+
+    it("should keep aggregate totals at zero when remote size is zero", fakeAsync(() => {
+        pathPairService.setPathPairs([
+            createPathPair("orphan", "Orphan")
+        ]);
+        viewFileService.setFiles([
+            createViewFile({
+                name: "orphan.mkv",
+                pathPairId: "orphan",
+                pathPairName: "Orphan",
+                localSize: 100,
+                remoteSize: 0,
+                status: ViewFile.Status.DOWNLOADED
+            })
+        ]);
+
+        fixture.detectChanges();
+        tick();
+        fixture.detectChanges();
+
+        expect(component.stats.length).toBe(1);
+        expect(component.stats[0].totalRemoteSize).toBe(0);
+        expect(component.stats[0].totalLocalSize).toBe(0);
+        expect(component.stats[0].overallProgress).toBe(0);
+    }));
+
     it("should hide the container when fewer than two enabled path pairs exist", fakeAsync(() => {
         pathPairService.setPathPairs([
             createPathPair("movies", "Movies")
