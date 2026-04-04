@@ -341,6 +341,14 @@
             font-size: 82%;
             color: rgba(0, 0, 0, 0.66);
         }
+
+        .revoked-visibility-actions {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 6px;
+        }
     }
 
     .key-list {

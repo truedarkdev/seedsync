@@ -138,9 +138,13 @@ export class ApiAccessService extends BaseWebService {
         );
     }
 
-    public deleteApiKey(keyId: string): Observable<void> {
+    public deleteApiKey(keyId: string, refresh: boolean = true): Observable<void> {
         return this._http.delete<void>(`${this.API_KEYS_URL}/${keyId}`).pipe(
-            tap(() => this.refresh())
+            tap(() => {
+                if (refresh) {
+                    this.refresh();
+                }
+            })
         );
     }
 

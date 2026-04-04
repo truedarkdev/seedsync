@@ -1,6 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
-import {Subject} from "rxjs";
-import {takeUntil} from "rxjs/operators";
+import {from, Subject} from "rxjs";
+import {concatMap, finalize, takeUntil} from "rxjs/operators";
 
 import {Modal} from "../../services/utils/modal.service";
 import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
@@ -55,6 +55,7 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
 
     public isCreating = false;
     public isEditing = false;
+    public isDeletingRevokedApiKeys = false;
     public formName = "";
     public formScopes: ScopeSelection = this.defaultScopeSelection();
     public bootstrapName = "bootstrap-admin";
@@ -268,12 +269,48 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
         );
     }
 
+    public deleteAllRevokedApiKeys(apiKeys: ApiKeyRecord[]) {
+        if (this.isFormOpen || this.isDeletingRevokedApiKeys || !this.showRevokedKeys) {
+            return;
+        }
+
+        const revokedKeys = this.getRevokedApiKeys(apiKeys);
+        if (revokedKeys.length === 0) {
+            return;
+        }
+
+        this.confirmAction(
+            "Delete Revoked API Keys",
+            `Permanently remove all ${revokedKeys.length} revoked key${revokedKeys.length === 1 ? "" : "s"}? This cannot be undone. Active keys will stay in place.`,
+            "Delete all",
+            "btn btn-danger",
+            () => {
+                this.isDeletingRevokedApiKeys = true;
+                this._changeDetector.markForCheck();
+
+                from(revokedKeys).pipe(
+                    concatMap(key => this._apiAccessService.deleteApiKey(key.id, false)),
+                    takeUntil(this._destroy$),
+                    finalize(() => {
+                        this.isDeletingRevokedApiKeys = false;
+                        if (!this._destroyed) {
+                            this._apiAccessService.refresh();
+                        }
+                        this._changeDetector.markForCheck();
+                    })
+                ).subscribe({
+                    error: error => this.showError(`Failed to delete revoked API keys: ${this.describeError(error)}`)
+                });
+            }
+        );
+    }
+
     public getActiveApiKeyCount(apiKeys: ApiKeyRecord[]): number {
         return (apiKeys || []).filter(key => key.active).length;
     }
 
     public getRevokedApiKeyCount(apiKeys: ApiKeyRecord[]): number {
-        return (apiKeys || []).filter(key => !key.active).length;
+        return this.getRevokedApiKeys(apiKeys).length;
     }
 
     public getVisibleApiKeys(apiKeys: ApiKeyRecord[]): ApiKeyRecord[] {
@@ -349,6 +386,10 @@ export class ApiAccessComponent implements OnInit, OnDestroy {
         return this.scopeOptions
             .filter(scope => selection[scope.value])
             .map(scope => scope.value);
+    }
+
+    private getRevokedApiKeys(apiKeys: ApiKeyRecord[]): ApiKeyRecord[] {
+        return (apiKeys || []).filter(key => !key.active);
     }
 
     private describeError(error: any): string {

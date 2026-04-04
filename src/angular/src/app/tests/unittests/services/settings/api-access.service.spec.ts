@@ -178,6 +178,23 @@ describe("Testing API access service", () => {
         httpMock.verify();
     });
 
+    it("should delete an api key without refreshing when asked", () => {
+        httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
+
+        let deleted = false;
+        apiAccessService.deleteApiKey("revoked-reader", false).subscribe({
+            next: () => deleted = true
+        });
+
+        const deleteRequest = httpMock.expectOne("/server/admin/api-keys/v1/revoked-reader");
+        expect(deleteRequest.request.method).toBe("DELETE");
+        deleteRequest.flush(null, {status: 204, statusText: "No Content"});
+
+        expect(deleted).toBeTrue();
+        httpMock.expectNone("/server/admin/api-keys/v1");
+        httpMock.verify();
+    });
+
     it("should update, rotate, and revoke API keys", () => {
         httpMock.expectOne("/server/admin/api-keys/v1").flush({keys: baseApiKeys});
 
