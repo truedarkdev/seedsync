@@ -161,6 +161,71 @@ class TestApiKeyStore(unittest.TestCase):
             store.revoke_api_key(record.id)
             self.assertIsNone(store.resolve_ui_session_api_key(replacement_session))
 
+    def test_create_ui_session_preserves_legacy_positional_argument_compatibility(self):
+        store = ApiKeyStore()
+
+        session = store.create_ui_session(["admin"], False, "api-key-id", "api-key-secret")
+
+        self.assertFalse(session.bootstrap)
+        self.assertFalse(session.remembered)
+        self.assertEqual("api-key-id", session.api_key_id)
+        self.assertEqual("api-key-secret", session.api_key_secret_hash)
+
+    def test_remembered_ui_session_is_not_time_pruned_and_cleared_with_api_key_revoke(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            created = store.create_api_key("admin", ["admin", "read"])
+            record = created["record"]
+
+            bootstrap_session = store.create_ui_session(["bootstrap"], bootstrap=True)
+            remembered_session = store.create_remembered_browser_session_for_api_key(record.id)
+            self.assertEqual("", remembered_session.expires_at)
+            self.assertGreater(
+                remembered_session.cookie_max_age_seconds(),
+                12 * 60 * 60,
+            )
+
+            fresh_reload = ApiKeyStore.from_file(store_path)
+            durable_remembered = fresh_reload.find_ui_session_by_secret(remembered_session.secret)
+
+            self.assertIsNotNone(durable_remembered)
+            self.assertTrue(durable_remembered.remembered)
+            self.assertEqual(record.id, fresh_reload.resolve_ui_session_api_key(durable_remembered).id)
+            self.assertGreater(
+                durable_remembered.cookie_max_age_seconds(),
+                12 * 60 * 60,
+            )
+
+            store._ApiKeyStore__ui_sessions[bootstrap_session.secret].expires_at = "2000-01-01T00:00:00+00:00"
+            store._ApiKeyStore__ui_sessions[remembered_session.secret].expires_at = "2000-01-01T00:00:00+00:00"
+            store.save()
+
+            expired_reload = ApiKeyStore.from_file(store_path)
+            self.assertIsNone(expired_reload.find_ui_session_by_secret(bootstrap_session.secret))
+            durable_after_timestamp_change = expired_reload.find_ui_session_by_secret(remembered_session.secret)
+            self.assertIsNotNone(durable_after_timestamp_change)
+            self.assertTrue(durable_after_timestamp_change.remembered)
+
+            expired_reload.revoke_api_key(record.id)
+            self.assertIsNone(expired_reload.find_ui_session_by_secret(remembered_session.secret))
+            self.assertNotIn(remembered_session.secret, expired_reload._ApiKeyStore__ui_sessions)
+
+    def test_delete_api_key_removes_remembered_browser_sessions_for_revoked_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = ApiKeyStore(file_path=os.path.join(temp_dir, "api-keys.json"))
+            created = store.create_api_key("admin", ["admin", "read"])
+            record = created["record"]
+            remembered_session = store.create_remembered_browser_session_for_api_key(record.id)
+
+            record.revoked_at = "2026-04-05T00:00:00+00:00"
+            record.updated_at = "2026-04-05T00:00:00+00:00"
+
+            deleted = store.delete_api_key(record.id)
+            self.assertEqual(record.id, deleted.id)
+            self.assertIsNone(store.find_ui_session_by_secret(remembered_session.secret))
+            self.assertNotIn(remembered_session.secret, store._ApiKeyStore__ui_sessions)
+
     def test_initial_admin_claim_reopens_when_handover_version_changes(self):
         store = ApiKeyStore()
 
