@@ -402,9 +402,8 @@ class TestSeedsync(unittest.TestCase):
         Seedsync._emit_startup_warnings(logger, config)
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
-        self.assertTrue(any("rollout compatibility only" in message for message in warning_messages))
-        self.assertTrue(any("admin endpoints still require scoped API keys" in message for message in warning_messages))
-        self.assertTrue(any("selected compatibility /server/* routes" in message for message in warning_messages))
+        self.assertTrue(any("general.api_token is configured" in message for message in warning_messages))
+        self.assertTrue(any("admin endpoints require scoped API keys" in message for message in warning_messages))
         self.assertTrue(any("0.0.0.0" in message for message in warning_messages))
         self.assertEqual(2, logger.warning.call_count)
 
@@ -609,7 +608,8 @@ class TestSeedsync(unittest.TestCase):
         Seedsync._emit_startup_warnings(logger, config, web_bind_host="127.0.0.1")
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
-        self.assertTrue(any("rollout compatibility only" in message for message in warning_messages))
+        self.assertTrue(any("general.api_token is configured" in message for message in warning_messages))
+        self.assertFalse(any("webhook_secret" in message for message in warning_messages))
         self.assertEqual(1, logger.warning.call_count)
 
     def test_emit_startup_warnings_warns_when_webhook_secret_field_exists_and_is_blank(self):
@@ -620,7 +620,7 @@ class TestSeedsync(unittest.TestCase):
 
         warning_messages = [call.args[0] for call in logger.warning.call_args_list]
         self.assertTrue(any("webhook_secret is not configured" in message for message in warning_messages))
-        self.assertTrue(any("rollout compatibility only" in message for message in warning_messages))
+        self.assertTrue(any("general.api_token is configured" in message for message in warning_messages))
         self.assertEqual(2, logger.warning.call_count)
 
     def test_persist_does_not_rewrite_unchanged_config(self):

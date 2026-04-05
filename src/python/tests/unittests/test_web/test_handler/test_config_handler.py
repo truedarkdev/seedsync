@@ -204,6 +204,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.context.status = MagicMock()
         self.context.config = Config()
         self.auth_store = ApiKeyStore()
+        self.admin_api_token = self.auth_store.create_api_key("unit-admin", ["admin"])["secret"]
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
 
     def test_get_route_honors_remote_detail_redaction_opt_out(self):
@@ -216,12 +217,11 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
         ConfigHandler(config).add_routes(self.web_app)
-        ui_session = self.auth_store.create_ui_session(["admin"])
 
         status_code, body = _invoke_get_route(
             self.web_app,
             "/server/config/get",
-            ui_session_secret=ui_session.secret,
+            api_token=self.admin_api_token,
         )
         out_dict = json.loads(body)
 
@@ -235,13 +235,12 @@ class TestConfigHandlerRoutes(unittest.TestCase):
     def test_set_route_blocks_redaction_toggle_from_body(self):
         config = Config()
         ConfigHandler(config).add_routes(self.web_app)
-        ui_session = self.auth_store.create_ui_session(["admin"])
 
         status_code, body = _invoke_post_json_route(
             self.web_app,
             "/server/config/set/general/config_api_redact_remote_details",
             {"value": False},
-            ui_session_secret=ui_session.secret,
+            api_token=self.admin_api_token,
         )
 
         self.assertEqual(403, status_code)
@@ -254,13 +253,12 @@ class TestConfigHandlerRoutes(unittest.TestCase):
     def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs_from_body(self):
         config = Config()
         ConfigHandler(config).add_routes(self.web_app)
-        ui_session = self.auth_store.create_ui_session(["admin"])
 
         status_code, body = _invoke_post_json_route(
             self.web_app,
             "/server/config/set/general/trusted_browser_bootstrap_remote_addrs",
             {"value": "172.25.0.1/32"},
-            ui_session_secret=ui_session.secret,
+            api_token=self.admin_api_token,
         )
 
         self.assertEqual(403, status_code)

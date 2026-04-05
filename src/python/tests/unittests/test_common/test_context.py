@@ -14,6 +14,7 @@ class TestArgs(unittest.TestCase):
         args.html_path = "/tmp/ui"
         args.debug = True
         args.exit = False
+        args.web_bind_host = "127.0.0.1"
 
         self.assertEqual(
             {
@@ -21,6 +22,7 @@ class TestArgs(unittest.TestCase):
                 "html_path": "/tmp/ui",
                 "debug": "True",
                 "exit": "False",
+                "web_bind_host": "127.0.0.1",
             },
             args.as_dict()
         )
@@ -65,6 +67,7 @@ class TestContext(unittest.TestCase):
         args.html_path = "/tmp/ui"
         args.debug = True
         args.exit = None
+        args.web_bind_host = "127.0.0.1"
 
         context = Context(logger, MagicMock(), config, args, Status())
         context.print_to_log()
@@ -81,6 +84,7 @@ class TestContext(unittest.TestCase):
                 call("  html_path: /tmp/ui"),
                 call("  debug: True"),
                 call("  exit: None"),
+                call("  web_bind_host: 127.0.0.1"),
             ],
             logger.debug.call_args_list
         )

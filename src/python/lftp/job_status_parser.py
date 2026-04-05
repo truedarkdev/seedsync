@@ -17,6 +17,12 @@ class LftpJobStatusParser:
     """
     Parses the output of lftp's "jobs -v" command into a LftpJobStatus
     """
+    __WRONG_TYPE_FAILURE_PREFIXES = (
+        "pget: Access failed: Wrong type",
+        "pget-chunk: Access failed: Wrong type",
+        "mirror: Access failed: Wrong type",
+    )
+
     # python doesn't support partial inline-modified flags, so we need
     # to capture all case-sensitive cases here
     __SIZE_UNITS_REGEX = ("b|B|"
@@ -93,6 +99,7 @@ class LftpJobStatusParser:
         # remove any remaining log line
         lines = filter(lambda s: not re.match(r"^\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}.*\s->\s.*$", s), lines)
         lines = list(lines)
+        has_wrong_type_failure = any(self.__is_wrong_type_failure_line(line) for line in lines)
         try:
             statuses += self.__parse_queue(lines)
         except ValueError as e:
@@ -104,7 +111,16 @@ class LftpJobStatusParser:
         except ValueError as e:
             self.logger.warning("LftpJobStateParser skipping bad job output: {}".format(str(e)))
             self.logger.debug("Bad status output:\n{}".format(output))
+        if has_wrong_type_failure and statuses and not any(
+            status.state == LftpJobStatus.State.RUNNING for status in statuses
+        ):
+            return []
         return statuses
+
+    @staticmethod
+    def __is_wrong_type_failure_line(line: str) -> bool:
+        line = line.lstrip()
+        return any(line.startswith(prefix) for prefix in LftpJobStatusParser.__WRONG_TYPE_FAILURE_PREFIXES)
 
     @staticmethod
     def __parse_jobs(lines: List[str]) -> List[LftpJobStatus]:
