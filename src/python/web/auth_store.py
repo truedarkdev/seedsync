@@ -21,6 +21,7 @@ _HASH_ALGORITHM = "pbkdf2_sha256"
 _HASH_ITERATIONS = 200000
 _HASH_SALT_BYTES = 16
 _UI_SESSION_TTL = timedelta(hours=12)
+_REMEMBERED_UI_SESSION_COOKIE_MAX_AGE = timedelta(days=3650)
 _BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
 _BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
 
@@ -119,10 +120,13 @@ class UiSessionRecord:
     created_at: str = ""
     expires_at: str = ""
     bootstrap: bool = False
+    remembered: bool = False
     api_key_id: Optional[str] = None
     api_key_secret_hash: Optional[str] = None
 
     def cookie_max_age_seconds(self) -> int:
+        if self.remembered:
+            return int(_REMEMBERED_UI_SESSION_COOKIE_MAX_AGE.total_seconds())
         created_at = datetime.fromisoformat(self.created_at)
         expires_at = datetime.fromisoformat(self.expires_at)
         return max(0, int((expires_at - created_at).total_seconds()))
@@ -204,7 +208,8 @@ class ApiKeyStore(Persist):
         scopes: Sequence[str],
         bootstrap: bool = False,
         api_key_id: Optional[str] = None,
-        api_key_secret_hash: Optional[str] = None
+        api_key_secret_hash: Optional[str] = None,
+        remembered: bool = False
     ) -> UiSessionRecord:
         normalized_scopes = _normalize_scopes(scopes)
         if type(bootstrap) is not bool:
@@ -213,13 +218,18 @@ class ApiKeyStore(Persist):
             raise ValueError("API key id cannot be blank")
         if api_key_secret_hash is not None and (not isinstance(api_key_secret_hash, str) or not api_key_secret_hash.strip()):
             raise ValueError("API key secret hash cannot be blank")
+        if type(remembered) is not bool:
+            raise ValueError("Remembered session flag must be a boolean")
+        if bootstrap and remembered:
+            raise ValueError("Bootstrap sessions cannot also be remembered")
         now = datetime.now(timezone.utc)
         record = UiSessionRecord(
             secret=secrets.token_urlsafe(32),
             scopes=normalized_scopes,
             created_at=now.isoformat(timespec="seconds"),
-            expires_at=(now + _UI_SESSION_TTL).isoformat(timespec="seconds"),
+            expires_at="" if remembered else (now + _UI_SESSION_TTL).isoformat(timespec="seconds"),
             bootstrap=bootstrap,
+            remembered=remembered,
             api_key_id=api_key_id.strip() if isinstance(api_key_id, str) else None,
             api_key_secret_hash=api_key_secret_hash.strip() if isinstance(api_key_secret_hash, str) else None,
         )
@@ -262,12 +272,40 @@ class ApiKeyStore(Persist):
             api_key_secret_hash=record.secret_hash
         )
 
+    def create_remembered_browser_session_for_api_key(self, key_id: str) -> UiSessionRecord:
+        if not isinstance(key_id, str) or not key_id.strip():
+            raise ValueError("API key id cannot be blank")
+
+        record = self.get_api_key(key_id)
+        if record is None:
+            raise KeyError("API key '{}' not found".format(key_id))
+        if record.is_revoked:
+            raise ValueError("Cannot create a browser session for a revoked API key")
+
+        return self.create_ui_session(
+            record.scopes,
+            remembered=True,
+            api_key_id=record.id,
+            api_key_secret_hash=record.secret_hash
+        )
+
+    def __discard_browser_sessions_for_api_key(self, key_id: str) -> int:
+        matching_secrets = [
+            secret for secret, session in self.__ui_sessions.items()
+            if getattr(session, "api_key_id", None) == key_id
+        ]
+        for secret in matching_secrets:
+            self.__ui_sessions.pop(secret, None)
+        return len(matching_secrets)
+
     def find_ui_session_by_secret(self, secret: str) -> Optional[UiSessionRecord]:
         now = datetime.now(timezone.utc)
         self.__prune_expired_ui_sessions(now)
         record = self.__ui_sessions.get(secret)
         if record is None:
             return None
+        if getattr(record, "remembered", False):
+            return record
         try:
             if datetime.fromisoformat(record.expires_at) <= now:
                 self.__ui_sessions.pop(secret, None)
@@ -462,6 +500,7 @@ class ApiKeyStore(Persist):
         if not record.is_revoked:
             raise ValueError("Cannot delete an active API key")
 
+        self.__discard_browser_sessions_for_api_key(record.id)
         self.__api_keys.remove(record)
         self.save()
         return record
@@ -476,6 +515,7 @@ class ApiKeyStore(Persist):
         now = _utc_now_iso()
         record.revoked_at = now
         record.updated_at = now
+        self.__discard_browser_sessions_for_api_key(record.id)
         self.save()
         return record
 
@@ -566,16 +606,20 @@ class ApiKeyStore(Persist):
             try:
                 api_key_id = raw_session.get("api_key_id")
                 api_key_secret_hash = raw_session.get("api_key_secret_hash")
+                remembered = raw_session.get("remembered", False)
                 if api_key_id is not None and not isinstance(api_key_id, str):
                     raise ValueError("API key session api_key_id must be a string")
                 if api_key_secret_hash is not None and not isinstance(api_key_secret_hash, str):
                     raise ValueError("API key session api_key_secret_hash must be a string")
+                if type(remembered) is not bool:
+                    raise ValueError("API key session remembered flag must be a boolean")
                 store.__ui_sessions[raw_session["secret"]] = UiSessionRecord(
                     secret=raw_session["secret"],
                     scopes=_normalize_scopes(raw_session.get("scopes", [])),
                     created_at=raw_session["created_at"],
                     expires_at=raw_session["expires_at"],
                     bootstrap=raw_session.get("bootstrap", False),
+                    remembered=remembered,
                     api_key_id=api_key_id,
                     api_key_secret_hash=api_key_secret_hash,
                 )
@@ -592,7 +636,7 @@ class ApiKeyStore(Persist):
         self.__prune_bootstrap_proof(now)
         self.__prune_bootstrap_exchange(now)
         payload = {
-            self.__KEY_VERSION: 2,
+            self.__KEY_VERSION: 3,
             self.__KEY_API_KEYS: [asdict(record) for record in self.__api_keys],
             self.__KEY_UI_SESSIONS: [
                 asdict(record)
@@ -608,6 +652,8 @@ class ApiKeyStore(Persist):
     def __prune_expired_ui_sessions(self, now: datetime) -> None:
         expired_session_ids = []
         for secret, record in self.__ui_sessions.items():
+            if getattr(record, "remembered", False):
+                continue
             try:
                 if datetime.fromisoformat(record.expires_at) <= now:
                     expired_session_ids.append(secret)

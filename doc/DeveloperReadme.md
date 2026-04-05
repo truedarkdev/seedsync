@@ -478,6 +478,27 @@ On this workspace, the common local convenience choice is
 `build/docker-local/remote-files` in the repo root, but it is a local choice,
 not a global public default.
 
+## Browser Access Model
+
+The intended browser-access UX is:
+
+- the first browser uses the bootstrap or handover flow to claim access
+- once claimed, a remembered browser should behave like a durable trusted
+  client
+- that remembered-browser state is a hidden implementation detail of the API
+  key credential
+- normal return visits should reopen the app without sending the user back
+  through `/bootstrap`
+- `/bootstrap` should mainly appear for first claim or explicit recovery
+- deleting or revoking the API key clears any remembered-browser state tied
+  to that key
+- bootstrap and recovery sessions remain short-lived
+
+When investigating or changing this area, do not treat a persistent cookie by
+itself as sufficient proof that the remembered-browser behavior is correct.
+The browser cookie and the server-side authorization retention model both need
+to match the intended durable-browser UX.
+
 The connection parameters for the remote server are:
 
 | Option         | Value                             |

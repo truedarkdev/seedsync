@@ -152,11 +152,13 @@ class AdminHandler(IHandler):
             if getattr(auth_record, "revoked_at", None) is not None:
                 return self.__json_response({"error": "API key has been revoked"}, status=403)
 
-            ui_session = self.__auth_store.create_browser_session_for_api_key(auth_record.id)
+            ui_session = self.__auth_store.create_remembered_browser_session_for_api_key(auth_record.id)
             response = self.__json_response({
                 "key": auth_record.to_public_dict(),
                 "browser_handover": self.__auth_store.get_browser_handover_state(self.__config),
-                "expires_at": ui_session.expires_at,
+                "remembered": True,
+                "expires_at": ui_session.expires_at or None,
+                "cookie_max_age_seconds": ui_session.cookie_max_age_seconds(),
             }, status=201)
             response.set_cookie(
                 WebApp._UI_SESSION_COOKIE_NAME,

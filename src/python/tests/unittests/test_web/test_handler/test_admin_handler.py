@@ -264,9 +264,40 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(["admin"], payload["key"]["scopes"])
         self.assertIn("browser_handover", payload)
         self.assertFalse(payload["browser_handover"]["open"])
+        self.assertTrue(payload["remembered"])
+        self.assertGreater(payload["cookie_max_age_seconds"], 12 * 60 * 60)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
-        self.assertIn("Max-Age=43200", response.headers.get("Set-Cookie", ""))
+        self.assertIn("Max-Age=315360000", response.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
+
+        cookie_secret = response.headers.get("Set-Cookie", "").split(";", 1)[0].split("=", 1)[1]
+        remembered_session = self.auth_store.find_ui_session_by_secret(cookie_secret)
+        self.assertIsNotNone(remembered_session)
+        self.assertTrue(remembered_session.remembered)
+
+    def test_revoke_api_key_clears_remembered_browser_sessions(self):
+        trusted_headers = self._same_origin_headers()
+
+        remember_response = self.test_app.post_json(
+            "/server/browser/v1/remember",
+            {"secret": self.admin_secret},
+            extra_environ=trusted_headers,
+        )
+        session_cookie = remember_response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        cookie_secret = session_cookie.split("=", 1)[1]
+        admin_cookie_headers = {
+            **self._same_origin_headers(),
+            "HTTP_COOKIE": session_cookie,
+        }
+
+        revoke_response = self.test_app.post(
+            "/server/admin/api-keys/v1/{}/revoke".format(self.admin_key_id),
+            extra_environ=admin_cookie_headers,
+        )
+
+        self.assertEqual(200, revoke_response.status_int)
+        self.assertNotIn(cookie_secret, self.auth_store._ApiKeyStore__ui_sessions)
+        self.assertIsNone(self.auth_store.find_ui_session_by_secret(cookie_secret))
 
     def test_bootstrap_proof_exchange_rejects_non_same_origin_requests(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-reject-non-origin.json"))
