@@ -1523,3 +1523,87 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(len(golden_jobs), len(statuses))
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
         self.assertEqual(golden_jobs, statuses_jobs)
+
+    def test_failure_before_jobs_slice_does_not_suppress_valid_jobs(self):
+        output = """
+        mirror: Access failed: Wrong type
+        jobs -v
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Now executing: [1] mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/ -- 17k/26M (0%) 5.0 KiB/s
+        [1] mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/  -- 17k/26M (0%) 5.0 KiB/s
+        """
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        golden_job1 = LftpJobStatus(job_id=1,
+                                    job_type=LftpJobStatus.Type.MIRROR,
+                                    state=LftpJobStatus.State.RUNNING,
+                                    name="a",
+                                    flags="-c")
+        golden_job1.total_transfer_state = LftpJobStatus.TransferState(17*1024, 26*1024*1024, 0, 5*1024, None)
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(golden_job1, statuses[0])
+
+    def test_failure_before_jobs_slice_does_not_suppress_valid_jobs_for_other_wrong_type_prefixes(self):
+        for prefix in ("pget", "pget-chunk"):
+            with self.subTest(prefix=prefix):
+                output = """
+                {prefix}: Access failed: Wrong type
+                jobs -v
+                [0] queue (sftp://someone:@localhost)
+                sftp://someone:@localhost/home/someone
+                Now executing: [1] mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/ -- 17k/26M (0%) 5.0 KiB/s
+                [1] mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/  -- 17k/26M (0%) 5.0 KiB/s
+                """.format(prefix=prefix)
+                parser = LftpJobStatusParser()
+                statuses = parser.parse(output)
+
+                golden_job1 = LftpJobStatus(job_id=1,
+                                            job_type=LftpJobStatus.Type.MIRROR,
+                                            state=LftpJobStatus.State.RUNNING,
+                                            name="a",
+                                            flags="-c")
+                golden_job1.total_transfer_state = LftpJobStatus.TransferState(17*1024, 26*1024*1024, 0, 5*1024, None)
+
+                self.assertEqual(1, len(statuses))
+                self.assertEqual(golden_job1, statuses[0])
+
+    def test_command_failure_after_jobs_slice_preserves_parseable_queue_snapshot(self):
+        output = """
+        jobs -v
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is running.
+        Commands queued:
+         1. mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/
+        mirror: Access failed: No such file (/tmp/test_lftp/remote/a)
+        """
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        golden = [
+            LftpJobStatus(job_id=1,
+                          job_type=LftpJobStatus.Type.MIRROR,
+                          state=LftpJobStatus.State.QUEUED,
+                          name="a",
+                          flags="-c")
+        ]
+
+        self.assertEqual(golden, statuses)
+
+    def test_wrong_type_failure_still_clears_stale_queue_snapshot(self):
+        output = """
+        jobs -v
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is running.
+        Commands queued:
+         1. mirror -c /tmp/test_lftp/remote/a /tmp/test_lftp/local/
+        mirror: Access failed: Wrong type
+        """
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        self.assertEqual([], statuses)

@@ -119,7 +119,7 @@ class TestPathPairsHandler(BaseTestWebApp):
         self.assertEqual(False, updated["enabled"])
         self.assertEqual("/remote/movies", updated["remote_path"])
         self.assertEqual("/local/movies", updated["local_path"])
-        self.controller.refresh_path_pairs.assert_called_once_with()
+        self.controller.refresh_path_pairs.assert_called_once_with(wait=True)
 
     def test_update_non_runtime_field_does_not_refresh_controller(self):
         created = json.loads(self.test_app.post_json("/server/path-pairs", {

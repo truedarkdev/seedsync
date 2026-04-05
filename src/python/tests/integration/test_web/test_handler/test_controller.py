@@ -15,7 +15,7 @@ class TestControllerHandler(BaseTestWebApp):
         self.context.config.lftp.local_path = self.temp_dir
         self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=self.temp_dir)
         self.web_app = self.web_app_builder.build()
-        self.test_app = self.build_browser_test_app()
+        self.test_app = self.build_browser_test_app(auth_secret=self.integration_admin_secret)
         self.controller.get_model_files = MagicMock(return_value=[])
 
     @staticmethod
@@ -278,7 +278,7 @@ class TestControllerHandler(BaseTestWebApp):
     def test_delete_local_rejects_when_local_path_root_is_unavailable(self):
         self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=None)
         self.web_app = self.web_app_builder.build()
-        self.test_app = self.build_browser_test_app()
+        self.test_app = self.build_browser_test_app(auth_secret=self.integration_admin_secret)
         self.controller.queue_command = MagicMock()
 
         response = self.test_app.delete("/server/command/delete_local/test1", expect_errors=True)
@@ -290,7 +290,7 @@ class TestControllerHandler(BaseTestWebApp):
     def test_queue_remains_allowed_when_local_path_root_is_unavailable(self):
         self.web_app_builder.controller_handler = ControllerHandler(self.controller, local_path=None)
         self.web_app = self.web_app_builder.build()
-        self.test_app = self.build_browser_test_app()
+        self.test_app = self.build_browser_test_app(auth_secret=self.integration_admin_secret)
 
         def side_effect(cmd: Controller.Command):
             cmd.callbacks[0].on_success()

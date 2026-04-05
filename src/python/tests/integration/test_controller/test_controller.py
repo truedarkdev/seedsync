@@ -2883,6 +2883,12 @@ class TestController(unittest.TestCase):
         self.context.config.lftp.use_ssh_key = False
 
         self.controller = Controller(self.context, self.controller_persist)
+        # Explicitly disable key-based auth on the LFTP path so this test
+        # exercises the password-auth contract directly.
+        program = self.controller._Controller__lftp.sftp_connect_program
+        program = program[:-1]
+        program += " -oPubkeyAuthentication=no\""
+        self.controller._Controller__lftp.sftp_connect_program = program
         self.controller.start()
         # wait for initial scan
         self.__wait_for_initial_model()
@@ -2915,10 +2921,21 @@ class TestController(unittest.TestCase):
                     break
 
         # Verify
+        final_target = os.path.join(TestController.temp_dir, "local", "rc")
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", "rc")
+        downloaded_file = self.__wait_for_model_file(
+            "rc",
+            lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
+            "Timed out waiting for password-auth transfer to finish",
+            max_iterations=4000,
+        )
         listener.file_added.assert_not_called()
         listener.file_removed.assert_not_called()
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
+        self.assertEqual(10*1024, downloaded_file.local_size)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertFalse(os.path.exists(staging_target))
         fcmp = cmp(os.path.join(TestController.temp_dir, "remote", "rc"),
-                   os.path.join(TestController.temp_dir, "local", "rc"))
+                   final_target)
         self.assertTrue(fcmp)

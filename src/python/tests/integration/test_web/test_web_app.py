@@ -78,13 +78,17 @@ class BaseTestWebApp(unittest.TestCase):
             extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(self.integration_admin_secret)}
         )
 
-    def build_browser_test_app(self):
+    def build_browser_test_app(self, auth_secret=None):
+        extra_environ = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "127.0.0.1",
+        }
+        if auth_secret is not None:
+            extra_environ["HTTP_AUTHORIZATION"] = "Bearer {}".format(auth_secret)
+
         browser_app = TestApp(
             self.web_app,
-            extra_environ={
-                "HTTP_HOST": "localhost:8800",
-                "REMOTE_ADDR": "127.0.0.1",
-            }
+            extra_environ=extra_environ
         )
         browser_app.get("/")
         return browser_app
@@ -99,7 +103,7 @@ class TestWebApp(BaseTestWebApp):
         self.web_app.process()
 
     def test_index_sets_connect_src_csp_header(self):
-        response = self.build_browser_test_app().get("/")
+        response = self.build_browser_test_app().get("/index.html")
 
         self.assertEqual(
             "connect-src 'self' https://api.github.com",
@@ -113,10 +117,13 @@ class TestWebApp(BaseTestWebApp):
         self.assertIn("<html></html>", response.text)
 
     def test_dashboard_path_pair_deep_link_serves_index_html(self):
-        response = self.build_browser_test_app().get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
+        response = self.build_browser_test_app().get(
+            "/dashboard/123e4567-e89b-12d3-a456-426614174000"
+        ).follow()
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("<html></html>", response.text)
+        self.assertIn("SeedSync browser access", response.text)
+        self.assertIn("Save this browser for next time", response.text)
 
     def test_dashboard_path_pair_deep_link_issues_ui_session_cookie(self):
         browser_app = TestApp(
@@ -129,8 +136,15 @@ class TestWebApp(BaseTestWebApp):
 
         response = browser_app.get("/dashboard/123e4567-e89b-12d3-a456-426614174000")
 
+        self.assertEqual("http://localhost:8800/bootstrap", response.headers["Location"])
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
+
+        response = response.follow()
+
         self.assertEqual(200, response.status_int)
-        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertIn("SeedSync browser access", response.text)
+        self.assertIn("Save this browser for next time", response.text)
+        self.assertEqual({}, browser_app.cookies)
 
     def test_trusted_docker_gateway_requires_bootstrap_limited_session_before_first_admin_exists(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
@@ -144,7 +158,7 @@ class TestWebApp(BaseTestWebApp):
         browser_app = TestApp(
             self.web_app,
             extra_environ={
-                "HTTP_HOST": "localhost:8800",
+                "HTTP_HOST": "seedsync.local:8800",
                 "REMOTE_ADDR": "172.25.0.1",
             }
         )
@@ -152,7 +166,10 @@ class TestWebApp(BaseTestWebApp):
         response = browser_app.get("/", expect_errors=True)
 
         self.assertEqual(403, response.status_int)
-        self.assertIn("bootstrap-limited UI session", response.text)
+        self.assertIn(
+            "First-admin browser bootstrap requires direct loopback access or an approved local browser request.",
+            response.text
+        )
 
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):

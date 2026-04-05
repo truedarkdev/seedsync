@@ -15,7 +15,7 @@ import pexpect
 import pytest
 
 from tests.utils import TestUtils
-from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParserError
+from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 
 
 # noinspection PyPep8Naming,SpellCheckingInspection
@@ -580,6 +580,46 @@ class TestLftp(unittest.TestCase):
         self.assertEqual([], statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
 
+    def test_status_drops_stale_queue_snapshot_after_command_failure(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Queue is running.\n"
+            "Commands queued:\n"
+            " 1. mirror -c /remote/c /local/\n"
+            "mirror: Access failed: Wrong type\n"
+        ))
+
+        statuses = lftp.status()
+
+        self.assertEqual([], statuses)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "jobs -v",
+            timeout_seconds=0,
+            require_prompt_ready=False,
+            status_poll=True
+        )
+
+    def test_status_ignores_command_failure_before_jobs_slice(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = LftpJobStatusParser()
+        lftp._Lftp__run_command = MagicMock(return_value=(
+            "mirror: Access failed: Wrong type\n"
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)  -- 90 B/s\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Now executing: [1] mirror -c /tmp/test_lftp_rm_s6oau/remote/a /tmp/test_lftp_rm_s6oau/local/ -- 345/26M (0%) 90 B/s\n"
+            "[1] mirror -c /tmp/test_lftp_rm_s6oau/remote/a /tmp/test_lftp_rm_s6oau/local/  -- 345/26M (0%) 90 B/s\n"
+        ))
+
+        statuses = lftp.status()
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual("a", statuses[0].name)
+        self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
+
     def test_run_command_logs_warning_on_timeout(self):
         lftp = Lftp.__new__(Lftp)
         lftp.logger = MagicMock()
@@ -755,6 +795,8 @@ class TestLftp(unittest.TestCase):
             "test_run_command_status_poll_preserves_recovered_connecting_output",
             "test_run_command_records_pending_error_for_common_failure_outputs",
             "test_status_marks_poll_unhealthy_when_parser_error_is_suppressed",
+            "test_status_drops_stale_queue_snapshot_after_command_failure",
+            "test_status_ignores_command_failure_before_jobs_slice",
             "test_run_command_logs_warning_on_timeout",
             "test_ensure_prompt_ready_returns_when_prompt_is_ready",
             "test_ensure_prompt_ready_recovers_once_after_initial_timeout",
