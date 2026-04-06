@@ -677,6 +677,83 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, stream_response.status_int)
         self.assertIn("text/event-stream", stream_response.headers["Content-Type"])
 
+    def test_loopback_remembered_browser_session_redirects_to_bootstrap_while_handover_is_open(self):
+        store = ApiKeyStore()
+        self.context.config.general.browser_handover_recovery_version = "0"
+        created = store.create_initial_admin_api_key_if_available("0", "admin")
+        self.assertIsNotNone(created)
+
+        web_app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(web_app)
+
+        @web_app.route("/server/ping", required_scope="read")
+        def _ping():
+            return "pong"
+
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+
+            remember_response = client.post_json(
+                "/server/browser/v1/remember",
+                {"secret": created["secret"]},
+                extra_environ=self._same_origin_headers(),
+            )
+
+            self.context.config.general.browser_handover_recovery_version = "1"
+            self.assertTrue(store.get_browser_handover_state(self.context.config)["open"])
+
+            response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+                expect_errors=True,
+            )
+            read_response = client.get(
+                "/server/ping",
+                extra_environ=self._same_origin_headers(),
+                expect_errors=True,
+            )
+            bootstrap_response = client.get(
+                "/bootstrap",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+            )
+            bootstrap_claim_response = client.post_json(
+                "/server/admin/bootstrap/v1/first-api-key",
+                {},
+                extra_environ=self._same_origin_headers(),
+            )
+            shell_after_claim_response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                },
+            )
+
+        self.assertEqual(201, remember_response.status_int)
+        self.assertIn("seedsync_ui_session=", remember_response.headers.get("Set-Cookie", ""))
+        self.assertEqual(302, response.status_int)
+        self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
+        self.assertEqual(302, read_response.status_int)
+        self.assertTrue(read_response.headers.get("Location", "").endswith("/bootstrap"))
+        self.assertEqual(200, bootstrap_response.status_int)
+        self.assertIn("Claim the first local session", bootstrap_response.text)
+        self.assertNotIn("Save this browser for next time", bootstrap_response.text)
+        self.assertEqual(201, bootstrap_claim_response.status_int)
+        self.assertIn("seedsync_ui_session=", bootstrap_claim_response.headers.get("Set-Cookie", ""))
+        self.assertEqual(200, shell_after_claim_response.status_int)
+        self.assertIn("<html></html>", shell_after_claim_response.text)
+
     def test_loopback_legacy_shell_session_redirects_to_bootstrap_after_first_admin_exists(self):
         store = ApiKeyStore()
         store.create_api_key("admin", ["admin"])

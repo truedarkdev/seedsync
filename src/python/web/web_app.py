@@ -228,6 +228,13 @@ class WebApp(bottle.Bottle):
         browser_handover_version = getattr(general_config, "browser_handover_recovery_version", "")
         return browser_handover_version if isinstance(browser_handover_version, str) else ""
 
+    def __is_browser_handover_open(self) -> bool:
+        if self.__auth_store is None:
+            return False
+
+        browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
+        return bool(browser_handover_state.get("open", False))
+
     @staticmethod
     def __is_server_path(path: str) -> bool:
         return path == "/server" or path.startswith("/server/")
@@ -605,6 +612,10 @@ class WebApp(bottle.Bottle):
                     return
                 if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
                     return
+                current_session = self.__get_ui_session()
+                if self.__is_browser_handover_open() and current_session is not None:
+                    if not getattr(current_session, "bootstrap", False):
+                        bottle.redirect("/bootstrap")
                 if self.__is_trusted_forwarded_origin_source():
                     ui_session_scopes = self.__get_ui_session_scopes()
                     if ui_session_scopes is not None:
@@ -708,7 +719,7 @@ class WebApp(bottle.Bottle):
                 )
 
         current_session = self.__get_ui_session()
-        if getattr(current_session, "api_key_id", None):
+        if getattr(current_session, "api_key_id", None) and not self.__is_browser_handover_open():
             bottle.redirect("/")
 
         browser_handover_state = {
@@ -1143,6 +1154,11 @@ class WebApp(bottle.Bottle):
     def __authorize_browser_bootstrap(self) -> None:
         if self.__auth_store is None:
             return
+
+        if self.__is_browser_handover_open():
+            current_session = self.__get_ui_session()
+            if current_session is None or not getattr(current_session, "bootstrap", False):
+                bottle.redirect("/bootstrap")
 
         if self.__get_ui_session() is not None:
             return
