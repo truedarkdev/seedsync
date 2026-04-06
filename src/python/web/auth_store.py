@@ -30,6 +30,38 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _history_file_path(file_path: Optional[str]) -> Optional[str]:
+    if not file_path:
+        return None
+    history_root, _ = os.path.splitext(file_path)
+    return "{}.history.jsonl".format(history_root)
+
+
+def append_api_key_store_history(file_path: Optional[str], event: str, reason: str, **details) -> None:
+    history_path = _history_file_path(file_path)
+    if history_path is None:
+        return
+
+    payload = {
+        "timestamp": _utc_now_iso(),
+        "event": event,
+        "reason": reason,
+        "store_file": os.path.basename(file_path),
+    }
+    if details:
+        payload["details"] = details
+
+    try:
+        history_dir = os.path.dirname(history_path)
+        if history_dir:
+            os.makedirs(history_dir, exist_ok=True)
+        with open(history_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True))
+            handle.write("\n")
+    except (OSError, TypeError, ValueError):
+        return
+
+
 def _normalize_scopes(scopes: Sequence[str]) -> List[str]:
     if not isinstance(scopes, (list, tuple, set)):
         raise ValueError("API key scopes must be a list of scope names")
@@ -173,6 +205,22 @@ class ApiKeyStore(Persist):
         self.__bootstrap_proof_path = file_path
         self.__sync_bootstrap_proof_artifact()
 
+    def __record_history_event(self, event: str, reason: str, **details) -> None:
+        append_api_key_store_history(self.__file_path, event, reason, **details)
+
+    def __history_snapshot(self) -> Dict[str, object]:
+        return {
+            "api_key_count": len(self.__api_keys),
+            "active_api_key_count": len([record for record in self.__api_keys if not record.is_revoked]),
+            "ui_session_count": len(self.__ui_sessions),
+            "remembered_ui_session_count": len([
+                session for session in self.__ui_sessions.values() if getattr(session, "remembered", False)
+            ]),
+            "browser_handover_claimed_version": self.__browser_handover_claimed_version,
+            "bootstrap_proof_present": self.__bootstrap_proof is not None,
+            "bootstrap_exchange_present": self.__bootstrap_exchange is not None,
+        }
+
     @property
     def api_keys(self) -> List[ApiKeyRecord]:
         return list(self.__api_keys)
@@ -236,6 +284,20 @@ class ApiKeyStore(Persist):
         self.__ui_sessions[record.secret] = record
         self.__prune_expired_ui_sessions(now)
         self.save()
+        if remembered:
+            reason = "remembered_browser_session_created"
+        elif bootstrap:
+            reason = "bootstrap_session_created"
+        else:
+            reason = "browser_session_created"
+        self.__record_history_event(
+            "ui_session_created",
+            reason,
+            bootstrap=bootstrap,
+            remembered=remembered,
+            api_key_id=record.api_key_id,
+            scopes=record.scopes,
+        )
         return record
 
     def __create_api_key_record(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
@@ -289,13 +351,24 @@ class ApiKeyStore(Persist):
             api_key_secret_hash=record.secret_hash
         )
 
-    def __discard_browser_sessions_for_api_key(self, key_id: str) -> int:
+    def __discard_browser_sessions_for_api_key(self, key_id: str, reason: str) -> int:
         matching_secrets = [
             secret for secret, session in self.__ui_sessions.items()
             if getattr(session, "api_key_id", None) == key_id
         ]
+        remembered_count = len([
+            secret for secret in matching_secrets
+            if getattr(self.__ui_sessions.get(secret), "remembered", False)
+        ])
         for secret in matching_secrets:
             self.__ui_sessions.pop(secret, None)
+        self.__record_history_event(
+            "ui_sessions_discarded",
+            reason,
+            api_key_id=key_id,
+            discarded_count=len(matching_secrets),
+            remembered_count=remembered_count,
+        )
         return len(matching_secrets)
 
     def find_ui_session_by_secret(self, secret: str) -> Optional[UiSessionRecord]:
@@ -351,6 +424,11 @@ class ApiKeyStore(Persist):
                 return False
             self.__browser_handover_claimed_version = version
             self.save()
+            self.__record_history_event(
+                "browser_handover_claimed",
+                "initial_admin_claimed",
+                browser_handover_version=version,
+            )
             return True
 
     def create_initial_admin_api_key_if_available(
@@ -365,9 +443,17 @@ class ApiKeyStore(Persist):
 
             result = self.__create_api_key_record(name, ["admin"])
             self.__browser_handover_claimed_version = version
-            self.clear_bootstrap_proof()
-            self.clear_bootstrap_exchange()
+            self.clear_bootstrap_proof(reason="admin_api_key_created")
+            self.clear_bootstrap_exchange(reason="admin_api_key_created")
             self.save()
+            self.__record_history_event(
+                "api_key_created",
+                "initial_admin_created",
+                api_key_id=result["record"].id,
+                name=result["record"].name,
+                scopes=result["record"].scopes,
+                browser_handover_version=version,
+            )
             return result
 
     def claim_initial_admin(self, browser_handover_version: str) -> None:
@@ -386,8 +472,8 @@ class ApiKeyStore(Persist):
         self.__prune_bootstrap_proof(now)
         self.__prune_bootstrap_exchange(now)
         if self.active_admin_key_count > 0:
-            self.clear_bootstrap_proof()
-            self.clear_bootstrap_exchange()
+            self.clear_bootstrap_proof(reason="active_admin_key_exists")
+            self.clear_bootstrap_exchange(reason="active_admin_key_exists")
             return None
 
         if self.__bootstrap_proof is None:
@@ -397,6 +483,11 @@ class ApiKeyStore(Persist):
                 expires_at=(now + _BOOTSTRAP_PROOF_TTL).isoformat(timespec="seconds"),
             )
             self.__sync_bootstrap_proof_artifact()
+            self.__record_history_event(
+                "bootstrap_proof_created",
+                "first_run_bootstrap_window_opened",
+                expires_at=self.__bootstrap_proof.expires_at,
+            )
 
         return self.__bootstrap_proof
 
@@ -417,17 +508,21 @@ class ApiKeyStore(Persist):
 
         self.__bootstrap_proof = None
         self.__sync_bootstrap_proof_artifact()
+        self.__record_history_event("bootstrap_proof_cleared", "consumed")
         return True
 
-    def clear_bootstrap_proof(self) -> None:
+    def clear_bootstrap_proof(self, reason: str = "manual_clear") -> None:
+        if self.__bootstrap_proof is None:
+            return
         self.__bootstrap_proof = None
         self.__sync_bootstrap_proof_artifact()
+        self.__record_history_event("bootstrap_proof_cleared", reason)
 
     def ensure_bootstrap_exchange(self) -> Optional[BootstrapExchangeRecord]:
         now = datetime.now(timezone.utc)
         self.__prune_bootstrap_exchange(now)
         if self.active_admin_key_count > 0:
-            self.clear_bootstrap_exchange()
+            self.clear_bootstrap_exchange(reason="active_admin_key_exists")
             return None
 
         if self.__bootstrap_exchange is None:
@@ -435,6 +530,11 @@ class ApiKeyStore(Persist):
                 secret=secrets.token_urlsafe(32),
                 created_at=now.isoformat(timespec="seconds"),
                 expires_at=(now + _BOOTSTRAP_EXCHANGE_TTL).isoformat(timespec="seconds"),
+            )
+            self.__record_history_event(
+                "bootstrap_exchange_created",
+                "first_run_bootstrap_window_opened",
+                expires_at=self.__bootstrap_exchange.expires_at,
             )
 
         return self.__bootstrap_exchange
@@ -455,18 +555,29 @@ class ApiKeyStore(Persist):
             return False
 
         self.__bootstrap_exchange = None
+        self.__record_history_event("bootstrap_exchange_cleared", "consumed")
         return True
 
-    def clear_bootstrap_exchange(self) -> None:
+    def clear_bootstrap_exchange(self, reason: str = "manual_clear") -> None:
+        if self.__bootstrap_exchange is None:
+            return
         self.__bootstrap_exchange = None
+        self.__record_history_event("bootstrap_exchange_cleared", reason)
 
     def create_api_key(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
         with self.__state_lock:
             result = self.__create_api_key_record(name, scopes)
             if "admin" in result["record"].scopes:
-                self.clear_bootstrap_proof()
-                self.clear_bootstrap_exchange()
+                self.clear_bootstrap_proof(reason="admin_api_key_created")
+                self.clear_bootstrap_exchange(reason="admin_api_key_created")
             self.save()
+            self.__record_history_event(
+                "api_key_created",
+                "create_api_key",
+                api_key_id=result["record"].id,
+                name=result["record"].name,
+                scopes=result["record"].scopes,
+            )
             return result
 
     def update_api_key(
@@ -484,13 +595,35 @@ class ApiKeyStore(Persist):
         if name is not None:
             if not isinstance(name, str) or not name.strip():
                 raise ValueError("API key name cannot be blank")
+            name_changed = name.strip() != record.name
             record.name = name.strip()
+        else:
+            name_changed = False
 
         if scopes is not None:
-            record.scopes = _normalize_scopes(scopes)
+            normalized_scopes = _normalize_scopes(scopes)
+            scopes_changed = normalized_scopes != record.scopes
+            record.scopes = normalized_scopes
+        else:
+            scopes_changed = False
 
         record.updated_at = _utc_now_iso()
         self.save()
+        if name_changed and scopes_changed:
+            reason = "name_and_scopes_updated"
+        elif name_changed:
+            reason = "name_updated"
+        elif scopes_changed:
+            reason = "scopes_updated"
+        else:
+            reason = "metadata_refreshed"
+        self.__record_history_event(
+            "api_key_updated",
+            reason,
+            api_key_id=record.id,
+            name=record.name,
+            scopes=record.scopes,
+        )
         return record
 
     def delete_api_key(self, key_id: str) -> ApiKeyRecord:
@@ -500,9 +633,16 @@ class ApiKeyStore(Persist):
         if not record.is_revoked:
             raise ValueError("Cannot delete an active API key")
 
-        self.__discard_browser_sessions_for_api_key(record.id)
+        discarded_count = self.__discard_browser_sessions_for_api_key(record.id, "api_key_deleted")
         self.__api_keys.remove(record)
         self.save()
+        self.__record_history_event(
+            "api_key_deleted",
+            "api_key_deleted",
+            api_key_id=record.id,
+            name=record.name,
+            discarded_session_count=discarded_count,
+        )
         return record
 
     def revoke_api_key(self, key_id: str) -> ApiKeyRecord:
@@ -515,8 +655,15 @@ class ApiKeyStore(Persist):
         now = _utc_now_iso()
         record.revoked_at = now
         record.updated_at = now
-        self.__discard_browser_sessions_for_api_key(record.id)
+        discarded_count = self.__discard_browser_sessions_for_api_key(record.id, "api_key_revoked")
         self.save()
+        self.__record_history_event(
+            "api_key_revoked",
+            "api_key_revoked",
+            api_key_id=record.id,
+            name=record.name,
+            discarded_session_count=discarded_count,
+        )
         return record
 
     def rotate_api_key(self, key_id: str) -> Dict[str, object]:
@@ -530,6 +677,13 @@ class ApiKeyStore(Persist):
         record.secret_hash = _hash_secret(secret)
         record.updated_at = _utc_now_iso()
         self.save()
+        self.__record_history_event(
+            "api_key_rotated",
+            "api_key_rotated",
+            api_key_id=record.id,
+            name=record.name,
+            scopes=record.scopes,
+        )
         return {"record": record, "secret": secret}
 
     def save(self):
@@ -539,11 +693,13 @@ class ApiKeyStore(Persist):
         if directory:
             os.makedirs(directory, exist_ok=True)
         self.to_file(self.__file_path)
+        self.__record_history_event("store_saved", "persisted", **self.__history_snapshot())
 
     @classmethod
     def from_file(cls, file_path: str) -> "ApiKeyStore":
         store = super().from_file(file_path)
         store.__file_path = file_path
+        store.__record_history_event("store_loaded", "loaded_existing_store", **store.__history_snapshot())
         return store
 
     @classmethod
@@ -672,8 +828,7 @@ class ApiKeyStore(Persist):
         except ValueError:
             pass
 
-        self.__bootstrap_proof = None
-        self.__sync_bootstrap_proof_artifact()
+        self.clear_bootstrap_proof(reason="expired")
 
     def __prune_bootstrap_exchange(self, now: datetime) -> None:
         if self.__bootstrap_exchange is None:
@@ -685,7 +840,7 @@ class ApiKeyStore(Persist):
         except ValueError:
             pass
 
-        self.__bootstrap_exchange = None
+        self.clear_bootstrap_exchange(reason="expired")
 
     def __sync_bootstrap_proof_artifact(self) -> None:
         if not self.__bootstrap_proof_path:

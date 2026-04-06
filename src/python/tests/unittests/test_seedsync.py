@@ -5,12 +5,24 @@ import sys
 import copy
 import tempfile
 import os
+import json
 import shutil
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit
 from seedsync import Seedsync
+from web.auth_store import ApiKeyStore
+
+
+def _read_history_entries(file_path):
+    history_path = os.path.splitext(file_path)[0] + ".history.jsonl"
+    with open(history_path, "r", encoding="utf-8") as handle:
+        return [
+            json.loads(line)
+            for line in handle
+            if line.strip()
+        ]
 
 
 class TestSeedsync(unittest.TestCase):
@@ -297,6 +309,73 @@ class TestSeedsync(unittest.TestCase):
         self.assertTrue(context.status.server.up)
         self.assertIsNone(context.status.server.error_msg)
         context.logger.info.assert_called_once_with("Controller startup recovered after timeout")
+
+    def test_load_persist_records_auth_store_recovery_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            sensitive_marker = "raw-secret-should-not-appear"
+            with open(store_path, "w", encoding="utf-8") as handle:
+                handle.write('{"api_keys":[{"secret_hash":"%s"}' % sensitive_marker)
+
+            store = Seedsync._load_persist(ApiKeyStore, store_path)
+
+            self.assertIsInstance(store, ApiKeyStore)
+            self.assertEqual(0, len(store.list_api_keys()))
+
+            backup_path = os.path.join(temp_dir, "api-keys.json.1.bak")
+            self.assertTrue(os.path.isfile(backup_path))
+
+            history_entries = _read_history_entries(store_path)
+            recovery_entries = [
+                entry for entry in history_entries
+                if entry["event"] == "store_load_failed"
+            ]
+            self.assertEqual(1, len(recovery_entries))
+            self.assertEqual("persist_error_fallback", recovery_entries[0]["reason"])
+            self.assertEqual("PersistError", recovery_entries[0]["details"]["error_type"])
+            self.assertEqual(backup_path, recovery_entries[0]["details"]["backup_path"])
+            self.assertEqual("fresh_store", recovery_entries[0]["details"]["fallback"])
+            history_path = os.path.splitext(store_path)[0] + ".history.jsonl"
+            with open(history_path, "r", encoding="utf-8") as handle:
+                history_text = handle.read()
+            self.assertNotIn(sensitive_marker, history_text)
+
+    def test_persist_uses_api_key_store_save_history(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            config_path = os.path.join(temp_dir, "settings.cfg")
+            store = ApiKeyStore(file_path=store_path)
+            store.create_api_key("admin", ["admin"])
+
+            initial_history = _read_history_entries(store_path)
+            initial_save_count = len([
+                entry for entry in initial_history
+                if entry["event"] == "store_saved"
+            ])
+
+            seedsync = Seedsync.__new__(Seedsync)
+            seedsync.context = SimpleNamespace(
+                logger=MagicMock(),
+                config=SimpleNamespace(to_str=MagicMock(return_value="{}")),
+            )
+            seedsync.controller_persist = MagicMock()
+            seedsync.auto_queue_persist = MagicMock()
+            seedsync.controller_persist_path = os.path.join(temp_dir, "controller.persist")
+            seedsync.auto_queue_persist_path = os.path.join(temp_dir, "autoqueue.persist")
+            seedsync.api_key_store = store
+            seedsync.api_key_store_path = store_path
+            seedsync.config_path = config_path
+
+            seedsync.persist()
+
+            updated_history = _read_history_entries(store_path)
+            updated_save_count = len([
+                entry for entry in updated_history
+                if entry["event"] == "store_saved"
+            ])
+            self.assertEqual(initial_save_count + 1, updated_save_count)
+            self.assertTrue(seedsync.controller_persist.to_file.called)
+            self.assertTrue(seedsync.auto_queue_persist.to_file.called)
 
     def test_timeout_status_keeps_later_controller_failure_degraded(self):
         context = SimpleNamespace(
