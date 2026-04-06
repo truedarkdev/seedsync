@@ -2,6 +2,7 @@
 
 import logging
 from threading import Thread
+from urllib.parse import urlsplit
 
 import bottle
 from paste import httpserver
@@ -54,6 +55,10 @@ class MyWSGIHandler(httpserver.WSGIHandler):
     This class is overridden to fix a bug in Paste http server
     """
     # noinspection SpellCheckingInspection
+    def wsgi_setup(self, environ=None):
+        super().wsgi_setup(environ)
+        self.wsgi_environ["seedsync.raw_path"] = urlsplit(self.path).path
+
     def wsgi_write_chunk(self, chunk):
         if type(chunk) is str:
             chunk = str.encode(chunk)

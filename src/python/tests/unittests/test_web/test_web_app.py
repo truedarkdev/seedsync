@@ -754,6 +754,78 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, shell_after_claim_response.status_int)
         self.assertIn("<html></html>", shell_after_claim_response.text)
 
+    def test_loopback_remembered_browser_session_allows_bootstrap_static_assets_while_handover_is_open(self):
+        store = ApiKeyStore()
+        self.context.config.general.browser_handover_recovery_version = "0"
+        created = store.create_initial_admin_api_key_if_available("0", "admin")
+        self.assertIsNotNone(created)
+
+        web_app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(web_app)
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            os.makedirs(os.path.join(html_path, "assets"))
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            with open(os.path.join(html_path, "assets", "logo.png"), "w") as asset_file:
+                asset_file.write("logo")
+            with open(os.path.join(html_path, "assets", "favicon.png"), "w") as asset_file:
+                asset_file.write("icon")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+
+            remember_response = client.post_json(
+                "/server/browser/v1/remember",
+                {"secret": created["secret"]},
+                extra_environ=self._same_origin_headers(),
+            )
+
+            self.context.config.general.browser_handover_recovery_version = "1"
+            logo_response = client.get(
+                "/assets/logo.png",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                    "seedsync.raw_path": "/assets/logo.png",
+                },
+            )
+            favicon_response = client.get(
+                "/assets/favicon.png",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                    "seedsync.raw_path": "/assets/favicon.png",
+                },
+            )
+            hostile_asset_response = client.get(
+                "/assets/logo.png",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                    "seedsync.raw_path": "/assets/../assets/logo.png",
+                },
+                expect_errors=True,
+            )
+            shell_response = client.get(
+                "/",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "REMOTE_ADDR": "127.0.0.1",
+                    "seedsync.raw_path": "/",
+                },
+                expect_errors=True,
+            )
+
+        self.assertEqual(201, remember_response.status_int)
+        self.assertIn("seedsync_ui_session=", remember_response.headers.get("Set-Cookie", ""))
+        self.assertEqual(200, logo_response.status_int)
+        self.assertEqual(200, favicon_response.status_int)
+        self.assertEqual(302, hostile_asset_response.status_int)
+        self.assertTrue(hostile_asset_response.headers.get("Location", "").endswith("/bootstrap"))
+        self.assertEqual(302, shell_response.status_int)
+        self.assertTrue(shell_response.headers.get("Location", "").endswith("/bootstrap"))
+
     def test_loopback_legacy_shell_session_redirects_to_bootstrap_after_first_admin_exists(self):
         store = ApiKeyStore()
         store.create_api_key("admin", ["admin"])

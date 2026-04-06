@@ -64,6 +64,10 @@ class WebApp(bottle.Bottle):
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
     _UI_SESSION_COOKIE_NAME = "seedsync_ui_session"
     _BOOTSTRAP_EXCHANGE_COOKIE_NAME = "seedsync_bootstrap_exchange"
+    _BOOTSTRAP_SAFE_STATIC_ASSET_PATHS = {
+        "/assets/favicon.png",
+        "/assets/logo.png",
+    }
 
     def __init__(self, context: Context, controller: Controller, auth_store: Optional[object] = None):
         super().__init__()
@@ -537,6 +541,10 @@ class WebApp(bottle.Bottle):
             WebApp.__is_loopback_host(WebApp.__request_host()) and
             self.__is_direct_same_origin_browser_request()
         )
+
+    def __is_bootstrap_safe_static_asset_request(self) -> bool:
+        request_path = bottle.request.environ.get("seedsync.raw_path") or bottle.request.path
+        return request_path in self._BOOTSTRAP_SAFE_STATIC_ASSET_PATHS
 
     def __allow_bootstrap_proof_exchange(self) -> bool:
         if (
@@ -1156,6 +1164,8 @@ class WebApp(bottle.Bottle):
             return
 
         if self.__is_browser_handover_open():
+            if self.__is_bootstrap_safe_static_asset_request():
+                return
             current_session = self.__get_ui_session()
             if current_session is None or not getattr(current_session, "bootstrap", False):
                 bottle.redirect("/bootstrap")
