@@ -34,7 +34,7 @@ Freshness rule:
 
 | Lane | Status | Best current evidence | Freshness / notes |
 | --- | --- | --- | --- |
-| Python web/auth backend | Healthy | Targeted auth/admin/config/web-app pytest coverage plus live Docker and Playwright proof for bootstrap, claim, remember, and cookie/session behavior. | Fresh as of 2026-04-04; keep detailed run history in task notes or artifacts. |
+| Python web/auth backend | Healthy | Targeted auth/admin/config/web-app pytest coverage, including bootstrap handover-safe static asset behavior, plus live Docker and Playwright proof for bootstrap, claim, remember, and cookie/session behavior. | Fresh as of 2026-04-06; keep detailed run history in task notes or artifacts. |
 | Python unit/backend | Healthy | Targeted controller unit coverage for path-pair refresh and runtime state rebuild behavior. | Fresh as of 2026-03-30. |
 | Python integration/controller | Healthy | Targeted controller integration coverage for the initial model path. | Fresh as of 2026-03-30. |
 | WSL backend stop-state integration | Healthy | Targeted WSL/Linux stop-state slice for the backend contract. | Fresh as of 2026-03-30. |
