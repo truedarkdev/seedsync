@@ -20,7 +20,7 @@ from common import Localization, Status, ConfigError, Persist, PersistError
 from common import PathPairManager
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
 from web import WebAppJob, WebAppBuilder
-from web.auth_store import ApiKeyStore
+from web.auth_store import ApiKeyStore, append_api_key_store_history
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
@@ -269,7 +269,7 @@ class Seedsync:
         self.controller_persist.to_file(self.controller_persist_path)
         self.auto_queue_persist.to_file(self.auto_queue_persist_path)
         if hasattr(self, "api_key_store") and hasattr(self, "api_key_store_path"):
-            self.api_key_store.to_file(self.api_key_store_path)
+            self.api_key_store.save()
         new_config_str = self.context.config.to_str()
         try:
             with open(self.config_path, "r") as f:
@@ -561,12 +561,21 @@ class Seedsync:
         if os.path.isfile(file_path):
             try:
                 return cls.from_file(file_path)
-            except PersistError:
+            except PersistError as exc:
                 if Seedsync.logger:
                     Seedsync.logger.exception("Caught exception")
 
                 # backup file
-                Seedsync.__backup_file(file_path)
+                backup_path = Seedsync.__backup_file(file_path)
+                if cls is ApiKeyStore:
+                    append_api_key_store_history(
+                        file_path,
+                        "store_load_failed",
+                        "persist_error_fallback",
+                        error_type=exc.__class__.__name__,
+                        backup_path=backup_path,
+                        fallback="fresh_store",
+                    )
 
                 # noinspection PyCallingNonCallable
                 return cls()
@@ -589,6 +598,7 @@ class Seedsync:
         if Seedsync.logger:
             Seedsync.logger.info("Backing up {} to {}".format(file_path, backup_path))
         shutil.copy(file_path, backup_path)
+        return backup_path
 
 
 if __name__ == "__main__":

@@ -7,6 +7,16 @@ import threading
 from web.auth_store import ApiKeyStore
 
 
+def _read_history_entries(file_path):
+    history_path = os.path.splitext(file_path)[0] + ".history.jsonl"
+    with open(history_path, "r", encoding="utf-8") as handle:
+        return [
+            json.loads(line)
+            for line in handle
+            if line.strip()
+        ]
+
+
 class TestApiKeyStore(unittest.TestCase):
     def test_create_update_revoke_and_rotate_persist_without_raw_secret(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -53,6 +63,15 @@ class TestApiKeyStore(unittest.TestCase):
             reloaded = ApiKeyStore.from_file(store_path)
             self.assertEqual(0, len(reloaded.list_api_keys()))
             self.assertEqual(0, len(reloaded.list_api_keys(include_revoked=True)))
+
+            history_entries = _read_history_entries(store_path)
+            events = [entry["event"] for entry in history_entries]
+            self.assertIn("store_loaded", events)
+            self.assertIn("api_key_created", events)
+            self.assertIn("api_key_updated", events)
+            self.assertIn("api_key_rotated", events)
+            self.assertIn("api_key_revoked", events)
+            self.assertIn("api_key_deleted", events)
 
     def test_delete_api_key_rejects_active_keys(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -210,6 +229,20 @@ class TestApiKeyStore(unittest.TestCase):
             expired_reload.revoke_api_key(record.id)
             self.assertIsNone(expired_reload.find_ui_session_by_secret(remembered_session.secret))
             self.assertNotIn(remembered_session.secret, expired_reload._ApiKeyStore__ui_sessions)
+
+            history_entries = _read_history_entries(store_path)
+            remembered_creation = [
+                entry for entry in history_entries
+                if entry["event"] == "ui_session_created" and entry["reason"] == "remembered_browser_session_created"
+            ]
+            self.assertEqual(1, len(remembered_creation))
+            discarded_entries = [
+                entry for entry in history_entries
+                if entry["event"] == "ui_sessions_discarded" and entry["reason"] == "api_key_revoked"
+            ]
+            self.assertEqual(1, len(discarded_entries))
+            self.assertEqual(1, discarded_entries[0]["details"]["discarded_count"])
+            self.assertEqual(1, discarded_entries[0]["details"]["remembered_count"])
 
     def test_delete_api_key_removes_remembered_browser_sessions_for_revoked_key(self):
         with tempfile.TemporaryDirectory() as temp_dir:
