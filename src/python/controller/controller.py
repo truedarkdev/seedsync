@@ -71,9 +71,15 @@ class Controller:
                 """Called on action failure"""
                 pass
 
-        def __init__(self, action: Action, filename: str):
+        def __init__(self,
+                     action: Action,
+                     filename: str,
+                     flow_id: str = None,
+                     origin: str = "manual"):
             self.action = action
             self.filename = filename
+            self.flow_id = flow_id
+            self.origin = origin
             self.callbacks = []
 
         def add_callback(self, callback: ICallback):
@@ -131,6 +137,8 @@ class Controller:
 
         # The command queue
         self.__command_queue = Queue()
+        self.__command_flow_sequence = 0
+        self.__command_flow_lock = Lock()
 
         # The model
         self.__model = Model()
@@ -660,7 +668,20 @@ class Controller:
         return model_files
 
     def queue_command(self, command: Command):
+        if getattr(command, "flow_id", None) is None:
+            command.flow_id = self.__next_command_flow_id(command)
         self.__command_queue.put(command)
+        self.__record_command_breadcrumb(
+            command=command,
+            message="command_queued",
+            details={
+                "command": getattr(command.action, "name", str(command.action)),
+                "origin": getattr(command, "origin", "manual"),
+                "file_name": command.filename,
+                "queue_size": self.__safe_command_queue_size(),
+            },
+            event_type="state_transition",
+        )
 
     def __get_model_files(self) -> List[ModelFile]:
         model_files = []
@@ -851,6 +872,7 @@ class Controller:
                             path_pair_id: str = None,
                             path_pair_name: str = None,
                             corr_id: str = None,
+                            flow_id: str = None,
                             trace_scope: str = "flow"):
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         if breadcrumb_trace is None:
@@ -862,11 +884,53 @@ class Controller:
             stage=stage,
             event_type=event_type,
             corr_id=corr_id if corr_id is not None else (file_id if file_id is not None else stage),
+            flow_id=flow_id,
             file_id=file_id,
             path_pair_id=path_pair_id,
             path_pair_name=path_pair_name,
             trace_scope=trace_scope,
         )
+
+    def __next_command_flow_id(self, command: "Controller.Command") -> str:
+        lock = getattr(self, "_Controller__command_flow_lock", None)
+        if lock is None:
+            lock = Lock()
+            self.__command_flow_lock = lock
+        with lock:
+            sequence = getattr(self, "_Controller__command_flow_sequence", 0) + 1
+            self.__command_flow_sequence = sequence
+        action_name = getattr(command.action, "name", str(command.action)).lower()
+        return "cmd:{}:{}:{}".format(action_name, command.filename, sequence)
+
+    @staticmethod
+    def __command_corr_id(command: "Controller.Command", file: ModelFile = None):
+        if file is not None:
+            return file.path_pair_id or file.file_id or command.filename
+        return command.filename
+
+    def __record_command_breadcrumb(self,
+                                    command: "Controller.Command",
+                                    message: str,
+                                    details: dict,
+                                    event_type: str = "state_transition",
+                                    file: ModelFile = None):
+        self.__record_breadcrumb(
+            stage="command",
+            message=message,
+            details=details,
+            event_type=event_type,
+            file_id=file.file_id if file is not None else None,
+            path_pair_id=file.path_pair_id if file is not None else None,
+            path_pair_name=file.path_pair_name if file is not None else None,
+            corr_id=self.__command_corr_id(command, file),
+            flow_id=getattr(command, "flow_id", None),
+        )
+
+    def __safe_command_queue_size(self):
+        try:
+            return self.__command_queue.qsize()
+        except (NotImplementedError, AttributeError):
+            return None
 
     def __trace_corr_id_from_files(self, files, fallback: str):
         if files is not None:
@@ -1543,24 +1607,18 @@ class Controller:
                             _error_code: int = 400,
                             _file: ModelFile = None):
             self.logger.warning("Command failed. {}".format(_msg))
-            self.__record_breadcrumb(
-                stage="command",
+            self.__record_command_breadcrumb(
+                command=_command,
                 message="command_failed",
                 details={
                     "command": getattr(_command.action, "name", str(_command.action)),
                     "message": _msg,
                     "error_code": _error_code,
                     "file_name": _file.name if _file is not None else _command.filename,
+                    "lifecycle_phase": "dispatch",
                 },
                 event_type="failure",
-                file_id=_file.file_id if _file is not None else None,
-                path_pair_id=_file.path_pair_id if _file is not None else None,
-                path_pair_name=_file.path_pair_name if _file is not None else None,
-                corr_id=(
-                    _file.path_pair_id
-                    if _file is not None and _file.path_pair_id is not None
-                    else (_file.file_id if _file is not None else _command.filename)
-                ),
+                file=_file,
             )
             for _callback in _command.callbacks:
                 _callback.on_failure(_msg, _error_code)
@@ -1571,8 +1629,28 @@ class Controller:
             try:
                 file = self.__model.get_file(command.filename)
             except ModelError:
+                self.__record_command_breadcrumb(
+                    command=command,
+                    message="command_dequeued",
+                    details={
+                        "command": getattr(command.action, "name", str(command.action)),
+                        "file_name": command.filename,
+                        "queue_size": self.__safe_command_queue_size(),
+                    },
+                )
                 _notify_failure(command, "File '{}' not found".format(command.filename), 404)
                 continue
+            self.__record_command_breadcrumb(
+                command=command,
+                message="command_dequeued",
+                details={
+                    "command": getattr(command.action, "name", str(command.action)),
+                    "file_name": file.name,
+                    "queue_size": self.__safe_command_queue_size(),
+                    "origin": getattr(command, "origin", "manual"),
+                },
+                file=file,
+            )
             self.__temp_diag(
                 "command_received",
                 file_id=file.file_id,
@@ -1612,6 +1690,16 @@ class Controller:
                     )
                     self.__persist.stopped_file_names.discard(file.file_id)
                     self.__persist.stopped_file_names.discard(file.name)
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "QUEUE",
+                            "mode": "lftp_queue",
+                            "stopped_marked": stopped_marked,
+                        },
+                        file=file,
+                    )
                 except LftpError as e:
                     _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
                     continue
@@ -1672,6 +1760,15 @@ class Controller:
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "STOP",
+                            "mode": "lftp_kill",
+                        },
+                        file=file,
+                    )
                 except (LftpError, LftpJobStatusParserError) as e:
                     _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
                     continue
@@ -1739,12 +1836,21 @@ class Controller:
                         self.__trace_target_archive_event("extract_command_queued", {
                             "file": self.__summarize_target_archive_file(file),
                         })
-                    self.__extract_process.extract(file)
+                    self.__extract_process.extract(file, flow_id=command.flow_id)
                     self.__temp_diag(
                         "extract_command_dispatched",
                         file_id=file.file_id,
                         file_name=file.name,
                         state=getattr(file.state, "name", file.state),
+                    )
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "EXTRACT",
+                            "mode": "extract_process_queue",
+                        },
+                        file=file,
                     )
 
             elif command.action == Controller.Command.Action.VALIDATE:
@@ -1771,6 +1877,15 @@ class Controller:
                     continue
                 else:
                     self.__validate_process.validate(file)
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "VALIDATE",
+                            "mode": "validate_process_queue",
+                        },
+                        file=file,
+                    )
 
             elif command.action == Controller.Command.Action.DELETE_LOCAL:
                 if file.state not in (
@@ -1798,6 +1913,16 @@ class Controller:
                     )
                     self.__persist.stopped_file_names.add(file.file_id)
                     self.__validate_process.clear(file.file_id)
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "DELETE_LOCAL",
+                            "mode": "delete_local_process",
+                            "await_completion": True,
+                        },
+                        file=file,
+                    )
 
             elif command.action == Controller.Command.Action.DELETE_REMOTE:
                 if file.state not in (
@@ -1841,6 +1966,16 @@ class Controller:
                     self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
                     self.__validate_process.clear(file.file_id)
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_dispatched",
+                        details={
+                            "command": "DELETE_REMOTE",
+                            "mode": "delete_remote_process",
+                            "await_completion": False,
+                        },
+                        file=file,
+                    )
 
             # If we get here, it was a success
             if command.action in (
@@ -1851,6 +1986,16 @@ class Controller:
             if command.action != Controller.Command.Action.DELETE_LOCAL:
                 for callback in command.callbacks:
                     callback.on_success()
+                self.__record_command_breadcrumb(
+                    command=command,
+                    message="command_finished",
+                    details={
+                        "command": getattr(command.action, "name", str(command.action)),
+                        "lifecycle_phase": "dispatch",
+                        "completion": "accepted",
+                    },
+                    file=file,
+                )
 
     def __log_memory_usage(self):
         with self.__model_lock:
@@ -1921,6 +2066,18 @@ class Controller:
                     try:
                         command_process.process.propagate_exception()
                     except FileNotFoundError as error:
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_failed",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": str(error),
+                                "error_code": 404,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                            },
+                            event_type="failure",
+                        )
                         self.logger.warning(
                             "Command {} for file {} failed: {}".format(
                                 command_process.command.action,
@@ -1935,6 +2092,18 @@ class Controller:
                                 404
                             )
                     except Exception as error:
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_failed",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": str(error),
+                                "error_code": 500,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                            },
+                            event_type="failure",
+                        )
                         self.logger.warning(
                             "Command {} for file {} failed: {}".format(
                                 command_process.command.action,
@@ -1952,9 +2121,42 @@ class Controller:
                         command_process.post_callback()
                         for callback in command_process.command.callbacks:
                             callback.on_success()
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_finished",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "lifecycle_phase": "cleanup",
+                                "completion": "completed",
+                            },
+                        )
                 else:
                     # Do the post callback
                     command_process.post_callback()
                     # Propagate the exception
-                    command_process.process.propagate_exception()
+                    try:
+                        command_process.process.propagate_exception()
+                    except Exception as error:
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_failed",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": str(error),
+                                "error_code": 500,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                            },
+                            event_type="failure",
+                        )
+                        raise
+                    self.__record_command_breadcrumb(
+                        command=command_process.command,
+                        message="command_finished",
+                        details={
+                            "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                            "lifecycle_phase": "cleanup",
+                            "completion": "completed",
+                        },
+                    )
         self.__active_command_processes = still_active_processes

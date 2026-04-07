@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta
 import os
 import json
+import threading
+import time
 import unittest
 from queue import Queue
 from threading import Lock
@@ -22,6 +24,7 @@ class TestController(unittest.TestCase):
         self.controller = Controller.__new__(Controller)
         self.controller.logger = MagicMock()
         self.controller._Controller__command_queue = Queue()
+        self.controller._Controller__command_flow_lock = Lock()
         self.controller._Controller__active_command_processes = []
         self.controller._Controller__active_downloading_file_names = []
         self.controller._Controller__active_extracting_file_names = []
@@ -78,6 +81,48 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
+
+    def test_queue_command_assigns_unique_flow_ids_under_concurrent_enqueues(self):
+        class SlowSequence(int):
+            def __new__(cls, value):
+                instance = int.__new__(cls, value)
+                return instance
+
+            def __add__(self, other):
+                time.sleep(0.01)
+                return int(self) + other
+
+        thread_count = 16
+        self.controller._Controller__command_flow_sequence = SlowSequence(0)
+
+        commands = [Controller.Command(Controller.Command.Action.QUEUE, "dup") for _ in range(thread_count)]
+        errors = []
+
+        def _queue(command):
+            try:
+                self.controller.queue_command(command)
+            except Exception as exc:  # pragma: no cover - defensive test capture
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_queue, args=(command,)) for command in commands]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual([], errors)
+        self.assertEqual(thread_count, self.controller._Controller__command_queue.qsize())
+        self.assertEqual(
+            thread_count,
+            len({command.flow_id for command in commands})
+        )
+        self.assertEqual(
+            ["cmd:queue:dup:{}".format(index) for index in range(1, thread_count + 1)],
+            sorted(
+                (command.flow_id for command in commands),
+                key=lambda flow_id: int(flow_id.rsplit(":", 1)[1])
+            )
+        )
 
     def test_update_model_ignores_lftp_status_parser_errors(self):
         self.controller._Controller__lftp.status.side_effect = LftpJobStatusParserError("bad status")
@@ -213,9 +258,11 @@ class TestController(unittest.TestCase):
             stage="controller",
             event_type="state_transition",
             corr_id="controller",
+            flow_id=None,
             file_id=None,
             path_pair_id=None,
             path_pair_name=None,
+            trace_scope="flow",
         )
         self.controller._Controller__active_scan_process.start.assert_called_once_with()
         self.controller._Controller__local_scan_process.start.assert_called_once_with()
@@ -288,6 +335,7 @@ class TestController(unittest.TestCase):
             stage="scan",
             event_type="failure",
             corr_id="remote_scan:aggregate",
+            flow_id=None,
             file_id=None,
             path_pair_id=None,
             path_pair_name=None,
@@ -1401,6 +1449,52 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
+    def test_delete_local_command_lifecycle_breadcrumbs_keep_same_flow_id(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.path_pair_name = "Movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            process.is_alive.return_value = False
+            process.propagate_exception.return_value = None
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            self.controller._Controller__cleanup_commands()
+
+        lifecycle_entries = [
+            call.kwargs
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] in {
+                "command_queued",
+                "command_dequeued",
+                "command_dispatched",
+                "command_finished",
+            }
+        ]
+        self.assertEqual(4, len(lifecycle_entries))
+        flow_ids = {entry.get("flow_id") for entry in lifecycle_entries}
+        self.assertEqual(1, len(flow_ids))
+        self.assertEqual({"cmd:delete_local:{}:1".format(file.file_id)}, flow_ids)
+        self.assertEqual(
+            ["command_queued", "command_dequeued", "command_dispatched", "command_finished"],
+            [
+                call.args[1]
+                for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+                if len(call.args) >= 2 and call.args[1] in {
+                    "command_queued", "command_dequeued", "command_dispatched", "command_finished"
+                }
+            ]
+        )
+
     def test_process_commands_delete_local_preserves_callbacks_for_failed_cleanup(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
@@ -1441,6 +1535,20 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.controller._Controller__validate_process.validate.assert_called_once_with(file)
+
+    def test_process_commands_extract_passes_flow_id_to_extract_process(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.EXTRACT, "dup", flow_id="flow-123")
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__extract_process.extract.assert_called_once_with(file, flow_id="flow-123")
 
     def test_process_commands_validate_rejects_missing_remote_file(self):
         file = ModelFile("dup", False)

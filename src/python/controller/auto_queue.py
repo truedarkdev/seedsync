@@ -2,7 +2,7 @@
 
 import json
 from abc import ABC, abstractmethod
-from typing import Set, List, Callable, Tuple, Optional
+from typing import Set, List, Callable, Tuple, Optional, Dict
 import fnmatch
 from threading import Lock
 import os
@@ -174,6 +174,7 @@ class AutoQueue:
         self.__enabled = context.config.autoqueue.enabled
         self.__patterns_only = context.config.autoqueue.patterns_only
         self.__auto_extract_enabled = context.config.autoqueue.auto_extract
+        self.__cycle_sequence = 0
 
         if self.__enabled:
             persist.add_listener(self.__persist_listener)
@@ -232,10 +233,12 @@ class AutoQueue:
         """
         if not self.__enabled:
             return
+        self.__cycle_sequence += 1
 
         ###
         # Queue
         ###
+        queue_candidates = {}
         new_files_to_queue = self.__filter_candidates(
             candidates=self.__model_listener.new_files,
             accept=lambda f: (
@@ -244,6 +247,7 @@ class AutoQueue:
                 (f.local_size is None or f.local_size == 0)
             )
         )
+        queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
 
         modified_candidates_actual_update = []
         modified_candidates_remote_discovery = []
@@ -253,6 +257,8 @@ class AutoQueue:
                     modified_candidates_actual_update.append(new_file)
                 else:
                     modified_candidates_remote_discovery.append(new_file)
+        queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
+        queue_candidates.update({file.file_id: file for file in modified_candidates_remote_discovery})
 
         modified_files_actual_update = self.__filter_candidates(
             candidates=modified_candidates_actual_update,
@@ -278,15 +284,20 @@ class AutoQueue:
             for file, pattern in files_to_queue_dict.values()
             if not self.__controller.is_file_stopped(file.file_id)
         ]
+        files_to_queue_by_id = {file.file_id: file for file, _ in files_to_queue}
+        queue_blocked_reason_counts, queue_blocked_samples = self.__summarize_auto_queue_decisions(
+            lane="queue",
+            candidate_files=list(queue_candidates.values()),
+            selected_by_id=files_to_queue_by_id,
+        )
 
         ###
         # Extract
         ###
         files_to_extract = []
+        extract_candidate_files = []
 
         if self.__auto_extract_enabled:
-            extract_candidate_files = []
-
             # Candidate all new files
             extract_candidate_files += self.__model_listener.new_files
 
@@ -306,6 +317,12 @@ class AutoQueue:
                     f.local_size > 0 and
                     f.is_extractable
             )
+        files_to_extract_by_id = {file.file_id: file for file, _ in files_to_extract}
+        extract_blocked_reason_counts, extract_blocked_samples = self.__summarize_auto_queue_decisions(
+            lane="extract",
+            candidate_files=extract_candidate_files,
+            selected_by_id=files_to_extract_by_id,
+        )
 
         trace_target_file = None
         if self.__is_target_archive_trace_enabled():
@@ -410,12 +427,16 @@ class AutoQueue:
         self.__record_breadcrumb(
             "auto_queue_cycle",
             {
+                "cycle": self.__cycle_sequence,
                 "new_queue_candidates": len(new_files_to_queue),
                 "modified_queue_candidates": len(modified_files_actual_update) + len(modified_files_remote_discovery),
                 "queue_count": len(files_to_queue),
                 "extract_count": len(files_to_extract),
                 "patterns_only": self.__patterns_only,
                 "auto_extract_enabled": self.__auto_extract_enabled,
+                "queue_blocked_reason_counts": queue_blocked_reason_counts,
+                "extract_blocked_reason_counts": extract_blocked_reason_counts,
+                "blocked_samples": (queue_blocked_samples + extract_blocked_samples)[:5],
             }
         )
 
@@ -429,7 +450,12 @@ class AutoQueue:
                 "Auto queueing '{}'".format(file.name) +
                 (" for pattern '{}'".format(pattern.pattern) if pattern else "")
             )
-            command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+            command = Controller.Command(
+                Controller.Command.Action.QUEUE,
+                file.file_id,
+                flow_id="autoq:{}:QUEUE:{}".format(self.__cycle_sequence, file.file_id),
+                origin="auto_queue",
+            )
             self.__controller.queue_command(command)
 
         # Send the extract commands
@@ -438,7 +464,12 @@ class AutoQueue:
                 "Auto extracting '{}'".format(file.name) +
                 (" for pattern '{}'".format(pattern.pattern) if pattern else "")
             )
-            command = Controller.Command(Controller.Command.Action.EXTRACT, file.file_id)
+            command = Controller.Command(
+                Controller.Command.Action.EXTRACT,
+                file.file_id,
+                flow_id="autoq:{}:EXTRACT:{}".format(self.__cycle_sequence, file.file_id),
+                origin="auto_queue",
+            )
             self.__controller.queue_command(command)
 
         # Clear the processed files
@@ -495,6 +526,65 @@ class AutoQueue:
                         files_matched[file.file_id] = (file, new_pattern)
 
         return list(files_matched.values())
+
+    def __summarize_auto_queue_decisions(self,
+                                         lane: str,
+                                         candidate_files: List[ModelFile],
+                                         selected_by_id: Dict[str, ModelFile]):
+        reason_counts = {}
+        samples = []
+        seen_ids = set()
+
+        for file in candidate_files:
+            if file.file_id in seen_ids:
+                continue
+            seen_ids.add(file.file_id)
+            if file.file_id in selected_by_id:
+                continue
+
+            if lane == "queue":
+                reason = self.__queue_block_reason(file)
+            else:
+                reason = self.__extract_block_reason(file)
+
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+            if len(samples) < 3:
+                samples.append({
+                    "lane": lane,
+                    "file_id": file.file_id,
+                    "file_name": file.name,
+                    "reason": reason,
+                })
+
+        return reason_counts, samples
+
+    def __queue_block_reason(self, file: ModelFile) -> str:
+        if file.remote_size is None:
+            return "missing_remote"
+        if file.state != ModelFile.State.DEFAULT:
+            return "state_not_default"
+        if file.local_size is not None and file.local_size != 0:
+            return "local_present"
+        if self.__patterns_only and not any(self.__match(pattern, file) for pattern in self.__persist.patterns):
+            return "pattern_no_match"
+        if self.__controller.is_file_stopped(file.file_id):
+            return "explicitly_stopped"
+        return "filtered_out"
+
+    def __extract_block_reason(self, file: ModelFile) -> str:
+        if not self.__auto_extract_enabled:
+            return "auto_extract_disabled"
+        if file.state != ModelFile.State.DOWNLOADED:
+            return "state_not_downloaded"
+        if file.local_size is None:
+            return "missing_local_size"
+        if file.local_size <= 0:
+            return "empty_local_size"
+        if not file.is_extractable:
+            return "not_extractable"
+        if self.__patterns_only and not any(self.__match(pattern, file) for pattern in self.__persist.patterns):
+            return "pattern_no_match"
+        return "filtered_out"
 
     @staticmethod
     def __match(pattern: AutoQueuePattern, file: ModelFile) -> bool:

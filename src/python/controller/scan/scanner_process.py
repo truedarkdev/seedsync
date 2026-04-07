@@ -103,12 +103,14 @@ class ScannerProcess(AppProcess):
         timestamp_start = datetime.now()
         if self.verbose:
             self.logger.debug("Running a scan")
+        flow_id = "{}:{}".format(self.__scanner.__class__.__name__, int(timestamp_start.timestamp() * 1000))
         self.__record_breadcrumb(
             "scan_started",
             {
                 "scanner": self.__scanner.__class__.__name__,
                 "interval_ms": self.__interval_in_ms,
             },
+            flow_id=flow_id,
         )
         try:
             files = self.__scanner.scan()
@@ -128,6 +130,7 @@ class ScannerProcess(AppProcess):
                     "managed_extract_file_count": len(managed_extract_file_ids),
                 },
                 corr_id=self.__trace_corr_id(),
+                flow_id=flow_id,
                 path_pair_id=self.__trace_path_pair_id(),
                 path_pair_name=self.__trace_path_pair_name(),
             )
@@ -143,6 +146,7 @@ class ScannerProcess(AppProcess):
                     },
                     event_type="failure",
                     corr_id=self.__trace_corr_id(),
+                    flow_id=flow_id,
                     path_pair_id=self.__trace_path_pair_id(),
                     path_pair_name=self.__trace_path_pair_name(),
                 )
@@ -174,6 +178,7 @@ class ScannerProcess(AppProcess):
                 },
                 event_type="failure",
                 corr_id=self.__trace_corr_id(),
+                flow_id=flow_id,
                 path_pair_id=self.__trace_path_pair_id(),
                 path_pair_name=self.__trace_path_pair_name(),
             )
@@ -199,7 +204,8 @@ class ScannerProcess(AppProcess):
         return getattr(self.__scanner, "path_pair_name", None)
 
     def __record_breadcrumb(self, message: str, details: dict, event_type: str = "state_transition",
-                            corr_id: str = None, path_pair_id: str = None, path_pair_name: str = None):
+                            corr_id: str = None, flow_id: str = None,
+                            path_pair_id: str = None, path_pair_name: str = None):
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -209,6 +215,7 @@ class ScannerProcess(AppProcess):
             stage="scan",
             event_type=event_type,
             corr_id=corr_id if corr_id is not None else self.__trace_corr_id(),
+            flow_id=flow_id,
             path_pair_id=path_pair_id if path_pair_id is not None else self.__trace_path_pair_id(),
             path_pair_name=path_pair_name if path_pair_name is not None else self.__trace_path_pair_name(),
         )
