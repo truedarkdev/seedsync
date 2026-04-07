@@ -26,7 +26,8 @@ state.
 
 ### Does SeedSync collect any data?
 
-No, SeedSync does not collect any data.
+SeedSync does not collect remote telemetry by default.
+It does include an opt-in local breadcrumb recorder that stores a small bounded debug window on the server for incident troubleshooting.
 
 
 ## Troubleshooting
@@ -46,6 +47,9 @@ When enabled, it keeps a short bounded history of structured breadcrumbs so you 
 
 Turn it on in `Settings > General` with `Enable breadcrumb trace recorder`, reproduce the problem, then read `GET /server/breadcrumbs/get` for the recent breadcrumb window with an authenticated admin session or an admin-scoped API key.
 If you are polling after an earlier snapshot, use `since_version=<n>` to ask for only newer entries.
+You can also narrow the response with `limit`, `corr_id`, `flow_id`, `stage`, `event_type`, `path_pair_id`, `file_id`, and `order=asc|desc`.
+Turning tracing off keeps the retained breadcrumb window available until it is explicitly cleared.
+An authenticated admin can purge the retained window with `POST /server/breadcrumbs/reset`.
 
 ### How are breadcrumbs different from normal logs?
 

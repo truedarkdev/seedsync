@@ -32,11 +32,13 @@ Breadcrumb trace is a low-overhead, opt-in recent-context recorder for hard-to-d
 It keeps a short bounded window of structured breadcrumbs in memory so operators can see the lead-up to a problem without turning on noisy debug logging.
 
 Enable it in `Settings > General` with `Enable breadcrumb trace recorder`.
+The same section also lets you tune the breadcrumb retention depth if you want a larger or smaller recent window.
 
 When you need the recent failure context, read the breadcrumb diagnostics endpoint with an authenticated admin session or an admin-scoped API key:
 
 - `GET /server/breadcrumbs/get`
 - add `since_version=<n>` to read only entries newer than a previous snapshot
+- optionally add `limit`, `corr_id`, `flow_id`, `stage`, `event_type`, `path_pair_id`, `file_id`, and `order=asc|desc` for server-side filtering and bounded retrieval
 
 Use breadcrumbs for the short sequence of state changes, retries, queue decisions, transfer steps, and extraction transitions around the failure.
 Use normal logs for long-lived operational history and broad troubleshooting context.

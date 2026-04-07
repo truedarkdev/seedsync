@@ -201,6 +201,7 @@ class TestConfig(unittest.TestCase):
             "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
             "browser_handover_recovery_version": "2026.04.03",
             "breadcrumb_trace_enabled": "False",
+            "breadcrumb_trace_retention_depth": "128",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -211,6 +212,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
         self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
         self.assertEqual(False, general.breadcrumb_trace_enabled)
+        self.assertEqual(128, general.breadcrumb_trace_retention_depth)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -225,6 +227,9 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "debug", "-1")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "0")
+        self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "1025")
 
     def test_general_breadcrumb_trace_enabled_requires_bool(self):
         general = Config.General()
@@ -247,6 +252,39 @@ class TestConfig(unittest.TestCase):
             "Bad config: General.config_api_redact_remote_details (False) must be a boolean value",
             str(error.exception)
         )
+
+    def test_general_breadcrumb_trace_retention_depth_requires_bounded_positive_int(self):
+        general = Config.General()
+        general.breadcrumb_trace_retention_depth = 128
+
+        with self.assertRaises(ConfigError) as error:
+            general.breadcrumb_trace_retention_depth = 0
+        self.assertEqual(
+            "Bad config: General.breadcrumb_trace_retention_depth (0) must be greater than 0",
+            str(error.exception)
+        )
+
+        with self.assertRaises(ConfigError) as error:
+            general.breadcrumb_trace_retention_depth = 1025
+        self.assertEqual(
+            "Bad config: General.breadcrumb_trace_retention_depth (1025) must not exceed 1024 (FD_SETSIZE limit)",
+            str(error.exception)
+        )
+
+    def test_general_breadcrumb_trace_retention_depth_defaults_to_128(self):
+        good_dict = {
+            "debug": "True",
+            "verbose": "False",
+            "api_token": "token-value",
+            "allowed_hostname": "",
+            "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
+            "browser_handover_recovery_version": "2026.04.03",
+            "breadcrumb_trace_enabled": "False",
+            "config_api_redact_remote_details": "False",
+        }
+
+        general = Config.General.from_dict(good_dict)
+        self.assertEqual(128, general.breadcrumb_trace_retention_depth)
 
     def test_lftp(self):
         good_dict = {
@@ -491,6 +529,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
             self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
             self.assertEqual(False, config.general.breadcrumb_trace_enabled)
+            self.assertEqual(128, config.general.breadcrumb_trace_retention_depth)
             self.assertEqual(True, config.general.config_api_redact_remote_details)
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
@@ -548,6 +587,7 @@ class TestConfig(unittest.TestCase):
             config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
             config.general.browser_handover_recovery_version = "2026.04.03"
             config.general.breadcrumb_trace_enabled = False
+            config.general.breadcrumb_trace_retention_depth = 128
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
@@ -587,6 +627,7 @@ class TestConfig(unittest.TestCase):
             trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32
             browser_handover_recovery_version = 2026.04.03
             breadcrumb_trace_enabled = False
+            breadcrumb_trace_retention_depth = 128
             config_api_redact_remote_details = True
 
             [Lftp]

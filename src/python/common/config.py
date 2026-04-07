@@ -261,6 +261,9 @@ class Config(Persist):
         breadcrumb_trace_enabled = PROP("breadcrumb_trace_enabled",
                                         Checkers.bool_value,
                                         Converters.bool)
+        breadcrumb_trace_retention_depth = PROP("breadcrumb_trace_retention_depth",
+                                                Checkers.int_non_negative_max(1024),
+                                                Converters.int)
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -274,6 +277,7 @@ class Config(Persist):
             self.trusted_browser_bootstrap_remote_addrs = None
             self.browser_handover_recovery_version = None
             self.breadcrumb_trace_enabled = False
+            self.breadcrumb_trace_retention_depth = 128
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -293,6 +297,9 @@ class Config(Persist):
             if "breadcrumb_trace_enabled" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["breadcrumb_trace_enabled"] = False
+            if "breadcrumb_trace_retention_depth" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["breadcrumb_trace_retention_depth"] = 128
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True

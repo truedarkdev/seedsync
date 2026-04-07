@@ -1,5 +1,6 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
+import queue
 import unittest
 from unittest.mock import patch
 
@@ -46,6 +47,61 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertFalse(snapshot["window_reset"])
         self.assertEqual(0, snapshot["version"])
 
+    def test_disabled_emitter_traffic_stays_bounded_without_retaining_raw_backlog(self):
+        enabled = {"value": False}
+        collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)
+        emitter = collector.create_emitter()
+
+        for index in range(200):
+            emitter.record(
+                "scanner_process",
+                "scan_started",
+                {"phase": "init", "iteration": index, "token": "secret-token-{}".format(index)},
+                stage="scan",
+                corr_id="flow-1",
+            )
+
+        snapshot = collector.snapshot()
+        self.assertEqual(False, snapshot["enabled"])
+        self.assertEqual(0, snapshot["entry_count"])
+        self.assertEqual([], snapshot["entries"])
+        self.assertEqual(0, snapshot["external_queue_drain_count"])
+        self.assertFalse(snapshot["external_queue_drain_limited"])
+
+    def test_emitter_created_while_disabled_can_record_after_enable(self):
+        enabled = {"value": False}
+        collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)
+        emitter = collector.create_emitter()
+
+        emitter.record("scanner_process", "scan_started", {"phase": "init"}, stage="scan")
+        self.assertEqual(0, collector.snapshot()["entry_count"])
+
+        enabled["value"] = True
+        collector.sync_enabled_state()
+        emitter.record("scanner_process", "scan_started", {"phase": "resume"}, stage="scan")
+        snapshot = collector.snapshot()
+        self.assertEqual(True, snapshot["enabled"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("scan_started", snapshot["entries"][0]["message"])
+        self.assertEqual("scan", snapshot["entries"][0]["stage"])
+        self.assertEqual("resume", snapshot["entries"][0]["details"]["phase"])
+
+    def test_emitter_created_while_enabled_stops_after_disable(self):
+        enabled = {"value": True}
+        collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)
+        emitter = collector.create_emitter()
+
+        emitter.record("scanner_process", "scan_started", {"phase": "initial"}, stage="scan")
+        self.assertEqual(1, collector.snapshot()["entry_count"])
+        enabled["value"] = False
+        collector.sync_enabled_state()
+        emitter.record("scanner_process", "scan_started", {"phase": "stopped"}, stage="scan")
+
+        snapshot = collector.snapshot()
+        self.assertEqual(False, snapshot["enabled"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("initial", snapshot["entries"][0]["details"]["phase"])
+
     def test_record_redacts_risky_strings_inside_generic_detail_values(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 
@@ -91,7 +147,7 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual("<redacted>", entry["details"]["command"])
         self.assertEqual("<redacted>", entry["details"]["api_token"])
 
-    def test_snapshot_clears_retained_entries_after_disable(self):
+    def test_snapshot_preserves_retained_entries_after_disable(self):
         enabled = {"value": True}
         collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)
 
@@ -100,11 +156,212 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
 
         snapshot = collector.snapshot()
         self.assertEqual(False, snapshot["enabled"])
-        self.assertEqual([], snapshot["entries"])
-        self.assertEqual(True, snapshot["window_reset"])
-        self.assertEqual("disabled", snapshot["window_reset_reason"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("start", snapshot["entries"][0]["message"])
+        self.assertFalse(snapshot["window_reset"])
+        self.assertIsNone(snapshot["window_reset_reason"])
         enabled["value"] = True
-        self.assertEqual([], collector.snapshot()["entries"])
+        self.assertEqual(1, collector.snapshot()["entry_count"])
+
+    def test_snapshot_while_disabled_surfaces_pending_external_records(self):
+        enabled = {"value": True}
+        collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)
+        emitter = collector.create_emitter()
+
+        emitter.record("controller", "start", {"phase": "queued"}, stage="controller", corr_id="flow-1")
+        enabled["value"] = False
+        collector.sync_enabled_state()
+
+        snapshot = collector.snapshot()
+        self.assertEqual(False, snapshot["enabled"])
+        self.assertEqual(1, snapshot["external_queue_drain_count"])
+        self.assertFalse(snapshot["external_queue_drain_limited"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("start", snapshot["entries"][0]["message"])
+        self.assertEqual("queued", snapshot["entries"][0]["details"]["phase"])
+        self.assertEqual("controller", snapshot["entries"][0]["stage"])
+        self.assertEqual("flow-1", snapshot["entries"][0]["corr_id"])
+
+    def test_snapshot_supports_filters_limit_and_order(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+
+        collector.record(
+            "controller",
+            "start",
+            {"path_pair_count": 0},
+            stage="controller",
+            event_type="state_transition",
+            corr_id="flow-1",
+            flow_id="flow-a",
+            path_pair_id="pair-1",
+            file_id="file-1",
+        )
+        collector.record(
+            "controller",
+            "refresh",
+            {"path_pair_count": 1},
+            stage="refresh",
+            event_type="state_transition",
+            corr_id="flow-2",
+            flow_id="flow-b",
+            path_pair_id="pair-2",
+            file_id="file-2",
+        )
+        collector.record(
+            "controller",
+            "finish",
+            {"path_pair_count": 2},
+            stage="finish",
+            event_type="state_transition",
+            corr_id="flow-1",
+            flow_id="flow-a",
+            path_pair_id="pair-1",
+            file_id="file-1",
+        )
+
+        ascending_snapshot = collector.snapshot(
+            corr_id="flow-1",
+            flow_id="flow-a",
+            event_type="state_transition",
+            path_pair_id="pair-1",
+            file_id="file-1",
+            limit=1,
+            order="asc",
+        )
+        self.assertEqual(1, ascending_snapshot["entry_count"])
+        self.assertEqual("start", ascending_snapshot["entries"][0]["message"])
+        self.assertEqual(1, ascending_snapshot["query"]["limit"])
+        self.assertEqual("asc", ascending_snapshot["query"]["order"])
+        self.assertEqual("flow-1", ascending_snapshot["query"]["corr_id"])
+
+        descending_snapshot = collector.snapshot(
+            corr_id="flow-1",
+            flow_id="flow-a",
+            event_type="state_transition",
+            path_pair_id="pair-1",
+            file_id="file-1",
+            limit=1,
+            order="desc",
+        )
+        self.assertEqual(1, descending_snapshot["entry_count"])
+        self.assertEqual("finish", descending_snapshot["entries"][0]["message"])
+        self.assertEqual("desc", descending_snapshot["query"]["order"])
+
+    def test_clear_resets_retained_entries_and_marks_reset_metadata(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+
+        collector.record("controller", "start", {"phase": "init"})
+        collector.clear()
+
+        snapshot = collector.snapshot()
+        self.assertEqual(0, snapshot["entry_count"])
+        self.assertEqual(True, snapshot["window_reset"])
+        self.assertEqual("clear", snapshot["window_reset_reason"])
+        self.assertEqual(1, snapshot["last_reset_version"])
+        self.assertEqual("clear", snapshot["last_reset_reason"])
+        self.assertEqual([], snapshot["entries"])
+
+    def test_reset_resets_retained_entries_and_marks_reset_metadata(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+
+        collector.record("controller", "start", {"phase": "init"})
+        collector.reset()
+
+        snapshot = collector.snapshot()
+        self.assertEqual(0, snapshot["entry_count"])
+        self.assertEqual(True, snapshot["window_reset"])
+        self.assertEqual("reset", snapshot["window_reset_reason"])
+        self.assertEqual(1, snapshot["last_reset_version"])
+        self.assertEqual("reset", snapshot["last_reset_reason"])
+        self.assertEqual([], snapshot["entries"])
+
+    def test_snapshot_reports_non_limited_drain_when_queue_exactly_exhausted(self):
+        class FakeRecordQueue:
+            def __init__(self, records):
+                self.__records = list(records)
+
+            def get_nowait(self):
+                if not self.__records:
+                    raise queue.Empty()
+                return self.__records.pop(0)
+
+            def empty(self):
+                return True
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        collector._BreadcrumbTraceCollector__external_records = FakeRecordQueue([
+            {
+                "source": "controller",
+                "message": "start",
+                "details": {"path_pair_count": 0},
+                "metadata": {"stage": "controller", "event_type": "state_transition", "corr_id": "flow-1"},
+                "created_ns": 10,
+                "created_ms": 0,
+            },
+            {
+                "source": "controller",
+                "message": "refresh",
+                "details": {"path_pair_count": 1},
+                "metadata": {"stage": "refresh", "event_type": "state_transition", "corr_id": "flow-1"},
+                "created_ns": 20,
+                "created_ms": 0,
+            },
+        ])
+
+        snapshot = collector.snapshot()
+        self.assertEqual(2, snapshot["external_queue_drain_count"])
+        self.assertFalse(snapshot["external_queue_drain_limited"])
+        self.assertEqual(["start", "refresh"], [entry["message"] for entry in snapshot["entries"]])
+
+    def test_snapshot_reports_bounded_external_drain_telemetry(self):
+        class FakeRecordQueue:
+            def __init__(self, records):
+                self.__records = list(records)
+
+            def get_nowait(self):
+                if not self.__records:
+                    raise queue.Empty()
+                return self.__records.pop(0)
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        collector._BreadcrumbTraceCollector__external_records = FakeRecordQueue([
+            {
+                "source": "controller",
+                "message": "start",
+                "details": {"path_pair_count": 0},
+                "metadata": {"stage": "controller", "event_type": "state_transition", "corr_id": "flow-1"},
+                "created_ns": 10,
+                "created_ms": 0,
+            },
+            {
+                "source": "controller",
+                "message": "refresh",
+                "details": {"path_pair_count": 1},
+                "metadata": {"stage": "refresh", "event_type": "state_transition", "corr_id": "flow-1"},
+                "created_ns": 20,
+                "created_ms": 0,
+            },
+            {
+                "source": "controller",
+                "message": "finish",
+                "details": {"path_pair_count": 2},
+                "metadata": {"stage": "finish", "event_type": "state_transition", "corr_id": "flow-1"},
+                "created_ns": 30,
+                "created_ms": 0,
+            },
+        ])
+
+        snapshot = collector.snapshot()
+        self.assertEqual(2, snapshot["external_queue_drain_count"])
+        self.assertEqual(2, snapshot["external_queue_drain_limit"])
+        self.assertTrue(snapshot["external_queue_drain_limited"])
+        self.assertEqual(2, snapshot["entry_count"])
+        self.assertEqual(["start", "refresh"], [entry["message"] for entry in snapshot["entries"]])
+
+        snapshot = collector.snapshot()
+        self.assertEqual(1, snapshot["external_queue_drain_count"])
+        self.assertFalse(snapshot["external_queue_drain_limited"])
+        self.assertEqual(["refresh", "finish"], [entry["message"] for entry in snapshot["entries"]])
 
     def test_record_coalesces_repeated_entries_and_redacts_command_details(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)

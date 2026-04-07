@@ -78,6 +78,18 @@ class TestContext(unittest.TestCase):
         self.assertEqual("controller", snapshot["entries"][0]["source"])
         self.assertEqual("start", snapshot["entries"][0]["message"])
 
+    def test_context_uses_configured_breadcrumb_retention_depth(self):
+        logger = MagicMock()
+        web_access_logger = MagicMock()
+        config = MagicMock()
+        config.general.breadcrumb_trace_enabled = True
+        config.general.breadcrumb_trace_retention_depth = 64
+        args = Args()
+        status = Status()
+
+        context = Context(logger, web_access_logger, config, args, status)
+        self.assertEqual(64, context.breadcrumb_trace.max_entries)
+
     def test_print_to_log_emits_config_and_args(self):
         logger = MagicMock()
         config = MagicMock()

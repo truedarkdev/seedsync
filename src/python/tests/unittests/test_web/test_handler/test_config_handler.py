@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from wsgiref.util import setup_testing_defaults
 
-from common import Config, ConfigError
+from common import Config, ConfigError, BreadcrumbTraceCollector
 from web.auth_store import ApiKeyStore
 from web.handler.config import ConfigHandler
 from web.web_app import WebApp
@@ -175,6 +175,38 @@ class TestConfigHandlerSet(unittest.TestCase):
             response.body
         )
         inner.set_property.assert_not_called()
+
+    def test_set_breadcrumb_trace_enabled_calls_sync_hook(self):
+        sync_hook = MagicMock()
+        handler = ConfigHandler(self.config, breadcrumb_trace_sync=sync_hook)
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.general = inner
+
+        response = handler._ConfigHandler__handle_set_config("general", "breadcrumb_trace_enabled", True)
+
+        self.assertEqual(200, response.status_code)
+        inner.set_property.assert_called_once_with("breadcrumb_trace_enabled", True)
+        sync_hook.assert_called_once()
+
+    def test_set_breadcrumb_trace_enabled_updates_active_gate(self):
+        config = Config()
+        config.general.breadcrumb_trace_enabled = True
+        collector = BreadcrumbTraceCollector(lambda: config.general.breadcrumb_trace_enabled, max_entries=2)
+        emitter = collector.create_emitter()
+        handler = ConfigHandler(config, breadcrumb_trace_sync=collector.sync_enabled_state)
+
+        emitter.record("controller", "start", {"phase": "init"}, stage="scan")
+        self.assertEqual(1, collector.snapshot()["entry_count"])
+        response = handler._ConfigHandler__handle_set_config("general", "breadcrumb_trace_enabled", False)
+        self.assertEqual(200, response.status_code)
+        emitter.record("controller", "start", {"phase": "disabled"}, stage="scan")
+
+        snapshot = collector.snapshot()
+        self.assertEqual(False, snapshot["enabled"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("init", snapshot["entries"][0]["details"]["phase"])
 
     def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
