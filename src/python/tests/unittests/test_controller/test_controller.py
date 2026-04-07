@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from controller import Controller, ModelBuilder
+from controller.extract import ExtractStatus
 from controller.scan import MultiPathActiveScanner
 from common import AppError
 from common.path_pair import PathPair
@@ -28,6 +29,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context = MagicMock()
         self.controller._Controller__context.status.controller = MagicMock()
         self.controller._Controller__context.status.server = SimpleNamespace(up=True, error_msg=None)
+        self.controller._Controller__context.breadcrumb_trace = MagicMock()
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__password = None
         self.controller._Controller__persist = MagicMock()
@@ -194,6 +196,103 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.join.assert_called_once_with()
         self.controller._Controller__mp_logger.stop.assert_called_once_with()
         self.assertFalse(self.controller._Controller__started)
+
+    @patch("controller.controller.os.makedirs")
+    def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
+        self.controller._Controller__context.breadcrumb_trace = MagicMock()
+
+        self.controller.start()
+
+        self.controller._Controller__context.breadcrumb_trace.record.assert_called_once_with(
+            "controller",
+            "start",
+            {
+                "path_pair_count": 0,
+                "staging_path_count": 0,
+            },
+            stage="controller",
+            event_type="state_transition",
+            corr_id="controller",
+            file_id=None,
+            path_pair_id=None,
+            path_pair_name=None,
+        )
+        self.controller._Controller__active_scan_process.start.assert_called_once_with()
+        self.controller._Controller__local_scan_process.start.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.start.assert_called_once_with()
+        self.controller._Controller__extract_process.start.assert_called_once_with()
+        self.controller._Controller__validate_process.start.assert_called_once_with()
+        self.controller._Controller__mp_logger.start.assert_called_once_with()
+        self.assertTrue(self.controller._Controller__started)
+
+    def test_update_model_records_scan_and_extract_breadcrumbs(self):
+        remote_scan = SimpleNamespace(
+            files=[SimpleNamespace(name="remote-one", file_id="remote-1", path_pair_id="pair-1")],
+            failed=False,
+            error_message=None,
+            timestamp=datetime.now(),
+        )
+        local_scan = SimpleNamespace(
+            files=[SimpleNamespace(name="local-one", file_id="local-1", path_pair_id="pair-1")],
+            managed_extract_file_ids=["managed-one"],
+            timestamp=datetime.now(),
+        )
+        extract_status = ExtractStatus("archive.zip", False, ExtractStatus.State.EXTRACTING)
+        extract_statuses = SimpleNamespace(statuses=[extract_status])
+        extracted_results = [
+            SimpleNamespace(name="archive.zip", file_id="file-123", is_dir=False, path_pair_id="pair-1")
+        ]
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            files=[],
+            malformed_status_only_file_ids=[],
+            managed_extract_file_ids=[],
+            timestamp=datetime.now(),
+        )
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = remote_scan
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = local_scan
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = extract_statuses
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__extract_process.pop_completed.return_value = extracted_results
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
+
+        self.controller._Controller__update_model()
+
+        message_to_corr_ids = {
+            call.args[1]: call.kwargs.get("corr_id")
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+        }
+        self.assertEqual("pair-1", message_to_corr_ids["remote_scan_result"])
+        self.assertEqual("pair-1", message_to_corr_ids["local_scan_result"])
+        self.assertEqual("pair-1", message_to_corr_ids["extract_completed"])
+        self.assertEqual("extract:aggregate", message_to_corr_ids["extract_status_result"])
+
+    def test_propagate_exceptions_records_remote_scan_failure_breadcrumb(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.side_effect = Exception("boom")
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__validate_process.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+        self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
+
+        with self.assertRaises(Exception):
+            self.controller._Controller__propagate_exceptions()
+
+        self.controller._Controller__context.breadcrumb_trace.record.assert_any_call(
+            "controller",
+            "remote_scan_failure",
+            {"error_message": "boom"},
+            stage="scan",
+            event_type="failure",
+            corr_id="remote_scan:aggregate",
+            file_id=None,
+            path_pair_id=None,
+            path_pair_name=None,
+            trace_scope="aggregate",
+        )
 
     def test_update_model_preserves_stale_lftp_statuses_after_unhealthy_poll_returns_data_and_cache_expires(self):
         status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")

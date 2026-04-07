@@ -15,6 +15,7 @@ from .handler.stream_log import LogStreamHandler
 from .handler.stream_heartbeat import HeartbeatStreamHandler
 from .handler.status import StatusHandler
 from .handler.path_pairs import PathPairsHandler
+from .handler.breadcrumb_trace import BreadcrumbTraceHandler
 
 
 class WebAppBuilder:
@@ -39,6 +40,7 @@ class WebAppBuilder:
         self.config_handler = ConfigHandler(context.config)
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
+        self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
         self.admin_handler = None
         if self.__auth_store is not None:
             self.admin_handler = AdminHandler(context.config, self.__auth_store)
@@ -67,6 +69,7 @@ class WebAppBuilder:
         self.config_handler.add_routes(web_app)
         self.auto_queue_handler.add_routes(web_app)
         self.status_handler.add_routes(web_app)
+        self.breadcrumb_trace_handler.add_routes(web_app)
         if self.admin_handler is not None:
             self.admin_handler.add_routes(web_app)
         if self.path_pairs_handler is not None:

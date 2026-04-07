@@ -200,6 +200,7 @@ class TestConfig(unittest.TestCase):
             "allowed_hostname": "",
             "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
             "browser_handover_recovery_version": "2026.04.03",
+            "breadcrumb_trace_enabled": "False",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -209,6 +210,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("", general.allowed_hostname)
         self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
         self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
+        self.assertEqual(False, general.breadcrumb_trace_enabled)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -223,6 +225,17 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "debug", "-1")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
+
+    def test_general_breadcrumb_trace_enabled_requires_bool(self):
+        general = Config.General()
+        general.breadcrumb_trace_enabled = False
+
+        with self.assertRaises(ConfigError) as error:
+            general.breadcrumb_trace_enabled = 1
+        self.assertEqual(
+            "Bad config: General.breadcrumb_trace_enabled (1) must be a boolean value",
+            str(error.exception)
+        )
 
     def test_general_redaction_flag_requires_bool(self):
         general = Config.General()
@@ -477,6 +490,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("", config.general.allowed_hostname)
             self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
             self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
+            self.assertEqual(False, config.general.breadcrumb_trace_enabled)
             self.assertEqual(True, config.general.config_api_redact_remote_details)
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
@@ -533,6 +547,7 @@ class TestConfig(unittest.TestCase):
             config.general.allowed_hostname = ""
             config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
             config.general.browser_handover_recovery_version = "2026.04.03"
+            config.general.breadcrumb_trace_enabled = False
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
@@ -571,6 +586,7 @@ class TestConfig(unittest.TestCase):
             allowed_hostname =
             trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32
             browser_handover_recovery_version = 2026.04.03
+            breadcrumb_trace_enabled = False
             config_api_redact_remote_details = True
 
             [Lftp]

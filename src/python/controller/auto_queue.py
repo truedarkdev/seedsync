@@ -161,6 +161,7 @@ class AutoQueue:
                  persist: AutoQueuePersist,
                  controller: Controller):
         self.logger = context.logger.getChild("AutoQueue")
+        self.__breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
@@ -406,6 +407,18 @@ class AutoQueue:
             for file in blocked_extract_candidates:
                 self.__controller.clear_extracted_marker(file)
 
+        self.__record_breadcrumb(
+            "auto_queue_cycle",
+            {
+                "new_queue_candidates": len(new_files_to_queue),
+                "modified_queue_candidates": len(modified_files_actual_update) + len(modified_files_remote_discovery),
+                "queue_count": len(files_to_queue),
+                "extract_count": len(files_to_extract),
+                "patterns_only": self.__patterns_only,
+                "auto_extract_enabled": self.__auto_extract_enabled,
+            }
+        )
+
         ###
         # Send commands
         ###
@@ -433,6 +446,18 @@ class AutoQueue:
         self.__model_listener.modified_files.clear()
         # Clear the new patterns
         self.__persist_listener.new_patterns.clear()
+
+    def __record_breadcrumb(self, message: str, details: dict):
+        if self.__breadcrumb_trace is None:
+            return
+        self.__breadcrumb_trace.record(
+            "auto_queue",
+            message,
+            details,
+            stage="auto_queue",
+            event_type="state_transition",
+            corr_id="auto_queue",
+        )
 
     def __filter_candidates(self,
                             candidates: List[ModelFile],

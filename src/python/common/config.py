@@ -258,6 +258,9 @@ class Config(Persist):
         browser_handover_recovery_version = PROP("browser_handover_recovery_version",
                                                  Checkers.null,
                                                  Converters.null)
+        breadcrumb_trace_enabled = PROP("breadcrumb_trace_enabled",
+                                        Checkers.bool_value,
+                                        Converters.bool)
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -270,6 +273,7 @@ class Config(Persist):
             self.allowed_hostname = None
             self.trusted_browser_bootstrap_remote_addrs = None
             self.browser_handover_recovery_version = None
+            self.breadcrumb_trace_enabled = False
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -286,6 +290,9 @@ class Config(Persist):
             if "browser_handover_recovery_version" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["browser_handover_recovery_version"] = ""
+            if "breadcrumb_trace_enabled" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["breadcrumb_trace_enabled"] = False
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True

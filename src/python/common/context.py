@@ -7,6 +7,7 @@ from typing import Optional
 
 # my libs
 from .config import Config
+from .breadcrumb_trace import BreadcrumbTraceCollector
 from .path_pair import PathPairManager
 from .status import Status
 
@@ -44,7 +45,8 @@ class Context:
                  config: Config,
                  args: Args,
                  status: Status,
-                 path_pair_manager: Optional[PathPairManager] = None):
+                 path_pair_manager: Optional[PathPairManager] = None,
+                 breadcrumb_trace: Optional[BreadcrumbTraceCollector] = None):
         """
         Primary constructor to construct the top-level context
         """
@@ -55,11 +57,21 @@ class Context:
         self.args = args
         self.status = status
         self.path_pair_manager = path_pair_manager
+        self.breadcrumb_trace = breadcrumb_trace if breadcrumb_trace is not None else BreadcrumbTraceCollector(
+            self.__breadcrumb_trace_enabled
+        )
 
     def create_child_context(self, context_name: str) -> "Context":
         child_context = copy.copy(self)
         child_context.logger = self.logger.getChild(context_name)
         return child_context
+
+    def __breadcrumb_trace_enabled(self) -> bool:
+        general_config = getattr(self.config, "general", None)
+        if general_config is None:
+            return False
+        enabled = getattr(general_config, "breadcrumb_trace_enabled", False)
+        return enabled if type(enabled) is bool else False
 
     def print_to_log(self):
         # Print the config

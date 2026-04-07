@@ -200,7 +200,8 @@ class Controller:
         self.__extract_process = ExtractProcess(
             out_dir_path=out_dir_path,
             local_path=self.__context.config.lftp.local_path,
-            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
+            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         self.__validate_process = ValidateProcess(
             remote_address=self.__context.config.lftp.remote_address,
@@ -272,15 +273,18 @@ class Controller:
         active_scan_process = ScannerProcess(
             scanner=active_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_downloading_scan,
-            verbose=False
+            verbose=False,
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         local_scan_process = ScannerProcess(
             scanner=local_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_local_scan,
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         remote_scan_process = ScannerProcess(
             scanner=remote_scanner,
             interval_in_ms=self.__context.config.controller.interval_ms_remote_scan,
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
 
         self.__lftp.set_path_pairs(lftp_path_pairs)
@@ -324,6 +328,15 @@ class Controller:
         self.__path_pair_runtime_error = error_msg
         self.__context.status.server.up = False
         self.__context.status.server.error_msg = error_msg
+        self.__record_breadcrumb(
+            stage="path_pair_runtime",
+            message="path_pair_runtime_error",
+            details={
+                "error_message": error_msg,
+            },
+            event_type="failure",
+            corr_id="path_pair_runtime",
+        )
 
     def __clear_path_pair_runtime_error(self):
         if self.__path_pair_runtime_error is None:
@@ -453,6 +466,16 @@ class Controller:
         self.__active_scan_process = active_scan_process
         self.__local_scan_process = local_scan_process
         self.__remote_scan_process = remote_scan_process
+        self.__record_breadcrumb(
+            stage="path_pair_runtime",
+            message="path_pair_runtime_refreshed",
+            details={
+                "path_pair_count": len(path_pairs_by_id),
+                "staging_path_count": len(path_pair_staging_paths),
+            },
+            event_type="state_transition",
+            corr_id="path_pair_runtime",
+        )
 
     def __apply_path_pair_refresh(self):
         active_files = list(
@@ -534,6 +557,16 @@ class Controller:
         self.__validate_process.start()
         self.__mp_logger.start()
         self.__started = True
+        self.__record_breadcrumb(
+            stage="controller",
+            message="start",
+            details={
+                "path_pair_count": len(self.__path_pairs_by_id),
+                "staging_path_count": len(self.__path_pair_staging_paths),
+            },
+            event_type="state_transition",
+            corr_id="controller",
+        )
 
     def process(self):
         """
@@ -809,7 +842,52 @@ class Controller:
         self.__target_archive_trace_last_signature = signature
         self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
 
+    def __record_breadcrumb(self,
+                            stage: str,
+                            message: str,
+                            details: dict = None,
+                            event_type: str = "diagnostic",
+                            file_id: str = None,
+                            path_pair_id: str = None,
+                            path_pair_name: str = None,
+                            corr_id: str = None,
+                            trace_scope: str = "flow"):
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if breadcrumb_trace is None:
+            return
+        breadcrumb_trace.record(
+            "controller",
+            message,
+            {} if details is None else details,
+            stage=stage,
+            event_type=event_type,
+            corr_id=corr_id if corr_id is not None else (file_id if file_id is not None else stage),
+            file_id=file_id,
+            path_pair_id=path_pair_id,
+            path_pair_name=path_pair_name,
+            trace_scope=trace_scope,
+        )
+
+    def __trace_corr_id_from_files(self, files, fallback: str):
+        if files is not None:
+            for file in files:
+                path_pair_id = getattr(file, "path_pair_id", None)
+                if path_pair_id is not None:
+                    return path_pair_id
+                file_id = getattr(file, "file_id", None)
+                if file_id is not None:
+                    return file_id
+        return fallback
+
     def __temp_diag(self, stage: str, file_id: str = None, **payload):
+        self.__record_breadcrumb(
+            stage=stage,
+            message=stage,
+            details=payload,
+            event_type="diagnostic",
+            file_id=file_id,
+            corr_id=file_id if file_id is not None else stage
+        )
         if self.__temp_diag_file_id is None:
             return
         if file_id is not None and file_id != self.__temp_diag_file_id:
@@ -1217,13 +1295,46 @@ class Controller:
         # Update model builder state
         if latest_remote_scan is not None:
             self.__model_builder.set_remote_files(latest_remote_scan.files)
+            self.__record_breadcrumb(
+                stage="scan",
+                message="remote_scan_result",
+                details={
+                    "file_count": len(latest_remote_scan.files),
+                    "failed": latest_remote_scan.failed,
+                    "error_message": latest_remote_scan.error_message,
+                },
+                event_type="failure" if latest_remote_scan.failed else "state_transition",
+                corr_id=self.__trace_corr_id_from_files(latest_remote_scan.files, "remote_scan"),
+            )
         if latest_local_scan is not None:
             self.__model_builder.set_local_files(latest_local_scan.files)
             recovered_extracted_file_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
             if isinstance(recovered_extracted_file_ids, (list, tuple, set)):
                 self.__persist.extracted_file_names.update(recovered_extracted_file_ids)
+            self.__record_breadcrumb(
+                stage="scan",
+                message="local_scan_result",
+                details={
+                    "file_count": len(latest_local_scan.files),
+                    "managed_extract_file_count": len(recovered_extracted_file_ids)
+                    if isinstance(recovered_extracted_file_ids, (list, tuple, set))
+                    else None,
+                },
+                event_type="state_transition",
+                corr_id=self.__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
+            )
         if latest_active_scan is not None:
             self.__model_builder.set_active_files(latest_active_scan.files)
+            self.__record_breadcrumb(
+                stage="scan",
+                message="active_scan_result",
+                details={
+                    "file_count": len(latest_active_scan.files),
+                    "malformed_status_only_file_count": len(latest_active_scan.malformed_status_only_file_ids),
+                },
+                event_type="state_transition",
+                corr_id=self.__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
+            )
         if lftp_statuses is not None:
             self.__model_builder.set_lftp_statuses(lftp_statuses)
             if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
@@ -1232,6 +1343,19 @@ class Controller:
                 )
         if latest_extract_statuses is not None:
             self.__model_builder.set_extract_statuses(latest_extract_statuses.statuses)
+            self.__record_breadcrumb(
+                stage="extract",
+                message="extract_status_result",
+                details={
+                    "status_count": len(latest_extract_statuses.statuses),
+                    "extracting_count": len([
+                        s for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
+                    ]),
+                },
+                event_type="state_transition",
+                corr_id="extract:aggregate",
+                trace_scope="aggregate",
+            )
             if self.__is_target_archive_trace_enabled():
                 for status in latest_extract_statuses.statuses:
                     trace_target_file = self.__find_target_archive_model_file(status.name)
@@ -1244,11 +1368,18 @@ class Controller:
         if latest_validation_statuses is not None:
             self.__model_builder.set_validation_statuses(latest_validation_statuses.statuses)
         if latest_extracted_results:
+            extracted_result_summaries = []
             for result in latest_extracted_results:
                 extracted_file_ids = {result.name}
                 if result.file_id is not None:
                     extracted_file_ids.add(result.file_id)
                 self.__persist.extracted_file_names.update(extracted_file_ids)
+                extracted_result_summaries.append({
+                    "name": result.name,
+                    "file_id": result.file_id,
+                    "is_dir": result.is_dir,
+                    "path_pair_id": result.path_pair_id,
+                })
                 trace_target_file = self.__find_target_archive_model_file(result.name, result.file_id)
                 if trace_target_file is not None:
                     self.__trace_target_archive_event("extracted_marker_added", {
@@ -1256,6 +1387,16 @@ class Controller:
                         "is_dir": result.is_dir,
                     })
             self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
+            self.__record_breadcrumb(
+                stage="extract",
+                message="extract_completed",
+                details={
+                    "result_count": len(latest_extracted_results),
+                    "results": extracted_result_summaries,
+                },
+                event_type="state_transition",
+                corr_id=self.__trace_corr_id_from_files(latest_extracted_results, "extract"),
+            )
         self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
         # Build the new model, if needed
@@ -1397,8 +1538,30 @@ class Controller:
             self.__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
 
     def __process_commands(self):
-        def _notify_failure(_command: Controller.Command, _msg: str, _error_code: int = 400):
+        def _notify_failure(_command: Controller.Command,
+                            _msg: str,
+                            _error_code: int = 400,
+                            _file: ModelFile = None):
             self.logger.warning("Command failed. {}".format(_msg))
+            self.__record_breadcrumb(
+                stage="command",
+                message="command_failed",
+                details={
+                    "command": getattr(_command.action, "name", str(_command.action)),
+                    "message": _msg,
+                    "error_code": _error_code,
+                    "file_name": _file.name if _file is not None else _command.filename,
+                },
+                event_type="failure",
+                file_id=_file.file_id if _file is not None else None,
+                path_pair_id=_file.path_pair_id if _file is not None else None,
+                path_pair_name=_file.path_pair_name if _file is not None else None,
+                corr_id=(
+                    _file.path_pair_id
+                    if _file is not None and _file.path_pair_id is not None
+                    else (_file.file_id if _file is not None else _command.filename)
+                ),
+            )
             for _callback in _command.callbacks:
                 _callback.on_failure(_msg, _error_code)
 
@@ -1423,7 +1586,7 @@ class Controller:
 
             if command.action == Controller.Command.Action.QUEUE:
                 if file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
@@ -1450,7 +1613,7 @@ class Controller:
                     self.__persist.stopped_file_names.discard(file.file_id)
                     self.__persist.stopped_file_names.discard(file.name)
                 except LftpError as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
+                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
                     continue
 
             elif command.action == Controller.Command.Action.STOP:
@@ -1458,14 +1621,16 @@ class Controller:
                     _notify_failure(
                         command,
                         "File '{}' is not Queued or Downloading".format(command.filename),
-                        409
+                        409,
+                        file
                     )
                     continue
                 if not file.is_stoppable:
                     _notify_failure(
                         command,
                         "File '{}' could not be stopped".format(command.filename),
-                        409
+                        409,
+                        file
                     )
                     continue
                 try:
@@ -1499,7 +1664,8 @@ class Controller:
                         _notify_failure(
                             command,
                             "File '{}' could not be stopped".format(command.filename),
-                            409
+                            409,
+                            file
                         )
                         continue
                     self.__persist.stopped_file_names.add(file.file_id)
@@ -1507,7 +1673,7 @@ class Controller:
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None
                 except (LftpError, LftpJobStatusParserError) as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500)
+                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
                     continue
 
             elif command.action == Controller.Command.Action.EXTRACT:
@@ -1543,7 +1709,8 @@ class Controller:
                         "File '{}' in state {} cannot be extracted".format(
                             command.filename, str(file.state)
                         ),
-                        409
+                        409,
+                        file
                     )
                     continue
                 elif file.local_size is None:
@@ -1559,7 +1726,7 @@ class Controller:
                             "file": self.__summarize_target_archive_file(file),
                             "reason": "missing_local_file",
                         })
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                     continue
                 else:
                     self.__temp_diag(
@@ -1592,14 +1759,15 @@ class Controller:
                         "File '{}' in state {} cannot be validated".format(
                             command.filename, str(file.state)
                         ),
-                        409
+                        409,
+                        file
                     )
                     continue
                 elif file.local_size is None:
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                     continue
                 elif file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 else:
                     self.__validate_process.validate(file)
@@ -1615,11 +1783,12 @@ class Controller:
                         "Local file '{}' cannot be deleted in state {}".format(
                             command.filename, str(file.state)
                         ),
-                        409
+                        409,
+                        file
                     )
                     continue
                 elif file.local_size is None:
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                     continue
                 else:
                     self.__queue_delete_local_process(
@@ -1642,11 +1811,12 @@ class Controller:
                         "Remote file '{}' cannot be deleted in state {}".format(
                             command.filename, str(file.state)
                         ),
-                        409
+                        409,
+                        file
                     )
                     continue
                 elif file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404)
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 else:
                     process = DeleteRemoteProcess(
@@ -1725,6 +1895,16 @@ class Controller:
         self.__context.status.controller.latest_remote_scan_time = datetime.now()
         self.__context.status.controller.latest_remote_scan_failed = True
         self.__context.status.controller.latest_remote_scan_error = error_message
+        self.__record_breadcrumb(
+            stage="scan",
+            message="remote_scan_failure",
+            details={
+                "error_message": error_message,
+            },
+            event_type="failure",
+            corr_id="remote_scan:aggregate",
+            trace_scope="aggregate",
+        )
 
     def __cleanup_commands(self):
         """

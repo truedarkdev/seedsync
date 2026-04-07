@@ -73,7 +73,8 @@ class ScannerProcess(AppProcess):
     """
     def __init__(self,
                  scanner: IScanner, interval_in_ms: int,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 breadcrumb_trace=None):
         """
         Create a scanner process
         :param scanner: IScanner implementation
@@ -86,6 +87,7 @@ class ScannerProcess(AppProcess):
         self.__interval_in_ms = interval_in_ms
         self.__last_recoverable_error_message = None
         self.verbose = verbose
+        self.__breadcrumb_trace = breadcrumb_trace
 
     @overrides(AppProcess)
     def run_init(self):
@@ -101,6 +103,13 @@ class ScannerProcess(AppProcess):
         timestamp_start = datetime.now()
         if self.verbose:
             self.logger.debug("Running a scan")
+        self.__record_breadcrumb(
+            "scan_started",
+            {
+                "scanner": self.__scanner.__class__.__name__,
+                "interval_ms": self.__interval_in_ms,
+            },
+        )
         try:
             files = self.__scanner.scan()
             malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
@@ -110,9 +119,33 @@ class ScannerProcess(AppProcess):
                                    files=files,
                                    malformed_status_only_file_ids=malformed_status_only_file_ids,
                                    managed_extract_file_ids=managed_extract_file_ids)
+            self.__record_breadcrumb(
+                "scan_completed",
+                {
+                    "scanner": self.__scanner.__class__.__name__,
+                    "file_count": len(files),
+                    "malformed_status_only_file_count": len(malformed_status_only_file_ids),
+                    "managed_extract_file_count": len(managed_extract_file_ids),
+                },
+                corr_id=self.__trace_corr_id(),
+                path_pair_id=self.__trace_path_pair_id(),
+                path_pair_name=self.__trace_path_pair_name(),
+            )
         except ScannerError as e:
             # Non-recoverable errors continue up as a fatal error
             if not e.recoverable:
+                self.__record_breadcrumb(
+                    "scan_failed",
+                    {
+                        "scanner": self.__scanner.__class__.__name__,
+                        "recoverable": False,
+                        "error_message": str(e),
+                    },
+                    event_type="failure",
+                    corr_id=self.__trace_corr_id(),
+                    path_pair_id=self.__trace_path_pair_id(),
+                    path_pair_name=self.__trace_path_pair_name(),
+                )
                 raise
             error_message = str(e)
             files = e.files if e.files is not None else []
@@ -129,6 +162,21 @@ class ScannerProcess(AppProcess):
                                    managed_extract_file_ids=managed_extract_file_ids,
                                    failed=True,
                                    error_message=error_message)
+            self.__record_breadcrumb(
+                "scan_failed",
+                {
+                    "scanner": self.__scanner.__class__.__name__,
+                    "recoverable": True,
+                    "file_count": len(files),
+                    "malformed_status_only_file_count": len(malformed_status_only_file_ids),
+                    "managed_extract_file_count": len(managed_extract_file_ids),
+                    "error_message": error_message,
+                },
+                event_type="failure",
+                corr_id=self.__trace_corr_id(),
+                path_pair_id=self.__trace_path_pair_id(),
+                path_pair_name=self.__trace_path_pair_name(),
+            )
         self.__queue.put(result)
         delta_in_s = (datetime.now() - timestamp_start).total_seconds()
         delta_in_ms = int(delta_in_s * 1000)
@@ -140,6 +188,30 @@ class ScannerProcess(AppProcess):
             wait_time_in_s = float(self.__interval_in_ms - delta_in_ms) / 1000.0
             self.__wake_event.wait(timeout=wait_time_in_s)
             self.__wake_event.clear()
+
+    def __trace_corr_id(self):
+        return self.__trace_path_pair_id() or self.__scanner.__class__.__name__
+
+    def __trace_path_pair_id(self):
+        return getattr(self.__scanner, "path_pair_id", None)
+
+    def __trace_path_pair_name(self):
+        return getattr(self.__scanner, "path_pair_name", None)
+
+    def __record_breadcrumb(self, message: str, details: dict, event_type: str = "state_transition",
+                            corr_id: str = None, path_pair_id: str = None, path_pair_name: str = None):
+        if self.__breadcrumb_trace is None:
+            return
+        self.__breadcrumb_trace.record(
+            "scanner_process",
+            message,
+            details,
+            stage="scan",
+            event_type=event_type,
+            corr_id=corr_id if corr_id is not None else self.__trace_corr_id(),
+            path_pair_id=path_pair_id if path_pair_id is not None else self.__trace_path_pair_id(),
+            path_pair_name=path_pair_name if path_pair_name is not None else self.__trace_path_pair_name(),
+        )
 
     def pop_latest_result(self) -> Optional[ScannerResult]:
         """

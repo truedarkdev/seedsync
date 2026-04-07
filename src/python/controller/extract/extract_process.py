@@ -52,6 +52,18 @@ class ExtractProcess(AppProcess):
                               file_id: str = None,
                               path_pair_id: str = None):
             self.logger.info("Extraction completed for {}".format(name))
+            self.trace_owner._ExtractProcess__record_breadcrumb(
+                "extract_completed",
+                {
+                    "file_name": name,
+                    "is_dir": is_dir,
+                    "file_id": file_id,
+                    "path_pair_id": path_pair_id,
+                },
+                corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                file_id=file_id,
+                path_pair_id=path_pair_id,
+            )
             self.trace_owner._ExtractProcess__trace_target_archive_event("extract_completed", {
                 "file_name": name,
                 "is_dir": is_dir,
@@ -71,6 +83,19 @@ class ExtractProcess(AppProcess):
                            file_id: str = None,
                            path_pair_id: str = None):
             self.logger.error("Extraction failed for {}".format(name))
+            self.trace_owner._ExtractProcess__record_breadcrumb(
+                "extract_failed",
+                {
+                    "file_name": name,
+                    "is_dir": is_dir,
+                    "file_id": file_id,
+                    "path_pair_id": path_pair_id,
+                },
+                event_type="failure",
+                corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                file_id=file_id,
+                path_pair_id=path_pair_id,
+            )
             self.trace_owner._ExtractProcess__trace_target_archive_event("extract_failed", {
                 "file_name": name,
                 "is_dir": is_dir,
@@ -78,7 +103,11 @@ class ExtractProcess(AppProcess):
                 "path_pair_id": path_pair_id,
             })
 
-    def __init__(self, out_dir_path: str, local_path: str, managed_extract_folders_enabled: bool = True):
+    def __init__(self,
+                 out_dir_path: str,
+                 local_path: str,
+                 managed_extract_folders_enabled: bool = True,
+                 breadcrumb_trace=None):
         super().__init__(name=self.__class__.__name__)
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
@@ -87,6 +116,7 @@ class ExtractProcess(AppProcess):
         self.__status_result_queue = multiprocessing.Queue()
         self.__completed_result_queue = multiprocessing.Queue()
         self.__dispatch = None
+        self.__breadcrumb_trace = breadcrumb_trace
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
@@ -163,6 +193,18 @@ class ExtractProcess(AppProcess):
                     self.__dispatch.extract(file)
                 except ExtractDispatchError as e:
                     self.logger.warning(str(e))
+                    self.__record_breadcrumb(
+                        "extract_dispatch_blocked",
+                        {
+                            "file_name": file.name,
+                            "is_dir": file.is_dir,
+                            "reason": str(e),
+                        },
+                        event_type="failure",
+                        corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                        file_id=file.file_id,
+                        path_pair_id=file.path_pair_id,
+                    )
                     if self.__target_archive_trace_selector_matches_name(file.name):
                         self.__trace_target_archive_event("extract_dispatch_blocked", {
                             "file_name": file.name,
@@ -179,6 +221,29 @@ class ExtractProcess(AppProcess):
         self.__status_result_queue.put(status_result)
 
         time.sleep(ExtractProcess.__DEFAULT_SLEEP_INTERVAL_IN_SECS)
+
+    def __trace_corr_id(self, file_id: str = None, path_pair_id: str = None, file_name: str = None):
+        return path_pair_id or file_id or file_name
+
+    def __record_breadcrumb(self,
+                            message: str,
+                            details: dict,
+                            event_type: str = "state_transition",
+                            corr_id: str = None,
+                            file_id: str = None,
+                            path_pair_id: str = None):
+        if self.__breadcrumb_trace is None:
+            return
+        self.__breadcrumb_trace.record(
+            "extract_process",
+            message,
+            details,
+            stage="extract",
+            event_type=event_type,
+            corr_id=corr_id if corr_id is not None else self.__trace_corr_id(file_id, path_pair_id),
+            file_id=file_id,
+            path_pair_id=path_pair_id,
+        )
 
     def extract(self, file: ModelFile):
         """
