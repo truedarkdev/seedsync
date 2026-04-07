@@ -65,7 +65,7 @@ class TestBreadcrumbTraceHandler(BaseTestWebApp):
         self.assertEqual(403, resp.status_int)
         self.assertIn("admin", resp.text)
 
-    def test_get_clears_previously_retained_entries_after_disable(self):
+    def test_get_preserves_previously_retained_entries_after_disable(self):
         self.context.config.general.breadcrumb_trace_enabled = True
         self.context.breadcrumb_trace.record("controller", "start", {"path_pair_count": 0})
         self.context.config.general.breadcrumb_trace_enabled = False
@@ -74,15 +74,82 @@ class TestBreadcrumbTraceHandler(BaseTestWebApp):
         self.assertEqual(200, resp.status_int)
         json_dict = json.loads(resp.body.decode("utf-8"))
         self.assertEqual(False, json_dict["enabled"])
-        self.assertEqual([], json_dict["entries"])
-        self.assertEqual(True, json_dict["window_reset"])
-        self.assertEqual("disabled", json_dict["window_reset_reason"])
+        self.assertEqual(1, json_dict["entry_count"])
+        self.assertEqual("start", json_dict["entries"][0]["message"])
+        self.assertFalse(json_dict["window_reset"])
+        self.assertIsNone(json_dict["window_reset_reason"])
 
         self.context.config.general.breadcrumb_trace_enabled = True
         resp = self.test_app.get("/server/breadcrumbs/get")
         self.assertEqual(200, resp.status_int)
         json_dict = json.loads(resp.body.decode("utf-8"))
-        self.assertEqual([], json_dict["entries"])
+        self.assertEqual(1, json_dict["entry_count"])
+        self.assertEqual("start", json_dict["entries"][0]["message"])
+
+    def test_get_supports_filters_limit_and_order(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        self.context.breadcrumb_trace.record(
+            "controller",
+            "start",
+            {"path_pair_count": 0},
+            stage="controller",
+            event_type="state_transition",
+            corr_id="flow-1",
+            flow_id="flow-a",
+            path_pair_id="pair-1",
+            file_id="file-1"
+        )
+        self.context.breadcrumb_trace.record(
+            "controller",
+            "refresh",
+            {"path_pair_count": 1},
+            stage="refresh",
+            event_type="state_transition",
+            corr_id="flow-2",
+            flow_id="flow-b",
+            path_pair_id="pair-2",
+            file_id="file-2"
+        )
+        self.context.breadcrumb_trace.record(
+            "controller",
+            "finish",
+            {"path_pair_count": 2},
+            stage="finish",
+            event_type="state_transition",
+            corr_id="flow-1",
+            flow_id="flow-a",
+            path_pair_id="pair-1",
+            file_id="file-1"
+        )
+
+        resp = self.test_app.get(
+            "/server/breadcrumbs/get?corr_id=flow-1&flow_id=flow-a&event_type=state_transition"
+            "&path_pair_id=pair-1&file_id=file-1&limit=1&order=desc"
+        )
+        self.assertEqual(200, resp.status_int)
+        json_dict = json.loads(resp.body.decode("utf-8"))
+        self.assertEqual(1, json_dict["entry_count"])
+        self.assertEqual("finish", json_dict["entries"][0]["message"])
+        self.assertEqual(1, json_dict["query"]["limit"])
+        self.assertEqual("desc", json_dict["query"]["order"])
+        self.assertEqual("flow-1", json_dict["query"]["corr_id"])
+        self.assertEqual("flow-a", json_dict["query"]["flow_id"])
+        self.assertEqual("state_transition", json_dict["query"]["event_type"])
+        self.assertEqual("pair-1", json_dict["query"]["path_pair_id"])
+        self.assertEqual("file-1", json_dict["query"]["file_id"])
+
+    def test_get_rejects_invalid_limit_and_order(self):
+        resp = self.test_app.get("/server/breadcrumbs/get?limit=0", expect_errors=True)
+        self.assertEqual(400, resp.status_int)
+        self.assertIn("limit must be greater than 0", resp.text)
+
+        resp = self.test_app.get("/server/breadcrumbs/get?limit=cat", expect_errors=True)
+        self.assertEqual(400, resp.status_int)
+        self.assertIn("limit must be an integer", resp.text)
+
+        resp = self.test_app.get("/server/breadcrumbs/get?order=sideways", expect_errors=True)
+        self.assertEqual(400, resp.status_int)
+        self.assertIn("order must be 'asc' or 'desc'", resp.text)
 
     def test_get_redacts_sensitive_command_fields_and_returns_failure_summary(self):
         self.context.config.general.breadcrumb_trace_enabled = True
@@ -145,3 +212,29 @@ class TestBreadcrumbTraceHandler(BaseTestWebApp):
         self.assertNotIn("secret-token", reason)
         self.assertIn("**REDACTED**", error_message)
         self.assertIn("**REDACTED**", reason)
+
+    def test_reset_purges_retained_entries_and_requires_admin(self):
+        self.context.config.general.breadcrumb_trace_enabled = True
+        self.context.breadcrumb_trace.record("controller", "start", {"path_pair_count": 0})
+        self.context.breadcrumb_trace.record("controller", "refresh", {"path_pair_count": 1})
+
+        read_only_secret = self.auth_store.create_api_key("integration-reader", ["read"])["secret"]
+        read_only_app = TestApp(
+            self.web_app,
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(read_only_secret)}
+        )
+
+        resp = read_only_app.post("/server/breadcrumbs/reset", expect_errors=True)
+        self.assertEqual(403, resp.status_int)
+        self.assertIn("admin", resp.text)
+
+        resp = self.test_app.post("/server/breadcrumbs/reset")
+        self.assertEqual(200, resp.status_int)
+        json_dict = json.loads(resp.body.decode("utf-8"))
+        self.assertEqual("reset", json_dict["status"])
+
+        resp = self.test_app.get("/server/breadcrumbs/get")
+        self.assertEqual(200, resp.status_int)
+        json_dict = json.loads(resp.body.decode("utf-8"))
+        self.assertEqual(0, json_dict["entry_count"])
+        self.assertEqual("reset", json_dict["window_reset_reason"])

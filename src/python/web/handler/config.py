@@ -19,8 +19,9 @@ class ConfigHandler(IHandler):
         },
     }
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, breadcrumb_trace_sync=None):
         self.__config = config
+        self.__breadcrumb_trace_sync = breadcrumb_trace_sync
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -71,6 +72,8 @@ class ConfigHandler(IHandler):
             )
         try:
             inner_config.set_property(key, value)
+            if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
+                self.__breadcrumb_trace_sync()
             return HTTPResponse(body="{}.{} set to {}".format(section, key, value))
         except ConfigError as e:
             return HTTPResponse(body=str(e), status=400)

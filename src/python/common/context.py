@@ -58,7 +58,8 @@ class Context:
         self.status = status
         self.path_pair_manager = path_pair_manager
         self.breadcrumb_trace = breadcrumb_trace if breadcrumb_trace is not None else BreadcrumbTraceCollector(
-            self.__breadcrumb_trace_enabled
+            self.__breadcrumb_trace_enabled,
+            max_entries=self.__breadcrumb_trace_retention_depth()
         )
 
     def create_child_context(self, context_name: str) -> "Context":
@@ -72,6 +73,13 @@ class Context:
             return False
         enabled = getattr(general_config, "breadcrumb_trace_enabled", False)
         return enabled if type(enabled) is bool else False
+
+    def __breadcrumb_trace_retention_depth(self) -> int:
+        general_config = getattr(self.config, "general", None)
+        if general_config is None:
+            return 128
+        retention_depth = getattr(general_config, "breadcrumb_trace_retention_depth", 128)
+        return retention_depth if type(retention_depth) is int and retention_depth > 0 else 128
 
     def print_to_log(self):
         # Print the config

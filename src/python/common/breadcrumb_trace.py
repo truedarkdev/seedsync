@@ -12,19 +12,36 @@ from typing import Any, Callable, Deque, Dict, List, Optional
 
 
 class BreadcrumbTraceEmitter:
-    def __init__(self, record_queue: multiprocessing.Queue):
+    def __init__(
+        self,
+        record_queue: multiprocessing.Queue,
+        enabled_getter: Callable[[], bool],
+        enabled_gate: multiprocessing.Value,
+    ):
         self.__record_queue = record_queue
+        self.__enabled_getter = enabled_getter
+        self.__enabled_gate = enabled_gate
 
     def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
+        try:
+            enabled = bool(self.__enabled_gate.value)
+        except Exception:
+            enabled = False
+        if not enabled:
+            return
+
         created_ns = time.time_ns()
-        self.__record_queue.put({
-            "source": source,
-            "message": message,
-            "details": details,
-            "metadata": metadata,
-            "created_ns": created_ns,
-            "created_ms": int(created_ns / 1_000_000),
-        })
+        try:
+            self.__record_queue.put_nowait({
+                "source": source,
+                "message": message,
+                "details": details,
+                "metadata": metadata,
+                "created_ns": created_ns,
+                "created_ms": int(created_ns / 1_000_000),
+            })
+        except queue.Full:
+            return
 
 
 class BreadcrumbTraceNoopEmitter:
@@ -39,7 +56,8 @@ class BreadcrumbTraceCollector:
     The collector is intentionally lightweight and opt-in. Callers can keep
     recording breadcrumbs without having to guard every call site; the
     collector checks the enabled flag on each write and simply no-ops when the
-    facility is disabled.
+    facility is disabled. Retained entries stay available across disable/enable
+    transitions until an explicit reset clears them.
     """
 
     __MAX_DETAIL_STRING_LENGTH = 256
@@ -89,28 +107,36 @@ class BreadcrumbTraceCollector:
         self.__entries: Deque[Dict[str, Any]] = deque(maxlen=max_entries)
         self.__external_records = None
         self.__external_records_lock = Lock()
+        self.__enabled_gate = multiprocessing.Value("b", 0)
         self.__lock = Lock()
         self.__version = 0
         self.__last_reset_version = 0
+        self.__last_reset_reason = None
         self.__window_reset_pending = False
         self.__window_truncated_pending = False
+        self.__external_queue_last_drain_count = 0
+        self.__external_queue_last_drain_limit = self.__max_entries
+        self.__external_queue_drain_limited = False
         self.__last_signature = None
         self.__last_failure_entry = None
         self.__last_failure_version = None
+        self.sync_enabled_state()
 
     def create_emitter(self) -> BreadcrumbTraceEmitter:
-        if not self.is_enabled():
-            return BreadcrumbTraceNoopEmitter()
         with self.__external_records_lock:
             if self.__external_records is None:
-                self.__external_records = multiprocessing.Queue()
-            return BreadcrumbTraceEmitter(self.__external_records)
+                self.__external_records = multiprocessing.Queue(maxsize=self.__max_entries)
+            return BreadcrumbTraceEmitter(self.__external_records, self.__enabled_getter, self.__enabled_gate)
 
     def is_enabled(self) -> bool:
-        try:
-            return bool(self.__enabled_getter())
-        except Exception:
-            return False
+        enabled = self.__read_enabled_state()
+        self.__set_enabled_gate(enabled)
+        return enabled
+
+    def sync_enabled_state(self) -> bool:
+        enabled = self.__read_enabled_state()
+        self.__set_enabled_gate(enabled)
+        return enabled
 
     @property
     def max_entries(self) -> int:
@@ -120,12 +146,57 @@ class BreadcrumbTraceCollector:
     def version(self) -> int:
         return self.__version
 
+    def __read_enabled_state(self) -> bool:
+        try:
+            return bool(self.__enabled_getter())
+        except Exception:
+            return False
+
+    def __set_enabled_gate(self, enabled: bool):
+        try:
+            with self.__enabled_gate.get_lock():
+                self.__enabled_gate.value = 1 if enabled else 0
+        except Exception:
+            pass
+
+    def clear(self):
+        self.__drain_external_records(limit=None)
+        with self.__lock:
+            self.__entries.clear()
+            self.__last_signature = None
+            self.__last_failure_entry = None
+            self.__last_failure_version = None
+            self.__last_reset_version = self.__version
+            self.__last_reset_reason = "clear"
+            self.__window_reset_pending = True
+            self.__window_truncated_pending = False
+
+    def reset(self):
+        self.__drain_external_records(limit=None)
+        with self.__lock:
+            self.__entries.clear()
+            self.__last_signature = None
+            self.__last_failure_entry = None
+            self.__last_failure_version = None
+            self.__last_reset_version = self.__version
+            self.__last_reset_reason = "reset"
+            self.__window_reset_pending = True
+            self.__window_truncated_pending = False
+
     def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
-        self.__drain_external_records()
+        if self.is_enabled():
+            self.__drain_external_records(limit=self.__max_entries)
         self.__record_entry(source, message, details, **metadata)
 
-    def __record_entry(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
-        if not self.is_enabled():
+    def __record_entry(
+        self,
+        source: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+        allow_when_disabled: bool = False,
+        **metadata,
+    ):
+        if not allow_when_disabled and not self.is_enabled():
             return
 
         created_ns = metadata.pop("created_ns", None)
@@ -203,69 +274,151 @@ class BreadcrumbTraceCollector:
                 self.__last_failure_entry = copy.deepcopy(entry)
                 self.__last_failure_version = self.__version
 
-    def snapshot(self, since_version: Optional[int] = None) -> Dict[str, Any]:
-        self.__drain_external_records()
+    def snapshot(
+        self,
+        since_version: Optional[int] = None,
+        limit: Optional[int] = None,
+        corr_id: Optional[str] = None,
+        flow_id: Optional[str] = None,
+        stage: Optional[str] = None,
+        event_type: Optional[str] = None,
+        path_pair_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        order: str = "asc",
+    ) -> Dict[str, Any]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be greater than 0")
+        if order is None or order == "":
+            order = "asc"
+        if order not in {"asc", "desc"}:
+            raise ValueError("order must be 'asc' or 'desc'")
+
+        query = {
+            "since_version": since_version,
+            "limit": limit,
+            "corr_id": corr_id,
+            "flow_id": flow_id,
+            "stage": stage,
+            "event_type": event_type,
+            "path_pair_id": path_pair_id,
+            "file_id": file_id,
+            "order": order,
+        }
+
+        self.__drain_external_records(limit=self.__max_entries)
         with self.__lock:
             enabled = self.is_enabled()
+            all_entries = list(self.__entries)
+            entries = self.__filter_entries(
+                all_entries,
+                since_version=since_version,
+                limit=limit,
+                corr_id=corr_id,
+                flow_id=flow_id,
+                stage=stage,
+                event_type=event_type,
+                path_pair_id=path_pair_id,
+                file_id=file_id,
+                order=order,
+            )
+            window_reset = self.__window_reset_pending
+            if since_version is not None:
+                window_reset = window_reset or since_version < self.__last_reset_version
+            window_reset_reason = self.__last_reset_reason if window_reset else None
+            if window_reset and window_reset_reason is None:
+                window_reset_reason = "reset"
             if not enabled:
-                window_reset = bool(self.__entries)
-                if window_reset:
-                    self.__entries.clear()
-                    self.__last_signature = None
-                    self.__last_failure_entry = None
-                    self.__last_failure_version = None
-                    self.__last_reset_version = self.__version
-                    self.__window_reset_pending = True
                 payload = self.__build_snapshot_payload(
-                    entries=[],
-                    all_entries=[],
-                    since_version=since_version,
+                    entries=copy.deepcopy(entries),
+                    all_entries=all_entries,
+                    query=query,
                     window_reset=window_reset,
-                    window_reset_reason="disabled" if window_reset else None,
+                    window_reset_reason=window_reset_reason,
                     window_truncated=self.__window_truncated_pending,
+                    external_queue_drain_count=self.__external_queue_last_drain_count,
+                    external_queue_drain_limit=self.__external_queue_last_drain_limit,
+                    external_queue_drain_limited=self.__external_queue_drain_limited,
                 )
                 self.__window_reset_pending = False
                 self.__window_truncated_pending = False
                 return payload
 
-            all_entries = list(self.__entries)
-            entries = list(self.__entries)
-            window_reset = self.__window_reset_pending
-            if since_version is not None:
-                window_reset = window_reset or since_version < self.__last_reset_version
-                entries = [entry for entry in entries if entry["version"] > since_version]
-            entries = copy.deepcopy(entries)
             payload = self.__build_snapshot_payload(
-                entries=entries,
+                entries=copy.deepcopy(entries),
                 all_entries=all_entries,
-                since_version=since_version,
+                query=query,
                 window_reset=window_reset,
-                window_reset_reason="reset" if window_reset else None,
+                window_reset_reason=window_reset_reason,
                 window_truncated=self.__window_truncated_pending,
+                external_queue_drain_count=self.__external_queue_last_drain_count,
+                external_queue_drain_limit=self.__external_queue_last_drain_limit,
+                external_queue_drain_limited=self.__external_queue_drain_limited,
             )
             self.__window_reset_pending = False
             self.__window_truncated_pending = False
             return payload
 
+    def __filter_entries(
+        self,
+        entries: List[Dict[str, Any]],
+        since_version: Optional[int],
+        limit: Optional[int],
+        corr_id: Optional[str],
+        flow_id: Optional[str],
+        stage: Optional[str],
+        event_type: Optional[str],
+        path_pair_id: Optional[str],
+        file_id: Optional[str],
+        order: str,
+    ) -> List[Dict[str, Any]]:
+        filtered_entries = entries
+        if since_version is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["version"] > since_version]
+        if corr_id is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["corr_id"] == corr_id]
+        if flow_id is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["flow_id"] == flow_id]
+        if stage is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["stage"] == stage]
+        if event_type is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["event_type"] == event_type]
+        if path_pair_id is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["path_pair_id"] == path_pair_id]
+        if file_id is not None:
+            filtered_entries = [entry for entry in filtered_entries if entry["file_id"] == file_id]
+        if order == "desc":
+            filtered_entries = list(reversed(filtered_entries))
+        if limit is not None:
+            filtered_entries = filtered_entries[:min(limit, self.__max_entries)]
+        return filtered_entries
+
     def __build_snapshot_payload(
         self,
         entries: List[Dict[str, Any]],
         all_entries: List[Dict[str, Any]],
-        since_version: Optional[int],
+        query: Dict[str, Any],
         window_reset: bool,
         window_reset_reason: Optional[str],
         window_truncated: bool,
+        external_queue_drain_count: int,
+        external_queue_drain_limit: int,
+        external_queue_drain_limited: bool,
     ) -> Dict[str, Any]:
         payload = {
             "enabled": self.is_enabled(),
             "version": self.__version,
-            "since_version": since_version,
+            "since_version": query["since_version"],
             "last_reset_version": self.__last_reset_version,
+            "last_reset_reason": self.__last_reset_reason,
             "window_reset": window_reset,
             "window_reset_reason": window_reset_reason,
             "window_truncated": window_truncated,
             "max_entries": self.__max_entries,
             "entry_count": len(entries),
+            "query": query,
+            "external_queue_drain_count": external_queue_drain_count,
+            "external_queue_drain_limit": external_queue_drain_limit,
+            "external_queue_drain_limited": external_queue_drain_limited,
             "latest_failure_version": self.__last_failure_version,
             "latest_failure_entry": copy.deepcopy(self.__last_failure_entry),
             "failure_summary": self.__build_failure_summary(all_entries),
@@ -420,19 +573,27 @@ class BreadcrumbTraceCollector:
             sanitized = pattern.sub(replacement, sanitized)
         return sanitized
 
-    def __drain_external_records(self):
+    def __drain_external_records(self, limit: Optional[int] = None):
         if self.__external_records is None:
+            self.__external_queue_last_drain_count = 0
+            self.__external_queue_last_drain_limit = limit if limit is not None else self.__max_entries
+            self.__external_queue_drain_limited = False
             return
-        while True:
+        drained_count = 0
+        drain_limited = False
+        drain_limit = limit if limit is not None else self.__max_entries
+        while limit is None or drained_count < limit:
             try:
                 external_record = self.__external_records.get_nowait()
             except queue.Empty:
-                return
+                break
+            drained_count += 1
             metadata = external_record.get("metadata", {})
             self.__record_entry(
                 external_record.get("source"),
                 external_record.get("message"),
                 external_record.get("details"),
+                allow_when_disabled=True,
                 stage=metadata.get("stage"),
                 event_type=metadata.get("event_type", "breadcrumb"),
                 corr_id=metadata.get("corr_id"),
@@ -443,3 +604,11 @@ class BreadcrumbTraceCollector:
                 created_ns=external_record.get("created_ns"),
                 created_ms=external_record.get("created_ms"),
             )
+        if limit is not None and drained_count >= limit:
+            try:
+                drain_limited = not self.__external_records.empty()
+            except Exception:
+                drain_limited = True
+        self.__external_queue_last_drain_count = drained_count
+        self.__external_queue_last_drain_limit = drain_limit
+        self.__external_queue_drain_limited = drain_limited
