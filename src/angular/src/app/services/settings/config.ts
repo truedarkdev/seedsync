@@ -11,10 +11,12 @@ import {Record} from "immutable";
 interface IGeneral {
     debug: boolean;
     verbose: boolean;
+    breadcrumb_trace_enabled: boolean;
 }
 const DefaultGeneral: IGeneral = {
     debug: null,
-    verbose: null
+    verbose: null,
+    breadcrumb_trace_enabled: null
 };
 const GeneralRecord = Record(DefaultGeneral);
 

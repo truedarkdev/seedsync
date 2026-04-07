@@ -155,6 +155,12 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
         },
         {
             type: OptionType.Checkbox,
+            label: "Enable breadcrumb trace recorder",
+            valuePath: ["general", "breadcrumb_trace_enabled"],
+            description: "Keeps a low-overhead recent-context window for debugging failures."
+        },
+        {
+            type: OptionType.Checkbox,
             label: "Enable Debug",
             valuePath: ["general", "debug"],
             description: "Enables debug logging."
