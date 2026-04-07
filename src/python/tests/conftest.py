@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from common import Config
+from common import Config, BreadcrumbTraceCollector
 
 
 @pytest.fixture
@@ -62,6 +62,9 @@ def mock_context(test_logger):
     context.config.controller.managed_extract_folders_enabled = True
 
     context.config.general.verbose = False
+    context.breadcrumb_trace = BreadcrumbTraceCollector(
+        lambda: context.config.general.breadcrumb_trace_enabled
+    )
 
     context.args.local_path_to_scanfs = "/local/bin/scanfs"
 

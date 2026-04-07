@@ -3,6 +3,7 @@
 from .types import overrides
 from .job import Job
 from .context import Context, Args
+from .breadcrumb_trace import BreadcrumbTraceCollector
 from .error import AppError, ServiceExit, ServiceRestart
 from .constants import Constants
 from .config import Config, ConfigError

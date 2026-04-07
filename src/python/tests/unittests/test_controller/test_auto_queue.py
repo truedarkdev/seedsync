@@ -307,6 +307,7 @@ class TestAutoQueue(unittest.TestCase):
         self.context.config.autoqueue.patterns_only = True
         self.context.config.autoqueue.auto_extract = True
         self.context.logger = self.logger
+        self.context.breadcrumb_trace = MagicMock()
         self.controller = MagicMock()
         self.controller.get_model_files_and_add_listener = MagicMock()
         self.controller.queue_command = MagicMock()
@@ -367,6 +368,34 @@ class TestAutoQueue(unittest.TestCase):
         commands = [calls[i][0][0] for i in range(3)]
         self.assertEqual(set([Controller.Command.Action.QUEUE]*3), {c.action for c in commands})
         self.assertEqual({"File.One", "File.Two", "File.Three"}, {c.filename for c in commands})
+
+    def test_process_records_auto_queue_breadcrumb_summary(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="File.One"))
+
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        file_one = ModelFile("File.One", True)
+        file_one.remote_size = 100
+        self.model_listener.file_added(file_one)
+
+        auto_queue.process()
+
+        self.context.breadcrumb_trace.record.assert_any_call(
+            "auto_queue",
+            "auto_queue_cycle",
+            {
+                "new_queue_candidates": 1,
+                "modified_queue_candidates": 0,
+                "queue_count": 1,
+                "extract_count": 0,
+                "patterns_only": True,
+                "auto_extract_enabled": True,
+            },
+            stage="auto_queue",
+            event_type="state_transition",
+            corr_id="auto_queue",
+        )
 
     def test_matching_initial_files_are_queued(self):
         persist = AutoQueuePersist()

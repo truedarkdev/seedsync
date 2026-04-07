@@ -9,7 +9,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller import IScanner, ScannerProcess, ScannerError
+from controller.extract import ExtractProcess
 from system import SystemFile
 
 
@@ -287,6 +289,49 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual(2, process.logger.warning.call_count)
         self.assertIn("recoverable error", process.logger.warning.call_args_list[0][0][0])
         self.assertIn("recoverable error", process.logger.warning.call_args_list[1][0][0])
+
+    def test_scan_and_extract_breadcrumbs_share_correlated_versions(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        emitter = collector.create_emitter()
+
+        mock_scanner = DummyScanner()
+        mock_scanner.path_pair_id = "movies"
+        mock_scanner.path_pair_name = "Movies"
+        mock_scanner.scan = MagicMock(return_value=[])
+
+        process = ScannerProcess(
+            scanner=mock_scanner,
+            interval_in_ms=0,
+            verbose=False,
+            breadcrumb_trace=emitter
+        )
+        process.run_init()
+        process.run_loop()
+
+        extract_process = ExtractProcess(
+            out_dir_path="/out",
+            local_path="/local",
+            breadcrumb_trace=emitter
+        )
+        listener = ExtractProcess._ExtractProcess__ExtractListener(
+            logger=MagicMock(),
+            completed_queue=MagicMock(),
+            trace_owner=extract_process
+        )
+        listener.extract_completed(
+            name="movie.mkv",
+            is_dir=False,
+            file_id="movie-id",
+            path_pair_id="movies"
+        )
+
+        snapshot = collector.snapshot()
+        self.assertEqual(3, len(snapshot["entries"]))
+        self.assertEqual(["movies", "movies", "movies"], [entry["corr_id"] for entry in snapshot["entries"]])
+        self.assertEqual([1, 2, 3], [entry["version"] for entry in snapshot["entries"]])
+        self.assertEqual(["scan", "scan", "extract"], [entry["stage"] for entry in snapshot["entries"]])
+        self.assertEqual(["scan_started", "scan_completed", "extract_completed"],
+                         [entry["message"] for entry in snapshot["entries"]])
 
     def test_sends_fatal_exception_on_nonrecoverable_error(self):
         mock_scanner = DummyScanner()

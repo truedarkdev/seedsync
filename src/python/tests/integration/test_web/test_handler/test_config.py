@@ -9,6 +9,7 @@ class TestConfigHandler(BaseTestWebApp):
     def test_get(self):
         self.context.config.general.debug = True
         self.context.config.general.api_token = "super-secret-token"
+        self.context.config.general.breadcrumb_trace_enabled = False
         self.context.config.lftp.remote_address = "server.remote.com"
         self.context.config.lftp.remote_username = "seedsync-user"
         self.context.config.lftp.remote_port = 2222
@@ -20,6 +21,7 @@ class TestConfigHandler(BaseTestWebApp):
         json_dict = json.loads(str(resp.html))
         self.assertEqual(True, json_dict["general"]["debug"])
         self.assertEqual("**REDACTED**", json_dict["general"]["api_token"])
+        self.assertEqual(False, json_dict["general"]["breadcrumb_trace_enabled"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_address"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_username"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_path"])
@@ -32,6 +34,11 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.post_json("/server/config/set/general/debug", {"value": True})
         self.assertEqual(200, resp.status_int)
         self.assertEqual(True, self.context.config.general.debug)
+
+        self.assertEqual(False, self.context.config.general.breadcrumb_trace_enabled)
+        resp = self.test_app.post_json("/server/config/set/general/breadcrumb_trace_enabled", {"value": True})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(True, self.context.config.general.breadcrumb_trace_enabled)
 
         self.assertEqual(None, self.context.config.lftp.remote_path)
         resp = self.test_app.post_json("/server/config/set/lftp/remote_path", {"value": "/path/to/somewhere"})

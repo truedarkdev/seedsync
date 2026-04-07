@@ -10,7 +10,7 @@ import tempfile
 
 from webtest import TestApp
 
-from common import overrides, Status, Config, PathPairManager
+from common import overrides, Status, Config, PathPairManager, BreadcrumbTraceCollector
 from controller import AutoQueuePersist
 from web.auth_store import ApiKeyStore
 from web import WebAppBuilder
@@ -50,6 +50,9 @@ class BaseTestWebApp(unittest.TestCase):
         self.context.config = Config()
         self.context.path_pair_manager = PathPairManager(self.temp_dir)
         self.context.path_pair_manager.load()
+        self.context.breadcrumb_trace = BreadcrumbTraceCollector(
+            lambda: self.context.config.general.breadcrumb_trace_enabled
+        )
 
         # Real auto-queue persist
         self.auto_queue_persist = AutoQueuePersist()

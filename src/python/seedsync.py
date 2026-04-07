@@ -433,6 +433,7 @@ class Seedsync:
         config.general.allowed_hostname = ""
         config.general.trusted_browser_bootstrap_remote_addrs = ""
         config.general.browser_handover_recovery_version = ""
+        config.general.breadcrumb_trace_enabled = False
 
         config.lftp.remote_address = Seedsync.__CONFIG_DUMMY_VALUE
         config.lftp.remote_username = Seedsync.__CONFIG_DUMMY_VALUE

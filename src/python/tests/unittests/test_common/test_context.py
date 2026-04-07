@@ -38,8 +38,17 @@ class TestContext(unittest.TestCase):
         args = Args()
         status = Status()
         path_pair_manager = MagicMock()
+        breadcrumb_trace = MagicMock()
 
-        context = Context(logger, web_access_logger, config, args, status, path_pair_manager)
+        context = Context(
+            logger,
+            web_access_logger,
+            config,
+            args,
+            status,
+            path_pair_manager,
+            breadcrumb_trace=breadcrumb_trace,
+        )
         child_context = context.create_child_context("worker")
 
         self.assertIsNot(context, child_context)
@@ -50,6 +59,24 @@ class TestContext(unittest.TestCase):
         self.assertIs(args, child_context.args)
         self.assertIs(status, child_context.status)
         self.assertIs(path_pair_manager, child_context.path_pair_manager)
+        self.assertIs(breadcrumb_trace, child_context.breadcrumb_trace)
+
+    def test_context_provides_breadcrumb_trace_collector(self):
+        logger = MagicMock()
+        web_access_logger = MagicMock()
+        config = MagicMock()
+        config.general.breadcrumb_trace_enabled = True
+        args = Args()
+        status = Status()
+
+        context = Context(logger, web_access_logger, config, args, status)
+        context.breadcrumb_trace.record("controller", "start", {"phase": "init"})
+
+        snapshot = context.breadcrumb_trace.snapshot()
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual(1, len(snapshot["entries"]))
+        self.assertEqual("controller", snapshot["entries"][0]["source"])
+        self.assertEqual("start", snapshot["entries"][0]["message"])
 
     def test_print_to_log_emits_config_and_args(self):
         logger = MagicMock()
@@ -60,6 +87,7 @@ class TestContext(unittest.TestCase):
                 "verbose": False,
                 "api_token": "super-secret-token",
                 "webhook_secret": "super-secret-webhook-secret",
+                "breadcrumb_trace_enabled": False,
             }
         }
         args = Args()
@@ -79,6 +107,7 @@ class TestContext(unittest.TestCase):
                 call("  general.verbose: False"),
                 call("  general.api_token: **REDACTED**"),
                 call("  general.webhook_secret: **REDACTED**"),
+                call("  general.breadcrumb_trace_enabled: False"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),
                 call("  html_path: /tmp/ui"),
