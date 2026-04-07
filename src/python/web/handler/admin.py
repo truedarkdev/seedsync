@@ -121,7 +121,7 @@ class AdminHandler(IHandler):
                     "error": "First-admin browser bootstrap is only available when the initial handover window is open"
                 }, status=409)
 
-            ui_session = self.__auth_store.create_browser_session_for_api_key(result["record"].id)
+            ui_session = self.__auth_store.create_remembered_browser_session_for_api_key(result["record"].id)
             response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],
