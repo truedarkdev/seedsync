@@ -61,7 +61,8 @@ describe("Testing config service", () => {
         const configJson = {
             general: {
                 debug: true,
-                verbose: false
+                verbose: false,
+                breadcrumb_trace_enabled: true
             },
             lftp: {
                 remote_address: "remote.server.com",
@@ -99,6 +100,7 @@ describe("Testing config service", () => {
             next: config => {
                 expect(config.general.debug).toBe(true);
                 expect(config.general.verbose).toBe(false);
+                expect(config.general.breadcrumb_trace_enabled).toBe(true);
                 expect(config.lftp.remote_address).toBe("remote.server.com");
                 expect(config.lftp.remote_username).toBe("some.user");
                 expect(config.lftp.remote_password).toBe("my.password");
@@ -209,6 +211,19 @@ describe("Testing config service", () => {
         expectConfigSetRequest("general", "debug", true);
 
         expect(configSubscriberIndex).toBe(1);
+        httpMock.verify();
+    });
+
+    it("should send a POST on setting breadcrumb trace recording", () => {
+        httpMock.expectOne("/server/config/get").flush({general: {breadcrumb_trace_enabled: false}});
+
+        configService.set("general", "breadcrumb_trace_enabled", true).subscribe({
+           next: reaction => {
+               expect(reaction.success).toBe(true);
+           }
+        });
+
+        expectConfigSetRequest("general", "breadcrumb_trace_enabled", true);
         httpMock.verify();
     });
 

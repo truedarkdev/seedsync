@@ -9,7 +9,8 @@ describe("Testing config record initialization", () => {
         const configJson = {
             general: {
                 debug: true,
-                verbose: false
+                verbose: false,
+                breadcrumb_trace_enabled: true
             },
             lftp: {
                 remote_address: "remote.server.com",
@@ -53,6 +54,7 @@ describe("Testing config record initialization", () => {
     it("should initialize with correct values", () => {
         expect(config.general.debug).toBe(true);
         expect(config.general.verbose).toBe(false);
+        expect(config.general.breadcrumb_trace_enabled).toBe(true);
         expect(config.lftp.remote_address).toBe("remote.server.com");
         expect(config.lftp.remote_username).toBe("some.user");
         expect(config.lftp.remote_password).toBe("my.password");
@@ -97,7 +99,9 @@ describe("Testing config record initialization", () => {
         const partialConfig = new Config({general: {debug: true}});
 
         expect(partialConfig.general.debug).toBe(true);
+        expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
         expect(partialConfig.getValue("general", "debug")).toBe(true);
+        expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
         expect(partialConfig.getValue("missing", "value")).toBe(null);
