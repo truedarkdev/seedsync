@@ -4,10 +4,12 @@ import multiprocessing
 import datetime
 import time
 import queue
+import threading
 from typing import Optional, List
 import logging
 import os
 import json
+from collections import defaultdict, deque
 
 from .dispatch import ExtractDispatch, ExtractStatus, ExtractListener, ExtractDispatchError
 from common import overrides, AppProcess
@@ -52,6 +54,7 @@ class ExtractProcess(AppProcess):
                               file_id: str = None,
                               path_pair_id: str = None):
             self.logger.info("Extraction completed for {}".format(name))
+            flow_id = self.trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
             self.trace_owner._ExtractProcess__record_breadcrumb(
                 "extract_completed",
                 {
@@ -61,6 +64,7 @@ class ExtractProcess(AppProcess):
                     "path_pair_id": path_pair_id,
                 },
                 corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
@@ -83,6 +87,7 @@ class ExtractProcess(AppProcess):
                            file_id: str = None,
                            path_pair_id: str = None):
             self.logger.error("Extraction failed for {}".format(name))
+            flow_id = self.trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
             self.trace_owner._ExtractProcess__record_breadcrumb(
                 "extract_failed",
                 {
@@ -93,6 +98,7 @@ class ExtractProcess(AppProcess):
                 },
                 event_type="failure",
                 corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
@@ -122,6 +128,9 @@ class ExtractProcess(AppProcess):
             self.__target_archive_trace_file_id = None
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_last_signature = None
+        self.__inflight_flow_ids_by_file_id = defaultdict(deque)
+        self.__inflight_flow_ids_by_name = defaultdict(deque)
+        self.__inflight_flow_ids_lock = threading.Lock()
 
     @staticmethod
     def __extract_trace_selector_name(identifier: str):
@@ -188,10 +197,39 @@ class ExtractProcess(AppProcess):
         # Forward all the extract commands
         try:
             while True:
-                file = self.__command_queue.get(block=False)
+                queue_item = self.__command_queue.get(block=False)
+                if isinstance(queue_item, tuple) and len(queue_item) == 2:
+                    file, flow_id = queue_item
+                else:
+                    file = queue_item
+                    flow_id = None
+                self.__record_breadcrumb(
+                    "extract_command_dequeued",
+                    {
+                        "file_name": file.name,
+                        "is_dir": file.is_dir,
+                    },
+                    corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                    flow_id=flow_id,
+                    file_id=file.file_id,
+                    path_pair_id=file.path_pair_id,
+                )
                 try:
+                    self.__track_inflight_flow_id(file, flow_id)
                     self.__dispatch.extract(file)
+                    self.__record_breadcrumb(
+                        "extract_command_dispatched",
+                        {
+                            "file_name": file.name,
+                            "is_dir": file.is_dir,
+                        },
+                        corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                        flow_id=flow_id,
+                        file_id=file.file_id,
+                        path_pair_id=file.path_pair_id,
+                    )
                 except ExtractDispatchError as e:
+                    self.__untrack_inflight_flow_id(file, flow_id)
                     self.logger.warning(str(e))
                     self.__record_breadcrumb(
                         "extract_dispatch_blocked",
@@ -202,6 +240,7 @@ class ExtractProcess(AppProcess):
                         },
                         event_type="failure",
                         corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                        flow_id=flow_id,
                         file_id=file.file_id,
                         path_pair_id=file.path_pair_id,
                     )
@@ -211,6 +250,9 @@ class ExtractProcess(AppProcess):
                             "is_dir": file.is_dir,
                             "reason": str(e),
                         })
+                except Exception:
+                    self.__untrack_inflight_flow_id(file, flow_id)
+                    raise
         except queue.Empty:
             pass
 
@@ -230,6 +272,7 @@ class ExtractProcess(AppProcess):
                             details: dict,
                             event_type: str = "state_transition",
                             corr_id: str = None,
+                            flow_id: str = None,
                             file_id: str = None,
                             path_pair_id: str = None):
         if self.__breadcrumb_trace is None:
@@ -241,17 +284,86 @@ class ExtractProcess(AppProcess):
             stage="extract",
             event_type=event_type,
             corr_id=corr_id if corr_id is not None else self.__trace_corr_id(file_id, path_pair_id),
+            flow_id=flow_id,
             file_id=file_id,
             path_pair_id=path_pair_id,
         )
 
-    def extract(self, file: ModelFile):
+    def __track_inflight_flow_id(self, file: ModelFile, flow_id: str = None):
+        if flow_id is None:
+            return
+        with self.__inflight_flow_ids_lock:
+            if file.file_id is not None:
+                self.__inflight_flow_ids_by_file_id[file.file_id].append(flow_id)
+            self.__inflight_flow_ids_by_name[file.name].append(flow_id)
+
+    def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: str = None):
+        if flow_id is None:
+            return
+        with self.__inflight_flow_ids_lock:
+            self.__remove_flow_id(
+                self.__inflight_flow_ids_by_file_id,
+                file.file_id,
+                flow_id
+            )
+            self.__remove_flow_id(
+                self.__inflight_flow_ids_by_name,
+                file.name,
+                flow_id
+            )
+
+    @staticmethod
+    def __remove_flow_id(flow_ids_by_key, key, flow_id: str):
+        if key is None:
+            return
+        flow_ids = flow_ids_by_key.get(key)
+        if not flow_ids:
+            return
+        try:
+            flow_ids.remove(flow_id)
+        except ValueError:
+            return
+        if not flow_ids:
+            flow_ids_by_key.pop(key, None)
+
+    def __pop_inflight_flow_id(self, file_id: str = None, file_name: str = None):
+        with self.__inflight_flow_ids_lock:
+            if file_id is not None:
+                by_id = self.__inflight_flow_ids_by_file_id.get(file_id)
+                if by_id:
+                    flow_id = by_id.popleft()
+                    if not by_id:
+                        self.__inflight_flow_ids_by_file_id.pop(file_id, None)
+                    if file_name is not None:
+                        self.__remove_flow_id(self.__inflight_flow_ids_by_name, file_name, flow_id)
+                    return flow_id
+            if file_name is not None:
+                by_name = self.__inflight_flow_ids_by_name.get(file_name)
+                if by_name:
+                    flow_id = by_name.popleft()
+                    if not by_name:
+                        self.__inflight_flow_ids_by_name.pop(file_name, None)
+                    return flow_id
+        return None
+
+    def extract(self, file: ModelFile, flow_id: str = None):
         """
         Process-safe method to queue an extraction
         :param file:
         :return:
         """
-        self.__command_queue.put(file)
+        self.__record_breadcrumb(
+            "extract_command_queued",
+            {
+                "file_name": file.name,
+                "is_dir": file.is_dir,
+            },
+            corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+            flow_id=flow_id,
+            file_id=file.file_id,
+            path_pair_id=file.path_pair_id,
+        )
+        self.__command_queue.put((file, flow_id))
 
     def pop_latest_statuses(self) -> Optional[ExtractStatusResult]:
         """

@@ -332,6 +332,11 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual(["scan", "scan", "extract"], [entry["stage"] for entry in snapshot["entries"]])
         self.assertEqual(["scan_started", "scan_completed", "extract_completed"],
                          [entry["message"] for entry in snapshot["entries"]])
+        self.assertEqual(
+            snapshot["entries"][0]["flow_id"],
+            snapshot["entries"][1]["flow_id"]
+        )
+        self.assertIsNotNone(snapshot["entries"][0]["flow_id"])
 
     def test_sends_fatal_exception_on_nonrecoverable_error(self):
         mock_scanner = DummyScanner()

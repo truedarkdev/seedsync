@@ -14,6 +14,7 @@ import pytest
 
 from model import ModelFile
 from controller.extract import ExtractProcess, ExtractListener, ExtractStatus
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 
 
 pytestmark = pytest.mark.timeout(2)
@@ -308,3 +309,119 @@ class TestExtractProcess(unittest.TestCase):
         time.sleep(0.05)
         process.run_loop()
         self.assertEqual(3, self.extract_counter.value)
+
+    def test_extract_records_queue_dequeue_dispatch_lifecycle_with_flow_id(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        file = ModelFile("archive.zip", False)
+        file.path_pair_id = "pair-1"
+        file.local_size = 100
+
+        process.extract(file, flow_id="flow-123")
+        time.sleep(0.05)
+        process.run_loop()
+
+        entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] in {"extract_command_queued", "extract_command_dequeued", "extract_command_dispatched"}
+        ]
+        self.assertEqual(
+            ["extract_command_queued", "extract_command_dequeued", "extract_command_dispatched"],
+            [entry["message"] for entry in entries]
+        )
+        self.assertEqual(["flow-123", "flow-123", "flow-123"], [entry["flow_id"] for entry in entries])
+        self.assertEqual(["pair-1", "pair-1", "pair-1"], [entry["corr_id"] for entry in entries])
+
+    def test_extract_completion_breadcrumb_reuses_inflight_flow_id(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        captured_listener = {"value": None}
+
+        def _add_listener(listener: ExtractListener):
+            captured_listener["value"] = listener
+
+        self.mock_dispatch.add_listener.side_effect = _add_listener
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        file = ModelFile("archive.zip", False)
+        file.path_pair_id = "pair-1"
+        file.local_size = 100
+        process.extract(file, flow_id="flow-abc")
+        time.sleep(0.05)
+        process.run_loop()
+
+        captured_listener["value"].extract_completed(
+            name="archive.zip",
+            is_dir=False,
+            file_id=file.file_id,
+            path_pair_id="pair-1",
+        )
+
+        completion_entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] == "extract_completed"
+        ]
+        self.assertEqual(1, len(completion_entries))
+        self.assertEqual("flow-abc", completion_entries[0]["flow_id"])
+        self.assertEqual("pair-1", completion_entries[0]["corr_id"])
+
+    def test_extract_completion_keeps_flow_id_when_callback_fires_before_dispatch_returns(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        captured_listener = {"value": None}
+
+        def _add_listener(listener: ExtractListener):
+            captured_listener["value"] = listener
+
+        def _extract(file: ModelFile):
+            captured_listener["value"].extract_completed(
+                name=file.name,
+                is_dir=file.is_dir,
+                file_id=file.file_id,
+                path_pair_id=file.path_pair_id,
+            )
+
+        self.mock_dispatch.add_listener.side_effect = _add_listener
+        self.mock_dispatch.extract.side_effect = _extract
+
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        file = ModelFile("archive.zip", False)
+        file.path_pair_id = "pair-1"
+        file.local_size = 100
+
+        process.extract(file, flow_id="flow-race")
+        time.sleep(0.05)
+        process.run_loop()
+
+        completion_entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] == "extract_completed"
+        ]
+        self.assertEqual(1, len(completion_entries))
+        self.assertEqual("flow-race", completion_entries[0]["flow_id"])
+        self.assertEqual("pair-1", completion_entries[0]["corr_id"])
+        self.assertIsNone(
+            process._ExtractProcess__pop_inflight_flow_id(file_id=file.file_id, file_name=file.name)
+        )
+
+    def test_extract_dispatch_failure_rolls_back_preregistered_flow_id(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.mock_dispatch.extract.side_effect = Exception("boom")
+
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        file = ModelFile("archive.zip", False)
+        file.local_size = 100
+
+        process.extract(file, flow_id="flow-blocked")
+
+        with self.assertRaises(Exception):
+            process.run_loop()
+
+        self.assertIsNone(
+            process._ExtractProcess__pop_inflight_flow_id(file_id=file.file_id, file_name=file.name)
+        )

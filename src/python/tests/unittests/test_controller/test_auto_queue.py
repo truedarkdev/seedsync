@@ -381,21 +381,81 @@ class TestAutoQueue(unittest.TestCase):
 
         auto_queue.process()
 
-        self.context.breadcrumb_trace.record.assert_any_call(
-            "auto_queue",
-            "auto_queue_cycle",
-            {
-                "new_queue_candidates": 1,
-                "modified_queue_candidates": 0,
-                "queue_count": 1,
-                "extract_count": 0,
-                "patterns_only": True,
-                "auto_extract_enabled": True,
-            },
-            stage="auto_queue",
-            event_type="state_transition",
-            corr_id="auto_queue",
+        cycle_call = next(
+            (
+                call for call in self.context.breadcrumb_trace.record.call_args_list
+                if len(call.args) >= 2 and call.args[1] == "auto_queue_cycle"
+            ),
+            None
         )
+        self.assertIsNotNone(cycle_call)
+        details = cycle_call.args[2]
+        self.assertEqual(1, details["new_queue_candidates"])
+        self.assertEqual(0, details["modified_queue_candidates"])
+        self.assertEqual(1, details["queue_count"])
+        self.assertEqual(0, details["extract_count"])
+        self.assertEqual(True, details["patterns_only"])
+        self.assertEqual(True, details["auto_extract_enabled"])
+        self.assertEqual({}, details["queue_blocked_reason_counts"])
+        self.assertEqual({"state_not_downloaded": 1}, details["extract_blocked_reason_counts"])
+        self.assertEqual(1, len(details["blocked_samples"]))
+        self.assertEqual("state_not_downloaded", details["blocked_samples"][0]["reason"])
+
+    def test_process_records_blocked_reason_counts_for_stopped_and_pattern_mismatch(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="show*"))
+
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        stopped_file = ModelFile("show.s01e01.mkv", False)
+        stopped_file.remote_size = 100
+        missing_pattern = ModelFile("movie.mkv", False)
+        missing_pattern.remote_size = 100
+        extract_miss = ModelFile("archive.zip", False)
+        extract_miss.state = ModelFile.State.DOWNLOADED
+        extract_miss.local_size = 500
+        extract_miss.remote_size = 500
+        extract_miss.is_extractable = True
+
+        self.controller.is_file_stopped.side_effect = lambda file_id: file_id == stopped_file.file_id
+
+        self.model_listener.file_added(stopped_file)
+        self.model_listener.file_added(missing_pattern)
+        self.model_listener.file_added(extract_miss)
+
+        auto_queue.process()
+
+        cycle_call = next(
+            (
+                call for call in self.context.breadcrumb_trace.record.call_args_list
+                if len(call.args) >= 2 and call.args[1] == "auto_queue_cycle"
+            ),
+            None
+        )
+        self.assertIsNotNone(cycle_call)
+        details = cycle_call.args[2]
+        self.assertEqual(
+            {"explicitly_stopped": 1, "pattern_no_match": 1, "state_not_default": 1},
+            details["queue_blocked_reason_counts"]
+        )
+        self.assertEqual({"state_not_downloaded": 2, "pattern_no_match": 1}, details["extract_blocked_reason_counts"])
+        self.assertTrue(any(sample["reason"] == "explicitly_stopped" for sample in details["blocked_samples"]))
+
+    def test_auto_queue_commands_include_flow_id_and_origin(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="show*"))
+
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        file_one = ModelFile("show.s01e01.mkv", False)
+        file_one.remote_size = 100
+
+        self.model_listener.file_added(file_one)
+        auto_queue.process()
+
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual("auto_queue", command.origin)
+        self.assertTrue(command.flow_id.startswith("autoq:1:QUEUE:"))
 
     def test_matching_initial_files_are_queued(self):
         persist = AutoQueuePersist()
