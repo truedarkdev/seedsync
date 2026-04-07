@@ -192,7 +192,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
         self.assertIn("secret", allowed_payload)
         self.assertIn("seedsync_ui_session=", upgraded_cookie)
-        self.assertIn("Max-Age=43200", allowed_cookie)
+        self.assertIn("Max-Age=315360000", allowed_cookie)
         self.assertNotEqual("", upgraded_cookie)
         self.assertNotEqual(limited_cookie, upgraded_cookie)
         self.assertIn("browser_handover", allowed_payload)
@@ -239,14 +239,19 @@ class TestAdminHandler(unittest.TestCase):
         )
         bootstrap_payload = json.loads(bootstrap_response.text)
         admin_cookie = bootstrap_response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        cookie_secret = admin_cookie.split("=", 1)[1]
+        bootstrap_session = empty_store.find_ui_session_by_secret(cookie_secret)
         self.assertEqual(201, bootstrap_response.status_int)
         self.assertEqual(["admin"], bootstrap_payload["key"]["scopes"])
         self.assertIn("secret", bootstrap_payload)
         self.assertIn("browser_handover", bootstrap_payload)
         self.assertFalse(bootstrap_payload["browser_handover"]["open"])
         self.assertIn("seedsync_ui_session=", admin_cookie)
-        self.assertIn("Max-Age=43200", bootstrap_response.headers.get("Set-Cookie", ""))
+        self.assertIn("Max-Age=315360000", bootstrap_response.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", bootstrap_response.headers.get("Set-Cookie", ""))
+        self.assertIsNotNone(bootstrap_session)
+        self.assertTrue(bootstrap_session.remembered)
+        self.assertGreater(bootstrap_session.cookie_max_age_seconds(), 12 * 60 * 60)
         self.assertEqual(1, empty_store.active_admin_key_count)
 
     def test_remember_browser_session_route_issues_cookie_for_existing_api_key(self):
@@ -400,10 +405,18 @@ class TestAdminHandler(unittest.TestCase):
             extra_environ=bootstrap_headers,
         )
         bootstrap_payload = json.loads(bootstrap_response.text)
+        bootstrap_cookie = bootstrap_response.headers.get("Set-Cookie", "").split(";", 1)[0]
+        bootstrap_cookie_secret = bootstrap_cookie.split("=", 1)[1]
+        bootstrap_session = empty_store.find_ui_session_by_secret(bootstrap_cookie_secret)
 
         self.assertEqual(201, bootstrap_response.status_int)
         self.assertEqual(["admin"], bootstrap_payload["key"]["scopes"])
         self.assertIn("secret", bootstrap_payload)
+        self.assertIn("seedsync_ui_session=", bootstrap_cookie)
+        self.assertIn("Max-Age=315360000", bootstrap_response.headers.get("Set-Cookie", ""))
+        self.assertIsNotNone(bootstrap_session)
+        self.assertTrue(bootstrap_session.remembered)
+        self.assertGreater(bootstrap_session.cookie_max_age_seconds(), 12 * 60 * 60)
         self.assertEqual(1, empty_store.active_admin_key_count)
 
     def test_migration_state_reports_non_admin_keys_without_exiting_bootstrap_mode(self):
