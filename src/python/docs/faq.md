@@ -37,6 +37,27 @@ Make sure your remote server address was entered correctly.
 If using password-based login, make sure the password is correct.
 Check the logs for details about the exact failure.
 
+### What is the breadcrumb trace recorder for?
+
+It is an opt-in, low-overhead recorder for the recent lead-up to a failure.
+When enabled, it keeps a short bounded history of structured breadcrumbs so you can debug a stuck or surprising workflow without turning normal logs into debug spam.
+
+### How do I use breadcrumb diagnostics?
+
+Turn it on in `Settings > General` with `Enable breadcrumb trace recorder`, reproduce the problem, then read `GET /server/breadcrumbs/get` for the recent breadcrumb window with an authenticated admin session or an admin-scoped API key.
+If you are polling after an earlier snapshot, use `since_version=<n>` to ask for only newer entries.
+
+### How are breadcrumbs different from normal logs?
+
+Normal logs are for durable operational history and broad troubleshooting.
+Breadcrumbs are for a small recent failure window with high-signal state changes, retries, and transitions.
+Keep long-lived, audit-style messages in normal logs and keep breadcrumbs focused on the lead-up to one problem.
+
+### Are breadcrumb entries sensitive?
+
+They are bounded and designed to redact common sensitive values.
+The recorder is meant to capture useful context, not full command streams, raw payloads, or exhaustive secret scrubbing.
+
 ### I am getting some errors about locale?
 
 On some servers you may see errors in the log like so:

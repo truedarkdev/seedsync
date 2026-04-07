@@ -25,3 +25,21 @@ You can also restrict AutoQueue to pattern-based matches (see this option in the
 When pattern restriction is enabled, the AutoQueue page is where you can add or remove patterns.
 Any files or directories on the remote server that match a pattern will be automatically queued for transfer.
 With path pairs, auto-queue is evaluated per enabled path pair based on that pair's `Auto-queue` setting.
+
+## Breadcrumb Trace
+
+Breadcrumb trace is a low-overhead, opt-in recent-context recorder for hard-to-diagnose failures.
+It keeps a short bounded window of structured breadcrumbs in memory so operators can see the lead-up to a problem without turning on noisy debug logging.
+
+Enable it in `Settings > General` with `Enable breadcrumb trace recorder`.
+
+When you need the recent failure context, read the breadcrumb diagnostics endpoint with an authenticated admin session or an admin-scoped API key:
+
+- `GET /server/breadcrumbs/get`
+- add `since_version=<n>` to read only entries newer than a previous snapshot
+
+Use breadcrumbs for the short sequence of state changes, retries, queue decisions, transfer steps, and extraction transitions around the failure.
+Use normal logs for long-lived operational history and broad troubleshooting context.
+
+Breadcrumb entries are intentionally bounded and designed to redact common sensitive values.
+They are meant to explain what happened right before a failure, not to act as full command or payload logging or exhaustive secret scrubbing.
