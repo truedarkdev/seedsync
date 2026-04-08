@@ -1167,10 +1167,13 @@ class WebApp(bottle.Bottle):
             if self.__is_bootstrap_safe_static_asset_request():
                 return
             current_session = self.__get_ui_session()
-            if current_session is None or not getattr(current_session, "bootstrap", False):
+            if (
+                (current_session is None or not getattr(current_session, "bootstrap", False)) and
+                self.__is_trusted_browser_bootstrap_request()
+            ):
                 bottle.redirect("/bootstrap")
 
-        if self.__get_ui_session() is not None:
+        if self.__get_ui_session() is not None and self.__is_trusted_browser_bootstrap_request():
             return
 
         if self.__is_loopback_remote_addr() and WebApp.__is_loopback_host(WebApp.__request_host()):

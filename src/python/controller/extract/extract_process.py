@@ -196,8 +196,15 @@ class ExtractProcess(AppProcess):
     def run_loop(self):
         # Forward all the extract commands
         try:
+            first_queue_read = True
             while True:
-                queue_item = self.__command_queue.get(block=False)
+                if first_queue_read:
+                    # multiprocessing.Queue can briefly report empty right after a producer put.
+                    # A short first read timeout avoids dropping immediate follow-up dispatch work.
+                    queue_item = self.__command_queue.get(block=True, timeout=0.01)
+                    first_queue_read = False
+                else:
+                    queue_item = self.__command_queue.get(block=False)
                 if isinstance(queue_item, tuple) and len(queue_item) == 2:
                     file, flow_id = queue_item
                 else:
