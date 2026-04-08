@@ -34,9 +34,9 @@ Freshness rule:
 
 | Lane | Status | Best current evidence | Freshness / notes |
 | --- | --- | --- | --- |
-| Python web/auth backend | Healthy | Targeted auth/admin/config/web-app pytest coverage, including bootstrap handover-safe static asset behavior, plus live Docker and Playwright proof for bootstrap, claim, remember, and cookie/session behavior. | Fresh as of 2026-04-06; keep detailed run history in task notes or artifacts. |
-| Python unit/backend | Healthy | Targeted controller unit coverage for path-pair refresh/runtime state rebuild behavior plus breadcrumb trace collector retention/filter, disabled-backlog, reset, and cross-process gate coverage, controller failure-marker, and auto-queue summary coverage. | Fresh as of 2026-04-07. |
-| Python integration/controller | Healthy | Targeted controller and web-handler integration coverage for the breadcrumb retrieval path, including since-version, filtered retrieval, authenticated reset, and config-gate sync, plus the initial model path. | Fresh as of 2026-04-07. |
+| Python web/auth backend | Healthy | Green WSL scripted Python full-suite rerun, including the formerly failing bootstrap trust cases, plus live Docker and Playwright proof for bootstrap, claim, remember, and cookie/session behavior. | Fresh as of 2026-04-08; keep detailed run history in task notes or artifacts. |
+| Python unit/backend | Healthy | Green WSL scripted Python full-suite rerun, including the formerly failing extract-process and breadcrumb/config unit slices. | Fresh as of 2026-04-08. |
+| Python integration/controller | Healthy | Green WSL scripted Python full-suite rerun, including controller and web-handler integration coverage. | Fresh as of 2026-04-08. |
 | WSL backend stop-state integration | Healthy | Targeted WSL/Linux stop-state slice for the backend contract. | Fresh as of 2026-03-30. |
 | Host Angular/Karma full-suite proof | Healthy for host comparison only | Node 24 host Angular/Karma suite completes successfully. | Comparison evidence only; not the supported closure lane. Fresh as of 2026-04-01. |
 | Dockerized Angular build/test | Healthy | Dockerized Angular verifier path passes after the current frontend compatibility updates. | Supported frontend closure lane. Fresh as of 2026-04-01. |

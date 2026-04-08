@@ -102,6 +102,41 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1, snapshot["entry_count"])
         self.assertEqual("initial", snapshot["entries"][0]["details"]["phase"])
 
+    def test_snapshot_waits_for_delayed_first_external_record(self):
+        class DelayedRecordQueue:
+            def __init__(self, record):
+                self.__record = record
+
+            def get(self, timeout=None):
+                if timeout is None:
+                    raise queue.Empty()
+                if self.__record is None:
+                    raise queue.Empty()
+                record = self.__record
+                self.__record = None
+                return record
+
+            def get_nowait(self):
+                raise queue.Empty()
+
+            def empty(self):
+                return self.__record is None
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        collector._BreadcrumbTraceCollector__external_records = DelayedRecordQueue({
+            "source": "controller",
+            "message": "start",
+            "details": {"phase": "delayed"},
+            "metadata": {"stage": "controller", "corr_id": "flow-1"},
+            "created_ns": 10,
+            "created_ms": 0,
+        })
+
+        snapshot = collector.snapshot()
+        self.assertEqual(1, snapshot["external_queue_drain_count"])
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("delayed", snapshot["entries"][0]["details"]["phase"])
+
     def test_record_redacts_risky_strings_inside_generic_detail_values(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 

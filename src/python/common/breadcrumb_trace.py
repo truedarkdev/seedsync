@@ -63,6 +63,7 @@ class BreadcrumbTraceCollector:
     __MAX_DETAIL_STRING_LENGTH = 256
     __MAX_COLLECTION_DEPTH = 3
     __MAX_LIST_ITEMS = 16
+    __EXTERNAL_QUEUE_FIRST_RECORD_WAIT_SECONDS = 0.02
     __SENSITIVE_KEYWORDS = (
         "password",
         "passwd",
@@ -305,7 +306,10 @@ class BreadcrumbTraceCollector:
             "order": order,
         }
 
-        self.__drain_external_records(limit=self.__max_entries)
+        self.__drain_external_records(
+            limit=self.__max_entries,
+            wait_for_first_record=True,
+        )
         with self.__lock:
             enabled = self.is_enabled()
             all_entries = list(self.__entries)
@@ -573,7 +577,7 @@ class BreadcrumbTraceCollector:
             sanitized = pattern.sub(replacement, sanitized)
         return sanitized
 
-    def __drain_external_records(self, limit: Optional[int] = None):
+    def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False):
         if self.__external_records is None:
             self.__external_queue_last_drain_count = 0
             self.__external_queue_last_drain_limit = limit if limit is not None else self.__max_entries
@@ -584,7 +588,12 @@ class BreadcrumbTraceCollector:
         drain_limit = limit if limit is not None else self.__max_entries
         while limit is None or drained_count < limit:
             try:
-                external_record = self.__external_records.get_nowait()
+                if wait_for_first_record and drained_count == 0:
+                    external_record = self.__get_external_record(
+                        wait_timeout=BreadcrumbTraceCollector.__EXTERNAL_QUEUE_FIRST_RECORD_WAIT_SECONDS
+                    )
+                else:
+                    external_record = self.__get_external_record(wait_timeout=None)
             except queue.Empty:
                 break
             drained_count += 1
@@ -612,3 +621,10 @@ class BreadcrumbTraceCollector:
         self.__external_queue_last_drain_count = drained_count
         self.__external_queue_last_drain_limit = drain_limit
         self.__external_queue_drain_limited = drain_limited
+
+    def __get_external_record(self, wait_timeout: Optional[float]):
+        if wait_timeout is not None:
+            get_method = getattr(self.__external_records, "get", None)
+            if callable(get_method):
+                return get_method(timeout=wait_timeout)
+        return self.__external_records.get_nowait()
