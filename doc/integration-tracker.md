@@ -56,6 +56,18 @@ Refresh rule:
   - The CI/dependency cluster was treated as Angular-19-specific policy noise against the legacy Angular 4 baseline, with `cea63a27b502869241d704aabe266e18200d167c` split to a separate legacy dependency-audit task.
   - The Angular migration trio landed as `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `intentionally skipped`, `db497146b623aaa860d641c24b78e18919215242` `needs new integration task`, and `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `needs subject reopen`; the migration-tail commits `c6318bc50b88ab1ffa978852193d61be321cc42a`, `ab74f8c53d9daf1e765315808bf995a6ea01974a`, `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1`, and `36c13b3f0acf5b9f0df738cd9964a44f31885771` closed the frozen range, and the `c6318bc50b88ab1ffa978852193d61be321cc42a` follow-up is now integrated locally via the Subject 21 note.
 
+## thejuran-arr
+- Source branch: `thejuran-arr/main`
+- Last fully processed upstream commit: `unreviewed`
+- Fork tip at last full review: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`
+- Last full review date: `pending`
+- Status: refresh needed
+- Integrated so far: none yet; this is the renamed `thejuran/seedsyncarr` history and it starts as a separate line, not as a continuation of the old `thejuran/seedsync` checkpoint.
+- Resume when new upstream appears: fetch `thejuran-arr`, then review the history strictly oldest-to-newest from the first commit in this lane.
+- Notes:
+  - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
+  - Local remote HEAD observed for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
+
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
 
