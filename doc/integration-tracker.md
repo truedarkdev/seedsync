@@ -44,10 +44,11 @@ Refresh rule:
 - Last fully processed upstream commit: `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`
 - Fork tip at last full review: `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`
 - Last full review date: `2026-03-29`
-- Status: caught up through this tip
+- Status: closing lane; final legacy commit sweep remaining before removal
 - Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work through `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, including the host-header guard, the requests lock refresh, the AutoQueue-to-Settings merge, and the `remote_scanner` quoting hardening. Broader auth/CSP/token-flow, dashboard restyle, Playwright/QEMU timing, and planning/release docs remained intentionally out of this refresh so the default SeedSync behavior stays conservative and recognizable.
-- Resume when new upstream appears: fetch `thejuran/master`, compare against `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, and review only commits newer than that tip in strict oldest-to-newest order from the next frozen refresh ledger.
+- Resume when new upstream appears: fetch `thejuran/master`, review the remaining legacy commits in strict oldest-to-newest order, then remove this lane once that final sweep is complete.
 - Notes:
+  - This is now a closing legacy lane. `thejuran-arr` is the ongoing successor source, and `thejuran` should be removed from this tracker after the final old-fork commit sweep is fully processed.
   - This refresh has been folded back into the main tracker; the temporary frozen ledger is retired.
   - Deferred from this refresh: the broader auth/CSP/token bundle, dashboard visual restyles, Playwright/QEMU E2E timing churn, and release/planning bookkeeping.
   - Doc/planning artifacts were intentionally skipped, including the six doc-only commits from `00a0c86214261ad58592eb6978b71a948ae91e47` through `fa96fdf303b99919f10698511f12a3801d9f2cfe` and later phase-opening / completion docs.
