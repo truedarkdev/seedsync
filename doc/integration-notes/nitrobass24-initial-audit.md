@@ -110,7 +110,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 91 | `3154172f7eb38b12b8e597766ce5602baa27e5ab` | 2026-01-25 | Fix Docker image build - complete multi-stage Dockerfile | covered elsewhere |
 | 92 | `0b4a6c249a2ad04700f7dd3cec0189f73dad48b9` | 2026-01-25 | Docker-only deployment with optimized image (240MB) | needs area reopen |
 | 93 | `541b63093adaa7fbd214b2bc864238257b423061` | 2026-01-25 | Update CI/CD and documentation for Docker-only deployment | needs area reopen |
-| 94 | `18643263e6e48e520058f6f2251e0fdfbccc69d5` | 2026-01-25 | Fix Python 3.12 regex escape sequence warnings | needs integration |
+| 94 | `18643263e6e48e520058f6f2251e0fdfbccc69d5` | 2026-01-25 | Fix Python 3.12 regex escape sequence warnings | adapted locally in `1d30a9ec7c85a80801f8a04d2e56a6e3db269f95` |
 | 95 | `0e0a7d159f470faa970ff566fdb8bca46807ac95` | 2026-01-25 | Fix release workflow to mark new releases as latest | needs integration |
 | 96 | `e310c0582a98645ca4c2bb566a9c0b691a8232be` | 2026-01-25 | Update CHANGELOG for v0.9.2 [skip ci] | intentionally skipped |
 | 97 | `420deefd657e0890f0e450d16d0982997d69798f` | 2026-01-25 | Update dependencies to address security vulnerabilities | covered elsewhere |

@@ -97,7 +97,7 @@ Refresh rule:
 - Last dispositioned fork-unique row: `127` (`0b1619f9aa3e29190e833a6777dd44f02088338c`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Integrated so far: audit chunk `88-127` is fully dispositioned; no local code imports yet.
+- Integrated so far: audit chunk `88-127` is fully dispositioned; row `94` is locally adapted in `1d30a9ec7c85a80801f8a04d2e56a6e3db269f95`.
 - Resume when new upstream appears: run `git fetch --no-tags nitrobass24 --prune`, verify the branch tip, then continue from row `128` in exact 40-row contiguous chunks, oldest-to-newest; rows `1-87` are baseline accounting rows, rows `88-127` are already dispositioned, and do not start the next chunk until every row in the current chunk has a disposition.
 - Notes:
   - This repo is not GitHub-marked as a fork, but it is SeedSync-derived.
@@ -105,7 +105,7 @@ Refresh rule:
   - `38d6ef22d36b6a75c164bc754bac9cd2842e8722` is the frozen tip only, not a processed checkpoint.
   - The common base with local `origin/master` is `ff2a1039935beccbbf7ec76134b41d2e91137742`; rows `1-87` are baseline accounting rows and rows `88-956` are the fork-unique audit workload.
   - Treat this as a selective source because it is modernization-heavy.
-  - Chunk `88-127` is complete: 5 `needs integration` rows (`88`, `94`, `95`, `100`, `102`), 3 `needs area reopen` rows (`92`, `93`, `122`), 1 `maintainer decision needed` row (`105`), 20 `intentionally skipped`, and 11 `covered elsewhere`; next chunk is `128-167` and is not started yet.
+  - Chunk `88-127` is complete: row `94` is locally adapted, 4 `needs integration` rows remain (`88`, `95`, `100`, `102`), 3 `needs area reopen` rows (`92`, `93`, `122`), 1 `maintainer decision needed` row (`105`), 20 `intentionally skipped`, and 11 `covered elsewhere`; next chunk is `128-167` and is not started yet.
 
 ## Reference Notes
 - Subject 21 user-facing conflict review: [doc/integration-notes/S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
