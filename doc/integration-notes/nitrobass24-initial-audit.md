@@ -104,46 +104,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 85 | `cc5d04a5b9e1c9a67ca99e9d7d2afe96b2ec9a04` | 2020-12-30 | Changelist for Release v0.8.5 | baseline / already in origin |
 | 86 | `747cb82080db7381936a0981849735c5bbdfa835` | 2020-12-30 | Fixes broken rar extraction. | baseline / already in origin |
 | 87 | `ff2a1039935beccbbf7ec76134b41d2e91137742` | 2020-12-30 | Changelist for Release v0.8.6 | baseline / already in origin |
-| 88 | `ec38aaf6e6ca0ab2479fcd003d15679007101021` | 2024-11-29 | Create entrypoint.sh | pending |
-| 89 | `9ea6d980594eaabb8eabe95b768ac631ede674c8` | 2024-11-29 | Update Dockerfile | pending |
-| 90 | `009eade5876cb8f522259c863b16b2789631233e` | 2024-11-29 | Create docker-image.yml | pending |
-| 91 | `3154172f7eb38b12b8e597766ce5602baa27e5ab` | 2026-01-25 | Fix Docker image build - complete multi-stage Dockerfile | pending |
-| 92 | `0b4a6c249a2ad04700f7dd3cec0189f73dad48b9` | 2026-01-25 | Docker-only deployment with optimized image (240MB) | pending |
-| 93 | `541b63093adaa7fbd214b2bc864238257b423061` | 2026-01-25 | Update CI/CD and documentation for Docker-only deployment | pending |
-| 94 | `18643263e6e48e520058f6f2251e0fdfbccc69d5` | 2026-01-25 | Fix Python 3.12 regex escape sequence warnings | pending |
-| 95 | `0e0a7d159f470faa970ff566fdb8bca46807ac95` | 2026-01-25 | Fix release workflow to mark new releases as latest | pending |
-| 96 | `e310c0582a98645ca4c2bb566a9c0b691a8232be` | 2026-01-25 | Update CHANGELOG for v0.9.2 [skip ci] | pending |
-| 97 | `420deefd657e0890f0e450d16d0982997d69798f` | 2026-01-25 | Update dependencies to address security vulnerabilities | pending |
-| 98 | `01d12edb29397a9799bea906e015671d82259e3c` | 2026-01-25 | Remove poetry.lock - using requirements.txt instead [skip ci] | pending |
-| 99 | `b7d197d6ec332ecd29ecc3d4f7703de14c85a0c1` | 2026-01-25 | Update CHANGELOG for v0.9.3 | pending |
-| 100 | `122d4888084933a1e09410681c84e8176aeb0448` | 2026-01-26 | Fix Docker entrypoint UID/GID handling for Synology and shared groups | pending |
-| 101 | `3bef8dbd1d26f36e9967633fa7230341bc36b55d` | 2026-01-26 | Merge pull request #6 from nitrobass24/fix/issue-4 | pending |
-| 102 | `9bb477a43e6ffff9a06a0bef34a21fbee7ba92dc` | 2026-01-26 | Fix scanfs glibc compatibility for older seedbox servers | pending |
-| 103 | `26e6113df8a135a2b003826931c5e74ae2074170` | 2026-01-26 | Merge pull request #7 from nitrobass24/fix/issue-5 | pending |
-| 104 | `151fef6b4e27893966827a373aee9101551b0e5b` | 2026-01-26 | Update modernization plan with Angular 17 and v0.9.4 fixes | pending |
-| 105 | `7fbcda45defc0ebeadb1fadb771081238f570472` | 2026-01-26 | Update GitHub repository references from ipsingh06 to nitrobass24 | pending |
-| 106 | `4e96f8ff497d8d03b7a36f87c273309ac71c73df` | 2026-01-26 | Remove Deb package references - Docker-only deployment | pending |
-| 107 | `c247e71cfb67a5b319712010f658e3d866fcc387` | 2026-01-26 | Add docs site under website | pending |
-| 108 | `785318bcb1e8afe28e8c852fc4ebe75311df547f` | 2026-01-26 | Add docs lockfile | pending |
-| 109 | `1c6077c21f7e5e8fc9951555b3ba3c936167190a` | 2026-01-26 | Merge pull request #8 from nitrobass24/docs-website | pending |
-| 110 | `70746b441a8f9551fbcf5a5a96b7be37eba3f8a1` | 2026-01-26 | Add documentation website link to README | pending |
-| 111 | `0bc4613cf61d8d69815809dffcf6c51fdaecd850` | 2026-01-26 | Remove legacy mkdocs documentation | pending |
-| 112 | `366bf9c28eb5f7bcbe3bb33422bdeca0e0b78cd0` | 2026-01-26 | Fix footer background styling issue | pending |
-| 113 | `ebb0c5c9b33bdd54fe8a4fef8c5b0ee97c2f6244` | 2026-01-26 | Fix Edit this page background to blend with page | pending |
-| 114 | `545b89a3e610c25acb20a7600e0dd2930fc2c0d1` | 2026-01-26 | Add downloads badge to README | pending |
-| 115 | `28b0a2b1b8cd78c50b77cddc2522d1d8b1dc99a4` | 2026-01-26 | Add GHCR image size badge to README | pending |
-| 116 | `00a75d193012d896a0b655cfa81df8cbbbd95891` | 2026-01-26 | Add GHCR Docker pulls badge to README | pending |
-| 117 | `96aabb63a3c52cab9d60bb9573675621cac66371` | 2026-01-26 | Disable Docker attestations to remove unknown arch entries | pending |
-| 118 | `b3392197fbc6859962ee992108d7f6898717779c` | 2026-01-26 | Update MODERNIZATION_PLAN.md | pending |
-| 119 | `5f203bedcfcc9c7424592fc0c0a7740ddd726f7b` | 2026-01-26 | Update Dockerfile | pending |
-| 120 | `037709a08976c609ba87ca4c7e63ec0bb9a202ef` | 2026-01-26 | Update Dockerfile | pending |
-| 121 | `c2cebd403176852ce1670a8f5a5c016903ac9fb3` | 2026-01-26 | Merge pull request #11 from nitrobass24/nitrobass24-patch-1 | pending |
-| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | pending |
-| 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | pending |
-| 124 | `b39d67b67fd6f0889a2fb852e6aef9ff57dd3a93` | 2026-01-26 | Switch scanfs builder to Debian Bullseye | pending |
-| 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | pending |
-| 126 | `0508a7a841b7b0a777e97fddb673cd1b114a3a7c` | 2026-01-26 | Update CHANGELOG and MODERNIZATION_PLAN for v0.10.0 | pending |
-| 127 | `0b1619f9aa3e29190e833a6777dd44f02088338c` | 2026-01-26 | Add CLAUDE.md with project instructions and release process | pending |
+| 88 | `ec38aaf6e6ca0ab2479fcd003d15679007101021` | 2024-11-29 | Create entrypoint.sh | needs integration |
+| 89 | `9ea6d980594eaabb8eabe95b768ac631ede674c8` | 2024-11-29 | Update Dockerfile | covered elsewhere |
+| 90 | `009eade5876cb8f522259c863b16b2789631233e` | 2024-11-29 | Create docker-image.yml | covered elsewhere |
+| 91 | `3154172f7eb38b12b8e597766ce5602baa27e5ab` | 2026-01-25 | Fix Docker image build - complete multi-stage Dockerfile | covered elsewhere |
+| 92 | `0b4a6c249a2ad04700f7dd3cec0189f73dad48b9` | 2026-01-25 | Docker-only deployment with optimized image (240MB) | needs area reopen |
+| 93 | `541b63093adaa7fbd214b2bc864238257b423061` | 2026-01-25 | Update CI/CD and documentation for Docker-only deployment | needs area reopen |
+| 94 | `18643263e6e48e520058f6f2251e0fdfbccc69d5` | 2026-01-25 | Fix Python 3.12 regex escape sequence warnings | needs integration |
+| 95 | `0e0a7d159f470faa970ff566fdb8bca46807ac95` | 2026-01-25 | Fix release workflow to mark new releases as latest | needs integration |
+| 96 | `e310c0582a98645ca4c2bb566a9c0b691a8232be` | 2026-01-25 | Update CHANGELOG for v0.9.2 [skip ci] | intentionally skipped |
+| 97 | `420deefd657e0890f0e450d16d0982997d69798f` | 2026-01-25 | Update dependencies to address security vulnerabilities | covered elsewhere |
+| 98 | `01d12edb29397a9799bea906e015671d82259e3c` | 2026-01-25 | Remove poetry.lock - using requirements.txt instead [skip ci] | intentionally skipped |
+| 99 | `b7d197d6ec332ecd29ecc3d4f7703de14c85a0c1` | 2026-01-25 | Update CHANGELOG for v0.9.3 | intentionally skipped |
+| 100 | `122d4888084933a1e09410681c84e8176aeb0448` | 2026-01-26 | Fix Docker entrypoint UID/GID handling for Synology and shared groups | needs integration |
+| 101 | `3bef8dbd1d26f36e9967633fa7230341bc36b55d` | 2026-01-26 | Merge pull request #6 from nitrobass24/fix/issue-4 | covered elsewhere |
+| 102 | `9bb477a43e6ffff9a06a0bef34a21fbee7ba92dc` | 2026-01-26 | Fix scanfs glibc compatibility for older seedbox servers | needs integration |
+| 103 | `26e6113df8a135a2b003826931c5e74ae2074170` | 2026-01-26 | Merge pull request #7 from nitrobass24/fix/issue-5 | covered elsewhere |
+| 104 | `151fef6b4e27893966827a373aee9101551b0e5b` | 2026-01-26 | Update modernization plan with Angular 17 and v0.9.4 fixes | intentionally skipped |
+| 105 | `7fbcda45defc0ebeadb1fadb771081238f570472` | 2026-01-26 | Update GitHub repository references from ipsingh06 to nitrobass24 | maintainer decision needed |
+| 106 | `4e96f8ff497d8d03b7a36f87c273309ac71c73df` | 2026-01-26 | Remove Deb package references - Docker-only deployment | intentionally skipped |
+| 107 | `c247e71cfb67a5b319712010f658e3d866fcc387` | 2026-01-26 | Add docs site under website | intentionally skipped |
+| 108 | `785318bcb1e8afe28e8c852fc4ebe75311df547f` | 2026-01-26 | Add docs lockfile | intentionally skipped |
+| 109 | `1c6077c21f7e5e8fc9951555b3ba3c936167190a` | 2026-01-26 | Merge pull request #8 from nitrobass24/docs-website | covered elsewhere |
+| 110 | `70746b441a8f9551fbcf5a5a96b7be37eba3f8a1` | 2026-01-26 | Add documentation website link to README | intentionally skipped |
+| 111 | `0bc4613cf61d8d69815809dffcf6c51fdaecd850` | 2026-01-26 | Remove legacy mkdocs documentation | intentionally skipped |
+| 112 | `366bf9c28eb5f7bcbe3bb33422bdeca0e0b78cd0` | 2026-01-26 | Fix footer background styling issue | intentionally skipped |
+| 113 | `ebb0c5c9b33bdd54fe8a4fef8c5b0ee97c2f6244` | 2026-01-26 | Fix Edit this page background to blend with page | intentionally skipped |
+| 114 | `545b89a3e610c25acb20a7600e0dd2930fc2c0d1` | 2026-01-26 | Add downloads badge to README | intentionally skipped |
+| 115 | `28b0a2b1b8cd78c50b77cddc2522d1d8b1dc99a4` | 2026-01-26 | Add GHCR image size badge to README | intentionally skipped |
+| 116 | `00a75d193012d896a0b655cfa81df8cbbbd95891` | 2026-01-26 | Add GHCR Docker pulls badge to README | intentionally skipped |
+| 117 | `96aabb63a3c52cab9d60bb9573675621cac66371` | 2026-01-26 | Disable Docker attestations to remove unknown arch entries | intentionally skipped |
+| 118 | `b3392197fbc6859962ee992108d7f6898717779c` | 2026-01-26 | Update MODERNIZATION_PLAN.md | intentionally skipped |
+| 119 | `5f203bedcfcc9c7424592fc0c0a7740ddd726f7b` | 2026-01-26 | Update Dockerfile | covered elsewhere |
+| 120 | `037709a08976c609ba87ca4c7e63ec0bb9a202ef` | 2026-01-26 | Update Dockerfile | intentionally skipped |
+| 121 | `c2cebd403176852ce1670a8f5a5c016903ac9fb3` | 2026-01-26 | Merge pull request #11 from nitrobass24/nitrobass24-patch-1 | covered elsewhere |
+| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | needs area reopen |
+| 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | covered elsewhere |
+| 124 | `b39d67b67fd6f0889a2fb852e6aef9ff57dd3a93` | 2026-01-26 | Switch scanfs builder to Debian Bullseye | intentionally skipped |
+| 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | covered elsewhere |
+| 126 | `0508a7a841b7b0a777e97fddb673cd1b114a3a7c` | 2026-01-26 | Update CHANGELOG and MODERNIZATION_PLAN for v0.10.0 | intentionally skipped |
+| 127 | `0b1619f9aa3e29190e833a6777dd44f02088338c` | 2026-01-26 | Add CLAUDE.md with project instructions and release process | intentionally skipped |
 | 128 | `43c35ae37a3027516bba76e592dcd14e8b6acbdd` | 2026-01-26 | Rollback Angular 17 to Angular 4 (v0.10.1) | pending |
 | 129 | `e6d32c4e5629ac22fd83ca16ce4d6375ed43660a` | 2026-01-26 | Fix scanfs binary architecture for ARM local machines | pending |
 | 130 | `b7b45d3772576f444c5e5a85db9c426ade39fbb0` | 2026-01-27 | Fix restart button, settings persistence, and update About page | pending |
