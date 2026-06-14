@@ -118,7 +118,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 99 | `b7d197d6ec332ecd29ecc3d4f7703de14c85a0c1` | 2026-01-25 | Update CHANGELOG for v0.9.3 | intentionally skipped |
 | 100 | `122d4888084933a1e09410681c84e8176aeb0448` | 2026-01-26 | Fix Docker entrypoint UID/GID handling for Synology and shared groups | needs integration |
 | 101 | `3bef8dbd1d26f36e9967633fa7230341bc36b55d` | 2026-01-26 | Merge pull request #6 from nitrobass24/fix/issue-4 | covered elsewhere |
-| 102 | `9bb477a43e6ffff9a06a0bef34a21fbee7ba92dc` | 2026-01-26 | Fix scanfs glibc compatibility for older seedbox servers | needs integration |
+| 102 | `9bb477a43e6ffff9a06a0bef34a21fbee7ba92dc` | 2026-01-26 | Fix scanfs glibc compatibility for older seedbox servers | adapted locally in `c5d042018043cc274603e075b166bfa6b519b354` |
 | 103 | `26e6113df8a135a2b003826931c5e74ae2074170` | 2026-01-26 | Merge pull request #7 from nitrobass24/fix/issue-5 | covered elsewhere |
 | 104 | `151fef6b4e27893966827a373aee9101551b0e5b` | 2026-01-26 | Update modernization plan with Angular 17 and v0.9.4 fixes | intentionally skipped |
 | 105 | `7fbcda45defc0ebeadb1fadb771081238f570472` | 2026-01-26 | Update GitHub repository references from ipsingh06 to nitrobass24 | maintainer decision needed |
@@ -139,7 +139,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 120 | `037709a08976c609ba87ca4c7e63ec0bb9a202ef` | 2026-01-26 | Update Dockerfile | intentionally skipped |
 | 121 | `c2cebd403176852ce1670a8f5a5c016903ac9fb3` | 2026-01-26 | Merge pull request #11 from nitrobass24/nitrobass24-patch-1 | covered elsewhere |
 | 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | needs area reopen |
-| 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | covered elsewhere |
+| 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | adapted locally in `c5d042018043cc274603e075b166bfa6b519b354` |
 | 124 | `b39d67b67fd6f0889a2fb852e6aef9ff57dd3a93` | 2026-01-26 | Switch scanfs builder to Debian Bullseye | intentionally skipped |
 | 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | covered elsewhere |
 | 126 | `0508a7a841b7b0a777e97fddb673cd1b114a3a7c` | 2026-01-26 | Update CHANGELOG and MODERNIZATION_PLAN for v0.10.0 | intentionally skipped |
