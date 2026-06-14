@@ -1,6 +1,15 @@
 # Creates environment to build python binaries
-FROM python:3.12-slim-bullseye AS seedsync_build_pyinstaller_env
-RUN apt-get update && apt-get install -y \
+FROM python:3.11-slim-buster AS seedsync_build_pyinstaller_env
+RUN set -eux; \
+    printf '%s\n' \
+        'deb http://archive.debian.org/debian buster main' \
+        'deb http://archive.debian.org/debian-security buster/updates main' \
+        > /etc/apt/sources.list; \
+    rm -f /etc/apt/sources.list.d/debian.sources; \
+    printf '%s\n' \
+        'Acquire::Check-Valid-Until "false";' \
+        > /etc/apt/apt.conf.d/99archive-no-check-valid-until; \
+    apt-get update && apt-get install -y \
     binutils \
     build-essential \
     curl \
