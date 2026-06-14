@@ -121,9 +121,11 @@ RUN chmod -R a+rX /app/python
 # Full Seedsync docker image
 FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY --from=seedsync_build_scanfs /build/dist/scanfs /app/scanfs
 COPY src/docker/build/docker-image/setup_default_config.sh /scripts/
+COPY src/docker/build/docker-image/entrypoint.sh /scripts/
 
 # Accept new host keys on first connection while still rejecting changed keys.
 RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking accept-new" > /root/.ssh/config
@@ -131,7 +133,7 @@ RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking accept-new" > /root/.ssh/
 # SSH as any user fix
 # https://stackoverflow.com/a/57531352
 COPY src/docker/build/docker-image/run_as_user /usr/local/bin/
-RUN sed -i 's/\r$//' /scripts/setup_default_config.sh /usr/local/bin/run_as_user
+RUN sed -i 's/\r$//' /scripts/setup_default_config.sh /scripts/entrypoint.sh /usr/local/bin/run_as_user
 RUN chmod 755 /usr/local/bin/run_as_user
 COPY src/docker/build/docker-image/ssh /usr/local/sbin
 RUN sed -i 's/\r$//' /usr/local/sbin/ssh
@@ -140,6 +142,7 @@ COPY src/docker/build/docker-image/scp /usr/local/sbin
 RUN sed -i 's/\r$//' /usr/local/sbin/scp
 RUN chmod 755 /usr/local/sbin/scp
 RUN chmod 755 /scripts/setup_default_config.sh
+RUN chmod 755 /scripts/entrypoint.sh
 
 
 # Create non-root user and directories under that user
@@ -162,6 +165,12 @@ USER seedsync
 
 # First time config setup and replacement
 RUN /scripts/setup_default_config.sh
+
+# Switch back to root so the runtime entrypoint can validate IDs, fix ownership,
+# and drop privileges with gosu before launching the app.
+USER root
+
+ENTRYPOINT [ "/scripts/entrypoint.sh" ]
 
 # Must run app inside shell
 # Otherwise the container crashes as soon as a child process exits
