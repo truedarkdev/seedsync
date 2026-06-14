@@ -8,6 +8,7 @@ src/python/site
 htmlcov/
 .coverage
 AGENTS.md
+.mcp-tasklist/
 
 # SSH private keys
 id_rsa
