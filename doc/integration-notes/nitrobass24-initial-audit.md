@@ -104,7 +104,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 85 | `cc5d04a5b9e1c9a67ca99e9d7d2afe96b2ec9a04` | 2020-12-30 | Changelist for Release v0.8.5 | baseline / already in origin |
 | 86 | `747cb82080db7381936a0981849735c5bbdfa835` | 2020-12-30 | Fixes broken rar extraction. | baseline / already in origin |
 | 87 | `ff2a1039935beccbbf7ec76134b41d2e91137742` | 2020-12-30 | Changelist for Release v0.8.6 | baseline / already in origin |
-| 88 | `ec38aaf6e6ca0ab2479fcd003d15679007101021` | 2024-11-29 | Create entrypoint.sh | needs integration |
+| 88 | `ec38aaf6e6ca0ab2479fcd003d15679007101021` | 2024-11-29 | Create entrypoint.sh | adapted locally in `89362f026db73c655d4a286c57c5abbe860c8fcb` |
 | 89 | `9ea6d980594eaabb8eabe95b768ac631ede674c8` | 2024-11-29 | Update Dockerfile | covered elsewhere |
 | 90 | `009eade5876cb8f522259c863b16b2789631233e` | 2024-11-29 | Create docker-image.yml | covered elsewhere |
 | 91 | `3154172f7eb38b12b8e597766ce5602baa27e5ab` | 2026-01-25 | Fix Docker image build - complete multi-stage Dockerfile | covered elsewhere |
@@ -116,7 +116,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 97 | `420deefd657e0890f0e450d16d0982997d69798f` | 2026-01-25 | Update dependencies to address security vulnerabilities | covered elsewhere |
 | 98 | `01d12edb29397a9799bea906e015671d82259e3c` | 2026-01-25 | Remove poetry.lock - using requirements.txt instead [skip ci] | intentionally skipped |
 | 99 | `b7d197d6ec332ecd29ecc3d4f7703de14c85a0c1` | 2026-01-25 | Update CHANGELOG for v0.9.3 | intentionally skipped |
-| 100 | `122d4888084933a1e09410681c84e8176aeb0448` | 2026-01-26 | Fix Docker entrypoint UID/GID handling for Synology and shared groups | needs integration |
+| 100 | `122d4888084933a1e09410681c84e8176aeb0448` | 2026-01-26 | Fix Docker entrypoint UID/GID handling for Synology and shared groups | adapted locally in `89362f026db73c655d4a286c57c5abbe860c8fcb` |
 | 101 | `3bef8dbd1d26f36e9967633fa7230341bc36b55d` | 2026-01-26 | Merge pull request #6 from nitrobass24/fix/issue-4 | covered elsewhere |
 | 102 | `9bb477a43e6ffff9a06a0bef34a21fbee7ba92dc` | 2026-01-26 | Fix scanfs glibc compatibility for older seedbox servers | adapted locally in `c5d042018043cc274603e075b166bfa6b519b354` |
 | 103 | `26e6113df8a135a2b003826931c5e74ae2074170` | 2026-01-26 | Merge pull request #7 from nitrobass24/fix/issue-5 | covered elsewhere |
