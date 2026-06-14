@@ -88,6 +88,23 @@ Refresh rule:
   - Adapted rapidcopy commit `674992ac09857dc6fa8ca9642bd6a50597e2bb29` as a local `.select-all` header-checkbox alignment fix; did not take its Python `WebApp.stop()` hunk because local code already uses a consistent private stop flag implementation.
   - `thejuran` now has a new active frozen refresh ledger beyond its prior processed checkpoint.
 
+## nitrobass24
+- Source branch: `nitrobass24/develop`
+- Full manifest rows: `956 total reachable commits`
+- Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
+- Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
+- Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
+- Last dispositioned fork-unique row: `none yet`
+- Status: initial fork-unique audit pending
+- Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
+- Resume when new upstream appears: run `git fetch --no-tags nitrobass24 --prune`, verify the branch tip, then process manifest rows `88-956` in exact 40-row contiguous chunks, oldest-to-newest; rows `1-87` are baseline accounting rows, not integration workload, and do not start the next chunk until every row in the current chunk has a disposition.
+- Notes:
+  - This repo is not GitHub-marked as a fork, but it is SeedSync-derived.
+  - `remote.nitrobass24.tagOpt=--no-tags`; branch refs anchor this lane, and the pre-existing local `refs/tags/v1.0.0` is intentionally ignored.
+  - `38d6ef22d36b6a75c164bc754bac9cd2842e8722` is the frozen tip only, not a processed checkpoint.
+  - The common base with local `origin/master` is `ff2a1039935beccbbf7ec76134b41d2e91137742`; rows `1-87` are baseline accounting rows and rows `88-956` are the fork-unique audit workload.
+  - Treat this as a selective source because it is modernization-heavy.
+
 ## Reference Notes
 - Subject 21 user-facing conflict review: [doc/integration-notes/S21-user-facing-conflicts.md](/mnt/c/Git/seedsync/doc/integration-notes/S21-user-facing-conflicts.md)
   - The confirm-modal replacement and hardening follow-up from `c6318bc50b88ab1ffa978852193d61be321cc42a` is integrated locally.
