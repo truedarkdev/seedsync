@@ -291,5 +291,6 @@ jobs:
           else
             gh release create "${GITHUB_REF_NAME}" "${DEB_PATH}#${DEB_NAME}" \
               --title "Release ${GITHUB_REF}" \
-              --notes-file "${release_notes_file}"
+              --notes-file "${release_notes_file}" \
+              --latest
           fi
