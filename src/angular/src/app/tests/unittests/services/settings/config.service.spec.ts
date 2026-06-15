@@ -122,6 +122,7 @@ describe("Testing config service", () => {
                 expect(config.web.port).toBe(8800);
                 expect(config.autoqueue.enabled).toBe(true);
                 expect(config.autoqueue.patterns_only).toBe(false);
+                expect(config.autoqueue.auto_delete_remote).toBe(false);
             }
         });
 
