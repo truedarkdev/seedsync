@@ -158,7 +158,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 139 | `cac415e05d7a60c9568a980a0f5dd40189f11c17` | 2026-01-27 | Add CI workflow for develop branch | intentionally skipped |
 | 140 | `f1359e90029a1cce0c0379924d47399f7a645d83` | 2026-01-27 | Strip ANSI escape codes from LFTP output before parsing | covered elsewhere |
 | 141 | `59db35c230ec4422c7b76411e11052470399f931` | 2026-02-02 | Improve error messaging for remote shell not found | adapted locally in `ff1499f4b41f9b6abb61d5fc446992aebcdd554e` |
-| 142 | `054fb83fc855b7feba7b3104550fd7dc3b775d67` | 2026-02-07 | Release v0.10.5 - Fix tilde delete, shell detection, optional password, bandwidth limit | needs integration; remote-path/tilde-delete subfeature adapted in `edbdeac2ff7bb034fdd25700beef9523bf75816a`; shell-detection/scanner-install subfeature adapted in `ff1499f4b41f9b6abb61d5fc446992aebcdd554e` |
+| 142 | `054fb83fc855b7feba7b3104550fd7dc3b775d67` | 2026-02-07 | Release v0.10.5 - Fix tilde delete, shell detection, optional password, bandwidth limit | adapted locally across `edbdeac2ff7bb034fdd25700beef9523bf75816a`, `ff1499f4b41f9b6abb61d5fc446992aebcdd554e`, and `9f57de252b156587da48913e29809cf3c04724a3` |
 | 143 | `7af489e78c1fba931bb8eef950da89c34d25edfe` | 2026-02-07 | Release v0.10.6 - Auto-delete from remote after download (#25) | adapted locally in `e99ac88cd5bc33a7ac1a1494d47af09d24c36906` |
 | 144 | `7260932ab331bf069f844a6ef0a56d6d703b48ca` | 2026-01-27 | Merge pull request #16 from nitrobass24/develop | covered elsewhere |
 | 145 | `69aef40a1f346c5c280e32db03e92c092b6f8742` | 2026-02-07 | Merge pull request #28 from nitrobass24/develop | covered elsewhere |
