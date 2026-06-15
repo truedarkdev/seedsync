@@ -52,15 +52,16 @@ export class ViewFileOptions extends ViewFileOptionsRecord implements IViewFileO
 
 export module ViewFileOptions {
     export enum SortMethod {
-        STATUS,
-        NAME_ASC,
-        NAME_DESC,
-        STATUS_DESC,
-        SIZE_ASC,
-        SIZE_DESC,
-        SPEED_ASC,
-        SPEED_DESC,
-        ETA_ASC,
-        ETA_DESC
+        SMART_STATUS = 10,
+        STATUS = 0,
+        STATUS_DESC = 3,
+        NAME_ASC = 1,
+        NAME_DESC = 2,
+        SIZE_ASC = 4,
+        SIZE_DESC = 5,
+        SPEED_ASC = 6,
+        SPEED_DESC = 7,
+        ETA_ASC = 8,
+        ETA_DESC = 9
     }
 }

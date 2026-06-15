@@ -16,7 +16,7 @@ import {DomService} from "../../../../services/utils/dom.service";
 class MockViewFileOptionsService {
     private _options = new BehaviorSubject(new ViewFileOptions({
         showDetails: false,
-        sortMethod: ViewFileOptions.SortMethod.STATUS,
+        sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
         selectedStatusFilter: null,
         nameFilter: null,
         pinFilter: false
@@ -113,7 +113,7 @@ describe("Testing file options component", () => {
         ]));
         viewFileOptionsService.emitOptions(new ViewFileOptions({
             showDetails: false,
-            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
             selectedStatusFilter: null,
             nameFilter: null,
             pinFilter: false
@@ -130,7 +130,7 @@ describe("Testing file options component", () => {
         ]));
         viewFileOptionsService.emitOptions(new ViewFileOptions({
             showDetails: true,
-            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
             selectedStatusFilter: null,
             nameFilter: null,
             pinFilter: false

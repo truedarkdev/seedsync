@@ -45,7 +45,7 @@ describe("Testing view file options service", () => {
         viewOptionsService.options.subscribe({
             next: options => {
                 expect(options.showDetails).toBe(false);
-                expect(options.sortMethod).toBe(ViewFileOptions.SortMethod.STATUS);
+                expect(options.sortMethod).toBe(ViewFileOptions.SortMethod.SMART_STATUS);
                 expect(options.selectedStatusFilter).toBeNull();
                 expect(options.nameFilter).toBeNull();
                 expect(options.pinFilter).toBe(false);
@@ -152,15 +152,15 @@ describe("Testing view file options service", () => {
         expect(count).toBe(3);
     }));
 
-    it("should load sortMethod from storage", fakeAsync(() => {
+    it("should preserve legacy status sortMethod from storage", fakeAsync(() => {
         spyOn(storageService, "get").and.callFake(key => {
             if (key === StorageKeys.VIEW_OPTION_SORT_METHOD) {
-                return ViewFileOptions.SortMethod.NAME_ASC;
+                return ViewFileOptions.SortMethod.STATUS;
             }
         });
         // Recreate the service
         viewOptionsService = createViewOptionsService();
-        expect(storageService.get).toHaveBeenCalledWith(StorageKeys.VIEW_OPTION_SHOW_DETAILS);
+        expect(storageService.get).toHaveBeenCalledWith(StorageKeys.VIEW_OPTION_SORT_METHOD);
 
         let count = 0;
         let sortMethod = null;
@@ -172,7 +172,7 @@ describe("Testing view file options service", () => {
         });
         tick();
         expect(count).toBe(1);
-        expect(sortMethod).toBe(ViewFileOptions.SortMethod.NAME_ASC);
+        expect(sortMethod).toBe(ViewFileOptions.SortMethod.STATUS);
     }));
 
     it("should save sortMethod to storage", fakeAsync(() => {

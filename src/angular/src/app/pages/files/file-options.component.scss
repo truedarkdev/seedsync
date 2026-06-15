@@ -256,7 +256,13 @@
     #sort-status {
         @extend %dropdown;
 
+        // Keep the closed Sort control wide enough for the longest status label.
+        .dropdown-toggle {
+            min-width: 14.6rem;
+        }
+
         .dropdown-menu {
+            min-width: 0;
             width: max-content;
         }
 

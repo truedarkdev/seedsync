@@ -17,11 +17,11 @@
             </span>
         </div>
         <div class="status sortable"
-             [class.active]="isSortedBy(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)"
-             (click)="onSort(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)">
+             [class.active]="isStatusSorted(currentOptions.sortMethod)"
+             (click)="onStatusSort(currentOptions.sortMethod)">
             Status
             <span class="sort-indicator"
-                  *ngIf="isSortedBy(currentOptions.sortMethod, SortMethod.STATUS, SortMethod.STATUS_DESC)">
+                  *ngIf="isStatusSorted(currentOptions.sortMethod)">
                 {{isSortDescending(currentOptions.sortMethod, SortMethod.STATUS_DESC) ? "v" : "^"}}
             </span>
         </div>

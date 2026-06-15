@@ -130,6 +130,11 @@
             <div class="selection">
                 <!-- these divs only show the selected option -->
                 <div class="sel-item"
+                     *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SMART_STATUS">
+                    <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
+                    <span class="text">Smart Status</span>
+                </div>
+                <div class="sel-item"
                      *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.STATUS">
                     <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
                     <span class="text">Status</span>
@@ -182,6 +187,12 @@
             </div>
         </button>
         <div class="dropdown-menu dropdown-menu-end" data-bs-theme="dark">
+            <div class="dropdown-item"
+                 [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.SMART_STATUS"
+                 (click)="onSort(ViewFileOptions.SortMethod.SMART_STATUS)">
+                <div class="icon"><img src="assets/icons/states.svg" class="states" /></div>
+                <span class="text">Smart Status</span>
+            </div>
             <div class="dropdown-item"
                  [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.STATUS"
                  (click)="onSort(ViewFileOptions.SortMethod.STATUS)">

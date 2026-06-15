@@ -25,9 +25,12 @@ export class ViewFileOptionsService {
         // Load some options from storage
         const showDetails: boolean =
             this._storage.get(StorageKeys.VIEW_OPTION_SHOW_DETAILS) || false;
+        const storedSortMethod: ViewFileOptions.SortMethod =
+            this._storage.get(StorageKeys.VIEW_OPTION_SORT_METHOD);
         const sortMethod: ViewFileOptions.SortMethod =
-            this._storage.get(StorageKeys.VIEW_OPTION_SORT_METHOD) ||
-                ViewFileOptions.SortMethod.STATUS;
+            storedSortMethod == null ?
+                ViewFileOptions.SortMethod.SMART_STATUS :
+                storedSortMethod;
         const selectedStatusFilter: ViewFile.Status =
             this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) || null;
         const nameFilter: string =
