@@ -303,6 +303,7 @@ class TestConfig(unittest.TestCase):
             "num_max_total_connections": "7",
             "use_temp_file": "True",
             "rate_limit": "1M",
+            "net_socket_buffer": "512K",
             "staging_path": "/path/on/local/server/incomplete"
         }
         lftp = Config.Lftp.from_dict(good_dict)
@@ -321,6 +322,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(7, lftp.num_max_total_connections)
         self.assertEqual(True, lftp.use_temp_file)
         self.assertEqual("1M", lftp.rate_limit)
+        self.assertEqual("512K", lftp.net_socket_buffer)
         self.assertEqual("/path/on/local/server/incomplete", lftp.staging_path)
 
         self.check_common(Config.Lftp,
@@ -360,6 +362,57 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_password", "   ")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
+        self.check_bad_value_error(Config.Lftp, good_dict, "net_socket_buffer", "512KB")
+
+    def test_lftp_allows_empty_net_socket_buffer(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "net_socket_buffer": "",
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("", lftp.net_socket_buffer)
+
+    def test_lftp_net_socket_buffer_accepts_integer_input(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "net_socket_buffer": 8388608,
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("8388608", lftp.net_socket_buffer)
 
     def test_lftp_allows_empty_remote_password(self):
         good_dict = {
@@ -425,6 +478,30 @@ class TestConfig(unittest.TestCase):
         lftp = Config.Lftp.from_dict(good_dict)
 
         self.assertEqual("", lftp.staging_path)
+
+    def test_lftp_backfills_missing_net_socket_buffer(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("8M", lftp.net_socket_buffer)
 
     def test_controller(self):
         good_dict = {

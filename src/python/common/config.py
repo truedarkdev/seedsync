@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import configparser
+import re
 from typing import Dict
 from io import StringIO
 import collections
@@ -35,6 +36,9 @@ OuterConfigType = Dict[str, InnerConfigType]
 
 # Source: https://stackoverflow.com/a/39205612/8571324
 T = TypeVar('T', bound='InnerConfig')
+
+
+_BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORECASE)
 
 
 class Converters:
@@ -129,6 +133,30 @@ class Checkers:
                 cls.__name__, name, value
             ))
         return value
+
+    @staticmethod
+    def byte_size_or_empty(cls: T, name: str, value: Any) -> str:
+        if type(value) is int:
+            value = str(value)
+        if not isinstance(value, str):
+            raise ConfigError("Bad config: {}.{} ({}) must be a byte size value".format(
+                cls.__name__, name, value
+            ))
+        if value == "":
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ConfigError("Bad config: {}.{} is empty".format(
+                cls.__name__, name
+            ))
+        if not _BYTE_SIZE_VALUE_RE.match(normalized):
+            raise ConfigError("Bad config: {}.{} ({}) must be a byte size value like 512K, 8M, 1G, or 8388608".format(
+                cls.__name__, name, value
+            ))
+        suffix = normalized[-1]
+        if suffix.isalpha():
+            normalized = normalized[:-1] + suffix.upper()
+        return normalized
 
 
 class InnerConfig(ABC):
@@ -337,6 +365,7 @@ class Config(Persist):
                                          Converters.int)
         use_temp_file = PROP("use_temp_file", Checkers.null, Converters.bool)
         rate_limit = PROP("rate_limit", Checkers.null, Converters.null)
+        net_socket_buffer = PROP("net_socket_buffer", Checkers.byte_size_or_empty, Converters.null)
         staging_path = PROP("staging_path", Checkers.null, Converters.null)
 
         def __init__(self):
@@ -356,10 +385,14 @@ class Config(Persist):
             self.num_max_total_connections = None
             self.use_temp_file = None
             self.rate_limit = None
+            self.net_socket_buffer = None
             self.staging_path = None
 
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "net_socket_buffer" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["net_socket_buffer"] = "8M"
             if "staging_path" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["staging_path"] = ""

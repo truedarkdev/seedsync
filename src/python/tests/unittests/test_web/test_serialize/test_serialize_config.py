@@ -35,6 +35,7 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.num_max_connections_per_root_file = 2
         config.lftp.num_max_connections_per_dir_file = 3
         config.lftp.num_max_total_connections = 4
+        config.lftp.net_socket_buffer = "512K"
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
@@ -50,6 +51,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(2, out_dict["lftp"]["num_max_connections_per_root_file"])
         self.assertEqual(3, out_dict["lftp"]["num_max_connections_per_dir_file"])
         self.assertEqual(4, out_dict["lftp"]["num_max_total_connections"])
+        self.assertEqual("512K", out_dict["lftp"]["net_socket_buffer"])
         self.assertNotIn("server.remote.com", out)
         self.assertNotIn("user-on-remote-server", out)
         self.assertNotIn("secret123", out)
@@ -65,6 +67,7 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.local_path = "/local/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+        config.lftp.net_socket_buffer = "8M"
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
@@ -76,6 +79,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
         self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
         self.assertEqual("/remote/server/path/to/script", out_dict["lftp"]["remote_path_to_scan_script"])
+        self.assertEqual("8M", out_dict["lftp"]["net_socket_buffer"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
     def test_section_controller(self):

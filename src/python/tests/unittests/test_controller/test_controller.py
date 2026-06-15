@@ -34,6 +34,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.status.server = SimpleNamespace(up=True, error_msg=None)
         self.controller._Controller__context.breadcrumb_trace = MagicMock()
         self.controller._Controller__context.config.lftp.local_path = "/local"
+        self.controller._Controller__context.config.lftp.net_socket_buffer = ""
         self.controller._Controller__password = None
         self.controller._Controller__persist = MagicMock()
         self.controller._Controller__persist.downloaded_file_names = set()
@@ -49,6 +50,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_refresh_completed_generation = 0
         self.controller._Controller__path_pair_runtime_error = None
         self.controller._Controller__lftp = MagicMock()
+        self.controller._Controller__lftp.net_socket_buffer = ""
         self.controller._Controller__active_scan_process = MagicMock()
         self.controller._Controller__local_scan_process = MagicMock()
         self.controller._Controller__remote_scan_process = MagicMock()
@@ -271,6 +273,20 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.start.assert_called_once_with()
         self.controller._Controller__mp_logger.start.assert_called_once_with()
         self.assertTrue(self.controller._Controller__started)
+
+    def test_configure_lftp_applies_net_socket_buffer_when_configured(self):
+        self.controller._Controller__context.config.lftp.net_socket_buffer = "512K"
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertEqual("512K", self.controller._Controller__lftp.net_socket_buffer)
+
+    def test_configure_lftp_skips_empty_net_socket_buffer(self):
+        self.controller._Controller__context.config.lftp.net_socket_buffer = ""
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertEqual("", self.controller._Controller__lftp.net_socket_buffer)
 
     def test_update_model_records_scan_and_extract_breadcrumbs(self):
         remote_scan = SimpleNamespace(

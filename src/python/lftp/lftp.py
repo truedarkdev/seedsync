@@ -12,6 +12,7 @@ import pexpect
 
 # my libs
 from common import AppError
+from common.config import Checkers
 from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatusParserError
 
 
@@ -37,6 +38,7 @@ class Lftp:
     __SET_NUM_CONNECTIONS_MIRROR = "mirror:use-pget-n"
     __SET_NUM_MAX_TOTAL_CONNECTIONS = "net:connection-limit"
     __SET_RATE_LIMIT = "net:limit-rate"
+    __SET_NET_SOCKET_BUFFER = "net:socket-buffer"
     __SET_MIN_CHUNK_SIZE = "pget:min-chunk-size"
     __SET_PGET_SAVE_STATUS = "pget:save-status"
     __SET_NUM_PARALLEL_JOBS = "cmd:queue-parallel"
@@ -434,6 +436,17 @@ class Lftp:
     @rate_limit.setter
     def rate_limit(self, rate_limit: Union[int, str]):
         self.__set(Lftp.__SET_RATE_LIMIT, str(rate_limit))
+
+    @property
+    def net_socket_buffer(self) -> str:
+        return self.__get(Lftp.__SET_NET_SOCKET_BUFFER)
+
+    @net_socket_buffer.setter
+    def net_socket_buffer(self, net_socket_buffer: Union[int, str]):
+        normalized = Checkers.byte_size_or_empty(Lftp, "net_socket_buffer", net_socket_buffer)
+        if normalized == "":
+            return
+        self.__set(Lftp.__SET_NET_SOCKET_BUFFER, normalized)
 
     @property
     def min_chunk_size(self) -> str:
