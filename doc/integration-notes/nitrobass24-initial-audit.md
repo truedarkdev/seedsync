@@ -224,46 +224,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 205 | `ec2d08b480d0d1b01cf27c63998819eaa0b80255` | 2026-02-18 | Fix error handling bugs found during code review | already integrated |
 | 206 | `38286023cadda2ab962c3690640fcfa199abf86b` | 2026-02-18 | Merge pull request #64 from nitrobass24/fix/review-findings-error-handling | covered elsewhere |
 | 207 | `360e2d0605652e54bd0549bc53752b7ed88abe45` | 2026-02-19 | Fix LFTP status parser crash from interleaved 'jobs -v' command echo | already integrated |
-| 208 | `5b44317fdad8d5a39b96ad7671dc8bf035d1c71d` | 2026-02-19 | Fix SSH shell crash on filenames with apostrophes (e.g. "Don't Look Now") | pending |
-| 209 | `3fd9e6f6b62fe4810441cead6409166946ee679d` | 2026-02-19 | Merge pull request #66 from nitrobass24/fix/scanfs-timeout-crash | pending |
-| 210 | `bc15de5174a692a0c09bc2fa4a9d715466a3ac8a` | 2026-02-14 | Bump qs from 6.14.1 to 6.14.2 in /src/angular | pending |
-| 211 | `2e47b83bece5fc86e9d76c0e9d7bb21590a2da1a` | 2026-02-19 | Merge pull request #53 from nitrobass24/dependabot/npm_and_yarn/src/angular/qs-6.14.2 | pending |
-| 212 | `d3c4ad331215321ea4a65e1af0cfe05d9d620c5e` | 2026-02-14 | Bump qs from 6.14.1 to 6.14.2 in /website | pending |
-| 213 | `a98581ef9fae308bce5e1a098e97663e17df9c49` | 2026-02-19 | Merge pull request #59 from nitrobass24/dependabot/npm_and_yarn/website/qs-6.14.2 | pending |
-| 214 | `b3a08ff3806a3c435a33a1837ea63de6ea9754c6` | 2026-02-19 | Bump tar from 7.5.7 to 7.5.9 in /src/angular | pending |
-| 215 | `bc573593e740763164a9755472c0b5697b572af4` | 2026-02-19 | Merge pull request #65 from nitrobass24/dependabot/npm_and_yarn/src/angular/tar-7.5.9 | pending |
-| 216 | `7add29da7f7c124e031d49c4eea5c1188a297252` | 2026-02-19 | Merge remote-tracking branch 'origin/master' into develop | pending |
-| 217 | `30d2f7fcb106c4577aa22499f131db31d7ecb5fd` | 2026-02-19 | Configure Dependabot to target develop branch | pending |
-| 218 | `d2efd78ac52b892fa0353cd31e7c7328d9609e49` | 2026-02-19 | Fix wildly inaccurate directory download ETAs | pending |
-| 219 | `373f887f0351196ae3c84780ede7b6a379b35f9e` | 2026-02-19 | Merge pull request #68 from nitrobass24/fix/directory-download-eta | pending |
-| 220 | `5f970b6fd466b3cf3283172f7acac73820ab319b` | 2026-02-19 | Bump hono from 4.11.8 to 4.12.0 in /src/angular | pending |
-| 221 | `28717f66d3261e4fc717fb4fb6e015a0c74a79b9` | 2026-02-19 | Merge pull request #67 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.0 | pending |
-| 222 | `48aa74501d2a426f83e31e4b448dcd177bcbf599` | 2026-02-19 | Fix LFTP parser crash from terminal line wrapping on long paths | pending |
-| 223 | `dbea249f9d28bca574a7150ae1d82b5d2cfe3fd4` | 2026-02-19 | Merge pull request #69 from nitrobass24/fix/lftp-parser-line-wrap-crash | pending |
-| 224 | `7c7586b664cad4985846c2a106ebad17db6f12a2` | 2026-02-20 | Implement post-download pipeline for correct extract/delete-remote ordering (#70) | pending |
-| 225 | `960474f8736cb691abd77a5fef0e0045907c2b3e` | 2026-02-20 | Fix persist cleanup firing during in-flight staging moves (#71) | pending |
-| 226 | `ef8e5e2b48012433e74aae91692d262b5d316ccf` | 2026-02-20 | Fix persist cleanup firing during in-flight staging moves | pending |
-| 227 | `7a2ac5b81943765e56d9d8013e75e3d04d520d65` | 2026-02-20 | Fix extraction timing and re-download retry for staging pipeline | pending |
-| 228 | `b4b35cb6daa98d7ea77fcff67b8c28f0585d1072` | 2026-02-20 | Merge pull request #72 from nitrobass24/feat/post-download-pipeline | pending |
-| 229 | `4a26970f27c4d146b04dedcb47b38fceae16996e` | 2026-02-20 | Add EXTRACT_FAILED visual state for failed extractions after 3 retries | pending |
-| 230 | `b61bb62c7ac1171707dab8a1b2a3a55ef358f144` | 2026-02-20 | Merge pull request #73 from nitrobass24/feat/post-download-pipeline | pending |
-| 231 | `2eed690575600c966e239f152ceb7cff06afceea` | 2026-02-20 | Add CodeRabbit AI review configuration | pending |
-| 232 | `4170a1e0380fa2d193313848b2b76a0296c6fde9` | 2026-02-20 | Release v0.12.2 - Extraction failure handling and stability fixes | pending |
-| 233 | `7afd6a0c290c3587ba2e50c46c9fbb8124cddaa4` | 2026-02-21 | Fix reading pexpect attributes after sp.close() in sshcp | pending |
-| 234 | `622f87533cae8be4a047a0185a7b0ff12076fbf2` | 2026-02-21 | Fix model builder cache invalidation by copying persist sets | pending |
-| 235 | `976fadfd240930f368111ba93d2d424e59338e1f` | 2026-02-21 | Add Dependabot entry for Python pip dependencies | pending |
-| 236 | `d45cfb0920a5d3ac87a5dbe57645652df18f89a2` | 2026-02-21 | Fix reading exitstatus before process is reaped in sshcp | pending |
-| 237 | `e1254afc8fb12e6861557ba0c1fe1ba8d388d891` | 2026-02-21 | Chain LftpError when re-raising as AppError for traceback preservation | pending |
-| 238 | `83905bbf183f0386b21ebd6fb56481003601a091` | 2026-02-21 | Clear extraction retry count when file is re-queued for download | pending |
-| 239 | `2a96c25bd2513776c5d8e0394ae3b4565178d1ab` | 2026-02-20 | Add CodeRabbit AI review configuration | pending |
-| 240 | `527c52318e18d15235661cddce0594a100c5f105` | 2026-02-21 | Merge remote-tracking branch 'origin/master' into develop | pending |
-| 241 | `355a606f71f600581f30e2e527789b71f69323b7` | 2026-02-21 | Merge pull request #74 from nitrobass24/develop | pending |
-| 242 | `7127256314ffb4f5809d8c2f8f57fb9bc8a92c68` | 2026-02-21 | Fix UnicodeDecodeError crash when SSH output contains non-UTF-8 bytes | pending |
-| 243 | `76aa3b7ce6835abe3c408a11125e538c96e9dc5a` | 2026-02-21 | Merge pull request #76 from nitrobass24/fix/sshcp-unicode-decode-error | pending |
-| 244 | `94150945c5ca9cfe5ccdc06432444bed5b627164` | 2026-02-21 | Release v0.12.3 — Fix SSH output decoding crash | pending |
-| 245 | `32bb751897709a66eeed193c0e2bd087bfa5733d` | 2026-02-21 | Merge pull request #77 from nitrobass24/develop | pending |
-| 246 | `fe0f4a68f2e039ccdf269d5683cd981059f7f620` | 2026-02-26 | Fix extract retry loop and staging delete in controller | pending |
-| 247 | `d7fb5e9a6d1f779c66d7ca25d6b0c1540c275ff3` | 2026-02-26 | Fix late-binding closure bug in DELETE_LOCAL post_callback | pending |
+| 208 | `5b44317fdad8d5a39b96ad7671dc8bf035d1c71d` | 2026-02-19 | Fix SSH shell crash on filenames with apostrophes (e.g. "Don't Look Now") | already integrated |
+| 209 | `3fd9e6f6b62fe4810441cead6409166946ee679d` | 2026-02-19 | Merge pull request #66 from nitrobass24/fix/scanfs-timeout-crash | covered elsewhere |
+| 210 | `bc15de5174a692a0c09bc2fa4a9d715466a3ac8a` | 2026-02-14 | Bump qs from 6.14.1 to 6.14.2 in /src/angular | already integrated |
+| 211 | `2e47b83bece5fc86e9d76c0e9d7bb21590a2da1a` | 2026-02-19 | Merge pull request #53 from nitrobass24/dependabot/npm_and_yarn/src/angular/qs-6.14.2 | covered elsewhere |
+| 212 | `d3c4ad331215321ea4a65e1af0cfe05d9d620c5e` | 2026-02-14 | Bump qs from 6.14.1 to 6.14.2 in /website | already integrated |
+| 213 | `a98581ef9fae308bce5e1a098e97663e17df9c49` | 2026-02-19 | Merge pull request #59 from nitrobass24/dependabot/npm_and_yarn/website/qs-6.14.2 | covered elsewhere |
+| 214 | `b3a08ff3806a3c435a33a1837ea63de6ea9754c6` | 2026-02-19 | Bump tar from 7.5.7 to 7.5.9 in /src/angular | already integrated |
+| 215 | `bc573593e740763164a9755472c0b5697b572af4` | 2026-02-19 | Merge pull request #65 from nitrobass24/dependabot/npm_and_yarn/src/angular/tar-7.5.9 | covered elsewhere |
+| 216 | `7add29da7f7c124e031d49c4eea5c1188a297252` | 2026-02-19 | Merge remote-tracking branch 'origin/master' into develop | covered elsewhere |
+| 217 | `30d2f7fcb106c4577aa22499f131db31d7ecb5fd` | 2026-02-19 | Configure Dependabot to target develop branch | already integrated |
+| 218 | `d2efd78ac52b892fa0353cd31e7c7328d9609e49` | 2026-02-19 | Fix wildly inaccurate directory download ETAs | already integrated |
+| 219 | `373f887f0351196ae3c84780ede7b6a379b35f9e` | 2026-02-19 | Merge pull request #68 from nitrobass24/fix/directory-download-eta | covered elsewhere |
+| 220 | `5f970b6fd466b3cf3283172f7acac73820ab319b` | 2026-02-19 | Bump hono from 4.11.8 to 4.12.0 in /src/angular | already integrated |
+| 221 | `28717f66d3261e4fc717fb4fb6e015a0c74a79b9` | 2026-02-19 | Merge pull request #67 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.0 | covered elsewhere |
+| 222 | `48aa74501d2a426f83e31e4b448dcd177bcbf599` | 2026-02-19 | Fix LFTP parser crash from terminal line wrapping on long paths | already integrated |
+| 223 | `dbea249f9d28bca574a7150ae1d82b5d2cfe3fd4` | 2026-02-19 | Merge pull request #69 from nitrobass24/fix/lftp-parser-line-wrap-crash | covered elsewhere |
+| 224 | `7c7586b664cad4985846c2a106ebad17db6f12a2` | 2026-02-20 | Implement post-download pipeline for correct extract/delete-remote ordering (#70) | already integrated |
+| 225 | `960474f8736cb691abd77a5fef0e0045907c2b3e` | 2026-02-20 | Fix persist cleanup firing during in-flight staging moves (#71) | already integrated |
+| 226 | `ef8e5e2b48012433e74aae91692d262b5d316ccf` | 2026-02-20 | Fix persist cleanup firing during in-flight staging moves | already integrated |
+| 227 | `7a2ac5b81943765e56d9d8013e75e3d04d520d65` | 2026-02-20 | Fix extraction timing and re-download retry for staging pipeline | already integrated |
+| 228 | `b4b35cb6daa98d7ea77fcff67b8c28f0585d1072` | 2026-02-20 | Merge pull request #72 from nitrobass24/feat/post-download-pipeline | covered elsewhere |
+| 229 | `4a26970f27c4d146b04dedcb47b38fceae16996e` | 2026-02-20 | Add EXTRACT_FAILED visual state for failed extractions after 3 retries | already integrated |
+| 230 | `b61bb62c7ac1171707dab8a1b2a3a55ef358f144` | 2026-02-20 | Merge pull request #73 from nitrobass24/feat/post-download-pipeline | covered elsewhere |
+| 231 | `2eed690575600c966e239f152ceb7cff06afceea` | 2026-02-20 | Add CodeRabbit AI review configuration | already integrated |
+| 232 | `4170a1e0380fa2d193313848b2b76a0296c6fde9` | 2026-02-20 | Release v0.12.2 - Extraction failure handling and stability fixes | covered elsewhere |
+| 233 | `7afd6a0c290c3587ba2e50c46c9fbb8124cddaa4` | 2026-02-21 | Fix reading pexpect attributes after sp.close() in sshcp | already integrated |
+| 234 | `622f87533cae8be4a047a0185a7b0ff12076fbf2` | 2026-02-21 | Fix model builder cache invalidation by copying persist sets | already integrated |
+| 235 | `976fadfd240930f368111ba93d2d424e59338e1f` | 2026-02-21 | Add Dependabot entry for Python pip dependencies | already integrated |
+| 236 | `d45cfb0920a5d3ac87a5dbe57645652df18f89a2` | 2026-02-21 | Fix reading exitstatus before process is reaped in sshcp | already integrated |
+| 237 | `e1254afc8fb12e6861557ba0c1fe1ba8d388d891` | 2026-02-21 | Chain LftpError when re-raising as AppError for traceback preservation | already integrated |
+| 238 | `83905bbf183f0386b21ebd6fb56481003601a091` | 2026-02-21 | Clear extraction retry count when file is re-queued for download | already integrated |
+| 239 | `2a96c25bd2513776c5d8e0394ae3b4565178d1ab` | 2026-02-20 | Add CodeRabbit AI review configuration | already integrated |
+| 240 | `527c52318e18d15235661cddce0594a100c5f105` | 2026-02-21 | Merge remote-tracking branch 'origin/master' into develop | covered elsewhere |
+| 241 | `355a606f71f600581f30e2e527789b71f69323b7` | 2026-02-21 | Merge pull request #74 from nitrobass24/develop | covered elsewhere |
+| 242 | `7127256314ffb4f5809d8c2f8f57fb9bc8a92c68` | 2026-02-21 | Fix UnicodeDecodeError crash when SSH output contains non-UTF-8 bytes | already integrated |
+| 243 | `76aa3b7ce6835abe3c408a11125e538c96e9dc5a` | 2026-02-21 | Merge pull request #76 from nitrobass24/fix/sshcp-unicode-decode-error | covered elsewhere |
+| 244 | `94150945c5ca9cfe5ccdc06432444bed5b627164` | 2026-02-21 | Release v0.12.3 — Fix SSH output decoding crash | covered elsewhere |
+| 245 | `32bb751897709a66eeed193c0e2bd087bfa5733d` | 2026-02-21 | Merge pull request #77 from nitrobass24/develop | covered elsewhere |
+| 246 | `fe0f4a68f2e039ccdf269d5683cd981059f7f620` | 2026-02-26 | Fix extract retry loop and staging delete in controller | already integrated |
+| 247 | `d7fb5e9a6d1f779c66d7ca25d6b0c1540c275ff3` | 2026-02-26 | Fix late-binding closure bug in DELETE_LOCAL post_callback | already integrated |
 | 248 | `ad7f19fae518bb463d4ec42c155cd934644d3f87` | 2026-02-26 | Merge pull request #82 from nitrobass24/fix/extract-retry-loop-and-staging-delete | pending |
 | 249 | `7a0b8952d6e0fc6868541ce612e6358af93ebd94` | 2026-02-27 | Fix chunk parser crash on rangeless format and zombie on controller death | pending |
 | 250 | `a9598f06ed1f9ed607b0b00556a7943704dcf403` | 2026-02-27 | Fix persist authority overriding children check for directories (#83) | pending |
