@@ -145,7 +145,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 126 | `0508a7a841b7b0a777e97fddb673cd1b114a3a7c` | 2026-01-26 | Update CHANGELOG and MODERNIZATION_PLAN for v0.10.0 | intentionally skipped |
 | 127 | `0b1619f9aa3e29190e833a6777dd44f02088338c` | 2026-01-26 | Add CLAUDE.md with project instructions and release process | intentionally skipped |
 | 128 | `43c35ae37a3027516bba76e592dcd14e8b6acbdd` | 2026-01-26 | Rollback Angular 17 to Angular 4 (v0.10.1) | intentionally skipped |
-| 129 | `e6d32c4e5629ac22fd83ca16ce4d6375ed43660a` | 2026-01-26 | Fix scanfs binary architecture for ARM local machines | needs integration |
+| 129 | `e6d32c4e5629ac22fd83ca16ce4d6375ed43660a` | 2026-01-26 | Fix scanfs binary architecture for ARM local machines | adapted locally in `0e189f2ccb9ddd3378347a56a47620d02e9001ea` |
 | 130 | `b7b45d3772576f444c5e5a85db9c426ade39fbb0` | 2026-01-27 | Fix restart button, settings persistence, and update About page | covered elsewhere |
 | 131 | `ce7527f395cc673be5cbd61e745d5aa34ae78def` | 2026-01-27 | Update CLAUDE.md with release process details | intentionally skipped |
 | 132 | `11d003f80d727aecc78766d6d925b4f6bacc1ddc` | 2026-01-27 | Remove angular-v17 from master - preserved in angular-17-upgrade branch | intentionally skipped |
