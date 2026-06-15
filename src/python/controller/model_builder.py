@@ -41,6 +41,7 @@ class ModelBuilder:
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
         self.__local_files = dict()
+        self.__active_files = dict()
         self.__remote_files = dict()
         self.__active_file_ids = set()
         self.__lftp_statuses = dict()
@@ -919,27 +920,36 @@ class ModelBuilder:
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
 
     def set_active_files(self, active_files: List[SystemFile]):
+        had_active_files = bool(self.__active_files)
         self.__active_file_ids = set()
-        # Update the local file state with this latest information
+        self.__active_files = {}
         for file in active_files:
             self.__collect_active_file_ids(file, self.__active_file_ids)
-            file_id = self.__root_file_id(file.name, file.path_pair_id)
-            existing_file = self.__local_files.get(file_id)
+            self.__active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
+        # Invalidate the cache
+        if had_active_files or len(active_files) > 0:
+            self.__cached_model = None
+
+    def __build_effective_local_files(self) -> Dict[str, SystemFile]:
+        if not self.__active_files:
+            return dict(self.__local_files)
+
+        effective_local_files = dict(self.__local_files)
+        for file_id, active_file in self.__active_files.items():
+            existing_file = effective_local_files.get(file_id)
             remote_file = self.__remote_files.get(file_id)
             if existing_file is not None and getattr(existing_file, "is_staging", False):
                 continue
             if existing_file is not None and \
                     self.__is_authoritative_local_file(existing_file) and \
-                    getattr(file, "is_staging", False) and \
+                    getattr(active_file, "is_staging", False) and \
                     existing_file.size is not None and \
-                    file.size is not None and \
-                    existing_file.size >= file.size and \
+                    active_file.size is not None and \
+                    existing_file.size >= active_file.size and \
                     not self.__remote_indicates_newer_content(existing_file, remote_file):
                 continue
-            self.__local_files[file_id] = file
-        # Invalidate the cache
-        if len(active_files) > 0:
-            self.__cached_model = None
+            effective_local_files[file_id] = active_file
+        return effective_local_files
 
     def set_local_files(self, local_files: List[SystemFile]):
         prev_local_files = self.__local_files
@@ -1016,6 +1026,7 @@ class ModelBuilder:
 
     def clear(self):
         self.__local_files.clear()
+        self.__active_files.clear()
         self.__remote_files.clear()
         self.__active_file_ids.clear()
         self.__lftp_statuses.clear()
@@ -1044,16 +1055,17 @@ class ModelBuilder:
         model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
         live_transferred_file_ids = set()
         seen_file_ids = set()
-        all_file_ids = set().union(self.__local_files.keys(), self.__remote_files.keys())
+        effective_local_files = self.__build_effective_local_files()
+        all_file_ids = set().union(effective_local_files.keys(), self.__remote_files.keys())
         ambiguous_file_names = set()
         file_name_counts = dict()
-        source_file_ids = set(self.__local_files.keys()).union(self.__remote_files.keys())
+        source_file_ids = set(effective_local_files.keys()).union(self.__remote_files.keys())
         for status_file_id in self.__lftp_statuses.keys():
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
 
         for file_id in all_file_ids:
-            source_file = self.__local_files.get(file_id)
+            source_file = effective_local_files.get(file_id)
             if source_file is None:
                 source_file = self.__remote_files.get(file_id)
             if source_file is None:
@@ -1074,7 +1086,7 @@ class ModelBuilder:
         for file_id in all_file_ids:
             seen_file_ids.add(file_id)
             remote = self.__remote_files.get(file_id, None)
-            local = self.__local_files.get(file_id, None)
+            local = effective_local_files.get(file_id, None)
             status = self.__lftp_statuses.get(file_id, None)
             is_stopped = self.__is_stopped_file(file_id, remote, local)
             name = remote.name if remote else local.name if local else file_id

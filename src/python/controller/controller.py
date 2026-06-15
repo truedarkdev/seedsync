@@ -222,6 +222,10 @@ class Controller:
         # Keep track of active files
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
+        # Path-pair aware completion tracking so a finished download stays
+        # visible until the model reaches a terminal state.
+        self.__prev_downloading_file_names = set()
+        self.__pending_completion_file_names = set()
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
         self.__last_lftp_statuses = []
@@ -494,7 +498,8 @@ class Controller:
     def __apply_path_pair_refresh(self):
         active_files = list(
             getattr(self, "_Controller__active_downloading_file_names", []) +
-            getattr(self, "_Controller__active_extracting_file_names", [])
+            getattr(self, "_Controller__active_extracting_file_names", []) +
+            list(getattr(self, "_Controller__pending_completion_file_names", []))
         )
         was_started = self.__started
         old_active_scan_process = self.__active_scan_process
@@ -1240,6 +1245,10 @@ class Controller:
             self.__lftp_status_cache_max_age_seconds = max(3, self.__lftp_status_poll_retry_seconds * 3)
         if not hasattr(self, "_Controller__lftp_status_poll_retry_active"):
             self.__lftp_status_poll_retry_active = False
+        if not hasattr(self, "_Controller__prev_downloading_file_names"):
+            self.__prev_downloading_file_names = set()
+        if not hasattr(self, "_Controller__pending_completion_file_names"):
+            self.__pending_completion_file_names = set()
 
         # Grab the latest scan results
         latest_remote_scan = self.__remote_scan_process.pop_latest_result()
@@ -1333,10 +1342,28 @@ class Controller:
                 status for status in lftp_statuses
                 if status.file_id not in self.__malformed_status_only_file_ids
             ]
-            self.__active_downloading_file_names = [
+            current_downloading_file_names = [
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
             ]
+            if lftp_status_poll_healthy or lftp_statuses:
+                current_downloading_file_names_set = set(current_downloading_file_names)
+                just_completed_file_names = self.__prev_downloading_file_names - current_downloading_file_names_set
+                just_completed_file_names = {
+                    file_name for file_name in just_completed_file_names
+                    if not self.__is_explicitly_stopped(file_name[0], file_name[1])
+                }
+                if just_completed_file_names:
+                    for name, path_pair_id, _ in just_completed_file_names:
+                        self.logger.info(
+                            "Download completion pending (LFTP job finished): {}".format(
+                                ModelFile.build_file_id(name, path_pair_id)
+                            )
+                        )
+                    self.__pending_completion_file_names.update(just_completed_file_names)
+                    self.__local_scan_process.force_scan()
+                self.__prev_downloading_file_names = current_downloading_file_names_set
+            self.__active_downloading_file_names = current_downloading_file_names
         if self.__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             self.__next_lftp_status_poll_at = None
         if latest_extract_statuses is not None:
@@ -1359,7 +1386,9 @@ class Controller:
 
         # Update the active scanner's state
         self.__set_active_scanner_files(
-            self.__active_downloading_file_names + self.__active_extracting_file_names
+            self.__active_downloading_file_names +
+            self.__active_extracting_file_names +
+            list(self.__pending_completion_file_names)
         )
 
         # Update model builder state
@@ -1476,6 +1505,12 @@ class Controller:
             new_model = self.__model_builder.build_model()
 
             with self.__model_lock:
+                def pending_completion_file_ids():
+                    return {
+                        ModelFile.build_file_id(file_name, path_pair_id)
+                        for file_name, path_pair_id, _ in self.__pending_completion_file_names
+                    }
+
                 # Diff the new model with old model
                 model_diff = ModelDiffUtil.diff_models(self.__model, new_model)
 
@@ -1488,20 +1523,58 @@ class Controller:
                     elif diff.change == ModelDiff.Change.UPDATED:
                         self.__model.update_file(diff.new_file)
 
-                    # Detect if a file was just Downloaded
-                    #   an Added file in Downloaded state
-                    #   an Updated file transitioning to Downloaded state
-                    # If so, update the persist state
-                    # Note: This step is done after the new model is build because
-                    #       model_builder is the one that discovers when a file is Downloaded
+                    if diff.change == ModelDiff.Change.REMOVED and diff.old_file is not None and \
+                            latest_local_scan is not None and \
+                            diff.old_file.file_id in pending_completion_file_ids():
+                        self.__pending_completion_file_names = {
+                            file_name for file_name in self.__pending_completion_file_names
+                            if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.old_file.file_id
+                        }
+
+                    completion_proved = False
+                    if diff.new_file is not None and diff.old_file is not None and \
+                            diff.new_file.file_id in pending_completion_file_ids() and \
+                            not self.__is_explicitly_stopped(diff.new_file.name, diff.new_file.path_pair_id):
+                        if diff.new_file.state in (
+                                ModelFile.State.DOWNLOADED,
+                                ModelFile.State.EXTRACTED,
+                                ModelFile.State.DELETED
+                        ):
+                            completion_proved = True
+                        elif diff.old_file.remote_size is not None and \
+                                diff.new_file.local_size is not None and \
+                                diff.new_file.local_size >= diff.old_file.remote_size:
+                            completion_proved = True
+
+                    if completion_proved and diff.new_file is not None:
+                        self.__pending_completion_file_names = {
+                            file_name for file_name in self.__pending_completion_file_names
+                            if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.new_file.file_id
+                        }
+                        if diff.new_file.file_id not in self.__persist.downloaded_file_names:
+                            self.__persist.downloaded_file_names.add(diff.new_file.file_id)
+                            self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                        self.clear_extracted_marker(diff.new_file)
+                        if self.__target_archive_trace_selector_matches_file(diff.new_file.file_id, diff.new_file.name):
+                            self.__trace_target_archive_event("downloaded_marker_added", {
+                                "file": self.__summarize_target_archive_file(diff.new_file),
+                            })
+                        self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
+
+                    # Detect if a file was just Downloaded through a direct state transition.
+                    # Pending-completion files are handled above so disappearance does not
+                    # immediately count as a completed download.
                     downloaded = False
-                    if diff.change == ModelDiff.Change.ADDED and \
-                            diff.new_file.state == ModelFile.State.DOWNLOADED:
-                        downloaded = True
-                    elif diff.change == ModelDiff.Change.UPDATED and \
-                            diff.new_file.state == ModelFile.State.DOWNLOADED and \
-                            diff.old_file.state != ModelFile.State.DOWNLOADED:
-                        downloaded = True
+                    if diff.new_file is not None and \
+                            not completion_proved and \
+                            diff.new_file.file_id not in pending_completion_file_ids():
+                        if diff.change == ModelDiff.Change.ADDED and \
+                                diff.new_file.state == ModelFile.State.DOWNLOADED:
+                            downloaded = True
+                        elif diff.change == ModelDiff.Change.UPDATED and \
+                                diff.new_file.state == ModelFile.State.DOWNLOADED and \
+                                diff.old_file.state != ModelFile.State.DOWNLOADED:
+                            downloaded = True
                     if downloaded:
                         self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
@@ -1564,7 +1637,9 @@ class Controller:
                     remove_downloaded_file_names = {
                         downloaded_file_name
                         for downloaded_file_name in self.__persist.downloaded_file_names
-                        if downloaded_file_name not in active_model_names and downloaded_file_name not in active_model_ids
+                        if downloaded_file_name not in active_model_names and
+                        downloaded_file_name not in active_model_ids and
+                        downloaded_file_name not in pending_completion_file_ids()
                     }
                     if remove_downloaded_file_names:
                         self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
