@@ -13,3 +13,4 @@ from .multiprocessing_logger import MultiprocessingLogger
 from .status import Status, IStatusListener, StatusComponent, IStatusComponentListener
 from .app_process import AppProcess, AppOneShotProcess
 from .path_pair import PathPair, PathPairCollection, PathPairError, PathPairManager
+from .remote_path_utils import escape_remote_path_for_shell

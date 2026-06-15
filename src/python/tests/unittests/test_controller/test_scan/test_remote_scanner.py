@@ -163,7 +163,7 @@ class TestRemoteScanner(unittest.TestCase):
         scanner.scan()
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_has_calls([
-            call("md5sum /remote/path/to/scan/script | awk '{print $1}' || echo"),
+            call("md5sum {} | awk '{{print $1}}' || echo".format(shlex.quote("/remote/path/to/scan/script"))),
             call(ANY)
         ])
 
@@ -328,6 +328,34 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_called_with(
             "/remote/path/to/scan/script /remote/path/to/scan"
+        )
+
+    def test_uses_home_expansion_for_tilde_remote_paths(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="~/data/torrents",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        self.ssh_run_command_count = 0
+
+        def ssh_shell(*args):
+            self.ssh_run_command_count += 1
+            if self.ssh_run_command_count == 1:
+                return "".encode()
+            return json.dumps([]).encode()
+
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        scanner.scan()
+
+        self.assertEqual(2, self.mock_ssh.shell.call_count)
+        self.mock_ssh.shell.assert_called_with(
+            "/remote/path/to/scan/script ~/data/torrents"
         )
 
     def test_quotes_scan_commands_with_spaces_in_remote_paths(self):
