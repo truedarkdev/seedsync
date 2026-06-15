@@ -195,7 +195,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 176 | `75210e8352ed797816a30c21d2e04cadcfcd1181` | 2026-02-12 | Advanced LFTP settings and staging bug fixes (#40) | already integrated |
 | 177 | `ad6163357d1242682facc892d5e1e3770bd620d7` | 2026-02-12 | Remove duplicate ci-develop.yml workflow (#42) | intentionally skipped |
 | 178 | `f6d665d919320d1a68a146a2d10cff5e55d16b92` | 2026-02-12 | Fix Advanced LFTP settings not editable for existing configs (#43) | already integrated |
-| 179 | `66cc07450513c27931ff352fdb99dd65613c9ef8` | 2026-02-12 | Change net_socket_buffer from int to string to support suffixed values (#44) | needs new integration task |
+| 179 | `66cc07450513c27931ff352fdb99dd65613c9ef8` | 2026-02-12 | Change net_socket_buffer from int to string to support suffixed values (#44) | adapted locally in `e9b50b39638a6fd7327d2480393a986e3cf2ead2` |
 | 180 | `b9c53132ddd3dbb51e27c7f3ffea540bc318db77` | 2026-02-12 | Graceful config upgrades: backfill defaults and save to disk (#45) | already integrated |
 | 181 | `ff5bc7ca3ac1c17d1d610f66b8213abf559df593` | 2026-02-12 | Add remote server diagnostics on first connection (#41) | already integrated |
 | 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | already integrated |
