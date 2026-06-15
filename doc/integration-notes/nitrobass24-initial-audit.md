@@ -295,7 +295,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 276 | `a976b9e52d227b6a601f9ca8f98e683eae11d5c8` | 2026-02-28 | Merge pull request #94 from nitrobass24/docs/add-umask-to-readme | covered elsewhere |
 | 277 | `7edb32561b1b192ba20e2b606d68e1ceaf8ab35e` | 2026-02-28 | Update website dependencies to address transitive vulnerabilities | intentionally skipped |
 | 278 | `bdfb0ba4e8460fb529ccdd09b056ada10b5384f3` | 2026-02-28 | Merge pull request #95 from nitrobass24/fix/dependabot-security-alerts | covered elsewhere |
-| 279 | `94af5b7095e89961b7d4ff4162c454f74f37d6c9` | 2026-02-28 | Mask SSH password in debug log output | needs integration/adapt locally |
+| 279 | `94af5b7095e89961b7d4ff4162c454f74f37d6c9` | 2026-02-28 | Mask SSH password in debug log output | adapted locally in `a9d02db2feaf03923207fc394356eef126c3c6e0` |
 | 280 | `c9538d4f80b30f25cf885fceb9d84f4af80318fc` | 2026-02-28 | Merge pull request #98 from nitrobass24/fix/mask-password-in-debug-logs | covered elsewhere |
 | 281 | `2d9ed7ecb2053c20b73a51a5569b7837a0573738` | 2026-02-28 | Release v0.12.5 — update CHANGELOG and bump version | intentionally skipped |
 | 282 | `94bc62df5aa58d57847c1b95b714373e8394d160` | 2026-02-28 | Skip Angular build on arm64 via build-contexts override | needs area reopen |
