@@ -231,12 +231,18 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
 
-        # Downloaded - local only after the remote file disappeared
+        # Downloaded - stays downloaded after the remote file disappears
         self.model_builder.clear()
-        self.model_builder.set_local_files([SystemFile("a", 100, False)])
+        self.model_builder.set_remote_files([SystemFile("a", 100, False)])
+        self.model_builder.set_local_files([SystemFile("a", 50, False)])
         self.model_builder.set_downloaded_files({"a"})
         model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
+
+        self.model_builder.set_remote_files([])
+        model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
+        self.assertIsNone(model.get_file("a").remote_size)
 
         # Staging-only local file should not be promoted by stale completion markers
         self.model_builder.clear()
@@ -2121,9 +2127,9 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(child.eta)
         self.assertFalse(self.model_builder.has_changes())
 
-    def test_build_downloading_state_is_retained(self):
-        # downloading files latest info should be retained even after
-        # they have stopped downloading
+    def test_build_active_overlay_falls_back_to_persistent_local_state_when_cleared(self):
+        # The active overlay is transient; clearing it should expose the
+        # persistent local snapshot again instead of keeping stale active data.
         self.model_builder.set_local_files([SystemFile("a", 42, False)])
         self.model_builder.set_active_files([SystemFile("a", 99, False)])
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -2132,13 +2138,47 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(99, model.get_file("a").local_size)
 
-        # set active files to empty
+        # Clear the overlay and rebuild from persistent local state.
         self.model_builder.set_active_files([])
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         s.total_transfer_state = LftpJobStatus.TransferState(12345, 1000, 0.25, None, None)
         self.model_builder.set_lftp_statuses([s])
         model = self.model_builder.build_model()
+        self.assertEqual(42, model.get_file("a").local_size)
+
+    def test_build_running_state_merges_active_files_without_mutating_local_state(self):
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 42, False)])
+        self.model_builder.set_active_files([SystemFile("a", 99, False)])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(42, self.model_builder._ModelBuilder__local_files["a"].size)
+        self.assertEqual(99, self.model_builder._ModelBuilder__active_files["a"].size)
         self.assertEqual(99, model.get_file("a").local_size)
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
+
+        self.model_builder.set_active_files([])
+        self.assertTrue(self.model_builder.has_changes())
+
+        model = self.model_builder.build_model()
+        self.assertEqual(42, model.get_file("a").local_size)
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
+
+    def test_rebuild_on_cleared_active_files_rebuilds_cached_overlay(self):
+        self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
+        self.model_builder.set_local_files([SystemFile("a", 42, False)])
+        self.model_builder.set_active_files([SystemFile("a", 99, False)])
+
+        model = self.model_builder.build_model()
+        self.assertEqual(99, model.get_file("a").local_size)
+
+        self.model_builder.set_active_files([])
+        self.assertTrue(self.model_builder.has_changes())
+
+        model = self.model_builder.build_model()
+        self.assertEqual(42, model.get_file("a").local_size)
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
 
     def test_build_downloading_speed(self):
         s = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -3147,9 +3187,9 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(self.model_builder.has_changes())
         self.model_builder.build_model()
 
-        # Does not invalidate on empty active files
+        # Invalidates when the active overlay is cleared after previously being populated
         self.model_builder.set_active_files([])
-        self.assertFalse(self.model_builder.has_changes())
+        self.assertTrue(self.model_builder.has_changes())
 
     def test_rebuild_on_local_files(self):
         self.assertTrue(self.model_builder.has_changes())

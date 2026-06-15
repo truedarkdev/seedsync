@@ -28,6 +28,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_command_processes = []
         self.controller._Controller__active_downloading_file_names = []
         self.controller._Controller__active_extracting_file_names = []
+        self.controller._Controller__prev_downloading_file_names = set()
+        self.controller._Controller__pending_completion_file_names = set()
         self.controller._Controller__pending_auto_purge_file_ids = set()
         self.controller._Controller__context = MagicMock()
         self.controller._Controller__context.status.controller = MagicMock()
@@ -1033,6 +1035,247 @@ class TestController(unittest.TestCase):
         self.assertEqual({added_file.file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_called_with(set())
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_handles_removed_diff_without_new_file(self, diff_models):
+        old_file = ModelFile("removed.bin", False)
+        old_file.path_pair_id = "movies"
+        old_file.state = ModelFile.State.DOWNLOADED
+
+        pending_entry = ("removed.bin", "movies", "Movies")
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        current_model.add_file(old_file)
+        new_model = Model()
+        new_model.set_base_logger(self.controller.logger)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = new_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            files=[],
+            timestamp=datetime.now(),
+        )
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = {pending_entry}
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.REMOVED,
+                old_file=old_file,
+                new_file=None
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(set(), self.controller._Controller__model.get_file_ids())
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_keeps_pending_completion_until_local_completion_proof(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 900
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        partial_file = ModelFile("movie.mkv", False)
+        partial_file.path_pair_id = "movies"
+        partial_file.remote_size = 1000
+        partial_file.local_size = 900
+        partial_file.state = ModelFile.State.DOWNLOADING
+        partial_model = Model()
+        partial_model.set_base_logger(self.controller.logger)
+        partial_model.add_file(partial_file)
+
+        terminal_file = ModelFile("movie.mkv", False)
+        terminal_file.path_pair_id = "movies"
+        terminal_file.remote_size = 1000
+        terminal_file.local_size = 1000
+        terminal_file.state = ModelFile.State.DOWNLOADED
+        terminal_model = Model()
+        terminal_model.set_base_logger(self.controller.logger)
+        terminal_model.add_file(terminal_file)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            partial_model,
+            terminal_model
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__active_scanner = MultiPathActiveScanner({})
+        self.controller._Controller__active_scanner.set_active_files = MagicMock()
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=active_file,
+                    new_file=partial_file
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=partial_file,
+                    new_file=terminal_file
+                )
+            ]
+        ]
+
+        self.controller._Controller__update_model()
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
+        self.controller._Controller__active_scanner.set_active_files.assert_called_with([completion_entry])
+
+        self.controller._Controller__update_model()
+        self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_applies_pending_completion_side_effects_once_for_terminal_update(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 900
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        terminal_file = ModelFile("movie.mkv", False)
+        terminal_file.path_pair_id = "movies"
+        terminal_file.remote_size = 1000
+        terminal_file.local_size = 1000
+        terminal_file.state = ModelFile.State.DOWNLOADED
+        terminal_model = Model()
+        terminal_model.set_base_logger(self.controller.logger)
+        terminal_model.add_file(terminal_file)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = terminal_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self.controller.clear_extracted_marker = MagicMock()
+        self.controller._Controller__move_from_staging = MagicMock()
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.UPDATED,
+                old_file=active_file,
+                new_file=terminal_file
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+        self.controller.clear_extracted_marker.assert_called_once_with(terminal_file)
+        self.controller._Controller__move_from_staging.assert_called_once_with("movie.mkv", "movies")
+        self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({completion_file_id})
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_does_not_mark_stopped_disappearing_download_as_downloaded(self, diff_models):
+        stopped_entry = ("movie.mkv", "movies", "Movies")
+        stopped_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 900
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        removed_model = Model()
+        removed_model.set_base_logger(self.controller.logger)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = removed_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {stopped_entry}
+        self.controller._Controller__persist.stopped_file_names = {stopped_file_id}
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.REMOVED,
+                old_file=active_file,
+                new_file=None
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+        self.controller._Controller__active_scanner.set_active_files.assert_called_with([])
+
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_does_not_mark_partial_disappearing_download_as_downloaded(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 900
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        partial_file = ModelFile("movie.mkv", False)
+        partial_file.path_pair_id = "movies"
+        partial_file.remote_size = 1000
+        partial_file.local_size = 900
+        partial_file.state = ModelFile.State.DOWNLOADING
+        partial_model = Model()
+        partial_model.set_base_logger(self.controller.logger)
+        partial_model.add_file(partial_file)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = partial_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.UPDATED,
+                old_file=active_file,
+                new_file=partial_file
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
+        self.controller._Controller__active_scanner.set_active_files.assert_called_with(["movie.mkv"])
 
     def test_clear_extracted_marker_does_not_clear_duplicate_names_across_path_pairs(self):
         file_a = ModelFile("archive.zip", False)
