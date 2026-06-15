@@ -7,10 +7,9 @@ import os
 import posixpath
 from typing import Optional
 import hashlib
-import shlex
 
 from .scanner_process import IScanner, ScannerError
-from common import overrides, Localization
+from common import overrides, Localization, escape_remote_path_for_shell
 from ssh import Sshcp, SshcpError, TRANSIENT_ERROR_PATTERNS
 from system import SystemFile
 
@@ -81,9 +80,9 @@ class RemoteScanner(IScanner):
 
         try:
             out = self.__ssh.shell("{} {}".format(
-                shlex.quote(self.__remote_path_to_scan_script),
-                shlex.quote(self.__remote_path_to_scan))
-            )
+                escape_remote_path_for_shell(self.__remote_path_to_scan_script),
+                escape_remote_path_for_shell(self.__remote_path_to_scan, allow_tilde_expansion=True)
+            ))
         except SshcpError as e:
             self.logger.warning("Caught an SshcpError: {}".format(str(e)))
             recoverable = True
@@ -126,7 +125,9 @@ class RemoteScanner(IScanner):
             local_md5sum = hashlib.md5(f.read()).hexdigest()
         self.logger.debug("Local scanfs md5sum = {}".format(local_md5sum))
         try:
-            out = self.__ssh.shell("md5sum {} | awk '{{print $1}}' || echo".format(shlex.quote(self.__remote_path_to_scan_script)))
+            out = self.__ssh.shell("md5sum {} | awk '{{print $1}}' || echo".format(
+                escape_remote_path_for_shell(self.__remote_path_to_scan_script)
+            ))
             out = out.decode()
             if out == local_md5sum:
                 self.logger.info("Skipping remote scanfs installation: already installed")

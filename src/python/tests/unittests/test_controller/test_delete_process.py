@@ -1,9 +1,10 @@
 import os
-import shlex
+import posixpath
 import unittest
 from unittest.mock import MagicMock, patch
 
 from controller.delete.delete_process import DeleteLocalProcess, DeleteRemoteProcess
+from common import escape_remote_path_for_shell
 
 
 class TestDeleteRemoteProcess(unittest.TestCase):
@@ -23,7 +24,9 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "what's.mkv")))
+        ssh.shell.assert_called_once_with(
+            "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "what's.mkv"))
+        )
 
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_quotes_shell_metacharacters(self, sshcp_cls):
@@ -41,7 +44,9 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "bad;rm -rf /")))
+        ssh.shell.assert_called_once_with(
+            "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "bad;rm -rf /"))
+        )
 
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_leaves_normal_filename_unquoted(self, sshcp_cls):
@@ -59,7 +64,32 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
         process.run_once()
 
-        ssh.shell.assert_called_once_with("rm -rf " + shlex.quote(os.path.join("/remote", "normal.mkv")))
+        ssh.shell.assert_called_once_with(
+            "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "normal.mkv"))
+        )
+
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_shell_expands_tilde_remote_path(self, sshcp_cls):
+        ssh = MagicMock()
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="~/remote",
+            file_name="normal.mkv"
+        )
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        ssh.shell.assert_called_once_with(
+            "rm -rf " + escape_remote_path_for_shell(
+                posixpath.join("~/remote", "normal.mkv"),
+                allow_tilde_expansion=True
+            )
+        )
 
 
 class TestDeleteLocalProcess(unittest.TestCase):
