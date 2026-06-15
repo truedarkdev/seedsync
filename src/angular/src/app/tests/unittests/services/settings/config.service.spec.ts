@@ -325,6 +325,15 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
+    it("should allow empty remote password values", () => {
+        httpMock.expectOne("/server/config/get").flush({lftp: {remote_password: "initial"}});
+
+        configService.set("lftp", "remote_password", "").subscribe(DoNothing);
+
+        expectConfigSetRequest("lftp", "remote_password", "");
+        httpMock.verify();
+    });
+
     it("should send updated config on a successful set", () => {
         const configJson = {general: {debug: false}};
         // first connect

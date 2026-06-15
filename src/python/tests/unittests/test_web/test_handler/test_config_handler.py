@@ -300,6 +300,53 @@ class TestConfigHandlerRoutes(unittest.TestCase):
             body
         )
 
+    def test_set_route_allows_empty_remote_password_from_body(self):
+        config = Config()
+        config.lftp.remote_password = "existing-password"
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/remote_password",
+            {"value": ""},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(200, status_code)
+        self.assertEqual("", config.lftp.remote_password)
+        self.assertIn("lftp.remote_password set to", body)
+
+    def test_set_route_rejects_whitespace_remote_password_from_body(self):
+        config = Config()
+        config.lftp.remote_password = "existing-password"
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/remote_password",
+            {"value": "  "},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(400, status_code)
+        self.assertEqual("existing-password", config.lftp.remote_password)
+        self.assertIn("Bad config: Lftp.remote_password is empty", body)
+
+    def test_set_route_treats_literal_empty_sentinel_as_value(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/remote_password",
+            {"value": "__empty__"},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(200, status_code)
+        self.assertEqual("__empty__", config.lftp.remote_password)
+        self.assertIn("lftp.remote_password set to __empty__", body)
+
     def test_set_route_rejects_old_url_value_shape(self):
         config = Config()
         ConfigHandler(config).add_routes(self.web_app)

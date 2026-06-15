@@ -44,12 +44,13 @@ export class ConfigService extends BaseWebService {
      */
     public set(section: string, option: string, value: any): Observable<WebReaction> {
         const valueStr: string = String(value);
+        const allowBlankValue = section === "lftp" && option === "remote_password";
         const currentConfig = this._config.getValue();
         if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
             return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(false, null, `Config has no option named ${section}.${option}`));
             });
-        } else if (valueStr.length === 0) {
+        } else if (valueStr.length === 0 && !allowBlankValue) {
             return new Observable<WebReaction>(observer => {
                 observer.next(new WebReaction(
                     false, null, Localization.Notification.CONFIG_VALUE_BLANK(section, option))
