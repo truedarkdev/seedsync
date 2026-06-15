@@ -110,6 +110,8 @@ Fork material to revisit in that future task:
   - builds out the broader reusable theme lane around `ThemeService`, including first-load FOUC prevention, registration/bootstrap wiring, and focused Settings-page toggle coverage
 - thejuran earlier dark-mode styling lane: `9a32aa9f`, `88d6258e`, `3f1d7d2e`, `31e2aae5`
   - captures the pre-terminal overhaul theme-aware CSS-variable migration, dropdown dark-mode cleanup, and later action-bar/sidebar dark-mode polish that could inform a less opinionated optional theme system
+- nitrobass24 dark-mode/theme lane: `c2037c0ff3370246b57facce2aa08f4ecb5cadfd`, `ef28f9884f45f9a07326edc8d46439af43b53e3d`
+  - adds a global dark-mode toggle and a later 3-surface elevation/semantic color redesign; these stay folded into the future theming evaluation instead of becoming repeated maintainer decisions in the nitrobass24 audit
 - thejuran terminal presentation suite: `ef728cc2`, `6865ea03`, `29e7d5d0`, `42d75b03`, `0bdeef59`, `b7fdff1a`, `d8570982`, `12a05c86`
   - adds a more opinionated terminal-style visual language across shell, dashboard, settings, logs, and about page
 - thejuran terminal-overhaul roadmap envelope: `3d2a3a2e` through `cf0a5fcb`

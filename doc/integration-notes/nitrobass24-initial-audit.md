@@ -188,7 +188,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 169 | `edac8873cb8c43c171b6c995376d0f356418fe34` | 2026-02-09 | Merge pull request #34 from nitrobass24/fix/config-persistence-hardening | covered elsewhere |
 | 170 | `90ce595d0296b77ecf8d47d3b3119fb8332fdc32` | 2026-02-11 | Add staging directory feature for fast-disk downloads | already integrated |
 | 171 | `a0992912215e0b279ccd1cd82b311d702b17fc7a` | 2026-02-11 | Merge pull request #36 from nitrobass24/feat/staging-directory | covered elsewhere |
-| 172 | `c2037c0ff3370246b57facce2aa08f4ecb5cadfd` | 2026-02-12 | Add dark mode support with theme toggle (#133) (#37) | maintainer decision needed |
+| 172 | `c2037c0ff3370246b57facce2aa08f4ecb5cadfd` | 2026-02-12 | Add dark mode support with theme toggle (#133) (#37) | covered elsewhere |
 | 173 | `35586499b6bb8ac6ad91132b70ce4c3b32020621` | 2026-02-12 | Fix staging directory not moving completed downloads (#38) | already integrated |
 | 174 | `382cf14a2e2ee17613661b4c59a37d642fa17601` | 2026-02-12 | Fix staging directory download completion and file detection (#39) | already integrated |
 | 175 | `9682f456e1a4e7f4fd1887a6c58ab2e38c47a60d` | 2026-02-12 | Add git workflow rules to CLAUDE.md | intentionally skipped |
@@ -199,11 +199,11 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 180 | `b9c53132ddd3dbb51e27c7f3ffea540bc318db77` | 2026-02-12 | Graceful config upgrades: backfill defaults and save to disk (#45) | already integrated |
 | 181 | `ff5bc7ca3ac1c17d1d610f66b8213abf559df593` | 2026-02-12 | Add remote server diagnostics on first connection (#41) | already integrated |
 | 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | already integrated |
-| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | maintainer decision needed |
-| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | maintainer decision needed |
+| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | adapted locally in `e55e6a4402b6b715cab09a1311d14c47186b8988` |
+| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | intentionally skipped |
 | 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
-| 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | maintainer decision needed |
+| 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | covered elsewhere |
 | 188 | `fa5aa24b5c2cb383274a5bf799a4b4d59a6517fa` | 2026-02-13 | Bump version to 0.12.0 and update changelog for release | covered elsewhere |
 | 189 | `281c2333f6416777802b6dc3d238c0ad1bde7c9f` | 2026-02-13 | Update docs for v0.12.0 features | covered elsewhere |
 | 190 | `e8d3b78a783a7a0b48c8bf069a54e4bc64cfe9a5` | 2026-02-13 | Merge pull request #52 from nitrobass24/develop | covered elsewhere |
