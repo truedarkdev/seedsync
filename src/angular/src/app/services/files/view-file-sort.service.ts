@@ -9,15 +9,15 @@ import {ViewFileOptions} from "./view-file-options";
 
 /**
  * Comparator used to sort the ViewFiles
- * First, sorts by status.
+ * First, sorts by legacy status priority.
  * Second, sorts by name.
  * @param {ViewFile} a
  * @param {ViewFile} b
  * @returns {number}
  * @private
  */
-const StatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
-    const statusComparison = compareStatus(a, b);
+const LegacyStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
+    const statusComparison = compareStatusLegacy(a, b);
     if (statusComparison !== 0) {
         return statusComparison;
     }
@@ -26,15 +26,37 @@ const StatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number 
 
 /**
  * Comparator used to sort the ViewFiles
- * First, sorts by status descending.
+ * First, sorts by smart status buckets.
+ * Second, sorts same-status files by older remote timestamps.
+ * Third, sorts by name.
+ * @param {ViewFile} a
+ * @param {ViewFile} b
+ * @returns {number}
+ * @private
+ */
+const SmartStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
+    const statusComparison = compareStatusImproved(a, b);
+    if (statusComparison !== 0) {
+        return statusComparison;
+    }
+    const timestampComparison = compareRemoteTimestamp(a, b);
+    if (timestampComparison !== 0) {
+        return timestampComparison;
+    }
+    return compareByName(a, b);
+};
+
+/**
+ * Comparator used to sort the ViewFiles
+ * First, sorts by legacy status descending.
  * Second, sorts by name.
  * @param {ViewFile} a
  * @param {ViewFile} b
  * @returns {number}
  * @private
  */
-const StatusDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
-    const statusComparison = compareStatus(a, b);
+const LegacyStatusDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
+    const statusComparison = compareStatusLegacy(a, b);
     if (statusComparison !== 0) {
         return -statusComparison;
     }
@@ -165,6 +187,15 @@ const compareByName = (a: ViewFile, b: ViewFile): number => {
     return a.name.localeCompare(b.name);
 };
 
+const compareRemoteTimestamp = (a: ViewFile, b: ViewFile): number => {
+    const aTime = getRemoteCreatedTimestampValue(a);
+    const bTime = getRemoteCreatedTimestampValue(b);
+    if (aTime === bTime) {
+        return 0;
+    }
+    return aTime - bTime;
+};
+
 const compareNullableNumbers = (a: number, b: number): number => {
     const aNumber = normalizeSortNumber(a);
     const bNumber = normalizeSortNumber(b);
@@ -210,7 +241,18 @@ const getSortSize = (file: ViewFile): number => {
     return normalizeSortNumber(file.localSize);
 };
 
-const compareStatus = (a: ViewFile, b: ViewFile): number => {
+const getRemoteCreatedTimestampValue = (file: ViewFile): number => {
+    if (file.remoteCreatedTimestamp == null || typeof file.remoteCreatedTimestamp.getTime !== "function") {
+        return 0;
+    }
+    const time = file.remoteCreatedTimestamp.getTime();
+    if (typeof time !== "number" || !isFinite(time)) {
+        return 0;
+    }
+    return time;
+};
+
+const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
     if (a.status !== b.status) {
         const statusPriorities = {
             [ViewFile.Status.CORRUPT]: 0,
@@ -232,6 +274,28 @@ const compareStatus = (a: ViewFile, b: ViewFile): number => {
     return 0;
 };
 
+const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
+    if (a.status !== b.status) {
+        const statusPriorities = {
+            [ViewFile.Status.CORRUPT]: 0,
+            [ViewFile.Status.EXTRACTING]: 1,
+            [ViewFile.Status.VALIDATING]: 2,
+            [ViewFile.Status.DOWNLOADING]: 3,
+            [ViewFile.Status.QUEUED]: 4,
+            [ViewFile.Status.STOPPED]: 5,
+            [ViewFile.Status.DEFAULT]: 6,
+            [ViewFile.Status.DELETED]: 6,
+            [ViewFile.Status.EXTRACTED]: 7,
+            [ViewFile.Status.VALIDATED]: 7,
+            [ViewFile.Status.DOWNLOADED]: 7
+        };
+        if (statusPriorities[a.status] !== statusPriorities[b.status]) {
+            return statusPriorities[a.status] - statusPriorities[b.status];
+        }
+    }
+    return 0;
+};
+
 /**
  * ViewFileSortService class provides sorting services for
  * view files
@@ -241,15 +305,19 @@ const compareStatus = (a: ViewFile, b: ViewFile): number => {
  */
 @Injectable()
 export class ViewFileSortService {
-    private _sortMethod: ViewFileOptions.SortMethod = null;
+    private _currentComparator: ViewFileComparator = null;
     private readonly _comparators = {
+        [ViewFileOptions.SortMethod.SMART_STATUS]: {
+            comparator: SmartStatusComparator,
+            label: "Smart Status"
+        },
         [ViewFileOptions.SortMethod.STATUS]: {
-            comparator: StatusComparator,
+            comparator: LegacyStatusComparator,
             label: "Status"
         },
         [ViewFileOptions.SortMethod.STATUS_DESC]: {
-            comparator: StatusDescendingComparator,
-            label: "Status Desc"
+            comparator: LegacyStatusDescendingComparator,
+            label: "Status Reverse"
         },
         [ViewFileOptions.SortMethod.NAME_ASC]: {
             comparator: NameAscendingComparator,
@@ -289,18 +357,24 @@ export class ViewFileSortService {
                 private _viewFileService: ViewFileService,
                 private _viewFileOptionsService: ViewFileOptionsService) {
         this._viewFileOptionsService.options.subscribe(options => {
-            // Check if the sort method changed
-            if (this._sortMethod !== options.sortMethod) {
-                this._sortMethod = options.sortMethod;
-                const sortConfig = this._comparators[this._sortMethod];
-                if (sortConfig != null) {
-                    this._viewFileService.setComparator(sortConfig.comparator);
-                    this._logger.debug("Comparator set to: " + sortConfig.label);
-                } else {
-                    this._viewFileService.setComparator(null);
-                    this._logger.debug("Comparator set to: null");
-                }
+            const sortConfig = this.getSortConfig(options);
+            if (this._currentComparator !== sortConfig.comparator) {
+                this._currentComparator = sortConfig.comparator;
+                this._viewFileService.setComparator(sortConfig.comparator);
+                this._logger.debug("Comparator set to: " + sortConfig.label);
             }
         });
+    }
+
+    private getSortConfig(options: ViewFileOptions): {comparator: ViewFileComparator, label: string} {
+        const sortConfig = this._comparators[options.sortMethod];
+        if (sortConfig != null) {
+            return sortConfig;
+        }
+
+        return {
+            comparator: null,
+            label: "null"
+        };
     }
 }

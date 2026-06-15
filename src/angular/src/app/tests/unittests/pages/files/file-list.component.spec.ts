@@ -32,11 +32,12 @@ class MockViewFileService {
 class MockViewFileOptionsService {
     options = new BehaviorSubject(new ViewFileOptions({
         showDetails: false,
-        sortMethod: ViewFileOptions.SortMethod.STATUS,
+        sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
         selectedStatusFilter: null,
         nameFilter: null,
         pinFilter: false
     })).asObservable();
+    setSortMethod = jasmine.createSpy("setSortMethod");
 }
 
 class MockFileSelectionService {
@@ -61,16 +62,18 @@ function createViewFile(props: any = {}): ViewFile {
 describe("Testing file list component", () => {
     let component: FileListComponent;
     let mockViewFileService: MockViewFileService;
+    let mockViewFileOptionsService: MockViewFileOptionsService;
     let mockLogger: MockLoggerService;
     let mockFileComponent: FileComponent;
 
     beforeEach(() => {
         mockLogger = new MockLoggerService();
         mockViewFileService = new MockViewFileService();
+        mockViewFileOptionsService = new MockViewFileOptionsService();
         component = new FileListComponent(
             mockLogger as any,
             mockViewFileService as any,
-            new MockViewFileOptionsService() as any,
+            mockViewFileOptionsService as any,
             new MockFileSelectionService() as any,
             new MockChangeDetectorRef() as any
         );
@@ -156,5 +159,29 @@ describe("Testing file list component", () => {
 
         expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
         expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+    });
+
+    it("should switch Smart Status to Status Reverse when the status header is clicked", () => {
+        component.onStatusSort(ViewFileOptions.SortMethod.SMART_STATUS);
+
+        expect(mockViewFileOptionsService.setSortMethod).toHaveBeenCalledWith(
+            ViewFileOptions.SortMethod.STATUS_DESC
+        );
+    });
+
+    it("should switch legacy Status to Status Reverse when the status header is clicked", () => {
+        component.onStatusSort(ViewFileOptions.SortMethod.STATUS);
+
+        expect(mockViewFileOptionsService.setSortMethod).toHaveBeenCalledWith(
+            ViewFileOptions.SortMethod.STATUS_DESC
+        );
+    });
+
+    it("should switch Status Reverse back to Smart Status when the status header is clicked", () => {
+        component.onStatusSort(ViewFileOptions.SortMethod.STATUS_DESC);
+
+        expect(mockViewFileOptionsService.setSortMethod).toHaveBeenCalledWith(
+            ViewFileOptions.SortMethod.SMART_STATUS
+        );
     });
 });

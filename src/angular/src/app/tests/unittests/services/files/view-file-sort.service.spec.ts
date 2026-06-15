@@ -49,7 +49,7 @@ describe("Testing view file sort service", () => {
     it("calls setComparator when sort method is changed", fakeAsync(() => {
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
@@ -113,12 +113,12 @@ describe("Testing view file sort service", () => {
     it("does not call setComparator on duplicate sort methods", fakeAsync(() => {
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
@@ -127,29 +127,29 @@ describe("Testing view file sort service", () => {
     it("does not call setComparator when a different option is changed", fakeAsync(() => {
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
             showDetails: false,
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
             showDetails: true,
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
     }));
 
-    it("correctly sorts by status", fakeAsync(() => {
+    it("correctly sorts by smart status", fakeAsync(() => {
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
         tick();
         expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
         expect(sortComparator).not.toBeNull();
 
-        // Check the order based on status
+        // Check the order based on smart status buckets
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTING}),
             new ViewFile({status: ViewFile.Status.DOWNLOADING})
@@ -163,10 +163,6 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTED}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
             new ViewFile({status: ViewFile.Status.CORRUPT}),
             new ViewFile({status: ViewFile.Status.EXTRACTING})
         )).toBeLessThan(0);
@@ -177,6 +173,110 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.VALIDATING}),
             new ViewFile({status: ViewFile.Status.DOWNLOADING})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.STOPPED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.STOPPED}),
+            new ViewFile({status: ViewFile.Status.DEFAULT})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.STOPPED}),
+            new ViewFile({status: ViewFile.Status.DELETED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT}),
+            new ViewFile({status: ViewFile.Status.EXTRACTED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT}),
+            new ViewFile({status: ViewFile.Status.VALIDATED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DELETED}),
+            new ViewFile({status: ViewFile.Status.EXTRACTED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DELETED}),
+            new ViewFile({status: ViewFile.Status.VALIDATED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DELETED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+        )).toBeLessThan(0);
+
+        // Default and Deleted should be intermixed
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT, name: ""}),
+            new ViewFile({status: ViewFile.Status.DELETED, name: ""})
+        )).toBe(0);
+
+        // Completed bucket entries should be ordered by age across statuses.
+        expect(sortComparator(
+            new ViewFile({
+                status: ViewFile.Status.EXTRACTED,
+                name: "zeta",
+                remoteCreatedTimestamp: new Date(1000)
+            }),
+            new ViewFile({
+                status: ViewFile.Status.VALIDATED,
+                name: "alpha",
+                remoteCreatedTimestamp: new Date(2000)
+            })
+        )).toBeLessThan(0);
+
+        expect(sortComparator(
+            new ViewFile({
+                status: ViewFile.Status.VALIDATED,
+                name: "beta",
+                remoteCreatedTimestamp: new Date(1000)
+            }),
+            new ViewFile({
+                status: ViewFile.Status.DOWNLOADED,
+                name: "gamma",
+                remoteCreatedTimestamp: new Date(2000)
+            })
+        )).toBeLessThan(0);
+
+        // Given the same status, older remote files should come first.
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTED}),
+            new ViewFile({status: ViewFile.Status.STOPPED})
+        )).toBeGreaterThan(0);
+
+        // If same-status timestamps match, the name fallback still applies.
+        expect(sortComparator(
+            new ViewFile({
+                status: ViewFile.Status.EXTRACTED,
+                name: "alpha",
+                remoteCreatedTimestamp: new Date(1000)
+            }),
+            new ViewFile({
+                status: ViewFile.Status.EXTRACTED,
+                name: "beta",
+                remoteCreatedTimestamp: new Date(1000)
+            })
+        )).toBeLessThan(0);
+    }));
+
+    it("correctly sorts by legacy status", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.STATUS,
+        }));
+        tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
+
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.EXTRACTED}),
+            new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTED}),
@@ -188,55 +288,51 @@ describe("Testing view file sort service", () => {
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DOWNLOADED}),
-            new ViewFile({status: ViewFile.Status.STOPPED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.STOPPED}),
             new ViewFile({status: ViewFile.Status.DEFAULT})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.STOPPED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED}),
             new ViewFile({status: ViewFile.Status.DELETED})
         )).toBeLessThan(0);
-
-        // Default and Deleted should be intermixed
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DEFAULT, name: ""}),
             new ViewFile({status: ViewFile.Status.DELETED, name: ""})
         )).toBe(0);
 
-        // Given same status, order should be determined by ascending name
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "flower"}),
-            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "tofu"})
-        )).toBeLessThan(0);
+            new ViewFile({
+                status: ViewFile.Status.EXTRACTED,
+                name: "zeta",
+                remoteCreatedTimestamp: new Date(1000)
+            }),
+            new ViewFile({
+                status: ViewFile.Status.EXTRACTED,
+                name: "alpha",
+                remoteCreatedTimestamp: new Date(2000)
+            })
+        )).toBeGreaterThan(0);
     }));
 
-    it("prioritizes validation statuses between their adjacent states", fakeAsync(() => {
+    it("keeps status reverse unchanged", fakeAsync(() => {
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
         viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS
+            sortMethod: ViewFileOptions.SortMethod.STATUS_DESC
         }));
         tick();
+        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
+        expect(sortComparator).not.toBeNull();
 
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.CORRUPT}),
-            new ViewFile({status: ViewFile.Status.EXTRACTING})
+            new ViewFile({status: ViewFile.Status.DEFAULT, name: "alpha"}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADING, name: "beta"})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTING}),
-            new ViewFile({status: ViewFile.Status.VALIDATING})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.VALIDATING}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADING})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTED}),
-            new ViewFile({status: ViewFile.Status.VALIDATED})
+            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "alpha"}),
+            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "beta"})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.VALIDATED}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+            new ViewFile({status: ViewFile.Status.EXTRACTED})
         )).toBeLessThan(0);
     }));
 
@@ -292,25 +388,6 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED, name: "aaaa"}),
             new ViewFile({status: ViewFile.Status.EXTRACTED, name: "aaaa"})
         )).toBe(0);
-    }));
-
-    it("correctly sorts by descending status", fakeAsync(() => {
-        expect(viewFileService.setComparator).toHaveBeenCalledTimes(0);
-        viewFileOptionsService._options.next(new ViewFileOptions({
-            sortMethod: ViewFileOptions.SortMethod.STATUS_DESC
-        }));
-        tick();
-        expect(viewFileService.setComparator).toHaveBeenCalledTimes(1);
-        expect(sortComparator).not.toBeNull();
-
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DEFAULT, name: "alpha"}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADING, name: "beta"})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "alpha"}),
-            new ViewFile({status: ViewFile.Status.EXTRACTED, name: "beta"})
-        )).toBeLessThan(0);
     }));
 
     it("correctly sorts by ascending size", fakeAsync(() => {

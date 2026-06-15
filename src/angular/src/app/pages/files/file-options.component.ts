@@ -71,7 +71,7 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
             this._changeDetector.detectChanges();
         });
 
-        // Keep the latest options for toggle behaviour implementation
+        // Keep the latest options for the toggle handlers.
         this._optionsSubscription = this.viewFileOptionsService.options.subscribe(options => this._latestOptions = options);
 
         window.addEventListener("scroll", this._windowScrollListener, true);

@@ -108,10 +108,24 @@ export class FileListComponent implements OnInit, OnDestroy {
         }
     }
 
+    onStatusSort(currentSortMethod: ViewFileOptions.SortMethod): void {
+        this.viewFileOptionsService.setSortMethod(
+            currentSortMethod === ViewFileOptions.SortMethod.STATUS_DESC ?
+                ViewFileOptions.SortMethod.SMART_STATUS :
+                ViewFileOptions.SortMethod.STATUS_DESC
+        );
+    }
+
     isSortedBy(currentSortMethod: ViewFileOptions.SortMethod,
                primarySortMethod: ViewFileOptions.SortMethod,
                secondarySortMethod: ViewFileOptions.SortMethod): boolean {
         return currentSortMethod === primarySortMethod || currentSortMethod === secondarySortMethod;
+    }
+
+    isStatusSorted(currentSortMethod: ViewFileOptions.SortMethod): boolean {
+        return currentSortMethod === ViewFileOptions.SortMethod.SMART_STATUS ||
+            currentSortMethod === ViewFileOptions.SortMethod.STATUS ||
+            currentSortMethod === ViewFileOptions.SortMethod.STATUS_DESC;
     }
 
     isSortDescending(currentSortMethod: ViewFileOptions.SortMethod,
