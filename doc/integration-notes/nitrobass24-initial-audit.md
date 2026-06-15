@@ -199,8 +199,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 180 | `b9c53132ddd3dbb51e27c7f3ffea540bc318db77` | 2026-02-12 | Graceful config upgrades: backfill defaults and save to disk (#45) | already integrated |
 | 181 | `ff5bc7ca3ac1c17d1d610f66b8213abf559df593` | 2026-02-12 | Add remote server diagnostics on first connection (#41) | already integrated |
 | 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | already integrated |
-| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | needs area reopen |
-| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | needs area reopen |
+| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | maintainer decision needed |
+| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | maintainer decision needed |
 | 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | maintainer decision needed |
