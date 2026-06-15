@@ -174,6 +174,7 @@ class AutoQueue:
         self.__enabled = context.config.autoqueue.enabled
         self.__patterns_only = context.config.autoqueue.patterns_only
         self.__auto_extract_enabled = context.config.autoqueue.auto_extract
+        self.__auto_delete_remote_enabled = context.config.autoqueue.auto_delete_remote
         self.__cycle_sequence = 0
 
         if self.__enabled:
@@ -424,6 +425,11 @@ class AutoQueue:
             for file in blocked_extract_candidates:
                 self.__controller.clear_extracted_marker(file)
 
+        ###
+        # Delete Remote
+        ###
+        files_to_delete_remote = self.__filter_delete_remote_candidates()
+
         self.__record_breadcrumb(
             "auto_queue_cycle",
             {
@@ -468,6 +474,20 @@ class AutoQueue:
                 Controller.Command.Action.EXTRACT,
                 file.file_id,
                 flow_id="autoq:{}:EXTRACT:{}".format(self.__cycle_sequence, file.file_id),
+                origin="auto_queue",
+            )
+            self.__controller.queue_command(command)
+
+        # Send the delete remote commands (after extract so extraction happens first)
+        for file, pattern in files_to_delete_remote:
+            self.logger.info(
+                "Auto deleting remote '{}'".format(file.name) +
+                (" for pattern '{}'".format(pattern.pattern) if pattern else "")
+            )
+            command = Controller.Command(
+                Controller.Command.Action.DELETE_REMOTE,
+                file.file_id,
+                flow_id="autoq:{}:DELETE_REMOTE:{}".format(self.__cycle_sequence, file.file_id),
                 origin="auto_queue",
             )
             self.__controller.queue_command(command)
@@ -557,6 +577,46 @@ class AutoQueue:
                 })
 
         return reason_counts, samples
+
+    def __filter_delete_remote_candidates(self) -> List[Tuple[ModelFile, Optional[AutoQueuePattern]]]:
+        """
+        Select remote-delete candidates from true completion transitions only.
+        This intentionally avoids startup seeding and new-pattern backfill.
+        """
+        if not self.__auto_delete_remote_enabled:
+            return []
+
+        files_matched = dict()
+        for old_file, new_file in self.__model_listener.modified_files:
+            if not self.__is_remote_delete_transition(old_file, new_file):
+                continue
+            if self.__patterns_only:
+                for pattern in self.__persist.patterns:
+                    if self.__match(pattern, new_file):
+                        files_matched[new_file.file_id] = (new_file, pattern)
+                        break
+            else:
+                files_matched[new_file.file_id] = (new_file, None)
+
+        return list(files_matched.values())
+
+    @staticmethod
+    def __is_remote_delete_transition(old_file: ModelFile, new_file: ModelFile) -> bool:
+        if new_file.remote_size is None:
+            return False
+        if old_file.state == new_file.state:
+            return False
+        if new_file.state == ModelFile.State.EXTRACTED:
+            return old_file.state == ModelFile.State.EXTRACTING
+        if new_file.state == ModelFile.State.DOWNLOADED:
+            if new_file.is_extractable:
+                return False
+            return old_file.state not in (
+                ModelFile.State.DOWNLOADED,
+                ModelFile.State.EXTRACTED,
+                ModelFile.State.EXTRACTING,
+            )
+        return False
 
     def __queue_block_reason(self, file: ModelFile) -> str:
         if file.remote_size is None:
