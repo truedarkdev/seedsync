@@ -144,46 +144,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | covered elsewhere |
 | 126 | `0508a7a841b7b0a777e97fddb673cd1b114a3a7c` | 2026-01-26 | Update CHANGELOG and MODERNIZATION_PLAN for v0.10.0 | intentionally skipped |
 | 127 | `0b1619f9aa3e29190e833a6777dd44f02088338c` | 2026-01-26 | Add CLAUDE.md with project instructions and release process | intentionally skipped |
-| 128 | `43c35ae37a3027516bba76e592dcd14e8b6acbdd` | 2026-01-26 | Rollback Angular 17 to Angular 4 (v0.10.1) | pending |
-| 129 | `e6d32c4e5629ac22fd83ca16ce4d6375ed43660a` | 2026-01-26 | Fix scanfs binary architecture for ARM local machines | pending |
-| 130 | `b7b45d3772576f444c5e5a85db9c426ade39fbb0` | 2026-01-27 | Fix restart button, settings persistence, and update About page | pending |
-| 131 | `ce7527f395cc673be5cbd61e745d5aa34ae78def` | 2026-01-27 | Update CLAUDE.md with release process details | pending |
-| 132 | `11d003f80d727aecc78766d6d925b4f6bacc1ddc` | 2026-01-27 | Remove angular-v17 from master - preserved in angular-17-upgrade branch | pending |
-| 133 | `c46c4e32e4d17cdc5a74ccdb2244956126283307` | 2026-01-27 | Update CLAUDE.md - document branch structure | pending |
-| 134 | `372f7e0cc860a106567f579a6932ccd88d11f9cc` | 2026-01-27 | Add path filter to docs workflow - only deploy when website/ changes | pending |
-| 135 | `9cbb21b92368a363a91c6aa8e1296a1f4ad61bbf` | 2026-01-27 | Only publish Docker images on release tags | pending |
-| 136 | `b3a37b1be1dcd754c32dfe14eaaf7d235c64ed91` | 2026-01-27 | Document CI/CD workflow behavior in CLAUDE.md | pending |
-| 137 | `d2c42620e69a115880af42c4656e841534c295a6` | 2026-01-27 | Fix remote paths with tilde (~) for shell expansion (#14) | pending |
-| 138 | `dc3da40b92ca4d7885d8d35259eee21f86803d0d` | 2026-01-27 | Fix LftpJobStatusParser crash on empty output (#15) | pending |
-| 139 | `cac415e05d7a60c9568a980a0f5dd40189f11c17` | 2026-01-27 | Add CI workflow for develop branch | pending |
-| 140 | `f1359e90029a1cce0c0379924d47399f7a645d83` | 2026-01-27 | Strip ANSI escape codes from LFTP output before parsing | pending |
-| 141 | `59db35c230ec4422c7b76411e11052470399f931` | 2026-02-02 | Improve error messaging for remote shell not found | pending |
-| 142 | `054fb83fc855b7feba7b3104550fd7dc3b775d67` | 2026-02-07 | Release v0.10.5 - Fix tilde delete, shell detection, optional password, bandwidth limit | pending |
-| 143 | `7af489e78c1fba931bb8eef950da89c34d25edfe` | 2026-02-07 | Release v0.10.6 - Auto-delete from remote after download (#25) | pending |
-| 144 | `7260932ab331bf069f844a6ef0a56d6d703b48ca` | 2026-01-27 | Merge pull request #16 from nitrobass24/develop | pending |
-| 145 | `69aef40a1f346c5c280e32db03e92c092b6f8742` | 2026-02-07 | Merge pull request #28 from nitrobass24/develop | pending |
-| 146 | `afc3f5824a8b5b8bd889b6af5d110b604ad19b14` | 2026-02-07 | Merge master into develop | pending |
-| 147 | `2ee0e21bae50451c04effd89bc1abb1c5773dcf3` | 2026-02-07 | Migrate frontend from Angular 4 to Angular 21 | pending |
-| 148 | `61fbfc50e0366a0895d532b65ff6c094465b0436` | 2026-02-07 | Fix SSE streaming bootstrap, checkbox rendering, and Dockerfile for Angular 21 | pending |
-| 149 | `cb2a9ff12e020224de4679099c628b5d5a83b2f7` | 2026-02-07 | Add Bootstrap JS for dropdowns, eagerly init filter/sort services, simplify settings | pending |
-| 150 | `b1db68bd05444c598a30366dce17740a26976c1a` | 2026-02-07 | Clean up build warnings: adjust budgets and fix Dockerfile platform arg | pending |
-| 151 | `2cb09a6a697e8007e8fba1796e5c59c7bd340ffe` | 2026-02-07 | Prepare v0.11.0: fix FA icon, dynamic version, remove old code, update docs | pending |
-| 152 | `8e57a35d2f2f0b87907c2a4fa40476ae73c3a689` | 2026-02-07 | Add CI workflow for angular-21-upgrade branch | pending |
-| 153 | `e79915a466de4d54f9ecf87261bb721f02c920d3` | 2026-02-07 | Add comprehensive Angular unit tests (125 tests across 15 files) | pending |
-| 154 | `5d540655341e9376608df6cb6ad89d16a5c377ae` | 2026-02-08 | Track package-lock.json for reproducible Docker builds | pending |
-| 155 | `8b409c5c76b0c89c1e8212ef0d143ee34a29009f` | 2026-02-08 | Prep v0.11.0 merge: update changelog, remove branch CI | pending |
-| 156 | `066fa3f5a7a1b5d3ee74af1fde9cb8132e229677` | 2026-02-07 | Merge pull request #29 from nitrobass24/develop | pending |
-| 157 | `464c04f596b90c81056baefa3541953b331b88fc` | 2026-02-07 | Update docs for v0.10.5 and v0.10.6 features | pending |
-| 158 | `a793d106fbf9e60da1e57026917b046ffc84e1b7` | 2026-02-07 | Merge pull request #30 from nitrobass24/develop | pending |
-| 159 | `8a23231c34e3c6288098d84d67ceac073e5d7601` | 2026-02-08 | Merge master into angular-21-upgrade | pending |
-| 160 | `f5b08cc5b2523003e06c957d43d632bb9b2a4f31` | 2026-02-08 | Merge Angular 4 → 21 frontend rewrite (v0.11.0) | pending |
-| 161 | `71b2e77e35dfca6d01ded29d057fe5ce930f78ec` | 2026-02-08 | Update CLAUDE.md for Angular 21 and current branch state | pending |
-| 162 | `04cefc303acc4566ebc2d61e201fa62b9942ef26` | 2026-02-08 | Fix config file overwritten on container restart | pending |
-| 163 | `c9d539121f5ea9e06e1ba89faa61649e97b75781` | 2026-02-08 | Release v0.11.1 - Fix config overwritten on container restart | pending |
-| 164 | `de7b7bdd8f856f484ba6bd3aa2a86d24c2c34908` | 2026-02-08 | Add docker pull command to release notes template | pending |
-| 165 | `9faf724a51c47b6872e1e4b2258a847c0c8d9dda` | 2026-02-09 | Move web access logs to DEBUG level to reduce log noise | pending |
-| 166 | `b63244d7e2c5bcb5e26e452ece0de17b40edd8d5` | 2026-02-09 | Release v0.11.2 - Move web access logs to DEBUG level | pending |
-| 167 | `c636dd68fd9f22a9d7cf09ca0ba8633f1eccca2a` | 2026-02-09 | Harden config persistence against data loss | pending |
+| 128 | `43c35ae37a3027516bba76e592dcd14e8b6acbdd` | 2026-01-26 | Rollback Angular 17 to Angular 4 (v0.10.1) | intentionally skipped |
+| 129 | `e6d32c4e5629ac22fd83ca16ce4d6375ed43660a` | 2026-01-26 | Fix scanfs binary architecture for ARM local machines | needs integration |
+| 130 | `b7b45d3772576f444c5e5a85db9c426ade39fbb0` | 2026-01-27 | Fix restart button, settings persistence, and update About page | covered elsewhere |
+| 131 | `ce7527f395cc673be5cbd61e745d5aa34ae78def` | 2026-01-27 | Update CLAUDE.md with release process details | intentionally skipped |
+| 132 | `11d003f80d727aecc78766d6d925b4f6bacc1ddc` | 2026-01-27 | Remove angular-v17 from master - preserved in angular-17-upgrade branch | intentionally skipped |
+| 133 | `c46c4e32e4d17cdc5a74ccdb2244956126283307` | 2026-01-27 | Update CLAUDE.md - document branch structure | intentionally skipped |
+| 134 | `372f7e0cc860a106567f579a6932ccd88d11f9cc` | 2026-01-27 | Add path filter to docs workflow - only deploy when website/ changes | intentionally skipped |
+| 135 | `9cbb21b92368a363a91c6aa8e1296a1f4ad61bbf` | 2026-01-27 | Only publish Docker images on release tags | covered elsewhere |
+| 136 | `b3a37b1be1dcd754c32dfe14eaaf7d235c64ed91` | 2026-01-27 | Document CI/CD workflow behavior in CLAUDE.md | intentionally skipped |
+| 137 | `d2c42620e69a115880af42c4656e841534c295a6` | 2026-01-27 | Fix remote paths with tilde (~) for shell expansion (#14) | needs integration |
+| 138 | `dc3da40b92ca4d7885d8d35259eee21f86803d0d` | 2026-01-27 | Fix LftpJobStatusParser crash on empty output (#15) | covered elsewhere |
+| 139 | `cac415e05d7a60c9568a980a0f5dd40189f11c17` | 2026-01-27 | Add CI workflow for develop branch | intentionally skipped |
+| 140 | `f1359e90029a1cce0c0379924d47399f7a645d83` | 2026-01-27 | Strip ANSI escape codes from LFTP output before parsing | covered elsewhere |
+| 141 | `59db35c230ec4422c7b76411e11052470399f931` | 2026-02-02 | Improve error messaging for remote shell not found | needs integration |
+| 142 | `054fb83fc855b7feba7b3104550fd7dc3b775d67` | 2026-02-07 | Release v0.10.5 - Fix tilde delete, shell detection, optional password, bandwidth limit | needs integration |
+| 143 | `7af489e78c1fba931bb8eef950da89c34d25edfe` | 2026-02-07 | Release v0.10.6 - Auto-delete from remote after download (#25) | needs integration |
+| 144 | `7260932ab331bf069f844a6ef0a56d6d703b48ca` | 2026-01-27 | Merge pull request #16 from nitrobass24/develop | covered elsewhere |
+| 145 | `69aef40a1f346c5c280e32db03e92c092b6f8742` | 2026-02-07 | Merge pull request #28 from nitrobass24/develop | covered elsewhere |
+| 146 | `afc3f5824a8b5b8bd889b6af5d110b604ad19b14` | 2026-02-07 | Merge master into develop | covered elsewhere |
+| 147 | `2ee0e21bae50451c04effd89bc1abb1c5773dcf3` | 2026-02-07 | Migrate frontend from Angular 4 to Angular 21 | already integrated |
+| 148 | `61fbfc50e0366a0895d532b65ff6c094465b0436` | 2026-02-07 | Fix SSE streaming bootstrap, checkbox rendering, and Dockerfile for Angular 21 | covered elsewhere |
+| 149 | `cb2a9ff12e020224de4679099c628b5d5a83b2f7` | 2026-02-07 | Add Bootstrap JS for dropdowns, eagerly init filter/sort services, simplify settings | covered elsewhere |
+| 150 | `b1db68bd05444c598a30366dce17740a26976c1a` | 2026-02-07 | Clean up build warnings: adjust budgets and fix Dockerfile platform arg | covered elsewhere |
+| 151 | `2cb09a6a697e8007e8fba1796e5c59c7bd340ffe` | 2026-02-07 | Prepare v0.11.0: fix FA icon, dynamic version, remove old code, update docs | covered elsewhere |
+| 152 | `8e57a35d2f2f0b87907c2a4fa40476ae73c3a689` | 2026-02-07 | Add CI workflow for angular-21-upgrade branch | intentionally skipped |
+| 153 | `e79915a466de4d54f9ecf87261bb721f02c920d3` | 2026-02-07 | Add comprehensive Angular unit tests (125 tests across 15 files) | covered elsewhere |
+| 154 | `5d540655341e9376608df6cb6ad89d16a5c377ae` | 2026-02-08 | Track package-lock.json for reproducible Docker builds | covered elsewhere |
+| 155 | `8b409c5c76b0c89c1e8212ef0d143ee34a29009f` | 2026-02-08 | Prep v0.11.0 merge: update changelog, remove branch CI | covered elsewhere |
+| 156 | `066fa3f5a7a1b5d3ee74af1fde9cb8132e229677` | 2026-02-07 | Merge pull request #29 from nitrobass24/develop | covered elsewhere |
+| 157 | `464c04f596b90c81056baefa3541953b331b88fc` | 2026-02-07 | Update docs for v0.10.5 and v0.10.6 features | covered elsewhere |
+| 158 | `a793d106fbf9e60da1e57026917b046ffc84e1b7` | 2026-02-07 | Merge pull request #30 from nitrobass24/develop | covered elsewhere |
+| 159 | `8a23231c34e3c6288098d84d67ceac073e5d7601` | 2026-02-08 | Merge master into angular-21-upgrade | covered elsewhere |
+| 160 | `f5b08cc5b2523003e06c957d43d632bb9b2a4f31` | 2026-02-08 | Merge Angular 4 → 21 frontend rewrite (v0.11.0) | already integrated |
+| 161 | `71b2e77e35dfca6d01ded29d057fe5ce930f78ec` | 2026-02-08 | Update CLAUDE.md for Angular 21 and current branch state | intentionally skipped |
+| 162 | `04cefc303acc4566ebc2d61e201fa62b9942ef26` | 2026-02-08 | Fix config file overwritten on container restart | already integrated |
+| 163 | `c9d539121f5ea9e06e1ba89faa61649e97b75781` | 2026-02-08 | Release v0.11.1 - Fix config overwritten on container restart | covered elsewhere |
+| 164 | `de7b7bdd8f856f484ba6bd3aa2a86d24c2c34908` | 2026-02-08 | Add docker pull command to release notes template | intentionally skipped |
+| 165 | `9faf724a51c47b6872e1e4b2258a847c0c8d9dda` | 2026-02-09 | Move web access logs to DEBUG level to reduce log noise | needs integration |
+| 166 | `b63244d7e2c5bcb5e26e452ece0de17b40edd8d5` | 2026-02-09 | Release v0.11.2 - Move web access logs to DEBUG level | covered elsewhere |
+| 167 | `c636dd68fd9f22a9d7cf09ca0ba8633f1eccca2a` | 2026-02-09 | Harden config persistence against data loss | already integrated |
 | 168 | `864c1c205db3d22dceafb0f510f952ef61880dbf` | 2026-02-09 | Release v0.11.3 - Harden config persistence against data loss | pending |
 | 169 | `edac8873cb8c43c171b6c995376d0f356418fe34` | 2026-02-09 | Merge pull request #34 from nitrobass24/fix/config-persistence-hardening | pending |
 | 170 | `90ce595d0296b77ecf8d47d3b3119fb8332fdc32` | 2026-02-11 | Add staging directory feature for fast-disk downloads | pending |

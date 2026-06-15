@@ -94,18 +94,20 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `127` (`0b1619f9aa3e29190e833a6777dd44f02088338c`)
+- Last dispositioned fork-unique row: `167` (`c636dd68fd9f22a9d7cf09ca0ba8633f1eccca2a`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Integrated so far: audit chunk `88-127` is fully dispositioned; rows `88`, `94`, `95`, `100`, `102`, and `123` are locally adapted in `89362f026db73c655d4a286c57c5abbe860c8fcb`, `1d30a9ec7c85a80801f8a04d2e56a6e3db269f95`, `391b171a0797d45745e5908d513181b7e97a8751`, and `c5d042018043cc274603e075b166bfa6b519b354`.
-- Resume when new upstream appears: run `git fetch --no-tags nitrobass24 --prune`, verify the branch tip, then continue from row `128` in exact 40-row contiguous chunks, oldest-to-newest; rows `1-87` are baseline accounting rows, rows `88-127` are already dispositioned, and do not start the next chunk until every row in the current chunk has a disposition.
+- Integrated so far: audit chunks `88-127` and `128-167` are fully dispositioned; rows `88`, `94`, `95`, `100`, `102`, and `123` are locally adapted in `89362f026db73c655d4a286c57c5abbe860c8fcb`, `1d30a9ec7c85a80801f8a04d2e56a6e3db269f95`, `391b171a0797d45745e5908d513181b7e97a8751`, and `c5d042018043cc274603e075b166bfa6b519b354`; rows `129`, `137`, `141`, `142`, `143`, and `165` remain in the active implementation queue.
+- Resume when new upstream appears: run `git fetch --no-tags nitrobass24 --prune`, verify the branch tip, then continue from the active implementation queue before moving to row `168` in exact 40-row contiguous chunks, oldest-to-newest; rows `1-87` are baseline accounting rows, rows `88-167` are already dispositioned, and do not start the next chunk until every row in the current chunk has a disposition.
 - Notes:
   - This repo is not GitHub-marked as a fork, but it is SeedSync-derived.
   - `remote.nitrobass24.tagOpt=--no-tags`; branch refs anchor this lane, and the pre-existing local `refs/tags/v1.0.0` is intentionally ignored.
   - `38d6ef22d36b6a75c164bc754bac9cd2842e8722` is the frozen tip only, not a processed checkpoint.
   - The common base with local `origin/master` is `ff2a1039935beccbbf7ec76134b41d2e91137742`; rows `1-87` are baseline accounting rows and rows `88-956` are the fork-unique audit workload.
   - Treat this as a selective source because it is modernization-heavy.
-  - Chunk `88-127` is complete: rows `88`, `94`, `95`, `100`, `102`, and `123` are locally adapted, 0 `needs integration` rows remain, 3 `needs area reopen` rows (`92`, `93`, `122`), 1 `maintainer decision needed` row (`105`), 20 `intentionally skipped`, and 10 `covered elsewhere`; next chunk is `128-167` and is not started yet.
+  - Chunk `88-127` is complete: rows `88`, `94`, `95`, `100`, `102`, and `123` are locally adapted, 0 `needs integration` rows remain, 3 `needs area reopen` rows (`92`, `93`, `122`), 1 `maintainer decision needed` row (`105`), 20 `intentionally skipped`, and 10 `covered elsewhere`.
+  - Chunk `128-167` is dispositioned: 4 `already integrated`, 20 `covered elsewhere`, 10 `intentionally skipped`, 6 `needs integration` rows (`129`, `137`, `141`, `142`, `143`, `165`), 0 `needs area reopen`, 0 `needs new integration task`, and 0 `maintainer decision needed`.
+  - Next nitrobass24 work: implement the chunk `128-167` queue before opening row `168`; row `129` is Docker scanfs cross-architecture builder support, row `137` is remote `~` path expansion, row `141` is remote shell-not-found messaging, row `142` covers remaining v0.10.5 behavior deltas, row `143` covers optional auto-delete-after-download behavior, and row `165` moves web access logs to DEBUG.
   - Follow-up: row `88`/`100` PUID/PGID support intentionally treats PUID/PGID and mounted paths as trusted operator-controlled Docker inputs; security review accepted residual non-blocking risks around existing principal reuse and reused-account home mutation.
   - Follow-up: row `102`/`123` compatibility is implemented for the Docker image scanfs build only; evaluate the separate `src/docker/build/deb/Dockerfile` scanfs packaging lane when deb packaging compatibility is in scope.
 
