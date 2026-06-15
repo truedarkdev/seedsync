@@ -18,6 +18,15 @@ PYTEST_ARTIFACT_DIR:=$(ROOTDIR)/tmp/pytest
 DEFAULT_STAGING_REGISTRY:=localhost:5000
 DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
 DEB_GLIBC_MAX:=2.31
+SCANFS_PLATFORM?=linux/amd64
+SCANFS_PLATFORM_SUPPORTED:=linux/amd64 linux/arm64 linux/arm/v7
+
+ifeq ($(value SCANFS_PLATFORM),linux/amd64)
+else ifeq ($(value SCANFS_PLATFORM),linux/arm64)
+else ifeq ($(value SCANFS_PLATFORM),linux/arm/v7)
+else
+$(error Unsupported SCANFS_PLATFORM '$(value SCANFS_PLATFORM)'; supported values: $(SCANFS_PLATFORM_SUPPORTED))
+endif
 
 #DOCKER_BUILDKIT_FLAGS=BUILDKIT_PROGRESS=plain
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
@@ -33,6 +42,7 @@ builddir:
 scanfs: builddir
 	$(DOCKER) build \
 		-f ${SOURCEDIR}/docker/build/deb/Dockerfile \
+		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
 		--target seedsync_build_scanfs_export \
 		--output ${BUILDDIR} \
 		${ROOTDIR}
@@ -40,6 +50,7 @@ scanfs: builddir
 deb: builddir
 	$(DOCKER) build \
 		-f ${SOURCEDIR}/docker/build/deb/Dockerfile \
+		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
 		--target seedsync_build_deb_export \
 		--output ${BUILDDIR} \
 		${ROOTDIR}
@@ -60,6 +71,7 @@ docker-image: docker-buildx
 	# final image
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
+		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
 		--target seedsync_run \
 		--tag $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} \
 		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max \
@@ -85,6 +97,7 @@ docker-image-release:
 	# final image
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
+		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
 		--target seedsync_run \
 		--tag ${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION} \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
