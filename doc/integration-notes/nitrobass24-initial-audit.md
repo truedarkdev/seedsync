@@ -201,17 +201,17 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | already integrated |
 | 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | needs area reopen |
 | 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | needs area reopen |
-| 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | needs new integration task |
-| 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | needs new integration task |
+| 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
+| 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | maintainer decision needed |
 | 188 | `fa5aa24b5c2cb383274a5bf799a4b4d59a6517fa` | 2026-02-13 | Bump version to 0.12.0 and update changelog for release | covered elsewhere |
 | 189 | `281c2333f6416777802b6dc3d238c0ad1bde7c9f` | 2026-02-13 | Update docs for v0.12.0 features | covered elsewhere |
 | 190 | `e8d3b78a783a7a0b48c8bf069a54e4bc64cfe9a5` | 2026-02-13 | Merge pull request #52 from nitrobass24/develop | covered elsewhere |
 | 191 | `f1b1877f9a157b37ab2f0eebc6c32210e2950e70` | 2026-02-13 | Fix lftp pexpect timeout recovery to prevent buffer corruption (#20) | already integrated |
 | 192 | `b465d67419dae7a1ed52663f53dde34cc1d2cc9e` | 2026-02-13 | Merge pull request #54 from nitrobass24/fix/lftp-pexpect-timeout-recovery | covered elsewhere |
-| 193 | `12bfce70a1d1e846d15603bf3343a374f82f0d23` | 2026-02-14 | Fix download state loss after LFTP job completion | needs new integration task |
+| 193 | `12bfce70a1d1e846d15603bf3343a374f82f0d23` | 2026-02-14 | Fix download state loss after LFTP job completion | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 194 | `fc65492bbe197d7c50828bfd6debcdab4e5bb889` | 2026-02-14 | Merge pull request #55 from nitrobass24/fix/download-state-loss-after-lftp-completion | covered elsewhere |
-| 195 | `f2cb5d8e72b52f823aae6ea1ac1129326000beea` | 2026-02-14 | Fix progress bar glitch during downloads caused by race condition | needs new integration task |
+| 195 | `f2cb5d8e72b52f823aae6ea1ac1129326000beea` | 2026-02-14 | Fix progress bar glitch during downloads caused by race condition | adapted locally in `b2049ad13e0fb98eca019bb764c1fa31ab725adc` |
 | 196 | `fbc32607521d950a918e646b42732722cf13b5f1` | 2026-02-14 | Merge pull request #57 from nitrobass24/fix/progress-bar-glitch | covered elsewhere |
 | 197 | `33e3a8fd4889949e2a64b54706c57a34829afdfe` | 2026-02-14 | Release v0.12.1 - Bug fixes for download stability | covered elsewhere |
 | 198 | `43badbbe4363b94f16fabd36cd790dd800c9df91` | 2026-02-14 | Merge pull request #58 from nitrobass24/release/v0.12.1 | covered elsewhere |
