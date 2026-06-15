@@ -1,5 +1,8 @@
-# Creates environment to build python binaries
-FROM python:3.11-slim-buster AS seedsync_build_pyinstaller_env
+# Build scanfs for the remote seedbox architecture, not the local build host.
+ARG SCANFS_PLATFORM=linux/amd64
+
+# Creates environment to build scanfs binaries
+FROM --platform=${SCANFS_PLATFORM} python:3.11-slim-buster AS seedsync_build_scanfs_env
 RUN set -eux; \
     printf '%s\n' \
         'deb http://archive.debian.org/debian buster main' \
@@ -27,7 +30,7 @@ RUN poetry install
 
 
 # Builds scanfs with pyinstaller
-FROM seedsync_build_pyinstaller_env AS seedsync_build_scanfs
+FROM seedsync_build_scanfs_env AS seedsync_build_scanfs
 COPY src/python /python
 RUN mkdir -p /build
 RUN pyinstaller /python/scan_fs.py \

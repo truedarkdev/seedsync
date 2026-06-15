@@ -1,3 +1,6 @@
+# Build scanfs for the remote seedbox architecture, not the local build host.
+ARG SCANFS_PLATFORM=linux/amd64
+
 # Creates environment to build python binaries
 FROM python:3.12-slim-bullseye AS seedsync_build_pyinstaller_env
 RUN apt-get update && apt-get install -y \
@@ -36,9 +39,29 @@ RUN pyinstaller /python/seedsync.py \
     --name seedsync
 
 
+# Creates environment to build scanfs binaries
+FROM --platform=${SCANFS_PLATFORM} python:3.12-slim-bullseye AS seedsync_build_scanfs_env
+RUN apt-get update && apt-get install -y \
+    binutils \
+    build-essential \
+    curl \
+    libffi-dev \
+    zlib1g-dev \
+    && rm -rf /var/lib/apt/lists/*
+# Install Poetry
+RUN pip3 install "poetry==2.3.2"
+RUN poetry config virtualenvs.create false
+COPY src/python/pyproject.toml /app/python/
+COPY src/python/poetry.lock /app/python/
+WORKDIR /app/python
+ENV LC_ALL=C.UTF-8
+ENV LANG=C.UTF-8
+RUN poetry install
+
+
 # Builds scanfs with pyinstaller
 # Output is in /build/dist/
-FROM seedsync_build_pyinstaller_env AS seedsync_build_scanfs
+FROM seedsync_build_scanfs_env AS seedsync_build_scanfs
 COPY src/python /python
 RUN mkdir -p /build
 RUN	pyinstaller /python/scan_fs.py \

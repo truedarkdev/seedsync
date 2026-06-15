@@ -6,6 +6,8 @@ services:
       context: .
       dockerfile: src/docker/build/docker-image/Dockerfile
       target: seedsync_run
+      args:
+        SCANFS_PLATFORM: "${SCANFS_PLATFORM:-linux/amd64}"
     environment:
       SEEDSYNC_DEBUG: "${SEEDSYNC_DEBUG:-0}"
       # Kept visible so the stop-trace local override can set this key explicitly.

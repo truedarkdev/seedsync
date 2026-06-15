@@ -124,6 +124,21 @@ npm install
 make scanfs
 ```
 
+`SCANFS_PLATFORM` selects the architecture of the generated remote `scanfs`
+binary. It defaults to `linux/amd64` because `scanfs` runs on the remote
+seedbox, not the local build host. Override it for non-x86 remote servers, for
+example:
+
+```bash
+make SCANFS_PLATFORM=linux/arm64 scanfs
+make SCANFS_PLATFORM=linux/arm64 deb
+make SCANFS_PLATFORM=linux/arm64 docker-image
+```
+
+If your build host is not already prepared for cross-architecture Docker
+builds, `make scanfs` and `make deb` may need Docker BuildKit plus binfmt/QEMU
+support first. See the multi-arch setup note in the Build section above.
+
 ### Run python
 
 ```bash
