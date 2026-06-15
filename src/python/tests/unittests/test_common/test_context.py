@@ -129,3 +129,78 @@ class TestContext(unittest.TestCase):
             ],
             logger.debug.call_args_list
         )
+
+    def test_print_to_log_redacts_lftp_remote_password(self):
+        logger = MagicMock()
+        config = MagicMock()
+        config.as_dict.return_value = {
+            "General": {
+                "debug": True,
+            },
+            "Lftp": {
+                "remote_address": "seedbox.example.com",
+                "remote_username": "seeduser",
+                "remote_password": "super-secret-ssh-password",
+            },
+        }
+        args = Args()
+        args.local_path_to_scanfs = "/usr/bin/scanfs"
+        args.html_path = "/tmp/ui"
+        args.debug = True
+        args.exit = None
+        args.web_bind_host = "127.0.0.1"
+
+        context = Context(logger, MagicMock(), config, args, Status())
+        context.print_to_log()
+
+        self.assertEqual(
+            [
+                call("Config:"),
+                call("  General.debug: True"),
+                call("  Lftp.remote_address: seedbox.example.com"),
+                call("  Lftp.remote_username: seeduser"),
+                call("  Lftp.remote_password: ********"),
+                call("Args:"),
+                call("  local_path_to_scanfs: /usr/bin/scanfs"),
+                call("  html_path: /tmp/ui"),
+                call("  debug: True"),
+                call("  exit: None"),
+                call("  web_bind_host: 127.0.0.1"),
+            ],
+            logger.debug.call_args_list
+        )
+
+    def test_print_to_log_leaves_empty_or_missing_remote_password_blank(self):
+        for remote_password in ("", None):
+            with self.subTest(remote_password=remote_password):
+                logger = MagicMock()
+                config = MagicMock()
+                config.as_dict.return_value = {
+                    "General": {
+                        "debug": True,
+                    },
+                    "Lftp": {
+                        "remote_address": "seedbox.example.com",
+                        "remote_password": remote_password,
+                    },
+                }
+                args = Args()
+
+                context = Context(logger, MagicMock(), config, args, Status())
+                context.print_to_log()
+
+                self.assertEqual(
+                    [
+                        call("Config:"),
+                        call("  General.debug: True"),
+                        call("  Lftp.remote_address: seedbox.example.com"),
+                        call("  Lftp.remote_password: "),
+                        call("Args:"),
+                        call("  local_path_to_scanfs: None"),
+                        call("  html_path: None"),
+                        call("  debug: None"),
+                        call("  exit: None"),
+                        call("  web_bind_host: None"),
+                    ],
+                    logger.debug.call_args_list
+                )

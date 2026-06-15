@@ -81,6 +81,15 @@ class Context:
         retention_depth = getattr(general_config, "breadcrumb_trace_retention_depth", 128)
         return retention_depth if type(retention_depth) is int and retention_depth > 0 else 128
 
+    def __redact_config_log_value(self, section, option, value):
+        section_name = str(section).lower()
+        option_name = str(option).lower()
+        if section_name == "general" and option_name in {"api_token", "webhook_secret"}:
+            return "**REDACTED**"
+        if section_name == "lftp" and option_name == "remote_password":
+            return "********" if value else ""
+        return value
+
     def print_to_log(self):
         # Print the config
         self.logger.debug("Config:")
@@ -88,8 +97,7 @@ class Context:
         for section in config_dict.keys():
             for option in config_dict[section].keys():
                 value = config_dict[section][option]
-                if str(section).lower() == "general" and str(option).lower() in {"api_token", "webhook_secret"}:
-                    value = "**REDACTED**"
+                value = self.__redact_config_log_value(section, option, value)
                 self.logger.debug("  {}.{}: {}".format(section, option, value))
 
         self.logger.debug("Args:")
