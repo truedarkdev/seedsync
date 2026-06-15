@@ -181,7 +181,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 162 | `04cefc303acc4566ebc2d61e201fa62b9942ef26` | 2026-02-08 | Fix config file overwritten on container restart | already integrated |
 | 163 | `c9d539121f5ea9e06e1ba89faa61649e97b75781` | 2026-02-08 | Release v0.11.1 - Fix config overwritten on container restart | covered elsewhere |
 | 164 | `de7b7bdd8f856f484ba6bd3aa2a86d24c2c34908` | 2026-02-08 | Add docker pull command to release notes template | intentionally skipped |
-| 165 | `9faf724a51c47b6872e1e4b2258a847c0c8d9dda` | 2026-02-09 | Move web access logs to DEBUG level to reduce log noise | needs integration |
+| 165 | `9faf724a51c47b6872e1e4b2258a847c0c8d9dda` | 2026-02-09 | Move web access logs to DEBUG level to reduce log noise | adapted locally in `5368c551be44634cf4178510ca15cda1700242d5` |
 | 166 | `b63244d7e2c5bcb5e26e452ece0de17b40edd8d5` | 2026-02-09 | Release v0.11.2 - Move web access logs to DEBUG level | covered elsewhere |
 | 167 | `c636dd68fd9f22a9d7cf09ca0ba8633f1eccca2a` | 2026-02-09 | Harden config persistence against data loss | already integrated |
 | 168 | `864c1c205db3d22dceafb0f510f952ef61880dbf` | 2026-02-09 | Release v0.11.3 - Harden config persistence against data loss | pending |
