@@ -265,9 +265,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 246 | `fe0f4a68f2e039ccdf269d5683cd981059f7f620` | 2026-02-26 | Fix extract retry loop and staging delete in controller | already integrated |
 | 247 | `d7fb5e9a6d1f779c66d7ca25d6b0c1540c275ff3` | 2026-02-26 | Fix late-binding closure bug in DELETE_LOCAL post_callback | already integrated |
 | 248 | `ad7f19fae518bb463d4ec42c155cd934644d3f87` | 2026-02-26 | Merge pull request #82 from nitrobass24/fix/extract-retry-loop-and-staging-delete | covered elsewhere |
-| 249 | `7a0b8952d6e0fc6868541ce612e6358af93ebd94` | 2026-02-27 | Fix chunk parser crash on rangeless format and zombie on controller death | needs integration/adapt locally |
+| 249 | `7a0b8952d6e0fc6868541ce612e6358af93ebd94` | 2026-02-27 | Fix chunk parser crash on rangeless format and zombie on controller death | parser portion adapted locally in `f7d52a4e537013fd52e8dfaf70f5885a954cddaa`; lifecycle portion still needs integration/adapt locally |
 | 250 | `a9598f06ed1f9ed607b0b00556a7943704dcf403` | 2026-02-27 | Fix persist authority overriding children check for directories (#83) | needs integration/adapt locally |
-| 251 | `da312d2187542f0d742e972e47e920ea43ab64ff` | 2026-02-27 | Add test for rangeless chunk line with no trailing data line | needs integration/adapt locally |
+| 251 | `da312d2187542f0d742e972e47e920ea43ab64ff` | 2026-02-27 | Add test for rangeless chunk line with no trailing data line | adapted locally in `f7d52a4e537013fd52e8dfaf70f5885a954cddaa` |
 | 252 | `99638a213a30478b9574c594cf483232d553b55c` | 2026-02-27 | Merge pull request #85 from nitrobass24/fix/chunk-parser-and-zombie-crash | covered elsewhere |
 | 253 | `a93b83f4cb1fef4703c0fd849048d4e79f415249` | 2026-02-27 | Replace unrar-free with full unrar for RAR5 support | needs integration/adapt locally |
 | 254 | `16e5f890488c195e61ff83b76c243b3455316101` | 2026-02-27 | Merge pull request #87 from nitrobass24/fix/extract-retry-loop | covered elsewhere |
