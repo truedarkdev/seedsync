@@ -15,6 +15,7 @@ import pexpect
 import pytest
 
 from tests.utils import TestUtils
+from common import ConfigError
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 
 
@@ -874,6 +875,41 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("2k", self.lftp.rate_limit)
         self.lftp.rate_limit = "1M"
         self.assertEqual("1M", self.lftp.rate_limit)
+
+    def test_net_socket_buffer(self):
+        lftp = Lftp.__new__(Lftp)
+        lftp._Lftp__run_command = MagicMock(return_value="")
+
+        lftp.net_socket_buffer = 8388608
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "set net:socket-buffer 8388608",
+            require_prompt_ready=False
+        )
+        lftp._Lftp__run_command.reset_mock()
+
+        lftp.net_socket_buffer = "512K"
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "set net:socket-buffer 512K",
+            require_prompt_ready=False
+        )
+        lftp._Lftp__run_command.reset_mock()
+
+        lftp.net_socket_buffer = "2k"
+
+        lftp._Lftp__run_command.assert_called_once_with(
+            "set net:socket-buffer 2K",
+            require_prompt_ready=False
+        )
+        lftp._Lftp__run_command.reset_mock()
+
+        lftp.net_socket_buffer = ""
+
+        lftp._Lftp__run_command.assert_not_called()
+
+        with self.assertRaises(ConfigError):
+            lftp.net_socket_buffer = "512KB"
 
     def test_min_chunk_size(self):
         self.lftp.min_chunk_size = 500

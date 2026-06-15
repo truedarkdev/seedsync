@@ -79,6 +79,7 @@ describe("Testing config service", () => {
                 num_max_total_connections: 32,
                 use_temp_file: true,
                 rate_limit: "1M",
+                net_socket_buffer: "8M",
                 staging_path: "/some/local/path/incomplete",
             },
             controller: {
@@ -115,6 +116,7 @@ describe("Testing config service", () => {
                 expect(config.lftp.num_max_total_connections).toBe(32);
                 expect(config.lftp.use_temp_file).toBe(true);
                 expect(config.lftp.rate_limit).toBe("1M");
+                expect(config.lftp.net_socket_buffer).toBe("8M");
                 expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
                 expect(config.controller.interval_ms_remote_scan).toBe(30000);
                 expect(config.controller.interval_ms_local_scan).toBe(10000);
@@ -332,6 +334,36 @@ describe("Testing config service", () => {
         configService.set("lftp", "remote_password", "").subscribe(DoNothing);
 
         expectConfigSetRequest("lftp", "remote_password", "");
+        httpMock.verify();
+    });
+
+    it("should allow empty net_socket_buffer values", () => {
+        httpMock.expectOne("/server/config/get").flush({lftp: {net_socket_buffer: "8M"}});
+
+        configService.set("lftp", "net_socket_buffer", "").subscribe(DoNothing);
+
+        expectConfigSetRequest("lftp", "net_socket_buffer", "");
+        httpMock.verify();
+    });
+
+    it("should normalize net_socket_buffer before sending config updates", () => {
+        httpMock.expectOne("/server/config/get").flush({lftp: {net_socket_buffer: "2M"}});
+
+        const configExpected = [
+            new Config({lftp: {net_socket_buffer: "2M"}}),
+            new Config({lftp: {net_socket_buffer: "8M"}})
+        ];
+        let configSubscriberIndex = 0;
+        configService.config.subscribe({
+            next: config => {
+                expect(Immutable.is(config, configExpected[configSubscriberIndex++])).toBe(true);
+            }
+        });
+
+        configService.set("lftp", "net_socket_buffer", "8m").subscribe(DoNothing);
+
+        expectConfigSetRequest("lftp", "net_socket_buffer", "8M");
+        expect(configSubscriberIndex).toBe(2);
         httpMock.verify();
     });
 

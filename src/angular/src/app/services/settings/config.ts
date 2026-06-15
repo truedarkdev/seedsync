@@ -39,6 +39,7 @@ interface ILftp {
     num_max_total_connections: number;
     use_temp_file: boolean;
     rate_limit: string;
+    net_socket_buffer: string;
     staging_path: string;
 }
 const DefaultLftp: ILftp = {
@@ -57,6 +58,7 @@ const DefaultLftp: ILftp = {
     num_max_total_connections: null,
     use_temp_file: null,
     rate_limit: "0",
+    net_socket_buffer: "8M",
     staging_path: "",
 };
 const LftpRecord = Record(DefaultLftp);

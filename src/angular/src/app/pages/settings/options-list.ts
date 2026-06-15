@@ -136,6 +136,13 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
         },
         {
             type: OptionType.Text,
+            label: "Socket Buffer",
+            valuePath: ["lftp", "net_socket_buffer"],
+            description: "Set LFTP's socket buffer size. Use values like 512K or 8M. Leave blank to skip setting net:socket-buffer.\n" +
+                         "(net:socket-buffer)"
+        },
+        {
+            type: OptionType.Text,
             label: "Staging Directory",
             valuePath: ["lftp", "staging_path"],
             description: "Optional directory for in-progress downloads. Leave empty to use the Local Directory plus /incomplete."

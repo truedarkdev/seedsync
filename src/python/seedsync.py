@@ -450,6 +450,7 @@ class Seedsync:
         config.lftp.num_max_total_connections = 16
         config.lftp.use_temp_file = False
         config.lftp.rate_limit = "0"
+        config.lftp.net_socket_buffer = "8M"
         config.lftp.staging_path = ""
 
         config.controller.interval_ms_remote_scan = 30000

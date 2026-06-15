@@ -356,6 +356,7 @@ class TestController(unittest.TestCase):
                 "remote_username": "seedsynctest",
                 "remote_password": "seedsyncpass",
                 "rate_limit": "0",
+                "net_socket_buffer": "512K",
                 "remote_port": 22,
                 "remote_path": os.path.join(self.temp_dir, "remote"),
                 "local_path": os.path.join(self.temp_dir, "local"),
@@ -546,6 +547,7 @@ class TestController(unittest.TestCase):
 
     def test_initial_model(self):
         self.controller = Controller(self.context, self.controller_persist)
+        self.assertEqual("512K", self.controller._Controller__lftp.net_socket_buffer)
         self.controller.start()
         # wait for initial scan
         self.__wait_for_initial_model()

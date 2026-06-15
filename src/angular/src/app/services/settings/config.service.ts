@@ -43,8 +43,10 @@ export class ConfigService extends BaseWebService {
      * @returns {WebReaction}
      */
     public set(section: string, option: string, value: any): Observable<WebReaction> {
-        const valueStr: string = String(value);
-        const allowBlankValue = section === "lftp" && option === "remote_password";
+        const normalizedValue = this.normalizeValue(section, option, value);
+        const valueStr: string = String(normalizedValue);
+        const allowBlankValue = section === "lftp" &&
+            (option === "remote_password" || option === "net_socket_buffer");
         const currentConfig = this._config.getValue();
         if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
             return new Observable<WebReaction>(observer => {
@@ -58,13 +60,13 @@ export class ConfigService extends BaseWebService {
             });
         } else {
             const url = this.CONFIG_SET_URL(section, option);
-            const obs = this._restService.sendPostRequest(url, {value});
+            const obs = this._restService.sendPostRequest(url, {value: normalizedValue});
             obs.subscribe({
                 next: reaction => {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const config = this._config.getValue();
-                        const newConfig = new Config(config.updateIn([section, option], (_) => value));
+                        const newConfig = new Config(config.updateIn([section, option], (_) => normalizedValue));
                         this._config.next(newConfig);
                     }
                 }
@@ -95,6 +97,24 @@ export class ConfigService extends BaseWebService {
                 }
             }
         });
+    }
+
+    private normalizeValue(section: string, option: string, value: any): any {
+        if (section === "lftp" && option === "net_socket_buffer") {
+            return this.normalizeNetSocketBufferValue(value);
+        }
+        return value;
+    }
+
+    private normalizeNetSocketBufferValue(value: any): string {
+        const valueStr = String(value).trim();
+        if (valueStr.length === 0) {
+            return valueStr;
+        }
+        if (/^[0-9]+[kmg]$/i.test(valueStr)) {
+            return valueStr.slice(0, -1) + valueStr.slice(-1).toUpperCase();
+        }
+        return valueStr;
     }
 }
 

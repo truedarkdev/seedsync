@@ -14,6 +14,7 @@ class TestConfigHandler(BaseTestWebApp):
         self.context.config.lftp.remote_username = "seedsync-user"
         self.context.config.lftp.remote_port = 2222
         self.context.config.lftp.remote_path = "/remote/server/path"
+        self.context.config.lftp.net_socket_buffer = "512K"
         self.context.config.controller.interval_ms_local_scan = 5678
         self.context.config.web.port = 8080
         resp = self.test_app.get("/server/config/get")
@@ -26,6 +27,7 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_username"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_path"])
         self.assertEqual(2222, json_dict["lftp"]["remote_port"])
+        self.assertEqual("512K", json_dict["lftp"]["net_socket_buffer"])
         self.assertEqual(5678, json_dict["controller"]["interval_ms_local_scan"])
         self.assertEqual(8080, json_dict["web"]["port"])
 
@@ -44,6 +46,15 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.post_json("/server/config/set/lftp/remote_path", {"value": "/path/to/somewhere"})
         self.assertEqual(200, resp.status_int)
         self.assertEqual("/path/to/somewhere", self.context.config.lftp.remote_path)
+
+        self.assertEqual(None, self.context.config.lftp.net_socket_buffer)
+        resp = self.test_app.post_json("/server/config/set/lftp/net_socket_buffer", {"value": "8M"})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual("8M", self.context.config.lftp.net_socket_buffer)
+
+        resp = self.test_app.post_json("/server/config/set/lftp/net_socket_buffer", {"value": ""})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual("", self.context.config.lftp.net_socket_buffer)
 
         self.assertEqual(None, self.context.config.controller.interval_ms_local_scan)
         resp = self.test_app.post_json("/server/config/set/controller/interval_ms_local_scan", {"value": 5678})
@@ -131,6 +142,16 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(400, resp.status_int)
         self.assertEqual("Bad config: Controller.interval_ms_local_scan (-1) must be greater than 0", str(resp.html))
         self.assertEqual(None, self.context.config.controller.interval_ms_local_scan)
+
+        # byte size value
+        self.assertEqual(None, self.context.config.lftp.net_socket_buffer)
+        resp = self.test_app.post_json("/server/config/set/lftp/net_socket_buffer", {"value": "bad"}, expect_errors=True)
+        self.assertEqual(400, resp.status_int)
+        self.assertEqual(
+            "Bad config: Lftp.net_socket_buffer (bad) must be a byte size value like 512K, 8M, 1G, or 8388608",
+            str(resp.html)
+        )
+        self.assertEqual(None, self.context.config.lftp.net_socket_buffer)
 
     def test_set_empty_value(self):
         self.assertEqual(None, self.context.config.lftp.remote_path)

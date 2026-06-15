@@ -176,17 +176,7 @@ class Controller:
         self.__lftp.set_base_logger(self.logger)
         self.__lftp.set_base_remote_dir_path(self.__context.config.lftp.remote_path)
         self.__lftp.set_base_local_dir_path(self.__staging_path)
-        # Configure Lftp
-        self.__lftp.num_parallel_jobs = self.__context.config.lftp.num_max_parallel_downloads
-        self.__lftp.num_parallel_files = self.__context.config.lftp.num_max_parallel_files_per_download
-        self.__lftp.num_connections_per_root_file = self.__context.config.lftp.num_max_connections_per_root_file
-        self.__lftp.num_connections_per_dir_file = self.__context.config.lftp.num_max_connections_per_dir_file
-        self.__lftp.num_max_total_connections = self.__context.config.lftp.num_max_total_connections
-        self.__lftp.use_temp_file = self.__context.config.lftp.use_temp_file
-        if self.__context.config.lftp.rate_limit:
-            self.__lftp.rate_limit = self.__context.config.lftp.rate_limit
-        self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
-        self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
+        self.__configure_lftp()
 
         try:
             self.__refresh_path_pair_runtime_state()
@@ -249,6 +239,22 @@ class Controller:
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
 
         self.__started = False
+
+    def __configure_lftp(self):
+        # Configure Lftp
+        self.__lftp.num_parallel_jobs = self.__context.config.lftp.num_max_parallel_downloads
+        self.__lftp.num_parallel_files = self.__context.config.lftp.num_max_parallel_files_per_download
+        self.__lftp.num_connections_per_root_file = self.__context.config.lftp.num_max_connections_per_root_file
+        self.__lftp.num_connections_per_dir_file = self.__context.config.lftp.num_max_connections_per_dir_file
+        self.__lftp.num_max_total_connections = self.__context.config.lftp.num_max_total_connections
+        self.__lftp.use_temp_file = self.__context.config.lftp.use_temp_file
+        if self.__context.config.lftp.rate_limit:
+            self.__lftp.rate_limit = self.__context.config.lftp.rate_limit
+        net_socket_buffer = self.__context.config.lftp.net_socket_buffer
+        if net_socket_buffer is not None and net_socket_buffer != "":
+            self.__lftp.net_socket_buffer = net_socket_buffer
+        self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
+        self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:
         if self.__context.path_pair_manager is None:

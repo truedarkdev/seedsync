@@ -28,6 +28,7 @@ describe("Testing config record initialization", () => {
                 num_max_total_connections: 32,
                 use_temp_file: true,
                 rate_limit: "1M",
+                net_socket_buffer: "8M",
                 staging_path: "/some/local/path/incomplete"
             },
             controller: {
@@ -70,6 +71,7 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.num_max_total_connections).toBe(32);
         expect(config.lftp.use_temp_file).toBe(true);
         expect(config.lftp.rate_limit).toBe("1M");
+        expect(config.lftp.net_socket_buffer).toBe("8M");
         expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
         expect(config.controller.interval_ms_remote_scan).toBe(30000);
         expect(config.controller.interval_ms_local_scan).toBe(10000);
@@ -106,6 +108,7 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
+        expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
         expect(partialConfig.getValue("missing", "value")).toBe(null);
     });
 });
