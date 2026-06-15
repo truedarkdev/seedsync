@@ -11,6 +11,21 @@ class TestLftpJobStatusParser(unittest.TestCase):
         # Show full diff
         self.maxDiff = None
 
+    @staticmethod
+    def _parse_pget_with_chunk_tail(chunk_tail):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Now executing: [2] pget -c ~/downloads/completed/SomeFile.mkv -o /data/lftpsync//\n"
+            "[2] pget -c ~/downloads/completed/SomeFile.mkv -o /data/lftpsync// \n"
+            "    sftp://user:pass@host:22/home/user\n"
+            "    `~/downloads/completed/SomeFile.mkv', got 1000 of 2000 (50%) \n"
+            "{}"
+        ).format(chunk_tail)
+        parser = LftpJobStatusParser()
+        return parser.parse(output)
+
     def test_size_to_bytes(self):
         self.assertEqual(345, LftpJobStatusParser._size_to_bytes("345"))
         self.assertEqual(1000, LftpJobStatusParser._size_to_bytes("1000b"))
@@ -399,6 +414,59 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(golden_queue, statuses_queue)
         statuses_jobs = [j for j in statuses if j.state == LftpJobStatus.State.RUNNING]
         self.assertEqual(golden_jobs, statuses_jobs)
+
+    def test_chunk_without_range(self):
+        statuses = self._parse_pget_with_chunk_tail(
+            "  \\chunk 5077\n"
+            "    `~/downloads/completed/SomeFile.mkv' at 5077 (0%) [Connecting...]\n"
+        )
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual("SomeFile.mkv", statuses[0].name)
+        self.assertEqual(
+            LftpJobStatus.TransferState(1000, 2000, 50, None, None),
+            statuses[0].total_transfer_state
+        )
+
+    def test_chunk_without_data_line(self):
+        statuses = self._parse_pget_with_chunk_tail(
+            "  \\chunk 0-999\n"
+        )
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual("SomeFile.mkv", statuses[0].name)
+        self.assertEqual(
+            LftpJobStatus.TransferState(1000, 2000, 50, None, None),
+            statuses[0].total_transfer_state
+        )
+
+    def test_chunk_without_data_line_rangeless(self):
+        statuses = self._parse_pget_with_chunk_tail(
+            "  \\chunk 5077\n"
+        )
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual("SomeFile.mkv", statuses[0].name)
+        self.assertEqual(
+            LftpJobStatus.TransferState(1000, 2000, 50, None, None),
+            statuses[0].total_transfer_state
+        )
+
+    def test_chunk_header_does_not_swallow_following_job_line(self):
+        statuses = self._parse_pget_with_chunk_tail(
+            "  \\chunk 0-999\n"
+            "[3] pget -c ~/downloads/completed/AnotherFile.mkv -o /data/lftpsync// \n"
+            "    sftp://user:pass@host:22/home/user\n"
+            "    `~/downloads/completed/AnotherFile.mkv', got 3000 of 4000 (75%) \n"
+        )
+
+        self.assertEqual(2, len(statuses))
+        self.assertEqual("SomeFile.mkv", statuses[0].name)
+        self.assertEqual("AnotherFile.mkv", statuses[1].name)
+        self.assertEqual(
+            LftpJobStatus.TransferState(3000, 4000, 75, None, None),
+            statuses[1].total_transfer_state
+        )
 
     def test_statuses_preserve_remote_and_local_paths(self):
         output = """
