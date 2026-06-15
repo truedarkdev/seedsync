@@ -24,6 +24,7 @@ class TestRemoteScanner(unittest.TestCase):
         self.addCleanup(ssh_patcher.stop)
         self.mock_ssh_cls = ssh_patcher.start()
         self.mock_ssh = self.mock_ssh_cls.return_value
+        self.mock_ssh.detect_shell.return_value = "/bin/sh"
 
         logger = logging.getLogger()
         handler = logging.StreamHandler(sys.stdout)
@@ -95,6 +96,7 @@ class TestRemoteScanner(unittest.TestCase):
         self.mock_ssh.shell.side_effect = ssh_shell
 
         scanner.scan()
+        self.mock_ssh.detect_shell.assert_called_once()
         self.mock_ssh.copy.assert_called_once_with(
             local_path=TestRemoteScanner.temp_scan_script,
             remote_path="/remote/path/to/scan/script"
@@ -103,6 +105,7 @@ class TestRemoteScanner(unittest.TestCase):
 
         # should not be called the second time
         scanner.scan()
+        self.assertEqual(1, self.mock_ssh.detect_shell.call_count)
         self.mock_ssh.copy.assert_not_called()
 
     def test_copy_appends_scanfs_name_to_remote_path(self):
@@ -166,6 +169,34 @@ class TestRemoteScanner(unittest.TestCase):
             call("md5sum {} | awk '{{print $1}}' || echo".format(shlex.quote("/remote/path/to/scan/script"))),
             call(ANY)
         ])
+
+    def test_raises_nonrecoverable_error_when_shell_detection_fails(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        self.mock_ssh.detect_shell.side_effect = SshcpError(
+            "bash: /bin/bash: No such file or directory"
+        )
+
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+
+        self.assertEqual(
+            Localization.Error.REMOTE_SERVER_INSTALL.format(
+                "bash: /bin/bash: No such file or directory"
+            ),
+            str(ctx.exception)
+        )
+        self.assertFalse(ctx.exception.recoverable)
+        self.mock_ssh.shell.assert_not_called()
+        self.mock_ssh.copy.assert_not_called()
 
     def test_skips_install_on_md5sum_match(self):
         scanner = RemoteScanner(

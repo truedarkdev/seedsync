@@ -2,8 +2,12 @@
 
 import logging
 import os
+import posixpath
+import re
+import shlex
 import shutil
 import time
+from typing import List, Optional
 
 import pexpect
 import pexpect.popen_spawn
@@ -27,6 +31,7 @@ class Sshcp:
     Scp command utility
     """
     __TIMEOUT_SECS = 180
+    SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
 
     def __init__(self,
                  host: str,
@@ -39,6 +44,8 @@ class Sshcp:
         self.__port = port
         self.__user = user
         self.__password = password
+        self.__detected_shell: Optional[str] = None
+        self.__shell_detection_in_progress = False
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def set_base_logger(self, base_logger: logging.Logger):
@@ -46,6 +53,186 @@ class Sshcp:
 
     def __describe_target(self) -> str:
         return "host={}, user={}, port={}".format(self.__host, self.__user, self.__port)
+
+    def __is_missing_remote_shell_error(self, error_message: str) -> bool:
+        if "No such file or directory" not in error_message:
+            return False
+        for line in error_message.splitlines():
+            stripped = line.strip()
+            for shell in self.SHELL_CANDIDATES:
+                shell_name = posixpath.basename(shell)
+                if re.match(
+                    r"^(?:-?{}:\s*)?{}:\s*No such file or directory$".format(
+                        re.escape(shell_name),
+                        re.escape(shell)
+                    ),
+                    stripped
+                ):
+                    return True
+        return False
+
+    def __format_missing_remote_shell_error(self,
+                                            error_message: str,
+                                            available_shells: Optional[List[str]] = None) -> str:
+        if available_shells:
+            shells_str = ", ".join(available_shells)
+            return (
+                "Remote user's shell not found: {}. Available shells on the remote server: {}. "
+                "Fix by running on the remote server: sudo chsh -s {} {}".format(
+                    error_message,
+                    shells_str,
+                    available_shells[0],
+                    self.__user
+                )
+            )
+        return (
+            "Remote user's shell not found (login shell not found and no common shells could be "
+            "detected): {}. Fix by running on the remote server: sudo chsh -s /bin/sh {} OR "
+            "sudo ln -s /usr/bin/bash /bin/bash".format(
+                error_message,
+                self.__user
+            )
+        )
+
+    def detect_shell(self) -> str:
+        if self.__detected_shell is not None:
+            return self.__detected_shell
+
+        self.logger.debug("Detecting remote shell...")
+        self.__shell_detection_in_progress = True
+        try:
+            out = self.__run_command(
+                command="ssh",
+                flags=[
+                    "-p", str(self.__port),  # port
+                ],
+                args=[
+                    "{}@{}".format(self.__user, self.__host),
+                    "echo __shell_path__$(which bash 2>/dev/null || "
+                    "which sh 2>/dev/null || "
+                    "echo unknown)__end__"
+                ]
+            )
+        except SshcpError as e:
+            error_message = str(e)
+            if not self.__is_missing_remote_shell_error(error_message):
+                raise
+
+            self.logger.warning(
+                "Remote shell not found on server. Checking candidate shells via SFTP..."
+            )
+            available_shells = self.__check_remote_shells_via_sftp()
+            raise SshcpError(self.__format_missing_remote_shell_error(
+                error_message,
+                available_shells
+            ))
+        finally:
+            self.__shell_detection_in_progress = False
+
+        out_str = out.decode()
+        shell_path = None
+        if "__shell_path__" in out_str and "__end__" in out_str:
+            shell_path = out_str.split("__shell_path__", 1)[1].split("__end__", 1)[0].strip()
+            if not shell_path or shell_path == "unknown" or not posixpath.isabs(shell_path):
+                shell_path = None
+
+        if shell_path is None:
+            self.logger.warning(
+                "Remote shell probe returned ambiguous output. Checking candidate shells via SFTP..."
+            )
+            available_shells = self.__check_remote_shells_via_sftp()
+            if not available_shells:
+                raise SshcpError(
+                    "Unable to detect remote shell from probe output and no common shells "
+                    "could be detected via SFTP."
+                )
+            shell_path = available_shells[0]
+
+        self.__detected_shell = shell_path
+        self.logger.info("Detected remote shell: {}".format(self.__detected_shell))
+        return self.__detected_shell
+
+    def __check_remote_shells_via_sftp(self) -> List[str]:
+        available_shells = []
+        for shell_path in self.SHELL_CANDIDATES:
+            try:
+                self.__sftp_stat(shell_path)
+            except SshcpError as e:
+                if not str(e).startswith("File not found:"):
+                    raise SshcpError(
+                        "SFTP shell probe failed while checking {}: {}".format(
+                            shell_path,
+                            e
+                        )
+                    )
+                continue
+            available_shells.append(shell_path)
+        return available_shells
+
+    def __sftp_stat(self, remote_path: str):
+        command_args = [
+            "sftp",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "LogLevel=error",
+        ]
+
+        if self.__password is None:
+            command_args += [
+                "-o", "PasswordAuthentication=no",
+            ]
+        else:
+            command_args += [
+                "-o", "PubkeyAuthentication=no",
+            ]
+
+        command_args += [
+            "-P", str(self.__port),
+            "{}@{}".format(self.__user, self.__host),
+        ]
+
+        self.logger.debug("Command: {}".format(command_args))
+
+        sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        try:
+            timeout = 30
+            if self.__password is not None:
+                i = sp.expect([
+                    r'(?i)password:\s*',
+                    pexpect.EOF,
+                ], timeout=timeout)
+                if i == 1:
+                    raise SshcpError("SFTP connection failed")
+                sp.sendline(self.__password)
+
+            i = sp.expect([
+                r'sftp> ',
+                pexpect.EOF,
+            ], timeout=timeout)
+            if i != 0:
+                raise SshcpError("SFTP connection failed")
+
+            sp.sendline("ls {}".format(remote_path))
+            i = sp.expect([
+                r'sftp> ',
+                pexpect.EOF,
+            ], timeout=timeout)
+
+            output = sp.before.decode().strip() if isinstance(sp.before, bytes) else str(sp.before).strip()
+            if i != 0:
+                if "No such file" in output or "not found" in output or "Can't ls" in output:
+                    raise SshcpError("File not found: {}".format(remote_path))
+                raise SshcpError("SFTP connection failed")
+            if "No such file" in output or "not found" in output or "Can't ls" in output:
+                raise SshcpError("File not found: {}".format(remote_path))
+
+            sp.sendline("bye")
+            sp.expect(pexpect.EOF, timeout=10)
+        except pexpect.exceptions.TIMEOUT:
+            raise SshcpError("SFTP timed out")
+        finally:
+            close = getattr(sp, "close", None)
+            if callable(close):
+                close()
 
     def __log_timeout(self, phase: str, command: str, sp, start_time: float):
         elapsed = time.time() - start_time
@@ -138,6 +325,8 @@ class Sshcp:
                     before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
                     after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
                     self.logger.warning("Command failed: '{} - {}'".format(before, after))
+                    if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
+                        raise SshcpError(self.__format_missing_remote_shell_error(before))
                 if i == 1:
                     before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
                     if command == "scp" and "no such file or directory" not in before_lower:
@@ -185,6 +374,8 @@ class Sshcp:
                 before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
                 after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
                 self.logger.warning("Command failed: '{} - {}'".format(before, after))
+                if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
+                    raise SshcpError(self.__format_missing_remote_shell_error(before))
             if i == 1:
                 before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
                 if command == "scp" and "no such file or directory" not in before_lower:
@@ -230,6 +421,8 @@ class Sshcp:
             before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
             after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
             self.logger.warning("Command failed: '{} - {}'".format(before, after))
+            if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
+                raise SshcpError(self.__format_missing_remote_shell_error(before))
             raise SshcpError(sp.before.decode().strip())
 
         return sp.before.replace(b'\r\n', b'\n').strip()
@@ -243,8 +436,14 @@ class Sshcp:
         if not command:
             raise ValueError("Command cannot be empty")
 
-        if "'" in command and '"' in command:
+        if self.__detected_shell is None and "'" in command and '"' in command:
             raise ValueError("Command cannot contain both single and double quotes")
+
+        if self.__detected_shell is not None:
+            command = "{} -c {}".format(
+                shlex.quote(self.__detected_shell),
+                shlex.quote(command)
+            )
 
         flags = [
             "-p", str(self.__port),  # port

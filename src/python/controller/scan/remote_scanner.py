@@ -121,6 +121,14 @@ class RemoteScanner(IScanner):
                 ),
                 recoverable=False
             )
+        try:
+            self.__ssh.detect_shell()
+        except SshcpError as e:
+            self.logger.exception("Shell detection failed")
+            raise ScannerError(
+                Localization.Error.REMOTE_SERVER_INSTALL.format(str(e).strip()),
+                recoverable=False
+            )
         with open(self.__local_path_to_scan_script, "rb") as f:
             local_md5sum = hashlib.md5(f.read()).hexdigest()
         self.logger.debug("Local scanfs md5sum = {}".format(local_md5sum))
