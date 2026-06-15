@@ -93,6 +93,14 @@ class Checkers:
         return value
 
     @staticmethod
+    def string_allow_empty(cls: T, name: str, value: str) -> str:
+        if value != "" and (not value or not value.strip()):
+            raise ConfigError("Bad config: {}.{} is empty".format(
+                cls.__name__, name
+            ))
+        return value
+
+    @staticmethod
     def int_non_negative(cls: T, name: str, value: int) -> int:
         if value < 0:
             raise ConfigError("Bad config: {}.{} ({}) must be zero or greater".format(
@@ -308,7 +316,7 @@ class Config(Persist):
     class Lftp(IC):
         remote_address = PROP("remote_address", Checkers.string_nonempty, Converters.null)
         remote_username = PROP("remote_username", Checkers.string_nonempty, Converters.null)
-        remote_password = PROP("remote_password", Checkers.string_nonempty, Converters.null)
+        remote_password = PROP("remote_password", Checkers.string_allow_empty, Converters.null)
         remote_port = PROP("remote_port", Checkers.int_positive, Converters.int)
         remote_path = PROP("remote_path", Checkers.string_nonempty, Converters.null)
         local_path = PROP("local_path", Checkers.string_nonempty, Converters.null)

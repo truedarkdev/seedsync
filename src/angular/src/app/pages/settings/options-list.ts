@@ -32,7 +32,7 @@ export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
             type: OptionType.Password,
             label: "Server Password",
             valuePath: ["lftp", "remote_password"],
-            description: null
+            description: "Leave blank when using SSH key authentication."
         },
         {
             type: OptionType.Checkbox,

@@ -328,7 +328,6 @@ class TestConfig(unittest.TestCase):
                           {
                               "remote_address",
                               "remote_username",
-                              "remote_password",
                               "remote_port",
                               "remote_path",
                               "local_path",
@@ -358,8 +357,51 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "33")
+        self.check_bad_value_error(Config.Lftp, good_dict, "remote_password", "   ")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
+
+    def test_lftp_allows_empty_remote_password(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("", lftp.remote_password)
+
+        self.check_common(Config.Lftp,
+                          good_dict,
+                          {
+                              "remote_address",
+                              "remote_username",
+                              "remote_port",
+                              "remote_path",
+                              "local_path",
+                              "remote_path_to_scan_script",
+                              "use_ssh_key",
+                              "num_max_parallel_downloads",
+                              "num_max_parallel_files_per_download",
+                              "num_max_connections_per_root_file",
+                              "num_max_connections_per_dir_file",
+                              "num_max_total_connections",
+                              "use_temp_file"
+                          })
 
     def test_lftp_backfills_missing_staging_path(self):
         good_dict = {
