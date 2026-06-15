@@ -184,46 +184,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 165 | `9faf724a51c47b6872e1e4b2258a847c0c8d9dda` | 2026-02-09 | Move web access logs to DEBUG level to reduce log noise | adapted locally in `5368c551be44634cf4178510ca15cda1700242d5` |
 | 166 | `b63244d7e2c5bcb5e26e452ece0de17b40edd8d5` | 2026-02-09 | Release v0.11.2 - Move web access logs to DEBUG level | covered elsewhere |
 | 167 | `c636dd68fd9f22a9d7cf09ca0ba8633f1eccca2a` | 2026-02-09 | Harden config persistence against data loss | already integrated |
-| 168 | `864c1c205db3d22dceafb0f510f952ef61880dbf` | 2026-02-09 | Release v0.11.3 - Harden config persistence against data loss | pending |
-| 169 | `edac8873cb8c43c171b6c995376d0f356418fe34` | 2026-02-09 | Merge pull request #34 from nitrobass24/fix/config-persistence-hardening | pending |
-| 170 | `90ce595d0296b77ecf8d47d3b3119fb8332fdc32` | 2026-02-11 | Add staging directory feature for fast-disk downloads | pending |
-| 171 | `a0992912215e0b279ccd1cd82b311d702b17fc7a` | 2026-02-11 | Merge pull request #36 from nitrobass24/feat/staging-directory | pending |
-| 172 | `c2037c0ff3370246b57facce2aa08f4ecb5cadfd` | 2026-02-12 | Add dark mode support with theme toggle (#133) (#37) | pending |
-| 173 | `35586499b6bb8ac6ad91132b70ce4c3b32020621` | 2026-02-12 | Fix staging directory not moving completed downloads (#38) | pending |
-| 174 | `382cf14a2e2ee17613661b4c59a37d642fa17601` | 2026-02-12 | Fix staging directory download completion and file detection (#39) | pending |
-| 175 | `9682f456e1a4e7f4fd1887a6c58ab2e38c47a60d` | 2026-02-12 | Add git workflow rules to CLAUDE.md | pending |
-| 176 | `75210e8352ed797816a30c21d2e04cadcfcd1181` | 2026-02-12 | Advanced LFTP settings and staging bug fixes (#40) | pending |
-| 177 | `ad6163357d1242682facc892d5e1e3770bd620d7` | 2026-02-12 | Remove duplicate ci-develop.yml workflow (#42) | pending |
-| 178 | `f6d665d919320d1a68a146a2d10cff5e55d16b92` | 2026-02-12 | Fix Advanced LFTP settings not editable for existing configs (#43) | pending |
-| 179 | `66cc07450513c27931ff352fdb99dd65613c9ef8` | 2026-02-12 | Change net_socket_buffer from int to string to support suffixed values (#44) | pending |
-| 180 | `b9c53132ddd3dbb51e27c7f3ffea540bc318db77` | 2026-02-12 | Graceful config upgrades: backfill defaults and save to disk (#45) | pending |
-| 181 | `ff5bc7ca3ac1c17d1d610f66b8213abf559df593` | 2026-02-12 | Add remote server diagnostics on first connection (#41) | pending |
-| 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | pending |
-| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | pending |
-| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | pending |
-| 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | pending |
-| 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | pending |
-| 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | pending |
-| 188 | `fa5aa24b5c2cb383274a5bf799a4b4d59a6517fa` | 2026-02-13 | Bump version to 0.12.0 and update changelog for release | pending |
-| 189 | `281c2333f6416777802b6dc3d238c0ad1bde7c9f` | 2026-02-13 | Update docs for v0.12.0 features | pending |
-| 190 | `e8d3b78a783a7a0b48c8bf069a54e4bc64cfe9a5` | 2026-02-13 | Merge pull request #52 from nitrobass24/develop | pending |
-| 191 | `f1b1877f9a157b37ab2f0eebc6c32210e2950e70` | 2026-02-13 | Fix lftp pexpect timeout recovery to prevent buffer corruption (#20) | pending |
-| 192 | `b465d67419dae7a1ed52663f53dde34cc1d2cc9e` | 2026-02-13 | Merge pull request #54 from nitrobass24/fix/lftp-pexpect-timeout-recovery | pending |
-| 193 | `12bfce70a1d1e846d15603bf3343a374f82f0d23` | 2026-02-14 | Fix download state loss after LFTP job completion | pending |
-| 194 | `fc65492bbe197d7c50828bfd6debcdab4e5bb889` | 2026-02-14 | Merge pull request #55 from nitrobass24/fix/download-state-loss-after-lftp-completion | pending |
-| 195 | `f2cb5d8e72b52f823aae6ea1ac1129326000beea` | 2026-02-14 | Fix progress bar glitch during downloads caused by race condition | pending |
-| 196 | `fbc32607521d950a918e646b42732722cf13b5f1` | 2026-02-14 | Merge pull request #57 from nitrobass24/fix/progress-bar-glitch | pending |
-| 197 | `33e3a8fd4889949e2a64b54706c57a34829afdfe` | 2026-02-14 | Release v0.12.1 - Bug fixes for download stability | pending |
-| 198 | `43badbbe4363b94f16fabd36cd790dd800c9df91` | 2026-02-14 | Merge pull request #58 from nitrobass24/release/v0.12.1 | pending |
-| 199 | `1505cc221f07f60c9400a70dd103744dc5f43fd0` | 2026-02-15 | Fix scanfs timeout crash: pexpect leak, retry logic, SSH keepalive | pending |
-| 200 | `834fc1c4a73b1fb7ae1c0a616d8856f6fe329eb6` | 2026-02-15 | Merge pull request #62 from nitrobass24/fix/scanfs-timeout-crash | pending |
-| 201 | `b1e250e958f785dfa917c962d4e5f461b70d10cb` | 2026-02-17 | Fix FileExistsError crash during cross-device move | pending |
-| 202 | `b1950908347e8fc12689dedf52bdbccf464ab7dd` | 2026-02-17 | Fix app crash on transient SSH errors during scanfs installation | pending |
-| 203 | `64aae2f57f253aa50910ea6678b7ba3ae2f65fa1` | 2026-02-18 | Fix LFTP transient errors crashing the app and reduce scanner log noise | pending |
-| 204 | `06c53ea9e40f07ec7dd4388ace3276fe9ee915b5` | 2026-02-18 | Merge pull request #63 from nitrobass24/fix/install-scanfs-transient-crash | pending |
-| 205 | `ec2d08b480d0d1b01cf27c63998819eaa0b80255` | 2026-02-18 | Fix error handling bugs found during code review | pending |
-| 206 | `38286023cadda2ab962c3690640fcfa199abf86b` | 2026-02-18 | Merge pull request #64 from nitrobass24/fix/review-findings-error-handling | pending |
-| 207 | `360e2d0605652e54bd0549bc53752b7ed88abe45` | 2026-02-19 | Fix LFTP status parser crash from interleaved 'jobs -v' command echo | pending |
+| 168 | `864c1c205db3d22dceafb0f510f952ef61880dbf` | 2026-02-09 | Release v0.11.3 - Harden config persistence against data loss | covered elsewhere |
+| 169 | `edac8873cb8c43c171b6c995376d0f356418fe34` | 2026-02-09 | Merge pull request #34 from nitrobass24/fix/config-persistence-hardening | covered elsewhere |
+| 170 | `90ce595d0296b77ecf8d47d3b3119fb8332fdc32` | 2026-02-11 | Add staging directory feature for fast-disk downloads | already integrated |
+| 171 | `a0992912215e0b279ccd1cd82b311d702b17fc7a` | 2026-02-11 | Merge pull request #36 from nitrobass24/feat/staging-directory | covered elsewhere |
+| 172 | `c2037c0ff3370246b57facce2aa08f4ecb5cadfd` | 2026-02-12 | Add dark mode support with theme toggle (#133) (#37) | maintainer decision needed |
+| 173 | `35586499b6bb8ac6ad91132b70ce4c3b32020621` | 2026-02-12 | Fix staging directory not moving completed downloads (#38) | already integrated |
+| 174 | `382cf14a2e2ee17613661b4c59a37d642fa17601` | 2026-02-12 | Fix staging directory download completion and file detection (#39) | already integrated |
+| 175 | `9682f456e1a4e7f4fd1887a6c58ab2e38c47a60d` | 2026-02-12 | Add git workflow rules to CLAUDE.md | intentionally skipped |
+| 176 | `75210e8352ed797816a30c21d2e04cadcfcd1181` | 2026-02-12 | Advanced LFTP settings and staging bug fixes (#40) | already integrated |
+| 177 | `ad6163357d1242682facc892d5e1e3770bd620d7` | 2026-02-12 | Remove duplicate ci-develop.yml workflow (#42) | intentionally skipped |
+| 178 | `f6d665d919320d1a68a146a2d10cff5e55d16b92` | 2026-02-12 | Fix Advanced LFTP settings not editable for existing configs (#43) | already integrated |
+| 179 | `66cc07450513c27931ff352fdb99dd65613c9ef8` | 2026-02-12 | Change net_socket_buffer from int to string to support suffixed values (#44) | needs new integration task |
+| 180 | `b9c53132ddd3dbb51e27c7f3ffea540bc318db77` | 2026-02-12 | Graceful config upgrades: backfill defaults and save to disk (#45) | already integrated |
+| 181 | `ff5bc7ca3ac1c17d1d610f66b8213abf559df593` | 2026-02-12 | Add remote server diagnostics on first connection (#41) | already integrated |
+| 182 | `b6cf2023dc99e81fb88b9df402e503063d91bf6f` | 2026-02-12 | Clarify that 0 means unlimited for Max Total Connections (#46) | already integrated |
+| 183 | `c487f3ec5a64362efa0149e1ec8317ed5e661102` | 2026-02-12 | Fix dashboard status sort: reorder groups and sort oldest first (#47) | needs area reopen |
+| 184 | `2993a5d7e51e7c89a80671598826fc935c4700db` | 2026-02-12 | Move File Discovery to left column below Archive Extraction (#48) | needs area reopen |
+| 185 | `425b0d3982dd56c3b0ce42bf0f9d8163a6bfe9d5` | 2026-02-12 | Fix crash when remote file is removed during sync (#49) | needs new integration task |
+| 186 | `cabb47906e4a8ba297720c199002777132c14aa0` | 2026-02-12 | Preserve DOWNLOADED state after remote file is auto-deleted (#50) | needs new integration task |
+| 187 | `ef28f9884f45f9a07326edc8d46439af43b53e3d` | 2026-02-12 | Redesign dark mode with 3-surface elevation system and semantic colors (#51) | maintainer decision needed |
+| 188 | `fa5aa24b5c2cb383274a5bf799a4b4d59a6517fa` | 2026-02-13 | Bump version to 0.12.0 and update changelog for release | covered elsewhere |
+| 189 | `281c2333f6416777802b6dc3d238c0ad1bde7c9f` | 2026-02-13 | Update docs for v0.12.0 features | covered elsewhere |
+| 190 | `e8d3b78a783a7a0b48c8bf069a54e4bc64cfe9a5` | 2026-02-13 | Merge pull request #52 from nitrobass24/develop | covered elsewhere |
+| 191 | `f1b1877f9a157b37ab2f0eebc6c32210e2950e70` | 2026-02-13 | Fix lftp pexpect timeout recovery to prevent buffer corruption (#20) | already integrated |
+| 192 | `b465d67419dae7a1ed52663f53dde34cc1d2cc9e` | 2026-02-13 | Merge pull request #54 from nitrobass24/fix/lftp-pexpect-timeout-recovery | covered elsewhere |
+| 193 | `12bfce70a1d1e846d15603bf3343a374f82f0d23` | 2026-02-14 | Fix download state loss after LFTP job completion | needs new integration task |
+| 194 | `fc65492bbe197d7c50828bfd6debcdab4e5bb889` | 2026-02-14 | Merge pull request #55 from nitrobass24/fix/download-state-loss-after-lftp-completion | covered elsewhere |
+| 195 | `f2cb5d8e72b52f823aae6ea1ac1129326000beea` | 2026-02-14 | Fix progress bar glitch during downloads caused by race condition | needs new integration task |
+| 196 | `fbc32607521d950a918e646b42732722cf13b5f1` | 2026-02-14 | Merge pull request #57 from nitrobass24/fix/progress-bar-glitch | covered elsewhere |
+| 197 | `33e3a8fd4889949e2a64b54706c57a34829afdfe` | 2026-02-14 | Release v0.12.1 - Bug fixes for download stability | covered elsewhere |
+| 198 | `43badbbe4363b94f16fabd36cd790dd800c9df91` | 2026-02-14 | Merge pull request #58 from nitrobass24/release/v0.12.1 | covered elsewhere |
+| 199 | `1505cc221f07f60c9400a70dd103744dc5f43fd0` | 2026-02-15 | Fix scanfs timeout crash: pexpect leak, retry logic, SSH keepalive | already integrated |
+| 200 | `834fc1c4a73b1fb7ae1c0a616d8856f6fe329eb6` | 2026-02-15 | Merge pull request #62 from nitrobass24/fix/scanfs-timeout-crash | covered elsewhere |
+| 201 | `b1e250e958f785dfa917c962d4e5f461b70d10cb` | 2026-02-17 | Fix FileExistsError crash during cross-device move | already integrated |
+| 202 | `b1950908347e8fc12689dedf52bdbccf464ab7dd` | 2026-02-17 | Fix app crash on transient SSH errors during scanfs installation | already integrated |
+| 203 | `64aae2f57f253aa50910ea6678b7ba3ae2f65fa1` | 2026-02-18 | Fix LFTP transient errors crashing the app and reduce scanner log noise | already integrated |
+| 204 | `06c53ea9e40f07ec7dd4388ace3276fe9ee915b5` | 2026-02-18 | Merge pull request #63 from nitrobass24/fix/install-scanfs-transient-crash | covered elsewhere |
+| 205 | `ec2d08b480d0d1b01cf27c63998819eaa0b80255` | 2026-02-18 | Fix error handling bugs found during code review | already integrated |
+| 206 | `38286023cadda2ab962c3690640fcfa199abf86b` | 2026-02-18 | Merge pull request #64 from nitrobass24/fix/review-findings-error-handling | covered elsewhere |
+| 207 | `360e2d0605652e54bd0549bc53752b7ed88abe45` | 2026-02-19 | Fix LFTP status parser crash from interleaved 'jobs -v' command echo | already integrated |
 | 208 | `5b44317fdad8d5a39b96ad7671dc8bf035d1c71d` | 2026-02-19 | Fix SSH shell crash on filenames with apostrophes (e.g. "Don't Look Now") | pending |
 | 209 | `3fd9e6f6b62fe4810441cead6409166946ee679d` | 2026-02-19 | Merge pull request #66 from nitrobass24/fix/scanfs-timeout-crash | pending |
 | 210 | `bc15de5174a692a0c09bc2fa4a9d715466a3ac8a` | 2026-02-14 | Bump qs from 6.14.1 to 6.14.2 in /src/angular | pending |
