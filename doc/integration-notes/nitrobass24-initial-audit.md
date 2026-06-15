@@ -264,46 +264,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 245 | `32bb751897709a66eeed193c0e2bd087bfa5733d` | 2026-02-21 | Merge pull request #77 from nitrobass24/develop | covered elsewhere |
 | 246 | `fe0f4a68f2e039ccdf269d5683cd981059f7f620` | 2026-02-26 | Fix extract retry loop and staging delete in controller | already integrated |
 | 247 | `d7fb5e9a6d1f779c66d7ca25d6b0c1540c275ff3` | 2026-02-26 | Fix late-binding closure bug in DELETE_LOCAL post_callback | already integrated |
-| 248 | `ad7f19fae518bb463d4ec42c155cd934644d3f87` | 2026-02-26 | Merge pull request #82 from nitrobass24/fix/extract-retry-loop-and-staging-delete | pending |
-| 249 | `7a0b8952d6e0fc6868541ce612e6358af93ebd94` | 2026-02-27 | Fix chunk parser crash on rangeless format and zombie on controller death | pending |
-| 250 | `a9598f06ed1f9ed607b0b00556a7943704dcf403` | 2026-02-27 | Fix persist authority overriding children check for directories (#83) | pending |
-| 251 | `da312d2187542f0d742e972e47e920ea43ab64ff` | 2026-02-27 | Add test for rangeless chunk line with no trailing data line | pending |
-| 252 | `99638a213a30478b9574c594cf483232d553b55c` | 2026-02-27 | Merge pull request #85 from nitrobass24/fix/chunk-parser-and-zombie-crash | pending |
-| 253 | `a93b83f4cb1fef4703c0fd849048d4e79f415249` | 2026-02-27 | Replace unrar-free with full unrar for RAR5 support | pending |
-| 254 | `16e5f890488c195e61ff83b76c243b3455316101` | 2026-02-27 | Merge pull request #87 from nitrobass24/fix/extract-retry-loop | pending |
-| 255 | `5be88fd554abdc16da6bb2589901b99eb1e09601` | 2026-02-28 | Release v0.12.4 — Fix RAR5 extraction, incomplete directory re-download, parser crash | pending |
-| 256 | `dcbaf6234f1d12226299877de5f8c832cc1c1490` | 2026-02-28 | Report ExtractDispatchError as extraction failure | pending |
-| 257 | `f9eaecefe803a668c78f68a9898b82d0478ad74f` | 2026-02-28 | Add manual extract fix to CHANGELOG | pending |
-| 258 | `569959317b6ea8c43075e576e9319720ef973215` | 2026-02-28 | Fix extract not finding archives after staging move | pending |
-| 259 | `d880ba69603d053a05ac66cc5a1e849fdd4116d1` | 2026-02-28 | Add staging extract fix to CHANGELOG | pending |
-| 260 | `59039a55fb44c87400710d24dbf5b9e8bc465359` | 2026-02-28 | Pin unrar version and fix CHANGELOG markdown lint | pending |
-| 261 | `91fce4e75bd62b74179f1ed2dab591fc65d52304` | 2026-02-21 | Bump ajv in /website | pending |
-| 262 | `945741b59fba2ce5735dec4ba94dde6c126e67d6` | 2026-02-24 | Merge pull request #75 from nitrobass24/dependabot/npm_and_yarn/website/multi-73726a8ab8 | pending |
-| 263 | `862fd5c5b84c90de3944ca0f8b47303a6151abce` | 2026-02-28 | Merge master into develop to sync dependabot updates | pending |
-| 264 | `e606495a6280d6b69036c0c38f8112a1cf078bb4` | 2026-02-28 | Merge pull request #88 from nitrobass24/develop | pending |
-| 265 | `047f7257e9b4011e13a12594ec95d1f8301992e0` | 2026-02-28 | Bump rollup from 4.57.1 to 4.59.0 in /src/angular | pending |
-| 266 | `6d79cff59c8c06ae5bd0ec5dcce954de306ea2f3` | 2026-02-28 | Merge pull request #89 from nitrobass24/dependabot/npm_and_yarn/src/angular/rollup-4.59.0 | pending |
-| 267 | `8faca1ff6d77be57e602db1ff8ef2051ecf825c9` | 2026-02-28 | Fix Delete Remote on directory hanging with infinite spinner | pending |
-| 268 | `6fade95b65fcfdec6916816abb1e03eaec529572` | 2026-02-28 | Add UMASK environment variable for file permission control | pending |
-| 269 | `b09c573fc86fa5b6a780193094bdf1d68dd8fd8a` | 2026-02-28 | Merge pull request #92 from nitrobass24/fix/delete-remote-directory-hang | pending |
-| 270 | `27c0b4baee364da59371df18b85d51fd6a8302a0` | 2026-02-28 | Bump @angular/core from 21.1.3 to 21.1.6 in /src/angular | pending |
-| 271 | `cee4775c43878a12db8a96371d959b93f0765dc3` | 2026-02-28 | Bump all Angular packages to 21.2.0 | pending |
-| 272 | `aef64c9b81963399065045899cdbf36061df38cf` | 2026-02-28 | Merge pull request #90 from nitrobass24/dependabot/npm_and_yarn/src/angular/angular/core-21.1.6 | pending |
-| 273 | `848894327331dac57c9651a02abc0d5a6acefcbe` | 2026-02-28 | Parallelize CI builds and add Angular unit tests | pending |
-| 274 | `b5be932551a64719b2b5520f90bcb2ade47c8e8f` | 2026-02-28 | Merge pull request #93 from nitrobass24/ci/parallel-builds-unit-tests | pending |
-| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | pending |
-| 276 | `a976b9e52d227b6a601f9ca8f98e683eae11d5c8` | 2026-02-28 | Merge pull request #94 from nitrobass24/docs/add-umask-to-readme | pending |
-| 277 | `7edb32561b1b192ba20e2b606d68e1ceaf8ab35e` | 2026-02-28 | Update website dependencies to address transitive vulnerabilities | pending |
-| 278 | `bdfb0ba4e8460fb529ccdd09b056ada10b5384f3` | 2026-02-28 | Merge pull request #95 from nitrobass24/fix/dependabot-security-alerts | pending |
-| 279 | `94af5b7095e89961b7d4ff4162c454f74f37d6c9` | 2026-02-28 | Mask SSH password in debug log output | pending |
-| 280 | `c9538d4f80b30f25cf885fceb9d84f4af80318fc` | 2026-02-28 | Merge pull request #98 from nitrobass24/fix/mask-password-in-debug-logs | pending |
-| 281 | `2d9ed7ecb2053c20b73a51a5569b7837a0573738` | 2026-02-28 | Release v0.12.5 — update CHANGELOG and bump version | pending |
-| 282 | `94bc62df5aa58d57847c1b95b714373e8394d160` | 2026-02-28 | Skip Angular build on arm64 via build-contexts override | pending |
-| 283 | `e5b41f22a59fab4695bc21a1364f677b4744a081` | 2026-02-28 | Fix CHANGELOG heading spacing and align Angular version declarations | pending |
-| 284 | `4cb1ea7787a8be7dead50b144760b0391f4fb111` | 2026-02-28 | Release v0.12.5 — update CHANGELOG with CI optimization | pending |
-| 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | pending |
-| 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | pending |
-| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | pending |
+| 248 | `ad7f19fae518bb463d4ec42c155cd934644d3f87` | 2026-02-26 | Merge pull request #82 from nitrobass24/fix/extract-retry-loop-and-staging-delete | covered elsewhere |
+| 249 | `7a0b8952d6e0fc6868541ce612e6358af93ebd94` | 2026-02-27 | Fix chunk parser crash on rangeless format and zombie on controller death | needs integration/adapt locally |
+| 250 | `a9598f06ed1f9ed607b0b00556a7943704dcf403` | 2026-02-27 | Fix persist authority overriding children check for directories (#83) | needs integration/adapt locally |
+| 251 | `da312d2187542f0d742e972e47e920ea43ab64ff` | 2026-02-27 | Add test for rangeless chunk line with no trailing data line | needs integration/adapt locally |
+| 252 | `99638a213a30478b9574c594cf483232d553b55c` | 2026-02-27 | Merge pull request #85 from nitrobass24/fix/chunk-parser-and-zombie-crash | covered elsewhere |
+| 253 | `a93b83f4cb1fef4703c0fd849048d4e79f415249` | 2026-02-27 | Replace unrar-free with full unrar for RAR5 support | needs integration/adapt locally |
+| 254 | `16e5f890488c195e61ff83b76c243b3455316101` | 2026-02-27 | Merge pull request #87 from nitrobass24/fix/extract-retry-loop | covered elsewhere |
+| 255 | `5be88fd554abdc16da6bb2589901b99eb1e09601` | 2026-02-28 | Release v0.12.4 — Fix RAR5 extraction, incomplete directory re-download, parser crash | covered elsewhere |
+| 256 | `dcbaf6234f1d12226299877de5f8c832cc1c1490` | 2026-02-28 | Report ExtractDispatchError as extraction failure | needs integration/adapt locally |
+| 257 | `f9eaecefe803a668c78f68a9898b82d0478ad74f` | 2026-02-28 | Add manual extract fix to CHANGELOG | intentionally skipped |
+| 258 | `569959317b6ea8c43075e576e9319720ef973215` | 2026-02-28 | Fix extract not finding archives after staging move | needs integration/adapt locally |
+| 259 | `d880ba69603d053a05ac66cc5a1e849fdd4116d1` | 2026-02-28 | Add staging extract fix to CHANGELOG | intentionally skipped |
+| 260 | `59039a55fb44c87400710d24dbf5b9e8bc465359` | 2026-02-28 | Pin unrar version and fix CHANGELOG markdown lint | needs integration/adapt locally |
+| 261 | `91fce4e75bd62b74179f1ed2dab591fc65d52304` | 2026-02-21 | Bump ajv in /website | intentionally skipped |
+| 262 | `945741b59fba2ce5735dec4ba94dde6c126e67d6` | 2026-02-24 | Merge pull request #75 from nitrobass24/dependabot/npm_and_yarn/website/multi-73726a8ab8 | covered elsewhere |
+| 263 | `862fd5c5b84c90de3944ca0f8b47303a6151abce` | 2026-02-28 | Merge master into develop to sync dependabot updates | covered elsewhere |
+| 264 | `e606495a6280d6b69036c0c38f8112a1cf078bb4` | 2026-02-28 | Merge pull request #88 from nitrobass24/develop | covered elsewhere |
+| 265 | `047f7257e9b4011e13a12594ec95d1f8301992e0` | 2026-02-28 | Bump rollup from 4.57.1 to 4.59.0 in /src/angular | covered elsewhere |
+| 266 | `6d79cff59c8c06ae5bd0ec5dcce954de306ea2f3` | 2026-02-28 | Merge pull request #89 from nitrobass24/dependabot/npm_and_yarn/src/angular/rollup-4.59.0 | covered elsewhere |
+| 267 | `8faca1ff6d77be57e602db1ff8ef2051ecf825c9` | 2026-02-28 | Fix Delete Remote on directory hanging with infinite spinner | needs integration/adapt locally |
+| 268 | `6fade95b65fcfdec6916816abb1e03eaec529572` | 2026-02-28 | Add UMASK environment variable for file permission control | needs integration/adapt locally |
+| 269 | `b09c573fc86fa5b6a780193094bdf1d68dd8fd8a` | 2026-02-28 | Merge pull request #92 from nitrobass24/fix/delete-remote-directory-hang | covered elsewhere |
+| 270 | `27c0b4baee364da59371df18b85d51fd6a8302a0` | 2026-02-28 | Bump @angular/core from 21.1.3 to 21.1.6 in /src/angular | covered elsewhere |
+| 271 | `cee4775c43878a12db8a96371d959b93f0765dc3` | 2026-02-28 | Bump all Angular packages to 21.2.0 | covered elsewhere |
+| 272 | `aef64c9b81963399065045899cdbf36061df38cf` | 2026-02-28 | Merge pull request #90 from nitrobass24/dependabot/npm_and_yarn/src/angular/angular/core-21.1.6 | covered elsewhere |
+| 273 | `848894327331dac57c9651a02abc0d5a6acefcbe` | 2026-02-28 | Parallelize CI builds and add Angular unit tests | needs area reopen |
+| 274 | `b5be932551a64719b2b5520f90bcb2ade47c8e8f` | 2026-02-28 | Merge pull request #93 from nitrobass24/ci/parallel-builds-unit-tests | covered elsewhere |
+| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | needs new integration task |
+| 276 | `a976b9e52d227b6a601f9ca8f98e683eae11d5c8` | 2026-02-28 | Merge pull request #94 from nitrobass24/docs/add-umask-to-readme | covered elsewhere |
+| 277 | `7edb32561b1b192ba20e2b606d68e1ceaf8ab35e` | 2026-02-28 | Update website dependencies to address transitive vulnerabilities | intentionally skipped |
+| 278 | `bdfb0ba4e8460fb529ccdd09b056ada10b5384f3` | 2026-02-28 | Merge pull request #95 from nitrobass24/fix/dependabot-security-alerts | covered elsewhere |
+| 279 | `94af5b7095e89961b7d4ff4162c454f74f37d6c9` | 2026-02-28 | Mask SSH password in debug log output | needs integration/adapt locally |
+| 280 | `c9538d4f80b30f25cf885fceb9d84f4af80318fc` | 2026-02-28 | Merge pull request #98 from nitrobass24/fix/mask-password-in-debug-logs | covered elsewhere |
+| 281 | `2d9ed7ecb2053c20b73a51a5569b7837a0573738` | 2026-02-28 | Release v0.12.5 — update CHANGELOG and bump version | intentionally skipped |
+| 282 | `94bc62df5aa58d57847c1b95b714373e8394d160` | 2026-02-28 | Skip Angular build on arm64 via build-contexts override | needs area reopen |
+| 283 | `e5b41f22a59fab4695bc21a1364f677b4744a081` | 2026-02-28 | Fix CHANGELOG heading spacing and align Angular version declarations | intentionally skipped |
+| 284 | `4cb1ea7787a8be7dead50b144760b0391f4fb111` | 2026-02-28 | Release v0.12.5 — update CHANGELOG with CI optimization | intentionally skipped |
+| 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | needs new integration task |
+| 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | needs area reopen |
+| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | needs new integration task |
 | 288 | `5f37c1c13eaf99ff4eb1217d24b318af58cef9b8` | 2026-02-28 | Merge pull request #99 from nitrobass24/develop | pending |
 | 289 | `68800b4356cb3e50699a9fc35e946418672e4e32` | 2026-02-28 | Merge branch 'master' into develop | pending |
 | 290 | `33fec0d7700ae0cc6b2996401efcc99532b477cb` | 2026-02-28 | Release v0.12.6 — Unraid docs, Docker build optimizations | pending |
