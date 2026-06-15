@@ -108,3 +108,4 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertIn("autoqueue", out_dict)
         self.assertEqual(True, out_dict["autoqueue"]["enabled"])
         self.assertEqual(False, out_dict["autoqueue"]["patterns_only"])
+        self.assertEqual(False, out_dict["autoqueue"]["auto_delete_remote"])

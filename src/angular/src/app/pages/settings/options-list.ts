@@ -190,6 +190,12 @@ export const OPTIONS_CONTEXT_AUTOQUEUE: IOptionsContext = {
             valuePath: ["autoqueue", "auto_extract"],
             description: "Automatically extract files"
         },
+        {
+            type: OptionType.Checkbox,
+            label: "Delete remote files after download",
+            valuePath: ["autoqueue", "auto_delete_remote"],
+            description: "Opt in to remove remote files after download or extraction."
+        },
     ]
 };
 

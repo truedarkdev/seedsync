@@ -1192,6 +1192,198 @@ class TestAutoQueue(unittest.TestCase):
         self.assertEqual(set([Controller.Command.Action.EXTRACT]*3), {c.action for c in commands})
         self.assertEqual({"File.One", "File.Two", "File.Three"}, {c.filename for c in commands})
 
+    def test_downloaded_extractable_files_are_extracted_before_remote_deletion(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        file_one = ModelFile("archive.zip", False)
+        file_one.state = ModelFile.State.DOWNLOADED
+        file_one.local_size = 100
+        file_one.remote_size = 100
+        file_one.is_extractable = True
+
+        self.model_listener.file_added(file_one)
+        auto_queue.process()
+
+        calls = self.controller.queue_command.call_args_list
+        self.assertEqual(1, len(calls))
+        command = calls[0][0][0]
+        self.assertEqual(Controller.Command.Action.EXTRACT, command.action)
+        self.assertEqual("archive.zip", command.filename)
+
+    def test_extracted_completion_transition_deletes_remote_when_enabled(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("archive.zip", False)
+        old_file.state = ModelFile.State.EXTRACTING
+        old_file.local_size = 100
+        old_file.remote_size = 100
+        old_file.is_extractable = True
+
+        new_file = ModelFile("archive.zip", False)
+        new_file.state = ModelFile.State.EXTRACTED
+        new_file.local_size = 100
+        new_file.remote_size = 100
+        new_file.is_extractable = True
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual("archive.zip", command.filename)
+
+    def test_marker_style_downloaded_to_extracted_transition_does_not_delete_remote(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("archive.zip", False)
+        old_file.state = ModelFile.State.DOWNLOADED
+        old_file.local_size = 100
+        old_file.remote_size = 100
+        old_file.is_extractable = True
+
+        new_file = ModelFile("archive.zip", False)
+        new_file.state = ModelFile.State.EXTRACTED
+        new_file.local_size = 100
+        new_file.remote_size = 100
+        new_file.is_extractable = True
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
+    def test_non_extract_download_completion_deletes_remote_when_enabled(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("archive.zip", False)
+        old_file.state = ModelFile.State.DEFAULT
+        old_file.remote_size = None
+
+        new_file = ModelFile("archive.zip", False)
+        new_file.state = ModelFile.State.DOWNLOADED
+        new_file.local_size = 100
+        new_file.remote_size = 100
+        new_file.is_extractable = False
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual("archive.zip", command.filename)
+
+    def test_disabled_auto_delete_does_not_queue_remote_delete(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("archive.zip", False)
+        old_file.state = ModelFile.State.DEFAULT
+
+        new_file = ModelFile("archive.zip", False)
+        new_file.state = ModelFile.State.DOWNLOADED
+        new_file.local_size = 100
+        new_file.remote_size = 100
+        new_file.is_extractable = False
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
+    def test_remote_size_none_suppresses_remote_delete(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("archive.zip", False)
+        old_file.state = ModelFile.State.DEFAULT
+
+        new_file = ModelFile("archive.zip", False)
+        new_file.state = ModelFile.State.DOWNLOADED
+        new_file.local_size = 100
+        new_file.remote_size = None
+        new_file.is_extractable = False
+
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
+    def test_initial_completed_model_files_do_not_auto_delete_remote(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        file_one = ModelFile("archive.zip", False)
+        file_one.state = ModelFile.State.EXTRACTED
+        file_one.local_size = 100
+        file_one.remote_size = 100
+        file_one.is_extractable = True
+        self.initial_model = [file_one]
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
+    def test_new_pattern_backfilled_completed_file_does_not_auto_delete_remote(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+        self.context.config.autoqueue.patterns_only = True
+
+        persist = AutoQueuePersist()
+
+        file_one = ModelFile("archive.zip", False)
+        file_one.state = ModelFile.State.EXTRACTED
+        file_one.local_size = 100
+        file_one.remote_size = 100
+        file_one.is_extractable = True
+        self.initial_model = [file_one]
+
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))
+
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
     def test_auto_extract_trace_logs_queued_decision_for_selected_file(self):
         persist = AutoQueuePersist()
         persist.add_pattern(AutoQueuePattern(pattern="archive.zip"))

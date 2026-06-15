@@ -453,11 +453,13 @@ class TestConfig(unittest.TestCase):
         good_dict = {
             "enabled": "True",
             "patterns_only": "False",
-            "auto_extract": "True"
+            "auto_extract": "True",
+            "auto_delete_remote": "True"
         }
         autoqueue = Config.AutoQueue.from_dict(good_dict)
         self.assertEqual(True, autoqueue.enabled)
         self.assertEqual(False, autoqueue.patterns_only)
+        self.assertEqual(True, autoqueue.auto_delete_remote)
 
         self.check_common(Config.AutoQueue,
                           good_dict,
@@ -474,6 +476,8 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.AutoQueue, good_dict, "patterns_only", "-1")
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_extract", "SomeString")
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_extract", "-1")
+        self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_delete_remote", "SomeString")
+        self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_delete_remote", "-1")
 
     def test_from_file(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
@@ -561,6 +565,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(False, config.autoqueue.enabled)
             self.assertEqual(True, config.autoqueue.patterns_only)
             self.assertEqual(True, config.autoqueue.auto_extract)
+            self.assertEqual(False, config.autoqueue.auto_delete_remote)
 
             # unknown section error
             with open(config_path, "a") as config_file:
@@ -614,6 +619,7 @@ class TestConfig(unittest.TestCase):
             config.autoqueue.enabled = True
             config.autoqueue.patterns_only = True
             config.autoqueue.auto_extract = False
+            config.autoqueue.auto_delete_remote = False
             config.to_file(config_file_path)
             with open(config_file_path, "r") as f:
                 actual_str = f.read()
@@ -663,6 +669,7 @@ class TestConfig(unittest.TestCase):
             enabled = True
             patterns_only = True
             auto_extract = False
+            auto_delete_remote = False
             """
 
             golden_lines = [s.strip() for s in golden_str.splitlines()]

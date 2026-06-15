@@ -392,12 +392,21 @@ class Config(Persist):
         enabled = PROP("enabled", Checkers.null, Converters.bool)
         patterns_only = PROP("patterns_only", Checkers.null, Converters.bool)
         auto_extract = PROP("auto_extract", Checkers.null, Converters.bool)
+        auto_delete_remote = PROP("auto_delete_remote", Checkers.bool_value, Converters.bool)
 
         def __init__(self):
             super().__init__()
             self.enabled = None
             self.patterns_only = None
             self.auto_extract = None
+            self.auto_delete_remote = False
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "auto_delete_remote" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["auto_delete_remote"] = False
+            return super().from_dict(config_dict)
 
     def __init__(self):
         self.general = Config.General()

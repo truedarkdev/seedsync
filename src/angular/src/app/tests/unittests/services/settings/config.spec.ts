@@ -81,6 +81,7 @@ describe("Testing config record initialization", () => {
         expect(config.autoqueue.enabled).toBe(true);
         expect(config.autoqueue.patterns_only).toBe(false);
         expect(config.autoqueue.auto_extract).toBe(true);
+        expect(config.autoqueue.auto_delete_remote).toBe(false);
     });
 
     it("should be immutable", () => {
@@ -100,6 +101,7 @@ describe("Testing config record initialization", () => {
 
         expect(partialConfig.general.debug).toBe(true);
         expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
+        expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
         expect(partialConfig.getValue("general", "debug")).toBe(true);
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
