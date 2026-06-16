@@ -81,6 +81,7 @@ RUN set -eux; \
         p7zip \
         p7zip-full \
         p7zip-rar \
+        unrar \
         bzip2 \
         curl \
         libnss-wrapper \
