@@ -316,7 +316,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 297 | `66ac8dec07733ff8e6e3670ea76b588b78c60a68` | 2026-03-02 | fix: create and chown /staging directory in container (#112) | adapted locally in `46cd02fe` |
 | 298 | `a1d882db88660094912e40805b0c46cdaa7eea8f` | 2026-03-02 | Release v0.12.8 — Staging path fix and entrypoint permission improvements | covered elsewhere |
 | 299 | `6ac0efb8ed959a1dab5b88f08d487c7205006915` | 2026-03-02 | Release v0.12.9 — UMASK diagnostic logging (#113) | covered elsewhere |
-| 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | needs integration/adapt locally |
+| 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | adapted locally in `f1a407c5` |
 | 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | adapted locally in `46cd02fe` |
 | 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | needs area reopen |
 | 303 | `530cb3f3e616cfb573b4274343499a6e14eeedb2` | 2026-03-04 | fix: make Angular build output CSP-compliant (#134) | needs integration/adapt locally |
