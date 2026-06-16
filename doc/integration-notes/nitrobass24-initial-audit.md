@@ -357,7 +357,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 338 | `85f289492e20d9c29c475675791e856152f34f20` | 2026-03-05 | fix: address code review findings for path pairs PR | needs area reopen |
 | 339 | `61db57e7398215b2d469246e4279b50b2e4fef80` | 2026-03-05 | fix: address round 2 code review findings for path pairs PR | needs area reopen |
 | 340 | `06d1e0f76b57af7798991ec67f2760a5286ab8a1` | 2026-03-05 | fix: address round 3 code review findings for path pairs PR | needs area reopen |
-| 341 | `7aaceb68cc359969ef6a4a4d256e7cdc062eb326` | 2026-03-05 | Merge pull request #149 from nitrobass24/feat/multiple-path-pairs | pending |
+| 341 | `7aaceb68cc359969ef6a4a4d256e7cdc062eb326` | 2026-03-05 | Merge pull request #149 from nitrobass24/feat/multiple-path-pairs | covered elsewhere |
 | 342 | `41b2893ec56e572fd2dcee1ad2d84789a2cc645c` | 2026-03-05 | feat: make Python scanfs the primary scanner, drop PyInstaller (#80) (#148) | pending |
 | 343 | `08118e118104d903d778bc42e3c0686c068792a6` | 2026-03-05 | fix: remove stale paste reference and dead modal localization strings | pending |
 | 344 | `e0b1839a8f2ae7fcf2b219e420cb7c0bb1dfebf0` | 2026-03-05 | fix: make scan_fs.py self-contained for remote execution | pending |
