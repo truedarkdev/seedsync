@@ -311,13 +311,13 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 292 | `71b696af249116550a385af3c945435849c213ca` | 2026-03-01 | Remove unused wrangler dependency from website | intentionally skipped |
 | 293 | `f865cf654b9efe8fe75b7f5dc660685730f5711e` | 2026-03-01 | Merge pull request #107 from nitrobass24/fix/remove-wrangler | covered elsewhere |
 | 294 | `6b586f2ac1bb445b704af7f51e013f1714a171e8` | 2026-03-01 | Merge pull request #108 from nitrobass24/develop | covered elsewhere |
-| 295 | `0b18669e887ba94b5b883d82848b2f69b07453ee` | 2026-03-02 | fix: apply UMASK env var via os.umask() at Python startup (#111) | needs integration/adapt locally |
+| 295 | `0b18669e887ba94b5b883d82848b2f69b07453ee` | 2026-03-02 | fix: apply UMASK env var via os.umask() at Python startup (#111) | adapted locally in `46cd02fe` |
 | 296 | `e8d1cef7f9b557a03e0a545b01af267052886d6c` | 2026-03-02 | Release v0.12.7 — Fix UMASK not applied to downloaded files | covered elsewhere |
-| 297 | `66ac8dec07733ff8e6e3670ea76b588b78c60a68` | 2026-03-02 | fix: create and chown /staging directory in container (#112) | needs integration/adapt locally |
+| 297 | `66ac8dec07733ff8e6e3670ea76b588b78c60a68` | 2026-03-02 | fix: create and chown /staging directory in container (#112) | adapted locally in `46cd02fe` |
 | 298 | `a1d882db88660094912e40805b0c46cdaa7eea8f` | 2026-03-02 | Release v0.12.8 — Staging path fix and entrypoint permission improvements | covered elsewhere |
 | 299 | `6ac0efb8ed959a1dab5b88f08d487c7205006915` | 2026-03-02 | Release v0.12.9 — UMASK diagnostic logging (#113) | covered elsewhere |
 | 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | needs integration/adapt locally |
-| 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | needs integration/adapt locally |
+| 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | adapted locally in `46cd02fe` |
 | 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | needs area reopen |
 | 303 | `530cb3f3e616cfb573b4274343499a6e14eeedb2` | 2026-03-04 | fix: make Angular build output CSP-compliant (#134) | needs integration/adapt locally |
 | 304 | `828214daa3a3eb3e120af1ce47359335ca3f833c` | 2026-03-04 | fix: eagerly initialize ConfigService to fix settings not loading (#136) | needs integration/adapt locally |
