@@ -325,8 +325,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 306 | `f15e7c4f409114710f4ef1d540c892cf99003471` | 2026-03-04 | fix: address round 5 review findings | needs area reopen |
 | 307 | `bb5be5290330119b8cef54a759222d7ca4b8eb3f` | 2026-03-04 | fix: address round 6 review findings | needs area reopen |
 | 308 | `562b19a189de07827e519251416645dc960946bc` | 2026-03-04 | Release v0.12.10 — Security hardening (#137) | covered elsewhere |
-| 309 | `9f8a1846779fc224c3d2aac5ec26e3245a42723d` | 2026-03-04 | feat: slim Docker image by ~8 MB (170 → 162 MB) | needs integration/adapt locally |
-| 310 | `ec57a43cc485e4c04f0f2b163dd86ef30dd59309` | 2026-03-04 | fix: consolidate Dockerfile RUN layers and document unpinned packages | needs integration/adapt locally |
+| 309 | `9f8a1846779fc224c3d2aac5ec26e3245a42723d` | 2026-03-04 | feat: slim Docker image by ~8 MB (170 → 162 MB) | adapted locally in `034832ed` |
+| 310 | `ec57a43cc485e4c04f0f2b163dd86ef30dd59309` | 2026-03-04 | fix: consolidate Dockerfile RUN layers and document unpinned packages | adapted locally in `034832ed` |
 | 311 | `483db92aeadc29b2a9d95edd5003eb92405d83c2` | 2026-03-04 | Merge pull request #139 from nitrobass24/feat/slim-docker-image | covered elsewhere |
 | 312 | `ef373fa0d646f69631476ccabb24bfa1c9a0004e` | 2026-03-04 | docs: update MODERNIZATION_PLAN.md for v0.12.10 | intentionally skipped |
 | 313 | `038e2120aa7243f0ae3e85d4620744b03d6b355c` | 2026-03-05 | chore: add feat/v0.13.0 to CodeRabbit base branches | intentionally skipped |
