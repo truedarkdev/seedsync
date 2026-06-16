@@ -140,6 +140,50 @@ describe("Testing file component", () => {
         })).not.toThrow();
     });
 
+    it("should clear the active remote delete action when remote deletability drops without a status change", () => {
+        const oldFile = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isRemotelyDeletable: true
+        });
+        const newFile = createViewFile({
+            fileId: oldFile.fileId,
+            name: oldFile.name,
+            status: ViewFile.Status.DOWNLOADED,
+            isRemotelyDeletable: false
+        });
+        component.file = newFile;
+        component.activeAction = FileAction.DELETE_REMOTE;
+
+        component.ngOnChanges({
+            file: new SimpleChange(oldFile, newFile, false)
+        });
+
+        expect(component.activeAction).toBe(null);
+        expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
+    it("should clear the active local delete action when local deletability drops without a status change", () => {
+        const oldFile = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isLocallyDeletable: true
+        });
+        const newFile = createViewFile({
+            fileId: oldFile.fileId,
+            name: oldFile.name,
+            status: ViewFile.Status.DOWNLOADED,
+            isLocallyDeletable: false
+        });
+        component.file = newFile;
+        component.activeAction = FileAction.DELETE_LOCAL;
+
+        component.ngOnChanges({
+            file: new SimpleChange(oldFile, newFile, false)
+        });
+
+        expect(component.activeAction).toBe(null);
+        expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
     it("should set the active action when queueing a queueable file", () => {
         const queueSpy = spyOn(component.queueEvent, "emit");
         component.file = createViewFile({isQueueable: true});

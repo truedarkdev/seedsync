@@ -2267,10 +2267,15 @@ class Controller:
                 else:
                     # Do the post callback
                     command_process.post_callback()
-                    # Propagate the exception
+                    # Propagate the exception without crashing the controller loop
                     try:
                         command_process.process.propagate_exception()
                     except Exception as error:
+                        self.logger.warning(
+                            "Command process failed: %s",
+                            command_process.process.name,
+                            exc_info=True
+                        )
                         self.__record_command_breadcrumb(
                             command=command_process.command,
                             message="command_failed",
@@ -2283,14 +2288,14 @@ class Controller:
                             },
                             event_type="failure",
                         )
-                        raise
-                    self.__record_command_breadcrumb(
-                        command=command_process.command,
-                        message="command_finished",
-                        details={
-                            "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                            "lifecycle_phase": "cleanup",
-                            "completion": "completed",
-                        },
-                    )
+                    else:
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_finished",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "lifecycle_phase": "cleanup",
+                                "completion": "completed",
+                            },
+                        )
         self.__active_command_processes = still_active_processes
