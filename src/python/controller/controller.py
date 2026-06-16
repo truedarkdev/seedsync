@@ -145,8 +145,8 @@ class Controller:
         self.__model.set_base_logger(self.logger)
         # Lock for the model
         # Note: While the scanners are in a separate process, the rest of the application
-        #       is threaded in a single process. (The webserver is bottle+paste which is
-        #       multi-threaded). Therefore it is safe to use a threading Lock for the model
+        #       is threaded in a single process. (The webserver is threaded Bottle WSGI
+        #       server). Therefore it is safe to use a threading Lock for the model
         #       (the scanner processes never try to access the model)
         self.__model_lock = Lock()
         self.__path_pair_refresh_lock = Lock()
