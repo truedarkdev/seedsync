@@ -351,7 +351,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 332 | `bb5f6023a2c3df9b719f57e6036bdac8dd8d27c9` | 2026-03-04 | feat: add historical log query endpoint with search/filter UI (#124) | needs new integration task |
 | 333 | `87d11b036ce8412b8840224c7ad00fbb30f30801` | 2026-03-05 | ci: enable build and publish for feat/v0.13.0 branch | needs area reopen |
 | 334 | `be3ff0b60fa317ba2daea2e2ccbc3abf7902da2f` | 2026-03-05 | Merge branch 'develop' into feat/v0.13.0 | covered elsewhere |
-| 335 | `6ba47dd35688925bf09fc21a81af2e137cee5e9c` | 2026-03-05 | ci: retrigger build | pending |
+| 335 | `6ba47dd35688925bf09fc21a81af2e137cee5e9c` | 2026-03-05 | ci: retrigger build | covered elsewhere |
 | 336 | `2f7675353545a633c2bbc62ccfec0811de4f395a` | 2026-03-04 | feat: replace paste WSGI server with Bottle built-in (#140) | pending |
 | 337 | `139d97cc472a8fcbfed73d5337ada1857030dee5` | 2026-03-04 | feat: add multiple path pairs support (#122) | pending |
 | 338 | `85f289492e20d9c29c475675791e856152f34f20` | 2026-03-05 | fix: address code review findings for path pairs PR | pending |
