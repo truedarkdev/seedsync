@@ -318,12 +318,12 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 299 | `6ac0efb8ed959a1dab5b88f08d487c7205006915` | 2026-03-02 | Release v0.12.9 — UMASK diagnostic logging (#113) | covered elsewhere |
 | 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | adapted locally in `f1a407c5` |
 | 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | adapted locally in `46cd02fe` |
-| 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | needs area reopen |
+| 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | adapted locally in `3e2485e5` |
 | 303 | `530cb3f3e616cfb573b4274343499a6e14eeedb2` | 2026-03-04 | fix: make Angular build output CSP-compliant (#134) | adapted locally in `c1a3a77c` |
 | 304 | `828214daa3a3eb3e120af1ce47359335ca3f833c` | 2026-03-04 | fix: eagerly initialize ConfigService to fix settings not loading (#136) | adapted locally in `518422ee` |
 | 305 | `3dbe1b6f9dfad5ee21fa12ae682f3525168267a2` | 2026-03-04 | Prepare v0.12.10 release — security hardening and CSP fixes | covered elsewhere |
-| 306 | `f15e7c4f409114710f4ef1d540c892cf99003471` | 2026-03-04 | fix: address round 5 review findings | needs area reopen |
-| 307 | `bb5be5290330119b8cef54a759222d7ca4b8eb3f` | 2026-03-04 | fix: address round 6 review findings | needs area reopen |
+| 306 | `f15e7c4f409114710f4ef1d540c892cf99003471` | 2026-03-04 | fix: address round 5 review findings | adapted locally in `3e2485e5` |
+| 307 | `bb5be5290330119b8cef54a759222d7ca4b8eb3f` | 2026-03-04 | fix: address round 6 review findings | adapted locally in `3e2485e5` |
 | 308 | `562b19a189de07827e519251416645dc960946bc` | 2026-03-04 | Release v0.12.10 — Security hardening (#137) | covered elsewhere |
 | 309 | `9f8a1846779fc224c3d2aac5ec26e3245a42723d` | 2026-03-04 | feat: slim Docker image by ~8 MB (170 → 162 MB) | adapted locally in `034832ed` |
 | 310 | `ec57a43cc485e4c04f0f2b163dd86ef30dd59309` | 2026-03-04 | fix: consolidate Dockerfile RUN layers and document unpinned packages | adapted locally in `034832ed` |
