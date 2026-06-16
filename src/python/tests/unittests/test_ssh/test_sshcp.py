@@ -88,6 +88,22 @@ class TestSshcp(unittest.TestCase):
         self.assertIn("connection closed", error_str)
         self.assertNotIn("incorrect password", error_str)
 
+    def test_copy_preserves_scp_destination_permission_denied_error(self):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        spawn = MagicMock()
+        spawn.expect.return_value = 9
+        spawn.before = b"scp: /home/remoteuser/restricted/scanfs: - "
+        spawn.after = b"Permission denied"
+
+        with patch("ssh.sshcp.pexpect.spawn", return_value=spawn, create=True):
+            with self.assertRaises(SshcpError) as ctx:
+                sshcp.copy(local_path=self.local_file, remote_path="/home/remoteuser/restricted/scanfs")
+
+        self.assertEqual(
+            "scp: /home/remoteuser/restricted/scanfs: - Permission denied",
+            str(ctx.exception)
+        )
+
     @parameterized.expand(_PARAMS)
     def test_copy_error_missing_local_file(self, _, password):
         local_file = os.path.join(self.local_dir, "nofile.txt")
