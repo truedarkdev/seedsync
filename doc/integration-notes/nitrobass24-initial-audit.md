@@ -304,46 +304,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | needs new integration task |
 | 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | needs area reopen |
 | 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | needs new integration task |
-| 288 | `5f37c1c13eaf99ff4eb1217d24b318af58cef9b8` | 2026-02-28 | Merge pull request #99 from nitrobass24/develop | pending |
-| 289 | `68800b4356cb3e50699a9fc35e946418672e4e32` | 2026-02-28 | Merge branch 'master' into develop | pending |
-| 290 | `33fec0d7700ae0cc6b2996401efcc99532b477cb` | 2026-02-28 | Release v0.12.6 — Unraid docs, Docker build optimizations | pending |
-| 291 | `1360d7376186daf6f7e5b76c9e69a5ec0fe731e2` | 2026-02-28 | Merge pull request #103 from nitrobass24/develop | pending |
-| 292 | `71b696af249116550a385af3c945435849c213ca` | 2026-03-01 | Remove unused wrangler dependency from website | pending |
-| 293 | `f865cf654b9efe8fe75b7f5dc660685730f5711e` | 2026-03-01 | Merge pull request #107 from nitrobass24/fix/remove-wrangler | pending |
-| 294 | `6b586f2ac1bb445b704af7f51e013f1714a171e8` | 2026-03-01 | Merge pull request #108 from nitrobass24/develop | pending |
-| 295 | `0b18669e887ba94b5b883d82848b2f69b07453ee` | 2026-03-02 | fix: apply UMASK env var via os.umask() at Python startup (#111) | pending |
-| 296 | `e8d1cef7f9b557a03e0a545b01af267052886d6c` | 2026-03-02 | Release v0.12.7 — Fix UMASK not applied to downloaded files | pending |
-| 297 | `66ac8dec07733ff8e6e3670ea76b588b78c60a68` | 2026-03-02 | fix: create and chown /staging directory in container (#112) | pending |
-| 298 | `a1d882db88660094912e40805b0c46cdaa7eea8f` | 2026-03-02 | Release v0.12.8 — Staging path fix and entrypoint permission improvements | pending |
-| 299 | `6ac0efb8ed959a1dab5b88f08d487c7205006915` | 2026-03-02 | Release v0.12.9 — UMASK diagnostic logging (#113) | pending |
-| 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | pending |
-| 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | pending |
-| 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | pending |
-| 303 | `530cb3f3e616cfb573b4274343499a6e14eeedb2` | 2026-03-04 | fix: make Angular build output CSP-compliant (#134) | pending |
-| 304 | `828214daa3a3eb3e120af1ce47359335ca3f833c` | 2026-03-04 | fix: eagerly initialize ConfigService to fix settings not loading (#136) | pending |
-| 305 | `3dbe1b6f9dfad5ee21fa12ae682f3525168267a2` | 2026-03-04 | Prepare v0.12.10 release — security hardening and CSP fixes | pending |
-| 306 | `f15e7c4f409114710f4ef1d540c892cf99003471` | 2026-03-04 | fix: address round 5 review findings | pending |
-| 307 | `bb5be5290330119b8cef54a759222d7ca4b8eb3f` | 2026-03-04 | fix: address round 6 review findings | pending |
-| 308 | `562b19a189de07827e519251416645dc960946bc` | 2026-03-04 | Release v0.12.10 — Security hardening (#137) | pending |
-| 309 | `9f8a1846779fc224c3d2aac5ec26e3245a42723d` | 2026-03-04 | feat: slim Docker image by ~8 MB (170 → 162 MB) | pending |
-| 310 | `ec57a43cc485e4c04f0f2b163dd86ef30dd59309` | 2026-03-04 | fix: consolidate Dockerfile RUN layers and document unpinned packages | pending |
-| 311 | `483db92aeadc29b2a9d95edd5003eb92405d83c2` | 2026-03-04 | Merge pull request #139 from nitrobass24/feat/slim-docker-image | pending |
-| 312 | `ef373fa0d646f69631476ccabb24bfa1c9a0004e` | 2026-03-04 | docs: update MODERNIZATION_PLAN.md for v0.12.10 | pending |
-| 313 | `038e2120aa7243f0ae3e85d4620744b03d6b355c` | 2026-03-05 | chore: add feat/v0.13.0 to CodeRabbit base branches | pending |
-| 314 | `52692810c694e9d39c8595e498772cdec0ea3b31` | 2026-03-05 | chore: add dependabot config targeting develop | pending |
-| 315 | `0e9780b59bcff4ce97add59c09c8ac4f8463f2b4` | 2026-03-04 | Bump hono from 4.12.3 to 4.12.5 in /src/angular | pending |
-| 316 | `6ca7e55d0e2bb0855f975071c98baa791720fa89` | 2026-03-05 | Merge pull request #131 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.5 | pending |
-| 317 | `ede82684ee14a874192493f315feadbdf566b67b` | 2026-03-04 | Bump @hono/node-server from 1.19.9 to 1.19.10 in /src/angular | pending |
-| 318 | `32c1ac13bc2d843f0d74557593b9bbdcc70c1146` | 2026-03-05 | Merge pull request #132 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono/node-server-1.19.10 | pending |
-| 319 | `f88893d26b6e41ab8cfb082b0655cc5f7d2dfcb3` | 2026-03-04 | Bump immutable from 5.1.4 to 5.1.5 in /src/angular | pending |
-| 320 | `75d3486168f3c6178bff2024c43738d78d698894` | 2026-03-05 | Merge pull request #133 from nitrobass24/dependabot/npm_and_yarn/src/angular/immutable-5.1.5 | pending |
-| 321 | `db3d84f405f39f63e9124caa98c277c62f643b9f` | 2026-03-05 | Bump svgo from 3.3.2 to 3.3.3 in /website | pending |
-| 322 | `c953ded2d1b6a8cd3101dade70ad0ad416a18d74` | 2026-03-05 | Merge pull request #135 from nitrobass24/dependabot/npm_and_yarn/website/svgo-3.3.3 | pending |
-| 323 | `171bc77b82fb27902f3b55abb2a03f1a6ac0608a` | 2026-03-05 | Bump tar from 7.5.9 to 7.5.10 in /src/angular | pending |
-| 324 | `5e1f1df37ae8f152554de73428f8424518d2dc4e` | 2026-03-05 | Merge pull request #138 from nitrobass24/dependabot/npm_and_yarn/src/angular/tar-7.5.10 | pending |
-| 325 | `d414a6d6093f91d1d67333ed2aa00a202a77624c` | 2026-03-05 | Revert "Bump tar from 7.5.9 to 7.5.10 in /src/angular" | pending |
-| 326 | `7accdea1007741f62f3197ee5392ba93b0b6aecb` | 2026-03-05 | Merge pull request #150 from nitrobass24/revert-138-dependabot/npm_and_yarn/src/angular/tar-7.5.10 | pending |
-| 327 | `5492b3aa97b8fe70abacb400993880917258cf54` | 2026-03-04 | feat: add structured JSON logging option (#127) | pending |
+| 288 | `5f37c1c13eaf99ff4eb1217d24b318af58cef9b8` | 2026-02-28 | Merge pull request #99 from nitrobass24/develop | covered elsewhere |
+| 289 | `68800b4356cb3e50699a9fc35e946418672e4e32` | 2026-02-28 | Merge branch 'master' into develop | covered elsewhere |
+| 290 | `33fec0d7700ae0cc6b2996401efcc99532b477cb` | 2026-02-28 | Release v0.12.6 — Unraid docs, Docker build optimizations | covered elsewhere |
+| 291 | `1360d7376186daf6f7e5b76c9e69a5ec0fe731e2` | 2026-02-28 | Merge pull request #103 from nitrobass24/develop | covered elsewhere |
+| 292 | `71b696af249116550a385af3c945435849c213ca` | 2026-03-01 | Remove unused wrangler dependency from website | intentionally skipped |
+| 293 | `f865cf654b9efe8fe75b7f5dc660685730f5711e` | 2026-03-01 | Merge pull request #107 from nitrobass24/fix/remove-wrangler | covered elsewhere |
+| 294 | `6b586f2ac1bb445b704af7f51e013f1714a171e8` | 2026-03-01 | Merge pull request #108 from nitrobass24/develop | covered elsewhere |
+| 295 | `0b18669e887ba94b5b883d82848b2f69b07453ee` | 2026-03-02 | fix: apply UMASK env var via os.umask() at Python startup (#111) | needs integration/adapt locally |
+| 296 | `e8d1cef7f9b557a03e0a545b01af267052886d6c` | 2026-03-02 | Release v0.12.7 — Fix UMASK not applied to downloaded files | covered elsewhere |
+| 297 | `66ac8dec07733ff8e6e3670ea76b588b78c60a68` | 2026-03-02 | fix: create and chown /staging directory in container (#112) | needs integration/adapt locally |
+| 298 | `a1d882db88660094912e40805b0c46cdaa7eea8f` | 2026-03-02 | Release v0.12.8 — Staging path fix and entrypoint permission improvements | covered elsewhere |
+| 299 | `6ac0efb8ed959a1dab5b88f08d487c7205006915` | 2026-03-02 | Release v0.12.9 — UMASK diagnostic logging (#113) | covered elsewhere |
+| 300 | `981edbb7a4a5cd5bfb2a6260af11c1bfe83ecc5c` | 2026-03-03 | fix: robust scanfs installation for restricted remote environments (#114) | needs integration/adapt locally |
+| 301 | `722d21ce138d100f4616beddd59103bb3672923b` | 2026-03-03 | fix: disable sftp permission preservation to respect local umask (#115) | needs integration/adapt locally |
+| 302 | `1fa6785aadfc231eac68a9c8ff6927237853ffe2` | 2026-03-04 | Security hardening bundle for v0.12.10 (#130) | needs area reopen |
+| 303 | `530cb3f3e616cfb573b4274343499a6e14eeedb2` | 2026-03-04 | fix: make Angular build output CSP-compliant (#134) | needs integration/adapt locally |
+| 304 | `828214daa3a3eb3e120af1ce47359335ca3f833c` | 2026-03-04 | fix: eagerly initialize ConfigService to fix settings not loading (#136) | needs integration/adapt locally |
+| 305 | `3dbe1b6f9dfad5ee21fa12ae682f3525168267a2` | 2026-03-04 | Prepare v0.12.10 release — security hardening and CSP fixes | covered elsewhere |
+| 306 | `f15e7c4f409114710f4ef1d540c892cf99003471` | 2026-03-04 | fix: address round 5 review findings | needs area reopen |
+| 307 | `bb5be5290330119b8cef54a759222d7ca4b8eb3f` | 2026-03-04 | fix: address round 6 review findings | needs area reopen |
+| 308 | `562b19a189de07827e519251416645dc960946bc` | 2026-03-04 | Release v0.12.10 — Security hardening (#137) | covered elsewhere |
+| 309 | `9f8a1846779fc224c3d2aac5ec26e3245a42723d` | 2026-03-04 | feat: slim Docker image by ~8 MB (170 → 162 MB) | needs integration/adapt locally |
+| 310 | `ec57a43cc485e4c04f0f2b163dd86ef30dd59309` | 2026-03-04 | fix: consolidate Dockerfile RUN layers and document unpinned packages | needs integration/adapt locally |
+| 311 | `483db92aeadc29b2a9d95edd5003eb92405d83c2` | 2026-03-04 | Merge pull request #139 from nitrobass24/feat/slim-docker-image | covered elsewhere |
+| 312 | `ef373fa0d646f69631476ccabb24bfa1c9a0004e` | 2026-03-04 | docs: update MODERNIZATION_PLAN.md for v0.12.10 | intentionally skipped |
+| 313 | `038e2120aa7243f0ae3e85d4620744b03d6b355c` | 2026-03-05 | chore: add feat/v0.13.0 to CodeRabbit base branches | intentionally skipped |
+| 314 | `52692810c694e9d39c8595e498772cdec0ea3b31` | 2026-03-05 | chore: add dependabot config targeting develop | intentionally skipped |
+| 315 | `0e9780b59bcff4ce97add59c09c8ac4f8463f2b4` | 2026-03-04 | Bump hono from 4.12.3 to 4.12.5 in /src/angular | intentionally skipped |
+| 316 | `6ca7e55d0e2bb0855f975071c98baa791720fa89` | 2026-03-05 | Merge pull request #131 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.5 | covered elsewhere |
+| 317 | `ede82684ee14a874192493f315feadbdf566b67b` | 2026-03-04 | Bump @hono/node-server from 1.19.9 to 1.19.10 in /src/angular | intentionally skipped |
+| 318 | `32c1ac13bc2d843f0d74557593b9bbdcc70c1146` | 2026-03-05 | Merge pull request #132 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono/node-server-1.19.10 | covered elsewhere |
+| 319 | `f88893d26b6e41ab8cfb082b0655cc5f7d2dfcb3` | 2026-03-04 | Bump immutable from 5.1.4 to 5.1.5 in /src/angular | intentionally skipped |
+| 320 | `75d3486168f3c6178bff2024c43738d78d698894` | 2026-03-05 | Merge pull request #133 from nitrobass24/dependabot/npm_and_yarn/src/angular/immutable-5.1.5 | covered elsewhere |
+| 321 | `db3d84f405f39f63e9124caa98c277c62f643b9f` | 2026-03-05 | Bump svgo from 3.3.2 to 3.3.3 in /website | intentionally skipped |
+| 322 | `c953ded2d1b6a8cd3101dade70ad0ad416a18d74` | 2026-03-05 | Merge pull request #135 from nitrobass24/dependabot/npm_and_yarn/website/svgo-3.3.3 | covered elsewhere |
+| 323 | `171bc77b82fb27902f3b55abb2a03f1a6ac0608a` | 2026-03-05 | Bump tar from 7.5.9 to 7.5.10 in /src/angular | intentionally skipped |
+| 324 | `5e1f1df37ae8f152554de73428f8424518d2dc4e` | 2026-03-05 | Merge pull request #138 from nitrobass24/dependabot/npm_and_yarn/src/angular/tar-7.5.10 | covered elsewhere |
+| 325 | `d414a6d6093f91d1d67333ed2aa00a202a77624c` | 2026-03-05 | Revert "Bump tar from 7.5.9 to 7.5.10 in /src/angular" | intentionally skipped |
+| 326 | `7accdea1007741f62f3197ee5392ba93b0b6aecb` | 2026-03-05 | Merge pull request #150 from nitrobass24/revert-138-dependabot/npm_and_yarn/src/angular/tar-7.5.10 | covered elsewhere |
+| 327 | `5492b3aa97b8fe70abacb400993880917258cf54` | 2026-03-04 | feat: add structured JSON logging option (#127) | needs integration/adapt locally |
 | 328 | `e7144fae4b4b125b1a3c7da7075236dc0badecb4` | 2026-03-04 | feat: add multi-select and bulk operations to file list (#123) | pending |
 | 329 | `5cb2a7a9793908186f73236a870ecb35d8e43671` | 2026-03-04 | feat: replace pickle serialization with JSON in scanfs (#129) | pending |
 | 330 | `fd3dc0a2eaa8fd7ba55f611269d882e84e158730` | 2026-03-04 | fix: add isChecked to test helper for ViewFile spec | pending |
