@@ -68,13 +68,19 @@ class ControllerHandler(IHandler):
         if self.__local_path_root is None:
             return HTTPResponse(body="Invalid file path", status=400)
 
+        if not isinstance(file_name, str) or file_name == "" or "\x00" in file_name:
+            return HTTPResponse(body="Invalid file path", status=400)
+
         candidate_path = os.path.realpath(os.path.join(self.__local_path_root, file_name))
         try:
             common_path = os.path.commonpath([self.__local_path_root, candidate_path])
         except ValueError:
             common_path = ""
 
-        if os.path.normcase(common_path) != os.path.normcase(self.__local_path_root):
+        if (
+            os.path.normcase(common_path) != os.path.normcase(self.__local_path_root) or
+            os.path.normcase(candidate_path) == os.path.normcase(self.__local_path_root)
+        ):
             return HTTPResponse(body="Invalid file path", status=400)
         return None
 

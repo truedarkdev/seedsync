@@ -16,7 +16,24 @@ class DeleteLocalProcess(AppOneShotProcess):
         self.__file_name = file_name
 
     def run_once(self):
+        if not isinstance(self.__file_name, str) or self.__file_name == "" or "\x00" in self.__file_name:
+            self.logger.error("Invalid local delete filename: {}".format(self.__file_name))
+            return
+
         file_path = os.path.join(self.__local_path, self.__file_name)
+        real_base = os.path.realpath(self.__local_path)
+        real_target = os.path.realpath(file_path)
+        try:
+            common_path = os.path.commonpath([real_base, real_target])
+        except ValueError:
+            common_path = ""
+        if (
+            os.path.normcase(common_path) != os.path.normcase(real_base) or
+            os.path.normcase(real_target) == os.path.normcase(real_base)
+        ):
+            self.logger.error("Path traversal blocked: {} escapes {}".format(real_target, real_base))
+            return
+
         self.logger.debug("Deleting local file {}".format(self.__file_name))
         if not os.path.exists(file_path):
             self.logger.error("Failed to delete non-existing file: {}".format(file_path))
@@ -50,6 +67,19 @@ class DeleteRemoteProcess(AppOneShotProcess):
 
     def run_once(self):
         self.__ssh.set_base_logger(self.logger)
+        if not isinstance(self.__file_name, str) or "\x00" in self.__file_name:
+            self.logger.error("Invalid remote delete filename: {}".format(self.__file_name))
+            return
+
+        normalized_name = posixpath.normpath(self.__file_name.replace("\\", "/"))
+        if (
+            normalized_name in {"", ".", ".."} or
+            normalized_name.startswith("../") or
+            posixpath.isabs(normalized_name)
+        ):
+            self.logger.error("Path traversal blocked in remote delete: {}".format(self.__file_name))
+            return
+
         file_path = posixpath.join(self.__remote_path, self.__file_name)
         self.logger.debug("Deleting remote file: {}".format(self.__file_name))
         out = self.__ssh.shell(

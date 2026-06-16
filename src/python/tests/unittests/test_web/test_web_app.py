@@ -1635,6 +1635,57 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(200, response.status_int)
 
+    def test_loopback_proxy_headers_do_not_supply_forwarded_same_origin_for_cookie_writes(self):
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "https://localhost:8800",
+                "HTTP_X_FORWARDED_HOST": "localhost:8800",
+                "HTTP_X_FORWARDED_PROTO": "https",
+            },
+            expect_errors=True
+        )
+
+        self.assertEqual(403, response.status_int)
+        self.assertIn("Browser-origin signal required", response.text)
+
+    def test_configured_loopback_proxy_can_supply_forwarded_same_origin_for_cookie_writes(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "127.0.0.1/32"
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
+
+        @self.web_app.route("/server/ping", method="POST", required_scope="write")
+        def _ping():
+            return "pong"
+
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        self._issue_browser_session(client)
+
+        response = client.post(
+            "/server/ping",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "https://localhost:8800",
+                "HTTP_X_FORWARDED_HOST": "localhost:8800",
+                "HTTP_X_FORWARDED_PROTO": "https",
+            }
+        )
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("pong", response.text)
+
     def test_write_route_rejects_unsafe_forwarded_proto_for_cookie_backed_ui_session(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
@@ -1699,3 +1750,14 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_int)
+
+    def test_non_server_prefix_route_is_not_treated_as_api_route(self):
+        @self.web_app.route("/server-assets/ping")
+        def _asset_ping():
+            return "asset-pong"
+
+        client = TestApp(self.web_app)
+        response = client.get("/server-assets/ping")
+
+        self.assertEqual(200, response.status_int)
+        self.assertEqual("asset-pong", response.text)
