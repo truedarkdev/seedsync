@@ -363,7 +363,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 344 | `e0b1839a8f2ae7fcf2b219e420cb7c0bb1dfebf0` | 2026-03-05 | fix: make scan_fs.py self-contained for remote execution | needs area reopen |
 | 345 | `27cf0e259a5cdb7998ca76c55ea1d2c32b09623e` | 2026-03-05 | feat: replace patool with direct subprocess calls (#141) (#145) | needs area reopen |
 | 346 | `c8826cbebe81294b34b1d4aaedd0131de1f6663e` | 2026-03-05 | feat: add exclude patterns config for filtering remote files (#26) (#146) | needs new integration task |
-| 347 | `059c6c79dfd468841bdcda54af7635cb00480b78` | 2026-03-05 | test: add composite key test coverage for ViewFileService (#159) | pending |
+| 347 | `059c6c79dfd468841bdcda54af7635cb00480b78` | 2026-03-05 | test: add composite key test coverage for ViewFileService (#159) | adapted locally in `e50166d2` |
 | 348 | `66ac4a0ec1462cbe3fb7c63cd713b4f3df019663` | 2026-03-05 | feat: Settings UI for path pairs CRUD (#160) | pending |
 | 349 | `f33f1103e92e734225c13796c33272ff3958a25e` | 2026-03-05 | feat: per-pair LFTP and scanner instances in Controller (#155, #151) (#161) | pending |
 | 350 | `c1bfecbfc255305a500a679cbc0a591e7ead3fc5` | 2026-03-05 | fix: improve Path Pairs settings UX (#162) | pending |
