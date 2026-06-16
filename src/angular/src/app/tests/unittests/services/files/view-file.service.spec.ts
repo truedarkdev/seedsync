@@ -1,4 +1,5 @@
 import {fakeAsync, TestBed, tick} from "@angular/core/testing";
+import {of} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -12,6 +13,27 @@ import {ModelFile} from "../../../../services/files/model-file";
 import {ViewFile} from "../../../../services/files/view-file";
 import {ViewFileFilterCriteria} from "../../../../services/files/view-file.service";
 import {FileSelectionService} from "../../../../services/files/file-selection.service";
+import {WebReaction} from "../../../../services/utils/rest.service";
+
+
+function createDuplicateNamedModelFile(fileId: string,
+                                      pathPairId: string,
+                                      pathPairName: string,
+                                      extraProps: object = {}): ModelFile {
+    return new ModelFile(Object.assign({
+        file_id: fileId,
+        path_pair_id: pathPairId,
+        path_pair_name: pathPairName,
+        name: "dup"
+    }, extraProps));
+}
+
+
+function getViewFilesById(viewFiles: Immutable.List<ViewFile>): Map<string, ViewFile> {
+    const filesById = new Map<string, ViewFile>();
+    viewFiles.forEach(file => filesById.set(file.fileId, file));
+    return filesById;
+}
 
 
 describe("Testing view file service", () => {
@@ -830,38 +852,169 @@ describe("Testing view file service", () => {
         expect(count).toBe(7);
     }));
 
-    it("should select duplicate display names by file id", fakeAsync(() => {
-        let model = Immutable.Map<string, ModelFile>();
-        model = model.set("[\"movies\",\"dup\"]", new ModelFile({
-            file_id: "[\"movies\",\"dup\"]",
-            path_pair_id: "movies",
-            path_pair_name: "Movies",
-            name: "dup"
-        }));
-        model = model.set("[\"tv\",\"dup\"]", new ModelFile({
-            file_id: "[\"tv\",\"dup\"]",
-            path_pair_id: "tv",
-            path_pair_name: "TV",
-            name: "dup"
-        }));
+    it("should keep duplicate display names distinct in the view model", fakeAsync(() => {
+        const moviesId = "[\"movies\",\"dup\"]";
+        const tvId = "[\"tv\",\"dup\"]";
+
+        const model = Immutable.Map<string, ModelFile>()
+            .set(moviesId, createDuplicateNamedModelFile(moviesId, "movies", "Movies"))
+            .set(tvId, createDuplicateNamedModelFile(tvId, "tv", "TV"));
 
         mockModelService._files.next(model);
         tick();
 
-        let viewFileList;
+        let viewFileList: Immutable.List<ViewFile> = null;
         viewService.files.subscribe({
             next: list => viewFileList = list
         });
         tick();
 
-        viewService.setSelected(viewFileList.get(1));
+        const filesById = getViewFilesById(viewFileList);
+        expect(filesById.size).toBe(2);
+        expect(filesById.get(moviesId).name).toBe("dup");
+        expect(filesById.get(moviesId).fileId).toBe(moviesId);
+        expect(filesById.get(moviesId).pathPairId).toBe("movies");
+        expect(filesById.get(moviesId).pathPairName).toBe("Movies");
+        expect(filesById.get(tvId).name).toBe("dup");
+        expect(filesById.get(tvId).fileId).toBe(tvId);
+        expect(filesById.get(tvId).pathPairId).toBe("tv");
+        expect(filesById.get(tvId).pathPairName).toBe("TV");
+        expect(filesById.get(moviesId)).not.toBe(filesById.get(tvId));
+    }));
+
+    it("should select duplicate display names by file id and path pair", fakeAsync(() => {
+        const moviesId = "[\"movies\",\"dup\"]";
+        const tvId = "[\"tv\",\"dup\"]";
+
+        const model = Immutable.Map<string, ModelFile>()
+            .set(moviesId, createDuplicateNamedModelFile(moviesId, "movies", "Movies"))
+            .set(tvId, createDuplicateNamedModelFile(tvId, "tv", "TV"));
+
+        mockModelService._files.next(model);
         tick();
 
-        expect(viewFileList.get(0).isSelected).toBe(false);
-        expect(viewFileList.get(1).isSelected).toBe(true);
-        expect(viewFileList.get(1).fileId).toBe("[\"tv\",\"dup\"]");
-        expect(viewFileList.get(0).pathPairName).toBe("Movies");
-        expect(viewFileList.get(1).pathPairName).toBe("TV");
+        let viewFileList: Immutable.List<ViewFile> = null;
+        viewService.files.subscribe({
+            next: list => viewFileList = list
+        });
+        tick();
+
+        const filesById = getViewFilesById(viewFileList);
+        viewService.setSelected(filesById.get(tvId));
+        tick();
+
+        let updatedFilesById = getViewFilesById(viewFileList);
+        expect(updatedFilesById.get(moviesId).isSelected).toBe(false);
+        expect(updatedFilesById.get(tvId).isSelected).toBe(true);
+        expect(updatedFilesById.get(tvId).fileId).toBe(tvId);
+        expect(updatedFilesById.get(tvId).pathPairId).toBe("tv");
+
+        viewService.setSelected(updatedFilesById.get(moviesId));
+        tick();
+
+        updatedFilesById = getViewFilesById(viewFileList);
+        expect(updatedFilesById.get(moviesId).isSelected).toBe(true);
+        expect(updatedFilesById.get(moviesId).fileId).toBe(moviesId);
+        expect(updatedFilesById.get(moviesId).pathPairId).toBe("movies");
+        expect(updatedFilesById.get(tvId).isSelected).toBe(false);
+    }));
+
+    it("should delegate duplicate-name actions to the matching file id", fakeAsync(() => {
+        const moviesId = "[\"movies\",\"dup\"]";
+        const tvId = "[\"tv\",\"dup\"]";
+
+        const model = Immutable.Map<string, ModelFile>()
+            .set(moviesId, createDuplicateNamedModelFile(moviesId, "movies", "Movies"))
+            .set(tvId, createDuplicateNamedModelFile(tvId, "tv", "TV"));
+
+        mockModelService._files.next(model);
+        tick();
+
+        let viewFileList: Immutable.List<ViewFile> = null;
+        viewService.files.subscribe({
+            next: list => viewFileList = list
+        });
+        tick();
+
+        const filesById = getViewFilesById(viewFileList);
+        const queueReaction = new WebReaction(true, tvId, null);
+        const queueSpy = jasmine.createSpy("queue").and.callFake((file: ModelFile) => {
+            return of(queueReaction);
+        });
+        (mockModelService as any).queue = queueSpy;
+
+        let latestReaction: WebReaction = null;
+        viewService.queue(filesById.get(tvId)).subscribe({
+            next: reaction => latestReaction = reaction
+        });
+        tick();
+
+        expect(queueSpy).toHaveBeenCalledTimes(1);
+        expect(queueSpy.calls.mostRecent().args[0].file_id).toBe(tvId);
+        expect(queueSpy.calls.mostRecent().args[0].path_pair_id).toBe("tv");
+        expect(latestReaction.success).toBe(true);
+        expect(latestReaction.data).toBe(tvId);
+    }));
+
+    it("should preserve duplicate-name identity across update and remove diffs", fakeAsync(() => {
+        const moviesId = "[\"movies\",\"dup\"]";
+        const tvId = "[\"tv\",\"dup\"]";
+
+        let model = Immutable.Map<string, ModelFile>()
+            .set(moviesId, createDuplicateNamedModelFile(moviesId, "movies", "Movies", {
+                local_size: 10,
+                remote_size: 20
+            }))
+            .set(tvId, createDuplicateNamedModelFile(tvId, "tv", "TV", {
+                local_size: 30,
+                remote_size: 40
+            }));
+
+        mockModelService._files.next(model);
+        tick();
+
+        let viewFileList: Immutable.List<ViewFile> = null;
+        viewService.files.subscribe({
+            next: list => viewFileList = list
+        });
+        tick();
+
+        let filesById = getViewFilesById(viewFileList);
+        viewService.setSelected(filesById.get(tvId));
+        tick();
+
+        model = model.set(moviesId, createDuplicateNamedModelFile(moviesId, "movies", "Movies", {
+            local_size: 11,
+            remote_size: 21,
+            state: ModelFile.State.DOWNLOADING,
+            download_progress: 55,
+            is_stoppable: true
+        }));
+        mockModelService._files.next(model);
+        tick();
+
+        filesById = getViewFilesById(viewFileList);
+        expect(filesById.size).toBe(2);
+        expect(filesById.get(moviesId).fileId).toBe(moviesId);
+        expect(filesById.get(moviesId).pathPairId).toBe("movies");
+        expect(filesById.get(moviesId).localSize).toBe(11);
+        expect(filesById.get(moviesId).status).toBe(ViewFile.Status.DOWNLOADING);
+        expect(filesById.get(moviesId).isSelected).toBe(false);
+        expect(filesById.get(tvId).fileId).toBe(tvId);
+        expect(filesById.get(tvId).pathPairId).toBe("tv");
+        expect(filesById.get(tvId).isSelected).toBe(true);
+
+        model = model.remove(moviesId);
+        mockModelService._files.next(model);
+        tick();
+
+        filesById = getViewFilesById(viewFileList);
+        expect(filesById.size).toBe(1);
+        expect(filesById.has(moviesId)).toBe(false);
+        expect(filesById.get(tvId).fileId).toBe(tvId);
+        expect(filesById.get(tvId).pathPairId).toBe("tv");
+        expect(filesById.get(tvId).pathPairName).toBe("TV");
+        expect(filesById.get(tvId).isSelected).toBe(true);
     }));
 
     it("should should correctly set ViewFile isLocallyDeletable", fakeAsync(() => {
