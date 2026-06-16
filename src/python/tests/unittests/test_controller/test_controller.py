@@ -85,6 +85,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
+        self.controller._Controller__extract_process.pop_failed.return_value = []
 
     def test_queue_command_assigns_unique_flow_ids_under_concurrent_enqueues(self):
         class SlowSequence(int):
@@ -333,6 +334,85 @@ class TestController(unittest.TestCase):
         self.assertEqual("pair-1", message_to_corr_ids["local_scan_result"])
         self.assertEqual("pair-1", message_to_corr_ids["extract_completed"])
         self.assertEqual("extract:aggregate", message_to_corr_ids["extract_status_result"])
+
+    def test_update_model_records_extract_failed_breadcrumb_without_marking_extracted(self):
+        failed_results = [
+            SimpleNamespace(name="archive.zip", file_id="file-123", is_dir=False, path_pair_id="pair-1")
+        ]
+        extract_statuses = SimpleNamespace(statuses=[
+            ExtractStatus("archive.zip", False, ExtractStatus.State.EXTRACTING)
+        ])
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = extract_statuses
+        self.controller._Controller__extract_process.pop_failed.return_value = failed_results
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__context.breadcrumb_trace.record.assert_any_call(
+            "controller",
+            "extract_failed",
+            {
+                "result_count": 1,
+                "results": [{
+                    "name": "archive.zip",
+                    "file_id": "file-123",
+                    "is_dir": False,
+                    "path_pair_id": "pair-1",
+                }],
+            },
+            stage="extract",
+            event_type="failure",
+            corr_id="pair-1",
+            flow_id=None,
+            file_id=None,
+            path_pair_id=None,
+            path_pair_name=None,
+            trace_scope="flow",
+        )
+        self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+
+    def test_update_model_keeps_duplicate_name_extracting_status_for_other_path_pair_after_failure(self):
+        failed_results = [
+            SimpleNamespace(name="archive.zip", file_id="file-a", is_dir=False, path_pair_id="pair-a")
+        ]
+        extract_statuses = SimpleNamespace(statuses=[
+            ExtractStatus(
+                "archive.zip",
+                False,
+                ExtractStatus.State.EXTRACTING,
+                file_id="file-a",
+                path_pair_id="pair-a"
+            ),
+            ExtractStatus(
+                "archive.zip",
+                False,
+                ExtractStatus.State.EXTRACTING,
+                file_id="file-b",
+                path_pair_id="pair-b"
+            ),
+        ])
+        self.controller._Controller__active_scanner = MultiPathActiveScanner({})
+        self.controller._Controller__active_scanner.set_active_files = MagicMock()
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-b": SimpleNamespace(name="Pair B")
+        }
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = extract_statuses
+        self.controller._Controller__extract_process.pop_failed.return_value = failed_results
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual([
+            ("archive.zip", "pair-b", "Pair B")
+        ], self.controller._Controller__active_extracting_file_names)
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([
+            ("archive.zip", "pair-b", "Pair B")
+        ])
 
     def test_propagate_exceptions_records_remote_scan_failure_breadcrumb(self):
         self.controller._Controller__remote_scan_process.propagate_exception.side_effect = Exception("boom")

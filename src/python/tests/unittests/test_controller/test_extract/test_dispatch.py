@@ -97,6 +97,36 @@ class TestExtractDispatch(unittest.TestCase):
         self.assertTrue(str(ctx.exception).startswith("File is not an archive"))
         self.mock_is_archive.assert_called_once_with(os.path.join(self.local_path, mf.name))
 
+    def test_extract_single_uses_fallback_path_when_primary_missing(self):
+        fallback_path = os.path.join("fallback", "path")
+        dispatch = ExtractDispatch(
+            out_dir_path=self.out_dir_path,
+            local_path=self.local_path,
+            local_path_fallback=fallback_path
+        )
+        self.addCleanup(dispatch.stop)
+        dispatch.start()
+
+        def _is_archive(archive_path: str):
+            return archive_path == os.path.join(fallback_path, "aaa")
+
+        self.mock_is_archive.side_effect = _is_archive
+
+        mf = ModelFile("aaa", False)
+        mf.local_size = 100
+
+        dispatch.extract(mf)
+
+        self._wait_for_call_count(self.mock_extract_archive, 1)
+        self.mock_is_archive.assert_has_calls([
+            call(os.path.join(self.local_path, mf.name)),
+            call(os.path.join(fallback_path, mf.name)),
+        ])
+        self.mock_extract_archive.assert_called_once_with(
+            archive_path=os.path.join(fallback_path, "aaa"),
+            out_dir_path=os.path.join(self.out_dir_path, "aaa")
+        )
+
     def test_extract_single(self):
         self.mock_is_archive.return_value = True
 
@@ -687,6 +717,7 @@ class TestExtractDispatch(unittest.TestCase):
         ab.local_size = 100
         a.add_child(ab)
         b = ModelFile("b", True)
+        b.path_pair_id = "pair-b"
         b.local_size = 100
         ba = ModelFile("ba", False)
         ba.local_size = 100
@@ -708,9 +739,13 @@ class TestExtractDispatch(unittest.TestCase):
         self.assertEqual("a", status[0].name)
         self.assertEqual(True, status[0].is_dir)
         self.assertEqual(ExtractStatus.State.EXTRACTING, status[0].state)
+        self.assertEqual("a", status[0].file_id)
+        self.assertEqual(None, status[0].path_pair_id)
         self.assertEqual("b", status[1].name)
         self.assertEqual(True, status[1].is_dir)
         self.assertEqual(ExtractStatus.State.EXTRACTING, status[1].state)
+        self.assertEqual(b.file_id, status[1].file_id)
+        self.assertEqual("pair-b", status[1].path_pair_id)
         self.assertEqual("c", status[2].name)
         self.assertEqual(False, status[2].is_dir)
         self.assertEqual(ExtractStatus.State.EXTRACTING, status[2].state)
@@ -743,6 +778,8 @@ class TestExtractDispatch(unittest.TestCase):
         self.assertEqual("b", status[0].name)
         self.assertEqual(True, status[0].is_dir)
         self.assertEqual(ExtractStatus.State.EXTRACTING, status[0].state)
+        self.assertEqual(b.file_id, status[0].file_id)
+        self.assertEqual("pair-b", status[0].path_pair_id)
         self.assertEqual("c", status[1].name)
         self.assertEqual(False, status[1].is_dir)
         self.assertEqual(ExtractStatus.State.EXTRACTING, status[1].state)
@@ -751,7 +788,7 @@ class TestExtractDispatch(unittest.TestCase):
         self.send_count = 3
         while self.listener.extract_completed.call_count < 2:
             pass
-        self.listener.extract_completed.assert_called_with("b", True, "b", None)
+        self.listener.extract_completed.assert_called_with("b", True, b.file_id, "pair-b")
 
         status = self.dispatch.status()
         self.assertEqual(1, len(status))

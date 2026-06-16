@@ -13,7 +13,7 @@ import json
 import pytest
 
 from model import ModelFile
-from controller.extract import ExtractProcess, ExtractListener, ExtractStatus
+from controller.extract import ExtractDispatchError, ExtractFailedResult, ExtractProcess, ExtractListener, ExtractStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 
 
@@ -79,6 +79,24 @@ class TestExtractProcess(unittest.TestCase):
         while self.ctor_called.value == 0:
             pass
         self.assertEqual("/test/local/path", self.local_path.value.decode())
+
+    def test_param_out_local_path_fallback(self):
+        self.local_path_fallback = multiprocessing.Array(ctypes.c_char, 100)
+        self.ctor_called = multiprocessing.Value('i', 0)
+
+        def mock_ctor(**kwargs):
+            self.local_path_fallback.value = str.encode(kwargs["local_path_fallback"])
+            self.ctor_called.value = 1
+            return self.mock_dispatch
+        self.mock_dispatch_cls.side_effect = mock_ctor
+
+        process = ExtractProcess(out_dir_path="/test/out/path",
+                                 local_path="/test/local/path",
+                                 local_path_fallback="/test/local/fallback")
+        process.run_init()
+        while self.ctor_called.value == 0:
+            pass
+        self.assertEqual("/test/local/fallback", self.local_path_fallback.value.decode())
 
     def test_calls_start_dispatch(self):
         self.start_called = multiprocessing.Value('i', 0)
@@ -218,19 +236,28 @@ class TestExtractProcess(unittest.TestCase):
         process._ExtractProcess__target_archive_trace_file_id = "archive.zip"
         process._ExtractProcess__target_archive_trace_logger = MagicMock()
         process._ExtractProcess__target_archive_trace_last_signature = None
+        failed_queue = MagicMock()
 
         listener = ExtractProcess._ExtractProcess__ExtractListener(
             logger=MagicMock(),
             completed_queue=MagicMock(),
+            failed_queue=failed_queue,
             trace_owner=process
         )
 
-        listener.extract_failed("archive.zip", False)
+        listener.extract_failed("archive.zip", False, file_id="archive.zip", path_pair_id="pair-1")
 
         process._ExtractProcess__target_archive_trace_logger.info.assert_called_once()
         payload = json.loads(process._ExtractProcess__target_archive_trace_logger.info.call_args[0][1])
         self.assertEqual("extract_failed", payload["event"])
         self.assertEqual("archive.zip", payload["file_name"])
+        failed_queue.put.assert_called_once()
+        failed_result = failed_queue.put.call_args.args[0]
+        self.assertIsInstance(failed_result, ExtractFailedResult)
+        self.assertEqual("archive.zip", failed_result.name)
+        self.assertEqual(False, failed_result.is_dir)
+        self.assertEqual("archive.zip", failed_result.file_id)
+        self.assertEqual("pair-1", failed_result.path_pair_id)
 
     @pytest.mark.timeout(5)
     def test_forwards_extract_commands(self):
@@ -422,6 +449,32 @@ class TestExtractProcess(unittest.TestCase):
         with self.assertRaises(Exception):
             process.run_loop()
 
+        self.assertIsNone(
+            process._ExtractProcess__pop_inflight_flow_id(file_id=file.file_id, file_name=file.name)
+        )
+
+    def test_extract_dispatch_error_emits_failed_result(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        self.mock_dispatch.extract.side_effect = ExtractDispatchError("boom")
+
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        file = ModelFile("archive.zip", False)
+        file.path_pair_id = "pair-1"
+        file.local_size = 100
+
+        process.extract(file, flow_id="flow-blocked")
+        time.sleep(0.05)
+        process.run_loop()
+
+        failed = process.pop_failed()
+        self.assertEqual(1, len(failed))
+        self.assertEqual("archive.zip", failed[0].name)
+        self.assertEqual(False, failed[0].is_dir)
+        self.assertEqual(file.file_id, failed[0].file_id)
+        self.assertEqual("pair-1", failed[0].path_pair_id)
+        self.assertEqual(0, len(process.pop_failed()))
         self.assertIsNone(
             process._ExtractProcess__pop_inflight_flow_id(file_id=file.file_id, file_name=file.name)
         )

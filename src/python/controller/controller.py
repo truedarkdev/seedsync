@@ -195,9 +195,12 @@ class Controller:
             out_dir_path = self.__context.config.lftp.local_path
         else:
             out_dir_path = self.__context.config.controller.extract_path
+        # Keep the final local root primary, but allow archive lookup to fall
+        # back to staging so extraction can survive the move boundary.
         self.__extract_process = ExtractProcess(
             out_dir_path=out_dir_path,
             local_path=self.__context.config.lftp.local_path,
+            local_path_fallback=self.__staging_path,
             managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
@@ -954,6 +957,34 @@ class Controller:
                     return file_id
         return fallback
 
+    def __extract_status_matches_failed_result(self, status: ExtractStatus, failed_results) -> bool:
+        status_file_id = getattr(status, "file_id", None)
+        status_path_pair_id = getattr(status, "path_pair_id", None)
+        for result in failed_results or []:
+            result_file_id = getattr(result, "file_id", None)
+            if status_file_id and result_file_id:
+                if status_file_id == result_file_id:
+                    return True
+                continue
+
+            result_path_pair_id = getattr(result, "path_pair_id", None)
+            if status_path_pair_id and result_path_pair_id:
+                if status_path_pair_id == result_path_pair_id and status.name == result.name:
+                    return True
+                continue
+
+            if status.name == result.name:
+                return True
+        return False
+
+    def __active_extracting_file_tuple(self, status: ExtractStatus):
+        path_pair_id = getattr(status, "path_pair_id", None)
+        path_pair_name = getattr(status, "path_pair_name", None)
+        if path_pair_name is None:
+            path_pair = self.__get_path_pair(path_pair_id)
+            path_pair_name = getattr(path_pair, "name", None)
+        return status.name, path_pair_id, path_pair_name
+
     def __temp_diag(self, stage: str, file_id: str = None, **payload):
         self.__record_breadcrumb(
             stage=stage,
@@ -1330,6 +1361,7 @@ class Controller:
 
         # Grab the latest extracted file names
         latest_extracted_results = self.__extract_process.pop_completed()
+        latest_failed_results = self.__extract_process.pop_failed()
         previous_malformed_status_only_file_ids = set(self.__malformed_status_only_file_ids)
         if latest_active_scan is not None:
             self.__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
@@ -1368,8 +1400,10 @@ class Controller:
             self.__next_lftp_status_poll_at = None
         if latest_extract_statuses is not None:
             self.__active_extracting_file_names = [
-                (s.name, None, None)
-                for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
+                self.__active_extracting_file_tuple(s)
+                for s in latest_extract_statuses.statuses
+                if s.state == ExtractStatus.State.EXTRACTING
+                and not self.__extract_status_matches_failed_result(s, latest_failed_results)
             ]
         self.__temp_diag(
             "update_model",
@@ -1495,6 +1529,25 @@ class Controller:
                 },
                 event_type="state_transition",
                 corr_id=self.__trace_corr_id_from_files(latest_extracted_results, "extract"),
+            )
+        if latest_failed_results:
+            failed_result_summaries = []
+            for result in latest_failed_results:
+                failed_result_summaries.append({
+                    "name": result.name,
+                    "file_id": result.file_id,
+                    "is_dir": result.is_dir,
+                    "path_pair_id": result.path_pair_id,
+                })
+            self.__record_breadcrumb(
+                stage="extract",
+                message="extract_failed",
+                details={
+                    "result_count": len(latest_failed_results),
+                    "results": failed_result_summaries,
+                },
+                event_type="failure",
+                corr_id=self.__trace_corr_id_from_files(latest_failed_results, "extract"),
             )
         self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 

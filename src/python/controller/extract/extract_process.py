@@ -36,6 +36,20 @@ class ExtractCompletedResult:
         self.path_pair_id = path_pair_id
 
 
+class ExtractFailedResult:
+    def __init__(self,
+                 timestamp: datetime,
+                 name: str,
+                 is_dir: bool,
+                 file_id: str = None,
+                 path_pair_id: str = None):
+        self.timestamp = timestamp
+        self.name = name
+        self.is_dir = is_dir
+        self.file_id = file_id
+        self.path_pair_id = path_pair_id
+
+
 class ExtractProcess(AppProcess):
     __DEFAULT_SLEEP_INTERVAL_IN_SECS = 0.5
 
@@ -43,10 +57,12 @@ class ExtractProcess(AppProcess):
         def __init__(self,
                      logger: logging.Logger,
                      completed_queue: multiprocessing.Queue,
-                     trace_owner: "ExtractProcess"):
+                     trace_owner: "ExtractProcess",
+                     failed_queue: multiprocessing.Queue = None):
             self.logger = logger
             self.completed_queue = completed_queue
             self.trace_owner = trace_owner
+            self.failed_queue = failed_queue
 
         def extract_completed(self,
                               name: str,
@@ -108,19 +124,29 @@ class ExtractProcess(AppProcess):
                 "file_id": file_id,
                 "path_pair_id": path_pair_id,
             })
+            failed_result = ExtractFailedResult(timestamp=datetime.datetime.now(),
+                                                name=name,
+                                                is_dir=is_dir,
+                                                file_id=file_id,
+                                                path_pair_id=path_pair_id)
+            if self.failed_queue is not None:
+                self.failed_queue.put(failed_result)
 
     def __init__(self,
                  out_dir_path: str,
                  local_path: str,
+                 local_path_fallback: str = None,
                  managed_extract_folders_enabled: bool = True,
                  breadcrumb_trace=None):
         super().__init__(name=self.__class__.__name__)
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
+        self.__local_path_fallback = local_path_fallback
         self.__managed_extract_folders_enabled = managed_extract_folders_enabled
         self.__command_queue = multiprocessing.Queue()
         self.__status_result_queue = multiprocessing.Queue()
         self.__completed_result_queue = multiprocessing.Queue()
+        self.__failed_result_queue = multiprocessing.Queue()
         self.__dispatch = None
         self.__breadcrumb_trace = breadcrumb_trace
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
@@ -175,13 +201,15 @@ class ExtractProcess(AppProcess):
         # Create dispatch inside the process
         self.__dispatch = ExtractDispatch(out_dir_path=self.__out_dir_path,
                                           local_path=self.__local_path,
+                                          local_path_fallback=self.__local_path_fallback,
                                           managed_extract_folders_enabled=self.__managed_extract_folders_enabled)
 
         # Add extract listener
         listener = ExtractProcess.__ExtractListener(
             logger=self.logger,
             completed_queue=self.__completed_result_queue,
-            trace_owner=self
+            trace_owner=self,
+            failed_queue=self.__failed_result_queue
         )
         self.__dispatch.add_listener(listener)
 
@@ -257,6 +285,14 @@ class ExtractProcess(AppProcess):
                             "is_dir": file.is_dir,
                             "reason": str(e),
                         })
+                    failed_result = ExtractFailedResult(
+                        timestamp=datetime.datetime.now(),
+                        name=file.name,
+                        is_dir=file.is_dir,
+                        file_id=file.file_id,
+                        path_pair_id=file.path_pair_id,
+                    )
+                    self.__failed_result_queue.put(failed_result)
                 except Exception:
                     self.__untrack_inflight_flow_id(file, flow_id)
                     raise
@@ -402,3 +438,19 @@ class ExtractProcess(AppProcess):
         except queue.Empty:
             pass
         return completed
+
+    def pop_failed(self) -> List[ExtractFailedResult]:
+        """
+        Process-safe method to retrieve list of newly failed extractions
+        Returns an empty list if no new extractions failed since the last time
+        this method was called.
+        :return:
+        """
+        failed = []
+        try:
+            while True:
+                result = self.__failed_result_queue.get(block=False)
+                failed.append(result)
+        except queue.Empty:
+            pass
+        return failed
