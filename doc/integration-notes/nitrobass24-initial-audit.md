@@ -283,7 +283,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 264 | `e606495a6280d6b69036c0c38f8112a1cf078bb4` | 2026-02-28 | Merge pull request #88 from nitrobass24/develop | covered elsewhere |
 | 265 | `047f7257e9b4011e13a12594ec95d1f8301992e0` | 2026-02-28 | Bump rollup from 4.57.1 to 4.59.0 in /src/angular | covered elsewhere |
 | 266 | `6d79cff59c8c06ae5bd0ec5dcce954de306ea2f3` | 2026-02-28 | Merge pull request #89 from nitrobass24/dependabot/npm_and_yarn/src/angular/rollup-4.59.0 | covered elsewhere |
-| 267 | `8faca1ff6d77be57e602db1ff8ef2051ecf825c9` | 2026-02-28 | Fix Delete Remote on directory hanging with infinite spinner | needs integration/adapt locally |
+| 267 | `8faca1ff6d77be57e602db1ff8ef2051ecf825c9` | 2026-02-28 | Fix Delete Remote on directory hanging with infinite spinner | adapted locally in `cedadd93` |
 | 268 | `6fade95b65fcfdec6916816abb1e03eaec529572` | 2026-02-28 | Add UMASK environment variable for file permission control | adapted locally in `9d9c795a` |
 | 269 | `b09c573fc86fa5b6a780193094bdf1d68dd8fd8a` | 2026-02-28 | Merge pull request #92 from nitrobass24/fix/delete-remote-directory-hang | covered elsewhere |
 | 270 | `27c0b4baee364da59371df18b85d51fd6a8302a0` | 2026-02-28 | Bump @angular/core from 21.1.3 to 21.1.6 in /src/angular | covered elsewhere |
