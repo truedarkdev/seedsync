@@ -134,4 +134,9 @@ chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
 
 export HOME="$USER_HOME"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME)" >&2
+
+if [ -n "${UMASK:-}" ]; then
+    umask "$UMASK"
+fi
+
 exec gosu "$USER_NAME:$GROUP_NAME" "$@"
