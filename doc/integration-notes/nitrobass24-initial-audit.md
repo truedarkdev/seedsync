@@ -272,9 +272,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 253 | `a93b83f4cb1fef4703c0fd849048d4e79f415249` | 2026-02-27 | Replace unrar-free with full unrar for RAR5 support | adapted locally in `aa46ccd3814de04198e41ecdabf1d1d1d6354161` |
 | 254 | `16e5f890488c195e61ff83b76c243b3455316101` | 2026-02-27 | Merge pull request #87 from nitrobass24/fix/extract-retry-loop | covered elsewhere |
 | 255 | `5be88fd554abdc16da6bb2589901b99eb1e09601` | 2026-02-28 | Release v0.12.4 — Fix RAR5 extraction, incomplete directory re-download, parser crash | covered elsewhere |
-| 256 | `dcbaf6234f1d12226299877de5f8c832cc1c1490` | 2026-02-28 | Report ExtractDispatchError as extraction failure | needs integration/adapt locally |
+| 256 | `dcbaf6234f1d12226299877de5f8c832cc1c1490` | 2026-02-28 | Report ExtractDispatchError as extraction failure | adapted locally in `ae841fb1df6c88a8d8fd60641abcca5681588b6f` |
 | 257 | `f9eaecefe803a668c78f68a9898b82d0478ad74f` | 2026-02-28 | Add manual extract fix to CHANGELOG | intentionally skipped |
-| 258 | `569959317b6ea8c43075e576e9319720ef973215` | 2026-02-28 | Fix extract not finding archives after staging move | needs integration/adapt locally |
+| 258 | `569959317b6ea8c43075e576e9319720ef973215` | 2026-02-28 | Fix extract not finding archives after staging move | adapted locally in `ae841fb1df6c88a8d8fd60641abcca5681588b6f` |
 | 259 | `d880ba69603d053a05ac66cc5a1e849fdd4116d1` | 2026-02-28 | Add staging extract fix to CHANGELOG | intentionally skipped |
 | 260 | `59039a55fb44c87400710d24dbf5b9e8bc465359` | 2026-02-28 | Pin unrar version and fix CHANGELOG markdown lint | adapted locally in `aa46ccd3814de04198e41ecdabf1d1d1d6354161` without upstream's deb12-specific pin or changelog edit |
 | 261 | `91fce4e75bd62b74179f1ed2dab591fc65d52304` | 2026-02-21 | Bump ajv in /website | intentionally skipped |
