@@ -115,6 +115,41 @@ safe_chown_recursive() {
     fi
 }
 
+check_writable_path() {
+    local path="$1"
+
+    if ! gosu "$USER_NAME:$GROUP_NAME" bash -c '
+        path="$1"
+        test_file=$(mktemp "$path/.seedsync_write_test.XXXXXX") || {
+            printf "ERROR: failed to create writable-path probe under %s\n" "$path" >&2
+            exit 1
+        }
+        rm -f -- "$test_file" || {
+            printf "ERROR: failed to remove writable-path probe %s under %s\n" "$test_file" "$path" >&2
+            exit 1
+        }
+    ' bash "$path"; then
+        echo "ERROR: $path is not writable by $USER_NAME:$GROUP_NAME (UID=$USER_ID,GID=$GROUP_ID)" >&2
+        exit 1
+    fi
+}
+
+validate_umask() {
+    local umask_value="$1"
+
+    case "$umask_value" in
+        (*[!0-7]*)
+            printf 'ERROR: invalid UMASK value %s; expected octal digits 0-7\n' "$umask_value" >&2
+            exit 1
+            ;;
+    esac
+}
+
+if [ -n "${UMASK:-}" ]; then
+    validate_umask "$UMASK"
+    umask "$UMASK"
+fi
+
 USER_ID="$(resolve_id PUID "$DEFAULT_ID")"
 GROUP_ID="$(resolve_id PGID "$DEFAULT_ID")"
 GROUP_NAME="$(ensure_group "$GROUP_ID")"
@@ -125,18 +160,21 @@ ensure_user "$USER_ID" "$GROUP_NAME"
 # through large mounted trees unless their ownership really needs to be fixed.
 mkdir -p "$CONFIG_DIR" "$DOWNLOADS_DIR" "$MOUNTS_DIR" "$USER_HOME"
 mkdir -p "$USER_HOME/.ssh"
+mkdir -p /staging
 safe_chown_recursive "config directory" "$CONFIG_DIR"
 safe_chown "home directory" "$USER_HOME"
 safe_chown_recursive "home SSH directory" "$USER_HOME/.ssh"
 safe_chown "downloads directory" "$DOWNLOADS_DIR"
 safe_chown "mounts directory" "$MOUNTS_DIR"
+safe_chown "staging directory" /staging
 chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
+
+check_writable_path "$DOWNLOADS_DIR"
+if mountpoint -q /staging 2>/dev/null; then
+    check_writable_path /staging
+fi
 
 export HOME="$USER_HOME"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME)" >&2
-
-if [ -n "${UMASK:-}" ]; then
-    umask "$UMASK"
-fi
 
 exec gosu "$USER_NAME:$GROUP_NAME" "$@"

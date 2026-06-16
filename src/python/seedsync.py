@@ -42,6 +42,8 @@ class Seedsync:
     logger = None
 
     def __init__(self):
+        Seedsync._apply_umask_from_env()
+
         # Parse the args
         args = self._parse_args(sys.argv[1:])
 
@@ -382,6 +384,20 @@ class Seedsync:
                             help="Host/IP address for the web server to bind to")
 
         return parser.parse_args(args)
+
+    @staticmethod
+    def _apply_umask_from_env():
+        umask_value = os.environ.get("UMASK", "")
+        if not umask_value:
+            return
+
+        if any(character not in "01234567" for character in umask_value):
+            sys.stderr.write(
+                "ERROR: invalid UMASK value {!r}; expected octal digits 0-7\n".format(umask_value)
+            )
+            raise SystemExit(1)
+
+        os.umask(int(umask_value, 8))
 
     @staticmethod
     def _create_logger(name: str, debug: bool, logdir: Optional[str]) -> logging.Logger:

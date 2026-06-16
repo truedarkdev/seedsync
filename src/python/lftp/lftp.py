@@ -48,6 +48,15 @@ class Lftp:
     __SET_TEMP_FILE_NAME = "xfer:temp-file-name"
     __SET_SFTP_AUTO_CONFIRM = "sftp:auto-confirm"
     __SET_SFTP_CONNECT_PROGRAM = "sftp:connect-program"
+    __SET_SFTP_SET_PERMISSIONS = "sftp:set-permissions"
+
+    @staticmethod
+    def __has_valid_umask() -> bool:
+        umask_value = os.environ.get("UMASK", "")
+        if not umask_value:
+            return False
+
+        return all(character in "01234567" for character in umask_value)
 
     def __init__(self,
                  address: str,
@@ -98,6 +107,9 @@ class Lftp:
         self.__set(Lftp.__SET_COMMAND_AT_EXIT, "\"kill all\"")
         # Auto-add server to known host file
         self.sftp_auto_confirm = True
+        # Let a valid explicit UMASK control downloaded file permissions.
+        if Lftp.__has_valid_umask():
+            self.__set(Lftp.__SET_SFTP_SET_PERMISSIONS, "false")
         # Keep pget status snapshots fresher to reduce valid stop/resume rollback.
         self.__set(Lftp.__SET_PGET_SAVE_STATUS, "2")
 

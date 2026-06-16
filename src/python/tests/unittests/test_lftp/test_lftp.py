@@ -1485,10 +1485,23 @@ class TestLftp(unittest.TestCase):
 
         dockerfile = repo_root / dockerfile_relpath
         contents = dockerfile.read_text(encoding="utf-8")
+        entrypoint = repo_root / Path("src/docker/build/docker-image/entrypoint.sh")
+        entrypoint_contents = entrypoint.read_text(encoding="utf-8")
 
         self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
         self.assertIn("StrictHostKeyChecking accept-new", contents)
         self.assertIn("chmod 600 /home/seedsync/.ssh/config", contents)
+        self.assertIn("mkdir /staging", contents)
+        self.assertIn("chown seedsync:seedsync /staging", contents)
+        self.assertIn('VOLUME [ "/config", "/downloads" ]', contents)
+        self.assertIn('safe_chown "staging directory" /staging', entrypoint_contents)
+        self.assertIn("check_writable_path \"$DOWNLOADS_DIR\"", entrypoint_contents)
+        self.assertIn('mktemp "$path/.seedsync_write_test.XXXXXX"', entrypoint_contents)
+        self.assertIn('rm -f -- "$test_file"', entrypoint_contents)
+        self.assertNotIn('local test_file="${path}/.seedsync_write_test"', entrypoint_contents)
+        self.assertNotIn("touch '$test_file' && rm '$test_file'", entrypoint_contents)
+        self.assertIn("if mountpoint -q /staging 2>/dev/null; then", entrypoint_contents)
+        self.assertIn("ERROR: invalid UMASK value", entrypoint_contents)
 
 
 class TestLftpPromptClassification(unittest.TestCase):
@@ -1524,7 +1537,8 @@ class TestLftpPromptClassification(unittest.TestCase):
         process.expect.return_value = None
         spawn.return_value = process
 
-        Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+        with patch.dict(os.environ, {}, clear=True):
+            Lftp(address="localhost", port=22, user="seedsynctest", password=None)
 
         self.assertEqual(
             [
@@ -1535,6 +1549,50 @@ class TestLftpPromptClassification(unittest.TestCase):
             process.sendline.call_args_list
         )
         self.assertEqual(4, process.expect.call_count)
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_sets_permissions_override_when_umask_is_valid(self, spawn):
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.expect.return_value = None
+        spawn.return_value = process
+
+        with patch.dict(os.environ, {"UMASK": "022"}, clear=True):
+            Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+        self.assertEqual(
+            [
+                call('set cmd:at-exit "kill all"'),
+                call("set sftp:auto-confirm 1"),
+                call("set sftp:set-permissions false"),
+                call("set pget:save-status 2"),
+            ],
+            process.sendline.call_args_list
+        )
+        self.assertEqual(5, process.expect.call_count)
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_skips_permissions_override_when_umask_is_invalid_or_whitespace(self, spawn):
+        for umask_value in ("+022", "-022", "0o22", " 022", "022 ", "022\n", " "):
+            with self.subTest(umask_value=umask_value):
+                process = MagicMock()
+                process.isalive.return_value = True
+                process.expect.return_value = None
+                spawn.return_value = process
+
+                with patch.dict(os.environ, {"UMASK": umask_value}, clear=True):
+                    Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+                self.assertEqual(
+                    [
+                        call('set cmd:at-exit "kill all"'),
+                        call("set sftp:auto-confirm 1"),
+                        call("set pget:save-status 2"),
+                    ],
+                    process.sendline.call_args_list
+                )
+                self.assertNotIn(call("set sftp:set-permissions false"), process.sendline.call_args_list)
+                self.assertEqual(4, process.expect.call_count)
 
     def test_set_skips_prompt_readiness_probe(self):
         lftp = Lftp.__new__(Lftp)
