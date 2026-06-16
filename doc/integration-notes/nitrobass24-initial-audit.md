@@ -343,7 +343,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 324 | `5e1f1df37ae8f152554de73428f8424518d2dc4e` | 2026-03-05 | Merge pull request #138 from nitrobass24/dependabot/npm_and_yarn/src/angular/tar-7.5.10 | covered elsewhere |
 | 325 | `d414a6d6093f91d1d67333ed2aa00a202a77624c` | 2026-03-05 | Revert "Bump tar from 7.5.9 to 7.5.10 in /src/angular" | intentionally skipped |
 | 326 | `7accdea1007741f62f3197ee5392ba93b0b6aecb` | 2026-03-05 | Merge pull request #150 from nitrobass24/revert-138-dependabot/npm_and_yarn/src/angular/tar-7.5.10 | covered elsewhere |
-| 327 | `5492b3aa97b8fe70abacb400993880917258cf54` | 2026-03-04 | feat: add structured JSON logging option (#127) | needs integration/adapt locally |
+| 327 | `5492b3aa97b8fe70abacb400993880917258cf54` | 2026-03-04 | feat: add structured JSON logging option (#127) | adapted locally in `f3f5c790` |
 | 328 | `e7144fae4b4b125b1a3c7da7075236dc0badecb4` | 2026-03-04 | feat: add multi-select and bulk operations to file list (#123) | pending |
 | 329 | `5cb2a7a9793908186f73236a870ecb35d8e43671` | 2026-03-04 | feat: replace pickle serialization with JSON in scanfs (#129) | pending |
 | 330 | `fd3dc0a2eaa8fd7ba55f611269d882e84e158730` | 2026-03-04 | fix: add isChecked to test helper for ViewFile spec | pending |
