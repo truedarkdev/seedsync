@@ -345,7 +345,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 326 | `7accdea1007741f62f3197ee5392ba93b0b6aecb` | 2026-03-05 | Merge pull request #150 from nitrobass24/revert-138-dependabot/npm_and_yarn/src/angular/tar-7.5.10 | covered elsewhere |
 | 327 | `5492b3aa97b8fe70abacb400993880917258cf54` | 2026-03-04 | feat: add structured JSON logging option (#127) | adapted locally in `f3f5c790` |
 | 328 | `e7144fae4b4b125b1a3c7da7075236dc0badecb4` | 2026-03-04 | feat: add multi-select and bulk operations to file list (#123) | covered elsewhere |
-| 329 | `5cb2a7a9793908186f73236a870ecb35d8e43671` | 2026-03-04 | feat: replace pickle serialization with JSON in scanfs (#129) | pending |
+| 329 | `5cb2a7a9793908186f73236a870ecb35d8e43671` | 2026-03-04 | feat: replace pickle serialization with JSON in scanfs (#129) | already integrated |
 | 330 | `fd3dc0a2eaa8fd7ba55f611269d882e84e158730` | 2026-03-04 | fix: add isChecked to test helper for ViewFile spec | pending |
 | 331 | `74f9c08c55ae84e009b462e26176e50f552b9abf` | 2026-03-04 | feat: add webhook notifications on file events (#128) | pending |
 | 332 | `bb5f6023a2c3df9b719f57e6036bdac8dd8d27c9` | 2026-03-04 | feat: add historical log query endpoint with search/filter UI (#124) | pending |
