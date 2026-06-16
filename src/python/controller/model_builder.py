@@ -545,6 +545,18 @@ class ModelBuilder:
         return local_file.size >= remote_file.size
 
     @staticmethod
+    def __has_incomplete_remote_file_children(model_file: ModelFile) -> bool:
+        frontier = list(model_file.get_children())
+        while frontier:
+            child_file = frontier.pop(0)
+            if child_file.is_dir:
+                frontier += child_file.get_children()
+            elif child_file.remote_size is not None and \
+                    (child_file.local_size is None or child_file.local_size < child_file.remote_size):
+                return True
+        return False
+
+    @staticmethod
     def __normalize_download_progress(percent_local):
         if percent_local is None:
             return None
@@ -1417,6 +1429,7 @@ class ModelBuilder:
                     local.size is not None and \
                     remote.size is not None and \
                     local.size >= remote.size and \
+                    not self.__has_incomplete_remote_file_children(model_file) and \
                     self.__resolve_recent_live_transfer_snapshot(
                         file_id,
                         status.file_id if status is not None else model_file.file_id
@@ -1472,8 +1485,9 @@ class ModelBuilder:
                             local.size >= model_file.remote_size:
                         # A fully staged directory copy should be treated as complete even
                         # if live transfer state has already disappeared.
-                        model_file.state = ModelFile.State.DOWNLOADED
-                        arbitration_source = "staging_completion_without_live_status"
+                        if not self.__has_incomplete_remote_file_children(model_file):
+                            model_file.state = ModelFile.State.DOWNLOADED
+                            arbitration_source = "staging_completion_without_live_status"
                     else:
                         # root is a directory that also exists remotely
                         # check all the children
