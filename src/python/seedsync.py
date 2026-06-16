@@ -14,7 +14,7 @@ import platform
 import tempfile
 
 # my libs
-from common import ServiceExit, Context, Constants, Config, Args, AppError
+from common import ServiceExit, Context, Constants, Config, Args
 from common import ServiceRestart
 from common import Localization, Status, ConfigError, Persist, PersistError
 from common import PathPairManager
@@ -202,7 +202,6 @@ class Seedsync:
 
                 # Propagate exceptions
                 webapp_job.propagate_exception()
-                # Catch controller exceptions and keep running, but notify the web server of the error
                 if controller_start_isolated:
                     controller_start_isolated = Seedsync.__handle_controller_startup_timeout(
                         self.context,
@@ -210,15 +209,7 @@ class Seedsync:
                         controller_start_isolated
                     )
                 elif do_start_controller and not controller_start_failed:
-                    try:
-                        controller_job.propagate_exception()
-                    except AppError as exc:
-                        if not self.context.args.exit:
-                            self.context.status.server.up = False
-                            self.context.status.server.error_msg = str(exc)
-                            Seedsync.logger.exception("Caught exception")
-                        else:
-                            raise
+                    controller_job.propagate_exception()
 
                 # Check if a restart is requested
                 if web_app_builder.server_handler.is_restart_requested():

@@ -10,7 +10,7 @@ import shutil
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit
+from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, AppError
 from seedsync import Seedsync
 from web.auth_store import ApiKeyStore
 
@@ -610,6 +610,80 @@ class TestSeedsync(unittest.TestCase):
         controller_job.join.assert_not_called()
         webapp_job.terminate.assert_called_once_with()
         webapp_job.join.assert_called_once_with()
+
+    def test_run_propagates_controller_app_error_after_startup(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            web_access_logger=MagicMock(),
+            config=SimpleNamespace(
+                lftp=SimpleNamespace(
+                    remote_password="pw",
+                    use_ssh_key=False,
+                    remote_address="addr",
+                    remote_port=21,
+                    remote_username="user",
+                    remote_path="/remote",
+                    local_path="/local",
+                    remote_path_to_scan_script="/scan",
+                    use_temp_file=False,
+                    rate_limit=None,
+                ),
+                controller=SimpleNamespace(
+                    interval_ms_downloading_scan=1,
+                    interval_ms_local_scan=1,
+                    interval_ms_remote_scan=1,
+                    use_local_path_as_extract_path=False,
+                    extract_path="/extract",
+                ),
+                general=SimpleNamespace(debug=False, verbose=False),
+                web=SimpleNamespace(port=8800),
+            ),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
+            path_pair_manager=None,
+            create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
+        )
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = MagicMock()
+        seedsync.persist = MagicMock()
+
+        controller = MagicMock()
+        auto_queue = MagicMock()
+        web_app = MagicMock()
+        web_app_builder = MagicMock()
+        web_app_builder.build.return_value = web_app
+        web_app_builder.server_handler.is_restart_requested.return_value = False
+
+        controller_job = MagicMock()
+        controller_job.wait_until_setup_complete.return_value = True
+        controller_job.is_setup_complete.return_value = True
+        controller_job.propagate_exception.side_effect = AppError("controller died")
+        webapp_job = MagicMock()
+
+        with patch("seedsync.Seedsync._emit_startup_warnings"), \
+             patch("seedsync.Seedsync._detect_incomplete_config", return_value=[]), \
+             patch("seedsync.Controller", return_value=controller), \
+             patch("seedsync.AutoQueue", return_value=auto_queue), \
+             patch("seedsync.WebAppBuilder", return_value=web_app_builder), \
+             patch("seedsync.ControllerJob", return_value=controller_job) as mock_controller_job, \
+             patch("seedsync.WebAppJob", return_value=webapp_job) as mock_webapp_job, \
+             patch("seedsync.time.sleep", return_value=None), \
+             self.assertRaises(AppError):
+            mock_controller_job.__name__ = "ControllerJob"
+            mock_webapp_job.__name__ = "WebAppJob"
+            seedsync.run()
+
+        controller_job.wait_until_setup_complete.assert_called_once_with(
+            timeout=Constants.CONTROLLER_SETUP_TIMEOUT_IN_SECS
+        )
+        controller_job.propagate_exception.assert_called_once_with()
+        webapp_job.propagate_exception.assert_called_once_with()
+        controller_job.terminate.assert_called_once_with()
+        controller_job.join.assert_called_once_with()
+        webapp_job.terminate.assert_called_once_with()
+        webapp_job.join.assert_called_once_with()
+        seedsync.persist.assert_called_once_with()
 
     def test_run_redirects_restart_request_while_controller_setup_is_degraded(self):
         seedsync = Seedsync.__new__(Seedsync)
