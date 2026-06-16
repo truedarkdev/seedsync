@@ -5,6 +5,7 @@ import sys
 import copy
 import tempfile
 import os
+import io
 import json
 import shutil
 from unittest.mock import MagicMock, patch
@@ -92,6 +93,40 @@ class TestSeedsync(unittest.TestCase):
             "--scanfs", "/path/to/scanfs",
         ])
         self.assertEqual("0.0.0.0", args.web_bind_host)
+
+    def test_apply_umask_from_env_skips_empty_or_unset_values(self):
+        with patch("seedsync.os.umask") as umask, patch.dict(os.environ, {}, clear=True):
+            Seedsync._apply_umask_from_env()
+        umask.assert_not_called()
+
+        with patch("seedsync.os.umask") as umask, patch.dict(os.environ, {"UMASK": ""}, clear=True):
+            Seedsync._apply_umask_from_env()
+        umask.assert_not_called()
+
+    def test_apply_umask_from_env_applies_valid_octal_value(self):
+        with patch("seedsync.os.umask") as umask, patch.dict(os.environ, {"UMASK": "002"}, clear=True):
+            Seedsync._apply_umask_from_env()
+
+        umask.assert_called_once_with(0o002)
+
+    def test_apply_umask_from_env_exits_on_invalid_value(self):
+        for umask_value in ("not-octal", "+022", "-022", "0o22", " 022", "022 ", "022\n", " "):
+            with self.subTest(umask_value=umask_value):
+                stderr = io.StringIO()
+                with patch("seedsync.os.umask") as umask, \
+                     patch("seedsync.logging.warning") as warning, \
+                     patch("seedsync.sys.stderr", stderr), \
+                     patch.dict(os.environ, {"UMASK": umask_value}, clear=True):
+                    with self.assertRaises(SystemExit) as ctx:
+                        Seedsync._apply_umask_from_env()
+
+                self.assertEqual(1, ctx.exception.code)
+                umask.assert_not_called()
+                warning.assert_not_called()
+                self.assertEqual(
+                    "ERROR: invalid UMASK value {!r}; expected octal digits 0-7\n".format(umask_value),
+                    stderr.getvalue(),
+                )
 
     def test_args_logdir(self):
         argv = []
