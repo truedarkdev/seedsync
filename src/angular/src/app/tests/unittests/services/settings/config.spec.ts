@@ -46,6 +46,9 @@ describe("Testing config record initialization", () => {
                 enabled: true,
                 patterns_only: false,
                 auto_extract: true,
+            },
+            logging: {
+                log_format: "json"
             }
         };
         config = new Config(configJson);
@@ -84,6 +87,7 @@ describe("Testing config record initialization", () => {
         expect(config.autoqueue.patterns_only).toBe(false);
         expect(config.autoqueue.auto_extract).toBe(true);
         expect(config.autoqueue.auto_delete_remote).toBe(false);
+        expect(config.logging.log_format).toBe("json");
     });
 
     it("should be immutable", () => {
@@ -104,11 +108,13 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.general.debug).toBe(true);
         expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
         expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
+        expect(partialConfig.logging.log_format).toBe("standard");
         expect(partialConfig.getValue("general", "debug")).toBe(true);
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
         expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
+        expect(partialConfig.getValue("logging", "log_format")).toBe("standard");
         expect(partialConfig.getValue("missing", "value")).toBe(null);
     });
 });

@@ -117,4 +117,9 @@ describe("Testing settings page component", () => {
 
         expect(commandService.restart).not.toHaveBeenCalled();
     }));
+
+    it("should expose the logging settings context", () => {
+        expect(component.OPTIONS_CONTEXT_LOGGING.id).toBe("logging");
+        expect(component.OPTIONS_CONTEXT_LOGGING.options[0].valuePath).toEqual(["logging", "log_format"]);
+    });
 });

@@ -449,12 +449,27 @@ class Config(Persist):
                 config_dict["auto_delete_remote"] = False
             return super().from_dict(config_dict)
 
+    class Logging(IC):
+        log_format = PROP("log_format", Checkers.string_allow_empty, Converters.null)
+
+        def __init__(self):
+            super().__init__()
+            self.log_format = "standard"
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "log_format" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["log_format"] = "standard"
+            return super().from_dict(config_dict)
+
     def __init__(self):
         self.general = Config.General()
         self.lftp = Config.Lftp()
         self.controller = Config.Controller()
         self.web = Config.Web()
         self.autoqueue = Config.AutoQueue()
+        self.logging = Config.Logging()
 
     @staticmethod
     def _check_section(dct: OuterConfigType, name: str) -> InnerConfigType:
@@ -513,6 +528,7 @@ class Config(Persist):
         config.controller = Config.Controller.from_dict(Config._check_section(config_dict, "Controller"))
         config.web = Config.Web.from_dict(Config._check_section(config_dict, "Web"))
         config.autoqueue = Config.AutoQueue.from_dict(Config._check_section(config_dict, "AutoQueue"))
+        config.logging = Config.Logging.from_dict(config_dict.pop("Logging", {}))
 
         Config._check_empty_outer_dict(config_dict)
         return config
@@ -526,6 +542,7 @@ class Config(Persist):
         config_dict["Controller"] = self.controller.as_dict()
         config_dict["Web"] = self.web.as_dict()
         config_dict["AutoQueue"] = self.autoqueue.as_dict()
+        config_dict["Logging"] = self.logging.as_dict()
         return config_dict
 
     def has_section(self, name: str) -> bool:
