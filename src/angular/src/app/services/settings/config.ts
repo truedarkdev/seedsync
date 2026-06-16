@@ -112,6 +112,17 @@ const DefaultAutoQueue: IAutoQueue = {
 };
 const AutoQueueRecord = Record(DefaultAutoQueue);
 
+/*
+ * LOGGING
+ */
+interface ILogging {
+    log_format: string;
+}
+const DefaultLogging: ILogging = {
+    log_format: "standard",
+};
+const LoggingRecord = Record(DefaultLogging);
+
 
 
 /*
@@ -123,6 +134,7 @@ export interface IConfig {
     controller: IController;
     web: IWeb;
     autoqueue: IAutoQueue;
+    logging: ILogging;
 
 }
 const DefaultConfig: IConfig = {
@@ -131,6 +143,7 @@ const DefaultConfig: IConfig = {
     controller: null,
     web: null,
     autoqueue: null,
+    logging: null,
 };
 const ConfigRecord = Record(DefaultConfig);
 
@@ -141,6 +154,7 @@ export class Config extends ConfigRecord implements IConfig {
     controller: IController;
     web: IWeb;
     autoqueue: IAutoQueue;
+    logging: ILogging;
 
     constructor(props) {
         // Create immutable members
@@ -149,7 +163,8 @@ export class Config extends ConfigRecord implements IConfig {
             lftp: LftpRecord((props && props.lftp) || {}),
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
-            autoqueue: AutoQueueRecord((props && props.autoqueue) || {})
+            autoqueue: AutoQueueRecord((props && props.autoqueue) || {}),
+            logging: LoggingRecord((props && props.logging) || {})
         });
     }
 

@@ -188,6 +188,7 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.has_section("controller"))
         self.assertTrue(config.has_section("web"))
         self.assertTrue(config.has_section("autoqueue"))
+        self.assertTrue(config.has_section("logging"))
         self.assertFalse(config.has_section("nope"))
         self.assertFalse(config.has_section("from_file"))
         self.assertFalse(config.has_section("__init__"))
@@ -598,6 +599,21 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_delete_remote", "SomeString")
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_delete_remote", "-1")
 
+    def test_logging(self):
+        good_dict = {
+            "log_format": "json"
+        }
+        logging_config = Config.Logging.from_dict(good_dict)
+        self.assertEqual("json", logging_config.log_format)
+        self.assertEqual("standard", Config.Logging.from_dict({}).log_format)
+
+    def test_logging_allows_empty_value(self):
+        logging_config = Config.Logging.from_dict({
+            "log_format": ""
+        })
+
+        self.assertEqual("", logging_config.log_format)
+
     def test_from_file(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
             config_file.write("""
@@ -685,6 +701,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(True, config.autoqueue.patterns_only)
             self.assertEqual(True, config.autoqueue.auto_extract)
             self.assertEqual(False, config.autoqueue.auto_delete_remote)
+            self.assertEqual("standard", config.logging.log_format)
 
             # unknown section error
             with open(config_path, "a") as config_file:
@@ -739,6 +756,7 @@ class TestConfig(unittest.TestCase):
             config.autoqueue.patterns_only = True
             config.autoqueue.auto_extract = False
             config.autoqueue.auto_delete_remote = False
+            config.logging.log_format = "json"
             config.to_file(config_file_path)
             with open(config_file_path, "r") as f:
                 actual_str = f.read()
@@ -771,6 +789,7 @@ class TestConfig(unittest.TestCase):
             num_max_total_connections = 4
             use_temp_file = True
             rate_limit = None
+            net_socket_buffer = None
             staging_path = /local/server/path/incomplete
 
             [Controller]
@@ -789,6 +808,9 @@ class TestConfig(unittest.TestCase):
             patterns_only = True
             auto_extract = False
             auto_delete_remote = False
+
+            [Logging]
+            log_format = json
             """
 
             golden_lines = [s.strip() for s in golden_str.splitlines()]

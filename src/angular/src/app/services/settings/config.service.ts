@@ -46,7 +46,8 @@ export class ConfigService extends BaseWebService {
         const normalizedValue = this.normalizeValue(section, option, value);
         const valueStr: string = String(normalizedValue);
         const allowBlankValue = section === "lftp" &&
-            (option === "remote_password" || option === "net_socket_buffer");
+            (option === "remote_password" || option === "net_socket_buffer") ||
+            (section === "logging" && option === "log_format");
         const currentConfig = this._config.getValue();
         if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
             return new Observable<WebReaction>(observer => {

@@ -125,6 +125,7 @@ describe("Testing config service", () => {
                 expect(config.autoqueue.enabled).toBe(true);
                 expect(config.autoqueue.patterns_only).toBe(false);
                 expect(config.autoqueue.auto_delete_remote).toBe(false);
+                expect(config.logging.log_format).toBe("standard");
             }
         });
 
@@ -261,6 +262,15 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
+    it("should send a POST on setting log format", () => {
+        httpMock.expectOne("/server/config/get").flush({});
+
+        configService.set("logging", "log_format", "json").subscribe(DoNothing);
+
+        expectConfigSetRequest("logging", "log_format", "json");
+        httpMock.verify();
+    });
+
     it("should stringify checkbox values before sending config updates", () => {
         httpMock.expectOne("/server/config/get").flush({general: {debug: false}});
 
@@ -374,6 +384,15 @@ describe("Testing config service", () => {
         configService.set("lftp", "net_socket_buffer", "").subscribe(DoNothing);
 
         expectConfigSetRequest("lftp", "net_socket_buffer", "");
+        httpMock.verify();
+    });
+
+    it("should allow empty log_format values", () => {
+        httpMock.expectOne("/server/config/get").flush({});
+
+        configService.set("logging", "log_format", "").subscribe(DoNothing);
+
+        expectConfigSetRequest("logging", "log_format", "");
         httpMock.verify();
     });
 
