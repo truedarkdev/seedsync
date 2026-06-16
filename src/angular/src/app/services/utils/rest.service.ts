@@ -37,12 +37,12 @@ export class RestService {
         return new Observable<WebReaction>(observer => {
             const subscription = request.subscribe(
                 data => {
-                    this._logger.debug("%s http response: %s", url, data);
+                    this.logResponse(url, data);
                     observer.next(new WebReaction(true, data, null));
                 },
                 (err: HttpErrorResponse) => {
                     let errorMessage = null;
-                    this._logger.debug("%s error: %O", url, err);
+                    this.logError(url, err);
                     if (err.error instanceof Event) {
                         errorMessage = err.error.type;
                     } else {
@@ -57,6 +57,26 @@ export class RestService {
         //      prevent duplicate http requests
         //      share result with those that subscribe after the value was published
         // More info: https://blog.thoughtram.io/angular/2016/06/16/cold-vs-hot-observables.html
+    }
+
+    private logResponse(url: string, data: string): void {
+        if (this.shouldSuppressResponseLog(url)) {
+            this._logger.debug("%s http response: %s", url, "[redacted]");
+        } else {
+            this._logger.debug("%s http response: %s", url, data);
+        }
+    }
+
+    private logError(url: string, err: HttpErrorResponse): void {
+        if (this.shouldSuppressResponseLog(url)) {
+            this._logger.debug("%s error: %s", url, "[redacted]");
+        } else {
+            this._logger.debug("%s error: %O", url, err);
+        }
+    }
+
+    private shouldSuppressResponseLog(url: string): boolean {
+        return url.indexOf("/server/config/") === 0;
     }
 
     /**

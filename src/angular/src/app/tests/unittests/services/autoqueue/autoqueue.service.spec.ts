@@ -84,6 +84,39 @@ describe("Testing autoqueue service", () => {
         httpMock.verify();
     }));
 
+    it("should get empty list on malformed json response", fakeAsync(() => {
+        httpMock.expectOne("/server/autoqueue/get").flush([
+            {"pattern": "one"}
+        ]);
+
+        let latestPatterns = null;
+        aqService.patterns.subscribe({
+            next: patterns => {
+                latestPatterns = patterns;
+            }
+        });
+
+        tick();
+        expect(latestPatterns.size).toBe(1);
+
+        const consoleErrorSpy = spyOn(console, "error");
+        const malformedResponse = "not-json";
+
+        (<any>aqService).onConnected();
+        const request = httpMock.expectOne("/server/autoqueue/get");
+        expect(() => request.flush(malformedResponse)).not.toThrow();
+
+        tick();
+
+        expect(latestPatterns.size).toBe(0);
+        expect(consoleErrorSpy).toHaveBeenCalled();
+        const errorCall = consoleErrorSpy.calls.mostRecent();
+        expect(errorCall.args).toEqual(["Failed to parse autoqueue response"]);
+        expect(JSON.stringify(errorCall.args)).not.toContain(malformedResponse);
+        expect(errorCall.args.some(arg => arg instanceof SyntaxError)).toBe(false);
+        httpMock.verify();
+    }));
+
     it("should get empty list on get error 404", fakeAsync(() => {
         httpMock.expectOne("/server/autoqueue/get").flush(
         "Not found",

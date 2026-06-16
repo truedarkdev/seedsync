@@ -23,13 +23,13 @@ import {SidebarComponent} from "./pages/main/sidebar.component";
 import {SettingsPageComponent} from "./pages/settings/settings-page.component";
 import {ApiAccessComponent} from "./pages/settings/api-access.component";
 import {ServerStatusService} from "./services/server/server-status.service";
-import {ConfigServiceProvider} from "./services/settings/config.service";
+import {ConfigService, ConfigServiceProvider} from "./services/settings/config.service";
 import {OptionComponent} from "./pages/settings/option.component";
 import {PathPairsComponent} from "./pages/settings/path-pairs.component";
 import {NotificationService} from "./services/utils/notification.service";
 import {ServerCommandServiceProvider} from "./services/server/server-command.service";
 import {AutoQueuePageComponent} from "./pages/autoqueue/autoqueue-page.component";
-import {AutoQueueServiceProvider} from "./services/autoqueue/autoqueue.service";
+import {AutoQueueService, AutoQueueServiceProvider} from "./services/autoqueue/autoqueue.service";
 import {CachedReuseStrategy} from "./common/cached-reuse-strategy";
 import {ConnectedService} from "./services/utils/connected.service";
 import {RestService} from "./services/utils/rest.service";
@@ -129,6 +129,18 @@ import {StorageServiceModule} from "./services/utils/storage.service";
             provide: APP_INITIALIZER,
             useFactory: dummyFactory,
             deps: [VersionCheckService],
+            multi: true
+        },
+        {
+            provide: APP_INITIALIZER,
+            useFactory: dummyFactory,
+            deps: [ConfigService],
+            multi: true
+        },
+        {
+            provide: APP_INITIALIZER,
+            useFactory: dummyFactory,
+            deps: [AutoQueueService],
             multi: true
         },
     ],
