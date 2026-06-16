@@ -32,6 +32,10 @@ class Sshcp:
     """
     __TIMEOUT_SECS = 180
     SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
+    __SCP_DESTINATION_PERMISSION_DENIED = re.compile(
+        r"^scp:\s+(?:dest open\s+)?(?P<path>.+):\s+(?:-\s+)?permission denied$",
+        re.IGNORECASE
+    )
 
     def __init__(self,
                  host: str,
@@ -93,6 +97,28 @@ class Sshcp:
                 self.__user
             )
         )
+
+    @staticmethod
+    def __decode_spawn_output(output) -> str:
+        if output == pexpect.EOF:
+            return ""
+        if isinstance(output, bytes):
+            return output.decode(errors="replace")
+        return str(output)
+
+    @classmethod
+    def __format_spawn_error(cls, before, after) -> str:
+        return "{}{}".format(
+            cls.__decode_spawn_output(before),
+            cls.__decode_spawn_output(after)
+        ).strip()
+
+    @classmethod
+    def __is_scp_destination_permission_denied(cls, error_message: str) -> bool:
+        for line in error_message.splitlines():
+            if cls.__SCP_DESTINATION_PERMISSION_DENIED.match(line.strip()):
+                return True
+        return False
 
     def detect_shell(self) -> str:
         if self.__detected_shell is not None:
@@ -330,6 +356,9 @@ class Sshcp:
                 if i == 1:
                     before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
                     if command == "scp" and "no such file or directory" not in before_lower:
+                        scp_error = self.__format_spawn_error(sp.before, sp.after)
+                        if self.__is_scp_destination_permission_denied(scp_error):
+                            raise SshcpError(scp_error)
                         raise SshcpError("connection closed")
                     if self.__password is not None and self.__host in {"127.0.0.1", "localhost"} and (
                         "bad owner or permissions on" in before_lower
@@ -379,6 +408,9 @@ class Sshcp:
             if i == 1:
                 before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
                 if command == "scp" and "no such file or directory" not in before_lower:
+                    scp_error = self.__format_spawn_error(sp.before, sp.after)
+                    if self.__is_scp_destination_permission_denied(scp_error):
+                        raise SshcpError(scp_error)
                     raise SshcpError("connection closed")
                 raise SshcpError("Incorrect password")
             elif i in {3, 5}:
@@ -394,6 +426,9 @@ class Sshcp:
                 )
             elif i == 9:
                 if command == "scp":
+                    scp_error = self.__format_spawn_error(sp.before, sp.after)
+                    if self.__is_scp_destination_permission_denied(scp_error):
+                        raise SshcpError(scp_error)
                     raise SshcpError("connection closed")
                 raise SshcpError("Incorrect password")
 

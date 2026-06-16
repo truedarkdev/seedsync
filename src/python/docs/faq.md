@@ -38,6 +38,18 @@ Make sure your remote server address was entered correctly.
 If using password-based login, make sure the password is correct.
 Check the logs for details about the exact failure.
 
+### Why do I get `scp: dest open '/tmp/scanfs': Permission denied`?
+
+Some remote servers block writes to `/tmp`. SeedSync will retry the scanner install in the remote user's home directory for that run.
+
+To avoid the fallback on future restarts, open `Settings` and change `Server Script Path` to `~` or a home-based path such as `~/.local`.
+
+### Why do I get `Server Script Path '...' is a directory`?
+
+That usually means the configured scanner path overlaps your sync tree and a `scanfs` directory already exists there.
+
+Move `Server Script Path` outside the sync tree, remove the conflicting remote directory, and restart SeedSync.
+
 ### What is the breadcrumb trace recorder for?
 
 It is an opt-in, low-overhead recorder for the recent lead-up to a failure.

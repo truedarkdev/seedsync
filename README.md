@@ -55,6 +55,7 @@ Please refer to the documentation in this repository:
 * [FAQ](src/python/docs/faq.md)
 * [Latest Releases](https://github.com/truedarkdev/seedsync/releases/latest)
 
+If the remote scanner cannot copy to the configured `Server Script Path`, or the path collides with an existing `scanfs` directory, see the FAQ troubleshooting notes for the fallback and cleanup steps.
 
 ## Report an Issue
 
