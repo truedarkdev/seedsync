@@ -70,6 +70,57 @@ class TestPersist(unittest.TestCase):
         with open(file_path, "r") as f:
             self.assertEqual("write out some new content", f.read())
 
+    def test_to_file_overwrite_creates_backup(self):
+        file_path = os.path.join(self.temp_dir, "persist.json")
+        with open(file_path, "w") as f:
+            f.write("pre-existing content")
+        persist = DummyPersist()
+        persist.my_content = "write out some new content"
+
+        persist.to_file(file_path)
+
+        backup_dir = os.path.join(self.temp_dir, "backups")
+        backups = os.listdir(backup_dir)
+        self.assertEqual(1, len(backups))
+        self.assertRegex(backups[0], r"^persist-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{6}\.json$")
+        with open(os.path.join(backup_dir, backups[0]), "r") as f:
+            self.assertEqual("pre-existing content", f.read())
+
+    def test_to_file_prunes_old_backups(self):
+        file_path = os.path.join(self.temp_dir, "persist")
+        persist = DummyPersist()
+        with open(file_path, "w") as f:
+            f.write("initial")
+
+        for index in range(12):
+            persist.my_content = "content {}".format(index)
+            persist.to_file(file_path)
+
+        backup_dir = os.path.join(self.temp_dir, "backups")
+        backups = sorted(os.listdir(backup_dir))
+        self.assertEqual(10, len(backups))
+        backup_contents = []
+        for backup in backups:
+            with open(os.path.join(backup_dir, backup), "r") as f:
+                backup_contents.append(f.read())
+        self.assertEqual("content 1", backup_contents[0])
+        self.assertEqual("content 10", backup_contents[-1])
+        self.assertNotIn("initial", backup_contents)
+        self.assertNotIn("content 0", backup_contents)
+
+    def test_to_file_continues_when_backup_fails(self):
+        file_path = os.path.join(self.temp_dir, "persist")
+        with open(file_path, "w") as f:
+            f.write("pre-existing content")
+        persist = DummyPersist()
+        persist.my_content = "write out some new content"
+
+        with patch("common.persist.shutil.copy2", side_effect=OSError("copy failed")):
+            persist.to_file(file_path)
+
+        with open(file_path, "r") as f:
+            self.assertEqual("write out some new content", f.read())
+
     @unittest.skipUnless(os.name == "posix", "permission mode checks require POSIX semantics")
     def test_to_file_sets_0600_permissions(self):
         file_path = os.path.join(self.temp_dir, "persist_perms")
@@ -114,6 +165,25 @@ class TestPersist(unittest.TestCase):
         self.assertEqual(0o600, mode, f"Expected 0600 after overwrite, got {oct(mode)}")
         with open(file_path, "r") as f:
             self.assertEqual("second write", f.read())
+
+    @unittest.skipUnless(os.name == "posix", "permission mode checks require POSIX semantics")
+    def test_to_file_hardens_backup_permissions(self):
+        file_path = os.path.join(self.temp_dir, "persist_backup_perms")
+        with open(file_path, "w") as f:
+            f.write("pre-existing content")
+        os.chmod(file_path, 0o644)
+        persist = DummyPersist()
+        persist.my_content = "updated content"
+
+        persist.to_file(file_path)
+
+        backup_dir = os.path.join(self.temp_dir, "backups")
+        backups = os.listdir(backup_dir)
+        self.assertEqual(1, len(backups))
+        backup_dir_mode = os.stat(backup_dir).st_mode & 0o777
+        self.assertEqual(0o700, backup_dir_mode, f"Expected backup directory 0700 permissions, got {oct(backup_dir_mode)}")
+        backup_mode = os.stat(os.path.join(backup_dir, backups[0])).st_mode & 0o777
+        self.assertEqual(0o600, backup_mode, f"Expected backup 0600 permissions, got {oct(backup_mode)}")
 
     @unittest.skipUnless(os.name == "posix", "permission mode checks require POSIX semantics")
     def test_to_file_overwrite_tightens_permissive_existing_file(self):

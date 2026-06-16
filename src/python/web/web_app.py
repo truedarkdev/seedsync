@@ -350,6 +350,14 @@ class WebApp(bottle.Bottle):
         return raw_value
 
     @staticmethod
+    def __has_proxy_forwarding_headers() -> bool:
+        for header_name in ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"):
+            raw_value = bottle.request.get_header(header_name, "")
+            if isinstance(raw_value, str) and raw_value.strip():
+                return True
+        return False
+
+    @staticmethod
     def __request_forwarded_origin() -> Optional[Tuple[str, str, int]]:
         forwarded_proto = WebApp.__request_forwarded_proto()
         forwarded_host = WebApp.__request_forwarded_host()
@@ -385,7 +393,7 @@ class WebApp(bottle.Bottle):
         if request_origin is None:
             return None
 
-        if not self.__is_trusted_forwarded_origin_source():
+        if not self.__is_trusted_browser_bootstrap_remote_addr():
             return request_origin
 
         forwarded_origin = WebApp.__request_forwarded_origin()
@@ -425,6 +433,13 @@ class WebApp(bottle.Bottle):
         return False
 
     def __is_same_origin_browser_request(self) -> bool:
+        if (
+            self.__is_loopback_remote_addr() and
+            WebApp.__has_proxy_forwarding_headers() and
+            not self.__is_trusted_browser_bootstrap_remote_addr()
+        ):
+            return False
+
         request_origin = self.__effective_request_origin()
         if request_origin is None:
             return False
@@ -538,6 +553,7 @@ class WebApp(bottle.Bottle):
             self.__auth_store is not None and
             getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
             self.__is_loopback_remote_addr() and
+            not WebApp.__has_proxy_forwarding_headers() and
             WebApp.__is_loopback_host(WebApp.__request_host()) and
             self.__is_direct_same_origin_browser_request()
         )

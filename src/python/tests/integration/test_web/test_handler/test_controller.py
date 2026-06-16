@@ -257,6 +257,26 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual("Invalid file path", response.text)
         self.controller.queue_command.assert_not_called()
 
+    def test_delete_local_rejects_base_directory_target(self):
+        self.controller.queue_command = MagicMock()
+        uri = quote(quote(".", safe=""), safe="")
+
+        response = self.test_app.delete("/server/command/delete_local/"+uri, expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_delete_local_rejects_null_byte_filename(self):
+        self.controller.queue_command = MagicMock()
+        uri = quote(quote("bad\x00name", safe=""), safe="")
+
+        response = self.test_app.delete("/server/command/delete_local/"+uri, expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
     def test_delete_local_rejects_mismatched_file_id_authoritative_traversal_target(self):
         self.controller.queue_command = MagicMock()
         self.controller.get_model_files.return_value = [

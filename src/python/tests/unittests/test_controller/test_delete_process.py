@@ -1,5 +1,6 @@
 import os
 import posixpath
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -119,6 +120,78 @@ class TestDeleteRemoteProcess(unittest.TestCase):
             "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "normal.mkv"))
         )
 
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_blocks_remote_traversal_filename(self, sshcp_cls):
+        ssh = MagicMock()
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="/remote",
+            file_name="../escape"
+        )
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        ssh.shell.assert_not_called()
+
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_blocks_remote_base_directory_filename(self, sshcp_cls):
+        ssh = MagicMock()
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="/remote",
+            file_name="."
+        )
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        ssh.shell.assert_not_called()
+
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_blocks_remote_absolute_filename(self, sshcp_cls):
+        ssh = MagicMock()
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="/remote",
+            file_name="/etc/passwd"
+        )
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        ssh.shell.assert_not_called()
+
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_blocks_remote_null_byte_filename(self, sshcp_cls):
+        ssh = MagicMock()
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="/remote",
+            file_name="bad\x00name"
+        )
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        ssh.shell.assert_not_called()
+
 
 class TestDeleteLocalProcess(unittest.TestCase):
     @patch("controller.delete.delete_process.shutil.rmtree")
@@ -141,3 +214,28 @@ class TestDeleteLocalProcess(unittest.TestCase):
             process.run_once()
 
         exists.assert_called_once_with(os.path.join("/local", "missing.lftp"))
+
+    def test_run_once_blocks_local_traversal_filename(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            local_root = os.path.join(temp_dir, "local")
+            os.makedirs(local_root)
+            outside_file = os.path.join(temp_dir, "escape.txt")
+            with open(outside_file, "w") as f:
+                f.write("do not delete")
+
+            process = DeleteLocalProcess(local_path=local_root, file_name="../escape.txt")
+            process.logger = MagicMock()
+
+            process.run_once()
+
+            self.assertTrue(os.path.isfile(outside_file))
+            self.assertTrue(os.path.isdir(local_root))
+
+    def test_run_once_blocks_local_base_directory_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            process = DeleteLocalProcess(local_path=temp_dir, file_name=".")
+            process.logger = MagicMock()
+
+            process.run_once()
+
+            self.assertTrue(os.path.isdir(temp_dir))
