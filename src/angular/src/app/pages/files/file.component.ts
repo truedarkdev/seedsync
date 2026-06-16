@@ -57,12 +57,18 @@ export class FileComponent implements OnChanges {
             return;
         }
 
-        // Check for status changes
         const oldFile: ViewFile = changes.file.previousValue;
         const newFile: ViewFile = changes.file.currentValue;
-        if (oldFile != null && newFile != null && oldFile.status !== newFile.status) {
-            // Reset any active action
-            this.resetActiveAction();
+        if (oldFile != null && newFile != null) {
+            if (oldFile.status !== newFile.status) {
+                this.resetActiveAction();
+            } else if (this.activeAction === FileAction.DELETE_REMOTE &&
+                       oldFile.isRemotelyDeletable && !newFile.isRemotelyDeletable) {
+                this.resetActiveAction();
+            } else if (this.activeAction === FileAction.DELETE_LOCAL &&
+                       oldFile.isLocallyDeletable && !newFile.isLocallyDeletable) {
+                this.resetActiveAction();
+            }
 
             // Scroll into view if this file is selected and not already in viewport
             const fileElement = this.fileElement && this.fileElement.nativeElement;

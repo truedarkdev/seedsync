@@ -1739,6 +1739,83 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
+    def test_cleanup_commands_delete_remote_logs_failed_async_cleanup_without_crashing(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        process = MagicMock()
+        process.name = "DeleteRemoteProcess"
+        process.is_alive.return_value = False
+        process.propagate_exception.side_effect = Exception("boom")
+        post_callback = self.controller._Controller__remote_scan_process.force_scan
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=False
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_called_once_with()
+        self.controller.logger.warning.assert_called_once_with(
+            "Command process failed: %s",
+            "DeleteRemoteProcess",
+            exc_info=True
+        )
+        breadcrumb_calls = [
+            call
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] in {"command_failed", "command_finished"}
+        ]
+        self.assertEqual(["command_failed"], [call.args[1] for call in breadcrumb_calls])
+        self.assertEqual(500, breadcrumb_calls[0].args[2]["error_code"])
+        self.assertNotIn("completion", breadcrumb_calls[0].args[2])
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+
+    def test_cleanup_commands_delete_remote_records_success_breadcrumb_when_async_cleanup_completes(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        process = MagicMock()
+        process.name = "DeleteRemoteProcess"
+        process.is_alive.return_value = False
+        process.propagate_exception.return_value = None
+        post_callback = self.controller._Controller__remote_scan_process.force_scan
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=False
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_called_once_with()
+        self.controller.logger.warning.assert_not_called()
+        breadcrumb_calls = [
+            call
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] in {"command_failed", "command_finished"}
+        ]
+        self.assertEqual(["command_finished"], [call.args[1] for call in breadcrumb_calls])
+        self.assertEqual("completed", breadcrumb_calls[0].args[2]["completion"])
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+
     def test_queue_delete_local_process_without_command_uses_synthetic_no_callback_command(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"

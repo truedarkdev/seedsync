@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from controller.delete.delete_process import DeleteLocalProcess, DeleteRemoteProcess
 from common import escape_remote_path_for_shell
+from ssh import SshcpError
 
 
 class TestDeleteRemoteProcess(unittest.TestCase):
@@ -51,6 +52,7 @@ class TestDeleteRemoteProcess(unittest.TestCase):
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_leaves_normal_filename_unquoted(self, sshcp_cls):
         ssh = MagicMock()
+        ssh.shell.return_value = b"deleted"
         sshcp_cls.return_value = ssh
         process = DeleteRemoteProcess(
             remote_address="remote",
@@ -67,6 +69,10 @@ class TestDeleteRemoteProcess(unittest.TestCase):
         ssh.shell.assert_called_once_with(
             "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "normal.mkv"))
         )
+        process.logger.debug.assert_any_call("Deleting remote file: normal.mkv")
+        process.logger.debug.assert_any_call("Remote delete output: deleted")
+        process.logger.debug.assert_any_call("Successfully deleted remote file: normal.mkv")
+        process.logger.info.assert_not_called()
 
     @patch("controller.delete.delete_process.Sshcp")
     def test_run_once_shell_expands_tilde_remote_path(self, sshcp_cls):
@@ -89,6 +95,28 @@ class TestDeleteRemoteProcess(unittest.TestCase):
                 posixpath.join("~/remote", "normal.mkv"),
                 allow_tilde_expansion=True
             )
+        )
+
+    @patch("controller.delete.delete_process.Sshcp")
+    def test_run_once_propagates_sshcp_error(self, sshcp_cls):
+        ssh = MagicMock()
+        ssh.shell.side_effect = SshcpError("boom")
+        sshcp_cls.return_value = ssh
+        process = DeleteRemoteProcess(
+            remote_address="remote",
+            remote_username="user",
+            remote_password="pass",
+            remote_port=22,
+            remote_path="/remote",
+            file_name="normal.mkv"
+        )
+        process.logger = MagicMock()
+
+        with self.assertRaises(SshcpError):
+            process.run_once()
+
+        ssh.shell.assert_called_once_with(
+            "rm -rf " + escape_remote_path_for_shell(posixpath.join("/remote", "normal.mkv"))
         )
 
 
