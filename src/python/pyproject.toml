@@ -16,7 +16,6 @@ paste = "*"
 patool = "*"
 pexpect = "*"
 pytz = "*"
-requests = "^2.33.0"
 tblib = "*"
 six = "^1.17.0"
 
