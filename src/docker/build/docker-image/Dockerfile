@@ -98,6 +98,7 @@ RUN poetry config virtualenvs.create false
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
+ENV UMASK=""
 
 # Install Python dependencies
 RUN mkdir -p /app
