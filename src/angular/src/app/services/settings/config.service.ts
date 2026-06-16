@@ -90,8 +90,13 @@ export class ConfigService extends BaseWebService {
         this._restService.sendRequest(this.CONFIG_GET_URL).subscribe({
             next: reaction => {
                 if (reaction.success) {
-                    const config_json: IConfig = JSON.parse(reaction.data);
-                    this._config.next(new Config(config_json));
+                    try {
+                        const config_json: IConfig = JSON.parse(reaction.data);
+                        this._config.next(new Config(config_json));
+                    } catch (error) {
+                        this._logger.error("Failed to parse config response");
+                        this._config.next(null);
+                    }
                 } else {
                     this._config.next(null);
                 }

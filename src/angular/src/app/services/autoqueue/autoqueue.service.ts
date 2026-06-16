@@ -133,14 +133,19 @@ export class AutoQueueService extends BaseWebService {
         this._restService.sendRequest(this.AUTOQUEUE_GET_URL).subscribe({
             next: reaction => {
                 if (reaction.success) {
-                    const parsed: AutoQueuePatternJson[] = JSON.parse(reaction.data);
-                    const newPatterns: AutoQueuePattern[] = [];
-                    for (const patternJson of parsed) {
-                        newPatterns.push(new AutoQueuePattern({
-                            pattern: patternJson.pattern
-                        }));
+                    try {
+                        const parsed: AutoQueuePatternJson[] = JSON.parse(reaction.data);
+                        const newPatterns: AutoQueuePattern[] = [];
+                        for (const patternJson of parsed) {
+                            newPatterns.push(new AutoQueuePattern({
+                                pattern: patternJson.pattern
+                            }));
+                        }
+                        this._patterns.next(Immutable.List(newPatterns));
+                    } catch (error) {
+                        this._logger.error("Failed to parse autoqueue response");
+                        this._patterns.next(Immutable.List([]));
                     }
-                    this._patterns.next(Immutable.List(newPatterns));
                 } else {
                     this._patterns.next(Immutable.List([]));
                 }

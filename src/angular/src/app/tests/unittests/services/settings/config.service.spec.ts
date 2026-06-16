@@ -158,6 +158,37 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
+    it("should get null on malformed json response", fakeAsync(() => {
+        httpMock.expectOne("/server/config/get").flush({general: {debug: true}});
+
+        let latestConfig = null;
+        configService.config.subscribe({
+            next: config => {
+                latestConfig = config;
+            }
+        });
+
+        expect(latestConfig).not.toBe(null);
+        expect(latestConfig.general.debug).toBe(true);
+
+        const consoleErrorSpy = spyOn(console, "error");
+        const malformedResponse = "not-json";
+
+        (<any>configService).onConnected();
+        const request = httpMock.expectOne("/server/config/get");
+        expect(() => request.flush(malformedResponse)).not.toThrow();
+
+        tick();
+
+        expect(latestConfig).toBe(null);
+        expect(consoleErrorSpy).toHaveBeenCalled();
+        const errorCall = consoleErrorSpy.calls.mostRecent();
+        expect(errorCall.args).toEqual(["Failed to parse config response"]);
+        expect(JSON.stringify(errorCall.args)).not.toContain(malformedResponse);
+        expect(errorCall.args.some(arg => arg instanceof SyntaxError)).toBe(false);
+        httpMock.verify();
+    }));
+
     it("should get null on disconnect", fakeAsync(() => {
         const configExpected = [
             new Config({lftp: {remote_address: "first"}}),

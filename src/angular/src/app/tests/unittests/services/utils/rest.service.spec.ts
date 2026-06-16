@@ -59,7 +59,88 @@ describe("Testing rest service", () => {
         httpMock.verify();
     }));
 
-    it("should get error message on sendRequest error 404", fakeAsync(() => {
+    it("should redact config response logging", fakeAsync(() => {
+        const debugSpy = spyOn(console, "debug");
+        const responseBody = JSON.stringify({
+            lftp: {
+                remote_password: "supersecret"
+            }
+        });
+
+        restService.sendRequest("/server/config/get").subscribe({
+            next: reaction => {
+                expect(reaction.success).toBe(true);
+                expect(reaction.data).toBe(responseBody);
+            }
+        });
+        httpMock.expectOne("/server/config/get").flush(responseBody);
+
+        expect(debugSpy).toHaveBeenCalledWith("%s http response: %s", "/server/config/get", "[redacted]");
+        expect(JSON.stringify(debugSpy.calls.allArgs())).not.toContain("supersecret");
+        httpMock.verify();
+    }));
+
+    it("should redact config set response logging too", fakeAsync(() => {
+        const debugSpy = spyOn(console, "debug");
+        const responseBody = "lftp.remote_password set to supersecret";
+
+        restService.sendPostRequest("/server/config/set/lftp/remote_password", {value: "supersecret"}).subscribe({
+            next: reaction => {
+                expect(reaction.success).toBe(true);
+                expect(reaction.data).toBe(responseBody);
+            }
+        });
+        const request = httpMock.expectOne("/server/config/set/lftp/remote_password");
+        expect(request.request.method).toBe("POST");
+        expect(request.request.body).toEqual({value: "supersecret"});
+        request.flush(responseBody);
+
+        expect(debugSpy).toHaveBeenCalledWith(
+            "%s http response: %s",
+            "/server/config/set/lftp/remote_password",
+            "[redacted]"
+        );
+        expect(JSON.stringify(debugSpy.calls.allArgs())).not.toContain("supersecret");
+        httpMock.verify();
+    }));
+
+    it("should redact config error logging", fakeAsync(() => {
+        const debugSpy = spyOn(console, "debug");
+        const responseBody = "config-secret=supersecret";
+
+        restService.sendRequest("/server/config/get").subscribe({
+            next: reaction => {
+                expect(reaction.success).toBe(false);
+                expect(reaction.errorMessage).toBe(responseBody);
+            }
+        });
+        httpMock.expectOne("/server/config/get").flush(
+            responseBody,
+            {status: 404, statusText: "Bad Request"}
+        );
+
+        const errorCall = debugSpy.calls.mostRecent();
+        expect(errorCall.args).toEqual(["%s error: %s", "/server/config/get", "[redacted]"]);
+        expect(JSON.stringify(errorCall.args)).not.toContain("supersecret");
+        httpMock.verify();
+    }));
+
+    it("should keep raw response logging for non-config endpoints", fakeAsync(() => {
+        const debugSpy = spyOn(console, "debug");
+
+        restService.sendRequest("/server/request").subscribe({
+            next: reaction => {
+                expect(reaction.success).toBe(true);
+            }
+        });
+        httpMock.expectOne("/server/request").flush("success");
+
+        expect(debugSpy).toHaveBeenCalledWith("%s http response: %s", "/server/request", "success");
+        httpMock.verify();
+    }));
+
+    it("should get error message and keep raw error logging on sendRequest error 404", fakeAsync(() => {
+        const debugSpy = spyOn(console, "debug");
         let subscriberIndex = 0;
         restService.sendRequest("/server/request").subscribe({
             next: reaction => {
@@ -74,6 +155,11 @@ describe("Testing rest service", () => {
         );
 
         expect(subscriberIndex).toBe(1);
+        const errorCall = debugSpy.calls.mostRecent();
+        expect(errorCall.args[0]).toBe("%s error: %O");
+        expect(errorCall.args[1]).toBe("/server/request");
+        expect(errorCall.args[2].status).toBe(404);
+        expect(errorCall.args[2].error).toBe("Not found");
         httpMock.verify();
     }));
 
