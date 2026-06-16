@@ -516,6 +516,114 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DEFAULT, built_root.state)
         self.assertEqual(ModelFile.State.DEFAULT, built_root.get_children()[0].state)
 
+    def test_build_state_dir_persist_staging_root_stays_default_with_incomplete_remote_children(self):
+        remote_root = SystemFile("release", 300, True)
+        remote_root.add_child(SystemFile("part1.rar", 100, False))
+        remote_root.add_child(SystemFile("part2.rar", 100, False))
+        remote_root.add_child(SystemFile("part3.rar", 100, False))
+
+        local_root = SystemFile("release", 500, True, is_staging=True)
+        local_root.add_child(SystemFile("part1.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("part2.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("movie.mkv", 300, False, is_staging=True))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_downloaded_files({"release"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("release").state)
+
+    def test_build_state_dir_persist_staging_root_downloaded_when_remote_children_are_complete(self):
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile("part1.rar", 100, False))
+        remote_root.add_child(SystemFile("part2.rar", 100, False))
+
+        local_root = SystemFile("release", 200, True, is_staging=True)
+        local_root.add_child(SystemFile("part1.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("part2.rar", 100, False, is_staging=True))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_downloaded_files({"release"})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("release").state)
+
+    def test_build_state_dir_recent_snapshot_staging_root_stays_downloading_with_incomplete_remote_children(self):
+        remote_root = SystemFile("release", 300, True)
+        remote_root.add_child(SystemFile("part1.rar", 100, False))
+        remote_root.add_child(SystemFile("part2.rar", 100, False))
+        remote_root.add_child(SystemFile("part3.rar", 100, False))
+
+        local_root = SystemFile("release", 500, True, is_staging=True)
+        local_root.add_child(SystemFile("part1.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("part2.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("movie.mkv", 300, False, is_staging=True))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["release"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="release",
+                size_local=290,
+                percent_local=97,
+                speed=1000,
+                eta=1
+            )
+
+        model = self.model_builder.build_model()
+        built_root = model.get_file("release")
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, built_root.state)
+        self.assertEqual(290, built_root.transferred_size)
+        self.assertEqual(97, built_root.download_progress)
+
+    def test_build_state_dir_recent_snapshot_staging_root_downloaded_when_remote_children_are_complete(self):
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile("part1.rar", 100, False))
+        remote_root.add_child(SystemFile("part2.rar", 100, False))
+
+        local_root = SystemFile("release", 200, True, is_staging=True)
+        local_root.add_child(SystemFile("part1.rar", 100, False, is_staging=True))
+        local_root.add_child(SystemFile("part2.rar", 100, False, is_staging=True))
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["release"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="release",
+                size_local=190,
+                percent_local=95,
+                speed=1000,
+                eta=1
+            )
+
+        model = self.model_builder.build_model()
+        built_root = model.get_file("release")
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, built_root.state)
+        self.assertEqual(200, built_root.transferred_size)
+        self.assertIsNone(built_root.download_progress)
+        self.assertNotIn("release", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+    def test_build_state_dir_staging_root_downloaded_when_remote_child_size_is_unknown(self):
+        remote_root = SystemFile("release", 100, True)
+        remote_child = SystemFile("part1.rar", 0, False)
+        remote_child._SystemFile__size = None
+        remote_root.add_child(remote_child)
+
+        local_root = SystemFile("release", 100, True, is_staging=True)
+
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("release").state)
+
     def test_build_state_keeps_final_root_remote_size_match_completed(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
         self.model_builder.set_local_files([SystemFile("archive.zip", 100, False)])
