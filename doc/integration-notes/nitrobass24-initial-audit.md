@@ -366,7 +366,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 347 | `059c6c79dfd468841bdcda54af7635cb00480b78` | 2026-03-05 | test: add composite key test coverage for ViewFileService (#159) | adapted locally in `e50166d2` |
 | 348 | `66ac4a0ec1462cbe3fb7c63cd713b4f3df019663` | 2026-03-05 | feat: Settings UI for path pairs CRUD (#160) | covered elsewhere |
 | 349 | `f33f1103e92e734225c13796c33272ff3958a25e` | 2026-03-05 | feat: per-pair LFTP and scanner instances in Controller (#155, #151) (#161) | covered elsewhere |
-| 350 | `c1bfecbfc255305a500a679cbc0a591e7ead3fc5` | 2026-03-05 | fix: improve Path Pairs settings UX (#162) | pending |
+| 350 | `c1bfecbfc255305a500a679cbc0a591e7ead3fc5` | 2026-03-05 | fix: improve Path Pairs settings UX (#162) | intentionally skipped |
 | 351 | `eea09145ae73864e18b6adf6a11f8774f0445ff8` | 2026-03-05 | fix: disable Server/Local Directory fields when path pairs active (#163) | pending |
 | 352 | `faba6c1168cb5cd8f3fa97056a44ac3d19ff865a` | 2026-03-06 | feat: Alpine Docker image + dual-image CI (#164) | pending |
 | 353 | `4580795021a17113fd6598fae9f6ed971e3cbb1e` | 2026-03-06 | fix: clean up startup logs — add path pairs, remove GUID (#165) | pending |
