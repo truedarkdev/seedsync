@@ -15,12 +15,11 @@ RUN set -eux; \
     apt-get update && apt-get install -y \
     binutils \
     build-essential \
-    curl \
     libffi-dev \
     zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN pip3 install "poetry==2.3.2"
-RUN poetry config virtualenvs.create false
+RUN pip3 install "poetry==2.3.2" \
+    && poetry config virtualenvs.create false
 COPY src/python/pyproject.toml /app/python/
 COPY src/python/poetry.lock /app/python/
 WORKDIR /app/python
@@ -65,7 +64,8 @@ RUN npx ng build --configuration production --output-path /build/dist/
 # Installs all python dependencies
 FROM python:3.12-slim-bullseye AS seedsync_run_python_env
 
-# Install dependencies
+# Install the runtime toolchain in a single layer. The package set stays
+# intentionally unpinned so rebuilds pick up security refreshes.
 RUN set -eux; \
     if [ -f /etc/apt/sources.list.d/debian.sources ]; then \
         sed -i 's/Components: main/Components: main contrib non-free/g' /etc/apt/sources.list.d/debian.sources; \
@@ -86,15 +86,13 @@ RUN set -eux; \
         curl \
         libnss-wrapper \
         libxml2-dev libxslt-dev libffi-dev \
+    && ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-# Fix for patoolib
-# See: https://github.com/wummel/patool/issues/90
-RUN ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so
 
 # Keep Poetry pinned so the lockfile generation and image installs stay aligned.
-RUN pip3 install "poetry==2.3.2"
-RUN poetry config virtualenvs.create false
+RUN pip3 install "poetry==2.3.2" \
+    && poetry config virtualenvs.create false
 
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
@@ -109,11 +107,10 @@ RUN cd /app/python && poetry install --only main
 
 # Creates environment for Python dev
 FROM seedsync_run_python_env AS seedsync_run_python_devenv
-# The main dependency install downgrades requests to the application's pinned
-# runtime version, so refresh Poetry before adding dev-only dependencies.
-RUN pip3 install --force-reinstall "poetry==2.3.2"
-RUN poetry config virtualenvs.create false
-RUN cd /app/python && poetry install
+RUN pip3 install --force-reinstall "poetry==2.3.2" \
+    && poetry config virtualenvs.create false \
+    && cd /app/python \
+    && poetry install
 
 
 # Installs Seedsync python code
