@@ -2,7 +2,7 @@ import {ChangeDetectionStrategy, Component} from "@angular/core";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
 import {By} from "@angular/platform-browser";
-import {BehaviorSubject, of} from "rxjs";
+import {BehaviorSubject, of, throwError} from "rxjs";
 import {Modal} from "../../../../services/utils/modal.service";
 
 import {PathPairsComponent} from "../../../../pages/settings/path-pairs.component";
@@ -162,6 +162,49 @@ describe("Testing path pairs component", () => {
             auto_queue: true
         });
         expect(notificationService.show).toHaveBeenCalled();
+    });
+
+    it("should surface duplicate-name errors when creating a path pair", () => {
+        pathPairService.create.and.returnValue(throwError({
+            error: {
+                error: "Path pair with name 'Movies' already exists"
+            },
+            message: "Http failure response for /server/path-pairs: 409 Conflict"
+        }));
+
+        component.startCreate();
+        component.formName = "Movies";
+        component.formRemotePath = "/remote/movies";
+        component.formLocalPath = "/downloads/movies";
+        component.save();
+
+        expect(pathPairService.create).toHaveBeenCalled();
+        const notification = notificationService.show.calls.mostRecent().args[0] as Notification;
+        expect(notification.text).toBe("Failed to create: Path pair with name 'Movies' already exists");
+    });
+
+    it("should surface duplicate-name errors when updating a path pair", () => {
+        pathPairService.update.and.returnValue(throwError({
+            error: {
+                error: "Path pair with name 'TV' already exists"
+            },
+            message: "Http failure response for /server/path-pairs/movies: 409 Conflict"
+        }));
+
+        component.startEdit({
+            id: "movies",
+            name: "Movies",
+            remote_path: "/remote/movies",
+            local_path: "/downloads/movies",
+            enabled: true,
+            auto_queue: true
+        });
+        component.formName = "TV";
+        component.save();
+
+        expect(pathPairService.update).toHaveBeenCalled();
+        const notification = notificationService.show.calls.mostRecent().args[0] as Notification;
+        expect(notification.text).toBe("Failed to update: Path pair with name 'TV' already exists");
     });
 
     it("should populate the form when editing", () => {

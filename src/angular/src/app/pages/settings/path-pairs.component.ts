@@ -102,7 +102,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
                     this.showWarnings(result.warnings);
                     this.cancel();
                 },
-                error: error => this.showError("Failed to create: " + error.message)
+                error: error => this.showError("Failed to create: " + this.describeError(error))
             });
             return;
         }
@@ -121,7 +121,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
                     this.showWarnings(result.warnings);
                     this.cancel();
                 },
-                error: error => this.showError("Failed to update: " + error.message)
+                error: error => this.showError("Failed to update: " + this.describeError(error))
             });
         }
     }
@@ -148,7 +148,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
                                 this.cancel();
                             }
                         },
-                        error: error => this.showError("Failed to delete: " + error.message)
+                        error: error => this.showError("Failed to delete: " + this.describeError(error))
                     });
                 },
                 () => { return; }
@@ -166,7 +166,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
             auto_queue: pair.auto_queue
         }).subscribe({
             next: result => this.showWarnings(result.warnings),
-            error: error => this.showError("Failed to toggle: " + error.message)
+            error: error => this.showError("Failed to toggle: " + this.describeError(error))
         });
     }
 
@@ -192,7 +192,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
         ids[index] = ids[index - 1];
         ids[index - 1] = current;
         this._pathPairService.reorder(ids).subscribe({
-            error: error => this.showError("Failed to reorder: " + error.message)
+            error: error => this.showError("Failed to reorder: " + this.describeError(error))
         });
     }
 
@@ -205,7 +205,7 @@ export class PathPairsComponent implements OnInit, OnDestroy {
         ids[index] = ids[index + 1];
         ids[index + 1] = current;
         this._pathPairService.reorder(ids).subscribe({
-            error: error => this.showError("Failed to reorder: " + error.message)
+            error: error => this.showError("Failed to reorder: " + this.describeError(error))
         });
     }
 
@@ -246,5 +246,20 @@ export class PathPairsComponent implements OnInit, OnDestroy {
                 dismissible: true
             }));
         });
+    }
+
+    private describeError(error: any): string {
+        if (error && error.error) {
+            if (typeof error.error === "string") {
+                return error.error;
+            }
+            if (error.error.error) {
+                return error.error.error;
+            }
+        }
+        if (error && error.message) {
+            return error.message;
+        }
+        return "Unknown error";
     }
 }

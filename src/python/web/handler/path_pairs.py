@@ -6,7 +6,7 @@ from dataclasses import asdict
 import bottle
 from bottle import HTTPResponse
 
-from common import PathPairManager, PathPair, PathPairError, PersistError, overrides
+from common import PathPairManager, PathPair, PathPairConflictError, PathPairError, PersistError, overrides
 from ..web_app import IHandler, WebApp
 
 
@@ -100,6 +100,8 @@ class PathPairsHandler(IHandler):
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
+        except PathPairConflictError as exc:
+            return self.__json_response({"success": False, "error": str(exc)}, status=409)
         except PathPairError as exc:
             return self.__json_response({"success": False, "error": str(exc)}, status=400)
         except PersistError as exc:
@@ -135,6 +137,8 @@ class PathPairsHandler(IHandler):
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
             return self.__json_response({"success": False, "error": "Invalid JSON: {}".format(exc)}, status=400)
+        except PathPairConflictError as exc:
+            return self.__json_response({"success": False, "error": str(exc)}, status=409)
         except PathPairError as exc:
             return self.__json_response({"success": False, "error": str(exc)}, status=400)
         except PersistError as exc:
