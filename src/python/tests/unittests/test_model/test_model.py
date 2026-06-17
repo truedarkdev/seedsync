@@ -3,7 +3,7 @@
 import logging
 import sys
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from common import overrides
 from model import Model, ModelFile, IModelListener, ModelError
@@ -107,6 +107,25 @@ class TestLftpModel(unittest.TestCase):
         self.assertEqual(file_a_tv, self.model.get_file(file_a_tv.file_id))
         with self.assertRaises(ModelError):
             self.model.get_file("a")
+
+    def test_debug_logs_use_short_path_pair_identity(self):
+        self.model.logger = MagicMock()
+
+        file = ModelFile("test", False)
+        file.path_pair_id = "ab12cd34ef56"
+
+        self.model.add_file(file)
+        self.model.update_file(file)
+        self.model.remove_file(file.file_id)
+
+        self.assertEqual(
+            [
+                call("LftpModel: Adding file 'test [ab12cd34]'"),
+                call("LftpModel: Updating file 'test [ab12cd34]'"),
+                call("LftpModel: Removing file 'test [ab12cd34]'"),
+            ],
+            self.model.logger.debug.call_args_list
+        )
 
     def test_add_listener(self):
         listener = DummyModelListener()
