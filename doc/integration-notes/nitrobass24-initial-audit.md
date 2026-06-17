@@ -381,7 +381,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 362 | `b58b8a66121e4f351113d148c9ba306fd4971507` | 2026-03-06 | Merge pull request #172 from nitrobass24/fix/unique-pair-names | covered elsewhere |
 | 363 | `c25fc2c02909ec028b8b482393d388a91e3a33ea` | 2026-03-06 | ci: publish develop branch images to ghcr.io on every push | needs area reopen |
 | 364 | `2e37d2c17349381a31499df8b837d6ae859173cb` | 2026-03-06 | Merge pull request #175 from nitrobass24/ci/publish-develop | covered elsewhere |
-| 365 | `9a76b9bf60e723286cd9f8feb31e6177a3f64164` | 2026-03-06 | fix: per-pair extraction paths and staging subdirectories (#167, #168) | pending |
+| 365 | `9a76b9bf60e723286cd9f8feb31e6177a3f64164` | 2026-03-06 | fix: per-pair extraction paths and staging subdirectories (#167, #168) | needs area reopen |
 | 366 | `fc92bb16985915f53a54e092c8891994ce99ca5b` | 2026-03-06 | fix: propagate pair_id through extraction pipeline and guard None staging path | pending |
 | 367 | `d1e97e4a6f8de5b870f143f6bfda1818900144dc` | 2026-03-06 | fix: harden extract pipeline — pair_id on status, safer fallback, test updates | pending |
 | 368 | `2805bc07fa7e9e2487bd048d6a8f98a5b3b3fcda` | 2026-03-06 | fix: filter active_extracting_file_names by pair_id | pending |
