@@ -64,6 +64,13 @@ class Model:
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("Model")
 
+    @staticmethod
+    def __format_file_for_log(file: ModelFile) -> str:
+        path_pair_id = getattr(file, "path_pair_id", None)
+        if path_pair_id:
+            return "{} [{}]".format(file.name, path_pair_id[:8])
+        return file.name
+
     def add_listener(self, listener: IModelListener):
         """
         Add a model listener
@@ -94,7 +101,7 @@ class Model:
         :param file:
         :return:
         """
-        self.logger.debug("LftpModel: Adding file '{}'".format(file.name))
+        self.logger.debug("LftpModel: Adding file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
         if file_id in self.__files_by_id:
             raise ModelError("File already exists in the model")
@@ -123,9 +130,9 @@ class Model:
         :param filename:
         :return:
         """
-        self.logger.debug("LftpModel: Removing file '{}'".format(filename))
         file_id = self.__resolve_file_id(filename)
         file = self.__files_by_id[file_id]
+        self.logger.debug("LftpModel: Removing file '{}'".format(self.__format_file_for_log(file)))
         del self.__files_by_id[file_id]
         self.__file_ids_by_name[file.name].remove(file_id)
         if not self.__file_ids_by_name[file.name]:
@@ -141,7 +148,7 @@ class Model:
         :param file:
         :return:
         """
-        self.logger.debug("LftpModel: Updating file '{}'".format(file.name))
+        self.logger.debug("LftpModel: Updating file '{}'".format(self.__format_file_for_log(file)))
         file_id = file.file_id
         if file_id not in self.__files_by_id:
             raise ModelError("File does not exist in the model")

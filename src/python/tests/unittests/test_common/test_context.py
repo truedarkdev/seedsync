@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import MagicMock, call
 
+from common import PathPair
 from common.context import Args, Context
 from common.status import Status
 
@@ -120,6 +121,7 @@ class TestContext(unittest.TestCase):
                 call("  general.api_token: **REDACTED**"),
                 call("  general.webhook_secret: **REDACTED**"),
                 call("  general.breadcrumb_trace_enabled: False"),
+                call("Path Pairs: (none)"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),
                 call("  html_path: /tmp/ui"),
@@ -160,6 +162,7 @@ class TestContext(unittest.TestCase):
                 call("  Lftp.remote_address: seedbox.example.com"),
                 call("  Lftp.remote_username: seeduser"),
                 call("  Lftp.remote_password: ********"),
+                call("Path Pairs: (none)"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),
                 call("  html_path: /tmp/ui"),
@@ -195,6 +198,7 @@ class TestContext(unittest.TestCase):
                         call("  General.debug: True"),
                         call("  Lftp.remote_address: seedbox.example.com"),
                         call("  Lftp.remote_password: "),
+                        call("Path Pairs: (none)"),
                         call("Args:"),
                         call("  local_path_to_scanfs: None"),
                         call("  html_path: None"),
@@ -204,3 +208,77 @@ class TestContext(unittest.TestCase):
                     ],
                     logger.debug.call_args_list
                 )
+
+    def test_print_to_log_emits_path_pairs_when_configured(self):
+        logger = MagicMock()
+        config = MagicMock()
+        config.as_dict.return_value = {
+            "general": {},
+        }
+        args = Args()
+        path_pair_manager = MagicMock()
+        path_pair_manager.get_all_pairs.return_value = [
+            PathPair(
+                id="ab12cd34ef56",
+                name="Movies",
+                remote_path="/remote/movies",
+                local_path="/local/movies",
+                enabled=True,
+                auto_queue=True,
+            ),
+            PathPair(
+                id="1234abcd5678",
+                name="TV",
+                remote_path="/remote/tv",
+                local_path="/local/tv",
+                enabled=False,
+                auto_queue=False,
+            ),
+        ]
+
+        context = Context(logger, MagicMock(), config, args, Status(), path_pair_manager)
+        context.print_to_log()
+
+        self.assertEqual(
+            [
+                call("Config:"),
+                call("Path Pairs:"),
+                call("  Movies [ab12cd34]: /remote/movies -> /local/movies (enabled, auto_queue=on)"),
+                call("  TV [1234abcd]: /remote/tv -> /local/tv (disabled, auto_queue=off)"),
+                call("Args:"),
+                call("  local_path_to_scanfs: None"),
+                call("  html_path: None"),
+                call("  debug: None"),
+                call("  exit: None"),
+                call("  web_bind_host: None"),
+            ],
+            logger.debug.call_args_list
+        )
+
+    def test_print_to_log_emits_path_pairs_none_when_manager_is_empty(self):
+        logger = MagicMock()
+        config = MagicMock()
+        config.as_dict.return_value = {
+            "general": {},
+        }
+        args = Args()
+        path_pair_manager = MagicMock()
+        path_pair_manager.get_all_pairs.return_value = []
+
+        context = Context(logger, MagicMock(), config, args, Status(), path_pair_manager)
+        context.print_to_log()
+
+        self.assertEqual(
+            [
+                call("Config:"),
+                call("Path Pairs: (none)"),
+                call("Args:"),
+                call("  local_path_to_scanfs: None"),
+                call("  html_path: None"),
+                call("  debug: None"),
+                call("  exit: None"),
+                call("  web_bind_host: None"),
+            ],
+            logger.debug.call_args_list
+        )
+        path_pair_manager.get_all_pairs.assert_called_once_with()

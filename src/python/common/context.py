@@ -8,7 +8,7 @@ from typing import Optional
 # my libs
 from .config import Config
 from .breadcrumb_trace import BreadcrumbTraceCollector
-from .path_pair import PathPairManager
+from .path_pair import PathPair, PathPairManager
 from .status import Status
 
 
@@ -90,6 +90,12 @@ class Context:
             return "********" if value else ""
         return value
 
+    @staticmethod
+    def __format_path_pair_log_identity(path_pair: PathPair) -> str:
+        if path_pair.id:
+            return "{} [{}]".format(path_pair.name, path_pair.id[:8])
+        return path_pair.name
+
     def print_to_log(self):
         # Print the config
         self.logger.debug("Config:")
@@ -99,6 +105,26 @@ class Context:
                 value = config_dict[section][option]
                 value = self.__redact_config_log_value(section, option, value)
                 self.logger.debug("  {}.{}: {}".format(section, option, value))
+
+        path_pairs = []
+        if self.path_pair_manager is not None:
+            path_pairs = list(self.path_pair_manager.get_all_pairs() or [])
+        if path_pairs:
+            self.logger.debug("Path Pairs:")
+            for path_pair in path_pairs:
+                enabled = "enabled" if path_pair.enabled else "disabled"
+                auto_queue = "on" if path_pair.auto_queue else "off"
+                self.logger.debug(
+                    "  {}: {} -> {} ({}, auto_queue={})".format(
+                        self.__format_path_pair_log_identity(path_pair),
+                        path_pair.remote_path,
+                        path_pair.local_path,
+                        enabled,
+                        auto_queue,
+                    )
+                )
+        else:
+            self.logger.debug("Path Pairs: (none)")
 
         self.logger.debug("Args:")
         for name, value in self.args.as_dict().items():

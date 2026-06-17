@@ -369,7 +369,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 350 | `c1bfecbfc255305a500a679cbc0a591e7ead3fc5` | 2026-03-05 | fix: improve Path Pairs settings UX (#162) | intentionally skipped |
 | 351 | `eea09145ae73864e18b6adf6a11f8774f0445ff8` | 2026-03-05 | fix: disable Server/Local Directory fields when path pairs active (#163) | needs new integration task |
 | 352 | `faba6c1168cb5cd8f3fa97056a44ac3d19ff865a` | 2026-03-06 | feat: Alpine Docker image + dual-image CI (#164) | needs area reopen |
-| 353 | `4580795021a17113fd6598fae9f6ed971e3cbb1e` | 2026-03-06 | fix: clean up startup logs — add path pairs, remove GUID (#165) | pending |
+| 353 | `4580795021a17113fd6598fae9f6ed971e3cbb1e` | 2026-03-06 | fix: clean up startup logs — add path pairs, remove GUID (#165) | adapted locally in `<pending commit>` |
 | 354 | `dde649dcc0f6aceb38e4a5be5a852e40f977494c` | 2026-03-06 | Release v0.13.0 — Multiple path pairs, Alpine image, and more | pending |
 | 355 | `1385b05924d370d5cd91bd4c9af74610bafbd9da` | 2026-03-06 | docs: update README, website, and modernization plan for v0.13.0 | pending |
 | 356 | `46a178fcaa992abf428925352acbcc37b9ea4d1e` | 2026-03-06 | fix: address code review findings across frontend and backend | pending |
