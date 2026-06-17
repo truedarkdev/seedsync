@@ -373,7 +373,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 354 | `dde649dcc0f6aceb38e4a5be5a852e40f977494c` | 2026-03-06 | Release v0.13.0 — Multiple path pairs, Alpine image, and more | intentionally skipped |
 | 355 | `1385b05924d370d5cd91bd4c9af74610bafbd9da` | 2026-03-06 | docs: update README, website, and modernization plan for v0.13.0 | intentionally skipped |
 | 356 | `46a178fcaa992abf428925352acbcc37b9ea4d1e` | 2026-03-06 | fix: address code review findings across frontend and backend | needs area reopen |
-| 357 | `9ff156dfa36c908802ec3c5339c40ea796eabb7c` | 2026-03-06 | fix: staging extraction bug + round 2 code review fixes | pending |
+| 357 | `9ff156dfa36c908802ec3c5339c40ea796eabb7c` | 2026-03-06 | fix: staging extraction bug + round 2 code review fixes | needs area reopen |
 | 358 | `95813b589738f1d96415717de837da441e41a9b7` | 2026-03-06 | docs: document v0.13.0 known limitations in CHANGELOG and MODERNIZATION_PLAN | pending |
 | 359 | `038de391a18fb64db1423445d74abb23ad1339d2` | 2026-03-06 | docs: remove stale LFTP parsing limitation (fixed in PR #66) | pending |
 | 360 | `de0d58068189afc13a9e088bfd84dc043b23c1b5` | 2026-03-06 | Merge feat/v0.13.0 into develop — Multi-pair architecture & infrastructure | pending |
