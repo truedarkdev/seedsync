@@ -378,7 +378,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 359 | `038de391a18fb64db1423445d74abb23ad1339d2` | 2026-03-06 | docs: remove stale LFTP parsing limitation (fixed in PR #66) | intentionally skipped |
 | 360 | `de0d58068189afc13a9e088bfd84dc043b23c1b5` | 2026-03-06 | Merge feat/v0.13.0 into develop — Multi-pair architecture & infrastructure | covered elsewhere |
 | 361 | `150c45a712e17fcb3b76c6ec1b3ed50fa3d83091` | 2026-03-06 | fix: enforce unique path pair names (#169) | adapted locally in `c3003fda825c16c7ede45fc20b3c0f23ceb1be82` |
-| 362 | `b58b8a66121e4f351113d148c9ba306fd4971507` | 2026-03-06 | Merge pull request #172 from nitrobass24/fix/unique-pair-names | pending |
+| 362 | `b58b8a66121e4f351113d148c9ba306fd4971507` | 2026-03-06 | Merge pull request #172 from nitrobass24/fix/unique-pair-names | covered elsewhere |
 | 363 | `c25fc2c02909ec028b8b482393d388a91e3a33ea` | 2026-03-06 | ci: publish develop branch images to ghcr.io on every push | pending |
 | 364 | `2e37d2c17349381a31499df8b837d6ae859173cb` | 2026-03-06 | Merge pull request #175 from nitrobass24/ci/publish-develop | pending |
 | 365 | `9a76b9bf60e723286cd9f8feb31e6177a3f64164` | 2026-03-06 | fix: per-pair extraction paths and staging subdirectories (#167, #168) | pending |
