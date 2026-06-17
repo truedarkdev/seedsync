@@ -18,6 +18,13 @@ class PathPairError(AppError):
     pass
 
 
+class PathPairConflictError(PathPairError):
+    """
+    Exception indicating a conflicting path pair name
+    """
+    pass
+
+
 DOCKER_DOWNLOADS_BASE = "/downloads"
 DOCKER_MOUNTS_BASE = "/mounts"
 
@@ -101,10 +108,18 @@ class PathPairCollection:
                 return pair
         return None
 
+    def get_pair_by_name(self, name: str) -> Optional[PathPair]:
+        for pair in self.path_pairs:
+            if pair.name == name:
+                return pair
+        return None
+
     def add_pair(self, pair: PathPair):
         warnings = pair.validate()
         if self.get_pair_by_id(pair.id):
             raise PathPairError("Path pair with id '{}' already exists".format(pair.id))
+        if self.get_pair_by_name(pair.name):
+            raise PathPairConflictError("Path pair with name '{}' already exists".format(pair.name))
         self.path_pairs.append(pair)
         return warnings
 
@@ -112,6 +127,8 @@ class PathPairCollection:
         warnings = pair.validate()
         for index, existing in enumerate(self.path_pairs):
             if existing.id == pair.id:
+                if existing.name != pair.name and self.get_pair_by_name(pair.name):
+                    raise PathPairConflictError("Path pair with name '{}' already exists".format(pair.name))
                 self.path_pairs[index] = pair
                 return warnings
         raise PathPairError("Path pair with id '{}' not found".format(pair.id))

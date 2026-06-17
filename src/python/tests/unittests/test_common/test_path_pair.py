@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from common import PathPair, PathPairError, PathPairManager
+from common import PathPair, PathPairConflictError, PathPairError, PathPairManager
 
 
 class TestPathPairManager(unittest.TestCase):
@@ -45,6 +45,48 @@ class TestPathPairManager(unittest.TestCase):
 
         reloaded.remove_pair(pair.id)
         self.assertEqual([], reloaded.get_all_pairs())
+
+    def test_add_pair_rejects_duplicate_name(self):
+        first = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        second = PathPair(name="Movies", remote_path="/remote/tv", local_path="/local/tv")
+        self.manager.add_pair(first)
+
+        with self.assertRaises(PathPairConflictError) as context:
+            self.manager.add_pair(second)
+
+        self.assertEqual("Path pair with name 'Movies' already exists", str(context.exception))
+
+    def test_update_pair_rejects_duplicate_name_for_other_pair(self):
+        first = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        second = PathPair(name="TV", remote_path="/remote/tv", local_path="/local/tv")
+        self.manager.add_pair(first)
+        self.manager.add_pair(second)
+
+        with self.assertRaises(PathPairConflictError) as context:
+            self.manager.update_pair(PathPair(
+                id=second.id,
+                name="Movies",
+                remote_path="/remote/tv",
+                local_path="/local/tv"
+            ))
+
+        self.assertEqual("Path pair with name 'Movies' already exists", str(context.exception))
+
+    def test_update_pair_allows_keeping_own_name(self):
+        pair = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        self.manager.add_pair(pair)
+
+        warnings = self.manager.update_pair(PathPair(
+            id=pair.id,
+            name="Movies",
+            remote_path="/remote/films",
+            local_path="/local/films"
+        ))
+
+        self.assertEqual([], warnings)
+        updated = self.manager.get_pair_by_id(pair.id)
+        self.assertEqual("/remote/films", updated.remote_path)
+        self.assertEqual("/local/films", updated.local_path)
 
     def test_reorder_pairs_requires_complete_id_set(self):
         first = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
