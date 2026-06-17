@@ -375,7 +375,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 356 | `46a178fcaa992abf428925352acbcc37b9ea4d1e` | 2026-03-06 | fix: address code review findings across frontend and backend | needs area reopen |
 | 357 | `9ff156dfa36c908802ec3c5339c40ea796eabb7c` | 2026-03-06 | fix: staging extraction bug + round 2 code review fixes | needs area reopen |
 | 358 | `95813b589738f1d96415717de837da441e41a9b7` | 2026-03-06 | docs: document v0.13.0 known limitations in CHANGELOG and MODERNIZATION_PLAN | intentionally skipped |
-| 359 | `038de391a18fb64db1423445d74abb23ad1339d2` | 2026-03-06 | docs: remove stale LFTP parsing limitation (fixed in PR #66) | pending |
+| 359 | `038de391a18fb64db1423445d74abb23ad1339d2` | 2026-03-06 | docs: remove stale LFTP parsing limitation (fixed in PR #66) | intentionally skipped |
 | 360 | `de0d58068189afc13a9e088bfd84dc043b23c1b5` | 2026-03-06 | Merge feat/v0.13.0 into develop — Multi-pair architecture & infrastructure | pending |
 | 361 | `150c45a712e17fcb3b76c6ec1b3ed50fa3d83091` | 2026-03-06 | fix: enforce unique path pair names (#169) | pending |
 | 362 | `b58b8a66121e4f351113d148c9ba306fd4971507` | 2026-03-06 | Merge pull request #172 from nitrobass24/fix/unique-pair-names | pending |
