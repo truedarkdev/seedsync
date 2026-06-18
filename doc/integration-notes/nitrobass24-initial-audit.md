@@ -400,7 +400,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 381 | `3a37dd855de455cd41c28b313f28ffa5cde59c69` | 2026-03-06 | fix: healthcheck respects custom web port via WEB_PORT env var | intentionally skipped; local runtime has no `WEB_PORT` contract |
 | 382 | `a9abd653b9de885b219fd405081bb035eb494bf3` | 2026-03-06 | Merge pull request #180 from nitrobass24/fix/healthcheck-ipv6 | covered elsewhere |
 | 383 | `aa202b5e33f89d10a809bd820833fa73ae9860ff` | 2026-03-06 | ci: group @angular/* dependabot updates into single PR | needs area reopen |
-| 384 | `18c24c33187e0c1b10e113dc2cbd743bd6bd024b` | 2026-03-06 | Merge pull request #196 from nitrobass24/ci/dependabot-angular-group | pending |
+| 384 | `18c24c33187e0c1b10e113dc2cbd743bd6bd024b` | 2026-03-06 | Merge pull request #196 from nitrobass24/ci/dependabot-angular-group | covered elsewhere |
 | 385 | `62b0ef1e50af26c9e786db29d7b5d9d08764b397` | 2026-03-06 | docs: update CHANGELOG and MODERNIZATION_PLAN for v0.13.0 release | pending |
 | 386 | `d6cc9956fd355973d5e7591665ac60fad1e7d739` | 2026-03-06 | docs: remove resolved known limitations from MODERNIZATION_PLAN | pending |
 | 387 | `9ec504b304b934abac2138561dcd66fd4d0ef730` | 2026-03-06 | fix: address code review findings for v0.13.0 release | pending |
