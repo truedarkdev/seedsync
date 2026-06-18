@@ -976,6 +976,26 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(Localization.Error.REMOTE_SERVER_SCAN.format("Invalid scan data"), str(ctx.exception))
         self.assertFalse(ctx.exception.recoverable)
 
+    def test_raises_nonrecoverable_error_on_non_mapping_scan_entry(self):
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        def ssh_shell(*args):
+            return json.dumps([[]]).encode()
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+        self.assertEqual(Localization.Error.REMOTE_SERVER_SCAN.format("Invalid scan data"), str(ctx.exception))
+        self.assertFalse(ctx.exception.recoverable)
+
     def test_scan_rejects_non_string_remote_script_path(self):
         scanner = RemoteScanner(
             remote_address="my remote address",
