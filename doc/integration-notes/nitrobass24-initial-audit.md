@@ -385,7 +385,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 366 | `fc92bb16985915f53a54e092c8891994ce99ca5b` | 2026-03-06 | fix: propagate pair_id through extraction pipeline and guard None staging path | needs area reopen |
 | 367 | `d1e97e4a6f8de5b870f143f6bfda1818900144dc` | 2026-03-06 | fix: harden extract pipeline — pair_id on status, safer fallback, test updates | needs area reopen |
 | 368 | `2805bc07fa7e9e2487bd048d6a8f98a5b3b3fcda` | 2026-03-06 | fix: filter active_extracting_file_names by pair_id | covered elsewhere |
-| 369 | `47d812b740c73c0426a1b03637126d8c6d84e886` | 2026-03-06 | Merge pull request #173 from nitrobass24/fix/per-pair-extraction | pending |
+| 369 | `47d812b740c73c0426a1b03637126d8c6d84e886` | 2026-03-06 | Merge pull request #173 from nitrobass24/fix/per-pair-extraction | covered elsewhere |
 | 370 | `7f9b0f71e198f2ab0249aacc0431109942945ad3` | 2026-03-06 | fix: show warning banner when all path pairs are disabled (#170) | pending |
 | 371 | `ed032da149b6b8f391d6f3d5478748d61712dba2` | 2026-03-06 | fix: suppress remote-scan banners when all pairs disabled and add noEnabledPairs test | pending |
 | 372 | `d067ffa4a1a2b65fb77687133af9f02b99cfb7ef` | 2026-03-06 | Merge pull request #174 from nitrobass24/fix/graceful-pause-no-pairs | pending |
