@@ -402,7 +402,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 383 | `aa202b5e33f89d10a809bd820833fa73ae9860ff` | 2026-03-06 | ci: group @angular/* dependabot updates into single PR | needs area reopen |
 | 384 | `18c24c33187e0c1b10e113dc2cbd743bd6bd024b` | 2026-03-06 | Merge pull request #196 from nitrobass24/ci/dependabot-angular-group | covered elsewhere |
 | 385 | `62b0ef1e50af26c9e786db29d7b5d9d08764b397` | 2026-03-06 | docs: update CHANGELOG and MODERNIZATION_PLAN for v0.13.0 release | intentionally skipped |
-| 386 | `d6cc9956fd355973d5e7591665ac60fad1e7d739` | 2026-03-06 | docs: remove resolved known limitations from MODERNIZATION_PLAN | pending |
+| 386 | `d6cc9956fd355973d5e7591665ac60fad1e7d739` | 2026-03-06 | docs: remove resolved known limitations from MODERNIZATION_PLAN | intentionally skipped |
 | 387 | `9ec504b304b934abac2138561dcd66fd4d0ef730` | 2026-03-06 | fix: address code review findings for v0.13.0 release | pending |
 | 388 | `5aa82579de6c6238c3bf35cec52a474d9f751c13` | 2026-03-06 | fix: extract validation helper in path_pairs handler, catch AttributeError in scanner | pending |
 | 389 | `109db3905b1d22a221b067ebd89391255f5e5cbd` | 2026-03-05 | Bump hono from 4.12.3 to 4.12.5 in /src/angular | pending |
