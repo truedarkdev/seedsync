@@ -390,7 +390,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 371 | `ed032da149b6b8f391d6f3d5478748d61712dba2` | 2026-03-06 | fix: suppress remote-scan banners when all pairs disabled and add noEnabledPairs test | needs new integration task |
 | 372 | `d067ffa4a1a2b65fb77687133af9f02b99cfb7ef` | 2026-03-06 | Merge pull request #174 from nitrobass24/fix/graceful-pause-no-pairs | covered elsewhere |
 | 373 | `aa29fe586b94b76242292e25ce56ee95c1ef1bf5` | 2026-03-06 | ci: parallel arm64 builds on develop, unified publish job | needs area reopen |
-| 374 | `926c64f230818953057bca8706eda64568924503` | 2026-03-06 | Merge pull request #176 from nitrobass24/ci/parallel-arm-develop | pending |
+| 374 | `926c64f230818953057bca8706eda64568924503` | 2026-03-06 | Merge pull request #176 from nitrobass24/ci/parallel-arm-develop | covered elsewhere |
 | 375 | `58c1ae381e179ad0314133c2fafe9397c3cda55f` | 2026-03-06 | fix: skip spurious staging moves on container restart (#177) | pending |
 | 376 | `8e0f2843f3983d7a76aab712b6cc2a3f2da8a3e6` | 2026-03-06 | Merge pull request #179 from nitrobass24/fix/spurious-staging-moves | pending |
 | 377 | `9d34fe76e67c0d54cd56803c460f8f7706a3f4be` | 2026-03-06 | feat: consolidate all extraction to 7z, remove unrar dependency | pending |
