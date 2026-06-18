@@ -426,7 +426,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 407 | `67b7f6941db907adcadc18e0d8b4a6361127aaa3` | 2026-03-09 | Remove extraction retry/re-download logic | already integrated - local extraction failures are terminal, recorded as `EXTRACT_FAILED`, and no retry/re-download loop remains in the current controller/extract architecture |
 | 408 | `f16976cbc11353a3b27ab329496ee903b6459aa5` | 2026-03-09 | Merge pull request #207 from nitrobass24/fix/204-extract-verify-false-negative | already integrated - merge commit is tree-identical to row `407`, with no independent delta beyond rows `406` and `407` |
 | 409 | `8860245dc0a3bd7cef661e82253b4a9b4cb8a981` | 2026-03-09 | Fix auto-queue commands missing pair_id for path pairs (#205) | already integrated - local auto-queue/controller routing is path-pair-aware via `file_id` identity, with duplicate-name path-pair coverage in local tests |
-| 410 | `61e0aeb0429b5c4a89571e7342a94fa35495635b` | 2026-03-09 | Fix type annotations for Optional pair_id in auto_queue | pending |
+| 410 | `61e0aeb0429b5c4a89571e7342a94fa35495635b` | 2026-03-09 | Fix type annotations for Optional pair_id in auto_queue | already integrated - local `auto_queue` is path-pair/file-id aware and current candidate/retry typing already uses optional path-pair semantics |
 | 411 | `a0bd1af7501135cf7ae3d1713b7ebe539c4b7096` | 2026-03-09 | Merge pull request #206 from nitrobass24/fix/205-auto-delete-remote-path-pairs | pending |
 | 412 | `7f68a4c2f5d3eb7521b4d23da2e8d137e0521ac9` | 2026-03-09 | chore(deps): bump actions/setup-node from 4 to 6 (#199) | pending |
 | 413 | `67b8ac8d0ac408029519694aa0310f2ebc61ea95` | 2026-03-09 | chore(deps): bump docker/build-push-action from 5 to 7 (#200) | pending |
