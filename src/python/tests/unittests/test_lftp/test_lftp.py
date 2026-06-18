@@ -161,6 +161,10 @@ class TestLftp(unittest.TestCase):
             "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '",
             require_prompt_ready=False
         )
+        lftp.logger.info.assert_called_once_with(
+            "queue command: %s",
+            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '"
+        )
 
     def test_queue_dir_uses_override_paths(self):
         lftp = self._build_test_lftp()
