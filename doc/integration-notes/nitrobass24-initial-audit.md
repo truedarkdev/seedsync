@@ -398,7 +398,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 379 | `571acb788c5450181b5fe0b6d8fc3e18e63a7ed8` | 2026-03-06 | Merge pull request #178 from nitrobass24/feat/consolidate-7z | covered elsewhere |
 | 380 | `83390e72001b370b283357a2d200cd92b2a1321c` | 2026-03-06 | fix: healthcheck uses 127.0.0.1 instead of localhost | adapted locally in `src/docker/stage/docker-image/compose.yml` |
 | 381 | `3a37dd855de455cd41c28b313f28ffa5cde59c69` | 2026-03-06 | fix: healthcheck respects custom web port via WEB_PORT env var | intentionally skipped; local runtime has no `WEB_PORT` contract |
-| 382 | `a9abd653b9de885b219fd405081bb035eb494bf3` | 2026-03-06 | Merge pull request #180 from nitrobass24/fix/healthcheck-ipv6 | pending |
+| 382 | `a9abd653b9de885b219fd405081bb035eb494bf3` | 2026-03-06 | Merge pull request #180 from nitrobass24/fix/healthcheck-ipv6 | covered elsewhere |
 | 383 | `aa202b5e33f89d10a809bd820833fa73ae9860ff` | 2026-03-06 | ci: group @angular/* dependabot updates into single PR | pending |
 | 384 | `18c24c33187e0c1b10e113dc2cbd743bd6bd024b` | 2026-03-06 | Merge pull request #196 from nitrobass24/ci/dependabot-angular-group | pending |
 | 385 | `62b0ef1e50af26c9e786db29d7b5d9d08764b397` | 2026-03-06 | docs: update CHANGELOG and MODERNIZATION_PLAN for v0.13.0 release | pending |
