@@ -408,7 +408,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 389 | `109db3905b1d22a221b067ebd89391255f5e5cbd` | 2026-03-05 | Bump hono from 4.12.3 to 4.12.5 in /src/angular | covered elsewhere |
 | 390 | `4d99527feddaa5f992ee89bfcf76db8403aecf65` | 2026-03-06 | Merge pull request #153 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.5 | covered elsewhere |
 | 391 | `fd8f198c41d15b3fd032a2cd18238d9411cfec2e` | 2026-03-06 | Merge remote-tracking branch 'origin/master' into release/v0.13.0 | covered elsewhere - no-op merge marker; merge tree is identical to first parent `5aa82579...`, so there is no independent file delta to import |
-| 392 | `8b643396e89400f80cf8da68a1dc92371e6cb210` | 2026-03-06 | Release v0.13.0 — Multi-pair architecture & infrastructure | pending |
+| 392 | `8b643396e89400f80cf8da68a1dc92371e6cb210` | 2026-03-06 | Release v0.13.0 — Multi-pair architecture & infrastructure | covered elsewhere - release aggregation overlaps local evolved path-pair runtime/UI/API; missing logs/notifier and infra surfaces are tracked in focused follow-up lanes rather than imported from this broad merge |
 | 393 | `ee158a5216436b27aaedb9f0eb12f8a65a88ad77` | 2026-03-06 | Merge remote-tracking branch 'origin/master' into temp-merge-develop | pending |
 | 394 | `d17451e5e86c59e87b0ccbdaae45d44b2b99ff25` | 2026-03-07 | chore(deps): bump docker/setup-qemu-action from 3 to 4 | pending |
 | 395 | `5e1e0fe594cbd359abed5257003e944807fc53bf` | 2026-03-06 | Merge pull request #182 from nitrobass24/dependabot/github_actions/develop/docker/setup-qemu-action-4 | pending |
