@@ -431,7 +431,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 412 | `7f68a4c2f5d3eb7521b4d23da2e8d137e0521ac9` | 2026-03-09 | chore(deps): bump actions/setup-node from 4 to 6 (#199) | intentionally skipped - upstream-only `actions/setup-node` bump in absent `ci.yml`/`docs-pages.yml`; local `master.yml` has no setup-node usage |
 | 413 | `67b8ac8d0ac408029519694aa0310f2ebc61ea95` | 2026-03-09 | chore(deps): bump docker/build-push-action from 5 to 7 (#200) | intentionally skipped - upstream-only `docker/build-push-action` bump in absent `ci.yml`; local `master.yml` has no build-push-action usage |
 | 414 | `701750b83d3818c3f4d71e08849d61a35bf94002` | 2026-03-09 | chore(deps): bump actions/upload-pages-artifact from 3 to 4 (#202) | intentionally skipped - upstream-only `actions/upload-pages-artifact` bump in absent `docs-pages.yml`; local `master.yml` has no GitHub Pages artifact usage |
-| 415 | `399faf2a8867675adb17d33d6028c24b61a95c8e` | 2026-03-09 | chore(deps): bump actions/upload-artifact from 4 to 7 (#201) | pending |
+| 415 | `399faf2a8867675adb17d33d6028c24b61a95c8e` | 2026-03-09 | chore(deps): bump actions/upload-artifact from 4 to 7 (#201) | adapted locally - local `master.yml` `Publish artifact` step now uses `actions/upload-artifact@v7` |
 | 416 | `a6bd8fbdb2332a595ce9c50e3e224a863b950c8c` | 2026-03-09 | chore(deps): bump actions/download-artifact from 4 to 8 (#198) | pending |
 | 417 | `32f43c241ee5f08a1613014b6692b9150260fa8e` | 2026-03-09 | Fix pending_completion never clearing for EXTRACTED/EXTRACT_FAILED with staging (#208) | pending |
 | 418 | `9c8eb11c2681502bacbb1bcf886d4561cde207f3` | 2026-03-09 | Use official 7-Zip binary with RAR codec support (#210) | pending |
