@@ -428,7 +428,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 409 | `8860245dc0a3bd7cef661e82253b4a9b4cb8a981` | 2026-03-09 | Fix auto-queue commands missing pair_id for path pairs (#205) | already integrated - local auto-queue/controller routing is path-pair-aware via `file_id` identity, with duplicate-name path-pair coverage in local tests |
 | 410 | `61e0aeb0429b5c4a89571e7342a94fa35495635b` | 2026-03-09 | Fix type annotations for Optional pair_id in auto_queue | already integrated - local `auto_queue` is path-pair/file-id aware and current candidate/retry typing already uses optional path-pair semantics |
 | 411 | `a0bd1af7501135cf7ae3d1713b7ebe539c4b7096` | 2026-03-09 | Merge pull request #206 from nitrobass24/fix/205-auto-delete-remote-path-pairs | already integrated - merge wrapper for the auto_queue path-pair fixes, with no independent delta beyond rows `409` and `410` already covered locally |
-| 412 | `7f68a4c2f5d3eb7521b4d23da2e8d137e0521ac9` | 2026-03-09 | chore(deps): bump actions/setup-node from 4 to 6 (#199) | pending |
+| 412 | `7f68a4c2f5d3eb7521b4d23da2e8d137e0521ac9` | 2026-03-09 | chore(deps): bump actions/setup-node from 4 to 6 (#199) | intentionally skipped - upstream-only `actions/setup-node` bump in absent `ci.yml`/`docs-pages.yml`; local `master.yml` has no setup-node usage |
 | 413 | `67b8ac8d0ac408029519694aa0310f2ebc61ea95` | 2026-03-09 | chore(deps): bump docker/build-push-action from 5 to 7 (#200) | pending |
 | 414 | `701750b83d3818c3f4d71e08849d61a35bf94002` | 2026-03-09 | chore(deps): bump actions/upload-pages-artifact from 3 to 4 (#202) | pending |
 | 415 | `399faf2a8867675adb17d33d6028c24b61a95c8e` | 2026-03-09 | chore(deps): bump actions/upload-artifact from 4 to 7 (#201) | pending |
