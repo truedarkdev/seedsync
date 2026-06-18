@@ -102,6 +102,8 @@ class AppProcess(Process):
     @overrides(Process)
     def terminate(self):
         # Send a terminate signal, and force terminate after a timeout
+        if self._terminate is None:
+            return
         self._terminate.set()
 
         def elapsed_ms(start):
@@ -116,11 +118,24 @@ class AppProcess(Process):
 
         super().terminate()
 
+    def close_queues(self):
+        """
+        Release multiprocessing resources after the process has been joined.
+        """
+        if self.__exception_queue is not None:
+            self.__exception_queue.close()
+            self.__exception_queue.join_thread()
+            self.__exception_queue = None
+        self.mp_logger = None
+        self._terminate = None
+
     def propagate_exception(self):
         """
         Raises any exception that was caught by the process
         :return:
         """
+        if self.__exception_queue is None:
+            return
         try:
             exc = self.__exception_queue.get(block=False)
             raise exc.re_raise()

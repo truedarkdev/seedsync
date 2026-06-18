@@ -194,6 +194,16 @@ class ScannerProcess(AppProcess):
             self.__wake_event.wait(timeout=wait_time_in_s)
             self.__wake_event.clear()
 
+    @overrides(AppProcess)
+    def close_queues(self):
+        if self.__queue is not None:
+            self.__queue.close()
+            self.__queue.join_thread()
+            self.__queue = None
+        if self.__wake_event is not None:
+            self.__wake_event = None
+        super().close_queues()
+
     def __trace_corr_id(self):
         return self.__trace_path_pair_id() or self.__scanner.__class__.__name__
 

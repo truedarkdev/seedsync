@@ -2,7 +2,7 @@ import os
 import tempfile
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from controller.validate import ValidateProcess
 from model import ModelFile
@@ -72,3 +72,43 @@ class TestValidateProcess(unittest.TestCase):
             "folder/file one.mkv": "aaaa",
             "folder/sub/file2.mkv": "bbbb"
         }, hashes)
+
+    def test_close_queues_releases_owned_queues_and_is_idempotent(self):
+        command_queue = MagicMock()
+        status_queue = MagicMock()
+
+        with patch(
+            "controller.validate.validate_process.multiprocessing.Queue",
+            side_effect=[command_queue, status_queue],
+        ), patch("controller.validate.validate_process.Sshcp") as mock_sshcp:
+            process = ValidateProcess(
+                remote_address="example.com",
+                remote_username="user",
+                remote_password=None,
+                remote_port=22,
+                local_path=self.temp_dir.name,
+                remote_path="/remote",
+                path_pairs_by_id={}
+            )
+
+        mock_sshcp.assert_called_once_with(
+            host="example.com",
+            port=22,
+            user="user",
+            password=None
+        )
+        process.mp_logger = MagicMock()
+        process._AppProcess__exception_queue = MagicMock()
+
+        process.close_queues()
+        process.close_queues()
+
+        command_queue.close.assert_called_once_with()
+        command_queue.join_thread.assert_called_once_with()
+        status_queue.close.assert_called_once_with()
+        status_queue.join_thread.assert_called_once_with()
+        self.assertIsNone(process._ValidateProcess__command_queue)
+        self.assertIsNone(process._ValidateProcess__status_result_queue)
+        self.assertIsNone(process._AppProcess__exception_queue)
+        self.assertIsNone(process._terminate)
+        self.assertIsNone(process.mp_logger)

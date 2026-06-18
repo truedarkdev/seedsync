@@ -244,6 +244,11 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.join.assert_called_once_with()
         self.controller._Controller__extract_process.join.assert_called_once_with()
         self.controller._Controller__validate_process.join.assert_called_once_with()
+        self.controller._Controller__active_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__local_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
+        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
         self.controller._Controller__mp_logger.stop.assert_called_once_with()
         self.assertFalse(self.controller._Controller__started)
 
@@ -1754,6 +1759,8 @@ class TestController(unittest.TestCase):
         post_callback.assert_called_once_with()
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
+        process.join.assert_called_once_with()
+        process.close_queues.assert_called_once_with()
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
     def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
@@ -1786,6 +1793,8 @@ class TestController(unittest.TestCase):
         post_callback.assert_not_called()
         callback.on_success.assert_not_called()
         callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
+        process.join.assert_called_once_with()
+        process.close_queues.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
     def test_cleanup_commands_delete_remote_logs_failed_async_cleanup_without_crashing(self):
@@ -1827,6 +1836,8 @@ class TestController(unittest.TestCase):
         self.assertEqual(["command_failed"], [call.args[1] for call in breadcrumb_calls])
         self.assertEqual(500, breadcrumb_calls[0].args[2]["error_code"])
         self.assertNotIn("completion", breadcrumb_calls[0].args[2])
+        process.join.assert_called_once_with()
+        process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
 
     def test_cleanup_commands_delete_remote_records_success_breadcrumb_when_async_cleanup_completes(self):
@@ -1863,6 +1874,8 @@ class TestController(unittest.TestCase):
         ]
         self.assertEqual(["command_finished"], [call.args[1] for call in breadcrumb_calls])
         self.assertEqual("completed", breadcrumb_calls[0].args[2]["completion"])
+        process.join.assert_called_once_with()
+        process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
 
     def test_queue_delete_local_process_without_command_uses_synthetic_no_callback_command(self):

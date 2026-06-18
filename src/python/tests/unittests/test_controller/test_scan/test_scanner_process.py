@@ -5,7 +5,7 @@ import multiprocessing
 import logging
 import sys
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -239,6 +239,28 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIs(latest_result, first_result)
         process.logger.warning.assert_called_once()
         self.assertIn("Scanner queue read failed", process.logger.warning.call_args[0][0])
+
+    def test_close_queues_releases_owned_queue_and_is_idempotent(self):
+        queue = MagicMock()
+        wake_event = MagicMock()
+
+        with patch("controller.scan.scanner_process.multiprocessing.Queue", return_value=queue), \
+                patch("controller.scan.scanner_process.multiprocessing.Event", return_value=wake_event):
+            process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False)
+
+        process.mp_logger = MagicMock()
+        process._AppProcess__exception_queue = MagicMock()
+
+        process.close_queues()
+        process.close_queues()
+
+        queue.close.assert_called_once_with()
+        queue.join_thread.assert_called_once_with()
+        self.assertIsNone(process._ScannerProcess__queue)
+        self.assertIsNone(process._ScannerProcess__wake_event)
+        self.assertIsNone(process._AppProcess__exception_queue)
+        self.assertIsNone(process._terminate)
+        self.assertIsNone(process.mp_logger)
 
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()

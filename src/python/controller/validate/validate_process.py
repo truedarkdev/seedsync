@@ -8,7 +8,7 @@ import queue
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 
-from common import AppProcess
+from common import overrides, AppProcess
 from model import ModelFile
 from ssh import Sshcp
 
@@ -120,6 +120,18 @@ class ValidateProcess(AppProcess):
         except Exception as error:  # pragma: no cover - process-level safety
             self.logger.exception("Validation failed for %s", file.file_id)
             self.__set_status(file.file_id, ModelFile.State.CORRUPT, 100, str(error))
+
+    @overrides(AppProcess)
+    def close_queues(self):
+        if self.__command_queue is not None:
+            self.__command_queue.close()
+            self.__command_queue.join_thread()
+            self.__command_queue = None
+        if self.__status_result_queue is not None:
+            self.__status_result_queue.close()
+            self.__status_result_queue.join_thread()
+            self.__status_result_queue = None
+        super().close_queues()
 
     def __publish_statuses(self):
         self.__status_result_queue.put(
