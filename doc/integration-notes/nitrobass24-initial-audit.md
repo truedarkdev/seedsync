@@ -470,9 +470,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 451 | `9c41fcd581d901c36d7554cd8b3a44becf40497c` | 2026-03-12 | Merge pull request #268 from nitrobass24/fix/fd-leak-restart | covered elsewhere - merge wrapper for rows `449`/`450` adaptation |
 | 452 | `3eaf5c00d51501663cc9b53e62e665014ffe1a6e` | 2026-03-12 | Fix model builder cache not invalidating when active files clear | already integrated - local `set_active_files` invalidation and tests already cover the cache reset behavior |
 | 453 | `2f22a004ff6389a853ec41e81b40beaa028448e6` | 2026-03-12 | Merge pull request #273 from nitrobass24/fix/active-files-cache-invalidation | covered elsewhere - merge wrapper for row `452` |
-| 454 | `01dd01c992544068a0dcf395f10687456051e616` | 2026-03-12 | Fix exclude patterns not passed to LFTP mirror command (#259) | pending |
-| 455 | `9f414fc0c953a6cb36ea81cf2b193996f5535d2e` | 2026-03-12 | Deduplicate pattern parsing in filter_excluded_files | pending |
-| 456 | `12ca4c5cbcced91eefa4920733e91885ac9eacb6` | 2026-03-12 | Merge pull request #261 from nitrobass24/fix/exclude-patterns-lftp | pending |
+| 454 | `01dd01c992544068a0dcf395f10687456051e616` | 2026-03-12 | Fix exclude patterns not passed to LFTP mirror command (#259) | needs integration - deferred to the existing exclude-pattern lane with rows `346`, `429`, `455`, and `467` |
+| 455 | `9f414fc0c953a6cb36ea81cf2b193996f5535d2e` | 2026-03-12 | Deduplicate pattern parsing in filter_excluded_files | needs integration - deferred to the existing exclude-pattern lane with rows `346`, `429`, `454`, and `467` |
+| 456 | `12ca4c5cbcced91eefa4920733e91885ac9eacb6` | 2026-03-12 | Merge pull request #261 from nitrobass24/fix/exclude-patterns-lftp | covered elsewhere - merge wrapper for deferred rows `454`/`455` |
 | 457 | `bd4a50aa6d5cd905b64346a79b0c8d08ad8b7b97` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | pending |
 | 458 | `0b799c7f868468684928614571a3802f47f67de1` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | pending |
 | 459 | `f50f8d900aa46e7826102a37d1dc2e7f09d78b15` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | pending |
