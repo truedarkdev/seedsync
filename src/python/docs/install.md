@@ -164,7 +164,7 @@ It is strongly recommended that you set up key-based authentication.
     Most commonly this should be:
 
         :::bash
-        -v ~/.ssh:/home/seedsync/.ssh
+        -v ~/.ssh:/home/seedsync/.ssh:ro
 
 
 !!! note
