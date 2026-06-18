@@ -6,7 +6,7 @@ import sys
 import time
 from multiprocessing import Value
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -175,6 +175,26 @@ class TestAppProcess(unittest.TestCase):
 
         self.assertEqual(2, mock_sleep.call_count)
         mock_terminate.assert_called_once_with()
+
+    def test_close_queues_releases_resources_and_makes_terminate_a_noop(self):
+        self.process = DummyProcess(fail=False)
+        self.process.mp_logger = MagicMock()
+        exception_queue = MagicMock()
+        self.process._AppProcess__exception_queue = exception_queue
+
+        self.process.close_queues()
+        self.process.close_queues()
+
+        exception_queue.close.assert_called_once_with()
+        exception_queue.join_thread.assert_called_once_with()
+        self.assertIsNone(self.process._AppProcess__exception_queue)
+        self.assertIsNone(self.process._terminate)
+        self.assertIsNone(self.process.mp_logger)
+
+        with patch("common.app_process.Process.terminate") as mock_terminate:
+            self.process.terminate()
+
+        mock_terminate.assert_not_called()
 
 
 class TestAppOneShotProcess(unittest.TestCase):

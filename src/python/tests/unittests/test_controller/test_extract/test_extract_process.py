@@ -111,6 +111,35 @@ class TestExtractProcess(unittest.TestCase):
         while self.start_called.value == 0:
             pass
 
+    def test_close_queues_releases_owned_queues_and_is_idempotent(self):
+        command_queue = MagicMock()
+        status_queue = MagicMock()
+        completed_queue = MagicMock()
+        failed_queue = MagicMock()
+
+        with patch(
+            "controller.extract.extract_process.multiprocessing.Queue",
+            side_effect=[command_queue, status_queue, completed_queue, failed_queue],
+        ):
+            process = ExtractProcess(out_dir_path="/test/out/path", local_path="/test/local/path")
+
+        process.mp_logger = MagicMock()
+        process._AppProcess__exception_queue = MagicMock()
+
+        process.close_queues()
+        process.close_queues()
+
+        for queue in (command_queue, status_queue, completed_queue, failed_queue):
+            queue.close.assert_called_once_with()
+            queue.join_thread.assert_called_once_with()
+        self.assertIsNone(process._ExtractProcess__command_queue)
+        self.assertIsNone(process._ExtractProcess__status_result_queue)
+        self.assertIsNone(process._ExtractProcess__completed_result_queue)
+        self.assertIsNone(process._ExtractProcess__failed_result_queue)
+        self.assertIsNone(process._AppProcess__exception_queue)
+        self.assertIsNone(process._terminate)
+        self.assertIsNone(process.mp_logger)
+
     @pytest.mark.timeout(10)
     def test_retrieves_status(self):
         # Use this as a signal to mock to control which status to send

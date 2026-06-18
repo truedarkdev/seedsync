@@ -625,10 +625,15 @@ class Controller:
             self.__extract_process.terminate()
             self.__validate_process.terminate()
             self.__active_scan_process.join()
+            self.__active_scan_process.close_queues()
             self.__local_scan_process.join()
+            self.__local_scan_process.close_queues()
             self.__remote_scan_process.join()
+            self.__remote_scan_process.close_queues()
             self.__extract_process.join()
+            self.__extract_process.close_queues()
             self.__validate_process.join()
+            self.__validate_process.close_queues()
             self.__mp_logger.stop()
             self.__started = False
             self.logger.info("Exited controller")
@@ -2202,106 +2207,110 @@ class Controller:
             if command_process.process.is_alive():
                 still_active_processes.append(command_process)
             else:
-                if command_process.await_completion:
-                    try:
-                        command_process.process.propagate_exception()
-                    except FileNotFoundError as error:
-                        self.__record_command_breadcrumb(
-                            command=command_process.command,
-                            message="command_failed",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "message": str(error),
-                                "error_code": 404,
-                                "file_name": command_process.file_name,
-                                "lifecycle_phase": "cleanup",
-                            },
-                            event_type="failure",
-                        )
-                        self.logger.warning(
-                            "Command {} for file {} failed: {}".format(
-                                command_process.command.action,
-                                command_process.file_name,
-                                error
+                try:
+                    if command_process.await_completion:
+                        try:
+                            command_process.process.propagate_exception()
+                        except FileNotFoundError as error:
+                            self.__record_command_breadcrumb(
+                                command=command_process.command,
+                                message="command_failed",
+                                details={
+                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                    "message": str(error),
+                                    "error_code": 404,
+                                    "file_name": command_process.file_name,
+                                    "lifecycle_phase": "cleanup",
+                                },
+                                event_type="failure",
                             )
-                        )
-                        self.__persist.stopped_file_names.discard(command_process.file_id)
-                        for callback in command_process.command.callbacks:
-                            callback.on_failure(
-                                "File '{}' does not exist locally".format(command_process.file_name),
-                                404
+                            self.logger.warning(
+                                "Command {} for file {} failed: {}".format(
+                                    command_process.command.action,
+                                    command_process.file_name,
+                                    error
+                                )
                             )
-                    except Exception as error:
-                        self.__record_command_breadcrumb(
-                            command=command_process.command,
-                            message="command_failed",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "message": str(error),
-                                "error_code": 500,
-                                "file_name": command_process.file_name,
-                                "lifecycle_phase": "cleanup",
-                            },
-                            event_type="failure",
-                        )
-                        self.logger.warning(
-                            "Command {} for file {} failed: {}".format(
-                                command_process.command.action,
-                                command_process.file_name,
-                                error
+                            self.__persist.stopped_file_names.discard(command_process.file_id)
+                            for callback in command_process.command.callbacks:
+                                callback.on_failure(
+                                    "File '{}' does not exist locally".format(command_process.file_name),
+                                    404
+                                )
+                        except Exception as error:
+                            self.__record_command_breadcrumb(
+                                command=command_process.command,
+                                message="command_failed",
+                                details={
+                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                    "message": str(error),
+                                    "error_code": 500,
+                                    "file_name": command_process.file_name,
+                                    "lifecycle_phase": "cleanup",
+                                },
+                                event_type="failure",
                             )
-                        )
-                        self.__persist.stopped_file_names.discard(command_process.file_id)
-                        for callback in command_process.command.callbacks:
-                            callback.on_failure(
-                                "Failed to delete local file '{}'".format(command_process.file_name),
-                                500
+                            self.logger.warning(
+                                "Command {} for file {} failed: {}".format(
+                                    command_process.command.action,
+                                    command_process.file_name,
+                                    error
+                                )
+                            )
+                            self.__persist.stopped_file_names.discard(command_process.file_id)
+                            for callback in command_process.command.callbacks:
+                                callback.on_failure(
+                                    "Failed to delete local file '{}'".format(command_process.file_name),
+                                    500
+                                )
+                        else:
+                            command_process.post_callback()
+                            for callback in command_process.command.callbacks:
+                                callback.on_success()
+                            self.__record_command_breadcrumb(
+                                command=command_process.command,
+                                message="command_finished",
+                                details={
+                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                    "lifecycle_phase": "cleanup",
+                                    "completion": "completed",
+                                },
                             )
                     else:
+                        # Do the post callback
                         command_process.post_callback()
-                        for callback in command_process.command.callbacks:
-                            callback.on_success()
-                        self.__record_command_breadcrumb(
-                            command=command_process.command,
-                            message="command_finished",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "lifecycle_phase": "cleanup",
-                                "completion": "completed",
-                            },
-                        )
-                else:
-                    # Do the post callback
-                    command_process.post_callback()
-                    # Propagate the exception without crashing the controller loop
-                    try:
-                        command_process.process.propagate_exception()
-                    except Exception as error:
-                        self.logger.warning(
-                            "Command process failed: %s",
-                            command_process.process.name,
-                            exc_info=True
-                        )
-                        self.__record_command_breadcrumb(
-                            command=command_process.command,
-                            message="command_failed",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "message": str(error),
-                                "error_code": 500,
-                                "file_name": command_process.file_name,
-                                "lifecycle_phase": "cleanup",
-                            },
-                            event_type="failure",
-                        )
-                    else:
-                        self.__record_command_breadcrumb(
-                            command=command_process.command,
-                            message="command_finished",
-                            details={
-                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
-                                "lifecycle_phase": "cleanup",
-                                "completion": "completed",
-                            },
-                        )
+                        # Propagate the exception without crashing the controller loop
+                        try:
+                            command_process.process.propagate_exception()
+                        except Exception as error:
+                            self.logger.warning(
+                                "Command process failed: %s",
+                                command_process.process.name,
+                                exc_info=True
+                            )
+                            self.__record_command_breadcrumb(
+                                command=command_process.command,
+                                message="command_failed",
+                                details={
+                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                    "message": str(error),
+                                    "error_code": 500,
+                                    "file_name": command_process.file_name,
+                                    "lifecycle_phase": "cleanup",
+                                },
+                                event_type="failure",
+                            )
+                        else:
+                            self.__record_command_breadcrumb(
+                                command=command_process.command,
+                                message="command_finished",
+                                details={
+                                    "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                    "lifecycle_phase": "cleanup",
+                                    "completion": "completed",
+                                },
+                            )
+                finally:
+                    command_process.process.join()
+                    command_process.process.close_queues()
         self.__active_command_processes = still_active_processes
