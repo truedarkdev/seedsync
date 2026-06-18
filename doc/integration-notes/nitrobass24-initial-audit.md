@@ -437,27 +437,27 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 418 | `9c8eb11c2681502bacbb1bcf886d4561cde207f3` | 2026-03-09 | Use official 7-Zip binary with RAR codec support (#210) | covered elsewhere - local Docker already installs `p7zip-rar` and `unrar`, while direct `7zz` source-build/stdout diagnostics belong with the existing row `345` extraction area reopen lane |
 | 419 | `d18356f207bf7a465d77932faf2a6ed46ccdc9f4` | 2026-03-09 | Use pre-built 7zip image instead of compiling from source (#212) | covered elsewhere - local Docker/patool runtime does not use upstream bundled `7zz`; prebuilt-7zip image swap belongs with row `345` only if direct-`7zz` extraction is reopened |
 | 420 | `90c31cfb780edf0585317a91fe5c3a17dee04fd1` | 2026-03-09 | Release v0.13.1 - RAR extraction fix and pipeline stability | covered elsewhere - release metadata only; changelog/version bump adds no independent implementation delta beyond rows `418` and `419` plus existing CI/release lanes |
-| 421 | `ea924d8ebdae2628459853ac99bcdbb099750b62` | 2026-03-09 | Add recommended hard link setup to FAQ and README (#215) | adapted locally - added hard-link setup guidance to local `README.md` and `src/python/docs/faq.md`; upstream `website/docs/faq.md` has no local surface |
-| 422 | `699eefbbfabbfb697be3260c60af21a77f65fbf3` | 2026-03-10 | Release v0.13.2 - Code quality, test coverage, and bug fixes (#229) | pending |
-| 423 | `bdb09d8bb2e03f6cbd60d124f429cde602bb9d22` | 2026-03-10 | Tighten .dockerignore to exclude more build context junk | pending |
-| 424 | `e60972db789194cbe1da9e4dbd17c6e1d2c3203d` | 2026-03-10 | Migrate multiprocessing from fork to spawn (#232) | pending |
-| 425 | `794c5683cdb24d6b020f63148f19b9b8c1c73d82` | 2026-03-10 | Add pair label column to file list (#156) (#233) | pending |
-| 426 | `56b4fbaeb1db87b511850cdeaa09f08300e411c8` | 2026-03-10 | Fix file descriptor leak on restart causing OSError: No file descriptors available (#234) | pending |
-| 427 | `e4ea4019afad457cf74f40f2e139128d82c6eca1` | 2026-03-10 | Fix duplicate entries when pairs share a local directory (#235) | pending |
-| 428 | `d8cb5761cb2d16af3c4cf6a26a6b4b5215145f50` | 2026-03-11 | Add post-download integrity checking (#125) (#236) | pending |
-| 429 | `e919d10cdf8ed8a875062ba87670b4a58f2af821` | 2026-03-11 | Fix exclude patterns with trailing slash (#239) (#240) | pending |
-| 430 | `294805163db9b0a83d466eed2bf729d3454eb2a1` | 2026-03-11 | Add SSE heartbeat to prevent stale connections (#243) | pending |
-| 431 | `81cc8333cd5c3b2d86258ed7c015eb78ec58dd44` | 2026-03-12 | Add lftp xfer:verify toggle for inline transfer verification (#242) (#247) | pending |
-| 432 | `5f98531701e50a114112b6af09c3bea20710f9f6` | 2026-03-10 | chore(deps-dev): bump hono from 4.12.5 to 4.12.7 in /src/angular (#237) | pending |
-| 433 | `657d1eb226fe3e8ecea3c3852c90cb7d02f3b436` | 2026-03-10 | chore(deps-dev): bump tar from 7.5.9 to 7.5.11 in /src/angular (#238) | pending |
-| 434 | `b29e4020518c5a88ebe4286f73b70e465f3461f8` | 2026-03-12 | Fix parser crash on unrecognized lftp status lines (#253) (#258) | pending |
-| 435 | `4bf82a958fb84a88eb08313b1c4ab9a64198bb25` | 2026-03-12 | Release v0.13.3 - Fix lftp parser crash on orphan progress lines | pending |
-| 436 | `70ff50752440aa73479d9a0450bebfdce5269275` | 2026-03-12 | Merge branch 'master' into develop | pending |
-| 437 | `1b4538a10c2540cb875a57ef0bd210757182b7a6` | 2026-03-12 | Add CI status, release, Angular, Python, and platform badges to README | pending |
-| 438 | `87f6296d54f494643d825ea04e8b60e3cfcd9ebb` | 2026-03-12 | Move debug toggle to Logging section and convert log format to dropdown (#248) | pending |
-| 439 | `b95555745a6636cbc30c08334e88164674ca4f50` | 2026-03-12 | Convert file action buttons to native button elements (#241) (#246) | pending |
-| 440 | `f2b7c6506ce866587fb7547ea862d524900cd9ef` | 2026-03-12 | Add Phase 1 high-priority service tests (#225) (#245) | pending |
-| 441 | `a0e0247876cc544093bcc342a91fc9075c259039` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | pending |
+| 421 | `ea924d8ebdae2628459853ac99bcdbb099750b62` | 2026-03-09 | Add recommended hard link setup to FAQ and README (#215) | adapted locally in `b885ac9c` - added hard-link setup guidance to local `README.md` and `src/python/docs/faq.md`; upstream `website/docs/faq.md` has no local surface |
+| 422 | `699eefbbfabbfb697be3260c60af21a77f65fbf3` | 2026-03-10 | Release v0.13.2 - Code quality, test coverage, and bug fixes (#229) | already integrated - upstream release SHA `699eefbbfabbfb697be3260c60af21a77f65fbf3` is present in local history/tag context |
+| 423 | `bdb09d8bb2e03f6cbd60d124f429cde602bb9d22` | 2026-03-10 | Tighten .dockerignore to exclude more build context junk | needs integration - tighten root `.dockerignore`; local root `.dockerignore` is absent/untracked |
+| 424 | `e60972db789194cbe1da9e4dbd17c6e1d2c3203d` | 2026-03-10 | Migrate multiprocessing from fork to spawn (#232) | needs integration - multiprocessing spawn/process lifecycle migration |
+| 425 | `794c5683cdb24d6b020f63148f19b9b8c1c73d82` | 2026-03-10 | Add pair label column to file list (#156) (#233) | already integrated - local evolved file list/model surfaces already expose path pair label/name behavior |
+| 426 | `56b4fbaeb1db87b511850cdeaa09f08300e411c8` | 2026-03-10 | Fix file descriptor leak on restart causing OSError: No file descriptors available (#234) | needs integration - process/queue close cleanup and file descriptor leak on restart |
+| 427 | `e4ea4019afad457cf74f40f2e139128d82c6eca1` | 2026-03-10 | Fix duplicate entries when pairs share a local directory (#235) | needs integration - duplicate entries when pairs share a local directory; parity was not conclusively proven and needs targeted proof/patch |
+| 428 | `d8cb5761cb2d16af3c4cf6a26a6b4b5215145f50` | 2026-03-11 | Add post-download integrity checking (#125) (#236) | already integrated - local validate process/status/web/UI flow is present |
+| 429 | `e919d10cdf8ed8a875062ba87670b4a58f2af821` | 2026-03-11 | Fix exclude patterns with trailing slash (#239) (#240) | needs new integration task / deferred - tied to the existing row `346` exclude-pattern filtering lane; not a standalone immediate implementation |
+| 430 | `294805163db9b0a83d466eed2bf729d3454eb2a1` | 2026-03-11 | Add SSE heartbeat to prevent stale connections (#243) | already integrated - local SSE heartbeat handler/registration/tests are present |
+| 431 | `81cc8333cd5c3b2d86258ed7c015eb78ec58dd44` | 2026-03-12 | Add lftp xfer:verify toggle for inline transfer verification (#242) (#247) | needs integration - lftp `xfer:verify` toggle/config/controller/lftp wiring |
+| 432 | `5f98531701e50a114112b6af09c3bea20710f9f6` | 2026-03-10 | chore(deps-dev): bump hono from 4.12.5 to 4.12.7 in /src/angular (#237) | intentionally skipped - upstream only changes untracked/ignored `src/angular/package-lock.json` for `hono` |
+| 433 | `657d1eb226fe3e8ecea3c3852c90cb7d02f3b436` | 2026-03-10 | chore(deps-dev): bump tar from 7.5.9 to 7.5.11 in /src/angular (#238) | intentionally skipped - upstream only changes untracked/ignored `src/angular/package-lock.json` for `tar` |
+| 434 | `b29e4020518c5a88ebe4286f73b70e465f3461f8` | 2026-03-12 | Fix parser crash on unrecognized lftp status lines (#253) (#258) | needs integration - lftp job status parser orphan/unrecognized progress-line hardening |
+| 435 | `4bf82a958fb84a88eb08313b1c4ab9a64198bb25` | 2026-03-12 | Release v0.13.3 - Fix lftp parser crash on orphan progress lines | intentionally skipped - upstream release metadata touches absent root `CHANGELOG.md` and package metadata only |
+| 436 | `70ff50752440aa73479d9a0450bebfdce5269275` | 2026-03-12 | Merge branch 'master' into develop | intentionally skipped - merge-only row with no independent payload |
+| 437 | `1b4538a10c2540cb875a57ef0bd210757182b7a6` | 2026-03-12 | Add CI status, release, Angular, Python, and platform badges to README | needs integration - README status/release/platform badges |
+| 438 | `87f6296d54f494643d825ea04e8b60e3cfcd9ebb` | 2026-03-12 | Move debug toggle to Logging section and convert log format to dropdown (#248) | needs integration - visible settings/logging UI changes; UI approval workflow applies before final-stage gates |
+| 439 | `b95555745a6636cbc30c08334e88164674ca4f50` | 2026-03-12 | Convert file action buttons to native button elements (#241) (#246) | needs integration - native file action buttons/accessibility; UI approval workflow applies before final-stage gates |
+| 440 | `f2b7c6506ce866587fb7547ea862d524900cd9ef` | 2026-03-12 | Add Phase 1 high-priority service tests (#225) (#245) | needs new integration task - high-priority Angular service tests due topology mismatch with local service/test layout |
+| 441 | `a0e0247876cc544093bcc342a91fc9075c259039` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | needs area reopen - existing CI/Docker build-topology lane; upstream Debian/Alpine consolidation must be reconciled with local Docker/workflow assumptions |
 | 442 | `c03ace3c27328ee4d6bb51a35962342569bc4abe` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | pending |
 | 443 | `c902aa1be2ed78c9852e2df564d5b0f12d7063a2` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | pending |
 | 444 | `394482fb7feead11022b4ae0162c4bb9df4f8fae` | 2026-03-12 | Add info-level logging for LFTP queue commands | pending |
