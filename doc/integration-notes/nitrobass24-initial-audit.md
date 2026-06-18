@@ -434,7 +434,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 415 | `399faf2a8867675adb17d33d6028c24b61a95c8e` | 2026-03-09 | chore(deps): bump actions/upload-artifact from 4 to 7 (#201) | adapted locally - local `master.yml` `Publish artifact` step now uses `actions/upload-artifact@v7` |
 | 416 | `a6bd8fbdb2332a595ce9c50e3e224a863b950c8c` | 2026-03-09 | chore(deps): bump actions/download-artifact from 4 to 8 (#198) | adapted locally - local `master.yml` download-artifact steps now use `actions/download-artifact@v8` |
 | 417 | `32f43c241ee5f08a1613014b6692b9150260fa8e` | 2026-03-09 | Fix pending_completion never clearing for EXTRACTED/EXTRACT_FAILED with staging (#208) | already integrated - local controller staging completion clearing already discards pending completion for `DELETED`, `EXTRACTED`, and `EXTRACT_FAILED` |
-| 418 | `9c8eb11c2681502bacbb1bcf886d4561cde207f3` | 2026-03-09 | Use official 7-Zip binary with RAR codec support (#210) | pending |
+| 418 | `9c8eb11c2681502bacbb1bcf886d4561cde207f3` | 2026-03-09 | Use official 7-Zip binary with RAR codec support (#210) | covered elsewhere - local Docker already installs `p7zip-rar` and `unrar`, while direct `7zz` source-build/stdout diagnostics belong with the existing row `345` extraction area reopen lane |
 | 419 | `d18356f207bf7a465d77932faf2a6ed46ccdc9f4` | 2026-03-09 | Use pre-built 7zip image instead of compiling from source (#212) | pending |
 | 420 | `90c31cfb780edf0585317a91fe5c3a17dee04fd1` | 2026-03-09 | Release v0.13.1 - RAR extraction fix and pipeline stability | pending |
 | 421 | `ea924d8ebdae2628459853ac99bcdbb099750b62` | 2026-03-09 | Add recommended hard link setup to FAQ and README (#215) | pending |
