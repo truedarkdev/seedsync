@@ -458,11 +458,11 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 439 | `b95555745a6636cbc30c08334e88164674ca4f50` | 2026-03-12 | Convert file action buttons to native button elements (#241) (#246) | needs integration - native file action buttons/accessibility; UI approval workflow applies before final-stage gates |
 | 440 | `f2b7c6506ce866587fb7547ea862d524900cd9ef` | 2026-03-12 | Add Phase 1 high-priority service tests (#225) (#245) | needs new integration task - high-priority Angular service tests due topology mismatch with local service/test layout |
 | 441 | `a0e0247876cc544093bcc342a91fc9075c259039` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | needs area reopen - existing CI/Docker build-topology lane; upstream Debian/Alpine consolidation must be reconciled with local Docker/workflow assumptions |
-| 442 | `c03ace3c27328ee4d6bb51a35962342569bc4abe` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | pending |
-| 443 | `c902aa1be2ed78c9852e2df564d5b0f12d7063a2` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | pending |
-| 444 | `394482fb7feead11022b4ae0162c4bb9df4f8fae` | 2026-03-12 | Add info-level logging for LFTP queue commands | pending |
-| 445 | `3452db2ad55c8672a973579458fdcff92bb86c1a` | 2026-03-12 | Fix pending_completion stuck for stopped downloads deleted locally | pending |
-| 446 | `28ee84796ae4e902b75b9b139f361d8d2bca1419` | 2026-03-12 | Merge pull request #272 from nitrobass24/fix/pending-completion-stuck | pending |
+| 442 | `c03ace3c27328ee4d6bb51a35962342569bc4abe` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | needs integration - broader xfer_verify/validate config contract |
+| 443 | `c902aa1be2ed78c9852e2df564d5b0f12d7063a2` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | needs area reopen - CI/Docker topology lane |
+| 444 | `394482fb7feead11022b4ae0162c4bb9df4f8fae` | 2026-03-12 | Add info-level logging for LFTP queue commands | adapted locally in `src/python/lftp/lftp.py` |
+| 445 | `3452db2ad55c8672a973579458fdcff92bb86c1a` | 2026-03-12 | Fix pending_completion stuck for stopped downloads deleted locally | adapted locally in `src/python/controller/controller.py` |
+| 446 | `28ee84796ae4e902b75b9b139f361d8d2bca1419` | 2026-03-12 | Merge pull request #272 from nitrobass24/fix/pending-completion-stuck | covered elsewhere - merge wrapper for row 445 adaptation |
 | 447 | `9152a322fae65b073c2e4542bce245e6ce3530e9` | 2026-03-12 | Expose verbose logging setting in web UI (#266) | pending |
 | 448 | `62a3c3e0f4daf35bbfbc501c6a7721a8735a0eb8` | 2026-03-12 | Merge pull request #270 from nitrobass24/fix/general-settings-ui | pending |
 | 449 | `b6553c1b05b95f045b76cff2bba3e8d27fb94670` | 2026-03-12 | Fix file descriptor leak on restart (#265) | pending |

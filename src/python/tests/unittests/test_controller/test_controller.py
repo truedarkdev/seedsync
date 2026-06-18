@@ -1357,6 +1357,55 @@ class TestController(unittest.TestCase):
         self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__active_scanner.set_active_files.assert_called_with(["movie.mkv"])
 
+    @patch("controller.controller.ModelDiffUtil.diff_models")
+    def test_update_model_clears_pending_completion_when_default_file_has_no_local_size(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        other_pending_entry = ("movie.mkv", "tv", "TV")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 900
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        reset_file = ModelFile("movie.mkv", False)
+        reset_file.path_pair_id = "movies"
+        reset_file.remote_size = 1000
+        reset_file.local_size = None
+        reset_file.state = ModelFile.State.DEFAULT
+        reset_model = Model()
+        reset_model.set_base_logger(self.controller.logger)
+        reset_model.add_file(reset_file)
+
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = reset_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self.controller._Controller__pending_completion_file_names = {
+            completion_entry,
+            other_pending_entry,
+        }
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.UPDATED,
+                old_file=active_file,
+                new_file=reset_file
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({other_pending_entry}, self.controller._Controller__pending_completion_file_names)
+        self.controller._Controller__active_scanner.set_active_files.assert_called_with(["movie.mkv", "movie.mkv"])
+
     def test_clear_extracted_marker_does_not_clear_duplicate_names_across_path_pairs(self):
         file_a = ModelFile("archive.zip", False)
         file_a.path_pair_id = "movies"

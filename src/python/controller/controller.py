@@ -1588,6 +1588,12 @@ class Controller:
                     if diff.new_file is not None and diff.old_file is not None and \
                             diff.new_file.file_id in pending_completion_file_ids() and \
                             not self.__is_explicitly_stopped(diff.new_file.name, diff.new_file.path_pair_id):
+                        if diff.new_file.state == ModelFile.State.DEFAULT and \
+                                diff.new_file.local_size is None:
+                            self.__pending_completion_file_names = {
+                                file_name for file_name in self.__pending_completion_file_names
+                                if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.new_file.file_id
+                            }
                         if diff.new_file.state in (
                                 ModelFile.State.DOWNLOADED,
                                 ModelFile.State.EXTRACTED,
