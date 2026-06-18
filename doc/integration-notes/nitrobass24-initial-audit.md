@@ -404,7 +404,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 385 | `62b0ef1e50af26c9e786db29d7b5d9d08764b397` | 2026-03-06 | docs: update CHANGELOG and MODERNIZATION_PLAN for v0.13.0 release | intentionally skipped |
 | 386 | `d6cc9956fd355973d5e7591665ac60fad1e7d739` | 2026-03-06 | docs: remove resolved known limitations from MODERNIZATION_PLAN | intentionally skipped |
 | 387 | `9ec504b304b934abac2138561dcd66fd4d0ef730` | 2026-03-06 | fix: address code review findings for v0.13.0 release | adapted locally in `src/python/docs/install.md` (SSH mount read-only); other UI/API hunks are covered elsewhere, obsolete, or divergent |
-| 388 | `5aa82579de6c6238c3bf35cec52a474d9f751c13` | 2026-03-06 | fix: extract validation helper in path_pairs handler, catch AttributeError in scanner | pending |
+| 388 | `5aa82579de6c6238c3bf35cec52a474d9f751c13` | 2026-03-06 | fix: extract validation helper in path_pairs handler, catch AttributeError in scanner | adapted locally in `src/python/controller/scan/remote_scanner.py` (malformed scan list elements without `.get()` now map to invalid scan data); path-pair validation helper portion belongs in the existing rows `338`-`340` path-pair hardening lane |
 | 389 | `109db3905b1d22a221b067ebd89391255f5e5cbd` | 2026-03-05 | Bump hono from 4.12.3 to 4.12.5 in /src/angular | pending |
 | 390 | `4d99527feddaa5f992ee89bfcf76db8403aecf65` | 2026-03-06 | Merge pull request #153 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.5 | pending |
 | 391 | `fd8f198c41d15b3fd032a2cd18238d9411cfec2e` | 2026-03-06 | Merge remote-tracking branch 'origin/master' into release/v0.13.0 | pending |
