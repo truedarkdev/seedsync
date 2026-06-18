@@ -394,7 +394,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 375 | `58c1ae381e179ad0314133c2fafe9397c3cda55f` | 2026-03-06 | fix: skip spurious staging moves on container restart (#177) | covered elsewhere |
 | 376 | `8e0f2843f3983d7a76aab712b6cc2a3f2da8a3e6` | 2026-03-06 | Merge pull request #179 from nitrobass24/fix/spurious-staging-moves | covered elsewhere |
 | 377 | `9d34fe76e67c0d54cd56803c460f8f7706a3f4be` | 2026-03-06 | feat: consolidate all extraction to 7z, remove unrar dependency | needs area reopen |
-| 378 | `06b9ac31b92f9701dac0791e4794e9781b06a961` | 2026-03-06 | fix: add -- arg terminator to 7z calls and use same-volume temp dir | pending |
+| 378 | `06b9ac31b92f9701dac0791e4794e9781b06a961` | 2026-03-06 | fix: add -- arg terminator to 7z calls and use same-volume temp dir | needs area reopen |
 | 379 | `571acb788c5450181b5fe0b6d8fc3e18e63a7ed8` | 2026-03-06 | Merge pull request #178 from nitrobass24/feat/consolidate-7z | pending |
 | 380 | `83390e72001b370b283357a2d200cd92b2a1321c` | 2026-03-06 | fix: healthcheck uses 127.0.0.1 instead of localhost | pending |
 | 381 | `3a37dd855de455cd41c28b313f28ffa5cde59c69` | 2026-03-06 | fix: healthcheck respects custom web port via WEB_PORT env var | pending |
