@@ -473,9 +473,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 454 | `01dd01c992544068a0dcf395f10687456051e616` | 2026-03-12 | Fix exclude patterns not passed to LFTP mirror command (#259) | needs integration - deferred to the existing exclude-pattern lane with rows `346`, `429`, `455`, and `467` |
 | 455 | `9f414fc0c953a6cb36ea81cf2b193996f5535d2e` | 2026-03-12 | Deduplicate pattern parsing in filter_excluded_files | needs integration - deferred to the existing exclude-pattern lane with rows `346`, `429`, `454`, and `467` |
 | 456 | `12ca4c5cbcced91eefa4920733e91885ac9eacb6` | 2026-03-12 | Merge pull request #261 from nitrobass24/fix/exclude-patterns-lftp | covered elsewhere - merge wrapper for deferred rows `454`/`455` |
-| 457 | `bd4a50aa6d5cd905b64346a79b0c8d08ad8b7b97` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | pending |
-| 458 | `0b799c7f868468684928614571a3802f47f67de1` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | pending |
-| 459 | `f50f8d900aa46e7826102a37d1dc2e7f09d78b15` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | pending |
+| 457 | `bd4a50aa6d5cd905b64346a79b0c8d08ad8b7b97` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | needs area reopen - CI/Docker topology differs locally; reconcile with existing CI/Docker lane instead of direct Alpine-only import |
+| 458 | `0b799c7f868468684928614571a3802f47f67de1` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | needs integration - keep with row `442` broader xfer_verify/validate config contract |
+| 459 | `f50f8d900aa46e7826102a37d1dc2e7f09d78b15` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | needs area reopen - upstream `ci.yml` publish split must be reconciled with local `master.yml`/Makefile release flow |
 | 460 | `14323fd7883ce21ad874a93aa07f208c054a0c0e` | 2026-03-12 | Fix parser crash on Unraid PTY line-wrap fragments (#260) | pending |
 | 461 | `26193be812528080a7e756fbd801c525f48e2fe7` | 2026-03-12 | Set COLUMNS env var in pexpect spawn to prevent Unraid PTY wrapping | pending |
 | 462 | `6b79bde4a81549eff8c1c79c9c9284c6aa054957` | 2026-03-12 | Fix off-by-one in consecutive status error threshold | pending |
