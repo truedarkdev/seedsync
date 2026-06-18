@@ -387,7 +387,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 368 | `2805bc07fa7e9e2487bd048d6a8f98a5b3b3fcda` | 2026-03-06 | fix: filter active_extracting_file_names by pair_id | covered elsewhere |
 | 369 | `47d812b740c73c0426a1b03637126d8c6d84e886` | 2026-03-06 | Merge pull request #173 from nitrobass24/fix/per-pair-extraction | covered elsewhere |
 | 370 | `7f9b0f71e198f2ab0249aacc0431109942945ad3` | 2026-03-06 | fix: show warning banner when all path pairs are disabled (#170) | needs new integration task |
-| 371 | `ed032da149b6b8f391d6f3d5478748d61712dba2` | 2026-03-06 | fix: suppress remote-scan banners when all pairs disabled and add noEnabledPairs test | pending |
+| 371 | `ed032da149b6b8f391d6f3d5478748d61712dba2` | 2026-03-06 | fix: suppress remote-scan banners when all pairs disabled and add noEnabledPairs test | needs new integration task |
 | 372 | `d067ffa4a1a2b65fb77687133af9f02b99cfb7ef` | 2026-03-06 | Merge pull request #174 from nitrobass24/fix/graceful-pause-no-pairs | pending |
 | 373 | `aa29fe586b94b76242292e25ce56ee95c1ef1bf5` | 2026-03-06 | ci: parallel arm64 builds on develop, unified publish job | pending |
 | 374 | `926c64f230818953057bca8706eda64568924503` | 2026-03-06 | Merge pull request #176 from nitrobass24/ci/parallel-arm-develop | pending |
