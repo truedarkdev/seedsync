@@ -189,6 +189,11 @@ class TestSeedsync(unittest.TestCase):
         self.assertIsNotNone(args)
         self.assertFalse(args.debug)
 
+    def test_resolve_log_level_prefers_debug_override(self):
+        self.assertEqual("DEBUG", Seedsync._resolve_log_level("INFO", True))
+        self.assertEqual("WARNING", Seedsync._resolve_log_level("warning", False))
+        self.assertEqual("INFO", Seedsync._resolve_log_level(None, False))
+
     def test_default_config(self):
         config = Seedsync._create_default_config()
         # Test that default config doesn't have any uninitialized values
@@ -713,7 +718,7 @@ class TestSeedsync(unittest.TestCase):
                     use_local_path_as_extract_path=False,
                     extract_path="/extract",
                 ),
-                general=SimpleNamespace(debug=False, verbose=False),
+                general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
             args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
@@ -780,7 +785,7 @@ class TestSeedsync(unittest.TestCase):
                     use_local_path_as_extract_path=False,
                     extract_path="/extract",
                 ),
-                general=SimpleNamespace(debug=False, verbose=False),
+                general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
             args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
@@ -854,7 +859,7 @@ class TestSeedsync(unittest.TestCase):
                     use_local_path_as_extract_path=False,
                     extract_path="/extract",
                 ),
-                general=SimpleNamespace(debug=False, verbose=False),
+                general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
             args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
@@ -948,7 +953,7 @@ class TestSeedsync(unittest.TestCase):
     def test_persist_rewrites_changed_config(self):
         old_config = Seedsync._create_default_config()
         new_config = copy.deepcopy(old_config)
-        new_config.general.debug = not old_config.general.debug
+        new_config.general.log_level = "DEBUG" if old_config.general.log_level != "DEBUG" else "INFO"
 
         seedsync = Seedsync.__new__(Seedsync)
         seedsync.context = MagicMock()

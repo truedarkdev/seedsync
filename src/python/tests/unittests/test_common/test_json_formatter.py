@@ -79,7 +79,7 @@ class TestJsonFormatter(unittest.TestCase):
 
     def test_create_logger_uses_json_formatter_when_configured(self):
         logger_name = "TestJsonFormatterLogger"
-        logger = Seedsync._create_logger(logger_name, debug=False, logdir=None, log_format="json")
+        logger = Seedsync._create_logger(logger_name, log_level="INFO", logdir=None, log_format="json")
         try:
             self.assertEqual(JsonFormatter, type(logger.handlers[0].formatter))
         finally:
@@ -89,9 +89,19 @@ class TestJsonFormatter(unittest.TestCase):
 
     def test_create_logger_uses_standard_formatter_by_default(self):
         logger_name = "TestStandardFormatterLogger"
-        logger = Seedsync._create_logger(logger_name, debug=False, logdir=None)
+        logger = Seedsync._create_logger(logger_name, log_level="INFO", logdir=None)
         try:
             self.assertEqual(logging.Formatter, type(logger.handlers[0].formatter))
+        finally:
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
+                handler.close()
+
+    def test_create_logger_uses_requested_log_level(self):
+        logger_name = "TestLogLevelLogger"
+        logger = Seedsync._create_logger(logger_name, log_level="DEBUG", logdir=None)
+        try:
+            self.assertEqual(logging.DEBUG, logger.level)
         finally:
             for handler in logger.handlers[:]:
                 logger.removeHandler(handler)

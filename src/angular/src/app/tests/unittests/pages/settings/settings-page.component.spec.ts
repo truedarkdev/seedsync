@@ -122,4 +122,12 @@ describe("Testing settings page component", () => {
         expect(component.OPTIONS_CONTEXT_LOGGING.id).toBe("logging");
         expect(component.OPTIONS_CONTEXT_LOGGING.options[0].valuePath).toEqual(["logging", "log_format"]);
     });
+
+    it("should expose the log level option in other settings", () => {
+        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options[2]!;
+
+        expect(logLevelOption.label).toBe("Log Level");
+        expect(logLevelOption.valuePath).toEqual(["general", "log_level"]);
+        expect(logLevelOption.choices![0]).toEqual({label: "Debug", value: "DEBUG"});
+    });
 });

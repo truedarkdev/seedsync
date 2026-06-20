@@ -195,7 +195,7 @@ class TestConfig(unittest.TestCase):
 
     def test_general(self):
         good_dict = {
-            "debug": "True",
+            "log_level": "DEBUG",
             "verbose": "False",
             "api_token": "token-value",
             "allowed_hostname": "",
@@ -206,7 +206,7 @@ class TestConfig(unittest.TestCase):
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
-        self.assertEqual(True, general.debug)
+        self.assertEqual("DEBUG", general.log_level)
         self.assertEqual(False, general.verbose)
         self.assertEqual("token-value", general.api_token)
         self.assertEqual("", general.allowed_hostname)
@@ -219,18 +219,57 @@ class TestConfig(unittest.TestCase):
         self.check_common(Config.General,
                           good_dict,
                           {
-                              "debug",
                               "verbose"
                           })
 
         # bad values
-        self.check_bad_value_error(Config.General, good_dict, "debug", "SomeString")
-        self.check_bad_value_error(Config.General, good_dict, "debug", "-1")
+        self.check_bad_value_error(Config.General, good_dict, "log_level", "SomeString")
+        self.check_bad_value_error(Config.General, good_dict, "log_level", "-1")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "0")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "1025")
+
+    def test_general_defaults_log_level_to_info_when_missing(self):
+        general = Config.General.from_dict({
+            "verbose": "False",
+            "api_token": "token-value",
+            "allowed_hostname": "",
+            "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
+            "browser_handover_recovery_version": "2026.04.03",
+            "breadcrumb_trace_enabled": "False",
+            "config_api_redact_remote_details": "False",
+        })
+
+        self.assertEqual("INFO", general.log_level)
+
+    def test_general_legacy_debug_maps_to_log_level(self):
+        for debug_value, expected_level in ((True, "DEBUG"), (False, "INFO")):
+            with self.subTest(debug_value=debug_value):
+                general = Config.General.from_dict({
+                    "debug": str(debug_value),
+                    "verbose": "False",
+                    "api_token": "token-value",
+                    "allowed_hostname": "",
+                    "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
+                    "browser_handover_recovery_version": "2026.04.03",
+                    "breadcrumb_trace_enabled": "False",
+                    "config_api_redact_remote_details": "False",
+                })
+
+                self.assertEqual(expected_level, general.log_level)
+
+    def test_general_debug_alias_updates_log_level(self):
+        general = Config.General()
+
+        self.assertTrue(general.has_property("debug"))
+
+        general.set_property("debug", True)
+        self.assertEqual("DEBUG", general.log_level)
+
+        general.set_property("debug", False)
+        self.assertEqual("INFO", general.log_level)
 
     def test_general_breadcrumb_trace_enabled_requires_bool(self):
         general = Config.General()
@@ -274,7 +313,7 @@ class TestConfig(unittest.TestCase):
 
     def test_general_breadcrumb_trace_retention_depth_defaults_to_128(self):
         good_dict = {
-            "debug": "True",
+            "log_level": "DEBUG",
             "verbose": "False",
             "api_token": "token-value",
             "allowed_hostname": "",
@@ -618,7 +657,7 @@ class TestConfig(unittest.TestCase):
         with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
             config_file.write("""
         [General]
-        debug=False
+        debug=True
         verbose=True
         browser_handover_recovery_version=2026.04.03
 
@@ -661,7 +700,7 @@ class TestConfig(unittest.TestCase):
         try:
             config = Config.from_file(config_path)
 
-            self.assertEqual(False, config.general.debug)
+            self.assertEqual("DEBUG", config.general.log_level)
             self.assertEqual(True, config.general.verbose)
             self.assertEqual("", config.general.api_token)
             self.assertEqual("", config.general.allowed_hostname)
@@ -721,7 +760,7 @@ class TestConfig(unittest.TestCase):
 
         try:
             config = Config()
-            config.general.debug = True
+            config.general.log_level = "DEBUG"
             config.general.verbose = False
             config.general.api_token = "api-token-value"
             config.general.allowed_hostname = ""
@@ -763,7 +802,7 @@ class TestConfig(unittest.TestCase):
 
             golden_str = """
             [General]
-            debug = True
+            log_level = DEBUG
             verbose = False
             api_token = api-token-value
             allowed_hostname =

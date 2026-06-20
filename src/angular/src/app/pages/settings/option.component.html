@@ -42,4 +42,19 @@
         <span *ngIf="description"
               class="description">{{description}}</span>
     </label>
+
+    <!-- Select -->
+    <label *ngIf="type == OptionType.Select">
+        <span class="name">{{label}}</span>
+        <select
+               class="form-control"
+               [disabled]="value === null || value === undefined"
+               (change)="onChange($event.target.value)">
+            <option *ngFor="let choice of choices"
+                    [value]="choice.value"
+                    [selected]="choice.value === value">{{choice.label}}</option>
+        </select>
+        <span *ngIf="description"
+              class="description">{{description}}</span>
+    </label>
 </div>

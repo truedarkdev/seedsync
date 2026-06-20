@@ -96,7 +96,7 @@ class TestContext(unittest.TestCase):
         config = MagicMock()
         config.as_dict.return_value = {
             "general": {
-                "debug": True,
+                "log_level": "DEBUG",
                 "verbose": False,
                 "api_token": "super-secret-token",
                 "webhook_secret": "super-secret-webhook-secret",
@@ -116,7 +116,7 @@ class TestContext(unittest.TestCase):
         self.assertEqual(
             [
                 call("Config:"),
-                call("  general.debug: True"),
+                call("  general.log_level: DEBUG"),
                 call("  general.verbose: False"),
                 call("  general.api_token: **REDACTED**"),
                 call("  general.webhook_secret: **REDACTED**"),
@@ -137,7 +137,7 @@ class TestContext(unittest.TestCase):
         config = MagicMock()
         config.as_dict.return_value = {
             "General": {
-                "debug": True,
+                "log_level": "DEBUG",
             },
             "Lftp": {
                 "remote_address": "seedbox.example.com",
@@ -158,7 +158,7 @@ class TestContext(unittest.TestCase):
         self.assertEqual(
             [
                 call("Config:"),
-                call("  General.debug: True"),
+                call("  General.log_level: DEBUG"),
                 call("  Lftp.remote_address: seedbox.example.com"),
                 call("  Lftp.remote_username: seeduser"),
                 call("  Lftp.remote_password: **REDACTED**"),
@@ -180,7 +180,7 @@ class TestContext(unittest.TestCase):
                 config = MagicMock()
                 config.as_dict.return_value = {
                     "General": {
-                        "debug": True,
+                        "log_level": "DEBUG",
                     },
                     "Lftp": {
                         "remote_address": "seedbox.example.com",
@@ -195,7 +195,7 @@ class TestContext(unittest.TestCase):
                 self.assertEqual(
                     [
                         call("Config:"),
-                        call("  General.debug: True"),
+                        call("  General.log_level: DEBUG"),
                         call("  Lftp.remote_address: seedbox.example.com"),
                         call("  Lftp.remote_password: "),
                         call("Path Pairs: (none)"),

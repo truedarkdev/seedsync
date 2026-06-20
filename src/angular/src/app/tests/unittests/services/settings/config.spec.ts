@@ -8,7 +8,7 @@ describe("Testing config record initialization", () => {
     beforeEach(() => {
         const configJson = {
             general: {
-                debug: true,
+                log_level: "DEBUG",
                 verbose: false,
                 breadcrumb_trace_enabled: true
             },
@@ -56,7 +56,7 @@ describe("Testing config record initialization", () => {
 
 
     it("should initialize with correct values", () => {
-        expect(config.general.debug).toBe(true);
+        expect(config.general.log_level).toBe("DEBUG");
         expect(config.general.verbose).toBe(false);
         expect(config.general.breadcrumb_trace_enabled).toBe(true);
         expect(config.lftp.remote_address).toBe("remote.server.com");
@@ -103,13 +103,13 @@ describe("Testing config record initialization", () => {
     });
 
     it("should allow missing sections and null-safe value lookup", () => {
-        const partialConfig = new Config({general: {debug: true}});
+        const partialConfig = new Config({general: {log_level: "DEBUG"}});
 
-        expect(partialConfig.general.debug).toBe(true);
+        expect(partialConfig.general.log_level).toBe("DEBUG");
         expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
         expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
         expect(partialConfig.logging.log_format).toBe("standard");
-        expect(partialConfig.getValue("general", "debug")).toBe(true);
+        expect(partialConfig.getValue("general", "log_level")).toBe("DEBUG");
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);

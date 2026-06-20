@@ -9,12 +9,12 @@ import {Record} from "immutable";
  * GENERAL
  */
 interface IGeneral {
-    debug: boolean;
+    log_level: string;
     verbose: boolean;
     breadcrumb_trace_enabled: boolean;
 }
 const DefaultGeneral: IGeneral = {
-    debug: null,
+    log_level: "INFO",
     verbose: null,
     breadcrumb_trace_enabled: null
 };
@@ -157,15 +157,44 @@ export class Config extends ConfigRecord implements IConfig {
     logging: ILogging;
 
     constructor(props) {
+        const general = Config.normalizeGeneral((props && props.general) || {});
         // Create immutable members
         super({
-            general: GeneralRecord((props && props.general) || {}),
+            general: GeneralRecord(general),
             lftp: LftpRecord((props && props.lftp) || {}),
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
             autoqueue: AutoQueueRecord((props && props.autoqueue) || {}),
             logging: LoggingRecord((props && props.logging) || {})
         });
+    }
+
+    private static normalizeGeneral(general: {[key: string]: any}): IGeneral {
+        const normalized = typeof general.toJS === "function"
+            ? {...general.toJS()}
+            : {...general};
+        if (normalized.log_level === undefined || normalized.log_level === null) {
+            if (normalized.debug !== undefined) {
+                const debugValue = typeof normalized.debug === "string"
+                    ? normalized.debug.trim().toLowerCase()
+                    : normalized.debug;
+                normalized.log_level = ["y", "yes", "t", "true", "on", "1"].includes(String(debugValue))
+                    ? "DEBUG"
+                    : "INFO";
+            }
+        }
+        if (typeof normalized.log_level === "string") {
+            const logLevel = normalized.log_level.trim();
+            if (logLevel.length === 0) {
+                delete normalized.log_level;
+            } else {
+                normalized.log_level = logLevel.toUpperCase();
+            }
+        } else if (normalized.log_level === undefined || normalized.log_level === null) {
+            delete normalized.log_level;
+        }
+        delete normalized.debug;
+        return normalized as IGeneral;
     }
 
     getValue(section: string, option: string): any {

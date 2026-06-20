@@ -5,6 +5,7 @@ export interface IOption {
     label: string;
     valuePath: [string, string];
     description: string;
+    choices?: {label: string; value: any;}[];
 }
 export interface IOptionsContext {
     header: string;
@@ -180,10 +181,17 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
             description: "Keeps a low-overhead recent-context window for debugging failures."
         },
         {
-            type: OptionType.Checkbox,
-            label: "Enable Debug",
-            valuePath: ["general", "debug"],
-            description: "Enables debug logging."
+            type: OptionType.Select,
+            label: "Log Level",
+            valuePath: ["general", "log_level"],
+            description: "Controls how much detail is written to the logs.",
+            choices: [
+                {label: "Debug", value: "DEBUG"},
+                {label: "Info", value: "INFO"},
+                {label: "Warning", value: "WARNING"},
+                {label: "Error", value: "ERROR"},
+                {label: "Critical", value: "CRITICAL"},
+            ]
         },
     ]
 };

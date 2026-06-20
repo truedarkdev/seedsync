@@ -8,7 +8,7 @@ from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 class TestConfigHandler(BaseTestWebApp):
     def test_get(self):
-        self.context.config.general.debug = True
+        self.context.config.general.log_level = "DEBUG"
         self.context.config.general.api_token = "super-secret-token"
         self.context.config.general.breadcrumb_trace_enabled = False
         self.context.config.lftp.remote_address = "server.remote.com"
@@ -21,7 +21,7 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.get("/server/config/get")
         self.assertEqual(200, resp.status_int)
         json_dict = json.loads(str(resp.html))
-        self.assertEqual(True, json_dict["general"]["debug"])
+        self.assertEqual("DEBUG", json_dict["general"]["log_level"])
         self.assertEqual("**REDACTED**", json_dict["general"]["api_token"])
         self.assertEqual(False, json_dict["general"]["breadcrumb_trace_enabled"])
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_address"])
@@ -33,10 +33,10 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(8080, json_dict["web"]["port"])
 
     def test_set_good(self):
-        self.assertEqual(None, self.context.config.general.debug)
-        resp = self.test_app.post_json("/server/config/set/general/debug", {"value": True})
+        self.assertEqual("INFO", self.context.config.general.log_level)
+        resp = self.test_app.post_json("/server/config/set/general/log_level", {"value": "DEBUG"})
         self.assertEqual(200, resp.status_int)
-        self.assertEqual(True, self.context.config.general.debug)
+        self.assertEqual("DEBUG", self.context.config.general.log_level)
 
         self.assertEqual(False, self.context.config.general.breadcrumb_trace_enabled)
         resp = self.test_app.post_json("/server/config/set/general/breadcrumb_trace_enabled", {"value": True})
@@ -91,10 +91,10 @@ class TestConfigHandler(BaseTestWebApp):
                     )
 
     def test_set_get_requests_no_longer_mutate(self):
-        self.assertEqual(None, self.context.config.general.debug)
-        resp = self.test_app.get("/server/config/set/general/debug", expect_errors=True)
+        self.assertEqual("INFO", self.context.config.general.log_level)
+        resp = self.test_app.get("/server/config/set/general/log_level", expect_errors=True)
         self.assertEqual(404, resp.status_int)
-        self.assertEqual(None, self.context.config.general.debug)
+        self.assertEqual("INFO", self.context.config.general.log_level)
 
     def test_set_api_token_via_body_is_forbidden(self):
         self.assertEqual(None, self.context.config.general.api_token)
@@ -153,12 +153,15 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertFalse(self.context.config.general.has_property("bad_option"))
 
     def test_set_bad_value(self):
-        # boolean
-        self.assertEqual(None, self.context.config.general.debug)
-        resp = self.test_app.post_json("/server/config/set/general/debug", {"value": "cat"}, expect_errors=True)
+        # log level
+        self.assertEqual("INFO", self.context.config.general.log_level)
+        resp = self.test_app.post_json("/server/config/set/general/log_level", {"value": "cat"}, expect_errors=True)
         self.assertEqual(400, resp.status_int)
-        self.assertEqual("Bad config: General.debug (cat) must be a boolean value", str(resp.html))
-        self.assertEqual(None, self.context.config.general.debug)
+        self.assertEqual(
+            "Bad config: General.log_level (cat) must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL",
+            str(resp.html)
+        )
+        self.assertEqual("INFO", self.context.config.general.log_level)
 
         # positive int
         self.assertEqual(None, self.context.config.controller.interval_ms_local_scan)

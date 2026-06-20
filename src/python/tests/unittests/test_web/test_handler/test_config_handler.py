@@ -391,7 +391,24 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         )
 
         self.assertEqual(404, status_code)
-        self.assertIsNone(config.general.debug)
+        self.assertEqual("INFO", config.general.log_level)
+
+    def test_set_route_accepts_legacy_debug_body(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+
+        for value, expected_level in ((True, "DEBUG"), (False, "INFO")):
+            with self.subTest(value=value):
+                status_code, body = _invoke_post_json_route(
+                    self.web_app,
+                    "/server/config/set/general/debug",
+                    {"value": value},
+                    api_token=self.admin_api_token,
+                )
+
+                self.assertEqual(200, status_code)
+                self.assertEqual(expected_level, config.general.log_level)
+                self.assertIn("general.debug set to {}".format(value), body)
 
     def test_get_route_rejects_legacy_token(self):
         auth_store = ApiKeyStore()
