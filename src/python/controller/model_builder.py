@@ -67,6 +67,13 @@ class ModelBuilder:
         self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
 
+    @staticmethod
+    def __build_dummy_model_logger() -> logging.Logger:
+        logger = logging.Logger("dummy.Model")
+        logger.addHandler(logging.NullHandler())
+        logger.propagate = False
+        return logger
+
     def set_stop_resume_trace_file_id(self, file_id: Optional[str]):
         self.__stop_resume_trace_file_id = file_id.strip() if file_id is not None and file_id.strip() else None
         self.__stop_resume_trace_last_idle_signature = None
@@ -1064,7 +1071,7 @@ class ModelBuilder:
             return self.__cached_model
 
         model = Model()
-        model.set_base_logger(logging.getLogger("dummy"))  # ignore the logs for this temp model
+        model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
         live_transferred_file_ids = set()
         seen_file_ids = set()
         effective_local_files = self.__build_effective_local_files()

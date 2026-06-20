@@ -29,6 +29,44 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder = ModelBuilder()
         self.model_builder.set_base_logger(logger)
 
+    def test_build_model_suppresses_temp_model_logs_without_mutating_shared_dummy_logger(self):
+        root_logger = logging.getLogger()
+        root_level = root_logger.level
+        dummy_logger = logging.getLogger("dummy")
+        dummy_model_logger = logging.getLogger("dummy.Model")
+        real_model_builder_logger = self.model_builder.logger
+        original_propagate = dummy_logger.propagate
+        original_model_propagate = dummy_model_logger.propagate
+        original_real_propagate = real_model_builder_logger.propagate
+        captured_records = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                captured_records.append(record)
+
+        handler = CaptureHandler()
+        root_logger.addHandler(handler)
+        root_logger.setLevel(logging.DEBUG)
+        dummy_logger.propagate = True
+        dummy_model_logger.propagate = True
+        try:
+            self.model_builder.clear()
+            self.model_builder.set_remote_files([SystemFile("a", 0, False)])
+            self.model_builder.build_model()
+            dummy_propagate = dummy_logger.propagate
+            dummy_model_propagate = dummy_model_logger.propagate
+            real_model_builder_propagate = real_model_builder_logger.propagate
+        finally:
+            root_logger.removeHandler(handler)
+            root_logger.setLevel(root_level)
+            dummy_logger.propagate = original_propagate
+            dummy_model_logger.propagate = original_model_propagate
+
+        self.assertTrue(dummy_propagate)
+        self.assertTrue(dummy_model_propagate)
+        self.assertEqual(original_real_propagate, real_model_builder_propagate)
+        self.assertFalse(any(record.name.startswith("dummy.Model") for record in captured_records))
+
     def __build_test_model_children_tree_1(self) -> Model:
         """Build a test model for children testing"""
         self.model_builder.clear()
