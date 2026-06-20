@@ -565,7 +565,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 546 | `17cc5e7eb4534531b33d688fa73ac6c77e40f1a3` | 2026-03-23 | Fix pre-existing code quality bugs from Ruff review (#289) | adapted locally in `ad1e3ab2`; SSH target helper and duplicate-extract wait-loop fix taken, notifier absent/deferred and cross-pair extract dedupe deferred until output isolation is path-pair-aware |
 | 547 | `38d205254dd3d61f2bf2672c4e87bc7db5aa016b` | 2026-03-23 | Fix missed user@host format in Sshcp.copy() to use _remote_address() | covered elsewhere - copy path included in `ad1e3ab2` SSH target helper adaptation |
 | 548 | `34e67792bf917dccec314cd1f09dcf126b1eaf1f` | 2026-03-23 | Merge pull request #312 from nitrobass24/fix/ruff-real-bugs | covered elsewhere - merge wrapper for rows `546`/`547` |
-| 549 | `85c99634b2994cf07e0e8f9d10b13b8cf4b6fad3` | 2026-03-23 | Add startup validation for required LFTP config fields (#310) | pending |
+| 549 | `85c99634b2994cf07e0e8f9d10b13b8cf4b6fad3` | 2026-03-23 | Add startup validation for required LFTP config fields (#310) | adapted locally in `91f92140`; startup required-field validation is centralized with field-name-only aggregate errors, enabled path-pair fallback, password-auth vs SSH-key auth handling, and focused controller/Seedsync coverage |
 | 550 | `3c83762b9df49769be96ab694aa560750cd1d79f` | 2026-03-24 | Improve backward-compat error to list specific missing field(s) | pending |
 | 551 | `bec227486367ecd2bbdd4924dc61089af423d12f` | 2026-03-24 | Use dynamic field names in backward-compat error message | pending |
 | 552 | `15e036c086ebb86bfa85034545bc644ee9ace13a` | 2026-03-24 | Merge pull request #313 from nitrobass24/fix/validate-lftp-config | pending |
