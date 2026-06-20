@@ -19,11 +19,12 @@ class Args:
     sub-components
     """
     def __init__(self):
-        self.local_path_to_scanfs = None
-        self.html_path = None
-        self.debug = None
-        self.exit = None
-        self.web_bind_host = None
+        self.local_path_to_scanfs: str | None = None
+        self.html_path: str | None = None
+        self.debug: bool | None = None
+        self.exit: bool | None = None
+        self.web_bind_host: str | None = None
+        self.logdir: str | None = None
 
     def as_dict(self) -> dict:
         dct = collections.OrderedDict()

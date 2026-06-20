@@ -1,12 +1,13 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-import multiprocessing
-import threading
-import queue
 import logging
-import time
+import multiprocessing
+import queue
 import sys
+import threading
+import time
 from logging.handlers import QueueHandler
+from types import TracebackType
 
 
 class MultiprocessingLogger:
@@ -26,10 +27,23 @@ class MultiprocessingLogger:
         self.logger = base_logger.getChild("MPLogger")
         self.__queue = multiprocessing.Queue(-1)
         self.__logger_level = base_logger.getEffectiveLevel()
-        self.__listener = threading.Thread(name="MPLoggerListener",
-                                           target=self.__listener)
-        self.__listener_shutdown = threading.Event()
-        self.__listener_exc_info = None
+        self.__listener_thread: threading.Thread | None = threading.Thread(
+            name="MPLoggerListener", target=self.__listener
+        )
+        self.__listener_shutdown: threading.Event | None = threading.Event()
+        self.__listener_exc_info: tuple[
+            type[BaseException] | None,
+            BaseException | None,
+            TracebackType | None,
+        ] | None = None
+
+    @property
+    def queue(self) -> multiprocessing.Queue:
+        return self.__queue
+
+    @property
+    def log_level(self) -> int:
+        return self.__logger_level
 
     def __getstate__(self):
         return {
@@ -43,16 +57,21 @@ class MultiprocessingLogger:
         self.__queue = state["queue"]
         self.__logger_level = state["logger_level"]
         # Listener lifecycle stays parent-owned; unpickled children only carry the queue.
-        self.__listener = None
+        self.__listener_thread = None
         self.__listener_shutdown = None
         self.__listener_exc_info = None
 
     def start(self):
-        self.__listener.start()
+        assert self.__listener_thread is not None
+        self.__listener_thread.start()
 
     def stop(self):
-        self.__listener_shutdown.set()
-        self.__listener.join()
+        if self.__listener_shutdown is not None:
+            self.__listener_shutdown.set()
+        if self.__listener_thread is not None:
+            self.__listener_thread.join()
+        self.__queue.close()
+        self.__queue.join_thread()
 
     def propagate_exception(self):
         """
@@ -63,7 +82,8 @@ class MultiprocessingLogger:
         if self.__listener_exc_info:
             exc_info = self.__listener_exc_info
             self.__listener_exc_info = None
-            raise exc_info[1].with_traceback(exc_info[2])
+            if exc_info[1] is not None:
+                raise exc_info[1].with_traceback(exc_info[2])
 
     @staticmethod
     def __remove_closed_stream_handlers(logger: logging.Logger):
@@ -98,6 +118,7 @@ class MultiprocessingLogger:
         return root_logger
 
     def __listener(self):
+        assert self.__listener_shutdown is not None
         self.__remove_closed_stream_handlers(self.logger)
         self.logger.debug("Started listener thread")
 

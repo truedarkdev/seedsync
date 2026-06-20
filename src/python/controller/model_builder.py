@@ -234,6 +234,7 @@ class ModelBuilder:
             return
         target_file = None
         try:
+            assert self.__stop_resume_trace_file_id is not None
             target_file = model.get_file(self.__stop_resume_trace_file_id)
         except ModelError:
             for file_id in model.get_file_ids():
@@ -1114,7 +1115,13 @@ class ModelBuilder:
                 raise ModelError("Zero sources have a file object")
 
             # sanity check between the sources
-            is_dir = remote.is_dir if remote else local.is_dir if local else status.type == LftpJobStatus.Type.MIRROR
+            if remote is not None:
+                is_dir = remote.is_dir
+            elif local is not None:
+                is_dir = local.is_dir
+            else:
+                assert status is not None
+                is_dir = status.type == LftpJobStatus.Type.MIRROR
             if (remote and is_dir != remote.is_dir) or \
                (local and is_dir != local.is_dir) or \
                (status and is_dir != (status.type == LftpJobStatus.Type.MIRROR)):
@@ -1304,7 +1311,11 @@ class ModelBuilder:
                 for _child_name in _all_children_names:
                     _remote_child = _remote_children.get(_child_name, None)
                     _local_child = _local_children.get(_child_name, None)
-                    _is_dir = _remote_child.is_dir if _remote_child else _local_child.is_dir
+                    if _remote_child is not None:
+                        _is_dir = _remote_child.is_dir
+                    else:
+                        assert _local_child is not None
+                        _is_dir = _local_child.is_dir
                     # sanity check is_dir
                     if (_remote_child and _is_dir != _remote_child.is_dir) or \
                        (_local_child and _is_dir != _local_child.is_dir):
@@ -1361,7 +1372,7 @@ class ModelBuilder:
                         _child_model_file.state = ModelFile.State.DOWNLOADING
                     elif _child_recent_transfer_state:
                         _child_model_file.state = ModelFile.State.DOWNLOADING
-                    elif _remote_child and \
+                    elif _remote_child and _local_child is not None and \
                             self.__is_authoritative_local_file(_local_child) and \
                             _local_child.size >= _remote_child.size:
                         _child_model_file.state = ModelFile.State.DOWNLOADED

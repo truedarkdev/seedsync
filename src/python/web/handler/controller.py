@@ -2,14 +2,14 @@
 
 import os
 from threading import BoundedSemaphore, Event
-from typing import Optional
+from typing import Any, Optional, cast
 from urllib.parse import unquote
 
 import bottle
 from bottle import HTTPResponse
 
 from common import overrides
-from controller import Controller
+from controller.controller import Controller
 from ..web_app import IHandler, WebApp
 
 
@@ -39,7 +39,7 @@ class WebResponseActionCallback(Controller.Command.ICallback):
         self.success = True
         self.__event.set()
 
-    def wait(self, timeout: float = None):
+    def wait(self, timeout: float | None = None):
         return self.__event.wait(timeout=timeout)
 
 
@@ -53,13 +53,13 @@ class ControllerHandler(IHandler):
         Controller.Command.Action.DELETE_REMOTE
     }
 
-    def __init__(self, controller: Controller, local_path: str = None):
+    def __init__(self, controller: Controller, local_path: str | None = None):
         self.__controller = controller
         self.__local_path_root = self.__normalize_local_path(local_path)
         self.__bulk_request_limiter = BoundedSemaphore(self._MAX_CONCURRENT_BULK_REQUESTS)
 
     @staticmethod
-    def __normalize_local_path(local_path: str) -> Optional[str]:
+    def __normalize_local_path(local_path: str | None) -> Optional[str]:
         if not isinstance(local_path, str) or local_path.strip() == "":
             return None
         return os.path.realpath(local_path)
@@ -94,6 +94,10 @@ class ControllerHandler(IHandler):
         ):
             return HTTPResponse(body="Invalid file path", status=400)
         return None
+
+    @staticmethod
+    def __query_param(name: str) -> str | None:
+        return cast(str | None, bottle.request.query.get(name))  # type: ignore[attr-defined]
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -144,14 +148,19 @@ class ControllerHandler(IHandler):
             "delete_remote": Controller.Command.Action.DELETE_REMOTE
         }.get(action)
 
-    def __execute_action(self, action, file_name: str, timeout: float = None):
+    def __execute_action(self, action, file_name: str, timeout: float | None = None):
         command = Controller.Command(action, file_name)
         callback = WebResponseActionCallback()
         command.add_callback(callback)
         self.__controller.queue_command(command)
         return callback, callback.wait(timeout=timeout)
 
-    def __resolve_command_identifier(self, file_name: str, file_id: str = None, path_pair_id: str = None):
+    def __resolve_command_identifier(
+        self,
+        file_name: str,
+        file_id: str | None = None,
+        path_pair_id: str | None = None,
+    ):
         guard_response = self.__check_file_name_safe(file_name)
         if guard_response:
             return None, None, guard_response
@@ -217,11 +226,12 @@ class ControllerHandler(IHandler):
 
         file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.QUEUE,
@@ -233,7 +243,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Queued file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_stop(self, file_name: str):
         """
@@ -246,11 +256,12 @@ class ControllerHandler(IHandler):
 
         file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.STOP,
@@ -262,7 +273,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Stopped file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_extract(self, file_name: str):
         """
@@ -275,12 +286,14 @@ class ControllerHandler(IHandler):
 
         file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
+        assert guard_name is not None
         guard_response = self.__check_path_safe(guard_name)
         if guard_response:
             return guard_response
@@ -295,7 +308,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested extraction for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_delete_local(self, file_name: str):
         """
@@ -308,12 +321,14 @@ class ControllerHandler(IHandler):
 
         file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
+        assert guard_name is not None
         guard_response = self.__check_path_safe(guard_name)
         if guard_response:
             return guard_response
@@ -328,7 +343,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested local delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_validate(self, file_name: str):
         """
@@ -341,11 +356,12 @@ class ControllerHandler(IHandler):
 
         file_identifier, _, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
         callback, completed = self.__execute_action(
             Controller.Command.Action.VALIDATE,
@@ -357,7 +373,7 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested validation for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_delete_remote(self, file_name: str):
         """
@@ -370,12 +386,14 @@ class ControllerHandler(IHandler):
 
         file_identifier, guard_name, error_response = self.__resolve_command_identifier(
             file_name,
-            bottle.request.query.get("file_id"),
-            bottle.request.query.get("path_pair_id")
+            self.__query_param("file_id"),
+            self.__query_param("path_pair_id")
         )
         if error_response:
             return error_response
+        assert file_identifier is not None
 
+        assert guard_name is not None
         guard_response = self.__check_path_safe(guard_name)
         if guard_response:
             return guard_response
@@ -390,14 +408,14 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested remote delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=callback.error, status=callback.error_code)
+            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_bulk(self, action: str):
         command_action = self.__get_action(action)
         if command_action is None:
             return HTTPResponse(body="Unsupported bulk action '{}'".format(action), status=404)
 
-        payload = bottle.request.json or {}
+        payload = cast(dict[str, Any], bottle.request.json or {})
         file_entries = payload.get("files")
         filenames = payload.get("filenames")
 

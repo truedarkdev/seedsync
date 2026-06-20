@@ -24,8 +24,8 @@ class WebAppJob(Job):
         self.web_access_logger = context.web_access_logger
         self.__context = context
         self.__app = web_app
-        self.__server = None
-        self.__server_thread = None
+        self.__server: MyWSGIRefServer | None = None
+        self.__server_thread: Thread | None = None
 
     @overrides(Job)
     def setup(self):
@@ -52,7 +52,9 @@ class WebAppJob(Job):
     @overrides(Job)
     def cleanup(self):
         self.__app.stop()
+        assert self.__server is not None
         self.__server.stop()
+        assert self.__server_thread is not None
         self.__server_thread.join()
 
 

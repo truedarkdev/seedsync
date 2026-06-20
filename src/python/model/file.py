@@ -216,7 +216,7 @@ class ModelFile:
         self.__is_stoppable = is_stoppable
 
     @property
-    def local_created_timestamp(self) -> datetime: return self.__local_created_timestamp
+    def local_created_timestamp(self) -> datetime | None: return self.__local_created_timestamp
 
     @local_created_timestamp.setter
     def local_created_timestamp(self, local_created_timestamp: datetime):
@@ -225,7 +225,7 @@ class ModelFile:
         self.__local_created_timestamp = local_created_timestamp
 
     @property
-    def local_modified_timestamp(self) -> datetime: return self.__local_modified_timestamp
+    def local_modified_timestamp(self) -> datetime | None: return self.__local_modified_timestamp
 
     @local_modified_timestamp.setter
     def local_modified_timestamp(self, local_modified_timestamp: datetime):
@@ -234,7 +234,7 @@ class ModelFile:
         self.__local_modified_timestamp = local_modified_timestamp
 
     @property
-    def remote_created_timestamp(self) -> datetime: return self.__remote_created_timestamp
+    def remote_created_timestamp(self) -> datetime | None: return self.__remote_created_timestamp
 
     @remote_created_timestamp.setter
     def remote_created_timestamp(self, remote_created_timestamp: datetime):
@@ -243,7 +243,7 @@ class ModelFile:
         self.__remote_created_timestamp = remote_created_timestamp
 
     @property
-    def remote_modified_timestamp(self) -> datetime: return self.__remote_modified_timestamp
+    def remote_modified_timestamp(self) -> datetime | None: return self.__remote_modified_timestamp
 
     @remote_modified_timestamp.setter
     def remote_modified_timestamp(self, remote_modified_timestamp: datetime):

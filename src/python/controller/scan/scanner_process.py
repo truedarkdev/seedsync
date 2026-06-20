@@ -4,7 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 import multiprocessing
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, List, Optional, cast
 import queue
 
 from common import overrides, AppProcess, AppError
@@ -58,7 +58,7 @@ class ScannerResult:
                  malformed_status_only_file_ids: Optional[List[str]] = None,
                  managed_extract_file_ids: Optional[List[str]] = None,
                  failed: bool = False,
-                 error_message: str = None):
+                 error_message: str | None = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -81,8 +81,8 @@ class ScannerProcess(AppProcess):
         :param interval_in_ms: Minimum interval (in ms) between results
         """
         super().__init__(name=scanner.__class__.__name__)
-        self.__queue = multiprocessing.Queue()
-        self.__wake_event = multiprocessing.Event()
+        self.__queue: Any | None = multiprocessing.Queue()
+        self.__wake_event: Any | None = multiprocessing.Event()
         self.__scanner = scanner
         self.__interval_in_ms = interval_in_ms
         self.__last_recoverable_error_message = None
@@ -182,6 +182,7 @@ class ScannerProcess(AppProcess):
                 path_pair_id=self.__trace_path_pair_id(),
                 path_pair_name=self.__trace_path_pair_name(),
             )
+        assert self.__queue is not None
         self.__queue.put(result)
         delta_in_s = (datetime.now() - timestamp_start).total_seconds()
         delta_in_ms = int(delta_in_s * 1000)
@@ -191,6 +192,7 @@ class ScannerProcess(AppProcess):
         # Wait until the next interval, or until a wake event is fired
         if delta_in_ms < self.__interval_in_ms:
             wait_time_in_s = float(self.__interval_in_ms - delta_in_ms) / 1000.0
+            assert self.__wake_event is not None
             self.__wake_event.wait(timeout=wait_time_in_s)
             self.__wake_event.clear()
 
@@ -208,14 +210,14 @@ class ScannerProcess(AppProcess):
         return self.__trace_path_pair_id() or self.__scanner.__class__.__name__
 
     def __trace_path_pair_id(self):
-        return getattr(self.__scanner, "path_pair_id", None)
+        return cast(Optional[str], getattr(self.__scanner, "path_pair_id", None))
 
     def __trace_path_pair_name(self):
-        return getattr(self.__scanner, "path_pair_name", None)
+        return cast(Optional[str], getattr(self.__scanner, "path_pair_name", None))
 
     def __record_breadcrumb(self, message: str, details: dict, event_type: str = "state_transition",
-                            corr_id: str = None, flow_id: str = None,
-                            path_pair_id: str = None, path_pair_name: str = None):
+                            corr_id: str | None = None, flow_id: str | None = None,
+                            path_pair_id: str | None = None, path_pair_name: str | None = None):
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -240,6 +242,7 @@ class ScannerProcess(AppProcess):
         latest_scan = None
         while True:
             try:
+                assert self.__queue is not None
                 latest_scan = self.__queue.get(block=False)
             except queue.Empty:
                 break
@@ -250,4 +253,5 @@ class ScannerProcess(AppProcess):
 
     def force_scan(self):
         """Force process to wake and do an immediate scan"""
+        assert self.__wake_event is not None
         self.__wake_event.set()

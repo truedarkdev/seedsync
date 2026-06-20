@@ -1,14 +1,17 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
-import sys
-from abc import abstractmethod
-from multiprocessing import Process, Queue, Event
 import queue
 import signal
+import sys
 import threading
 import time
+from abc import abstractmethod
 from datetime import datetime
+import multiprocessing
+from multiprocessing import Event, Process
+from multiprocessing.queues import Queue as MPQueue
+from typing import Any
 
 import tblib.pickling_support
 
@@ -49,12 +52,16 @@ class AppProcess(Process):
         super().__init__(name=self.__name)
 
         self.mp_logger = None
+        self._mp_log_queue: Any | None = None
+        self._mp_log_level: int | None = None
         self.logger = logging.getLogger(self.__name)
-        self.__exception_queue = Queue()
-        self._terminate = Event()
+        self.__exception_queue: Any | None = multiprocessing.Queue()
+        self._terminate: Any | None = multiprocessing.Event()
 
     def set_multiprocessing_logger(self, mp_logger: MultiprocessingLogger):
         self.mp_logger = mp_logger
+        self._mp_log_queue = mp_logger.queue
+        self._mp_log_level = mp_logger.log_level
 
     @overrides(Process)
     def run(self):
@@ -77,14 +84,22 @@ class AppProcess(Process):
         threading.current_thread().name = self.__name
 
         # Configure the logger for this process
-        if self.mp_logger:
-            self.logger = self.mp_logger.get_process_safe_logger().getChild(self.__name)
+        if self._mp_log_queue is not None:
+            from logging.handlers import QueueHandler
+
+            root_logger = logging.getLogger()
+            root_logger.handlers.clear()
+            root_logger.addHandler(QueueHandler(self._mp_log_queue))
+            if self._mp_log_level is not None:
+                root_logger.setLevel(self._mp_log_level)
+            self.logger = root_logger.getChild(self.__name)
 
         self.logger.debug("Started process")
 
         self.run_init()
 
         try:
+            assert self._terminate is not None
             while not self._terminate.is_set():
                 self.run_loop()
             self.logger.debug("Process received terminate flag")
@@ -92,6 +107,7 @@ class AppProcess(Process):
             self.logger.debug("Process received a ServiceExit")
         except Exception as e:
             self.logger.debug("Process caught an exception")
+            assert self.__exception_queue is not None
             self.__exception_queue.put(ExceptionWrapper(e))
             raise
         finally:
@@ -128,6 +144,8 @@ class AppProcess(Process):
             self.__exception_queue = None
         self.mp_logger = None
         self._terminate = None
+        self._mp_log_queue = None
+        self._mp_log_level = None
 
     def propagate_exception(self):
         """
@@ -176,6 +194,7 @@ class AppOneShotProcess(AppProcess):
     """
     def run_loop(self):
         self.run_once()
+        assert self._terminate is not None
         self._terminate.set()
 
     def run_cleanup(self):

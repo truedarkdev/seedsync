@@ -1,6 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from typing import List
+from typing import Any, List
 from datetime import datetime
 
 
@@ -12,8 +12,8 @@ class SystemFile:
                  name: str,
                  size: int,
                  is_dir: bool = False,
-                 time_created: datetime = None,
-                 time_modified: datetime = None,
+                 time_created: datetime | None = None,
+                 time_modified: datetime | None = None,
                  is_staging: bool = False):
         if size < 0:
             raise ValueError("File size must be greater than zero")
@@ -44,28 +44,28 @@ class SystemFile:
     def is_dir(self) -> bool: return self.__is_dir
 
     @property
-    def timestamp_created(self) -> datetime: return self.__timestamp_created
+    def timestamp_created(self) -> datetime | None: return self.__timestamp_created
 
     @property
-    def timestamp_modified(self) -> datetime: return self.__timestamp_modified
+    def timestamp_modified(self) -> datetime | None: return self.__timestamp_modified
 
     @property
     def children(self) -> List["SystemFile"]: return self.__children
 
     @property
-    def path_pair_id(self) -> str: return self.__path_pair_id
+    def path_pair_id(self) -> str | None: return self.__path_pair_id
 
     @path_pair_id.setter
-    def path_pair_id(self, path_pair_id: str):
+    def path_pair_id(self, path_pair_id: str | None):
         if path_pair_id is not None and type(path_pair_id) != str:
             raise TypeError
         self.__path_pair_id = path_pair_id
 
     @property
-    def path_pair_name(self) -> str: return self.__path_pair_name
+    def path_pair_name(self) -> str | None: return self.__path_pair_name
 
     @path_pair_name.setter
-    def path_pair_name(self, path_pair_name: str):
+    def path_pair_name(self, path_pair_name: str | None):
         if path_pair_name is not None and type(path_pair_name) != str:
             raise TypeError
         self.__path_pair_name = path_pair_name
@@ -93,7 +93,7 @@ class SystemFile:
             raise TypeError("Cannot add children to a file")
         self.__children.append(file)
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         d = {
             "name": self.__name,
             "size": self.__size,

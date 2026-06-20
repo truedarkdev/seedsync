@@ -1,13 +1,11 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from typing import Optional
-
 from ..web_app import IStreamHandler
 from ..utils import StreamQueue
 from ..serialize import SerializeModel
 from model import IModelListener, ModelFile
 from common import overrides
-from controller import Controller
+from controller.controller import Controller
 
 
 class WebResponseModelListener(IModelListener, StreamQueue[SerializeModel.UpdateEvent]):
@@ -42,7 +40,7 @@ class ModelStreamHandler(IStreamHandler):
         self.controller = controller
         self.serialize = SerializeModel()
         self.model_listener = WebResponseModelListener()
-        self.initial_model_files = None
+        self.initial_model_files: list[ModelFile] | None = None
         self.first_run = True
 
     @overrides(IStreamHandler)
@@ -50,9 +48,10 @@ class ModelStreamHandler(IStreamHandler):
         self.initial_model_files = self.controller.get_model_files_and_add_listener(self.model_listener)
 
     @overrides(IStreamHandler)
-    def get_value(self) -> Optional[str]:
+    def get_value(self) -> str | None:
         if self.first_run:
             self.first_run = False
+            assert self.initial_model_files is not None
             return self.serialize.model(self.initial_model_files)
         else:
             event = self.model_listener.get_next_event()

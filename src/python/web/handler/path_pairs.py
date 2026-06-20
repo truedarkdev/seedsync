@@ -1,6 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import json
+from typing import Any, cast
 from dataclasses import asdict
 
 import bottle
@@ -25,7 +26,7 @@ class PathPairsHandler(IHandler):
 
     @staticmethod
     def __load_request_json():
-        return json.loads(bottle.request.body.read().decode("utf-8"))
+        return json.loads(cast(bytes, bottle.request.body.read()).decode("utf-8"))  # type: ignore[attr-defined]
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -37,7 +38,7 @@ class PathPairsHandler(IHandler):
         web_app.get(
             "/server/path-pairs/<pair_id>",
             required_scope="read"
-        )(self.__handle_get_one)
+        )(self.__handle_get_one)  # type: ignore[call-issue]
         web_app.add_post_handler(
             "/server/path-pairs",
             self.__handle_create,
