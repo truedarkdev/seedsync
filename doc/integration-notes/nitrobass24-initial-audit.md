@@ -510,12 +510,12 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 491 | `2949a72eb4a334e7c85f1421a4a48ea9741d4879` | 2026-03-16 | chore(deps-dev): bump jsdom from 27.4.0 to 29.0.0 in /src/angular (#283) | intentionally skipped |
 | 492 | `818f0934c6505b477843e1c6a144b01aea3e9b8d` | 2026-03-17 | Consolidate Python deps to PEP 621 pyproject.toml (#287) | needs new integration task |
 | 493 | `ad3b590f3667a7c33d96d6149f3602bc2390139a` | 2026-03-17 | Add Ruff linting and formatting with CI enforcement (#288) | needs new integration task |
-| 494 | `0e19eb573882241cc5946f375498755c519537b2` | 2026-03-18 | Fix parser crash on chunk line-wrap from long filenames (#290) | needs integration |
+| 494 | `0e19eb573882241cc5946f375498755c519537b2` | 2026-03-18 | Fix parser crash on chunk line-wrap from long filenames (#290) | adapted locally in `9a48c8b4`; parser skips wrapped chunk fragments |
 | 495 | `09fb7723d6160ac508493bdec41ffad333121735` | 2026-03-18 | Add Pyright type checking foundation (#249 Phase 1) (#292) | needs new integration task |
-| 496 | `d761a6872ee96163e507cf94b68fb04efc0ca49c` | 2026-03-18 | Fix parser crash: skip unrecognized lines inside job context (#293) | needs integration |
+| 496 | `d761a6872ee96163e507cf94b68fb04efc0ca49c` | 2026-03-18 | Fix parser crash: skip unrecognized lines inside job context (#293) | adapted locally in `9a48c8b4`; parser skips unrecognized lines inside active job context |
 | 497 | `cefc87fb8c4f95b01bf4e13b5139e44ba4e45c7d` | 2026-03-18 | Split Pyright into its own CI job for visibility | needs area reopen |
 | 498 | `7e470883a7343bc3a75cde30d50306924932fc3b` | 2026-03-18 | Fix 91 Pyright errors across small modules (Phase 2) (#295) | needs new integration task |
-| 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | needs integration |
+| 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | adapted locally in `9a48c8b4`; tolerated parser failures return `None` instead of empty status snapshots |
 | 500 | `82343ce5f9222dd8b19153b0b9a62acfcc683304` | 2026-03-18 | Fix progress tracking for downloads with .lftp temp naming (#298) | already integrated |
 | 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | intentionally skipped |
 | 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs integration |
