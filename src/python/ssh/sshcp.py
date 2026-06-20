@@ -58,6 +58,13 @@ class Sshcp:
     def __describe_target(self) -> str:
         return "host={}, user={}, port={}".format(self.__host, self.__user, self.__port)
 
+    def __remote_address(self) -> str:
+        if self.__user is None:
+            if self.__host.startswith("-"):
+                raise ValueError("Hostname cannot start with '-'")
+            return self.__host
+        return "{}@{}".format(self.__user, self.__host)
+
     def __is_missing_remote_shell_error(self, error_message: str) -> bool:
         if "No such file or directory" not in error_message:
             return False
@@ -133,7 +140,7 @@ class Sshcp:
                     "-p", str(self.__port),  # port
                 ],
                 args=[
-                    "{}@{}".format(self.__user, self.__host),
+                    self.__remote_address(),
                     "echo __shell_path__$(which bash 2>/dev/null || "
                     "which sh 2>/dev/null || "
                     "echo unknown)__end__"
@@ -213,7 +220,7 @@ class Sshcp:
 
         command_args += [
             "-P", str(self.__port),
-            "{}@{}".format(self.__user, self.__host),
+            self.__remote_address(),
         ]
 
         self.logger.debug("Command: {}".format(command_args))
@@ -489,7 +496,7 @@ class Sshcp:
             "-p", str(self.__port),  # port
         ]
         args = [
-            "{}@{}".format(self.__user, self.__host),
+            self.__remote_address(),
             command
         ]
         return self.__run_command(
@@ -516,7 +523,7 @@ class Sshcp:
         ]
         args = [
             local_path,
-            "{}@{}:{}".format(self.__user, self.__host, remote_path)
+            "{}:{}".format(self.__remote_address(), remote_path)
         ]
         self.__run_command(
             command="scp",
