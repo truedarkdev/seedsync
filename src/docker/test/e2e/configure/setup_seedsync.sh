@@ -49,7 +49,7 @@ call_api_json() {
 }
 
 wait_for_app_ready "Seedsync app is up (before configuring)"
-call_api_json "${base_url}/server/config/set/general/debug" '{"value":true}'
+call_api_json "${base_url}/server/config/set/general/log_level" '{"value":"DEBUG"}'
 call_api_json "${base_url}/server/config/set/general/verbose" '{"value":true}'
 call_api_json "${base_url}/server/config/set/lftp/local_path" '{"value":"/downloads"}'
 call_api_json "${base_url}/server/config/set/lftp/remote_address" '{"value":"remote"}'

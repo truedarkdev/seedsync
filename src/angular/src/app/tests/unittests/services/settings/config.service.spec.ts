@@ -60,7 +60,7 @@ describe("Testing config service", () => {
     it("should parse config json correctly", () => {
         const configJson = {
             general: {
-                debug: true,
+                log_level: "DEBUG",
                 verbose: false,
                 breadcrumb_trace_enabled: true
             },
@@ -99,7 +99,7 @@ describe("Testing config service", () => {
 
         configService.config.subscribe({
             next: config => {
-                expect(config.general.debug).toBe(true);
+                expect(config.general.log_level).toBe("DEBUG");
                 expect(config.general.verbose).toBe(false);
                 expect(config.general.breadcrumb_trace_enabled).toBe(true);
                 expect(config.lftp.remote_address).toBe("remote.server.com");
@@ -160,7 +160,7 @@ describe("Testing config service", () => {
     });
 
     it("should get null on malformed json response", fakeAsync(() => {
-        httpMock.expectOne("/server/config/get").flush({general: {debug: true}});
+        httpMock.expectOne("/server/config/get").flush({general: {log_level: "DEBUG"}});
 
         let latestConfig = null;
         configService.config.subscribe({
@@ -170,7 +170,7 @@ describe("Testing config service", () => {
         });
 
         expect(latestConfig).not.toBe(null);
-        expect(latestConfig.general.debug).toBe(true);
+        expect(latestConfig.general.log_level).toBe("DEBUG");
 
         const consoleErrorSpy = spyOn(console, "error");
         const malformedResponse = "not-json";
@@ -230,12 +230,12 @@ describe("Testing config service", () => {
         httpMock.verify();
     }));
 
-    it("should send a POST on a set config option", () => {
+    it("should send a POST on a set log level option", () => {
         // first connect
         httpMock.expectOne("/server/config/get").flush("{}");
 
         let configSubscriberIndex = 0;
-        configService.set("general", "debug", true).subscribe({
+        configService.set("general", "log_level", "DEBUG").subscribe({
            next: reaction => {
                configSubscriberIndex++;
                expect(reaction.success).toBe(true);
@@ -243,7 +243,7 @@ describe("Testing config service", () => {
         });
 
         // set request
-        expectConfigSetRequest("general", "debug", true);
+        expectConfigSetRequest("general", "log_level", "DEBUG");
 
         expect(configSubscriberIndex).toBe(1);
         httpMock.verify();
@@ -271,14 +271,14 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
-    it("should stringify checkbox values before sending config updates", () => {
-        httpMock.expectOne("/server/config/get").flush({general: {debug: false}});
+    it("should preserve log level values before sending config updates", () => {
+        httpMock.expectOne("/server/config/get").flush({general: {log_level: "INFO"}});
 
-        configService.set("general", "debug", true).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", true);
+        configService.set("general", "log_level", "INFO").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "INFO");
 
-        configService.set("general", "debug", false).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", false);
+        configService.set("general", "log_level", "DEBUG").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "DEBUG");
 
         httpMock.verify();
     });
@@ -287,33 +287,28 @@ describe("Testing config service", () => {
         // first connect
         httpMock.expectOne("/server/config/get").flush("{}");
 
-        // boolean
-        configService.set("general", "debug", true).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", true);
-        configService.set("general", "debug", false).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", false);
-
-        // integer
-        configService.set("general", "debug", 0).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", 0);
-        configService.set("general", "debug", 1000).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", 1000);
-        configService.set("general", "debug", -1000).subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", -1000);
-
-        // string
-        configService.set("general", "debug", "test").subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", "test");
-        configService.set("general", "debug", "test space").subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", "test space");
-        configService.set("general", "debug", "test/slash").subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", "test/slash");
-        configService.set("general", "debug", "test\"doublequote").subscribe(
+        configService.set("general", "log_level", "DEBUG").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "DEBUG");
+        configService.set("general", "log_level", "INFO").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "INFO");
+        configService.set("general", "log_level", "WARNING").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "WARNING");
+        configService.set("general", "log_level", "ERROR").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "ERROR");
+        configService.set("general", "log_level", "CRITICAL").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "CRITICAL");
+        configService.set("general", "log_level", "test").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "test");
+        configService.set("general", "log_level", "test space").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "test space");
+        configService.set("general", "log_level", "test/slash").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "test/slash");
+        configService.set("general", "log_level", "test\"doublequote").subscribe(
             DoNothing
         );
-        expectConfigSetRequest("general", "debug", "test\"doublequote");
-        configService.set("general", "debug", "/test/leadingslash").subscribe(DoNothing);
-        expectConfigSetRequest("general", "debug", "/test/leadingslash");
+        expectConfigSetRequest("general", "log_level", "test\"doublequote");
+        configService.set("general", "log_level", "/test/leadingslash").subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "/test/leadingslash");
 
         httpMock.verify();
     });
@@ -323,11 +318,11 @@ describe("Testing config service", () => {
         httpMock.expectOne("/server/config/get").flush("{}");
 
         let configSubscriberIndex = 0;
-        configService.set("bad_section", "debug", true).subscribe({
+        configService.set("bad_section", "log_level", "DEBUG").subscribe({
            next: reaction => {
                configSubscriberIndex++;
                expect(reaction.success).toBe(false);
-               expect(reaction.errorMessage).toBe("Config has no option named bad_section.debug");
+               expect(reaction.errorMessage).toBe("Config has no option named bad_section.log_level");
            }
         });
 
@@ -340,7 +335,7 @@ describe("Testing config service", () => {
         httpMock.expectOne("/server/config/get").flush("{}");
 
         let configSubscriberIndex = 0;
-        configService.set("general", "bad_option", true).subscribe({
+        configService.set("general", "bad_option", "DEBUG").subscribe({
            next: reaction => {
                configSubscriberIndex++;
                expect(reaction.success).toBe(false);
@@ -357,11 +352,11 @@ describe("Testing config service", () => {
         httpMock.expectOne("/server/config/get").flush("{}");
 
         let configSubscriberIndex = 0;
-        configService.set("general", "debug", "").subscribe({
+        configService.set("general", "log_level", "").subscribe({
            next: reaction => {
                configSubscriberIndex++;
                expect(reaction.success).toBe(false);
-               expect(reaction.errorMessage).toBe("Setting general.debug cannot be blank.");
+               expect(reaction.errorMessage).toBe("Setting general.log_level cannot be blank.");
            }
         });
 
@@ -418,38 +413,35 @@ describe("Testing config service", () => {
     });
 
     it("should send updated config on a successful set", () => {
-        const configJson = {general: {debug: false}};
+        const configJson = {general: {log_level: "INFO"}};
         // first connect
         httpMock.expectOne("/server/config/get").flush(configJson);
 
-        const configExpected = [
-            new Config({general: {debug: false}}),
-            new Config({general: {debug: true}})
-        ];
+        const expectedLogLevels = ["INFO", "DEBUG"];
         let configSubscriberIndex = 0;
         configService.config.subscribe({
             next: config => {
-                expect(Immutable.is(config, configExpected[configSubscriberIndex++])).toBe(true);
+                expect(config.general.log_level).toBe(expectedLogLevels[configSubscriberIndex++]);
             }
         });
 
         // issue the set
-        configService.set("general", "debug", true).subscribe(DoNothing);
+        configService.set("general", "log_level", "DEBUG").subscribe(DoNothing);
 
         // set request
-        expectConfigSetRequest("general", "debug", true, "");
+        expectConfigSetRequest("general", "log_level", "DEBUG", "");
 
         expect(configSubscriberIndex).toBe(2);
         httpMock.verify();
     });
 
     it("should NOT send updated config on a failed set", () => {
-        const configJson = {general: {debug: false}};
+        const configJson = {general: {log_level: "INFO"}};
         // first connect
         httpMock.expectOne("/server/config/get").flush(configJson);
 
         const configExpected = [
-            new Config({general: {debug: false}})
+            new Config({general: {log_level: "INFO"}})
         ];
         let configSubscriberIndex = 0;
         configService.config.subscribe({
@@ -459,12 +451,12 @@ describe("Testing config service", () => {
         });
 
         // issue the set
-        configService.set("general", "debug", true).subscribe(DoNothing);
+        configService.set("general", "log_level", "DEBUG").subscribe(DoNothing);
 
         // set request
-        const request = httpMock.expectOne("/server/config/set/general/debug");
+        const request = httpMock.expectOne("/server/config/set/general/log_level");
         expect(request.request.method).toBe("POST");
-        expect(request.request.body).toEqual({value: true});
+        expect(request.request.body).toEqual({value: "DEBUG"});
         request.flush(
             "Not found",
             {status: 404, statusText: "Bad Request"}

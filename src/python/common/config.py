@@ -39,6 +39,24 @@ T = TypeVar('T', bound='InnerConfig')
 
 
 _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORECASE)
+_LOG_LEVEL_VALUES = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
+
+
+def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("Bad config: {}.{} ({}) must be a log level value".format(
+            config_cls.__name__, name, value
+        ))
+    normalized = value.strip().upper()
+    if not normalized:
+        raise ConfigError("Bad config: {}.{} is empty".format(
+            config_cls.__name__, name
+        ))
+    if normalized not in _LOG_LEVEL_VALUES:
+        raise ConfigError("Bad config: {}.{} ({}) must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL".format(
+            config_cls.__name__, name, value
+        ))
+    return normalized
 
 
 class Converters:
@@ -74,6 +92,10 @@ class Converters:
             ))
         return val
 
+    @staticmethod
+    def log_level(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_log_level(config_cls, name, value)
+
 
 class Checkers:
     @staticmethod
@@ -103,6 +125,10 @@ class Checkers:
                 config_cls.__name__, name
             ))
         return value
+
+    @staticmethod
+    def log_level(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_log_level(config_cls, name, value)
 
     @staticmethod
     def int_non_negative(config_cls: Any, name: str, value: int) -> int:
@@ -302,7 +328,7 @@ class Config(Persist):
         return isinstance(value, str) and value in cls.REDACTED_SENTINELS
 
     class General(IC):
-        debug = PROP("debug", Checkers.null, Converters.bool)
+        log_level = PROP("log_level", Checkers.log_level, Converters.log_level)
         verbose = PROP("verbose", Checkers.null, Converters.bool)
         api_token = PROP("api_token", Checkers.null, Converters.null)
         allowed_hostname = PROP("allowed_hostname", Checkers.null, Converters.null)
@@ -324,7 +350,7 @@ class Config(Persist):
 
         def __init__(self):
             super().__init__()
-            self.debug = None
+            self.log_level = "INFO"
             self.verbose = None
             self.api_token = None
             self.allowed_hostname = None
@@ -348,6 +374,20 @@ class Config(Persist):
             if "browser_handover_recovery_version" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["browser_handover_recovery_version"] = ""
+            if "log_level" not in config_dict:
+                config_dict = dict(config_dict)
+                if "debug" in config_dict:
+                    debug_value = config_dict.pop("debug")
+                    if type(debug_value) is str:
+                        debug_value = Converters.bool(cls, "debug", debug_value)
+                    else:
+                        debug_value = Checkers.bool_value(cls, "debug", debug_value)
+                    config_dict["log_level"] = "DEBUG" if debug_value else "INFO"
+                else:
+                    config_dict["log_level"] = "INFO"
+            else:
+                config_dict = dict(config_dict)
+                config_dict.pop("debug", None)
             if "breadcrumb_trace_enabled" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["breadcrumb_trace_enabled"] = False
@@ -358,6 +398,19 @@ class Config(Persist):
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True
             return super().from_dict(config_dict)
+
+        def has_property(self, name: str) -> bool:
+            if name == "debug":
+                return True
+            return super().has_property(name)
+
+        def set_property(self, name: str, value: Any):
+            if name == "debug":
+                debug_value = Converters.bool(self.__class__, name, value) if type(value) is str else value
+                debug_value = Checkers.bool_value(self.__class__, name, debug_value)
+                super().set_property("log_level", "DEBUG" if debug_value else "INFO")
+                return
+            super().set_property(name, value)
 
     class Lftp(IC):
         remote_address = PROP("remote_address", Checkers.string_nonempty, Converters.null)

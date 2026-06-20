@@ -16,6 +16,7 @@ export class OptionComponent implements OnInit {
     @Input() label: string;
     @Input() value: any;
     @Input() description: string;
+    @Input() choices: IOptionChoice[];
 
     @Output() changeEvent = new EventEmitter<any>();
 
@@ -47,5 +48,11 @@ export class OptionComponent implements OnInit {
 export enum OptionType {
     Text,
     Checkbox,
-    Password
+    Password,
+    Select
+}
+
+export interface IOptionChoice {
+    label: string;
+    value: any;
 }
