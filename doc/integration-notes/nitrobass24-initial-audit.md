@@ -486,8 +486,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 467 | `69c50edef63bfffa90d9107f7865252271720fbc` | 2026-03-12 | Fix exclude patterns: use --exclude-glob instead of --exclude | needs integration |
 | 468 | `8cacc58ba5e31422f11b9305ea5c6bb1af3a71cf` | 2026-03-12 | Allow workflow_dispatch to publish Docker images | needs area reopen |
 | 469 | `1fd8efbabaf949a07a46fa84e22279c983a694f6` | 2026-03-12 | Merge remote-tracking branch 'origin/master' into develop | covered elsewhere |
-| 470 | `a24d0431f4d7561d9336a24f89acad3ca4209df3` | 2026-03-12 | Silence redundant LftpModel log noise from temporary model (#267) | needs integration |
-| 471 | `6977fffe38993d8d455466483b53401830f3c458` | 2026-03-12 | Disable propagation on dummy logger to prevent log leakage | needs integration |
+| 470 | `a24d0431f4d7561d9336a24f89acad3ca4209df3` | 2026-03-12 | Silence redundant LftpModel log noise from temporary model (#267) | adapted locally in `9020f3ec`; temp model uses private dummy logger |
+| 471 | `6977fffe38993d8d455466483b53401830f3c458` | 2026-03-12 | Disable propagation on dummy logger to prevent log leakage | adapted locally in `9020f3ec`; private dummy logger does not propagate or mutate registry loggers |
 | 472 | `fd0957621307f53d45277751abe1bcc6aa405dc2` | 2026-03-12 | Merge pull request #269 from nitrobass24/fix/model-log-noise | covered elsewhere |
 | 473 | `c7470447bf1dcbfd68f082ca0e75834b05c2fc52` | 2026-03-12 | Deduplicate amd64 Docker build in CI | needs area reopen |
 | 474 | `62360ad7c8e8e41d6afc76598af01201e3902768` | 2026-03-12 | Merge pull request #274 from nitrobass24/ci/deduplicate-amd64-build | covered elsewhere |
