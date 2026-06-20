@@ -586,7 +586,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 567 | `eb53c11047429f03c03ff21ac7974cc3993e8387` | 2026-03-30 | chore(deps): bump brace-expansion from 1.1.12 to 1.1.13 in /website (#323) | intentionally skipped - website-only dependency bump; local repo has no tracked `website/` subtree or website lockfile surface |
 | 568 | `af892403fa09e481a3115680f80d1f5d86522bd6` | 2026-03-30 | chore(deps): bump pygments from 2.19.2 to 2.20.0 in /src/python (#322) | covered elsewhere - duplicate Pygments security bump already adapted to local Poetry lock in row `563` / `a5ca259f` |
 | 569 | `b63f595d2c01f1a150da8362696fc6dfb36b2b39` | 2026-03-30 | Merge branch 'develop' | covered elsewhere - merge wrapper with no net file delta against parent2; row `568` Pygments payload is covered by row `563` |
-| 570 | `08be3e06613f9eea7eb5ff032b3e440adbe9440c` | 2026-04-04 | Merge branch 'master' into develop | pending |
+| 570 | `08be3e06613f9eea7eb5ff032b3e440adbe9440c` | 2026-04-04 | Merge branch 'master' into develop | covered elsewhere - no-op merge with tree identical to both parents; no independent payload beyond prior rows |
 | 571 | `7640643651b9ee8adf3be67d5d3dfe5b21877b1b` | 2026-04-04 | Replace debug toggle with log level dropdown (#252) (#332) | pending |
 | 572 | `9e866765262895d28fc2f232b4d97247ef2ca00f` | 2026-04-04 | Add size sorting to file list (#254) (#334) | pending |
 | 573 | `850258e5c03a625f12755a6df18ec066de3866da` | 2026-04-05 | Add virtual scrolling for large file lists (#256) (#335) | pending |
