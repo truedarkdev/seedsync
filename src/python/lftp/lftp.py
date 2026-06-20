@@ -667,7 +667,7 @@ class Lftp:
             "'"
         ]
         command = " ".join(part for part in parts if part is not None)
-        self.logger.info("queue command: %s", command)
+        self.logger.debug("queue command: %s", command)
         self.__run_command(command, require_prompt_ready=False)
 
     def kill(self,

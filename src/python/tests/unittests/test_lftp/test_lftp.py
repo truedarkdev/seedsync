@@ -161,7 +161,7 @@ class TestLftp(unittest.TestCase):
             "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '",
             require_prompt_ready=False
         )
-        lftp.logger.info.assert_called_once_with(
+        lftp.logger.debug.assert_called_once_with(
             "queue command: %s",
             "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '"
         )
