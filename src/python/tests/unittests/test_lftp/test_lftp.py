@@ -582,8 +582,24 @@ class TestLftp(unittest.TestCase):
 
         statuses = lftp.status()
 
-        self.assertEqual([], statuses)
+        self.assertIsNone(statuses)
         self.assertFalse(lftp.last_status_poll_healthy)
+
+    def test_status_returns_none_when_parser_error_is_tolerated_during_connection_grace_retry(self):
+        lftp = self._build_test_lftp()
+        lftp._Lftp__job_status_parser = MagicMock()
+        lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("bad status")
+        lftp._Lftp__consecutive_status_errors = 0
+        lftp._Lftp__last_command_timed_out = False
+        lftp._Lftp__last_status_poll_healthy = True
+        lftp._Lftp__status_poll_needs_connection_grace = True
+
+        statuses = lftp.status()
+
+        self.assertIsNone(statuses)
+        self.assertFalse(lftp.last_status_poll_healthy)
+        self.assertEqual(2, lftp._Lftp__job_status_parser.parse.call_count)
+        self.assertEqual(2, lftp._Lftp__run_command.call_count)
 
     def test_status_drops_stale_queue_snapshot_after_command_failure(self):
         lftp = self._build_test_lftp()
@@ -1728,7 +1744,7 @@ class TestLftpPromptClassification(unittest.TestCase):
 
         for _ in range(9):
             statuses = lftp.status()
-            self.assertEqual([], statuses)
+            self.assertIsNone(statuses)
 
         self.assertEqual(9, lftp._Lftp__consecutive_status_errors)
 
@@ -1875,6 +1891,38 @@ class TestLftpKillPathMatching(unittest.TestCase):
         )
         polls = iter([
             ([], False),
+            ([status], True),
+            ([], True),
+        ])
+
+        def status_side_effect():
+            statuses, healthy = next(polls)
+            lftp._Lftp__last_status_poll_healthy = healthy
+            return statuses
+
+        lftp.status = MagicMock(side_effect=status_side_effect)
+
+        with patch("lftp.lftp.time.sleep") as sleep:
+            killed = lftp.kill("rc")
+
+        self.assertTrue(killed)
+        self.assertEqual(3, lftp.status.call_count)
+        sleep.assert_called_once_with(0.05)
+        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
+
+    def test_kill_retries_parser_failure_before_giving_up(self):
+        lftp = TestLftp._build_test_lftp()
+        status = LftpJobStatus(
+            job_id=11,
+            job_type=LftpJobStatus.Type.PGET,
+            state=LftpJobStatus.State.RUNNING,
+            name="rc",
+            flags="-c",
+            remote_path="/remote/rc",
+            local_path="/local/incomplete/rc.lftp"
+        )
+        polls = iter([
+            (None, False),
             ([status], True),
             ([], True),
         ])
