@@ -30,7 +30,7 @@ class ConfigError(AppError):
     pass
 
 
-InnerConfigType = Dict[str, str]
+InnerConfigType = Dict[str, Any]
 OuterConfigType = Dict[str, InnerConfigType]
 
 
@@ -43,115 +43,115 @@ _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORE
 
 class Converters:
     @staticmethod
-    def null(_: T, __: str, value: str) -> str:
+    def null(_: Any, __: str, value: str) -> str:
         return value
 
     @staticmethod
-    def int(cls: T, name: str, value: str) -> int:
+    def int(config_cls: Any, name: str, value: str) -> int:
         if not value:
             raise ConfigError("Bad config: {}.{} is empty".format(
-                cls.__name__, name
+                config_cls.__name__, name
             ))
         try:
             val = int(value)
         except ValueError:
             raise ConfigError("Bad config: {}.{} ({}) must be an integer value".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         return val
 
     @staticmethod
-    def bool(cls: T, name: str, value: str) -> bool:
+    def bool(config_cls: Any, name: str, value: str) -> bool:
         if not value:
             raise ConfigError("Bad config: {}.{} is empty".format(
-                cls.__name__, name
+                config_cls.__name__, name
             ))
         try:
             val = bool(_strtobool(value))
         except ValueError:
             raise ConfigError("Bad config: {}.{} ({}) must be a boolean value".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         return val
 
 
 class Checkers:
     @staticmethod
-    def null(_: T, __: str, value: Any) -> Any:
+    def null(_: Any, __: str, value: Any) -> Any:
         return value
 
     @staticmethod
-    def bool_value(cls: T, name: str, value: bool) -> bool:
+    def bool_value(config_cls: Any, name: str, value: bool) -> bool:
         if type(value) is not bool:
             raise ConfigError("Bad config: {}.{} ({}) must be a boolean value".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         return value
 
     @staticmethod
-    def string_nonempty(cls: T, name: str, value: str) -> str:
+    def string_nonempty(config_cls: Any, name: str, value: str) -> str:
         if not value or not value.strip():
             raise ConfigError("Bad config: {}.{} is empty".format(
-                cls.__name__, name
+                config_cls.__name__, name
             ))
         return value
 
     @staticmethod
-    def string_allow_empty(cls: T, name: str, value: str) -> str:
+    def string_allow_empty(config_cls: Any, name: str, value: str) -> str:
         if value != "" and (not value or not value.strip()):
             raise ConfigError("Bad config: {}.{} is empty".format(
-                cls.__name__, name
+                config_cls.__name__, name
             ))
         return value
 
     @staticmethod
-    def int_non_negative(cls: T, name: str, value: int) -> int:
+    def int_non_negative(config_cls: Any, name: str, value: int) -> int:
         if value < 0:
             raise ConfigError("Bad config: {}.{} ({}) must be zero or greater".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         return value
 
     @staticmethod
     def int_non_negative_max(max_val: int) -> Callable:
-        def _checker(cls: T, name: str, value: int) -> int:
+        def _checker(config_cls: Any, name: str, value: int) -> int:
             if value < 1:
                 raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
-                    cls.__name__, name, value
+                    config_cls.__name__, name, value
                 ))
             if value > max_val:
                 raise ConfigError("Bad config: {}.{} ({}) must not exceed {} (FD_SETSIZE limit)".format(
-                    cls.__name__, name, value, max_val
+                    config_cls.__name__, name, value, max_val
                 ))
             return value
         return _checker
 
     @staticmethod
-    def int_positive(cls: T, name: str, value: int) -> int:
+    def int_positive(config_cls: Any, name: str, value: int) -> int:
         if value < 1:
             raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         return value
 
     @staticmethod
-    def byte_size_or_empty(cls: T, name: str, value: Any) -> str:
+    def byte_size_or_empty(config_cls: Any, name: str, value: Any) -> str:
         if type(value) is int:
             value = str(value)
         if not isinstance(value, str):
             raise ConfigError("Bad config: {}.{} ({}) must be a byte size value".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         if value == "":
             return value
         normalized = value.strip()
         if not normalized:
             raise ConfigError("Bad config: {}.{} is empty".format(
-                cls.__name__, name
+                config_cls.__name__, name
             ))
         if not _BYTE_SIZE_VALUE_RE.match(normalized):
             raise ConfigError("Bad config: {}.{} ({}) must be a byte size value like 512K, 8M, 1G, or 8388608".format(
-                cls.__name__, name, value
+                config_cls.__name__, name, value
             ))
         suffix = normalized[-1]
         if suffix.isalpha():
@@ -286,7 +286,7 @@ class Config(Persist):
     REDACTED_SENTINEL = "**REDACTED**"
     LEGACY_REDACTED_SENTINEL = "********"
     REDACTED_SENTINELS = frozenset((REDACTED_SENTINEL, LEGACY_REDACTED_SENTINEL))
-    SENSITIVE_FIELDS = collections.OrderedDict([
+    SENSITIVE_FIELDS: Dict[str, tuple[str, ...]] = collections.OrderedDict([
         ("general", ("api_token", "webhook_secret")),
         ("lftp", ("remote_password",)),
     ])
@@ -505,7 +505,7 @@ class Config(Persist):
 
     @classmethod
     @overrides(Persist)
-    def from_str(cls: "Config", content: str) -> "Config":
+    def from_str(cls: type["Config"], content: str) -> "Config":
         config_parser = configparser.ConfigParser()
         try:
             config_parser.read_string(content)
@@ -521,7 +521,7 @@ class Config(Persist):
             config_dict[section] = {}
             for option in config_parser.options(section):
                 config_dict[section][option] = config_parser.get(section, option)
-        return Config.from_dict(config_dict)
+        return cls.from_dict(config_dict)
 
     @overrides(Persist)
     def to_str(self) -> str:

@@ -7,7 +7,7 @@ import re
 import shlex
 import shutil
 import time
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import pexpect
 import pexpect.popen_spawn
@@ -40,8 +40,8 @@ class Sshcp:
     def __init__(self,
                  host: str,
                  port: int,
-                 user: str = None,
-                 password: str = None):
+                 user: Optional[str] = None,
+                 password: Optional[str] = None):
         if host is None:
             raise ValueError("Hostname not specified.")
         self.__host = host
@@ -99,15 +99,15 @@ class Sshcp:
         )
 
     @staticmethod
-    def __decode_spawn_output(output) -> str:
-        if output == pexpect.EOF:
+    def __decode_spawn_output(output: Any) -> str:
+        if output is None or output is pexpect.EOF or output is pexpect.TIMEOUT:
             return ""
         if isinstance(output, bytes):
             return output.decode(errors="replace")
         return str(output)
 
     @classmethod
-    def __format_spawn_error(cls, before, after) -> str:
+    def __format_spawn_error(cls, before: Any, after: Any) -> str:
         return "{}{}".format(
             cls.__decode_spawn_output(before),
             cls.__decode_spawn_output(after)
@@ -260,7 +260,7 @@ class Sshcp:
             if callable(close):
                 close()
 
-    def __log_timeout(self, phase: str, command: str, sp, start_time: float):
+    def __log_timeout(self, phase: str, command: str, sp: Any, start_time: float):
         elapsed = time.time() - start_time
         self.logger.exception(
             "Timed out during {} after {:.3f}s (command={}, {})".format(
@@ -272,7 +272,7 @@ class Sshcp:
         )
         self.logger.error("Command output before:\n{}".format(sp.before))
 
-    def __spawn_process(self, command: str, command_args: list):
+    def __spawn_process(self, command: str, command_args: list[str]) -> tuple[Any, bool]:
         spawn_factory = getattr(pexpect, "spawn", None)
         resolver_options = None
         resolver_modified = False
@@ -331,8 +331,8 @@ class Sshcp:
 
         start_time = time.time()
         sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        timeout_phase: str = "command execution"
         try:
-            timeout_phase = "command execution"
             if self.__password is not None:
                 timeout_phase = "password prompt"
                 i = sp.expect([
@@ -348,13 +348,13 @@ class Sshcp:
                     'Permission denied',  # i=9, auth rejected before/at prompt
                 ], timeout=self.__TIMEOUT_SECS)
                 if i > 0:
-                    before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
-                    after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
+                    before = self.__decode_spawn_output(sp.before).strip()
+                    after = self.__decode_spawn_output(sp.after).strip()
                     self.logger.warning("Command failed: '{} - {}'".format(before, after))
                     if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
                         raise SshcpError(self.__format_missing_remote_shell_error(before))
                 if i == 1:
-                    before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
+                    before_lower = self.__decode_spawn_output(sp.before).strip().lower()
                     if command == "scp" and "no such file or directory" not in before_lower:
                         scp_error = self.__format_spawn_error(sp.before, sp.after)
                         if self.__is_scp_destination_permission_denied(scp_error):
@@ -365,15 +365,17 @@ class Sshcp:
                     ):
                         raise SshcpError("Incorrect password")
                     error_msg = "Unknown error"
-                    if sp.before.decode().strip():
-                        error_msg += " - " + sp.before.decode().strip()
+                    before_text = self.__decode_spawn_output(sp.before).strip()
+                    if before_text:
+                        error_msg += " - " + before_text
                     raise SshcpError(error_msg)
                 elif i in {3, 5}:
                     raise SshcpError("Bad hostname: {}".format(self.__host))
                 elif i in {2, 4, 6, 7}:
                     error_msg = "Connection refused by server"
-                    if sp.before.decode().strip():
-                        error_msg += " - " + sp.before.decode().strip()
+                    before_text = self.__decode_spawn_output(sp.before).strip()
+                    if before_text:
+                        error_msg += " - " + before_text
                     raise SshcpError(error_msg)
                 elif i == 8:
                     raise SshcpError(
@@ -400,13 +402,13 @@ class Sshcp:
                 timeout=self.__TIMEOUT_SECS
             )
             if i > 0:
-                before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
-                after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
+                before = self.__decode_spawn_output(sp.before).strip()
+                after = self.__decode_spawn_output(sp.after).strip()
                 self.logger.warning("Command failed: '{} - {}'".format(before, after))
                 if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
                     raise SshcpError(self.__format_missing_remote_shell_error(before))
             if i == 1:
-                before_lower = sp.before.decode().strip().lower() if sp.before != pexpect.EOF else ""
+                before_lower = self.__decode_spawn_output(sp.before).strip().lower()
                 if command == "scp" and "no such file or directory" not in before_lower:
                     scp_error = self.__format_spawn_error(sp.before, sp.after)
                     if self.__is_scp_destination_permission_denied(scp_error):
@@ -417,8 +419,9 @@ class Sshcp:
                 raise SshcpError("Bad hostname: {}".format(self.__host))
             elif i in {2, 4, 6, 7}:
                 error_msg = "Connection refused by server"
-                if sp.before.decode().strip():
-                    error_msg += " - " + sp.before.decode().strip()
+                before_text = self.__decode_spawn_output(sp.before).strip()
+                if before_text:
+                    error_msg += " - " + before_text
                 raise SshcpError(error_msg)
             elif i == 8:
                 raise SshcpError(
@@ -453,14 +456,16 @@ class Sshcp:
         self.logger.debug("Return code: {}".format(exitstatus))
         self.logger.debug("Command took {:.3f}s".format(end_time-start_time))
         if exitstatus != 0:
-            before = sp.before.decode().strip() if sp.before != pexpect.EOF else ""
-            after = sp.after.decode().strip() if sp.after != pexpect.EOF else ""
+            before = self.__decode_spawn_output(sp.before).strip()
+            after = self.__decode_spawn_output(sp.after).strip()
             self.logger.warning("Command failed: '{} - {}'".format(before, after))
             if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
                 raise SshcpError(self.__format_missing_remote_shell_error(before))
-            raise SshcpError(sp.before.decode().strip())
+            raise SshcpError(self.__decode_spawn_output(sp.before).strip())
 
-        return sp.before.replace(b'\r\n', b'\n').strip()
+        before_val = sp.before
+        assert isinstance(before_val, bytes)
+        return before_val.replace(b'\r\n', b'\n').strip()
 
     def shell(self, command: str) -> bytes:
         """

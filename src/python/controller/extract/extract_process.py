@@ -1,11 +1,11 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import multiprocessing
-import datetime
 import time
 import queue
 import threading
-from typing import Optional, List
+from datetime import datetime
+from typing import Any, Optional, List, cast
 import logging
 import os
 import json
@@ -27,8 +27,8 @@ class ExtractCompletedResult:
                  timestamp: datetime,
                  name: str,
                  is_dir: bool,
-                 file_id: str = None,
-                 path_pair_id: str = None):
+                 file_id: Optional[str] = None,
+                 path_pair_id: Optional[str] = None):
         self.timestamp = timestamp
         self.name = name
         self.is_dir = is_dir
@@ -41,8 +41,8 @@ class ExtractFailedResult:
                  timestamp: datetime,
                  name: str,
                  is_dir: bool,
-                 file_id: str = None,
-                 path_pair_id: str = None):
+                 file_id: Optional[str] = None,
+                 path_pair_id: Optional[str] = None):
         self.timestamp = timestamp
         self.name = name
         self.is_dir = is_dir
@@ -58,7 +58,7 @@ class ExtractProcess(AppProcess):
                      logger: logging.Logger,
                      completed_queue: multiprocessing.Queue,
                      trace_owner: "ExtractProcess",
-                     failed_queue: multiprocessing.Queue = None):
+                     failed_queue: Optional[multiprocessing.Queue] = None):
             self.logger = logger
             self.completed_queue = completed_queue
             self.trace_owner = trace_owner
@@ -67,11 +67,12 @@ class ExtractProcess(AppProcess):
         def extract_completed(self,
                               name: str,
                               is_dir: bool,
-                              file_id: str = None,
-                              path_pair_id: str = None):
+                              file_id: Optional[str] = None,
+                              path_pair_id: Optional[str] = None):
             self.logger.info("Extraction completed for {}".format(name))
-            flow_id = self.trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
-            self.trace_owner._ExtractProcess__record_breadcrumb(
+            trace_owner: Any = self.trace_owner
+            flow_id = trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
+            trace_owner._ExtractProcess__record_breadcrumb(
                 "extract_completed",
                 {
                     "file_name": name,
@@ -79,18 +80,18 @@ class ExtractProcess(AppProcess):
                     "file_id": file_id,
                     "path_pair_id": path_pair_id,
                 },
-                corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                corr_id=trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            self.trace_owner._ExtractProcess__trace_target_archive_event("extract_completed", {
+            trace_owner._ExtractProcess__trace_target_archive_event("extract_completed", {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
                 "path_pair_id": path_pair_id,
             })
-            completed_result = ExtractCompletedResult(timestamp=datetime.datetime.now(),
+            completed_result = ExtractCompletedResult(timestamp=datetime.now(),
                                                       name=name,
                                                       is_dir=is_dir,
                                                       file_id=file_id,
@@ -100,11 +101,12 @@ class ExtractProcess(AppProcess):
         def extract_failed(self,
                            name: str,
                            is_dir: bool,
-                           file_id: str = None,
-                           path_pair_id: str = None):
+                           file_id: Optional[str] = None,
+                           path_pair_id: Optional[str] = None):
             self.logger.error("Extraction failed for {}".format(name))
-            flow_id = self.trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
-            self.trace_owner._ExtractProcess__record_breadcrumb(
+            trace_owner: Any = self.trace_owner
+            flow_id = trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
+            trace_owner._ExtractProcess__record_breadcrumb(
                 "extract_failed",
                 {
                     "file_name": name,
@@ -113,18 +115,18 @@ class ExtractProcess(AppProcess):
                     "path_pair_id": path_pair_id,
                 },
                 event_type="failure",
-                corr_id=self.trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                corr_id=trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            self.trace_owner._ExtractProcess__trace_target_archive_event("extract_failed", {
+            trace_owner._ExtractProcess__trace_target_archive_event("extract_failed", {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
                 "path_pair_id": path_pair_id,
             })
-            failed_result = ExtractFailedResult(timestamp=datetime.datetime.now(),
+            failed_result = ExtractFailedResult(timestamp=datetime.now(),
                                                 name=name,
                                                 is_dir=is_dir,
                                                 file_id=file_id,
@@ -135,7 +137,7 @@ class ExtractProcess(AppProcess):
     def __init__(self,
                  out_dir_path: str,
                  local_path: str,
-                 local_path_fallback: str = None,
+                 local_path_fallback: Optional[str] = None,
                  managed_extract_folders_enabled: bool = True,
                  breadcrumb_trace=None):
         super().__init__(name=self.__class__.__name__)
@@ -147,7 +149,7 @@ class ExtractProcess(AppProcess):
         self.__status_result_queue = multiprocessing.Queue()
         self.__completed_result_queue = multiprocessing.Queue()
         self.__failed_result_queue = multiprocessing.Queue()
-        self.__dispatch = None
+        self.__dispatch: Optional[ExtractDispatch] = None
         self.__breadcrumb_trace = breadcrumb_trace
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
@@ -159,7 +161,7 @@ class ExtractProcess(AppProcess):
         self.__inflight_flow_ids_lock = threading.Lock()
 
     @staticmethod
-    def __extract_trace_selector_name(identifier: str):
+    def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
         if identifier is None:
             return None
         try:
@@ -201,15 +203,15 @@ class ExtractProcess(AppProcess):
         # Create dispatch inside the process
         self.__dispatch = ExtractDispatch(out_dir_path=self.__out_dir_path,
                                           local_path=self.__local_path,
-                                          local_path_fallback=self.__local_path_fallback,
+                                          local_path_fallback=cast(Any, self.__local_path_fallback),
                                           managed_extract_folders_enabled=self.__managed_extract_folders_enabled)
 
         # Add extract listener
         listener = ExtractProcess.__ExtractListener(
             logger=self.logger,
-            completed_queue=self.__completed_result_queue,
+            completed_queue=cast(Any, self.__completed_result_queue),
             trace_owner=self,
-            failed_queue=self.__failed_result_queue
+            failed_queue=cast(Any, self.__failed_result_queue)
         )
         self.__dispatch.add_listener(listener)
 
@@ -218,10 +220,16 @@ class ExtractProcess(AppProcess):
 
     @overrides(AppProcess)
     def run_cleanup(self):
+        assert self.__dispatch is not None
         self.__dispatch.stop()
 
     @overrides(AppProcess)
     def run_loop(self):
+        assert self.__dispatch is not None
+        assert self.__command_queue is not None
+        assert self.__status_result_queue is not None
+        assert self.__completed_result_queue is not None
+        assert self.__failed_result_queue is not None
         # Forward all the extract commands
         try:
             first_queue_read = True
@@ -238,6 +246,7 @@ class ExtractProcess(AppProcess):
                 else:
                     file = queue_item
                     flow_id = None
+                assert isinstance(file, ModelFile)
                 self.__record_breadcrumb(
                     "extract_command_dequeued",
                     {
@@ -286,7 +295,7 @@ class ExtractProcess(AppProcess):
                             "reason": str(e),
                         })
                     failed_result = ExtractFailedResult(
-                        timestamp=datetime.datetime.now(),
+                        timestamp=datetime.now(),
                         name=file.name,
                         is_dir=file.is_dir,
                         file_id=file.file_id,
@@ -301,7 +310,7 @@ class ExtractProcess(AppProcess):
 
         # Queue the latest status
         statuses = self.__dispatch.status()
-        status_result = ExtractStatusResult(timestamp=datetime.datetime.now(),
+        status_result = ExtractStatusResult(timestamp=datetime.now(),
                                             statuses=statuses)
         self.__status_result_queue.put(status_result)
 
@@ -327,17 +336,20 @@ class ExtractProcess(AppProcess):
             self.__failed_result_queue = None
         super().close_queues()
 
-    def __trace_corr_id(self, file_id: str = None, path_pair_id: str = None, file_name: str = None):
+    def __trace_corr_id(self,
+                        file_id: Optional[str] = None,
+                        path_pair_id: Optional[str] = None,
+                        file_name: Optional[str] = None):
         return path_pair_id or file_id or file_name
 
     def __record_breadcrumb(self,
                             message: str,
                             details: dict,
                             event_type: str = "state_transition",
-                            corr_id: str = None,
-                            flow_id: str = None,
-                            file_id: str = None,
-                            path_pair_id: str = None):
+                            corr_id: Optional[str] = None,
+                            flow_id: Optional[str] = None,
+                            file_id: Optional[str] = None,
+                            path_pair_id: Optional[str] = None):
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -352,7 +364,7 @@ class ExtractProcess(AppProcess):
             path_pair_id=path_pair_id,
         )
 
-    def __track_inflight_flow_id(self, file: ModelFile, flow_id: str = None):
+    def __track_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
         if flow_id is None:
             return
         with self.__inflight_flow_ids_lock:
@@ -360,7 +372,7 @@ class ExtractProcess(AppProcess):
                 self.__inflight_flow_ids_by_file_id[file.file_id].append(flow_id)
             self.__inflight_flow_ids_by_name[file.name].append(flow_id)
 
-    def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: str = None):
+    def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
         if flow_id is None:
             return
         with self.__inflight_flow_ids_lock:
@@ -389,7 +401,9 @@ class ExtractProcess(AppProcess):
         if not flow_ids:
             flow_ids_by_key.pop(key, None)
 
-    def __pop_inflight_flow_id(self, file_id: str = None, file_name: str = None):
+    def __pop_inflight_flow_id(self,
+                               file_id: Optional[str] = None,
+                               file_name: Optional[str] = None):
         with self.__inflight_flow_ids_lock:
             if file_id is not None:
                 by_id = self.__inflight_flow_ids_by_file_id.get(file_id)
@@ -409,7 +423,7 @@ class ExtractProcess(AppProcess):
                     return flow_id
         return None
 
-    def extract(self, file: ModelFile, flow_id: str = None):
+    def extract(self, file: ModelFile, flow_id: Optional[str] = None):
         """
         Process-safe method to queue an extraction
         :param file:
@@ -426,6 +440,7 @@ class ExtractProcess(AppProcess):
             file_id=file.file_id,
             path_pair_id=file.path_pair_id,
         )
+        assert self.__command_queue is not None
         self.__command_queue.put((file, flow_id))
 
     def pop_latest_statuses(self) -> Optional[ExtractStatusResult]:
@@ -437,6 +452,7 @@ class ExtractProcess(AppProcess):
         """
         latest_result = None
         try:
+            assert self.__status_result_queue is not None
             while True:
                 latest_result = self.__status_result_queue.get(block=False)
         except queue.Empty:
@@ -452,6 +468,7 @@ class ExtractProcess(AppProcess):
         """
         completed = []
         try:
+            assert self.__completed_result_queue is not None
             while True:
                 result = self.__completed_result_queue.get(block=False)
                 completed.append(result)
@@ -468,6 +485,7 @@ class ExtractProcess(AppProcess):
         """
         failed = []
         try:
+            assert self.__failed_result_queue is not None
             while True:
                 result = self.__failed_result_queue.get(block=False)
                 failed.append(result)
