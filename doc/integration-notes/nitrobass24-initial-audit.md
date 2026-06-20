@@ -551,7 +551,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 532 | `5bfb18cc8c1f0d090b3252ca365e77471dda06c0` | 2026-03-19 | Assert queue_command not called on rejected filenames | adapted locally in `a10d7d3e`; route, file-id, path-pair, resolved identity, and bulk rejection tests assert no queue dispatch |
 | 533 | `30547791ea22bebe129896e60dcabfa91720f7f5` | 2026-03-19 | Fix pre-existing test failures and add assert_not_called checks | adapted locally in `a10d7d3e`; local tests cover invalid identity short-circuit and valid identity happy paths |
 | 534 | `7f25cd71e37cba96bf5e037ad1c934fa4fe201c4` | 2026-03-23 | Merge pull request #304 from nitrobass24/fix/reject-control-chars-filename | covered elsewhere |
-| 535 | `1f6c5af6d3dd6db3daf9526f1bc7b1aa98b44f15` | 2026-03-13 | Fix ModelFile type: local_size and remote_size are nullable | needs integration |
+| 535 | `1f6c5af6d3dd6db3daf9526f1bc7b1aa98b44f15` | 2026-03-13 | Fix ModelFile type: local_size and remote_size are nullable | adapted locally in `74c353ad` |
 | 536 | `f6c0a84f68b0b3f32a38bb8e3ee986bcd41655a6` | 2026-03-23 | Prepare v0.14.2 release | intentionally skipped |
 | 537 | `6abce01f714238ec182db5a4d6d805c56fef2eba` | 2026-03-23 | Address PR review findings across security, tests, and code quality | needs area reopen |
 | 538 | `0f94a26f0c220c74ab8e4fdb40378d93f0a8e01a` | 2026-03-23 | Fix CI failures and address second round of PR review findings | needs area reopen |
