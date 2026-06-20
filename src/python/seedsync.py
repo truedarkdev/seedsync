@@ -178,7 +178,7 @@ class Seedsync:
         # Initial checks to see if we should bother starting the controller
         path_pair_manager = self.context.path_pair_manager
         assert path_pair_manager is not None
-        incomplete_fields = Seedsync._detect_incomplete_config(self.context.config, path_pair_manager)
+        incomplete_fields = Seedsync._detect_incomplete_config(self.context.config, path_pair_manager, self.context.args)
         if incomplete_fields:
             do_start_controller = False
             self.context.logger.error("Config is incomplete: %s", ", ".join(incomplete_fields))
@@ -483,22 +483,12 @@ class Seedsync:
         return config
 
     @staticmethod
-    def _detect_incomplete_config(config: Config, path_pair_manager: PathPairManager | None = None) -> list:
-        incomplete_fields = []
-        config_dict = config.as_dict()
-        skip_fields = set()
-        if path_pair_manager is not None and len(path_pair_manager.get_all_pairs()) > 0:
-            skip_fields.update({
-                "Lftp.remote_path",
-                "Lftp.local_path",
-            })
-        for sec_name in config_dict:
-            for key in config_dict[sec_name]:
-                if Seedsync.__CONFIG_DUMMY_VALUE == config_dict[sec_name][key]:
-                    field_name = "{}.{}".format(sec_name, key)
-                    if field_name not in skip_fields:
-                        incomplete_fields.append(field_name)
-        return incomplete_fields
+    def _detect_incomplete_config(
+        config: Config,
+        path_pair_manager: PathPairManager | None = None,
+        args: Args | None = None
+    ) -> list:
+        return Controller.collect_missing_startup_fields(config, args=args, path_pair_manager=path_pair_manager)
 
     @staticmethod
     def _is_blank_config_value(value) -> bool:
