@@ -480,46 +480,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 461 | `26193be812528080a7e756fbd801c525f48e2fe7` | 2026-03-12 | Set COLUMNS env var in pexpect spawn to prevent Unraid PTY wrapping | adapted locally in `d48e570c`; `pexpect.spawn` gets env with `COLUMNS=10000` while preserving env |
 | 462 | `6b79bde4a81549eff8c1c79c9c9284c6aa054957` | 2026-03-12 | Fix off-by-one in consecutive status error threshold | adapted locally in `d48e570c`; status parser failure threshold is 10 with strict comparisons |
 | 463 | `96e79b85e93c1c7e1bf73b13c2ca5741d2be96f8` | 2026-03-12 | Merge pull request #263 from nitrobass24/fix/parser-resilience-unraid | covered elsewhere - merge wrapper for rows `460`-`462` adapted in `d48e570c`; no independent payload |
-| 464 | `f6e6663bbedc9486b36ed6217b8bdcdd4a43cb45` | 2026-03-12 | Release v0.13.4 - Exclude patterns fix and Unraid parser resilience | pending |
-| 465 | `b13d7d5a1bba9a904b2f7266614764353abbd91f` | 2026-03-12 | Fix v0.13.4 changelog to only include hotfix PRs | pending |
-| 466 | `21ca414843b8da2860917e318bcf4773f3ef4846` | 2026-03-12 | Add debug log for LFTP queue command | pending |
-| 467 | `69c50edef63bfffa90d9107f7865252271720fbc` | 2026-03-12 | Fix exclude patterns: use --exclude-glob instead of --exclude | pending |
-| 468 | `8cacc58ba5e31422f11b9305ea5c6bb1af3a71cf` | 2026-03-12 | Allow workflow_dispatch to publish Docker images | pending |
-| 469 | `1fd8efbabaf949a07a46fa84e22279c983a694f6` | 2026-03-12 | Merge remote-tracking branch 'origin/master' into develop | pending |
-| 470 | `a24d0431f4d7561d9336a24f89acad3ca4209df3` | 2026-03-12 | Silence redundant LftpModel log noise from temporary model (#267) | pending |
-| 471 | `6977fffe38993d8d455466483b53401830f3c458` | 2026-03-12 | Disable propagation on dummy logger to prevent log leakage | pending |
-| 472 | `fd0957621307f53d45277751abe1bcc6aa405dc2` | 2026-03-12 | Merge pull request #269 from nitrobass24/fix/model-log-noise | pending |
-| 473 | `c7470447bf1dcbfd68f082ca0e75834b05c2fc52` | 2026-03-12 | Deduplicate amd64 Docker build in CI | pending |
-| 474 | `62360ad7c8e8e41d6afc76598af01201e3902768` | 2026-03-12 | Merge pull request #274 from nitrobass24/ci/deduplicate-amd64-build | pending |
-| 475 | `f3de4cdd2005a45f4857277a6d0c3e91a8e2da93` | 2026-03-12 | Fix CI: inline SHOULD_PUBLISH expression in job-level if | pending |
-| 476 | `c4ca0ac30b7e2afddc47b1c5373ca2634e2ed00b` | 2026-03-12 | Prepare v0.14.0 release | pending |
-| 477 | `cceea49d6b0670dfab0a072655f3d21b4f78559e` | 2026-03-12 | Release v0.13.5 - Exclude-glob fix and queue logging | pending |
-| 478 | `bdc3d7d9e0dc14c580f915bfdd058de808dd18e8` | 2026-03-12 | Resolve merge conflicts and address PR review findings | pending |
-| 479 | `7b106632f967d74b886e727f9d56ce4c8a7343f9` | 2026-03-13 | Improve integrity check settings clarity and validate button UX | pending |
-| 480 | `dbfb2ae69e2dbede214437414fcf1bf6b1c229b2` | 2026-03-13 | Merge pull request #276 from nitrobass24/fix/validate-ui-clarity | pending |
-| 481 | `4160d794f908aee1e158d14c45c4b859d0bdca3f` | 2026-03-14 | Update docs and changelog for v0.14.0 release | pending |
-| 482 | `dc763668be0a9706ca970ebe879fd739df635e5e` | 2026-03-14 | Fix ModelFile nullable types, add validation tests, fix changelog duplicate | pending |
-| 483 | `71ce3f1e30e7d4c799e7d9506a1e998ad845ae33` | 2026-03-14 | Fix xfer_verify description, add missing validation tests, remove changelog duplicate | pending |
-| 484 | `6b45b21d2fb0e2a6a67ecd5c1546854d3b56ae79` | 2026-03-14 | Release v0.14.0 — Alpine-only image, integrity checking, verbose logging | pending |
-| 485 | `a564c0d8ed0de2455ade504c7b8d9dbfbb493a43` | 2026-03-14 | Add missing v0.14.0 milestone features to changelog | pending |
-| 486 | `d00e64c595b51f525535bb040cf1afed2de43e95` | 2026-03-15 | chore(deps): bump the angular group in /src/angular with 9 updates | pending |
-| 487 | `ffe00c5a06271a3b989c8440300f7a9a07b77a01` | 2026-03-16 | Merge pull request #282 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-ae743420d6 | pending |
-| 488 | `a685c848918e5b9d7ba139471b1578ec91a419cb` | 2026-03-14 | Add missing v0.14.0 milestone features to changelog | pending |
-| 489 | `f03fc1f564590956929045a98cb46bb7d3930bee` | 2026-03-16 | Merge master into develop to sync v0.14.0 release | pending |
-| 490 | `60bc9384ad985c4c4ed8f367f0591abc6fa4940d` | 2026-03-16 | chore(deps-dev): bump vitest from 4.0.18 to 4.1.0 in /src/angular (#284) | pending |
-| 491 | `2949a72eb4a334e7c85f1421a4a48ea9741d4879` | 2026-03-16 | chore(deps-dev): bump jsdom from 27.4.0 to 29.0.0 in /src/angular (#283) | pending |
-| 492 | `818f0934c6505b477843e1c6a144b01aea3e9b8d` | 2026-03-17 | Consolidate Python deps to PEP 621 pyproject.toml (#287) | pending |
-| 493 | `ad3b590f3667a7c33d96d6149f3602bc2390139a` | 2026-03-17 | Add Ruff linting and formatting with CI enforcement (#288) | pending |
-| 494 | `0e19eb573882241cc5946f375498755c519537b2` | 2026-03-18 | Fix parser crash on chunk line-wrap from long filenames (#290) | pending |
-| 495 | `09fb7723d6160ac508493bdec41ffad333121735` | 2026-03-18 | Add Pyright type checking foundation (#249 Phase 1) (#292) | pending |
-| 496 | `d761a6872ee96163e507cf94b68fb04efc0ca49c` | 2026-03-18 | Fix parser crash: skip unrecognized lines inside job context (#293) | pending |
-| 497 | `cefc87fb8c4f95b01bf4e13b5139e44ba4e45c7d` | 2026-03-18 | Split Pyright into its own CI job for visibility | pending |
-| 498 | `7e470883a7343bc3a75cde30d50306924932fc3b` | 2026-03-18 | Fix 91 Pyright errors across small modules (Phase 2) (#295) | pending |
-| 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | pending |
-| 500 | `82343ce5f9222dd8b19153b0b9a62acfcc683304` | 2026-03-18 | Fix progress tracking for downloads with .lftp temp naming (#298) | pending |
-| 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | pending |
-| 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | pending |
-| 503 | `f96e41de21fd86db06d8babc4622db078be28249` | 2026-03-18 | Release v0.14.1 — Parser stability, progress tracking, tooling | pending |
+| 464 | `f6e6663bbedc9486b36ed6217b8bdcdd4a43cb45` | 2026-03-12 | Release v0.13.4 - Exclude patterns fix and Unraid parser resilience | intentionally skipped |
+| 465 | `b13d7d5a1bba9a904b2f7266614764353abbd91f` | 2026-03-12 | Fix v0.13.4 changelog to only include hotfix PRs | intentionally skipped |
+| 466 | `21ca414843b8da2860917e318bcf4773f3ef4846` | 2026-03-12 | Add debug log for LFTP queue command | needs integration |
+| 467 | `69c50edef63bfffa90d9107f7865252271720fbc` | 2026-03-12 | Fix exclude patterns: use --exclude-glob instead of --exclude | needs integration |
+| 468 | `8cacc58ba5e31422f11b9305ea5c6bb1af3a71cf` | 2026-03-12 | Allow workflow_dispatch to publish Docker images | needs area reopen |
+| 469 | `1fd8efbabaf949a07a46fa84e22279c983a694f6` | 2026-03-12 | Merge remote-tracking branch 'origin/master' into develop | covered elsewhere |
+| 470 | `a24d0431f4d7561d9336a24f89acad3ca4209df3` | 2026-03-12 | Silence redundant LftpModel log noise from temporary model (#267) | needs integration |
+| 471 | `6977fffe38993d8d455466483b53401830f3c458` | 2026-03-12 | Disable propagation on dummy logger to prevent log leakage | needs integration |
+| 472 | `fd0957621307f53d45277751abe1bcc6aa405dc2` | 2026-03-12 | Merge pull request #269 from nitrobass24/fix/model-log-noise | covered elsewhere |
+| 473 | `c7470447bf1dcbfd68f082ca0e75834b05c2fc52` | 2026-03-12 | Deduplicate amd64 Docker build in CI | needs area reopen |
+| 474 | `62360ad7c8e8e41d6afc76598af01201e3902768` | 2026-03-12 | Merge pull request #274 from nitrobass24/ci/deduplicate-amd64-build | covered elsewhere |
+| 475 | `f3de4cdd2005a45f4857277a6d0c3e91a8e2da93` | 2026-03-12 | Fix CI: inline SHOULD_PUBLISH expression in job-level if | needs area reopen |
+| 476 | `c4ca0ac30b7e2afddc47b1c5373ca2634e2ed00b` | 2026-03-12 | Prepare v0.14.0 release | intentionally skipped |
+| 477 | `cceea49d6b0670dfab0a072655f3d21b4f78559e` | 2026-03-12 | Release v0.13.5 - Exclude-glob fix and queue logging | intentionally skipped |
+| 478 | `bdc3d7d9e0dc14c580f915bfdd058de808dd18e8` | 2026-03-12 | Resolve merge conflicts and address PR review findings | needs new integration task |
+| 479 | `7b106632f967d74b886e727f9d56ce4c8a7343f9` | 2026-03-13 | Improve integrity check settings clarity and validate button UX | needs area reopen |
+| 480 | `dbfb2ae69e2dbede214437414fcf1bf6b1c229b2` | 2026-03-13 | Merge pull request #276 from nitrobass24/fix/validate-ui-clarity | covered elsewhere |
+| 481 | `4160d794f908aee1e158d14c45c4b859d0bdca3f` | 2026-03-14 | Update docs and changelog for v0.14.0 release | intentionally skipped |
+| 482 | `dc763668be0a9706ca970ebe879fd739df635e5e` | 2026-03-14 | Fix ModelFile nullable types, add validation tests, fix changelog duplicate | needs area reopen |
+| 483 | `71ce3f1e30e7d4c799e7d9506a1e998ad845ae33` | 2026-03-14 | Fix xfer_verify description, add missing validation tests, remove changelog duplicate | needs area reopen |
+| 484 | `6b45b21d2fb0e2a6a67ecd5c1546854d3b56ae79` | 2026-03-14 | Release v0.14.0 — Alpine-only image, integrity checking, verbose logging | intentionally skipped |
+| 485 | `a564c0d8ed0de2455ade504c7b8d9dbfbb493a43` | 2026-03-14 | Add missing v0.14.0 milestone features to changelog | intentionally skipped |
+| 486 | `d00e64c595b51f525535bb040cf1afed2de43e95` | 2026-03-15 | chore(deps): bump the angular group in /src/angular with 9 updates | intentionally skipped |
+| 487 | `ffe00c5a06271a3b989c8440300f7a9a07b77a01` | 2026-03-16 | Merge pull request #282 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-ae743420d6 | covered elsewhere |
+| 488 | `a685c848918e5b9d7ba139471b1578ec91a419cb` | 2026-03-14 | Add missing v0.14.0 milestone features to changelog | intentionally skipped |
+| 489 | `f03fc1f564590956929045a98cb46bb7d3930bee` | 2026-03-16 | Merge master into develop to sync v0.14.0 release | covered elsewhere |
+| 490 | `60bc9384ad985c4c4ed8f367f0591abc6fa4940d` | 2026-03-16 | chore(deps-dev): bump vitest from 4.0.18 to 4.1.0 in /src/angular (#284) | intentionally skipped |
+| 491 | `2949a72eb4a334e7c85f1421a4a48ea9741d4879` | 2026-03-16 | chore(deps-dev): bump jsdom from 27.4.0 to 29.0.0 in /src/angular (#283) | intentionally skipped |
+| 492 | `818f0934c6505b477843e1c6a144b01aea3e9b8d` | 2026-03-17 | Consolidate Python deps to PEP 621 pyproject.toml (#287) | needs new integration task |
+| 493 | `ad3b590f3667a7c33d96d6149f3602bc2390139a` | 2026-03-17 | Add Ruff linting and formatting with CI enforcement (#288) | needs new integration task |
+| 494 | `0e19eb573882241cc5946f375498755c519537b2` | 2026-03-18 | Fix parser crash on chunk line-wrap from long filenames (#290) | needs integration |
+| 495 | `09fb7723d6160ac508493bdec41ffad333121735` | 2026-03-18 | Add Pyright type checking foundation (#249 Phase 1) (#292) | needs new integration task |
+| 496 | `d761a6872ee96163e507cf94b68fb04efc0ca49c` | 2026-03-18 | Fix parser crash: skip unrecognized lines inside job context (#293) | needs integration |
+| 497 | `cefc87fb8c4f95b01bf4e13b5139e44ba4e45c7d` | 2026-03-18 | Split Pyright into its own CI job for visibility | needs area reopen |
+| 498 | `7e470883a7343bc3a75cde30d50306924932fc3b` | 2026-03-18 | Fix 91 Pyright errors across small modules (Phase 2) (#295) | needs new integration task |
+| 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | needs integration |
+| 500 | `82343ce5f9222dd8b19153b0b9a62acfcc683304` | 2026-03-18 | Fix progress tracking for downloads with .lftp temp naming (#298) | already integrated |
+| 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | intentionally skipped |
+| 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs integration |
+| 503 | `f96e41de21fd86db06d8babc4622db078be28249` | 2026-03-18 | Release v0.14.1 — Parser stability, progress tracking, tooling | intentionally skipped |
 | 504 | `484477b1d06a7b4c20e42c0cf521663260d8109a` | 2026-03-18 | Fix flaky test_scanner_process by retrying multiprocessing queue read | pending |
 | 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | pending |
 | 506 | `be75a422fa74d040940fb75928c49ff0d1980ccb` | 2026-03-18 | Merge pull request #301 from nitrobass24/chore/pyright-phase3-security-paths | pending |
