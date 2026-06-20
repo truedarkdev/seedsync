@@ -64,12 +64,23 @@ class ControllerHandler(IHandler):
             return None
         return os.path.realpath(local_path)
 
+    @staticmethod
+    def __check_file_name_safe(file_name: str) -> Optional[HTTPResponse]:
+        if (
+            not isinstance(file_name, str) or
+            file_name == "" or
+            any(ord(char) < 32 or ord(char) == 127 for char in file_name)
+        ):
+            return HTTPResponse(body="Invalid file path", status=400)
+        return None
+
     def __check_path_safe(self, file_name: str) -> Optional[HTTPResponse]:
         if self.__local_path_root is None:
             return HTTPResponse(body="Invalid file path", status=400)
 
-        if not isinstance(file_name, str) or file_name == "" or "\x00" in file_name:
-            return HTTPResponse(body="Invalid file path", status=400)
+        guard_response = ControllerHandler.__check_file_name_safe(file_name)
+        if guard_response:
+            return guard_response
 
         candidate_path = os.path.realpath(os.path.join(self.__local_path_root, file_name))
         try:
@@ -141,25 +152,48 @@ class ControllerHandler(IHandler):
         return callback, callback.wait(timeout=timeout)
 
     def __resolve_command_identifier(self, file_name: str, file_id: str = None, path_pair_id: str = None):
-        model_files = self.__controller.get_model_files()
+        guard_response = self.__check_file_name_safe(file_name)
+        if guard_response:
+            return None, None, guard_response
 
         if file_id is not None:
             if not isinstance(file_id, str) or file_id == "":
                 return None, None, HTTPResponse(body="Invalid file_id query parameter", status=400)
-            matches = [model_file for model_file in model_files if model_file.file_id == file_id]
-            if len(matches) != 1:
-                return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
-            return file_id, matches[0].name, None
+            guard_response = self.__check_file_name_safe(file_id)
+            if guard_response:
+                return None, None, guard_response
 
         if path_pair_id is not None:
             if not isinstance(path_pair_id, str) or path_pair_id == "":
                 return None, None, HTTPResponse(body="Invalid path_pair_id query parameter", status=400)
+            guard_response = self.__check_file_name_safe(path_pair_id)
+            if guard_response:
+                return None, None, guard_response
+
+        model_files = self.__controller.get_model_files()
+
+        if file_id is not None:
+            matches = [model_file for model_file in model_files if model_file.file_id == file_id]
+            if len(matches) != 1:
+                return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
+            guard_response = self.__check_file_name_safe(matches[0].name)
+            if guard_response:
+                return None, None, guard_response
+            return file_id, matches[0].name, None
+
+        if path_pair_id is not None:
             matches = [
                 model_file for model_file in model_files
                 if model_file.name == file_name and model_file.path_pair_id == path_pair_id
             ]
             if len(matches) != 1:
                 return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
+            guard_response = self.__check_file_name_safe(matches[0].file_id)
+            if guard_response:
+                return None, None, guard_response
+            guard_response = self.__check_file_name_safe(matches[0].name)
+            if guard_response:
+                return None, None, guard_response
             return matches[0].file_id, matches[0].name, None
 
         matches = [model_file for model_file in model_files if model_file.name == file_name]

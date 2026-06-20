@@ -2,6 +2,7 @@
 
 import json
 
+from common import Config
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
@@ -65,6 +66,29 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.post_json("/server/config/set/web/port", {"value": 8080})
         self.assertEqual(200, resp.status_int)
         self.assertEqual(8080, self.context.config.web.port)
+
+    def test_set_redacted_sentinel_is_rejected_for_sensitive_fields(self):
+        self.context.config.general.api_token = "existing-api-token"
+        self.context.config.lftp.remote_password = "existing-remote-password"
+
+        for sentinel in (Config.REDACTED_SENTINEL, Config.LEGACY_REDACTED_SENTINEL):
+            for section, key, expected_value in (
+                ("general", "api_token", "existing-api-token"),
+                ("lftp", "remote_password", "existing-remote-password"),
+            ):
+                with self.subTest(sentinel=sentinel, section=section, key=key):
+                    resp = self.test_app.post_json(
+                        "/server/config/set/{}/{}".format(section, key),
+                        {"value": sentinel},
+                        expect_errors=True
+                    )
+
+                    self.assertEqual(400, resp.status_int)
+                    self.assertEqual(expected_value, getattr(getattr(self.context.config, section), key))
+                    self.assertEqual(
+                        "Section '{}' option '{}' cannot be set to redacted value".format(section, key),
+                        str(resp.html)
+                    )
 
     def test_set_get_requests_no_longer_mutate(self):
         self.assertEqual(None, self.context.config.general.debug)

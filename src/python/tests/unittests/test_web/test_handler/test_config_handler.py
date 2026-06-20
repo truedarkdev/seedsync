@@ -142,6 +142,23 @@ class TestConfigHandlerSet(unittest.TestCase):
 
         self.assertEqual(400, response.status_code)
 
+    def test_set_sensitive_field_success_response_is_redacted(self):
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "remote_password",
+            "super-secret-password"
+        )
+
+        self.assertEqual(200, response.status_code)
+        inner.set_property.assert_called_once_with("remote_password", "super-secret-password")
+        self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), response.body)
+        self.assertNotIn("super-secret-password", response.body)
+
     def test_set_api_token_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
@@ -314,7 +331,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
 
         self.assertEqual(200, status_code)
         self.assertEqual("", config.lftp.remote_password)
-        self.assertIn("lftp.remote_password set to", body)
+        self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), body)
 
     def test_set_route_rejects_whitespace_remote_password_from_body(self):
         config = Config()
@@ -345,7 +362,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
 
         self.assertEqual(200, status_code)
         self.assertEqual("__empty__", config.lftp.remote_password)
-        self.assertIn("lftp.remote_password set to __empty__", body)
+        self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), body)
 
     def test_set_route_allows_logging_format_from_body(self):
         config = Config()

@@ -2,6 +2,7 @@
 
 import unittest
 import json
+from unittest.mock import MagicMock
 
 from common import Config
 from web.serialize import SerializeConfig
@@ -20,6 +21,30 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(True, out_dict["general"]["config_api_redact_remote_details"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
         self.assertNotIn("super-secret-token", out)
+
+    def test_section_general_redacts_webhook_secret_when_present(self):
+        config = MagicMock()
+        config.general.config_api_redact_remote_details = True
+        config.as_dict.return_value = {
+            "General": {
+                "debug": True,
+                "api_token": "super-secret-token",
+                "webhook_secret": "super-secret-webhook-secret",
+            },
+            "Lftp": {
+                "remote_password": "super-secret-ssh-password",
+            },
+        }
+
+        out = SerializeConfig.config(config)
+        out_dict = json.loads(out)
+
+        self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
+        self.assertEqual("**REDACTED**", out_dict["general"]["webhook_secret"])
+        self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
+        self.assertNotIn("super-secret-token", out)
+        self.assertNotIn("super-secret-webhook-secret", out)
+        self.assertNotIn("super-secret-ssh-password", out)
 
     def test_section_lftp(self):
         config = Config()

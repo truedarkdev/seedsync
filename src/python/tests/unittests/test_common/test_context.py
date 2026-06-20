@@ -161,7 +161,7 @@ class TestContext(unittest.TestCase):
                 call("  General.debug: True"),
                 call("  Lftp.remote_address: seedbox.example.com"),
                 call("  Lftp.remote_username: seeduser"),
-                call("  Lftp.remote_password: ********"),
+                call("  Lftp.remote_password: **REDACTED**"),
                 call("Path Pairs: (none)"),
                 call("Args:"),
                 call("  local_path_to_scanfs: /usr/bin/scanfs"),

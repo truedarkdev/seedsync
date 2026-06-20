@@ -6,14 +6,11 @@ import collections
 from common import Config
 
 
-_SENSITIVE_FIELDS = {
-    "lftp": ["remote_password"],
-    "general": ["api_token"],
-}
+_SENSITIVE_FIELDS = Config.SENSITIVE_FIELDS
 
 _REMOTE_DETAIL_FIELDS = ("remote_address", "remote_username", "remote_path")
 
-_REDACTED = "**REDACTED**"
+_REDACTED = Config.REDACTED_SENTINEL
 
 
 class SerializeConfig:
