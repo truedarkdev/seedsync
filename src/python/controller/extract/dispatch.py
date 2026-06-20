@@ -29,16 +29,16 @@ class ExtractListener(ABC):
     def extract_completed(self,
                           name: str,
                           is_dir: bool,
-                          file_id: str = None,
-                          path_pair_id: str = None):
+                          file_id: str | None = None,
+                          path_pair_id: str | None = None):
         pass
 
     @abstractmethod
     def extract_failed(self,
                        name: str,
                        is_dir: bool,
-                       file_id: str = None,
-                       path_pair_id: str = None):
+                       file_id: str | None = None,
+                       path_pair_id: str | None = None):
         pass
 
 
@@ -54,8 +54,8 @@ class ExtractStatus:
                  name: str,
                  is_dir: bool,
                  state: State,
-                 file_id: str = None,
-                 path_pair_id: str = None):
+                 file_id: str | None = None,
+                 path_pair_id: str | None = None):
         self.__name = name
         self.__is_dir = is_dir
         self.__state = state
@@ -72,10 +72,10 @@ class ExtractStatus:
     def state(self) -> State: return self.__state
 
     @property
-    def file_id(self) -> str: return self.__file_id
+    def file_id(self) -> str | None: return self.__file_id
 
     @property
-    def path_pair_id(self) -> str: return self.__path_pair_id
+    def path_pair_id(self) -> str | None: return self.__path_pair_id
 
     def __eq__(self, other):
         return self.__dict__ == other.__dict__
@@ -89,8 +89,8 @@ class ExtractDispatch:
         def __init__(self,
                      root_name: str,
                      root_is_dir: bool,
-                     root_file_id: str = None,
-                     path_pair_id: str = None):
+                     root_file_id: str | None = None,
+                     path_pair_id: str | None = None):
             self.root_name = root_name
             self.root_is_dir = root_is_dir
             self.root_file_id = root_file_id
@@ -101,14 +101,14 @@ class ExtractDispatch:
                         archive_path: str,
                         out_dir_path: str,
                         archive_name: str,
-                        archive_file_id: str = None,
-                        path_pair_id: str = None):
+                        archive_file_id: str | None = None,
+                        path_pair_id: str | None = None):
             self.archive_paths.append((archive_path, out_dir_path, archive_name, archive_file_id, path_pair_id))
 
     def __init__(self,
                  out_dir_path: str,
                  local_path: str,
-                 local_path_fallback: str = None,
+                 local_path_fallback: str | None = None,
                  managed_extract_folders_enabled: bool = True):
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
@@ -116,8 +116,7 @@ class ExtractDispatch:
         self.__managed_extract_folders_enabled = managed_extract_folders_enabled
 
         self.__task_queue = queue.Queue()
-        self.__worker = threading.Thread(name="ExtractWorker",
-                                         target=self.__worker)
+        self.__worker_thread: threading.Thread = threading.Thread(name="ExtractWorker", target=self.__worker)
         self.__worker_shutdown = threading.Event()
 
         self.__listeners = []
@@ -129,11 +128,11 @@ class ExtractDispatch:
         self.logger = base_logger.getChild(self.__class__.__name__)
 
     def start(self):
-        self.__worker.start()
+        self.__worker_thread.start()
 
     def stop(self):
         self.__worker_shutdown.set()
-        self.__worker.join()
+        self.__worker_thread.join()
 
     def add_listener(self, listener: ExtractListener):
         with self.__listeners_lock:

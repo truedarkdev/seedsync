@@ -8,7 +8,7 @@ import os
 import logging
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Optional, Type, TypeVar
+from typing import Optional, Type, TypeVar, cast
 import shutil
 import platform
 import tempfile
@@ -67,8 +67,10 @@ class Seedsync:
             config = Seedsync._create_default_config()
             config.to_file(self.config_path)
 
+        assert config is not None
+
         # Determine the true value of debug
-        is_debug = args.debug or config.general.debug
+        is_debug = bool(args.debug or config.general.debug)
 
         # Create context args
         ctx_args = Args()
@@ -99,17 +101,19 @@ class Seedsync:
         path_pair_manager = PathPairManager(args.config_dir)
         path_pair_manager.load()
         if path_pair_manager.migrate_from_config(
-                remote_path=config.lftp.remote_path,
-                local_path=config.lftp.local_path):
+                remote_path=cast(str, config.lftp.remote_path),
+                local_path=cast(str, config.lftp.local_path)):
             logger.info("Migrated legacy path config to path pairs")
 
         # Create context
-        self.context = Context(logger=logger,
-                               web_access_logger=web_access_logger,
-                               config=config,
-                               args=ctx_args,
-                               status=status,
-                               path_pair_manager=path_pair_manager)
+        self.context: Context = Context(
+            logger=logger,
+            web_access_logger=web_access_logger,
+            config=config,
+            args=ctx_args,
+            status=status,
+            path_pair_manager=path_pair_manager,
+        )
 
         # Register the signal handlers
         signal.signal(signal.SIGTERM, self.signal)
@@ -119,14 +123,14 @@ class Seedsync:
         self.context.print_to_log()
 
         # Load the persists
-        self.controller_persist_path = os.path.join(args.config_dir, Seedsync.__FILE_CONTROLLER_PERSIST)
-        self.controller_persist = self._load_persist(ControllerPersist, self.controller_persist_path)
+        self.controller_persist_path: str = os.path.join(args.config_dir, Seedsync.__FILE_CONTROLLER_PERSIST)
+        self.controller_persist: ControllerPersist = self._load_persist(ControllerPersist, self.controller_persist_path)
 
-        self.auto_queue_persist_path = os.path.join(args.config_dir, Seedsync.__FILE_AUTO_QUEUE_PERSIST)
-        self.auto_queue_persist = self._load_persist(AutoQueuePersist, self.auto_queue_persist_path)
+        self.auto_queue_persist_path: str = os.path.join(args.config_dir, Seedsync.__FILE_AUTO_QUEUE_PERSIST)
+        self.auto_queue_persist: AutoQueuePersist = self._load_persist(AutoQueuePersist, self.auto_queue_persist_path)
 
-        self.api_key_store_path = os.path.join(args.config_dir, Seedsync.__FILE_API_KEY_STORE)
-        self.api_key_store = self._load_persist(ApiKeyStore, self.api_key_store_path)
+        self.api_key_store_path: str = os.path.join(args.config_dir, Seedsync.__FILE_API_KEY_STORE)
+        self.api_key_store: ApiKeyStore = self._load_persist(ApiKeyStore, self.api_key_store_path)
         self.api_key_store.bind_file_path(self.api_key_store_path)
         self.api_key_store.bind_bootstrap_proof_path(
             os.path.join(tempfile.gettempdir(), Seedsync.__FILE_BOOTSTRAP_PROOF)
@@ -135,14 +139,12 @@ class Seedsync:
     def run(self):
         self.context.logger.info("Starting SeedSync")
         self.context.logger.info("Platform: {}".format(platform.machine()))
-        api_key_store = getattr(self, "api_key_store", None)
-        if api_key_store is not None:
-            api_key_store.ensure_bootstrap_proof()
+        self.api_key_store.ensure_bootstrap_proof()
         Seedsync._emit_startup_warnings(
             self.context.logger,
             self.context.config,
-            getattr(self, "api_key_store", None),
-            web_bind_host=getattr(self.context.args, "web_bind_host", "0.0.0.0")
+            self.api_key_store,
+            web_bind_host=self.context.args.web_bind_host or "0.0.0.0"
         )
 
         if self.context.args.exit:
@@ -157,12 +159,7 @@ class Seedsync:
         auto_queue = AutoQueue(self.context, self.auto_queue_persist, controller)
 
         # Create web app
-        web_app_builder = WebAppBuilder(
-            self.context,
-            controller,
-            self.auto_queue_persist,
-            getattr(self, "api_key_store", None)
-        )
+        web_app_builder = WebAppBuilder(self.context, controller, self.auto_queue_persist, self.api_key_store)
         web_app = web_app_builder.build()
 
         # Define child threads
@@ -179,7 +176,9 @@ class Seedsync:
         do_start_controller = True
 
         # Initial checks to see if we should bother starting the controller
-        incomplete_fields = Seedsync._detect_incomplete_config(self.context.config, self.context.path_pair_manager)
+        path_pair_manager = self.context.path_pair_manager
+        assert path_pair_manager is not None
+        incomplete_fields = Seedsync._detect_incomplete_config(self.context.config, path_pair_manager)
         if incomplete_fields:
             do_start_controller = False
             self.context.logger.error("Config is incomplete: %s", ", ".join(incomplete_fields))
@@ -363,12 +362,13 @@ class Seedsync:
 
         # Whether package is frozen
         is_frozen = getattr(sys, 'frozen', False)
+        meipass = getattr(sys, "_MEIPASS", None)  # type: ignore[attr-defined]
 
         # Html path is only required if not running a frozen package
         # For a frozen package, set default to root/html
         # noinspection PyUnresolvedReferences
         # noinspection PyProtectedMember
-        default_html_path = os.path.join(sys._MEIPASS, "html") if is_frozen else None
+        default_html_path = os.path.join(meipass, "html") if is_frozen and meipass is not None else None
         parser.add_argument("--html",
                             required=not is_frozen,
                             default=default_html_path,
@@ -378,7 +378,7 @@ class Seedsync:
         # For a frozen package, set default to root/scanfs
         # noinspection PyUnresolvedReferences
         # noinspection PyProtectedMember
-        default_scanfs_path = os.path.join(sys._MEIPASS, "scanfs") if is_frozen else None
+        default_scanfs_path = os.path.join(meipass, "scanfs") if is_frozen and meipass is not None else None
         parser.add_argument("--scanfs",
                             required=not is_frozen,
                             default=default_scanfs_path,
@@ -483,7 +483,7 @@ class Seedsync:
         return config
 
     @staticmethod
-    def _detect_incomplete_config(config: Config, path_pair_manager: PathPairManager = None) -> list:
+    def _detect_incomplete_config(config: Config, path_pair_manager: PathPairManager | None = None) -> list:
         incomplete_fields = []
         config_dict = config.as_dict()
         skip_fields = set()
@@ -508,7 +508,7 @@ class Seedsync:
     def _emit_startup_warnings(
         logger: logging.Logger,
         config: Config,
-        auth_store: ApiKeyStore = None,
+        auth_store: ApiKeyStore | None = None,
         web_bind_host: str = "0.0.0.0"
     ) -> None:
         general_config = getattr(config, "general", None)
@@ -566,25 +566,25 @@ class Seedsync:
                 )
 
     @staticmethod
-    def _load_persist(cls: Type[T_Persist], file_path: str) -> T_Persist:
+    def _load_persist(persist_cls: Type[T_Persist], file_path: str) -> T_Persist:
         """
         Loads a persist from file.
         Backs up existing persist if it's corrupted. Returns a new blank
         persist in its place.
-        :param cls:
+        :param persist_cls:
         :param file_path:
         :return:
         """
         if os.path.isfile(file_path):
             try:
-                return cls.from_file(file_path)
+                return persist_cls.from_file(file_path)
             except PersistError as exc:
                 if Seedsync.logger:
                     Seedsync.logger.exception("Caught exception")
 
                 # backup file
                 backup_path = Seedsync.__backup_file(file_path)
-                if cls is ApiKeyStore:
+                if persist_cls is ApiKeyStore:
                     append_api_key_store_history(
                         file_path,
                         "store_load_failed",
@@ -595,10 +595,10 @@ class Seedsync:
                     )
 
                 # noinspection PyCallingNonCallable
-                return cls()
+                return persist_cls()
         else:
             # noinspection PyCallingNonCallable
-            return cls()
+            return persist_cls()
 
     @staticmethod
     def __backup_file(file_path: str):
@@ -629,10 +629,13 @@ if __name__ == "__main__":
         except ServiceExit:
             break
         except ServiceRestart:
-            Seedsync.logger.info("Restarting...")
+            if Seedsync.logger is not None:
+                Seedsync.logger.info("Restarting...")
             continue
         except Exception as e:
-            Seedsync.logger.exception("Caught exception")
+            if Seedsync.logger is not None:
+                Seedsync.logger.exception("Caught exception")
             raise
 
-        Seedsync.logger.info("Exited successfully")
+        if Seedsync.logger is not None:
+            Seedsync.logger.info("Exited successfully")

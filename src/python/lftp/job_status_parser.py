@@ -427,6 +427,7 @@ class LftpJobStatusParser:
                 result_at = chunk_at_m.search(line)
                 result_at2 = chunk_at2_m.search(line)
                 result_got = chunk_got_m.search(line)
+                assert prev_job is not None
                 if result_at:
                     # filename is full path, but chunk name is only normpath
                     if result_at.group("name") != os.path.basename(os.path.normpath(name)):

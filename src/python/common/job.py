@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from types import TracebackType
 
 # my libs
 from .context import Context
@@ -27,7 +28,7 @@ class Job(threading.Thread, ABC):
         self.__setup_complete = threading.Event()
 
         # For exception propagation
-        self.exc_info = None
+        self.exc_info: tuple[type[BaseException] | None, BaseException | None, TracebackType | None] | None = None
 
     @overrides(threading.Thread)
     def run(self):
@@ -76,7 +77,7 @@ class Job(threading.Thread, ABC):
         """
         self.shutdown_flag.set()
 
-    def wait_until_setup_complete(self, timeout: float = None) -> bool:
+    def wait_until_setup_complete(self, timeout: float | None = None) -> bool:
         """
         Wait for the job setup phase to finish.
         :param timeout:
@@ -100,7 +101,8 @@ class Job(threading.Thread, ABC):
         if self.exc_info:
             exc_info = self.exc_info
             self.exc_info = None
-            raise exc_info[1].with_traceback(exc_info[2])
+            if exc_info[1] is not None:
+                raise exc_info[1].with_traceback(exc_info[2])
 
     def _get_sleep_interval_in_secs(self) -> float:
         """

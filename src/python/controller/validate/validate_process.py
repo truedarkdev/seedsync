@@ -6,7 +6,7 @@ import multiprocessing
 import os
 import queue
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, cast
 
 from common import overrides, AppProcess
 from model import ModelFile
@@ -39,10 +39,10 @@ class ValidateProcess(AppProcess):
                  remote_port: int,
                  local_path: str,
                  remote_path: str,
-                 path_pairs_by_id: Dict[str, object]):
+        path_pairs_by_id: Dict[str, object]):
         super().__init__(name=self.__class__.__name__)
-        self.__command_queue = multiprocessing.Queue()
-        self.__status_result_queue = multiprocessing.Queue()
+        self.__command_queue: multiprocessing.Queue | None = multiprocessing.Queue()
+        self.__status_result_queue: multiprocessing.Queue | None = multiprocessing.Queue()
         self.__ssh = Sshcp(
             host=remote_address,
             port=remote_port,
@@ -51,7 +51,7 @@ class ValidateProcess(AppProcess):
         )
         self.__local_path = local_path
         self.__remote_path = remote_path
-        self.__path_pairs_by_id = {
+        self.__path_pairs_by_id: dict[str, dict[str, str | None]] = {
             pair_id: {
                 "local_path": getattr(pair, "local_path", None),
                 "remote_path": getattr(pair, "remote_path", None)
@@ -60,9 +60,11 @@ class ValidateProcess(AppProcess):
         self.__statuses = {}
 
     def validate(self, file: ModelFile):
+        assert self.__command_queue is not None
         self.__command_queue.put(("validate", file))
 
     def clear(self, file_id: str):
+        assert self.__command_queue is not None
         self.__command_queue.put(("clear", file_id))
 
     def set_path_pairs_by_id(self, path_pairs_by_id: Dict[str, object]):
@@ -72,12 +74,14 @@ class ValidateProcess(AppProcess):
                 "remote_path": getattr(pair, "remote_path", None)
             } for pair_id, pair in path_pairs_by_id.items()
         }
+        assert self.__command_queue is not None
         self.__command_queue.put(("set_path_pairs_by_id", self.__path_pairs_by_id))
 
     def pop_latest_statuses(self) -> Optional[ValidateStatusResult]:
         latest_result = None
         try:
             while True:
+                assert self.__status_result_queue is not None
                 latest_result = self.__status_result_queue.get(block=False)
         except queue.Empty:
             pass
@@ -91,6 +95,7 @@ class ValidateProcess(AppProcess):
 
     def run_loop(self):
         try:
+            assert self.__command_queue is not None
             command, payload = self.__command_queue.get(timeout=self.__DEFAULT_SLEEP_INTERVAL_IN_SECS)
         except queue.Empty:
             return
@@ -134,6 +139,7 @@ class ValidateProcess(AppProcess):
         super().close_queues()
 
     def __publish_statuses(self):
+        assert self.__status_result_queue is not None
         self.__status_result_queue.put(
             ValidateStatusResult(
                 timestamp=datetime.datetime.now(),
@@ -291,9 +297,21 @@ class ValidateProcess(AppProcess):
         return True, None
 
     def __get_local_base_path(self, path_pair_id: Optional[str]) -> str:
+        if path_pair_id is None:
+            return self.__local_path
         pair = self.__path_pairs_by_id.get(path_pair_id)
-        return pair["local_path"] if pair and pair.get("local_path") else self.__local_path
+        if pair is not None:
+            local_path = pair.get("local_path")
+            if isinstance(local_path, str) and local_path:
+                return local_path
+        return self.__local_path
 
     def __get_remote_base_path(self, path_pair_id: Optional[str]) -> str:
+        if path_pair_id is None:
+            return self.__remote_path
         pair = self.__path_pairs_by_id.get(path_pair_id)
-        return pair["remote_path"] if pair and pair.get("remote_path") else self.__remote_path
+        if pair is not None:
+            remote_path = pair.get("remote_path")
+            if isinstance(remote_path, str) and remote_path:
+                return remote_path
+        return self.__remote_path

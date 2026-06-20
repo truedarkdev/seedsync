@@ -1,15 +1,18 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-import logging
-from typing import Optional, List
-import time
 import copy
+import logging
+import time
 from threading import Lock
+from typing import TYPE_CHECKING
 
 from ..web_app import IStreamHandler
 from ..utils import StreamQueue
 from ..serialize import SerializeLogRecord
 from common import overrides
+
+if TYPE_CHECKING:
+    from ..web_app import WebApp
 
 
 class CachedQueueLogHandler(logging.Handler):
@@ -27,7 +30,7 @@ class CachedQueueLogHandler(logging.Handler):
         self.__cached_records = []
         self.__cache_lock = Lock()
 
-    def get_cached_records(self) -> List[logging.LogRecord]:
+    def get_cached_records(self) -> list[logging.LogRecord]:
         with self.__cache_lock:
             self.__prune_history()
             cache = copy.copy(self.__cached_records)
@@ -77,7 +80,7 @@ class LogStreamHandler(IStreamHandler):
     _CACHE_HISTORY_SIZE_IN_MS = 3000
 
     # Cache of logs
-    _cache = None
+    _cache: CachedQueueLogHandler | None = None
 
     def __init__(self, logger: logging.Logger):
         self.logger = logger
@@ -99,13 +102,14 @@ class LogStreamHandler(IStreamHandler):
     @overrides(IStreamHandler)
     def setup(self):
         # Send out all the cached records first
+        assert LogStreamHandler._cache is not None
         for record in LogStreamHandler._cache.get_cached_records():
             self.handler.emit(record)
         # Then subscribe the live stream
         self.logger.addHandler(self.handler)
 
     @overrides(IStreamHandler)
-    def get_value(self) -> Optional[str]:
+    def get_value(self) -> str | None:
         record = self.handler.get_next_event()
         if record is not None:
             return self.serialize.record(record)
