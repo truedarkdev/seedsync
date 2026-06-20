@@ -48,7 +48,7 @@ describe("Testing config record initialization", () => {
                 auto_extract: true,
             },
             logging: {
-                log_format: "json"
+                log_format: "JSON"
             }
         };
         config = new Config(configJson);
@@ -116,5 +116,21 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
         expect(partialConfig.getValue("logging", "log_format")).toBe("standard");
         expect(partialConfig.getValue("missing", "value")).toBe(null);
+    });
+
+    it("should normalize logging format values", () => {
+        const normalizedConfig = new Config({
+            logging: {
+                log_format: "Standard"
+            }
+        });
+        const blankLoggingConfig = new Config({
+            logging: {
+                log_format: "   "
+            }
+        });
+
+        expect(normalizedConfig.logging.log_format).toBe("standard");
+        expect(blankLoggingConfig.logging.log_format).toBe("standard");
     });
 });

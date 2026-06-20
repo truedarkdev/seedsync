@@ -46,8 +46,7 @@ export class ConfigService extends BaseWebService {
         const normalizedValue = this.normalizeValue(section, option, value);
         const valueStr: string = String(normalizedValue);
         const allowBlankValue = section === "lftp" &&
-            (option === "remote_password" || option === "net_socket_buffer") ||
-            (section === "logging" && option === "log_format");
+            (option === "remote_password" || option === "net_socket_buffer");
         const currentConfig = this._config.getValue();
         if (!currentConfig || !currentConfig.has(section) || !currentConfig.get(section).has(option)) {
             return new Observable<WebReaction>(observer => {
@@ -109,6 +108,9 @@ export class ConfigService extends BaseWebService {
         if (section === "lftp" && option === "net_socket_buffer") {
             return this.normalizeNetSocketBufferValue(value);
         }
+        if (section === "logging" && option === "log_format") {
+            return this.normalizeLogFormatValue(value);
+        }
         return value;
     }
 
@@ -121,6 +123,17 @@ export class ConfigService extends BaseWebService {
             return valueStr.slice(0, -1) + valueStr.slice(-1).toUpperCase();
         }
         return valueStr;
+    }
+
+    private normalizeLogFormatValue(value: any): string {
+        if (value === null || value === undefined) {
+            return "";
+        }
+        const valueStr = String(value).trim();
+        if (valueStr.length === 0) {
+            return valueStr;
+        }
+        return valueStr.toLowerCase();
     }
 }
 

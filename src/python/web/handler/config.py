@@ -79,7 +79,12 @@ class ConfigHandler(IHandler):
             inner_config.set_property(key, value)
             if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
                 self.__breadcrumb_trace_sync()
-            response_value = Config.REDACTED_SENTINEL if Config.is_sensitive_field(section, key) else value
+            if Config.is_sensitive_field(section, key):
+                response_value = Config.REDACTED_SENTINEL
+            elif isinstance(getattr(type(inner_config), key, None), property):
+                response_value = getattr(inner_config, key)
+            else:
+                response_value = value
             return HTTPResponse(body="{}.{} set to {}".format(section, key, response_value))
         except ConfigError as e:
             return HTTPResponse(body=str(e), status=400)

@@ -158,6 +158,7 @@ export class Config extends ConfigRecord implements IConfig {
 
     constructor(props) {
         const general = Config.normalizeGeneral((props && props.general) || {});
+        const logging = Config.normalizeLogging((props && props.logging) || {});
         // Create immutable members
         super({
             general: GeneralRecord(general),
@@ -165,7 +166,7 @@ export class Config extends ConfigRecord implements IConfig {
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
             autoqueue: AutoQueueRecord((props && props.autoqueue) || {}),
-            logging: LoggingRecord((props && props.logging) || {})
+            logging: LoggingRecord(logging)
         });
     }
 
@@ -195,6 +196,23 @@ export class Config extends ConfigRecord implements IConfig {
         }
         delete normalized.debug;
         return normalized as IGeneral;
+    }
+
+    private static normalizeLogging(logging: {[key: string]: any}): ILogging {
+        const normalized = typeof logging.toJS === "function"
+            ? {...logging.toJS()}
+            : {...logging};
+        if (typeof normalized.log_format === "string") {
+            const logFormat = normalized.log_format.trim().toLowerCase();
+            if (logFormat.length === 0) {
+                delete normalized.log_format;
+            } else {
+                normalized.log_format = logFormat;
+            }
+        } else if (normalized.log_format === undefined || normalized.log_format === null) {
+            delete normalized.log_format;
+        }
+        return normalized as ILogging;
     }
 
     getValue(section: string, option: string): any {

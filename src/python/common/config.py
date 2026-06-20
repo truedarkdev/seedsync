@@ -40,6 +40,7 @@ T = TypeVar('T', bound='InnerConfig')
 
 _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORECASE)
 _LOG_LEVEL_VALUES = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
+_LOG_FORMAT_VALUES = frozenset(("standard", "json"))
 
 
 def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
@@ -54,6 +55,23 @@ def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
         ))
     if normalized not in _LOG_LEVEL_VALUES:
         raise ConfigError("Bad config: {}.{} ({}) must be one of DEBUG, INFO, WARNING, ERROR, or CRITICAL".format(
+            config_cls.__name__, name, value
+        ))
+    return normalized
+
+
+def _normalize_log_format(config_cls: Any, name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("Bad config: {}.{} ({}) must be either standard or json".format(
+            config_cls.__name__, name, value
+        ))
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ConfigError("Bad config: {}.{} is empty".format(
+            config_cls.__name__, name
+        ))
+    if normalized not in _LOG_FORMAT_VALUES:
+        raise ConfigError("Bad config: {}.{} ({}) must be either standard or json".format(
             config_cls.__name__, name, value
         ))
     return normalized
@@ -129,6 +147,10 @@ class Checkers:
     @staticmethod
     def log_level(config_cls: Any, name: str, value: str) -> str:
         return _normalize_log_level(config_cls, name, value)
+
+    @staticmethod
+    def log_format(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_log_format(config_cls, name, value)
 
     @staticmethod
     def int_non_negative(config_cls: Any, name: str, value: int) -> int:
@@ -521,7 +543,7 @@ class Config(Persist):
             return super().from_dict(config_dict)
 
     class Logging(IC):
-        log_format = PROP("log_format", Checkers.string_allow_empty, Converters.null)
+        log_format = PROP("log_format", Checkers.log_format, Converters.null)
 
         def __init__(self):
             super().__init__()
@@ -530,6 +552,9 @@ class Config(Persist):
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
             if "log_format" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["log_format"] = "standard"
+            elif isinstance(config_dict["log_format"], str) and not config_dict["log_format"].strip():
                 config_dict = dict(config_dict)
                 config_dict["log_format"] = "standard"
             return super().from_dict(config_dict)

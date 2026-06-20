@@ -639,19 +639,17 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.AutoQueue, good_dict, "auto_delete_remote", "-1")
 
     def test_logging(self):
-        good_dict = {
-            "log_format": "json"
-        }
-        logging_config = Config.Logging.from_dict(good_dict)
-        self.assertEqual("json", logging_config.log_format)
+        self.assertEqual("json", Config.Logging.from_dict({"log_format": "json"}).log_format)
+        self.assertEqual("json", Config.Logging.from_dict({"log_format": "JSON"}).log_format)
         self.assertEqual("standard", Config.Logging.from_dict({}).log_format)
+        self.assertEqual("standard", Config.Logging.from_dict({"log_format": ""}).log_format)
 
-    def test_logging_allows_empty_value(self):
-        logging_config = Config.Logging.from_dict({
-            "log_format": ""
-        })
-
-        self.assertEqual("", logging_config.log_format)
+        with self.assertRaises(ConfigError) as error:
+            Config.Logging.from_dict({"log_format": "text"})
+        self.assertEqual(
+            "Bad config: Logging.log_format (text) must be either standard or json",
+            str(error.exception)
+        )
 
     def test_from_file(self):
         with tempfile.NamedTemporaryFile("w", delete=False) as config_file:
@@ -694,6 +692,9 @@ class TestConfig(unittest.TestCase):
         enabled=False
         patterns_only=True
         auto_extract=True
+
+        [Logging]
+        log_format=
         """)
             config_path = config_file.name
 
@@ -795,7 +796,7 @@ class TestConfig(unittest.TestCase):
             config.autoqueue.patterns_only = True
             config.autoqueue.auto_extract = False
             config.autoqueue.auto_delete_remote = False
-            config.logging.log_format = "json"
+            config.logging.log_format = "JSON"
             config.to_file(config_file_path)
             with open(config_file_path, "r") as f:
                 actual_str = f.read()
