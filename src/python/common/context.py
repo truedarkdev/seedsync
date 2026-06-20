@@ -84,10 +84,10 @@ class Context:
     def __redact_config_log_value(self, section, option, value):
         section_name = str(section).lower()
         option_name = str(option).lower()
-        if section_name == "general" and option_name in {"api_token", "webhook_secret"}:
-            return "**REDACTED**"
-        if section_name == "lftp" and option_name == "remote_password":
-            return "********" if value else ""
+        if Config.is_sensitive_field(section_name, option_name):
+            if section_name == "lftp" and option_name == "remote_password":
+                return Config.REDACTED_SENTINEL if value else ""
+            return Config.REDACTED_SENTINEL
         return value
 
     @staticmethod

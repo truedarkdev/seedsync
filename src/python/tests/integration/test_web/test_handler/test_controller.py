@@ -9,6 +9,18 @@ from controller import Controller
 from web.handler.controller import ControllerHandler
 
 
+class _PathPairIdentityMatchStr(str):
+    def __new__(cls, value: str, match_value: str):
+        obj = str.__new__(cls, value)
+        obj._match_value = match_value
+        return obj
+
+    def __eq__(self, other):
+        return other == self._match_value or str.__eq__(self, other)
+
+    __hash__ = str.__hash__
+
+
 class TestControllerHandler(BaseTestWebApp):
     def setUp(self):
         super().setUp()
@@ -60,6 +72,69 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("value\"with\"doublequote", command.filename)
+
+    def test_queue_rejects_ascii_control_characters(self):
+        for control_char in ("\n", "\r", "\t", "\x01", "\x7f"):
+            with self.subTest(control_char=repr(control_char)):
+                self.controller.queue_command = MagicMock()
+                uri = quote(quote("bad{}name".format(control_char), safe=""), safe="")
+
+                response = self.test_app.post("/server/command/queue/" + uri, expect_errors=True)
+
+                self.assertEqual(400, response.status_code)
+                self.assertEqual("Invalid file path", response.text)
+                self.controller.queue_command.assert_not_called()
+
+    def test_queue_rejects_control_characters_in_identity_resolved_file_id(self):
+        self.controller.queue_command = MagicMock()
+        bad_file_id = quote("bad\x01id", safe="")
+
+        response = self.test_app.post("/server/command/queue/safe-name?file_id={}".format(bad_file_id), expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_queue_rejects_control_characters_in_identity_resolved_model_name(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file("bad\x01name", "safe-file-id")
+        ]
+
+        response = self.test_app.post("/server/command/queue/safe-name?file_id=safe-file-id", expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_queue_rejects_control_characters_in_raw_path_pair_id(self):
+        self.controller.queue_command = MagicMock()
+        bad_path_pair_id = quote("bad\x01id", safe="")
+
+        response = self.test_app.post(
+            "/server/command/queue/safe-name?path_pair_id={}".format(bad_path_pair_id),
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_queue_accepts_path_pair_identity(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", "[\"movies\",\"dup\"]", "movies")
+        ]
+
+        response = self.test_app.post("/server/command/queue/dup?path_pair_id=movies")
+
+        self.assertEqual(200, response.status_code)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("[\"movies\",\"dup\"]", command.filename)
 
     def test_stop(self):
         def side_effect(cmd: Controller.Command):
@@ -360,6 +435,30 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("[\"tv\",\"dup\"]", command.filename)
 
+    def test_queue_rejects_control_characters_in_path_pair_id_resolved_file_id(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file("safe-name", "bad\x01id", "movies")
+        ]
+
+        response = self.test_app.post("/server/command/queue/safe-name?path_pair_id=movies", expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_queue_rejects_control_characters_in_path_pair_id_resolved_model_name(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file(_PathPairIdentityMatchStr("bad\x01name", "safe-name"), "safe-file-id", "movies")
+        ]
+
+        response = self.test_app.post("/server/command/queue/safe-name?path_pair_id=movies", expect_errors=True)
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
     def test_queue_rejects_ambiguous_filename_without_identity(self):
         self.controller.get_model_files.return_value = [
             self.__model_file("dup", "[\"movies\",\"dup\"]", "movies"),
@@ -398,6 +497,29 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(2, len(seen_commands))
         self.assertEqual("[\"movies\",\"dup\"]", seen_commands[0].filename)
         self.assertEqual("[\"tv\",\"dup\"]", seen_commands[1].filename)
+
+    def test_bulk_queue_accepts_path_pair_identity_objects(self):
+        seen_commands = []
+
+        def side_effect(cmd: Controller.Command):
+            seen_commands.append(cmd)
+            cmd.callbacks[0].on_success()
+
+        self.controller.queue_command = MagicMock()
+        self.controller.queue_command.side_effect = side_effect
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", "[\"movies\",\"dup\"]", "movies")
+        ]
+
+        response = self.test_app.post_json("/server/command/bulk/queue", {
+            "files": [
+                {"name": "dup", "path_pair_id": "movies"}
+            ]
+        })
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(1, len(seen_commands))
+        self.assertEqual("[\"movies\",\"dup\"]", seen_commands[0].filename)
 
     def test_bulk_queue_partial_failure_returns_summary(self):
         call_count = 0
@@ -472,6 +594,64 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
         self.assertEqual("good-file-id", command.filename)
+
+    def test_bulk_queue_rejects_control_characters_in_identity_resolved_file_id(self):
+        self.controller.queue_command = MagicMock()
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"files": [{"name": "safe-name", "file_id": "bad\x01id"}]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_bulk_queue_rejects_control_characters_in_raw_path_pair_id(self):
+        self.controller.queue_command = MagicMock()
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"files": [{"name": "safe-name", "path_pair_id": "bad\x01id"}]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_bulk_queue_rejects_control_characters_in_path_pair_id_resolved_file_id(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file("safe-name", "bad\x01id", "movies")
+        ]
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"files": [{"name": "safe-name", "path_pair_id": "movies"}]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
+
+    def test_bulk_queue_rejects_control_characters_in_path_pair_id_resolved_model_name(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file(_PathPairIdentityMatchStr("bad\x01name", "safe-name"), "safe-file-id", "movies")
+        ]
+
+        response = self.test_app.post_json(
+            "/server/command/bulk/queue",
+            {"files": [{"name": "safe-name", "path_pair_id": "movies"}]},
+            expect_errors=True
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("Invalid file path", response.text)
+        self.controller.queue_command.assert_not_called()
 
     def test_bulk_extract_rejects_path_traversal_and_continues(self):
         def side_effect(cmd: Controller.Command):

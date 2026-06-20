@@ -283,6 +283,24 @@ class Config(Persist):
     """
     Configuration registry
     """
+    REDACTED_SENTINEL = "**REDACTED**"
+    LEGACY_REDACTED_SENTINEL = "********"
+    REDACTED_SENTINELS = frozenset((REDACTED_SENTINEL, LEGACY_REDACTED_SENTINEL))
+    SENSITIVE_FIELDS = collections.OrderedDict([
+        ("general", ("api_token", "webhook_secret")),
+        ("lftp", ("remote_password",)),
+    ])
+
+    @classmethod
+    def is_sensitive_field(cls, section: str, key: str) -> bool:
+        if not isinstance(section, str) or not isinstance(key, str):
+            return False
+        return key in cls.SENSITIVE_FIELDS.get(section.lower(), ())
+
+    @classmethod
+    def is_redacted_value(cls, value: Any) -> bool:
+        return isinstance(value, str) and value in cls.REDACTED_SENTINELS
+
     class General(IC):
         debug = PROP("debug", Checkers.null, Converters.bool)
         verbose = PROP("verbose", Checkers.null, Converters.bool)

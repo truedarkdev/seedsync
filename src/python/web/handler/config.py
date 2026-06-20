@@ -62,6 +62,11 @@ class ConfigHandler(IHandler):
         inner_config = getattr(self.__config, section)
         if not inner_config.has_property(key):
             return HTTPResponse(body="Section '{}' in config has no option '{}'".format(section, key), status=404)
+        if Config.is_sensitive_field(section, key) and Config.is_redacted_value(value):
+            return HTTPResponse(
+                body="Section '{}' option '{}' cannot be set to redacted value".format(section, key),
+                status=400
+            )
         if (
             section in ConfigHandler.__BODY_SET_BLOCKED_FIELDS and
             key in ConfigHandler.__BODY_SET_BLOCKED_FIELDS[section]
@@ -74,6 +79,7 @@ class ConfigHandler(IHandler):
             inner_config.set_property(key, value)
             if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
                 self.__breadcrumb_trace_sync()
-            return HTTPResponse(body="{}.{} set to {}".format(section, key, value))
+            response_value = Config.REDACTED_SENTINEL if Config.is_sensitive_field(section, key) else value
+            return HTTPResponse(body="{}.{} set to {}".format(section, key, response_value))
         except ConfigError as e:
             return HTTPResponse(body=str(e), status=400)
