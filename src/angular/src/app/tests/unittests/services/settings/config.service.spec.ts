@@ -93,6 +93,9 @@ describe("Testing config service", () => {
             autoqueue: {
                 enabled: true,
                 patterns_only: false
+            },
+            logging: {
+                log_format: "JSON"
             }
         };
         httpMock.expectOne("/server/config/get").flush(configJson);
@@ -125,7 +128,7 @@ describe("Testing config service", () => {
                 expect(config.autoqueue.enabled).toBe(true);
                 expect(config.autoqueue.patterns_only).toBe(false);
                 expect(config.autoqueue.auto_delete_remote).toBe(false);
-                expect(config.logging.log_format).toBe("standard");
+                expect(config.logging.log_format).toBe("json");
             }
         });
 
@@ -263,11 +266,11 @@ describe("Testing config service", () => {
     });
 
     it("should send a POST on setting log format", () => {
-        httpMock.expectOne("/server/config/get").flush({});
+        httpMock.expectOne("/server/config/get").flush({logging: {log_format: "standard"}});
 
-        configService.set("logging", "log_format", "json").subscribe(DoNothing);
+        configService.set("logging", "log_format", "STANDARD").subscribe(DoNothing);
 
-        expectConfigSetRequest("logging", "log_format", "json");
+        expectConfigSetRequest("logging", "log_format", "standard");
         httpMock.verify();
     });
 
@@ -382,12 +385,19 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
-    it("should allow empty log_format values", () => {
-        httpMock.expectOne("/server/config/get").flush({});
+    it("should return error on empty log_format values", () => {
+        httpMock.expectOne("/server/config/get").flush({logging: {log_format: "standard"}});
 
-        configService.set("logging", "log_format", "").subscribe(DoNothing);
+        let configSubscriberIndex = 0;
+        configService.set("logging", "log_format", "").subscribe({
+            next: reaction => {
+                configSubscriberIndex++;
+                expect(reaction.success).toBe(false);
+                expect(reaction.errorMessage).toBe("Setting logging.log_format cannot be blank.");
+            }
+        });
 
-        expectConfigSetRequest("logging", "log_format", "");
+        expect(configSubscriberIndex).toBe(1);
         httpMock.verify();
     });
 

@@ -151,19 +151,6 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
     ]
 };
 
-export const OPTIONS_CONTEXT_LOGGING: IOptionsContext = {
-    header: "Logging",
-    id: "logging",
-    options: [
-        {
-            type: OptionType.Text,
-            label: "Log Format",
-            valuePath: ["logging", "log_format"],
-            description: 'Log output format: "standard" or "json"'
-        }
-    ]
-};
-
 export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
     header: "Other Settings",
     id: "other-settings",
@@ -179,6 +166,16 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
             label: "Enable breadcrumb trace recorder",
             valuePath: ["general", "breadcrumb_trace_enabled"],
             description: "Keeps a low-overhead recent-context window for debugging failures."
+        },
+        {
+            type: OptionType.Select,
+            label: "Log Format",
+            valuePath: ["logging", "log_format"],
+            description: "Choose Standard or JSON log output.",
+            choices: [
+                {label: "Standard", value: "standard"},
+                {label: "JSON", value: "json"},
+            ]
         },
         {
             type: OptionType.Select,

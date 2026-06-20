@@ -118,13 +118,14 @@ describe("Testing settings page component", () => {
         expect(commandService.restart).not.toHaveBeenCalled();
     }));
 
-    it("should expose the logging settings context", () => {
-        expect(component.OPTIONS_CONTEXT_LOGGING.id).toBe("logging");
-        expect(component.OPTIONS_CONTEXT_LOGGING.options[0].valuePath).toEqual(["logging", "log_format"]);
-    });
+    it("should expose the log format and log level options in other settings", () => {
+        const logFormatOption = component.OPTIONS_CONTEXT_OTHER.options[2]!;
+        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options[3]!;
 
-    it("should expose the log level option in other settings", () => {
-        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options[2]!;
+        expect(logFormatOption.label).toBe("Log Format");
+        expect(logFormatOption.valuePath).toEqual(["logging", "log_format"]);
+        expect(logFormatOption.choices![0]).toEqual({label: "Standard", value: "standard"});
+        expect(logFormatOption.choices![1]).toEqual({label: "JSON", value: "json"});
 
         expect(logLevelOption.label).toBe("Log Level");
         expect(logLevelOption.valuePath).toEqual(["general", "log_level"]);

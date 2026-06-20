@@ -27,23 +27,23 @@ describe("Testing option component", () => {
     it("should emit select changes", fakeAsync(() => {
         const changeSpy = jasmine.createSpy("change");
         component.type = OptionType.Select;
-        component.label = "Log Level";
-        component.value = "INFO";
+        component.label = "Log Format";
+        component.value = "standard";
         component.choices = [
-            {label: "Debug", value: "DEBUG"},
-            {label: "Info", value: "INFO"},
+            {label: "Standard", value: "standard"},
+            {label: "JSON", value: "json"},
         ];
         component.changeEvent.subscribe(changeSpy);
 
         fixture.detectChanges();
 
         const select = fixture.nativeElement.querySelector("select") as HTMLSelectElement;
-        expect(select.value).toBe("INFO");
-        select.value = "DEBUG";
+        expect(select.value).toBe("standard");
+        select.value = "json";
         select.dispatchEvent(new Event("change"));
 
         tick(1000);
 
-        expect(changeSpy).toHaveBeenCalledWith("DEBUG");
+        expect(changeSpy).toHaveBeenCalledWith("json");
     }));
 });

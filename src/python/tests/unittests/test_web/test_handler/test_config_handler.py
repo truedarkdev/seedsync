@@ -371,13 +371,28 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         status_code, body = _invoke_post_json_route(
             self.web_app,
             "/server/config/set/logging/log_format",
-            {"value": "json"},
+            {"value": "JSON"},
             api_token=self.admin_api_token,
         )
 
         self.assertEqual(200, status_code)
         self.assertEqual("json", config.logging.log_format)
         self.assertIn("logging.log_format set to json", body)
+
+    def test_set_route_rejects_invalid_logging_format_from_body(self):
+        config = Config()
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/logging/log_format",
+            {"value": "text"},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(400, status_code)
+        self.assertEqual("standard", config.logging.log_format)
+        self.assertIn("Bad config: Logging.log_format (text) must be either standard or json", body)
 
     def test_set_route_rejects_old_url_value_shape(self):
         config = Config()
