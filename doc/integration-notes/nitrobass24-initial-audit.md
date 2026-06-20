@@ -562,8 +562,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 543 | `04f0ecc5a2ebb770701ee8b1a19b956f96ae2bb6` | 2026-03-23 | Adopt uv for Python dependency management (#286) | needs new integration task |
 | 544 | `25d2798d7c05e1585d3b1e5932fdc0efd579d834` | 2026-03-23 | Pin uv versions: setup-uv@v7, Docker image uv:0.11 | needs new integration task - keep with row `543` uv/tooling lane because local CI/Docker topology lacks the upstream uv scaffolding |
 | 545 | `f82ea20e14bf0f9ff57ac3a0f70f9399b4664b2c` | 2026-03-23 | Merge pull request #311 from nitrobass24/feat/uv-dependency-management | covered elsewhere - merge wrapper for deferred rows `543`/`544` uv/tooling lane |
-| 546 | `17cc5e7eb4534531b33d688fa73ac6c77e40f1a3` | 2026-03-23 | Fix pre-existing code quality bugs from Ruff review (#289) | pending |
-| 547 | `38d205254dd3d61f2bf2672c4e87bc7db5aa016b` | 2026-03-23 | Fix missed user@host format in Sshcp.copy() to use _remote_address() | pending |
+| 546 | `17cc5e7eb4534531b33d688fa73ac6c77e40f1a3` | 2026-03-23 | Fix pre-existing code quality bugs from Ruff review (#289) | adapted locally in `ad1e3ab2`; SSH target helper and duplicate-extract wait-loop fix taken, notifier absent/deferred and cross-pair extract dedupe deferred until output isolation is path-pair-aware |
+| 547 | `38d205254dd3d61f2bf2672c4e87bc7db5aa016b` | 2026-03-23 | Fix missed user@host format in Sshcp.copy() to use _remote_address() | covered elsewhere - copy path included in `ad1e3ab2` SSH target helper adaptation |
 | 548 | `34e67792bf917dccec314cd1f09dcf126b1eaf1f` | 2026-03-23 | Merge pull request #312 from nitrobass24/fix/ruff-real-bugs | pending |
 | 549 | `85c99634b2994cf07e0e8f9d10b13b8cf4b6fad3` | 2026-03-23 | Add startup validation for required LFTP config fields (#310) | pending |
 | 550 | `3c83762b9df49769be96ab694aa560750cd1d79f` | 2026-03-24 | Improve backward-compat error to list specific missing field(s) | pending |
