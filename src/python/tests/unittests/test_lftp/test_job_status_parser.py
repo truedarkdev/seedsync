@@ -1090,6 +1090,55 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertTrue(any("skipping bad job output" in message for message in captured_logs.output))
         self.assertFalse(any("Skipping orphan lftp progress line" in message for message in captured_logs.output))
 
+    def test_chunk_wrap_fragment_after_valid_job_is_skipped(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/path/show /local/path/ -- 500M/1G (50%) 10M/s\n"
+            "tmos.7.1.DV.HDR.H.265-TheFarm.mkv' at 22283455338 (0%) 427.6K/s eta:28m [Receiving data]"
+        )
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+
+    def test_bare_chunk_wrap_fragment_is_skipped(self):
+        output = "tmos.7.1.DV.HDR.H.265-TheFarm.mkv' at 22283455338 (0%) 427.6K/s eta:28m [Receiving data]"
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        self.assertEqual(0, len(statuses))
+
+    def test_chunk_wrap_fragment_with_connecting_status_is_skipped(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/path/show /local/path/ -- 500M/1G (50%) 10M/s\n"
+            "Some.Long.Name.mkv' at 2760950243 (0%) [Connecting...]"
+        )
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+
+    def test_unrecognized_line_inside_job_is_skipped(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (sftp://someone:@localhost)\n"
+            "sftp://someone:@localhost/home/someone\n"
+            "Queue is running.\n"
+            "[1] mirror -c /remote/path/show /local/path/ -- 500M/1G (50%) 10M/s\n"
+            "completely unexpected garbage"
+        )
+        parser = LftpJobStatusParser()
+        statuses = parser.parse(output)
+
+        self.assertEqual(1, len(statuses))
+
     def test_queue_pty_line_wrap_skips_bad_queue_line(self):
         output = (
             "jobs -v\n"

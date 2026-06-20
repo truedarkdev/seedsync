@@ -243,18 +243,32 @@ class LftpJobStatusParser:
         ).format(eta=LftpJobStatusParser.__TIME_UNITS_REGEX)
         partial_progress_m = re.compile(partial_progress_pattern)
 
+        # Chunk line-wrap fragments from long filenames, e.g.:
+        #   "tmos.7.1.DV.HDR.H.265-TheFarm.mkv' at 22283455338 (0%) 427.6K/s eta:28m [Receiving data]"
+        chunk_wrap_pattern = (
+            r"^(?:[^`\\].*)?'\s+at\s+\d+\s+"
+            r"(?:\(\d+%\)\s+)?"
+            r"(?:(?:\d+\.?\d*\s?({sz}))\/s\s+)?"
+            r"(?:eta:({eta})\s+)?"
+            r"\s*\[.*\]$"
+        ).format(
+            sz=LftpJobStatusParser.__SIZE_UNITS_REGEX,
+            eta=LftpJobStatusParser.__TIME_UNITS_REGEX,
+        )
+        chunk_wrap_m = re.compile(chunk_wrap_pattern)
+
         prev_job = None
         while lines:
             line = lines.pop(0)
 
             # First line must be a valid job header
             if not (
-                prev_job or
+                prev_job is not None or
                 pget_header_m.match(line) or
                 mirror_header_m.match(line) or
                 mirror_fl_header_m.match(line)
             ):
-                if orphan_progress_m.match(line) or partial_progress_m.match(line):
+                if orphan_progress_m.match(line) or partial_progress_m.match(line) or chunk_wrap_m.match(line):
                     logger.warning("Skipping orphan lftp progress line: '%s'", line)
                     continue
                 raise ValueError("First line is not a matching header '{}'".format(line))
@@ -489,7 +503,7 @@ class LftpJobStatusParser:
                 # Continue the outer loop
                 continue
 
-            if prev_job and (
+            if prev_job is not None and (
                     line.startswith("Getting file list") or
                     line.startswith("cd ")
             ):
@@ -530,7 +544,11 @@ class LftpJobStatusParser:
                 # Continue the outer loop
                 continue
 
-            if orphan_progress_m.match(line) or partial_progress_m.match(line):
+            if prev_job is not None:
+                logger.warning("Skipping unrecognized line inside job context: '%s'", line)
+                continue
+
+            if orphan_progress_m.match(line) or partial_progress_m.match(line) or chunk_wrap_m.match(line):
                 logger.warning("Skipping orphan lftp progress line: '%s'", line)
                 continue
 

@@ -524,9 +524,10 @@ class Lftp:
     def sftp_connect_program(self, program: str):
         self.__set(Lftp.__SET_SFTP_CONNECT_PROGRAM, program)
 
-    def status(self) -> List[LftpJobStatus]:
+    def status(self) -> Optional[List[LftpJobStatus]]:
         """
-        Return a status list of queued and running jobs
+        Return a status list of queued and running jobs, or None when
+        parsing failed but the error is still within the tolerated threshold.
         :return:
         """
         try:
@@ -550,6 +551,7 @@ class Lftp:
             self.logger.warning("Ignoring status poll failure: {}".format(exc))
             return []
         timed_out = self.__last_command_timed_out
+        statuses: Optional[List[LftpJobStatus]] = None
         try:
             statuses = self.__job_status_parser.parse(out)
             self.__consecutive_status_errors = 0
@@ -559,10 +561,10 @@ class Lftp:
             self.__last_status_poll_healthy = False
             if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
-                statuses = []
             else:
                 raise
-        self.__annotate_status_path_pairs(statuses)
+        if statuses is not None:
+            self.__annotate_status_path_pairs(statuses)
         if not statuses and getattr(self, "_Lftp__status_poll_needs_connection_grace", False) and not self.__pending_error:
             self.__status_poll_needs_connection_grace = False
             connection_grace_timeout = max(STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS, 5.0)
@@ -581,10 +583,10 @@ class Lftp:
                 self.__last_status_poll_healthy = False
                 if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                     self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
-                    statuses = []
                 else:
                     raise
-            self.__annotate_status_path_pairs(statuses)
+            if statuses is not None:
+                self.__annotate_status_path_pairs(statuses)
         return statuses
 
     def __annotate_status_path_pairs(self, statuses: List[LftpJobStatus]):
@@ -680,6 +682,10 @@ class Lftp:
         """
         def find_matching_jobs():
             statuses = self.status()
+            if statuses is None:
+                # Parser failures come back as None; treat them as an empty
+                # snapshot so the retry loop can keep probing safely.
+                statuses = []
             status_poll_healthy = self.last_status_poll_healthy
             matching_jobs = []
             for status in statuses:
