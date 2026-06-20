@@ -222,6 +222,16 @@ class TestSeedsync(unittest.TestCase):
         self.assertEqual(["Lftp.remote_address"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_address = "value"
 
+        config.lftp.remote_password = incomplete_value
+        self.assertEqual(["Lftp.remote_password"], Seedsync._detect_incomplete_config(config))
+        config.lftp.remote_password = "value"
+
+        config.lftp.use_ssh_key = True
+        config.lftp.remote_password = incomplete_value
+        self.assertEqual([], Seedsync._detect_incomplete_config(config))
+        config.lftp.remote_password = "value"
+        config.lftp.use_ssh_key = False
+
         config.lftp.remote_username = incomplete_value
         self.assertEqual(["Lftp.remote_username"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_username = "value"
@@ -238,6 +248,86 @@ class TestSeedsync(unittest.TestCase):
         self.assertEqual(["Lftp.remote_path_to_scan_script"], Seedsync._detect_incomplete_config(config))
         config.lftp.remote_path_to_scan_script = "value"
 
+    def test_detect_incomplete_config_reports_missing_startup_fields_and_args(self):
+        config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                remote_address="remote.server.com",
+                remote_username="remote-user",
+                remote_password="password",
+                remote_port=22,
+                remote_path="/remote/path",
+                local_path="/local/path",
+                remote_path_to_scan_script="/scanfs",
+                use_ssh_key=False,
+                num_max_parallel_downloads=1,
+                num_max_parallel_files_per_download=1,
+                num_max_connections_per_root_file=1,
+                num_max_connections_per_dir_file=1,
+                num_max_total_connections=1,
+                use_temp_file=False,
+            ),
+            controller=SimpleNamespace(
+                interval_ms_remote_scan=1000,
+                interval_ms_local_scan=1000,
+                interval_ms_downloading_scan=1000,
+            ),
+            general=SimpleNamespace(verbose=False),
+            autoqueue=SimpleNamespace(auto_delete_remote=False),
+        )
+        args = SimpleNamespace(local_path_to_scanfs="/scanfs")
+
+        self.assertEqual([], Seedsync._detect_incomplete_config(config, args=args))
+
+        config.lftp.local_path = None
+        self.assertEqual(["Lftp.local_path"], Seedsync._detect_incomplete_config(config, args=args))
+        config.lftp.local_path = "/local/path"
+
+        config.lftp.remote_address = None
+        config.controller.interval_ms_remote_scan = None
+        config.general.verbose = None
+        config.autoqueue.auto_delete_remote = None
+        args.local_path_to_scanfs = None
+        self.assertEqual(
+            [
+                "Lftp.remote_address",
+                "Controller.interval_ms_remote_scan",
+                "General.verbose",
+                "AutoQueue.auto_delete_remote",
+                "Args.local_path_to_scanfs",
+            ],
+            Seedsync._detect_incomplete_config(config, args=args)
+        )
+
+    def test_detect_incomplete_config_requires_remote_username_even_with_ssh_key(self):
+        config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                remote_address="remote.server.com",
+                remote_username=None,
+                remote_password=None,
+                remote_port=22,
+                remote_path="/remote/path",
+                local_path="/local/path",
+                remote_path_to_scan_script="/scanfs",
+                use_ssh_key=True,
+                num_max_parallel_downloads=1,
+                num_max_parallel_files_per_download=1,
+                num_max_connections_per_root_file=1,
+                num_max_connections_per_dir_file=1,
+                num_max_total_connections=1,
+                use_temp_file=False,
+            ),
+            controller=SimpleNamespace(
+                interval_ms_remote_scan=1000,
+                interval_ms_local_scan=1000,
+                interval_ms_downloading_scan=1000,
+            ),
+            general=SimpleNamespace(verbose=False),
+            autoqueue=SimpleNamespace(auto_delete_remote=False),
+        )
+        args = SimpleNamespace(local_path_to_scanfs="/scanfs")
+
+        self.assertEqual(["Lftp.remote_username"], Seedsync._detect_incomplete_config(config, args=args))
+
     def test_detect_incomplete_config_skips_legacy_paths_when_path_pairs_exist(self):
         config = Seedsync._create_default_config()
         config.lftp.remote_address = "value"
@@ -248,9 +338,28 @@ class TestSeedsync(unittest.TestCase):
         manager = PathPairManager(tempfile.mkdtemp(prefix="test_path_pairs"))
         try:
             manager.load()
-            manager.add_pair(PathPair(name="Movies", remote_path="/remote/movies", local_path="/downloads/movies"))
+            manager.add_pair(PathPair(name="Movies", remote_path="/remote/movies", local_path="/downloads/movies", enabled=True))
 
             self.assertEqual([], Seedsync._detect_incomplete_config(config, manager))
+        finally:
+            shutil.rmtree(manager._config_dir)
+
+    def test_detect_incomplete_config_does_not_skip_legacy_paths_for_disabled_path_pairs(self):
+        config = Seedsync._create_default_config()
+        config.lftp.remote_address = "value"
+        config.lftp.remote_password = "value"
+        config.lftp.remote_username = "value"
+        config.lftp.remote_path_to_scan_script = "value"
+
+        manager = PathPairManager(tempfile.mkdtemp(prefix="test_path_pairs"))
+        try:
+            manager.load()
+            manager.add_pair(PathPair(name="Movies", remote_path="/remote/movies", local_path="/downloads/movies", enabled=False))
+
+            self.assertEqual(
+                ["Lftp.remote_path", "Lftp.local_path"],
+                Seedsync._detect_incomplete_config(config, manager)
+            )
         finally:
             shutil.rmtree(manager._config_dir)
 

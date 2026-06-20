@@ -1,18 +1,21 @@
 from datetime import datetime, timedelta
 import os
 import json
+import shutil
 import threading
 import time
+import tempfile
 import unittest
 from queue import Queue
 from threading import Lock
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from controller import Controller, ModelBuilder
+from controller import Controller, ControllerPersist, ModelBuilder
 from controller.extract import ExtractStatus
 from controller.scan import MultiPathActiveScanner
-from common import AppError
+from controller.controller import ControllerError
+from common import AppError, PathPairManager
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelError, ModelFile
@@ -38,6 +41,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__context.config.lftp.net_socket_buffer = ""
         self.controller._Controller__password = None
+        self.controller._Controller__legacy_local_path = "/local"
+        self.controller._Controller__legacy_remote_path = "/remote"
         self.controller._Controller__persist = MagicMock()
         self.controller._Controller__persist.downloaded_file_names = set()
         self.controller._Controller__persist.extracted_file_names = set()
@@ -86,6 +91,146 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def _make_startup_context(
+        self,
+        *,
+        local_path,
+        remote_path="/remote",
+        path_pair_manager=None,
+        local_path_to_scanfs="/scanfs",
+        use_local_path_as_extract_path=False,
+        remote_username="user",
+        remote_password="password",
+        use_ssh_key=False,
+        verbose=False,
+        auto_delete_remote=False,
+    ):
+        return SimpleNamespace(
+            logger=MagicMock(),
+            web_access_logger=MagicMock(),
+            config=SimpleNamespace(
+                lftp=SimpleNamespace(
+                    remote_address="remote.server.com",
+                    remote_username=remote_username,
+                    remote_password=remote_password,
+                    remote_port=22,
+                    remote_path=remote_path,
+                    local_path=local_path,
+                    remote_path_to_scan_script="/scanfs",
+                    use_ssh_key=use_ssh_key,
+                    num_max_parallel_downloads=1,
+                    num_max_parallel_files_per_download=1,
+                    num_max_connections_per_root_file=1,
+                    num_max_connections_per_dir_file=1,
+                    num_max_total_connections=1,
+                    use_temp_file=False,
+                    rate_limit=None,
+                    net_socket_buffer="8M",
+                    staging_path=None,
+                ),
+                controller=SimpleNamespace(
+                    interval_ms_remote_scan=1,
+                    interval_ms_local_scan=1,
+                    interval_ms_downloading_scan=1,
+                    extract_path="/extract",
+                    use_local_path_as_extract_path=use_local_path_as_extract_path,
+                    managed_extract_folders_enabled=True,
+                ),
+                general=SimpleNamespace(verbose=verbose),
+                autoqueue=SimpleNamespace(
+                    auto_delete_remote=auto_delete_remote,
+                    enabled=False,
+                    patterns_only=False,
+                    auto_extract=False,
+                ),
+            ),
+            args=SimpleNamespace(local_path_to_scanfs=local_path_to_scanfs),
+            status=SimpleNamespace(
+                server=SimpleNamespace(up=True, error_msg=None),
+                controller=SimpleNamespace(),
+            ),
+            path_pair_manager=path_pair_manager,
+            breadcrumb_trace=MagicMock(
+                create_emitter=MagicMock(return_value=MagicMock())
+            ),
+        )
+
+    def test_constructor_reports_missing_startup_fields_in_aggregate(self):
+        context = self._make_startup_context(local_path=None)
+
+        controller = Controller(context, ControllerPersist())
+
+        self.assertFalse(controller._Controller__started)
+        self.assertIsNotNone(controller._Controller__startup_validation_error)
+        self.assertIn("Lftp.local_path", controller._Controller__startup_validation_error)
+        self.assertEqual(controller._Controller__startup_validation_error, context.status.server.error_msg)
+        self.assertEqual([], controller.get_model_files())
+
+        with self.assertRaises(ControllerError) as error:
+            controller.start()
+
+        self.assertIn("Lftp.local_path", str(error.exception))
+
+    def test_constructor_uses_path_pair_fallback_when_legacy_paths_missing(self):
+        manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
+        try:
+            manager.load()
+            manager.add_pair(
+                PathPair(
+                    name="Movies",
+                    remote_path="/remote/movies",
+                    local_path="/downloads/movies",
+                    enabled=True,
+                )
+            )
+            context = self._make_startup_context(
+                local_path=None,
+                remote_path=None,
+                path_pair_manager=manager,
+            )
+
+            with patch("controller.controller.Lftp") as mock_lftp:
+                controller = Controller(context, ControllerPersist())
+
+            self.assertIsNone(controller._Controller__startup_validation_error)
+            self.assertEqual("/downloads/movies", controller._Controller__legacy_local_path)
+            self.assertEqual("/remote/movies", controller._Controller__legacy_remote_path)
+            self.assertEqual(
+                os.path.join("/downloads/movies", "incomplete"),
+                controller._Controller__staging_path
+            )
+            self.assertTrue(mock_lftp.called)
+        finally:
+            shutil.rmtree(manager._config_dir)
+
+    def test_constructor_reports_missing_legacy_paths_when_only_disabled_path_pairs_exist(self):
+        manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
+        try:
+            manager.load()
+            manager.add_pair(
+                PathPair(
+                    name="Movies",
+                    remote_path="/remote/movies",
+                    local_path="/downloads/movies",
+                    enabled=False,
+                )
+            )
+            context = self._make_startup_context(
+                local_path=None,
+                remote_path=None,
+                path_pair_manager=manager,
+            )
+
+            with patch("controller.controller.Lftp") as mock_lftp:
+                controller = Controller(context, ControllerPersist())
+
+            self.assertIsNotNone(controller._Controller__startup_validation_error)
+            self.assertIn("Lftp.remote_path", controller._Controller__startup_validation_error)
+            self.assertIn("Lftp.local_path", controller._Controller__startup_validation_error)
+            mock_lftp.assert_not_called()
+        finally:
+            shutil.rmtree(manager._config_dir)
 
     def test_queue_command_assigns_unique_flow_ids_under_concurrent_enqueues(self):
         class SlowSequence(int):

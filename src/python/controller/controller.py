@@ -11,6 +11,7 @@ import json
 import os
 import time
 import shutil
+from types import SimpleNamespace
 
 # my libs
 from .scan import (
@@ -26,7 +27,7 @@ from .extract import ExtractProcess, ExtractStatus
 from .validate import ValidateProcess
 from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
-from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair
+from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair, Localization
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from .controller_persist import ControllerPersist
@@ -114,6 +115,110 @@ class Controller:
         lftp_status_cache_max_age_seconds = max(3, lftp_status_poll_retry_seconds * 3)
         return lftp_status_poll_retry_seconds, lftp_status_cache_max_age_seconds
 
+    @staticmethod
+    def _is_missing_startup_value(value: Any) -> bool:
+        return value is None or (
+            isinstance(value, str) and (value.strip() == "" or value == "<replace me>")
+        )
+
+    @staticmethod
+    def collect_missing_startup_fields(
+        config: Any,
+        args: Any | None = None,
+        path_pair_manager: Any | None = None,
+    ) -> List[str]:
+        def _append_missing(section_name: str, field_name: str, value: Any) -> None:
+            if Controller._is_missing_startup_value(value):
+                missing_fields.append("{}.{}".format(section_name, field_name))
+
+        missing_fields: List[str] = []
+        enabled_path_pairs = []
+        if path_pair_manager is not None:
+            try:
+                enabled_path_pairs = list(path_pair_manager.get_enabled_pairs() or [])
+            except Exception:
+                enabled_path_pairs = []
+        require_legacy_paths = len(enabled_path_pairs) == 0
+
+        lftp_cfg = getattr(config, "lftp", None)
+        controller_cfg = getattr(config, "controller", None)
+        general_cfg = getattr(config, "general", None)
+        autoqueue_cfg = getattr(config, "autoqueue", None)
+
+        # The controller always starts Lftp, so the username remains required
+        # even when key-based auth is enabled. Password auth is conditional.
+        _append_missing("Lftp", "remote_address", getattr(lftp_cfg, "remote_address", None))
+        _append_missing("Lftp", "remote_username", getattr(lftp_cfg, "remote_username", None))
+        if getattr(lftp_cfg, "use_ssh_key", None) is False:
+            _append_missing("Lftp", "remote_password", getattr(lftp_cfg, "remote_password", None))
+        for field_name in (
+            "remote_port",
+            "remote_path_to_scan_script",
+            "use_ssh_key",
+            "use_temp_file",
+            "num_max_parallel_downloads",
+            "num_max_parallel_files_per_download",
+            "num_max_connections_per_root_file",
+            "num_max_connections_per_dir_file",
+            "num_max_total_connections",
+        ):
+            _append_missing("Lftp", field_name, getattr(lftp_cfg, field_name, None))
+
+        if require_legacy_paths:
+            for field_name in ("remote_path", "local_path"):
+                _append_missing("Lftp", field_name, getattr(lftp_cfg, field_name, None))
+
+        for field_name in (
+            "interval_ms_remote_scan",
+            "interval_ms_local_scan",
+            "interval_ms_downloading_scan",
+        ):
+            _append_missing("Controller", field_name, getattr(controller_cfg, field_name, None))
+
+        _append_missing("General", "verbose", getattr(general_cfg, "verbose", None))
+        _append_missing("AutoQueue", "auto_delete_remote", getattr(autoqueue_cfg, "auto_delete_remote", None))
+
+        if args is not None:
+            _append_missing("Args", "local_path_to_scanfs", getattr(args, "local_path_to_scanfs", None))
+
+        return missing_fields
+
+    def __initialize_startup_validation_failure(self, missing_fields: List[str]) -> None:
+        error_message = Localization.Error.SETTINGS_INCOMPLETE_FIELDS.format(", ".join(missing_fields))
+        self.__startup_validation_error = error_message
+        self.__context.status.server.up = False
+        self.__context.status.server.error_msg = error_message
+        self.logger.error(error_message)
+        self.__password = None
+        self.__legacy_local_path = None
+        self.__legacy_remote_path = None
+        self.__staging_path = ""
+        self.__lftp = None
+        self.__active_scanner = None
+        self.__local_scanner = None
+        self.__remote_scanner = None
+        self.__active_scan_process = None
+        self.__local_scan_process = None
+        self.__remote_scan_process = None
+        self.__extract_process = None
+        self.__validate_process = None
+        self.__mp_logger = None
+        self.__active_downloading_file_names = []
+        self.__active_extracting_file_names = []
+        self.__prev_downloading_file_names = set()
+        self.__pending_completion_file_names = set()
+        self.__malformed_status_only_file_ids = set()
+        self.__pending_auto_purge_file_ids = set()
+        self.__last_lftp_statuses = []
+        self.__next_lftp_status_poll_at = None
+        self.__lftp_status_poll_retry_seconds = 1
+        self.__lftp_status_cache_expires_at = None
+        self.__lftp_status_poll_retry_active = False
+        self.__active_command_processes = []
+        self.__startup_recovery_done = False
+        self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
+        self.__started = False
+
     def __init__(self,
                  context: Context,
                  persist: ControllerPersist):
@@ -131,9 +236,6 @@ class Controller:
         if self.__temp_diag_file_id is not None and not self.__temp_diag_file_id.strip():
             self.__temp_diag_file_id = None
         self.__temp_diag_last_signature = None
-
-        # Decide the password here
-        self.__password = context.config.lftp.remote_password if not context.config.lftp.use_ssh_key else None
 
         # The command queue
         self.__command_queue = Queue()
@@ -162,15 +264,40 @@ class Controller:
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
         self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
-        config = cast(Any, self.__context.config)
-        lftp_cfg = config.lftp
-        controller_cfg = config.controller
-        general_cfg = config.general
         self.__path_pairs_by_id: Dict[str, PathPair] = {}
         self.__path_pair_staging_paths: Dict[str, str] = {}
 
+        config = cast(Any, self.__context.config)
+        startup_args = getattr(self.__context, "args", None)
+        if startup_args is None:
+            startup_args = SimpleNamespace(local_path_to_scanfs=None)
+        missing_startup_fields = Controller.collect_missing_startup_fields(
+            config,
+            startup_args,
+            getattr(self.__context, "path_pair_manager", None),
+        )
+        self.__startup_validation_error = None
+        if missing_startup_fields:
+            self.__initialize_startup_validation_failure(missing_startup_fields)
+            return
+
+        # Decide the password here
+        lftp_cfg = config.lftp
+        controller_cfg = config.controller
+        general_cfg = config.general
+        self.__password = lftp_cfg.remote_password if not lftp_cfg.use_ssh_key else None
+
+        enabled_path_pairs = self.__get_enabled_path_pairs()
+        first_path_pair = enabled_path_pairs[0] if enabled_path_pairs else None
+        self.__legacy_local_path = lftp_cfg.local_path
+        if Controller._is_missing_startup_value(self.__legacy_local_path) and first_path_pair is not None:
+            self.__legacy_local_path = first_path_pair.local_path
+        self.__legacy_remote_path = lftp_cfg.remote_path
+        if Controller._is_missing_startup_value(self.__legacy_remote_path) and first_path_pair is not None:
+            self.__legacy_remote_path = first_path_pair.remote_path
+
         self.__staging_path = self.__build_staging_path(
-            lftp_cfg.local_path,
+            self.__legacy_local_path,
             lftp_cfg.staging_path
         )
 
@@ -180,7 +307,7 @@ class Controller:
                            user=lftp_cfg.remote_username,
                            password=self.__password)
         self.__lftp.set_base_logger(self.logger)
-        self.__lftp.set_base_remote_dir_path(lftp_cfg.remote_path)
+        self.__lftp.set_base_remote_dir_path(self.__legacy_remote_path)
         self.__lftp.set_base_local_dir_path(self.__staging_path)
         self.__configure_lftp()
 
@@ -198,14 +325,14 @@ class Controller:
 
         # Setup extract process
         if controller_cfg.use_local_path_as_extract_path:
-            out_dir_path = lftp_cfg.local_path
+            out_dir_path = self.__legacy_local_path
         else:
             out_dir_path = controller_cfg.extract_path
         # Keep the final local root primary, but allow archive lookup to fall
         # back to staging so extraction can survive the move boundary.
         self.__extract_process = ExtractProcess(
             out_dir_path=out_dir_path,
-            local_path=lftp_cfg.local_path,
+            local_path=self.__legacy_local_path,
             local_path_fallback=self.__staging_path,
             managed_extract_folders_enabled=controller_cfg.managed_extract_folders_enabled,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
@@ -215,8 +342,8 @@ class Controller:
             remote_username=lftp_cfg.remote_username,
             remote_password=self.__password,
             remote_port=lftp_cfg.remote_port,
-            local_path=lftp_cfg.local_path,
-            remote_path=lftp_cfg.remote_path,
+            local_path=self.__legacy_local_path,
+            remote_path=self.__legacy_remote_path,
             path_pairs_by_id=cast(Dict[str, object], self.__path_pairs_by_id)
         )
 
@@ -354,8 +481,7 @@ class Controller:
         if path_pair_staging_paths is None:
             path_pair_staging_paths = self.__path_pair_staging_paths
 
-        config = cast(Any, self.__context.config)
-        local_root_paths: Dict[Optional[str], str] = {None: config.lftp.local_path}
+        local_root_paths: Dict[Optional[str], str] = {None: self.__legacy_local_path}
         local_staging_paths: Dict[Optional[str], str] = {None: self.__staging_path}
         for pair_id, pair in path_pairs_by_id.items():
             local_root_paths[pair_id] = pair.local_path
@@ -409,7 +535,7 @@ class Controller:
                 ) for pair in enabled_path_pairs
             ])
         return LocalScanner(
-            local_path=config.lftp.local_path,
+            local_path=self.__legacy_local_path,
             use_temp_file=config.lftp.use_temp_file,
             staging_path=self.__staging_path,
             managed_extract_folders_enabled=config.controller.managed_extract_folders_enabled
@@ -436,7 +562,7 @@ class Controller:
             remote_username=config.lftp.remote_username,
             remote_password=self.__password,
             remote_port=config.lftp.remote_port,
-            remote_path_to_scan=config.lftp.remote_path,
+            remote_path_to_scan=self.__legacy_remote_path,
             local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
             remote_path_to_scan_script=config.lftp.remote_path_to_scan_script
         )
@@ -451,6 +577,9 @@ class Controller:
             )
 
     def refresh_path_pairs(self, wait: bool = False, timeout_secs: Optional[float] = None):
+        startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
+        if startup_validation_error is not None:
+            raise ControllerError(startup_validation_error)
         if not self.__started:
             self.__apply_path_pair_refresh()
             self.__mark_path_pair_refresh_completed(self.__path_pair_refresh_generation)
@@ -588,6 +717,9 @@ class Controller:
         Must be called after ctor and before process()
         :return:
         """
+        startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
+        if startup_validation_error is not None:
+            raise ControllerError(startup_validation_error)
         self.logger.debug("Starting controller")
         os.makedirs(self.__staging_path, exist_ok=True)
         for staging_path in self.__path_pair_staging_paths.values():
@@ -616,6 +748,9 @@ class Controller:
         This method should return relatively quickly as the heavy lifting is done by concurrent tasks
         :return:
         """
+        startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
+        if startup_validation_error is not None:
+            raise ControllerError(startup_validation_error)
         if not self.__started:
             raise ControllerError("Cannot process, controller is not started")
         self.__propagate_exceptions()
@@ -707,6 +842,13 @@ class Controller:
         return model_files
 
     def queue_command(self, command: Command):
+        startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
+        if startup_validation_error is not None:
+            self.logger.warning("Rejecting command because controller startup config is incomplete: %s",
+                                startup_validation_error)
+            for callback in command.callbacks:
+                callback.on_failure(startup_validation_error, 400)
+            return
         if getattr(command, "flow_id", None) is None:
             command.flow_id = self.__next_command_flow_id(command)
         self.__command_queue.put(command)
@@ -1077,7 +1219,7 @@ class Controller:
             final_path = path_pair.local_path if path_pair is not None else None
         else:
             staging_path = self.__staging_path
-            final_path = cast(Any, self.__context.config).lftp.local_path
+            final_path = self.__legacy_local_path
 
         if not staging_path or not final_path:
             return
@@ -1143,8 +1285,7 @@ class Controller:
 
     def __get_delete_local_target(self, file: ModelFile) -> Tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
-        config = cast(Any, self.__context.config)
-        final_path = path_pair.local_path if path_pair is not None else config.lftp.local_path
+        final_path = path_pair.local_path if path_pair is not None else self.__legacy_local_path
         staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
         final_target = os.path.join(final_path, file.name)
 
@@ -2123,7 +2264,7 @@ class Controller:
                         remote_password=self.__password,
                         remote_port=config.lftp.remote_port,
                         remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
-                        else config.lftp.remote_path,
+                        else self.__legacy_remote_path,
                         file_name=file.name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)
