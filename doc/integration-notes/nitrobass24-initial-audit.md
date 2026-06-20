@@ -561,7 +561,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 542 | `1fa5deedfa85fceae2cfed8fb38fa0eab03e1013` | 2026-03-23 | Merge pull request #309 from nitrobass24/release/v0.14.2 | covered elsewhere |
 | 543 | `04f0ecc5a2ebb770701ee8b1a19b956f96ae2bb6` | 2026-03-23 | Adopt uv for Python dependency management (#286) | needs new integration task |
 | 544 | `25d2798d7c05e1585d3b1e5932fdc0efd579d834` | 2026-03-23 | Pin uv versions: setup-uv@v7, Docker image uv:0.11 | needs new integration task - keep with row `543` uv/tooling lane because local CI/Docker topology lacks the upstream uv scaffolding |
-| 545 | `f82ea20e14bf0f9ff57ac3a0f70f9399b4664b2c` | 2026-03-23 | Merge pull request #311 from nitrobass24/feat/uv-dependency-management | pending |
+| 545 | `f82ea20e14bf0f9ff57ac3a0f70f9399b4664b2c` | 2026-03-23 | Merge pull request #311 from nitrobass24/feat/uv-dependency-management | covered elsewhere - merge wrapper for deferred rows `543`/`544` uv/tooling lane |
 | 546 | `17cc5e7eb4534531b33d688fa73ac6c77e40f1a3` | 2026-03-23 | Fix pre-existing code quality bugs from Ruff review (#289) | pending |
 | 547 | `38d205254dd3d61f2bf2672c4e87bc7db5aa016b` | 2026-03-23 | Fix missed user@host format in Sshcp.copy() to use _remote_address() | pending |
 | 548 | `34e67792bf917dccec314cd1f09dcf126b1eaf1f` | 2026-03-23 | Merge pull request #312 from nitrobass24/fix/ruff-real-bugs | pending |
