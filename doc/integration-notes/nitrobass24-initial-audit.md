@@ -476,10 +476,10 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 457 | `bd4a50aa6d5cd905b64346a79b0c8d08ad8b7b97` | 2026-03-12 | Remove Debian Docker variant, consolidate to Alpine-only (#231) (#244) | needs area reopen - CI/Docker topology differs locally; reconcile with existing CI/Docker lane instead of direct Alpine-only import |
 | 458 | `0b799c7f868468684928614571a3802f47f67de1` | 2026-03-12 | Fix CI: add missing xfer_verify to test config helper (#262) | needs integration - keep with row `442` broader xfer_verify/validate config contract |
 | 459 | `f50f8d900aa46e7826102a37d1dc2e7f09d78b15` | 2026-03-12 | CI: use pre-built Angular artifact for amd64 publish build | needs area reopen - upstream `ci.yml` publish split must be reconciled with local `master.yml`/Makefile release flow |
-| 460 | `14323fd7883ce21ad874a93aa07f208c054a0c0e` | 2026-03-12 | Fix parser crash on Unraid PTY line-wrap fragments (#260) | pending |
-| 461 | `26193be812528080a7e756fbd801c525f48e2fe7` | 2026-03-12 | Set COLUMNS env var in pexpect spawn to prevent Unraid PTY wrapping | pending |
-| 462 | `6b79bde4a81549eff8c1c79c9c9284c6aa054957` | 2026-03-12 | Fix off-by-one in consecutive status error threshold | pending |
-| 463 | `96e79b85e93c1c7e1bf73b13c2ca5741d2be96f8` | 2026-03-12 | Merge pull request #263 from nitrobass24/fix/parser-resilience-unraid | pending |
+| 460 | `14323fd7883ce21ad874a93aa07f208c054a0c0e` | 2026-03-12 | Fix parser crash on Unraid PTY line-wrap fragments (#260) | adapted locally in this batch; parser skips Unraid PTY progress fragments |
+| 461 | `26193be812528080a7e756fbd801c525f48e2fe7` | 2026-03-12 | Set COLUMNS env var in pexpect spawn to prevent Unraid PTY wrapping | adapted locally in this batch; `pexpect.spawn` gets env with `COLUMNS=10000` while preserving env |
+| 462 | `6b79bde4a81549eff8c1c79c9c9284c6aa054957` | 2026-03-12 | Fix off-by-one in consecutive status error threshold | adapted locally in this batch; status parser failure threshold is 10 with strict comparisons |
+| 463 | `96e79b85e93c1c7e1bf73b13c2ca5741d2be96f8` | 2026-03-12 | Merge pull request #263 from nitrobass24/fix/parser-resilience-unraid | covered elsewhere - merge wrapper for rows `460`-`462`; no independent payload |
 | 464 | `f6e6663bbedc9486b36ed6217b8bdcdd4a43cb45` | 2026-03-12 | Release v0.13.4 - Exclude patterns fix and Unraid parser resilience | pending |
 | 465 | `b13d7d5a1bba9a904b2f7266614764353abbd91f` | 2026-03-12 | Fix v0.13.4 changelog to only include hotfix PRs | pending |
 | 466 | `21ca414843b8da2860917e318bcf4773f3ef4846` | 2026-03-12 | Add debug log for LFTP queue command | pending |

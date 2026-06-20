@@ -17,7 +17,7 @@ from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatus
 
 
 # How many status errors are allowed before error propagates out
-MAX_CONSECUTIVE_STATUS_ERRORS = 2
+MAX_CONSECUTIVE_STATUS_ERRORS = 10
 MAX_KILL_MATCH_ATTEMPTS = 20
 STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS = 1.0
 
@@ -86,7 +86,9 @@ class Lftp:
             "-u", "{},{}".format(self.__user, self.__password if self.__password else ""),
             "sftp://{}".format(self.__address)
         ]
-        self.__process = pexpect.spawn("/usr/bin/lftp", args, dimensions=(24, 10000))
+        spawn_env = os.environ.copy()
+        spawn_env["COLUMNS"] = "10000"
+        self.__process = pexpect.spawn("/usr/bin/lftp", args, env=spawn_env, dimensions=(24, 10000))
         try:
             self.__process.expect(self.__expect_pattern)
         except pexpect.exceptions.TIMEOUT:
@@ -555,7 +557,7 @@ class Lftp:
         except LftpJobStatusParserError:
             self.__consecutive_status_errors += 1
             self.__last_status_poll_healthy = False
-            if self.__consecutive_status_errors <= MAX_CONSECUTIVE_STATUS_ERRORS:
+            if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                 self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
                 statuses = []
             else:
@@ -577,7 +579,7 @@ class Lftp:
             except LftpJobStatusParserError:
                 self.__consecutive_status_errors += 1
                 self.__last_status_poll_healthy = False
-                if self.__consecutive_status_errors <= MAX_CONSECUTIVE_STATUS_ERRORS:
+                if self.__consecutive_status_errors < MAX_CONSECUTIVE_STATUS_ERRORS:
                     self.logger.warning(f"Ignoring status error (count={self.__consecutive_status_errors})")
                     statuses = []
                 else:
