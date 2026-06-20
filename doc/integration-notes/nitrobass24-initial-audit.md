@@ -520,46 +520,46 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | intentionally skipped |
 | 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs area reopen - belongs with scanner/runtime compatibility policy because local scanfs currently enforces Python 3.11/3.12 and uses a packaged scanner binary |
 | 503 | `f96e41de21fd86db06d8babc4622db078be28249` | 2026-03-18 | Release v0.14.1 — Parser stability, progress tracking, tooling | intentionally skipped |
-| 504 | `484477b1d06a7b4c20e42c0cf521663260d8109a` | 2026-03-18 | Fix flaky test_scanner_process by retrying multiprocessing queue read | pending |
-| 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | pending |
-| 506 | `be75a422fa74d040940fb75928c49ff0d1980ccb` | 2026-03-18 | Merge pull request #301 from nitrobass24/chore/pyright-phase3-security-paths | pending |
-| 507 | `28e2aa73d12791cb1a8c7ed5d2bfb622e7141ca2` | 2026-03-18 | Fix final 80 Pyright errors — 0 errors in basic mode (#249 Phase 4) | pending |
-| 508 | `1ba27be3c5a5ad9e2bad294bd7b58367868427a4` | 2026-03-18 | Make Pyright type check required in CI | pending |
-| 509 | `2c0aff4e75316c1849928c68a7d19910753c7284` | 2026-03-18 | Merge pull request #302 from nitrobass24/chore/pyright-phase4-complex-modules | pending |
-| 510 | `8bc7a98a18ec7de29c2f334cacd220b2eb731ce4` | 2026-03-18 | Add Playwright E2E test suite, remove old Protractor (#250) | pending |
-| 511 | `f7d654fcb7a9235b9bc560c5b94d0c1e1cda1f95` | 2026-03-18 | Remove dead Docker E2E test infrastructure | pending |
-| 512 | `c6206805c9cb12552b2e738bf77486733ba08874` | 2026-03-18 | Improve Playwright test robustness | pending |
-| 513 | `8800c60de30edf17a2c3591ad09b44c439420ae4` | 2026-03-19 | Fix SSE-related test timeouts and selector issues | pending |
-| 514 | `ff3a6f375b58bf92f34f94a61da7a4fafbe80753` | 2026-03-19 | Add SEEDSYNC_DISABLE_RATE_LIMIT env var for E2E testing | pending |
-| 515 | `96e8b539df0009bfc06fb63a6b7637d9586e00d4` | 2026-03-19 | Fix page object selectors to match actual Angular DOM | pending |
-| 516 | `60d13717f063260093161256e1be968a5626681e` | 2026-03-19 | Fix all Playwright test failures — 55 pass, 11 skip, 0 fail | pending |
-| 517 | `a9ae89193ac2a1cba95ec1fa559014f04f288dbf` | 2026-03-19 | Remove test-results from git, update gitignore | pending |
-| 518 | `8be2ab18bd59357e919511bd7226e6aa5143b2e8` | 2026-03-19 | Add Playwright E2E tests to CI | pending |
-| 519 | `0018a5c1849dc4492ab5743501b5d4bfb2040f7f` | 2026-03-19 | Fix CI: use npm install instead of npm ci for Playwright | pending |
-| 520 | `aadd8a89a268ca50d5163111b4a6776381abdefb` | 2026-03-19 | Clean up unused params, add try/finally for pair cleanup | pending |
-| 521 | `e7b55773c7e69042c68e3345b5a4ed8128f5e0bf` | 2026-03-19 | Merge pull request #303 from nitrobass24/feat/playwright-e2e-tests | pending |
-| 522 | `996fce92ab31d71fa5b9985cb6b4f97232df8e51` | 2026-03-22 | chore(deps): bump the angular group in /src/angular with 9 updates | pending |
-| 523 | `486364fb1ff8390d516d199c60a4b3ba96392534` | 2026-03-23 | Merge pull request #307 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-d0bae5d802 | pending |
-| 524 | `937918490ef7ef95bfbc78207ba5ef2f67d69e18` | 2026-03-22 | chore(deps): bump actions/setup-python from 5 to 6 | pending |
-| 525 | `d6d8b719d80bc83e19140c4857c6445d1a6e94c1` | 2026-03-23 | Merge pull request #306 from nitrobass24/dependabot/github_actions/develop/actions/setup-python-6 | pending |
-| 526 | `23e621fee0105789948a25e829c83d19449db8e3` | 2026-03-23 | chore(deps-dev): bump jsdom from 29.0.0 to 29.0.1 in /src/angular | pending |
-| 527 | `cc2579727d0c37f54747aad05c7d3d3be3f2313d` | 2026-03-23 | Merge pull request #308 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/jsdom-29.0.1 | pending |
-| 528 | `19b1c46594009ff2460695f893b0c1ffecba2b8a` | 2026-03-19 | Redact sensitive credentials from API responses (#257) | pending |
-| 529 | `224c793ee85c6ac6dcf6db1e463dfe12ffff4ea1` | 2026-03-19 | Reject redacted sentinel in set handler, fix staticmethod | pending |
-| 530 | `185386384e4f704e06b7c0889688a6d150320b7e` | 2026-03-23 | Merge pull request #305 from nitrobass24/fix/redact-credentials-api | pending |
-| 531 | `5d3a3526bc242e76c346342cdb330c45634fbb6e` | 2026-03-19 | Reject control characters in decoded filenames (#300) | pending |
-| 532 | `5bfb18cc8c1f0d090b3252ca365e77471dda06c0` | 2026-03-19 | Assert queue_command not called on rejected filenames | pending |
-| 533 | `30547791ea22bebe129896e60dcabfa91720f7f5` | 2026-03-19 | Fix pre-existing test failures and add assert_not_called checks | pending |
-| 534 | `7f25cd71e37cba96bf5e037ad1c934fa4fe201c4` | 2026-03-23 | Merge pull request #304 from nitrobass24/fix/reject-control-chars-filename | pending |
-| 535 | `1f6c5af6d3dd6db3daf9526f1bc7b1aa98b44f15` | 2026-03-13 | Fix ModelFile type: local_size and remote_size are nullable | pending |
-| 536 | `f6c0a84f68b0b3f32a38bb8e3ee986bcd41655a6` | 2026-03-23 | Prepare v0.14.2 release | pending |
-| 537 | `6abce01f714238ec182db5a4d6d805c56fef2eba` | 2026-03-23 | Address PR review findings across security, tests, and code quality | pending |
-| 538 | `0f94a26f0c220c74ab8e4fdb40378d93f0a8e01a` | 2026-03-23 | Fix CI failures and address second round of PR review findings | pending |
-| 539 | `d1a1c54cd7cd2f2daa90524a9d9996356652ef7d` | 2026-03-23 | Harden E2E test cleanup and selector stability | pending |
-| 540 | `88eea5633c1c380281f34129afd5252acbda18b1` | 2026-03-23 | Address fourth round PR review: exact name matching and safer test cleanup | pending |
-| 541 | `1d900326576e235ad1d009bcb7107b6adc5c6a02` | 2026-03-23 | Harden settings E2E: select mutation in try, cleanup assertion, unique names | pending |
-| 542 | `1fa5deedfa85fceae2cfed8fb38fa0eab03e1013` | 2026-03-23 | Merge pull request #309 from nitrobass24/release/v0.14.2 | pending |
-| 543 | `04f0ecc5a2ebb770701ee8b1a19b956f96ae2bb6` | 2026-03-23 | Adopt uv for Python dependency management (#286) | pending |
+| 504 | `484477b1d06a7b4c20e42c0cf521663260d8109a` | 2026-03-18 | Fix flaky test_scanner_process by retrying multiprocessing queue read | already integrated |
+| 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | needs integration |
+| 506 | `be75a422fa74d040940fb75928c49ff0d1980ccb` | 2026-03-18 | Merge pull request #301 from nitrobass24/chore/pyright-phase3-security-paths | covered elsewhere |
+| 507 | `28e2aa73d12791cb1a8c7ed5d2bfb622e7141ca2` | 2026-03-18 | Fix final 80 Pyright errors — 0 errors in basic mode (#249 Phase 4) | needs integration |
+| 508 | `1ba27be3c5a5ad9e2bad294bd7b58367868427a4` | 2026-03-18 | Make Pyright type check required in CI | needs area reopen |
+| 509 | `2c0aff4e75316c1849928c68a7d19910753c7284` | 2026-03-18 | Merge pull request #302 from nitrobass24/chore/pyright-phase4-complex-modules | covered elsewhere |
+| 510 | `8bc7a98a18ec7de29c2f334cacd220b2eb731ce4` | 2026-03-18 | Add Playwright E2E test suite, remove old Protractor (#250) | needs new integration task |
+| 511 | `f7d654fcb7a9235b9bc560c5b94d0c1e1cda1f95` | 2026-03-18 | Remove dead Docker E2E test infrastructure | needs area reopen |
+| 512 | `c6206805c9cb12552b2e738bf77486733ba08874` | 2026-03-18 | Improve Playwright test robustness | needs new integration task |
+| 513 | `8800c60de30edf17a2c3591ad09b44c439420ae4` | 2026-03-19 | Fix SSE-related test timeouts and selector issues | needs new integration task |
+| 514 | `ff3a6f375b58bf92f34f94a61da7a4fafbe80753` | 2026-03-19 | Add SEEDSYNC_DISABLE_RATE_LIMIT env var for E2E testing | needs new integration task |
+| 515 | `96e8b539df0009bfc06fb63a6b7637d9586e00d4` | 2026-03-19 | Fix page object selectors to match actual Angular DOM | needs new integration task |
+| 516 | `60d13717f063260093161256e1be968a5626681e` | 2026-03-19 | Fix all Playwright test failures — 55 pass, 11 skip, 0 fail | needs new integration task |
+| 517 | `a9ae89193ac2a1cba95ec1fa559014f04f288dbf` | 2026-03-19 | Remove test-results from git, update gitignore | needs new integration task |
+| 518 | `8be2ab18bd59357e919511bd7226e6aa5143b2e8` | 2026-03-19 | Add Playwright E2E tests to CI | needs area reopen |
+| 519 | `0018a5c1849dc4492ab5743501b5d4bfb2040f7f` | 2026-03-19 | Fix CI: use npm install instead of npm ci for Playwright | needs area reopen |
+| 520 | `aadd8a89a268ca50d5163111b4a6776381abdefb` | 2026-03-19 | Clean up unused params, add try/finally for pair cleanup | needs new integration task |
+| 521 | `e7b55773c7e69042c68e3345b5a4ed8128f5e0bf` | 2026-03-19 | Merge pull request #303 from nitrobass24/feat/playwright-e2e-tests | covered elsewhere |
+| 522 | `996fce92ab31d71fa5b9985cb6b4f97232df8e51` | 2026-03-22 | chore(deps): bump the angular group in /src/angular with 9 updates | already integrated |
+| 523 | `486364fb1ff8390d516d199c60a4b3ba96392534` | 2026-03-23 | Merge pull request #307 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-d0bae5d802 | covered elsewhere |
+| 524 | `937918490ef7ef95bfbc78207ba5ef2f67d69e18` | 2026-03-22 | chore(deps): bump actions/setup-python from 5 to 6 | needs area reopen |
+| 525 | `d6d8b719d80bc83e19140c4857c6445d1a6e94c1` | 2026-03-23 | Merge pull request #306 from nitrobass24/dependabot/github_actions/develop/actions/setup-python-6 | covered elsewhere |
+| 526 | `23e621fee0105789948a25e829c83d19449db8e3` | 2026-03-23 | chore(deps-dev): bump jsdom from 29.0.0 to 29.0.1 in /src/angular | needs integration |
+| 527 | `cc2579727d0c37f54747aad05c7d3d3be3f2313d` | 2026-03-23 | Merge pull request #308 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/jsdom-29.0.1 | covered elsewhere |
+| 528 | `19b1c46594009ff2460695f893b0c1ffecba2b8a` | 2026-03-19 | Redact sensitive credentials from API responses (#257) | already integrated |
+| 529 | `224c793ee85c6ac6dcf6db1e463dfe12ffff4ea1` | 2026-03-19 | Reject redacted sentinel in set handler, fix staticmethod | needs integration |
+| 530 | `185386384e4f704e06b7c0889688a6d150320b7e` | 2026-03-23 | Merge pull request #305 from nitrobass24/fix/redact-credentials-api | covered elsewhere |
+| 531 | `5d3a3526bc242e76c346342cdb330c45634fbb6e` | 2026-03-19 | Reject control characters in decoded filenames (#300) | needs integration |
+| 532 | `5bfb18cc8c1f0d090b3252ca365e77471dda06c0` | 2026-03-19 | Assert queue_command not called on rejected filenames | needs integration |
+| 533 | `30547791ea22bebe129896e60dcabfa91720f7f5` | 2026-03-19 | Fix pre-existing test failures and add assert_not_called checks | needs integration |
+| 534 | `7f25cd71e37cba96bf5e037ad1c934fa4fe201c4` | 2026-03-23 | Merge pull request #304 from nitrobass24/fix/reject-control-chars-filename | covered elsewhere |
+| 535 | `1f6c5af6d3dd6db3daf9526f1bc7b1aa98b44f15` | 2026-03-13 | Fix ModelFile type: local_size and remote_size are nullable | needs integration |
+| 536 | `f6c0a84f68b0b3f32a38bb8e3ee986bcd41655a6` | 2026-03-23 | Prepare v0.14.2 release | intentionally skipped |
+| 537 | `6abce01f714238ec182db5a4d6d805c56fef2eba` | 2026-03-23 | Address PR review findings across security, tests, and code quality | needs area reopen |
+| 538 | `0f94a26f0c220c74ab8e4fdb40378d93f0a8e01a` | 2026-03-23 | Fix CI failures and address second round of PR review findings | needs area reopen |
+| 539 | `d1a1c54cd7cd2f2daa90524a9d9996356652ef7d` | 2026-03-23 | Harden E2E test cleanup and selector stability | needs new integration task |
+| 540 | `88eea5633c1c380281f34129afd5252acbda18b1` | 2026-03-23 | Address fourth round PR review: exact name matching and safer test cleanup | needs new integration task |
+| 541 | `1d900326576e235ad1d009bcb7107b6adc5c6a02` | 2026-03-23 | Harden settings E2E: select mutation in try, cleanup assertion, unique names | needs new integration task |
+| 542 | `1fa5deedfa85fceae2cfed8fb38fa0eab03e1013` | 2026-03-23 | Merge pull request #309 from nitrobass24/release/v0.14.2 | covered elsewhere |
+| 543 | `04f0ecc5a2ebb770701ee8b1a19b956f96ae2bb6` | 2026-03-23 | Adopt uv for Python dependency management (#286) | needs new integration task |
 | 544 | `25d2798d7c05e1585d3b1e5932fdc0efd579d834` | 2026-03-23 | Pin uv versions: setup-uv@v7, Docker image uv:0.11 | pending |
 | 545 | `f82ea20e14bf0f9ff57ac3a0f70f9399b4664b2c` | 2026-03-23 | Merge pull request #311 from nitrobass24/feat/uv-dependency-management | pending |
 | 546 | `17cc5e7eb4534531b33d688fa73ac6c77e40f1a3` | 2026-03-23 | Fix pre-existing code quality bugs from Ruff review (#289) | pending |
