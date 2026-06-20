@@ -518,7 +518,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | adapted locally in `9a48c8b4`; tolerated parser failures return `None` instead of empty status snapshots |
 | 500 | `82343ce5f9222dd8b19153b0b9a62acfcc683304` | 2026-03-18 | Fix progress tracking for downloads with .lftp temp naming (#298) | already integrated |
 | 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | intentionally skipped |
-| 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs integration |
+| 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs area reopen - belongs with scanner/runtime compatibility policy because local scanfs currently enforces Python 3.11/3.12 and uses a packaged scanner binary |
 | 503 | `f96e41de21fd86db06d8babc4622db078be28249` | 2026-03-18 | Release v0.14.1 — Parser stability, progress tracking, tooling | intentionally skipped |
 | 504 | `484477b1d06a7b4c20e42c0cf521663260d8109a` | 2026-03-18 | Fix flaky test_scanner_process by retrying multiprocessing queue read | pending |
 | 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | pending |
