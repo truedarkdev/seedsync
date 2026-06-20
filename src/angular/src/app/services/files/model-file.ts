@@ -10,8 +10,8 @@ interface IModelFile {
     path_pair_name: string;
     name: string;
     is_dir: boolean;
-    local_size: number;
-    remote_size: number;
+    local_size: number | null;
+    remote_size: number | null;
     transferred_size: number;
     download_progress: number;
     state: ModelFile.State;
@@ -70,8 +70,8 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     path_pair_name: string;
     name: string;
     is_dir: boolean;
-    local_size: number;
-    remote_size: number;
+    local_size: number | null;
+    remote_size: number | null;
     transferred_size: number;
     download_progress: number;
     state: ModelFile.State;

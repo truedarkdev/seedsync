@@ -669,7 +669,8 @@ describe("Testing view file service", () => {
         const testVectors: any[][][] = [
             [[ModelFile.State.VALIDATING, 100, 100], [ViewFile.Status.VALIDATING, false]],
             [[ModelFile.State.VALIDATED, 100, 100], [ViewFile.Status.VALIDATED, true]],
-            [[ModelFile.State.CORRUPT, 100, 100], [ViewFile.Status.CORRUPT, true]]
+            [[ModelFile.State.CORRUPT, 100, 100], [ViewFile.Status.CORRUPT, true]],
+            [[ModelFile.State.VALIDATED, null, null], [ViewFile.Status.VALIDATED, false]]
         ];
 
         let count = -1;

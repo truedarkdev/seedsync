@@ -96,6 +96,14 @@ describe("Testing model file initialization", () => {
         expect(baseModelFile.remote_modified_timestamp).toBeNull();
     });
 
+    it("should initialize null sizes correctly", () => {
+        baseJson.local_size = null;
+        baseJson.remote_size = null;
+        baseModelFile = ModelFile.fromJson(baseJson);
+        expect(baseModelFile.local_size).toBeNull();
+        expect(baseModelFile.remote_size).toBeNull();
+    });
+
     it("should correctly initialize children", () => {
         baseJson.children = [
             {
