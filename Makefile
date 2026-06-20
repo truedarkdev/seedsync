@@ -32,7 +32,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python
+.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -145,6 +145,22 @@ run-tests-python-native:
 	# native host python tests
 	mkdir -p ${PYTEST_ARTIFACT_DIR}
 	cd ${SOURCEDIR}/python && poetry run pytest -p no:cacheprovider
+
+# Local Python lint/typecheck lane. Poetry-managed dependency refresh stays deferred on this host.
+check-python-tooling: lint-python typecheck-python
+
+lint-python:
+	python_bin="$$(command -v python3 || command -v python)"; \
+	if [[ -z "$${python_bin}" ]]; then \
+		echo "${red}ERROR: python or python3 is required for the Ruff lane${reset}"; exit 1; \
+	fi; \
+	if ! "$${python_bin}" -m ruff --version >/dev/null 2>&1; then \
+		"$${python_bin}" -m pip install --user --upgrade ruff==0.15.18; \
+	fi; \
+	cd ${SOURCEDIR}/python && "$${python_bin}" -m ruff check .
+
+typecheck-python:
+	cd ${SOURCEDIR}/python && npx --yes pyright@1.1.410 --project pyrightconfig.json
 
 tests-angular:
 	# angular build
