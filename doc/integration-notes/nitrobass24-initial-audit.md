@@ -514,7 +514,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 495 | `09fb7723d6160ac508493bdec41ffad333121735` | 2026-03-18 | Add Pyright type checking foundation (#249 Phase 1) (#292) | needs new integration task |
 | 496 | `d761a6872ee96163e507cf94b68fb04efc0ca49c` | 2026-03-18 | Fix parser crash: skip unrecognized lines inside job context (#293) | adapted locally in `9a48c8b4`; parser skips unrecognized lines inside active job context |
 | 497 | `cefc87fb8c4f95b01bf4e13b5139e44ba4e45c7d` | 2026-03-18 | Split Pyright into its own CI job for visibility | needs area reopen |
-| 498 | `7e470883a7343bc3a75cde30d50306924932fc3b` | 2026-03-18 | Fix 91 Pyright errors across small modules (Phase 2) (#295) | needs new integration task |
+| 498 | `7e470883a7343bc3a75cde30d50306924932fc3b` | 2026-03-18 | Fix 91 Pyright errors across small modules (Phase 2) (#295) | adapted locally in `7d3e08f1`; upstream-only absent files were not created |
 | 499 | `c45ee2ac832af4a0faffc25f0e4ceed475950dc5` | 2026-03-18 | Fix false download completion on parser error (#296) | adapted locally in `9a48c8b4`; tolerated parser failures return `None` instead of empty status snapshots |
 | 500 | `82343ce5f9222dd8b19153b0b9a62acfcc683304` | 2026-03-18 | Fix progress tracking for downloads with .lftp temp naming (#298) | already integrated |
 | 501 | `0b7857b714e04cc4e0efd7fe5b9b363c2268be61` | 2026-03-18 | Prepare v0.14.1 release | intentionally skipped |
