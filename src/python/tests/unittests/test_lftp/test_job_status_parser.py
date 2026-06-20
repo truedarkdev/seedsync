@@ -1053,6 +1053,43 @@ class TestLftpJobStatusParser(unittest.TestCase):
         self.assertEqual(LftpJobStatus.State.QUEUED, statuses[0].state)
         self.assertEqual("rc", statuses[0].name)
 
+    def test_partial_progress_fragment_after_valid_job_is_skipped(self):
+        statuses = self._parse_pget_with_chunk_tail("/s eta:25m [Receiving data]")
+
+        self.assertEqual(1, len(statuses))
+        self.assertEqual(LftpJobStatus.Type.PGET, statuses[0].type)
+        self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
+        self.assertEqual("SomeFile.mkv", statuses[0].name)
+
+    def test_partial_progress_fragment_only_is_skipped_as_noise(self):
+        output = """
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is running.
+        /s eta:25m [Receiving data]
+        """
+        parser = LftpJobStatusParser()
+        with self.assertLogs("LftpJobStatusParser", level="WARNING") as captured_logs:
+            statuses = parser.parse(output)
+
+        self.assertEqual([], statuses)
+        self.assertTrue(any("Skipping orphan lftp progress line" in message for message in captured_logs.output))
+
+    def test_partial_progress_fragment_does_not_mask_unrelated_garbage(self):
+        output = """
+        [0] queue (sftp://someone:@localhost)
+        sftp://someone:@localhost/home/someone
+        Queue is running.
+        bad string uh oh
+        """
+        parser = LftpJobStatusParser()
+        with self.assertLogs("LftpJobStatusParser", level="WARNING") as captured_logs:
+            statuses = parser.parse(output)
+
+        self.assertEqual([], statuses)
+        self.assertTrue(any("skipping bad job output" in message for message in captured_logs.output))
+        self.assertFalse(any("Skipping orphan lftp progress line" in message for message in captured_logs.output))
+
     def test_queue_pty_line_wrap_skips_bad_queue_line(self):
         output = (
             "jobs -v\n"

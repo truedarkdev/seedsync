@@ -125,6 +125,7 @@ class LftpJobStatusParser:
     @staticmethod
     def __parse_jobs(lines: List[str]) -> List[LftpJobStatus]:
         jobs = []
+        logger = logging.getLogger("LftpJobStatusParser")
 
         # Header patterns
         # pget header
@@ -220,6 +221,28 @@ class LftpJobStatusParser:
 
         queue_done_m = re.compile(LftpJobStatusParser.__QUEUE_DONE_REGEX)
 
+        # Orphan progress lines lftp can emit outside a job context, e.g.:
+        #   "3.0K/s eta:3m [Receiving data]"
+        #   "10M/s eta:1h2m [Making data connection]"
+        orphan_progress_pattern = (
+            r"^(?:\d+\.?\d*\s?({sz}))\/s\s+"
+            r"eta:({eta})\s+"
+            r"\[.*\]$"
+        ).format(
+            sz=LftpJobStatusParser.__SIZE_UNITS_REGEX,
+            eta=LftpJobStatusParser.__TIME_UNITS_REGEX,
+        )
+        orphan_progress_m = re.compile(orphan_progress_pattern)
+
+        # Partial progress fragments from PTY line-wrap, e.g.:
+        #   "/s eta:25m [Receiving data]"  (tail of "347.3K/s eta:25m ...")
+        partial_progress_pattern = (
+            r"^\/s\s+"
+            r"eta:({eta})\s+"
+            r"\[.*\]$"
+        ).format(eta=LftpJobStatusParser.__TIME_UNITS_REGEX)
+        partial_progress_m = re.compile(partial_progress_pattern)
+
         prev_job = None
         while lines:
             line = lines.pop(0)
@@ -231,6 +254,9 @@ class LftpJobStatusParser:
                 mirror_header_m.match(line) or
                 mirror_fl_header_m.match(line)
             ):
+                if orphan_progress_m.match(line) or partial_progress_m.match(line):
+                    logger.warning("Skipping orphan lftp progress line: '%s'", line)
+                    continue
                 raise ValueError("First line is not a matching header '{}'".format(line))
 
             # Search for pget header
@@ -502,6 +528,10 @@ class LftpJobStatusParser:
                 if lines:
                     raise ValueError("There are more lines after the 'Done' line")
                 # Continue the outer loop
+                continue
+
+            if orphan_progress_m.match(line) or partial_progress_m.match(line):
+                logger.warning("Skipping orphan lftp progress line: '%s'", line)
                 continue
 
             # If we got here, then we don't know how to parse this line

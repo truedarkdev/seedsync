@@ -1555,6 +1555,24 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual(4, process.expect.call_count)
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
+    def test_init_preserves_env_while_forcing_wide_columns(self, spawn):
+        process = MagicMock()
+        process.isalive.return_value = True
+        process.expect.return_value = None
+        spawn.return_value = process
+
+        with patch.dict(os.environ, {"EXISTING": "keep"}, clear=True):
+            Lftp(address="localhost", port=22, user="seedsynctest", password=None)
+
+        self.assertEqual(
+            {
+                "EXISTING": "keep",
+                "COLUMNS": "10000",
+            },
+            spawn.call_args.kwargs["env"],
+        )
+
+    @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_sets_permissions_override_when_umask_is_valid(self, spawn):
         process = MagicMock()
         process.isalive.return_value = True
@@ -1703,6 +1721,34 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertNotIn("\x1b[?2004h", output)
         self.assertNotIn("\x1b[?2004l", output)
         self.assertIn("[0] queue (sftp://someone:@localhost)", output)
+
+    def test_status_ignores_nine_parser_errors_then_raises_on_tenth(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("boom")
+
+        for _ in range(9):
+            statuses = lftp.status()
+            self.assertEqual([], statuses)
+
+        self.assertEqual(9, lftp._Lftp__consecutive_status_errors)
+
+        with self.assertRaises(LftpJobStatusParserError):
+            lftp.status()
+
+        self.assertEqual(10, lftp._Lftp__consecutive_status_errors)
+
+    def test_status_connection_grace_retry_raises_on_tenth_parser_error(self):
+        lftp = TestLftp._build_status_poll_test_lftp()
+        lftp._Lftp__job_status_parser.parse.side_effect = LftpJobStatusParserError("boom")
+        lftp._Lftp__consecutive_status_errors = 8
+        lftp._Lftp__status_poll_needs_connection_grace = True
+
+        with self.assertRaises(LftpJobStatusParserError):
+            lftp.status()
+
+        self.assertEqual(10, lftp._Lftp__consecutive_status_errors)
+        self.assertEqual(2, lftp._Lftp__job_status_parser.parse.call_count)
+        self.assertEqual(2, lftp._Lftp__process.send.call_count)
 
 class TestLftpKillPathMatching(unittest.TestCase):
     def test_kill_matches_running_pget_job_by_staging_root(self):
