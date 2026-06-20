@@ -482,7 +482,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 463 | `96e79b85e93c1c7e1bf73b13c2ca5741d2be96f8` | 2026-03-12 | Merge pull request #263 from nitrobass24/fix/parser-resilience-unraid | covered elsewhere - merge wrapper for rows `460`-`462` adapted in `d48e570c`; no independent payload |
 | 464 | `f6e6663bbedc9486b36ed6217b8bdcdd4a43cb45` | 2026-03-12 | Release v0.13.4 - Exclude patterns fix and Unraid parser resilience | intentionally skipped |
 | 465 | `b13d7d5a1bba9a904b2f7266614764353abbd91f` | 2026-03-12 | Fix v0.13.4 changelog to only include hotfix PRs | intentionally skipped |
-| 466 | `21ca414843b8da2860917e318bcf4773f3ef4846` | 2026-03-12 | Add debug log for LFTP queue command | needs integration |
+| 466 | `21ca414843b8da2860917e318bcf4773f3ef4846` | 2026-03-12 | Add debug log for LFTP queue command | adapted locally in `51acb106`; queue command log is debug-level |
 | 467 | `69c50edef63bfffa90d9107f7865252271720fbc` | 2026-03-12 | Fix exclude patterns: use --exclude-glob instead of --exclude | needs integration |
 | 468 | `8cacc58ba5e31422f11b9305ea5c6bb1af3a71cf` | 2026-03-12 | Allow workflow_dispatch to publish Docker images | needs area reopen |
 | 469 | `1fd8efbabaf949a07a46fa84e22279c983a694f6` | 2026-03-12 | Merge remote-tracking branch 'origin/master' into develop | covered elsewhere |
