@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import List, Callable
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from threading import Lock
 from queue import Queue
 from enum import Enum
@@ -74,7 +74,7 @@ class Controller:
         def __init__(self,
                      action: Action,
                      filename: str,
-                     flow_id: str = None,
+                     flow_id: Optional[str] = None,
                      origin: str = "manual"):
             self.action = action
             self.filename = filename
@@ -162,19 +162,25 @@ class Controller:
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
         self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
+        config = cast(Any, self.__context.config)
+        lftp_cfg = config.lftp
+        controller_cfg = config.controller
+        general_cfg = config.general
+        self.__path_pairs_by_id: Dict[str, PathPair] = {}
+        self.__path_pair_staging_paths: Dict[str, str] = {}
+
         self.__staging_path = self.__build_staging_path(
-            self.__context.config.lftp.local_path,
-            self.__context.config.lftp.staging_path
+            lftp_cfg.local_path,
+            lftp_cfg.staging_path
         )
-        self.__path_pair_staging_paths = {}
 
         # Lftp
-        self.__lftp = Lftp(address=self.__context.config.lftp.remote_address,
-                           port=self.__context.config.lftp.remote_port,
-                           user=self.__context.config.lftp.remote_username,
+        self.__lftp = Lftp(address=lftp_cfg.remote_address,
+                           port=lftp_cfg.remote_port,
+                           user=lftp_cfg.remote_username,
                            password=self.__password)
         self.__lftp.set_base_logger(self.logger)
-        self.__lftp.set_base_remote_dir_path(self.__context.config.lftp.remote_path)
+        self.__lftp.set_base_remote_dir_path(lftp_cfg.remote_path)
         self.__lftp.set_base_local_dir_path(self.__staging_path)
         self.__configure_lftp()
 
@@ -191,27 +197,27 @@ class Controller:
             self.__refresh_path_pair_runtime_state([])
 
         # Setup extract process
-        if self.__context.config.controller.use_local_path_as_extract_path:
-            out_dir_path = self.__context.config.lftp.local_path
+        if controller_cfg.use_local_path_as_extract_path:
+            out_dir_path = lftp_cfg.local_path
         else:
-            out_dir_path = self.__context.config.controller.extract_path
+            out_dir_path = controller_cfg.extract_path
         # Keep the final local root primary, but allow archive lookup to fall
         # back to staging so extraction can survive the move boundary.
         self.__extract_process = ExtractProcess(
             out_dir_path=out_dir_path,
-            local_path=self.__context.config.lftp.local_path,
+            local_path=lftp_cfg.local_path,
             local_path_fallback=self.__staging_path,
-            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
+            managed_extract_folders_enabled=controller_cfg.managed_extract_folders_enabled,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         self.__validate_process = ValidateProcess(
-            remote_address=self.__context.config.lftp.remote_address,
-            remote_username=self.__context.config.lftp.remote_username,
+            remote_address=lftp_cfg.remote_address,
+            remote_username=lftp_cfg.remote_username,
             remote_password=self.__password,
-            remote_port=self.__context.config.lftp.remote_port,
-            local_path=self.__context.config.lftp.local_path,
-            remote_path=self.__context.config.lftp.remote_path,
-            path_pairs_by_id=self.__path_pairs_by_id
+            remote_port=lftp_cfg.remote_port,
+            local_path=lftp_cfg.local_path,
+            remote_path=lftp_cfg.remote_path,
+            path_pairs_by_id=cast(Dict[str, object], self.__path_pairs_by_id)
         )
 
         # Setup multiprocess logging
@@ -236,7 +242,7 @@ class Controller:
         (
             self.__lftp_status_poll_retry_seconds,
             self.__lftp_status_cache_max_age_seconds
-        ) = Controller.__lftp_status_refresh_timing(self.__context.config.controller.interval_ms_downloading_scan)
+        ) = Controller.__lftp_status_refresh_timing(controller_cfg.interval_ms_downloading_scan)
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
 
@@ -249,35 +255,40 @@ class Controller:
 
     def __configure_lftp(self):
         # Configure Lftp
-        self.__lftp.num_parallel_jobs = self.__context.config.lftp.num_max_parallel_downloads
-        self.__lftp.num_parallel_files = self.__context.config.lftp.num_max_parallel_files_per_download
-        self.__lftp.num_connections_per_root_file = self.__context.config.lftp.num_max_connections_per_root_file
-        self.__lftp.num_connections_per_dir_file = self.__context.config.lftp.num_max_connections_per_dir_file
-        self.__lftp.num_max_total_connections = self.__context.config.lftp.num_max_total_connections
-        self.__lftp.use_temp_file = self.__context.config.lftp.use_temp_file
-        if self.__context.config.lftp.rate_limit:
-            self.__lftp.rate_limit = self.__context.config.lftp.rate_limit
-        net_socket_buffer = self.__context.config.lftp.net_socket_buffer
+        config = cast(Any, self.__context.config)
+        lftp_cfg = config.lftp
+        general_cfg = config.general
+        self.__lftp.num_parallel_jobs = lftp_cfg.num_max_parallel_downloads
+        self.__lftp.num_parallel_files = lftp_cfg.num_max_parallel_files_per_download
+        self.__lftp.num_connections_per_root_file = lftp_cfg.num_max_connections_per_root_file
+        self.__lftp.num_connections_per_dir_file = lftp_cfg.num_max_connections_per_dir_file
+        self.__lftp.num_max_total_connections = lftp_cfg.num_max_total_connections
+        self.__lftp.use_temp_file = lftp_cfg.use_temp_file
+        if lftp_cfg.rate_limit:
+            self.__lftp.rate_limit = lftp_cfg.rate_limit
+        net_socket_buffer = lftp_cfg.net_socket_buffer
         if net_socket_buffer is not None and net_socket_buffer != "":
             self.__lftp.net_socket_buffer = net_socket_buffer
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
-        self.__lftp.set_verbose_logging(self.__context.config.general.verbose)
+        self.__lftp.set_verbose_logging(general_cfg.verbose)
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:
         if self.__context.path_pair_manager is None:
             return []
         return self.__context.path_pair_manager.get_enabled_pairs()
 
-    def __refresh_path_pair_runtime_state(self, enabled_path_pairs: List[PathPair] = None):
+    def __refresh_path_pair_runtime_state(self, enabled_path_pairs: Optional[List[PathPair]] = None):
         if enabled_path_pairs is None:
             enabled_path_pairs = self.__get_enabled_path_pairs()
 
-        path_pairs_by_id = {pair.id: pair for pair in enabled_path_pairs}
-        path_pair_staging_paths = {
+        config = cast(Any, self.__context.config)
+        controller_cfg = config.controller
+        path_pairs_by_id: Dict[str, PathPair] = {pair.id: pair for pair in enabled_path_pairs}
+        path_pair_staging_paths: Dict[str, str] = {
             pair.id: self.__build_staging_path(pair.local_path)
             for pair in enabled_path_pairs
         }
-        lftp_path_pairs = [
+        lftp_path_pairs: List[PathPair] = [
             PathPair(
                 remote_path=pair.remote_path,
                 local_path=path_pair_staging_paths[pair.id],
@@ -293,18 +304,18 @@ class Controller:
         remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
         active_scan_process = ScannerProcess(
             scanner=active_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_downloading_scan,
+            interval_in_ms=controller_cfg.interval_ms_downloading_scan,
             verbose=False,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         local_scan_process = ScannerProcess(
             scanner=local_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_local_scan,
+            interval_in_ms=controller_cfg.interval_ms_local_scan,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         remote_scan_process = ScannerProcess(
             scanner=remote_scanner,
-            interval_in_ms=self.__context.config.controller.interval_ms_remote_scan,
+            interval_in_ms=controller_cfg.interval_ms_remote_scan,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
 
@@ -319,7 +330,9 @@ class Controller:
         self.__local_scan_process = local_scan_process
         self.__remote_scan_process = remote_scan_process
 
-    def __build_lftp_path_pairs(self, path_pairs_by_id, path_pair_staging_paths):
+    def __build_lftp_path_pairs(self,
+                                path_pairs_by_id: Dict[str, PathPair],
+                                path_pair_staging_paths: Dict[str, str]) -> List[PathPair]:
         return [
             PathPair(
                 remote_path=pair.remote_path,
@@ -332,17 +345,21 @@ class Controller:
             for pair in path_pairs_by_id.values()
         ]
 
-    def __refresh_model_builder_local_paths(self, path_pairs_by_id=None, path_pair_staging_paths=None):
+    def __refresh_model_builder_local_paths(
+            self,
+            path_pairs_by_id: Optional[Dict[str, PathPair]] = None,
+            path_pair_staging_paths: Optional[Dict[str, str]] = None):
         if path_pairs_by_id is None:
             path_pairs_by_id = self.__path_pairs_by_id
         if path_pair_staging_paths is None:
             path_pair_staging_paths = self.__path_pair_staging_paths
 
-        local_root_paths = {None: self.__context.config.lftp.local_path}
-        local_staging_paths = {None: self.__staging_path}
+        config = cast(Any, self.__context.config)
+        local_root_paths: Dict[Optional[str], str] = {None: config.lftp.local_path}
+        local_staging_paths: Dict[Optional[str], str] = {None: self.__staging_path}
         for pair_id, pair in path_pairs_by_id.items():
             local_root_paths[pair_id] = pair.local_path
-            local_staging_paths[pair_id] = path_pair_staging_paths.get(pair_id)
+            local_staging_paths[pair_id] = path_pair_staging_paths.get(pair_id, self.__staging_path)
         self.__model_builder.set_local_root_paths(local_root_paths, local_staging_paths)
 
     def __record_path_pair_runtime_error(self, error_msg: str):
@@ -368,60 +385,63 @@ class Controller:
         self.__path_pair_runtime_error = None
 
     def __build_active_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
+        config = cast(Any, self.__context.config)
         if enabled_path_pairs:
             return MultiPathActiveScanner({
                 pair.id: path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
-            }, use_temp_file=self.__context.config.lftp.use_temp_file)
+            }, use_temp_file=config.lftp.use_temp_file)
         return ActiveScanner(
             self.__staging_path,
-            use_temp_file=self.__context.config.lftp.use_temp_file
+            use_temp_file=config.lftp.use_temp_file
         )
 
     def __build_local_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
+        config = cast(Any, self.__context.config)
         if enabled_path_pairs:
             return MultiPathLocalScanner([
                 LocalScanner(
                     local_path=pair.local_path,
-                    use_temp_file=self.__context.config.lftp.use_temp_file,
+                    use_temp_file=config.lftp.use_temp_file,
                     staging_path=path_pair_staging_paths[pair.id],
-                    managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled,
+                    managed_extract_folders_enabled=config.controller.managed_extract_folders_enabled,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
             ])
         return LocalScanner(
-            local_path=self.__context.config.lftp.local_path,
-            use_temp_file=self.__context.config.lftp.use_temp_file,
+            local_path=config.lftp.local_path,
+            use_temp_file=config.lftp.use_temp_file,
             staging_path=self.__staging_path,
-            managed_extract_folders_enabled=self.__context.config.controller.managed_extract_folders_enabled
+            managed_extract_folders_enabled=config.controller.managed_extract_folders_enabled
         )
 
     def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]):
+        config = cast(Any, self.__context.config)
         if enabled_path_pairs:
             return MultiPathRemoteScanner([
                 RemoteScanner(
-                    remote_address=self.__context.config.lftp.remote_address,
-                    remote_username=self.__context.config.lftp.remote_username,
+                    remote_address=config.lftp.remote_address,
+                    remote_username=config.lftp.remote_username,
                     remote_password=self.__password,
-                    remote_port=self.__context.config.lftp.remote_port,
+                    remote_port=config.lftp.remote_port,
                     remote_path_to_scan=pair.remote_path,
-                    local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
-                    remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script,
+                    local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
+                    remote_path_to_scan_script=config.lftp.remote_path_to_scan_script,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
             ])
         return RemoteScanner(
-            remote_address=self.__context.config.lftp.remote_address,
-            remote_username=self.__context.config.lftp.remote_username,
+            remote_address=config.lftp.remote_address,
+            remote_username=config.lftp.remote_username,
             remote_password=self.__password,
-            remote_port=self.__context.config.lftp.remote_port,
-            remote_path_to_scan=self.__context.config.lftp.remote_path,
-            local_path_to_scan_script=self.__context.args.local_path_to_scanfs,
-            remote_path_to_scan_script=self.__context.config.lftp.remote_path_to_scan_script
+            remote_port=config.lftp.remote_port,
+            remote_path_to_scan=config.lftp.remote_path,
+            local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
+            remote_path_to_scan_script=config.lftp.remote_path_to_scan_script
         )
 
-    def __mark_path_pair_refresh_completed(self, generation: int = None):
+    def __mark_path_pair_refresh_completed(self, generation: Optional[int] = None):
         if generation is None:
             generation = self.__path_pair_refresh_generation
         with self.__path_pair_refresh_lock:
@@ -430,7 +450,7 @@ class Controller:
                 generation
             )
 
-    def refresh_path_pairs(self, wait: bool = False, timeout_secs: float = None):
+    def refresh_path_pairs(self, wait: bool = False, timeout_secs: Optional[float] = None):
         if not self.__started:
             self.__apply_path_pair_refresh()
             self.__mark_path_pair_refresh_completed(self.__path_pair_refresh_generation)
@@ -468,8 +488,8 @@ class Controller:
 
     def __restore_path_pair_runtime_state(
             self,
-            path_pairs_by_id,
-            path_pair_staging_paths,
+            path_pairs_by_id: Dict[str, PathPair],
+            path_pair_staging_paths: Dict[str, str],
             active_scanner,
             local_scanner,
             remote_scanner,
@@ -478,7 +498,7 @@ class Controller:
             remote_scan_process):
         self.__lftp.set_path_pairs(self.__build_lftp_path_pairs(path_pairs_by_id, path_pair_staging_paths))
         self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
-        self.__validate_process.set_path_pairs_by_id(path_pairs_by_id)
+        self.__validate_process.set_path_pairs_by_id(cast(Dict[str, object], path_pairs_by_id))
         self.__path_pairs_by_id = path_pairs_by_id
         self.__path_pair_staging_paths = path_pair_staging_paths
         self.__active_scanner = active_scanner
@@ -527,7 +547,7 @@ class Controller:
                 self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
                 self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
                 self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
-                self.__validate_process.set_path_pairs_by_id(self.__path_pairs_by_id)
+                self.__validate_process.set_path_pairs_by_id(cast(Dict[str, object], self.__path_pairs_by_id))
 
             if was_started:
                 for staging_path in self.__path_pair_staging_paths.values():
@@ -705,29 +725,29 @@ class Controller:
     def __get_model_files(self) -> List[ModelFile]:
         model_files = []
         get_ids = getattr(self.__model, "get_file_ids", None)
-        identifiers = get_ids() if callable(get_ids) else self.__model.get_file_names()
+        identifiers = cast(List[str], get_ids()) if callable(get_ids) else self.__model.get_file_names()
         for identifier in identifiers:
             model_files.append(copy.deepcopy(self.__model.get_file(identifier)))
         return model_files
 
-    def __get_path_pair(self, path_pair_id: str):
+    def __get_path_pair(self, path_pair_id: Optional[str]) -> Optional[PathPair]:
         if not path_pair_id:
             return None
         return getattr(self, "_Controller__path_pairs_by_id", {}).get(path_pair_id)
 
     @staticmethod
-    def __build_staging_path(local_path: str, staging_path: str = None) -> str:
+    def __build_staging_path(local_path: str, staging_path: Optional[str] = None) -> str:
         return staging_path or os.path.join(local_path, "incomplete")
 
-    def __is_previously_downloaded(self, name: str, path_pair_id: str = None) -> bool:
+    def __is_previously_downloaded(self, name: str, path_pair_id: Optional[str] = None) -> bool:
         file_id = ModelFile.build_file_id(name, path_pair_id)
         return file_id in self.__persist.downloaded_file_names or name in self.__persist.downloaded_file_names
 
-    def __is_explicitly_stopped(self, name: str, path_pair_id: str = None) -> bool:
+    def __is_explicitly_stopped(self, name: str, path_pair_id: Optional[str] = None) -> bool:
         file_id = ModelFile.build_file_id(name, path_pair_id)
         return file_id in self.__persist.stopped_file_names or name in self.__persist.stopped_file_names
 
-    def __get_staging_path(self, path_pair_id: str = None) -> str:
+    def __get_staging_path(self, path_pair_id: Optional[str] = None) -> Optional[str]:
         if path_pair_id:
             path_pair = self.__get_path_pair(path_pair_id)
             if path_pair is not None:
@@ -735,7 +755,7 @@ class Controller:
             return self.__path_pair_staging_paths.get(path_pair_id)
         return self.__staging_path
 
-    def __get_stop_resume_trace_file_details(self, path: str, include_allocated_size: bool = False) -> dict:
+    def __get_stop_resume_trace_file_details(self, path: Optional[str], include_allocated_size: bool = False) -> dict:
         if path is None:
             return {
                 "exists": False,
@@ -773,12 +793,12 @@ class Controller:
                                 reason: str,
                                 file_id: str,
                                 file_name: str,
-                                path_pair_id: str = None,
+                                path_pair_id: Optional[str] = None,
                                 is_dir: bool = False,
-                                current_state: str = None,
-                                remote_base_dir_path: str = None,
-                                local_base_dir_path: str = None,
-        stopped_marked: bool = False):
+                                current_state: Optional[Any] = None,
+                                remote_base_dir_path: Optional[str] = None,
+                                local_base_dir_path: Optional[str] = None,
+                                stopped_marked: bool = False):
         trace_file_id = getattr(self, "_Controller__stop_resume_trace_file_id", None)
         if trace_file_id is None or (trace_file_id != file_id and trace_file_id != file_name):
             return
@@ -816,7 +836,7 @@ class Controller:
         )
 
     @staticmethod
-    def __extract_target_archive_trace_selector_name(identifier: str):
+    def __extract_target_archive_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
         if identifier is None:
             return None
         try:
@@ -852,7 +872,7 @@ class Controller:
             "is_extractable": file.is_extractable,
         }
 
-    def __find_target_archive_model_file(self, file_name: str, file_id: str = None):
+    def __find_target_archive_model_file(self, file_name: str, file_id: Optional[str] = None):
         try:
             file_ids = self.__model.get_file_ids()
         except AttributeError:
@@ -885,13 +905,13 @@ class Controller:
     def __record_breadcrumb(self,
                             stage: str,
                             message: str,
-                            details: dict = None,
+                            details: Optional[dict] = None,
                             event_type: str = "diagnostic",
-                            file_id: str = None,
-                            path_pair_id: str = None,
-                            path_pair_name: str = None,
-                            corr_id: str = None,
-                            flow_id: str = None,
+                            file_id: Optional[str] = None,
+                            path_pair_id: Optional[str] = None,
+                            path_pair_name: Optional[str] = None,
+                            corr_id: Optional[str] = None,
+                            flow_id: Optional[str] = None,
                             trace_scope: str = "flow"):
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         if breadcrumb_trace is None:
@@ -922,7 +942,7 @@ class Controller:
         return "cmd:{}:{}:{}".format(action_name, command.filename, sequence)
 
     @staticmethod
-    def __command_corr_id(command: "Controller.Command", file: ModelFile = None):
+    def __command_corr_id(command: "Controller.Command", file: Optional[ModelFile] = None):
         if file is not None:
             return file.path_pair_id or file.file_id or command.filename
         return command.filename
@@ -932,7 +952,7 @@ class Controller:
                                     message: str,
                                     details: dict,
                                     event_type: str = "state_transition",
-                                    file: ModelFile = None):
+                                    file: Optional[ModelFile] = None):
         self.__record_breadcrumb(
             stage="command",
             message=message,
@@ -990,7 +1010,7 @@ class Controller:
             path_pair_name = getattr(path_pair, "name", None)
         return status.name, path_pair_id, path_pair_name
 
-    def __temp_diag(self, stage: str, file_id: str = None, **payload):
+    def __temp_diag(self, stage: str, file_id: Optional[str] = None, **payload):
         self.__record_breadcrumb(
             stage=stage,
             message=stage,
@@ -1050,14 +1070,14 @@ class Controller:
         self.__persist.extracted_file_names.difference_update(stale_extracted_file_names)
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
-    def __move_from_staging(self, name: str, path_pair_id: str = None):
+    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None):
         if path_pair_id:
             staging_path = self.__get_staging_path(path_pair_id)
             path_pair = self.__get_path_pair(path_pair_id)
             final_path = path_pair.local_path if path_pair is not None else None
         else:
             staging_path = self.__staging_path
-            final_path = self.__context.config.lftp.local_path
+            final_path = cast(Any, self.__context.config).lftp.local_path
 
         if not staging_path or not final_path:
             return
@@ -1121,9 +1141,10 @@ class Controller:
                     "error": str(error),
                 })
 
-    def __get_delete_local_target(self, file: ModelFile) -> tuple[str, str]:
+    def __get_delete_local_target(self, file: ModelFile) -> Tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
-        final_path = path_pair.local_path if path_pair is not None else self.__context.config.lftp.local_path
+        config = cast(Any, self.__context.config)
+        final_path = path_pair.local_path if path_pair is not None else config.lftp.local_path
         staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
         final_target = os.path.join(final_path, file.name)
 
@@ -1169,7 +1190,7 @@ class Controller:
         self,
         file: ModelFile,
         post_callback: Callable,
-        command: "Controller.Command" = None
+        command: Optional["Controller.Command"] = None
     ):
         delete_local_path, delete_local_name = self.__get_delete_local_target(file)
         process = DeleteLocalProcess(
@@ -1418,7 +1439,7 @@ class Controller:
             lftp_status_count=len(lftp_statuses) if lftp_statuses is not None else None,
             active_downloading_count=len(self.__active_downloading_file_names),
             active_extracting_count=len(self.__active_extracting_file_names),
-            last_lftp_status_count=len(self.__last_lftp_statuses),
+            last_lftp_status_count=len(self.__last_lftp_statuses) if self.__last_lftp_statuses is not None else None,
             next_lftp_status_poll_at=self.__next_lftp_status_poll_at,
             lftp_status_cache_expires_at=self.__lftp_status_cache_expires_at,
         )
@@ -1575,10 +1596,13 @@ class Controller:
                 # Apply changes to the new model
                 for diff in model_diff:
                     if diff.change == ModelDiff.Change.ADDED:
+                        assert diff.new_file is not None
                         self.__model.add_file(diff.new_file)
                     elif diff.change == ModelDiff.Change.REMOVED:
+                        assert diff.old_file is not None
                         self.__model.remove_file(diff.old_file.file_id)
                     elif diff.change == ModelDiff.Change.UPDATED:
+                        assert diff.new_file is not None
                         self.__model.update_file(diff.new_file)
 
                     if diff.change == ModelDiff.Change.REMOVED and diff.old_file is not None and \
@@ -1637,9 +1661,11 @@ class Controller:
                             downloaded = True
                         elif diff.change == ModelDiff.Change.UPDATED and \
                                 diff.new_file.state == ModelFile.State.DOWNLOADED and \
+                                diff.old_file is not None and \
                                 diff.old_file.state != ModelFile.State.DOWNLOADED:
                             downloaded = True
                     if downloaded:
+                        assert diff.new_file is not None
                         self.__persist.downloaded_file_names.add(diff.new_file.file_id)
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self.clear_extracted_marker(diff.new_file)
@@ -1649,12 +1675,12 @@ class Controller:
                             })
                         self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
 
-                current_auto_purge_candidate_ids = {
-                    diff.new_file.file_id
-                    for diff in model_diff
-                    if diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED) and
-                    self.__should_auto_purge_local_file(diff.new_file)
-                }
+                current_auto_purge_candidate_ids = set()
+                for diff in model_diff:
+                    if diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED) and \
+                            diff.new_file is not None and \
+                            self.__should_auto_purge_local_file(diff.new_file):
+                        current_auto_purge_candidate_ids.add(diff.new_file.file_id)
                 if remote_reconciliation_established:
                     auto_purge_candidate_ids.update(current_auto_purge_candidate_ids)
                 else:
@@ -1750,7 +1776,7 @@ class Controller:
         def _notify_failure(_command: Controller.Command,
                             _msg: str,
                             _error_code: int = 400,
-                            _file: ModelFile = None):
+                            _file: Optional[ModelFile] = None):
             self.logger.warning("Command failed. {}".format(_msg))
             self.__record_command_breadcrumb(
                 command=_command,
@@ -1872,6 +1898,7 @@ class Controller:
                     local_path = None
                     local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
                     if path_pair is not None:
+                        assert file.path_pair_id is not None
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
                         local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
                     stopped_marked = file.file_id in self.__persist.stopped_file_names or \
@@ -2089,13 +2116,14 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 else:
+                    config = cast(Any, self.__context.config)
                     process = DeleteRemoteProcess(
-                        remote_address=self.__context.config.lftp.remote_address,
-                        remote_username=self.__context.config.lftp.remote_username,
+                        remote_address=config.lftp.remote_address,
+                        remote_username=config.lftp.remote_username,
                         remote_password=self.__password,
-                        remote_port=self.__context.config.lftp.remote_port,
+                        remote_port=config.lftp.remote_port,
                         remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
-                        else self.__context.config.lftp.remote_path,
+                        else config.lftp.remote_path,
                         file_name=file.name
                     )
                     process.set_multiprocessing_logger(self.__mp_logger)
@@ -2146,7 +2174,7 @@ class Controller:
         with self.__model_lock:
             get_ids = getattr(self.__model, "get_file_ids", None)
             if callable(get_ids):
-                model_file_count = len(get_ids())
+                model_file_count = len(cast(List[str], get_ids()))
             else:
                 model_file_count = len(self.__model.get_file_names())
 

@@ -23,7 +23,9 @@ class AutoQueuePattern(Serializable):
     def pattern(self) -> str:
         return self.__pattern
 
-    def __eq__(self, other: "AutoQueuePattern") -> bool:
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, AutoQueuePattern):
+            return False
         return self.__pattern == other.__pattern
 
     def __hash__(self) -> int:
@@ -95,8 +97,8 @@ class AutoQueuePersist(Persist):
 
     @classmethod
     @overrides(Persist)
-    def from_str(cls: "AutoQueuePersist", content: str) -> "AutoQueuePersist":
-        persist = AutoQueuePersist()
+    def from_str(cls: type["AutoQueuePersist"], content: str) -> "AutoQueuePersist":
+        persist = cls()
         try:
             dct = json.loads(content)
             pattern_list = dct[AutoQueuePersist.__KEY_PATTERNS]
@@ -191,7 +193,7 @@ class AutoQueue:
                 self.logger.debug("    {}".format(pattern.pattern))
 
     @staticmethod
-    def __extract_trace_selector_name(identifier: str):
+    def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
         if identifier is None:
             return None
         try:
@@ -655,9 +657,9 @@ class AutoQueue:
         :return:
         """
         # make the search case insensitive
-        pattern = pattern.pattern.lower()
+        pattern_str = pattern.pattern.lower()
         filename = file.name.lower()
         # 1. pattern match
         # 2. wildcard match
-        return pattern in filename or \
-            fnmatch.fnmatch(filename, pattern)
+        return pattern_str in filename or \
+            fnmatch.fnmatch(filename, pattern_str)

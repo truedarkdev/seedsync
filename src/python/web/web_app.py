@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import ipaddress
-from typing import Type, Callable, Optional, Tuple
+from typing import Any, Type, Callable, Optional, Tuple
 from abc import ABC, abstractmethod
 import time
 from urllib.parse import urlparse
@@ -100,11 +100,13 @@ class WebApp(bottle.Bottle):
                 if host not in {"localhost", "127.0.0.1", "[::1]", allowed_hostname}:
                     bottle.abort(400)
 
+            route: Any = None
             try:
                 route, _ = self.match(bottle.request.environ)
             except bottle.HTTPError:
                 bottle.abort(404)
 
+            assert route is not None
             if not WebApp.__is_server_path(route.rule):
                 bottle.abort(404)
 
@@ -133,37 +135,37 @@ class WebApp(bottle.Bottle):
         # Bootstrap landing page. It is intentionally tiny and same-origin so the
         # browser can claim first-run admin access or remember an API key without
         # exposing credentials to the helper process.
-        self.route("/bootstrap")(self.__bootstrap)
+        self.route("/bootstrap")(self.__bootstrap)  # type: ignore[operator]
 
         # Streaming route
         self.get(
             "/server/stream",
             required_scope="stream",
             allow_sessionless_ui=True,
-        )(self.__web_stream)
+        )(self.__web_stream)  # type: ignore[operator]
 
         # Front-end routes
-        self.route("/")(self.__index)
-        self.route("/dashboard")(self.__index)
-        self.route("/dashboard/<pathPairId>")(self.__dashboard_index)
-        self.route("/settings")(self.__index)
-        self.route("/autoqueue")(self.__index)
-        self.route("/logs")(self.__index)
-        self.route("/about")(self.__index)
+        self.route("/")(self.__index)  # type: ignore[operator]
+        self.route("/dashboard")(self.__index)  # type: ignore[operator]
+        self.route("/dashboard/<pathPairId>")(self.__dashboard_index)  # type: ignore[operator]
+        self.route("/settings")(self.__index)  # type: ignore[operator]
+        self.route("/autoqueue")(self.__index)  # type: ignore[operator]
+        self.route("/logs")(self.__index)  # type: ignore[operator]
+        self.route("/about")(self.__index)  # type: ignore[operator]
         # For static files
-        self.route("/<file_path:path>")(self.__static)
+        self.route("/<file_path:path>")(self.__static)  # type: ignore[operator]
 
     def add_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.get(path, required_scope=required_scope, **config)(handler)
+        self.get(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
 
     def add_post_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.post(path, required_scope=required_scope, **config)(handler)
+        self.post(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
 
     def add_put_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.put(path, required_scope=required_scope, **config)(handler)
+        self.put(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
 
     def add_delete_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.delete(path, required_scope=required_scope, **config)(handler)
+        self.delete(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
 
     def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs):
         self.__streaming_handlers.append((handler, kwargs))
@@ -236,7 +238,8 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None:
             return False
 
-        browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
+        auth_store: Any = self.__auth_store
+        browser_handover_state = auth_store.get_browser_handover_state(self.__config)
         return bool(browser_handover_state.get("open", False))
 
     @staticmethod
@@ -655,7 +658,8 @@ class WebApp(bottle.Bottle):
 
         auth_record = None
         if self.__auth_store is not None:
-            auth_record = self.__auth_store.find_api_key_by_secret(token)
+            auth_store: Any = self.__auth_store
+            auth_record = auth_store.find_api_key_by_secret(token)
 
         if auth_record is not None:
             if getattr(auth_record, "revoked_at", None) is not None:
@@ -752,7 +756,8 @@ class WebApp(bottle.Bottle):
             "open": False,
         }
         if self.__auth_store is not None:
-            browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
+            auth_store: Any = self.__auth_store
+            browser_handover_state = auth_store.get_browser_handover_state(self.__config)
 
         page_title = "SeedSync browser access"
         can_claim_initial_admin = bool(browser_handover_state.get("open", False))
@@ -793,7 +798,7 @@ class WebApp(bottle.Bottle):
             form_variant_class = "form-panel"
 
         bottle.response.content_type = "text/html; charset=utf-8"
-        bottle.response.cache_control = "no-store"
+        bottle.response.cache_control = "no-store"  # type: ignore[assignment]
         return """<!doctype html>
 <html lang="en">
 <head>
@@ -1251,7 +1256,7 @@ class WebApp(bottle.Bottle):
         try:
             # Setup the response header
             bottle.response.content_type = "text/event-stream"
-            bottle.response.cache_control = "no-cache"
+            bottle.response.cache_control = "no-cache"  # type: ignore[assignment]
 
             # Call setup on all handlers
             for handler in handlers:
