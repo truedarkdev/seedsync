@@ -542,7 +542,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 523 | `486364fb1ff8390d516d199c60a4b3ba96392534` | 2026-03-23 | Merge pull request #307 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-d0bae5d802 | covered elsewhere |
 | 524 | `937918490ef7ef95bfbc78207ba5ef2f67d69e18` | 2026-03-22 | chore(deps): bump actions/setup-python from 5 to 6 | needs area reopen |
 | 525 | `d6d8b719d80bc83e19140c4857c6445d1a6e94c1` | 2026-03-23 | Merge pull request #306 from nitrobass24/dependabot/github_actions/develop/actions/setup-python-6 | covered elsewhere |
-| 526 | `23e621fee0105789948a25e829c83d19449db8e3` | 2026-03-23 | chore(deps-dev): bump jsdom from 29.0.0 to 29.0.1 in /src/angular | needs integration |
+| 526 | `23e621fee0105789948a25e829c83d19449db8e3` | 2026-03-23 | chore(deps-dev): bump jsdom from 29.0.0 to 29.0.1 in /src/angular | intentionally skipped - local Angular stack has no tracked `jsdom` dependency or tracked package-lock surface to bump |
 | 527 | `cc2579727d0c37f54747aad05c7d3d3be3f2313d` | 2026-03-23 | Merge pull request #308 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/jsdom-29.0.1 | covered elsewhere |
 | 528 | `19b1c46594009ff2460695f893b0c1ffecba2b8a` | 2026-03-19 | Redact sensitive credentials from API responses (#257) | already integrated |
 | 529 | `224c793ee85c6ac6dcf6db1e463dfe12ffff4ea1` | 2026-03-19 | Reject redacted sentinel in set handler, fix staticmethod | adapted locally in `a10d7d3e`; sensitive config writes reject redacted sentinels and safe responses redact secrets |
