@@ -521,9 +521,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 502 | `2b3bf57fae85560cd5cc647864cb23a3ca7000d3` | 2026-03-18 | Fix scan_fs.py compatibility with Python 3.8+ remote servers | needs area reopen - belongs with scanner/runtime compatibility policy because local scanfs currently enforces Python 3.11/3.12 and uses a packaged scanner binary |
 | 503 | `f96e41de21fd86db06d8babc4622db078be28249` | 2026-03-18 | Release v0.14.1 — Parser stability, progress tracking, tooling | intentionally skipped |
 | 504 | `484477b1d06a7b4c20e42c0cf521663260d8109a` | 2026-03-18 | Fix flaky test_scanner_process by retrying multiprocessing queue read | already integrated |
-| 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | needs integration |
+| 505 | `793e01ca9eae93ee730b40ed92caa26959bba635` | 2026-03-18 | Fix 86 Pyright errors in security-critical paths (#249 Phase 3) | adapted locally in `8d29914e` |
 | 506 | `be75a422fa74d040940fb75928c49ff0d1980ccb` | 2026-03-18 | Merge pull request #301 from nitrobass24/chore/pyright-phase3-security-paths | covered elsewhere |
-| 507 | `28e2aa73d12791cb1a8c7ed5d2bfb622e7141ca2` | 2026-03-18 | Fix final 80 Pyright errors — 0 errors in basic mode (#249 Phase 4) | needs integration |
+| 507 | `28e2aa73d12791cb1a8c7ed5d2bfb622e7141ca2` | 2026-03-18 | Fix final 80 Pyright errors — 0 errors in basic mode (#249 Phase 4) | adapted locally in `8d29914e` |
 | 508 | `1ba27be3c5a5ad9e2bad294bd7b58367868427a4` | 2026-03-18 | Make Pyright type check required in CI | needs area reopen |
 | 509 | `2c0aff4e75316c1849928c68a7d19910753c7284` | 2026-03-18 | Merge pull request #302 from nitrobass24/chore/pyright-phase4-complex-modules | covered elsewhere |
 | 510 | `8bc7a98a18ec7de29c2f334cacd220b2eb731ce4` | 2026-03-18 | Add Playwright E2E test suite, remove old Protractor (#250) | needs new integration task |
