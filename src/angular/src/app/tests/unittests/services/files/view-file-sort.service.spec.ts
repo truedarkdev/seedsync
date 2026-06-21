@@ -411,6 +411,14 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "missing"}),
             new ViewFile({name: "present", remoteSize: 30})
         )).toBeGreaterThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "alpha", remoteSize: 100}),
+            new ViewFile({name: "beta", remoteSize: 100})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "alpha", remoteSize: 0, localSize: 0}),
+            new ViewFile({name: "beta", remoteSize: 0, localSize: 0})
+        )).toBeLessThan(0);
     }));
 
     it("correctly sorts by descending size", fakeAsync(() => {
@@ -427,13 +435,21 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "small", remoteSize: 10})
         )).toBeLessThan(0);
         expect(sortComparator(
-            new ViewFile({name: "present", remoteSize: 30}),
-            new ViewFile({name: "missing"})
+            new ViewFile({name: "local-only", remoteSize: 0, localSize: 300}),
+            new ViewFile({name: "remote", remoteSize: 200})
         )).toBeLessThan(0);
         expect(sortComparator(
             new ViewFile({name: "missing"}),
             new ViewFile({name: "present", remoteSize: 30})
         )).toBeGreaterThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "alpha", remoteSize: 100}),
+            new ViewFile({name: "beta", remoteSize: 100})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "alpha", remoteSize: 0, localSize: 0}),
+            new ViewFile({name: "beta", remoteSize: 0, localSize: 0})
+        )).toBeLessThan(0);
     }));
 
     it("correctly sorts by ascending speed", fakeAsync(() => {

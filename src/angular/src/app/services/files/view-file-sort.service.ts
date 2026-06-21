@@ -96,7 +96,7 @@ const NameDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile):
  * @constructor
  */
 const SizeAscendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
-    const sizeComparison = compareNullableNumbers(getSortSize(a), getSortSize(b));
+    const sizeComparison = compareNullableNumbers(getEffectiveSize(a), getEffectiveSize(b));
     if (sizeComparison !== 0) {
         return sizeComparison;
     }
@@ -112,7 +112,7 @@ const SizeAscendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): 
  * @constructor
  */
 const SizeDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
-    const sizeComparison = compareNullableNumbersDescending(getSortSize(a), getSortSize(b));
+    const sizeComparison = compareNullableNumbersDescending(getEffectiveSize(a), getEffectiveSize(b));
     if (sizeComparison !== 0) {
         return sizeComparison;
     }
@@ -196,7 +196,7 @@ const compareRemoteTimestamp = (a: ViewFile, b: ViewFile): number => {
     return aTime - bTime;
 };
 
-const compareNullableNumbers = (a: number, b: number): number => {
+const compareNullableNumbers = (a: number | null, b: number | null): number => {
     const aNumber = normalizeSortNumber(a);
     const bNumber = normalizeSortNumber(b);
     if (aNumber === bNumber) {
@@ -211,7 +211,7 @@ const compareNullableNumbers = (a: number, b: number): number => {
     return aNumber - bNumber;
 };
 
-const compareNullableNumbersDescending = (a: number, b: number): number => {
+const compareNullableNumbersDescending = (a: number | null, b: number | null): number => {
     const aNumber = normalizeSortNumber(a);
     const bNumber = normalizeSortNumber(b);
     if (aNumber === bNumber) {
@@ -226,19 +226,23 @@ const compareNullableNumbersDescending = (a: number, b: number): number => {
     return bNumber - aNumber;
 };
 
-const normalizeSortNumber = (value: number): number => {
+const normalizeSortNumber = (value: number | null | undefined): number | null => {
     if (typeof value !== "number" || !isFinite(value)) {
         return null;
     }
     return value;
 };
 
-const getSortSize = (file: ViewFile): number => {
+const getEffectiveSize = (file: ViewFile): number | null => {
     const remoteSize = normalizeSortNumber(file.remoteSize);
-    if (remoteSize !== null) {
+    if (remoteSize !== null && remoteSize > 0) {
         return remoteSize;
     }
-    return normalizeSortNumber(file.localSize);
+    const localSize = normalizeSortNumber(file.localSize);
+    if (localSize !== null && localSize > 0) {
+        return localSize;
+    }
+    return null;
 };
 
 const getRemoteCreatedTimestampValue = (file: ViewFile): number => {
