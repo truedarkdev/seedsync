@@ -606,7 +606,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 587 | `1e6319a6489b5abc0f9205d5b4234e90095d2d8e` | 2026-04-07 | Merge pull request #343 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono/node-server-1.19.13 | covered elsewhere - merge wrapper for row 586 lockfile-only dependency bump |
 | 588 | `f8f9a68b2fa626ae152ad1d1495bbb5261ed2836` | 2026-04-07 | Bump jsdom 29.0.1→29.0.2 and vitest 4.1.2→4.1.3 | intentionally skipped - lockfile-only Vitest/jsdom bump in ignored `src/angular/package-lock.json`; local tracked Angular stack remains Karma/Jasmine with no Vitest/jsdom manifest surface |
 | 589 | `d869371dc14bc65b46344221eb30a4eb2d06f9af` | 2026-04-08 | Merge pull request #345 from nitrobass24/chore/bump-dev-deps | covered elsewhere - merge wrapper for row 588 lockfile-only Vitest/jsdom dependency bump |
-| 590 | `baea40acc4bb9dc341cf274fbd6f36fe0b054b09` | 2026-04-08 | chore(deps-dev): bump hono from 4.12.7 to 4.12.12 in /src/angular | pending |
+| 590 | `baea40acc4bb9dc341cf274fbd6f36fe0b054b09` | 2026-04-08 | chore(deps-dev): bump hono from 4.12.7 to 4.12.12 in /src/angular | intentionally skipped - lockfile-only indirect Hono bump in ignored `src/angular/package-lock.json` with no tracked `package.json` surface |
 | 591 | `6b93442c05f4ccfde9770c4a9c569eedfb4ddf3f` | 2026-04-08 | Merge pull request #344 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.12 | pending |
 | 592 | `6302d39236f5cecdf1c9494ae0f5e7f0ab20399f` | 2026-04-13 | chore(deps-dev): bump vitest from 4.1.3 to 4.1.4 in /src/angular (#359) | pending |
 | 593 | `849c864d2faf555090bdd0f69a5279556d81fba4` | 2026-04-13 | chore(deps-dev): update pytest-timeout requirement in /src/python (#354) | pending |
