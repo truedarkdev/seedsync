@@ -1790,6 +1790,162 @@ class TestController(unittest.TestCase):
 
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
+    def test_process_commands_delete_local_defers_when_delete_cap_reached(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES)
+        ]
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_not_called()
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+        deferred_command = self.controller._Controller__command_queue.get_nowait()
+        self.assertIs(command, deferred_command)
+        self.assertEqual(Controller.Command.Action.DELETE_LOCAL, deferred_command.action)
+        self.assertEqual(
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
+            len(self.controller._Controller__active_command_processes)
+        )
+
+    def test_process_commands_delete_local_invalid_state_fails_even_when_delete_cap_reached(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES)
+        ]
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            process = MagicMock()
+            delete_local_process.return_value = process
+            callback = MagicMock()
+            command.add_callback(callback)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Local file '{}' cannot be deleted in state State.DOWNLOADING".format(command.filename),
+            409
+        )
+        callback.on_success.assert_not_called()
+        self.assertEqual(0, self.controller._Controller__command_queue.qsize())
+        self.assertEqual(
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
+            len(self.controller._Controller__active_command_processes)
+        )
+
+    def test_process_commands_delete_remote_starts_when_below_delete_cap(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES - 1)
+        ]
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            process = MagicMock()
+            delete_remote_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_remote_process.assert_called_once_with(
+            remote_address=unittest.mock.ANY,
+            remote_username=unittest.mock.ANY,
+            remote_password=None,
+            remote_port=unittest.mock.ANY,
+            remote_path="/remote",
+            file_name=file.name
+        )
+        process.start.assert_called_once_with()
+        self.assertEqual(
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
+            len(self.controller._Controller__active_command_processes)
+        )
+        self.assertEqual(0, self.controller._Controller__command_queue.qsize())
+
+    def test_process_commands_delete_remote_defers_when_delete_cap_reached(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES)
+        ]
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            process = MagicMock()
+            delete_remote_process.return_value = process
+            command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+            self.controller.queue_command(command)
+
+            self.controller._Controller__process_commands()
+
+        delete_remote_process.assert_not_called()
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+        deferred_command = self.controller._Controller__command_queue.get_nowait()
+        self.assertIs(command, deferred_command)
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, deferred_command.action)
+        self.assertEqual(
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
+            len(self.controller._Controller__active_command_processes)
+        )
+
+    def test_process_commands_queue_is_not_throttled_by_delete_cap(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES)
+        ]
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            file.name,
+            False,
+            remote_base_dir_path=None,
+            local_base_dir_path="/local/incomplete"
+        )
+        self.assertEqual(
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
+            len(self.controller._Controller__active_command_processes)
+        )
+        self.assertEqual(0, self.controller._Controller__command_queue.qsize())
+
     @patch("controller.controller.os.path.exists")
     def test_process_commands_delete_local_prefers_staging_path_until_move(self, exists):
         file = ModelFile("dup", False)

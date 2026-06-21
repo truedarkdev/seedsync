@@ -106,6 +106,8 @@ class Controller:
             self.post_callback = post_callback
             self.await_completion = await_completion
 
+    _MAX_CONCURRENT_COMMAND_PROCESSES = 8
+
     @staticmethod
     def __lftp_status_refresh_timing(interval_ms_downloading_scan: int):
         # Keep the unhealthy retry window close to the downloading scan
@@ -1935,6 +1937,7 @@ class Controller:
             for _callback in _command.callbacks:
                 _callback.on_failure(_msg, _error_code)
 
+        deferred_commands = []
         while not self.__command_queue.empty():
             command = self.__command_queue.get()
             self.logger.info("Received command {} for file {}".format(str(command.action), command.filename))
@@ -2219,6 +2222,9 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
                     continue
                 else:
+                    if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        deferred_commands.append(command)
+                        continue
                     self.__queue_delete_local_process(
                         file,
                         self.__local_scan_process.force_scan,
@@ -2257,6 +2263,9 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 else:
+                    if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        deferred_commands.append(command)
+                        continue
                     config = cast(Any, self.__context.config)
                     process = DeleteRemoteProcess(
                         remote_address=config.lftp.remote_address,
@@ -2307,9 +2316,12 @@ class Controller:
                         "command": getattr(command.action, "name", str(command.action)),
                         "lifecycle_phase": "dispatch",
                         "completion": "accepted",
-                    },
-                    file=file,
-                )
+                        },
+                        file=file,
+                    )
+
+        for deferred_command in deferred_commands:
+            self.__command_queue.put(deferred_command)
 
     def __log_memory_usage(self):
         with self.__model_lock:
