@@ -614,7 +614,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 595 | `5f3c1cad733b53b914c2be2b993d4c4e0a19e8e6` | 2026-04-13 | chore(deps): bump react from 19.2.4 to 19.2.5 in /website (#356) | intentionally skipped - website-only React dependency bump against absent local `website/` subtree |
 | 596 | `511f58817a37df8299a0804ce15966780b307f4c` | 2026-04-13 | chore(deps): bump @docusaurus/core from 3.9.2 to 3.10.0 in /website (#355) | intentionally skipped - website-only Docusaurus dependency bump against absent local `website/` subtree |
 | 597 | `30b73b84e344c45a632f087cfe58f14b153c1d2e` | 2026-04-13 | chore(deps): update pexpect requirement in /src/python (#349) | adapted locally - local Poetry manifest now requires `pexpect>=4.9.0`; lockfile updated coherently with Poetry metadata normalization |
-| 598 | `d6ba7f735f67813d6826978bc04b55f7c285b130` | 2026-04-13 | chore(deps): bump @docusaurus/preset-classic in /website (#358) | pending |
+| 598 | `d6ba7f735f67813d6826978bc04b55f7c285b130` | 2026-04-13 | chore(deps): bump @docusaurus/preset-classic in /website (#358) | intentionally skipped - website-only Docusaurus preset dependency bump against absent local `website/` subtree |
 | 599 | `891baac15b08771ba3db711228deb28b0bd324d4` | 2026-04-13 | chore(deps-dev): bump @docusaurus/types from 3.9.2 to 3.10.0 in /website (#353) | pending |
 | 600 | `f0a5d28bd8529c07d373423ff95d8d20281c1a58` | 2026-04-13 | chore(deps-dev): bump @docusaurus/module-type-aliases in /website (#351) | pending |
 | 601 | `9e384015f132a7f24fcb4db5667adbeb3d0ac07c` | 2026-04-13 | chore(deps): bump the angular group in /src/angular with 10 updates (#357) | pending |
