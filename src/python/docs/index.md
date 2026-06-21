@@ -18,3 +18,10 @@ External links:
 * Releases: [Latest release](https://github.com/truedarkdev/seedsync/releases/latest)
 * Installation Guide: [install.md](install.md)
 * Usage Guide: [usage.md](usage.md)
+
+## Quick start
+
+1. Follow the [Installation Guide](install.md) to run the container.
+2. Open the web UI at `http://localhost:8800`.
+3. Go to Settings and configure your remote server and local paths.
+4. Set up the [recommended workflow](usage.md#recommended-setup) with hard links and `Delete remote files after download` so SeedSync syncs newly completed items without touching seeding originals.
