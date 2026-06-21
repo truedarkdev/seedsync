@@ -1813,6 +1813,12 @@ class TestController(unittest.TestCase):
             self.controller._Controller__process_commands()
 
         delete_local_process.assert_not_called()
+        self.controller.logger.debug.assert_any_call(
+            "Deferring %s for '%s': %d active processes at cap",
+            Controller.Command.Action.DELETE_LOCAL,
+            command.filename,
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES
+        )
         self.assertEqual(1, self.controller._Controller__command_queue.qsize())
         deferred_command = self.controller._Controller__command_queue.get_nowait()
         self.assertIs(command, deferred_command)
@@ -1910,6 +1916,12 @@ class TestController(unittest.TestCase):
             self.controller._Controller__process_commands()
 
         delete_remote_process.assert_not_called()
+        self.controller.logger.debug.assert_any_call(
+            "Deferring %s for '%s': %d active processes at cap",
+            Controller.Command.Action.DELETE_REMOTE,
+            command.filename,
+            Controller._MAX_CONCURRENT_COMMAND_PROCESSES
+        )
         self.assertEqual(1, self.controller._Controller__command_queue.qsize())
         deferred_command = self.controller._Controller__command_queue.get_nowait()
         self.assertIs(command, deferred_command)
