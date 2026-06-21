@@ -23,11 +23,7 @@ state.
 
 ### How should I set up hard links with SeedSync?
 
-A common setup is to let the torrent client finish into its normal download directory, then use a hard-linker to create hard links in a separate completion directory. Point SeedSync at that completion directory so it syncs only completed data. If you want, an auto-delete step can clean up the hard-link copy after SeedSync has picked it up.
-
-Hard links only work when the download directory and the completion directory are on the same filesystem or device.
-
-If you use qBittorrent, tools such as `qbit-hardlinker` can automate the hard-link step. In ruTorrent, `Move to` is a move rather than a hard link, so it can break seeding or make the source unavailable.
+Use hard links with a dedicated completion directory, then see the [Recommended Setup](./usage.md#recommended-setup) guide for the full layout, client-specific setup notes, and the same-filesystem requirement.
 
 
 ## Security
