@@ -599,7 +599,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 580 | `5e294a4a16a83ca770e48fa80b1774b46e4227fb` | 2026-04-07 | Fix bulk delete crash from unbounded process spawning (#338) | adapted locally - backend delete-process cap/requeue added in controller; frontend bulk path is superseded locally so no direct TS import |
 | 581 | `5e4fa2e55137bab4b68a875b4909b24e47d6b190` | 2026-04-07 | Fix infinite busy-loop in command process throttling | covered elsewhere - local row 580 adaptation already uses a deferred-command list and post-loop requeue so capped delete commands cannot spin inside the same command-drain loop |
 | 582 | `7e747cce0d3924ef040b27ff18c85e774102f0a8` | 2026-04-07 | Add debug logging when delete commands are deferred | adapted locally - delete-cap deferrals now emit controller debug logs at both delete branches |
-| 583 | `ae49970c12b554e04bf6d621bdb1bae4930a1dd4` | 2026-04-07 | Fix ruff formatting in controller.py | pending |
+| 583 | `ae49970c12b554e04bf6d621bdb1bae4930a1dd4` | 2026-04-07 | Fix ruff formatting in controller.py | already integrated - local row 582 adaptation already added the delete-deferral debug logs in ruff-friendly multiline form |
 | 584 | `10b2f00aacb3c07c4e273865386b780d8db801ec` | 2026-04-07 | Scope concurrency cap to delete operations and allow move retry on failure | pending |
 | 585 | `c485d00f9569cab3f48943669915565984496640` | 2026-04-07 | Merge pull request #341 from nitrobass24/fix/bulk-delete-crash | pending |
 | 586 | `6b547fc2399bfa66d25d55f5a3ede6ba367214e3` | 2026-04-08 | chore(deps-dev): bump @hono/node-server in /src/angular | pending |
