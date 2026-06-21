@@ -608,7 +608,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 589 | `d869371dc14bc65b46344221eb30a4eb2d06f9af` | 2026-04-08 | Merge pull request #345 from nitrobass24/chore/bump-dev-deps | covered elsewhere - merge wrapper for row 588 lockfile-only Vitest/jsdom dependency bump |
 | 590 | `baea40acc4bb9dc341cf274fbd6f36fe0b054b09` | 2026-04-08 | chore(deps-dev): bump hono from 4.12.7 to 4.12.12 in /src/angular | intentionally skipped - lockfile-only indirect Hono bump in ignored `src/angular/package-lock.json` with no tracked `package.json` surface |
 | 591 | `6b93442c05f4ccfde9770c4a9c569eedfb4ddf3f` | 2026-04-08 | Merge pull request #344 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.12 | covered elsewhere - merge wrapper for row `590` lockfile-only Hono bump with no independent tracked payload |
-| 592 | `6302d39236f5cecdf1c9494ae0f5e7f0ab20399f` | 2026-04-13 | chore(deps-dev): bump vitest from 4.1.3 to 4.1.4 in /src/angular (#359) | pending |
+| 592 | `6302d39236f5cecdf1c9494ae0f5e7f0ab20399f` | 2026-04-13 | chore(deps-dev): bump vitest from 4.1.3 to 4.1.4 in /src/angular (#359) | intentionally skipped - upstream bumps absent Vitest dev-dependency/test-stack surface while local Angular remains Karma/Jasmine |
 | 593 | `849c864d2faf555090bdd0f69a5279556d81fba4` | 2026-04-13 | chore(deps-dev): update pytest-timeout requirement in /src/python (#354) | pending |
 | 594 | `69410ad54432058cd1c0c616de28b565edf4a3b3` | 2026-04-13 | chore(deps): update tblib requirement in /src/python (#350) | pending |
 | 595 | `5f3c1cad733b53b914c2be2b993d4c4e0a19e8e6` | 2026-04-13 | chore(deps): bump react from 19.2.4 to 19.2.5 in /website (#356) | pending |
