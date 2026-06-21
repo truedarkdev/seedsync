@@ -71,7 +71,7 @@ export class FileListComponent implements OnInit, OnDestroy {
         });
     }
 
-    static identify(index: number, item: ViewFile): string {
+    static identify(_index: number, item: ViewFile): string {
         return item.fileId || item.name;
     }
 
