@@ -15,7 +15,7 @@ parameterized = "*"
 patool = "*"
 pexpect = "*"
 pytz = "*"
-tblib = "*"
+tblib = ">=3.2.2"
 six = "^1.17.0"
 
 [tool.poetry.group.dev.dependencies]
