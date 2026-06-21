@@ -2223,6 +2223,12 @@ class Controller:
                     continue
                 else:
                     if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        self.logger.debug(
+                            "Deferring %s for '%s': %d active processes at cap",
+                            command.action,
+                            command.filename,
+                            len(self.__active_command_processes)
+                        )
                         deferred_commands.append(command)
                         continue
                     self.__queue_delete_local_process(
@@ -2264,6 +2270,12 @@ class Controller:
                     continue
                 else:
                     if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        self.logger.debug(
+                            "Deferring %s for '%s': %d active processes at cap",
+                            command.action,
+                            command.filename,
+                            len(self.__active_command_processes)
+                        )
                         deferred_commands.append(command)
                         continue
                     config = cast(Any, self.__context.config)
