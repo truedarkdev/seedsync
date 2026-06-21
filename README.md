@@ -38,7 +38,11 @@ they become available.
 You don't need to install anything on the remote server.
 All you need are the SSH credentials for the remote server.
 
-If you use a torrent workflow, a common setup is to let the client finish into its normal download directory, use a hard-linker to create hard links in a separate completion directory, and point SeedSync at that completion directory. That lets SeedSync sync only completed data, and an auto-delete step can clean up the hard-link copy after sync. Hard links only work when both directories are on the same filesystem or device.
+## Recommended Workflow
+
+The recommended setup is to use hard links with a dedicated completion directory. Point SeedSync at that directory, enable `Auto-queue`, and turn on `Delete remote files after download` so SeedSync syncs each file once while your seeding originals stay intact.
+
+See the [Recommended Setup](src/python/docs/usage.md#recommended-setup) guide for directory layout examples, torrent-client setup notes, and the same-filesystem requirement.
 
 ## Supported Platforms
 
