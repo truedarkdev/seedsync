@@ -16,6 +16,7 @@ class TestActiveScanner(unittest.TestCase):
 
     def test_scan_uses_temp_file_when_final_active_path_is_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
 
         with open(os.path.join(self.temp_dir, "download.zip.lftp"), "wb") as handle:
@@ -29,6 +30,7 @@ class TestActiveScanner(unittest.TestCase):
 
     def test_scan_uses_status_sidecar_for_temp_file_size_when_final_active_path_is_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
 
         with open(os.path.join(self.temp_dir, "download.zip.lftp"), "wb") as handle:
@@ -44,6 +46,7 @@ class TestActiveScanner(unittest.TestCase):
 
     def test_scan_ignores_status_only_partial_when_temp_file_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
         scanner.logger = MagicMock()
 
@@ -57,6 +60,7 @@ class TestActiveScanner(unittest.TestCase):
 
     def test_scan_ignores_malformed_status_only_partial_when_temp_file_missing(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
         scanner.logger = MagicMock()
 
@@ -70,6 +74,7 @@ class TestActiveScanner(unittest.TestCase):
 
     def test_scan_returns_malformed_status_only_file_ids(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
         scanner.logger = MagicMock()
 

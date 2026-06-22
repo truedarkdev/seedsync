@@ -83,6 +83,13 @@ class MultiPathActiveScanner(IScanner):
         self.__malformed_status_only_file_ids = []
         return malformed_status_only_file_ids
 
+    def close(self):
+        if self.__active_files_queue is None:
+            return
+        self.__active_files_queue.close()
+        self.__active_files_queue.join_thread()
+        self.__active_files_queue = None
+
     def __is_status_only_partial(
             self,
             scanner: SystemScanner,

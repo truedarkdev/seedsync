@@ -28,6 +28,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
             "movies": self.movies_dir,
             "tv": self.tv_dir,
         })
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [
             ("dup", "movies", "Movies"),
             ("dup", "tv", "TV"),
@@ -43,6 +44,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
     def test_scan_uses_single_scanner_fallback_for_missing_path_pair(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir})
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [("dup", None, None)]
 
         files = scanner.scan()
@@ -52,6 +54,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
     def test_scan_uses_temp_file_when_final_active_path_is_missing(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [("download.zip", "movies", "Movies")]
 
         temp_path = os.path.join(self.movies_dir, "download.zip.lftp")
@@ -68,6 +71,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
     def test_scan_uses_status_sidecar_for_temp_file_size_when_final_active_path_is_missing(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [("download.zip", "movies", "Movies")]
 
         temp_path = os.path.join(self.movies_dir, "download.zip.lftp")
@@ -86,6 +90,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
     def test_scan_ignores_status_only_partial_when_temp_file_missing(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [("download.zip", "movies", "Movies")]
         scanner.logger = MagicMock()
 
@@ -99,6 +104,7 @@ class TestMultiPathActiveScanner(unittest.TestCase):
 
     def test_scan_ignores_malformed_status_only_partial_when_temp_file_missing(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir}, use_temp_file=True)
+        self.addCleanup(scanner.close)
         scanner._MultiPathActiveScanner__active_files = [("download.zip", "movies", "Movies")]
         scanner.logger = MagicMock()
 
