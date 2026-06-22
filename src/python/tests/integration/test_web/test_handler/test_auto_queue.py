@@ -8,6 +8,10 @@ from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
 class TestAutoQueueHandler(BaseTestWebApp):
+    def __assert_json_response(self, response):
+        self.assertTrue(response.headers["Content-Type"].startswith("application/json"))
+        self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+
     def __assert_plain_text_response(self, response):
         self.assertTrue(response.headers["Content-Type"].startswith("text/plain"))
         self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
@@ -20,7 +24,8 @@ class TestAutoQueueHandler(BaseTestWebApp):
         self.auto_queue_persist.add_pattern(AutoQueuePattern(pattern="fi%ve"))
         resp = self.test_app.get("/server/autoqueue/get")
         self.assertEqual(200, resp.status_int)
-        json_list = json.loads(str(resp.html))
+        self.__assert_json_response(resp)
+        json_list = json.loads(resp.text)
         self.assertEqual(5, len(json_list))
         self.assertIn({"pattern": "one"}, json_list)
         self.assertIn({"pattern": "t wo"}, json_list)
@@ -36,7 +41,8 @@ class TestAutoQueueHandler(BaseTestWebApp):
         self.auto_queue_persist.add_pattern(AutoQueuePattern(pattern="e"))
         resp = self.test_app.get("/server/autoqueue/get")
         self.assertEqual(200, resp.status_int)
-        json_list = json.loads(str(resp.html))
+        self.__assert_json_response(resp)
+        json_list = json.loads(resp.text)
         self.assertEqual(5, len(json_list))
         self.assertEqual([
             {"pattern": "a"},

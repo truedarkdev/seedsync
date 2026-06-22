@@ -18,6 +18,8 @@ class TestAutoQueueHandlerGet(unittest.TestCase):
         response = self.handler._AutoQueueHandler__handle_get_autoqueue()
 
         self.assertEqual(200, response.status_code)
+        self.assertTrue(response.headers["Content-Type"].startswith("application/json"))
+        self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
         self.assertEqual(
             [{"pattern": "alpha"}, {"pattern": "beta"}],
             json.loads(response.body),
