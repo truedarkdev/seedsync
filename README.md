@@ -27,6 +27,8 @@ It uses LFTP to transfer files fast!
 * Automatically extract your files after sync
 * Auto-Queue - only sync the files you want based on pattern matching
 * Delete local and remote files easily
+* Staging directory - land downloads on fast storage before moving them to the final location
+* API keys - require web UI/API authentication when configured
 * Fully open source!
 
 ## How it works
@@ -62,6 +64,8 @@ Please refer to the documentation in this repository:
 * [Latest Releases](https://github.com/truedarkdev/seedsync/releases/latest)
 
 If the remote scanner cannot copy to the configured `Server Script Path`, or the path collides with an existing `scanfs` directory, see the FAQ troubleshooting notes for the fallback and cleanup steps.
+
+If you enable the Staging Directory, mount `/staging` in Docker and set `lftp.staging_path` in Settings so in-progress downloads land on fast storage before moving to the final location.
 
 ## Report an Issue
 
