@@ -128,8 +128,9 @@ class _BoundedWSGIServer(WSGIServer):
 
     def _is_stream_request(self, request):
         request_path = self._peek_request_path(request)
-        if request_path is None:
-            return True
+        # Only the positively identified SSE endpoint should use the tiny
+        # stream pool; ambiguous peeks stay on the normal queue so transient
+        # socket timing cannot starve ordinary pages.
         return request_path == self.stream_request_path
 
     def _peek_request_path(self, request):

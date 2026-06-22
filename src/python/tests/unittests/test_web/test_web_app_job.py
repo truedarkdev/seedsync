@@ -148,7 +148,7 @@ class TestBoundedWSGIServer(unittest.TestCase):
         self.assertEqual(socket.MSG_PEEK, extra_stream.recv_flags)
         self.assertEqual(socket.MSG_PEEK, normal_request.recv_flags)
 
-    def test_unreadable_or_partial_request_line_uses_stream_queue(self):
+    def test_unreadable_or_partial_request_line_uses_normal_queue(self):
         server = object.__new__(_BoundedWSGIServer)
         server._worker_shutdown = Event()
         server._normal_request_queue = Queue(maxsize=2)
@@ -161,13 +161,13 @@ class TestBoundedWSGIServer(unittest.TestCase):
         server.process_request(unreadable_request, ("127.0.0.1", 1001))
         server.process_request(partial_request, ("127.0.0.1", 1002))
 
-        self.assertTrue(server._normal_request_queue.empty())
-        queued_unreadable, unreadable_client = server._stream_request_queue.get_nowait()
-        queued_partial, partial_client = server._stream_request_queue.get_nowait()
+        queued_unreadable, unreadable_client = server._normal_request_queue.get_nowait()
+        queued_partial, partial_client = server._normal_request_queue.get_nowait()
         self.assertIs(unreadable_request, queued_unreadable)
         self.assertEqual(("127.0.0.1", 1001), unreadable_client)
         self.assertIs(partial_request, queued_partial)
         self.assertEqual(("127.0.0.1", 1002), partial_client)
+        self.assertTrue(server._stream_request_queue.empty())
         server.shutdown_request.assert_not_called()
 
     def test_encoded_stream_target_uses_stream_queue(self):
