@@ -10,6 +10,8 @@ from ..serialize import SerializeAutoQueue
 
 
 class AutoQueueHandler(IHandler):
+    __NOSNIFF = "nosniff"
+
     def __init__(self, auto_queue_persist: AutoQueuePersist):
         self.__auto_queue_persist = auto_queue_persist
 
@@ -20,7 +22,18 @@ class AutoQueueHandler(IHandler):
             status=status,
             headers={
                 "Content-Type": "text/plain",
-                "X-Content-Type-Options": "nosniff"
+                "X-Content-Type-Options": AutoQueueHandler.__NOSNIFF
+            }
+        )
+
+    @staticmethod
+    def __json_response(body: str, status: int = 200):
+        return HTTPResponse(
+            body=body,
+            status=status,
+            content_type="application/json",
+            headers={
+                "X-Content-Type-Options": AutoQueueHandler.__NOSNIFF
             }
         )
 
@@ -46,7 +59,7 @@ class AutoQueueHandler(IHandler):
         patterns = list(self.__auto_queue_persist.patterns)
         patterns.sort(key=lambda p: p.pattern)
         out_json = SerializeAutoQueue.patterns(patterns)
-        return HTTPResponse(body=out_json)
+        return self.__json_response(out_json)
 
     def __handle_add_autoqueue(self, pattern: str):
         # value is double encoded
