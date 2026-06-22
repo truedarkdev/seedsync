@@ -8,6 +8,10 @@ from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
 class TestAutoQueueHandler(BaseTestWebApp):
+    def __assert_plain_text_response(self, response):
+        self.assertTrue(response.headers["Content-Type"].startswith("text/plain"))
+        self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+
     def test_get(self):
         self.auto_queue_persist.add_pattern(AutoQueuePattern(pattern="one"))
         self.auto_queue_persist.add_pattern(AutoQueuePattern(pattern="t wo"))
@@ -82,12 +86,14 @@ class TestAutoQueueHandler(BaseTestWebApp):
         self.assertEqual(200, resp.status_int)
         resp = self.test_app.post("/server/autoqueue/add/one", expect_errors=True)
         self.assertEqual(409, resp.status_int)
-        self.assertEqual("Auto-queue pattern 'one' already exists.", str(resp.html))
+        self.assertEqual("Auto-queue pattern 'one' already exists.", resp.text)
+        self.__assert_plain_text_response(resp)
 
     def test_add_empty_value(self):
         uri = quote(quote("  ", safe=""), safe="")
         resp = self.test_app.post("/server/autoqueue/add/" + uri, expect_errors=True)
         self.assertEqual(400, resp.status_int)
+        self.__assert_plain_text_response(resp)
         self.assertEqual(0, len(self.auto_queue_persist.patterns))
 
         resp = self.test_app.post("/server/autoqueue/add/", expect_errors=True)
@@ -139,15 +145,33 @@ class TestAutoQueueHandler(BaseTestWebApp):
     def test_remove_non_existing(self):
         resp = self.test_app.post("/server/autoqueue/remove/one", expect_errors=True)
         self.assertEqual(404, resp.status_int)
-        self.assertEqual("Auto-queue pattern 'one' doesn't exist.", str(resp.html))
+        self.assertEqual("Auto-queue pattern 'one' doesn't exist.", resp.text)
+        self.__assert_plain_text_response(resp)
 
     def test_remove_empty_value(self):
         uri = quote(quote("  ", safe=""), safe="")
         resp = self.test_app.post("/server/autoqueue/remove/" + uri, expect_errors=True)
         self.assertEqual(404, resp.status_int)
-        self.assertEqual("Auto-queue pattern '  ' doesn't exist.", str(resp.html))
+        self.assertEqual("Auto-queue pattern '  ' doesn't exist.", resp.text)
         self.assertEqual(0, len(self.auto_queue_persist.patterns))
 
         resp = self.test_app.post("/server/autoqueue/remove/", expect_errors=True)
         self.assertEqual(404, resp.status_int)
         self.assertEqual(0, len(self.auto_queue_persist.patterns))
+
+    def test_add_response_is_plain_text_and_nosniff(self):
+        uri = quote(quote("/value/with/slashes", safe=""), safe="")
+        resp = self.test_app.post("/server/autoqueue/add/" + uri)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual("Added auto-queue pattern '/value/with/slashes'.", resp.text)
+        self.__assert_plain_text_response(resp)
+
+    def test_remove_response_is_plain_text_and_nosniff(self):
+        self.auto_queue_persist.add_pattern(AutoQueuePattern("/value/with/slashes"))
+        uri = quote(quote("/value/with/slashes", safe=""), safe="")
+        resp = self.test_app.post("/server/autoqueue/remove/" + uri)
+
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual("Removed auto-queue pattern '/value/with/slashes'.", resp.text)
+        self.__assert_plain_text_response(resp)
