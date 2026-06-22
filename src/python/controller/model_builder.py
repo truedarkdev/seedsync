@@ -1456,103 +1456,103 @@ class ModelBuilder:
 
     def __fill_model_file(
         self,
-        _model_file: ModelFile,
-        _remote: Optional[SystemFile],
-        _local: Optional[SystemFile],
-        _transfer_state: Optional[LftpJobStatus.TransferState],
-        _store_recent_snapshot: bool,
-        _recent_snapshot_root_file_id: Optional[str],
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        local: Optional[SystemFile],
+        transfer_state: Optional[LftpJobStatus.TransferState],
+        store_recent_snapshot: bool,
+        recent_snapshot_root_file_id: Optional[str],
         live_transferred_file_ids: Set[str],
     ):
         # set local and remote sizes
-        if _remote:
-            _model_file.remote_size = _remote.size
-        if _local:
-            _model_file.local_size = _local.size
+        if remote:
+            model_file.remote_size = remote.size
+        if local:
+            model_file.local_size = local.size
 
         # Note: no longer use lftp's file sizes
         #       they represent remaining size for resumed downloads
 
         # set the downloading speed and eta
-        if _transfer_state:
-            if _store_recent_snapshot:
+        if transfer_state:
+            if store_recent_snapshot:
                 self.__store_recent_live_transfer_snapshot(
-                    _model_file.file_id,
-                    _recent_snapshot_root_file_id if _recent_snapshot_root_file_id is not None else _model_file.file_id,
-                    _transfer_state
+                    model_file.file_id,
+                    recent_snapshot_root_file_id if recent_snapshot_root_file_id is not None else model_file.file_id,
+                    transfer_state
                 )
-            download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
+            download_progress = ModelBuilder.__normalize_download_progress(transfer_state.percent_local)
             if download_progress is not None:
-                _model_file.download_progress = download_progress
-            if _transfer_state.size_local is not None:
-                _model_file.transferred_size = _transfer_state.size_local
-                live_transferred_file_ids.add(_model_file.file_id)
-            _model_file.downloading_speed = _transfer_state.speed
-            _model_file.eta = _transfer_state.eta
+                model_file.download_progress = download_progress
+            if transfer_state.size_local is not None:
+                model_file.transferred_size = transfer_state.size_local
+                live_transferred_file_ids.add(model_file.file_id)
+            model_file.downloading_speed = transfer_state.speed
+            model_file.eta = transfer_state.eta
 
         # set the transferred size (only if file or dir exists on both ends)
-        if _local and _remote:
-            self.__update_transferred_size(_model_file, _remote, _local, live_transferred_file_ids)
+        if local and remote:
+            self.__update_transferred_size(model_file, remote, local, live_transferred_file_ids)
 
         # set the is_extractable flag
-        self.__update_extractable_flag(_model_file)
+        self.__update_extractable_flag(model_file)
 
         # set the timestamps
-        self.__update_timestamps(_model_file, _remote, _local)
+        self.__update_timestamps(model_file, remote, local)
 
     @staticmethod
     def __update_transferred_size(
-        _model_file: ModelFile,
-        _remote: SystemFile,
-        _local: SystemFile,
+        model_file: ModelFile,
+        remote: SystemFile,
+        local: SystemFile,
         live_transferred_file_ids: Set[str],
     ):
-        if _model_file.is_dir:
-            if _model_file.transferred_size is None:
+        if model_file.is_dir:
+            if model_file.transferred_size is None:
                 # dir transferred size is updated by child files
-                _model_file.transferred_size = 0
+                model_file.transferred_size = 0
         else:
-            if _model_file.transferred_size is None:
-                if ModelBuilder.__is_authoritative_local_file(_local):
-                    _model_file.transferred_size = min(_local.size, _remote.size)
+            if model_file.transferred_size is None:
+                if ModelBuilder.__is_authoritative_local_file(local):
+                    model_file.transferred_size = min(local.size, remote.size)
 
-            if _model_file.transferred_size is not None:
+            if model_file.transferred_size is not None:
                 # also update all parent directories
-                _parent_file = _model_file.parent
+                _parent_file = model_file.parent
                 while _parent_file is not None:
                     if _parent_file.file_id in live_transferred_file_ids:
                         break
                     if _parent_file.transferred_size is None:
                         _parent_file.transferred_size = 0
-                    _parent_file.transferred_size += _model_file.transferred_size
+                    _parent_file.transferred_size += model_file.transferred_size
                     _parent_file = _parent_file.parent
 
     @staticmethod
-    def __update_extractable_flag(_model_file: ModelFile):
-        if not _model_file.is_dir and Extract.is_archive_fast(_model_file.name):
-            _model_file.is_extractable = True
+    def __update_extractable_flag(model_file: ModelFile):
+        if not model_file.is_dir and Extract.is_archive_fast(model_file.name):
+            model_file.is_extractable = True
             # Also set the flag for all of its parents
-            _parent_file = _model_file.parent
+            _parent_file = model_file.parent
             while _parent_file is not None:
                 _parent_file.is_extractable = True
                 _parent_file = _parent_file.parent
 
     @staticmethod
     def __update_timestamps(
-        _model_file: ModelFile,
-        _remote: Optional[SystemFile],
-        _local: Optional[SystemFile],
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        local: Optional[SystemFile],
     ):
-        if _local:
-            if _local.timestamp_created:
-                _model_file.local_created_timestamp = _local.timestamp_created
-            if _local.timestamp_modified:
-                _model_file.local_modified_timestamp = _local.timestamp_modified
-        if _remote:
-            if _remote.timestamp_created:
-                _model_file.remote_created_timestamp = _remote.timestamp_created
-            if _remote.timestamp_modified:
-                _model_file.remote_modified_timestamp = _remote.timestamp_modified
+        if local:
+            if local.timestamp_created:
+                model_file.local_created_timestamp = local.timestamp_created
+            if local.timestamp_modified:
+                model_file.local_modified_timestamp = local.timestamp_modified
+        if remote:
+            if remote.timestamp_created:
+                model_file.remote_created_timestamp = remote.timestamp_created
+            if remote.timestamp_modified:
+                model_file.remote_modified_timestamp = remote.timestamp_modified
 
     @staticmethod
     def __estimate_eta(model_file: ModelFile):
