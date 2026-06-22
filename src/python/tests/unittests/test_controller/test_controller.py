@@ -100,6 +100,7 @@ class TestController(unittest.TestCase):
         remote_path="/remote",
         path_pair_manager=None,
         local_path_to_scanfs="/scanfs",
+        extract_path="/extract",
         use_local_path_as_extract_path=False,
         remote_username="user",
         remote_password="password",
@@ -134,7 +135,7 @@ class TestController(unittest.TestCase):
                     interval_ms_remote_scan=1,
                     interval_ms_local_scan=1,
                     interval_ms_downloading_scan=1,
-                    extract_path="/extract",
+                    extract_path=extract_path,
                     use_local_path_as_extract_path=use_local_path_as_extract_path,
                     managed_extract_folders_enabled=True,
                 ),
@@ -172,6 +173,59 @@ class TestController(unittest.TestCase):
             controller.start()
 
         self.assertIn("Lftp.local_path", str(error.exception))
+
+    def test_constructor_reports_missing_use_local_path_as_extract_path_in_aggregate(self):
+        context = self._make_startup_context(
+            local_path="/local",
+            use_local_path_as_extract_path=None,
+        )
+
+        controller = Controller(context, ControllerPersist())
+
+        self.assertFalse(controller._Controller__started)
+        self.assertIsNotNone(controller._Controller__startup_validation_error)
+        self.assertIn(
+            "Controller.use_local_path_as_extract_path",
+            controller._Controller__startup_validation_error,
+        )
+        self.assertEqual(controller._Controller__startup_validation_error, context.status.server.error_msg)
+
+        with self.assertRaises(ControllerError) as error:
+            controller.start()
+
+        self.assertIn("Controller.use_local_path_as_extract_path", str(error.exception))
+
+    def test_constructor_reports_missing_extract_path_when_local_path_is_not_extract_path(self):
+        context = self._make_startup_context(
+            local_path="/local",
+            extract_path="",
+            use_local_path_as_extract_path=False,
+        )
+
+        controller = Controller(context, ControllerPersist())
+
+        self.assertFalse(controller._Controller__started)
+        self.assertIsNotNone(controller._Controller__startup_validation_error)
+        self.assertIn("Controller.extract_path", controller._Controller__startup_validation_error)
+        self.assertEqual(controller._Controller__startup_validation_error, context.status.server.error_msg)
+
+        with self.assertRaises(ControllerError) as error:
+            controller.start()
+
+        self.assertIn("Controller.extract_path", str(error.exception))
+
+    def test_constructor_allows_empty_extract_path_when_local_path_is_extract_path(self):
+        context = self._make_startup_context(
+            local_path="/local",
+            extract_path="",
+            use_local_path_as_extract_path=True,
+        )
+
+        with patch("controller.controller.Lftp") as mock_lftp:
+            controller = Controller(context, ControllerPersist())
+
+        self.assertIsNone(controller._Controller__startup_validation_error)
+        self.assertTrue(mock_lftp.called)
 
     def test_constructor_uses_path_pair_fallback_when_legacy_paths_missing(self):
         manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
