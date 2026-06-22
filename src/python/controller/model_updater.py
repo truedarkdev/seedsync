@@ -9,6 +9,7 @@ delegates the model refresh boundary.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -16,6 +17,13 @@ from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 
 from .extract import ExtractStatus
+from .persist_keys import KEY_SEP
+
+
+_LEGACY_PAIR_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
 
 
 class ModelUpdater:
@@ -26,15 +34,50 @@ class ModelUpdater:
 
     def sync_persist_to_all_builders(self):
         controller = self._controller
+        path_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
         controller._Controller__model_builder.set_downloaded_files(  # type: ignore[attr-defined]
-            controller._Controller__persist.downloaded_file_names
+            self._filter_keys_for_model_builder(
+                controller._Controller__persist.downloaded_file_names,
+                path_pair_ids,
+            )
         )
         controller._Controller__model_builder.set_extracted_files(  # type: ignore[attr-defined]
-            controller._Controller__persist.extracted_file_names
+            self._filter_keys_for_model_builder(
+                controller._Controller__persist.extracted_file_names,
+                path_pair_ids,
+            )
         )
         controller._Controller__model_builder.set_stopped_files(  # type: ignore[attr-defined]
-            controller._Controller__persist.stopped_file_names
+            self._filter_keys_for_model_builder(
+                controller._Controller__persist.stopped_file_names,
+                path_pair_ids,
+            )
         )
+
+    @staticmethod
+    def _filter_keys_for_model_builder(keys: set[str], path_pair_ids: set[str]) -> set[str]:
+        if not path_pair_ids:
+            return set(keys)
+
+        filtered = set()
+        for key in keys:
+            normalized_key = key
+            for path_pair_id in path_pair_ids:
+                prefix = f"{path_pair_id}{KEY_SEP}"
+                if key.startswith(prefix):
+                    normalized_key = ModelFile.build_file_id(key[len(prefix) :], path_pair_id)
+                    break
+                if ModelUpdater._is_legacy_pair_scoped_colon_key(key, path_pair_id):
+                    normalized_key = ModelFile.build_file_id(key[len(path_pair_id) + 1 :], path_pair_id)
+                    break
+            filtered.add(normalized_key)
+        return filtered
+
+    @staticmethod
+    def _is_legacy_pair_scoped_colon_key(key: str, path_pair_id: str) -> bool:
+        if _LEGACY_PAIR_ID_RE.match(path_pair_id) is None:
+            return False
+        return key.startswith(f"{path_pair_id}:")
 
     def update(self):  # noqa: C901 - extracted controller refresh loop
         controller = self._controller
