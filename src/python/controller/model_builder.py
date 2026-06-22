@@ -1322,7 +1322,7 @@ class ModelBuilder:
 
     def __build_children(
         self,
-        model_file: ModelFile,
+        root_model_file: ModelFile,
         remote: Optional[SystemFile],
         local: Optional[SystemFile],
         status: Optional[LftpJobStatus],
@@ -1338,7 +1338,7 @@ class ModelBuilder:
         #       merely used for traversing children
         frontier = []
         if remote or local:
-            frontier.append((remote, local, status, model_file, remote, local))
+            frontier.append((remote, local, status, root_model_file, remote, local))
         while frontier:
             _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.pop(0)
             _remote_children = {sf.name: sf for sf in _remote.children} if _remote else {}
@@ -1413,7 +1413,7 @@ class ModelBuilder:
                         _local_child.size >= _remote_child.size:
                     _child_model_file.state = ModelFile.State.DOWNLOADED
                 elif _remote_child and not _child_is_stopped and \
-                        model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
+                        root_model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
                     _child_model_file.state = ModelFile.State.QUEUED
                     _child_arbitration_source = "queued_by_root_state"
                 else:
@@ -1440,7 +1440,7 @@ class ModelBuilder:
                 if self.__is_stop_resume_trace_enabled():
                     self.__trace_target_arbitration(
                         _child_model_file,
-                        model_file.file_id,
+                        root_model_file.file_id,
                         _child_is_stopped,
                         _remote_child is not None,
                         _local_child is not None,
