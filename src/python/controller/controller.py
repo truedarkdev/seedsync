@@ -31,6 +31,7 @@ from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, 
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from .controller_persist import ControllerPersist
+from .persist_keys import persist_key, strip_persist_key
 from .delete import DeleteLocalProcess, DeleteRemoteProcess
 
 
@@ -883,13 +884,37 @@ class Controller:
     def __build_staging_path(local_path: str, staging_path: Optional[str] = None) -> str:
         return staging_path or os.path.join(local_path, "incomplete")
 
+    @staticmethod
+    def __persist_key_candidates(name: str, path_pair_id: Optional[str] = None) -> set[str]:
+        candidates = {
+            name,
+            ModelFile.build_file_id(name, path_pair_id),
+            persist_key(path_pair_id, name),
+        }
+        if path_pair_id:
+            candidates.add("{}:{}".format(path_pair_id, name))
+        return candidates
+
+    @staticmethod
+    def __has_persist_key(keys: set[str], name: str, path_pair_id: Optional[str] = None) -> bool:
+        if not keys:
+            return False
+        if keys.intersection(Controller.__persist_key_candidates(name, path_pair_id)):
+            return True
+        return any(strip_persist_key(key, path_pair_id) == name for key in keys)
+
+    @staticmethod
+    def __clear_persist_key(keys: set[str], name: str, path_pair_id: Optional[str] = None) -> None:
+        keys.difference_update(Controller.__persist_key_candidates(name, path_pair_id))
+        for key in list(keys):
+            if strip_persist_key(key, path_pair_id) == name:
+                keys.discard(key)
+
     def __is_previously_downloaded(self, name: str, path_pair_id: Optional[str] = None) -> bool:
-        file_id = ModelFile.build_file_id(name, path_pair_id)
-        return file_id in self.__persist.downloaded_file_names or name in self.__persist.downloaded_file_names
+        return Controller.__has_persist_key(self.__persist.downloaded_file_names, name, path_pair_id)
 
     def __is_explicitly_stopped(self, name: str, path_pair_id: Optional[str] = None) -> bool:
-        file_id = ModelFile.build_file_id(name, path_pair_id)
-        return file_id in self.__persist.stopped_file_names or name in self.__persist.stopped_file_names
+        return Controller.__has_persist_key(self.__persist.stopped_file_names, name, path_pair_id)
 
     def __get_staging_path(self, path_pair_id: Optional[str] = None) -> Optional[str]:
         if path_pair_id:
@@ -1984,8 +2009,7 @@ class Controller:
                 try:
                     path_pair = self.__get_path_pair(file.path_pair_id)
                     local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
-                    stopped_marked = file.file_id in self.__persist.stopped_file_names or \
-                        file.name in self.__persist.stopped_file_names
+                    stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
                     self.__log_stop_resume_trace(
                         "queue_after_stop" if stopped_marked else "queue_fresh",
                         file.file_id,
@@ -2003,8 +2027,11 @@ class Controller:
                         remote_base_dir_path=path_pair.remote_path if path_pair else None,
                         local_base_dir_path=local_base_dir_path
                     )
-                    self.__persist.stopped_file_names.discard(file.file_id)
-                    self.__persist.stopped_file_names.discard(file.name)
+                    Controller.__clear_persist_key(
+                        self.__persist.stopped_file_names,
+                        file.name,
+                        file.path_pair_id
+                    )
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",

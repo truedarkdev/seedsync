@@ -5,6 +5,7 @@ import json
 
 from common import PersistError
 from controller import ControllerPersist
+from controller.persist_keys import KEY_SEP, persist_key, strip_persist_key
 
 
 class TestControllerPersist(unittest.TestCase):
@@ -66,6 +67,32 @@ class TestControllerPersist(unittest.TestCase):
             persist.stopped_file_names,
             persist_actual.stopped_file_names
         )
+
+    def test_persist_key_helpers(self):
+        self.assertEqual("plain-name", persist_key(None, "plain-name"))
+        self.assertEqual("pair-id{}plain-name".format(KEY_SEP), persist_key("pair-id", "plain-name"))
+        self.assertEqual(
+            "plain-name",
+            strip_persist_key("pair-id{}plain-name".format(KEY_SEP), "pair-id")
+        )
+        self.assertEqual(
+            "plain-name",
+            strip_persist_key("pair-id:plain-name", "pair-id")
+        )
+
+    def test_from_str_migrates_legacy_colon_prefixed_keys(self):
+        legacy_key = "12345678-1234-1234-1234-123456789abc:archive.zip"
+        expected_key = "12345678-1234-1234-1234-123456789abc{}archive.zip".format(KEY_SEP)
+        persist = ControllerPersist.from_str(json.dumps({
+            "downloaded": [legacy_key, "plain-name"],
+            "extracted": [legacy_key],
+            "stopped": [legacy_key],
+        }))
+        self.assertIn(expected_key, persist.downloaded_file_names)
+        self.assertIn(expected_key, persist.extracted_file_names)
+        self.assertIn(expected_key, persist.stopped_file_names)
+        self.assertIn("plain-name", persist.downloaded_file_names)
+        self.assertNotIn(legacy_key, persist.downloaded_file_names)
 
     def test_persist_read_error(self):
         # bad pattern
