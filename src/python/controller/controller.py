@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
-from threading import Lock
+from threading import Lock, RLock
 from queue import Queue
 from enum import Enum
 from datetime import datetime, timedelta
@@ -261,12 +261,9 @@ class Controller:
         # The model
         self.__model = Model()
         self.__model.set_base_logger(self.logger)
-        # Lock for the model
-        # Note: While the scanners are in a separate process, the rest of the application
-        #       is threaded in a single process. (The webserver is threaded Bottle WSGI
-        #       server). Therefore it is safe to use a threading Lock for the model
-        #       (the scanner processes never try to access the model)
-        self.__model_lock = Lock()
+        # Lock for the model. Listeners may re-enter controller model access
+        # while __update_model() is mutating the model, so this must be reentrant.
+        self.__model_lock = RLock()
         self.__path_pair_refresh_lock = Lock()
         self.__path_pair_refresh_requested = False
         self.__path_pair_refresh_generation = 0
