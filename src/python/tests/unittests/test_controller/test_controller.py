@@ -15,6 +15,7 @@ from controller import Controller, ControllerPersist, ModelBuilder
 from controller.extract import ExtractStatus
 from controller.scan import MultiPathActiveScanner
 from controller.controller import ControllerError
+from controller.persist_keys import KEY_SEP
 from common import AppError, PathPairManager
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -1769,6 +1770,69 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_queue_clears_path_pair_stopped_key_encodings(self):
+        pair_id = "12345678-1234-1234-1234-123456789abc"
+        file = ModelFile("dup", False)
+        file.path_pair_id = pair_id
+        file.remote_size = 10
+        self.controller._Controller__persist.stopped_file_names = {
+            file.file_id,
+            file.name,
+            "{}:{}".format(pair_id, file.name),
+            "{}{}{}".format(pair_id, KEY_SEP, file.name),
+        }
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            pair_id: SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_queue_clears_migrated_legacy_stopped_key(self):
+        pair_id = "12345678-1234-1234-1234-123456789abc"
+        file = ModelFile("dup", False)
+        file.path_pair_id = pair_id
+        file.remote_size = 10
+        self.controller._Controller__persist = ControllerPersist.from_str(json.dumps({
+            "downloaded": [],
+            "extracted": [],
+            "stopped": ["{}:{}".format(pair_id, file.name)],
+        }))
+        self.assertEqual(
+            {"{}{}{}".format(pair_id, KEY_SEP, file.name)},
+            self.controller._Controller__persist.stopped_file_names
+        )
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            pair_id: SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
+        }
+
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+
+    def test_persist_key_helpers_accept_legacy_and_unit_separator_keys(self):
+        pair_id = "12345678-1234-1234-1234-123456789abc"
+        file_name = "dup"
+
+        self.controller._Controller__persist.downloaded_file_names = {f"{pair_id}:{file_name}"}
+        self.assertTrue(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
+        self.controller._Controller__persist.downloaded_file_names = {f"{pair_id}{KEY_SEP}{file_name}"}
+        self.assertTrue(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
+
+        self.controller._Controller__persist.stopped_file_names = {f"{pair_id}:{file_name}"}
+        self.assertTrue(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
+        self.controller._Controller__persist.stopped_file_names = {f"{pair_id}{KEY_SEP}{file_name}"}
+        self.assertTrue(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
 
     def test_process_commands_delete_local_tracks_stopped_file_identity(self):
         file = ModelFile("dup", False)
