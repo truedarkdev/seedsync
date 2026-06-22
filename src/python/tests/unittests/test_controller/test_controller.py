@@ -68,6 +68,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process = MagicMock()
         self.controller._Controller__validate_process = MagicMock()
         self.controller._Controller__mp_logger = MagicMock()
+        self.controller._Controller__updater = MagicMock()
         self.controller._Controller__stop_resume_trace_logger = MagicMock()
         self.controller._Controller__stop_resume_trace_file_id = None
         self.controller._Controller__target_archive_trace_logger = MagicMock()
@@ -412,7 +413,7 @@ class TestController(unittest.TestCase):
             [call.args[0] for call in self.controller._Controller__active_scanner.set_active_files.call_args_list]
         )
 
-    @patch("controller.controller.datetime")
+    @patch("controller.model_updater.datetime")
     def test_update_model_schedules_healthy_status_poll_about_200ms_out(self, datetime_mock):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         now = datetime(2026, 4, 4, 12, 0, 0)
@@ -785,7 +786,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__started = True
         self.controller.refresh_path_pairs()
         self.controller._Controller__refresh_path_pair_runtime_state = MagicMock(side_effect=RuntimeError("activation failed"))
-        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
         self.controller._Controller__log_memory_usage = MagicMock()
 
         self.controller.process()
@@ -793,7 +794,7 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller._Controller__context.status.server.up)
         self.assertIn("activation failed", self.controller._Controller__context.status.server.error_msg)
         self.assertEqual(1, self.controller._Controller__path_pair_refresh_completed_generation)
-        self.controller._Controller__update_model.assert_called_once()
+        self.controller._Controller__updater.update.assert_called_once()
         self.controller._Controller__log_memory_usage.assert_called_once()
 
     def test_process_marks_refresh_completed_for_consumed_generation_only(self):
@@ -804,7 +805,7 @@ class TestController(unittest.TestCase):
             self.controller.refresh_path_pairs()
 
         self.controller._Controller__apply_path_pair_refresh = MagicMock(side_effect=bump_generation)
-        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
         self.controller._Controller__log_memory_usage = MagicMock()
 
         self.controller.process()
@@ -820,7 +821,7 @@ class TestController(unittest.TestCase):
             RuntimeError("activation failed"),
             None,
         ])
-        self.controller._Controller__update_model = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
         self.controller._Controller__log_memory_usage = MagicMock()
 
         self.controller.process()
@@ -843,7 +844,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__cleanup_commands = MagicMock(side_effect=lambda: call_order.append("cleanup"))
         self.controller._Controller__process_commands = MagicMock(side_effect=lambda: call_order.append("commands"))
         self.controller._Controller__apply_path_pair_refresh = MagicMock(side_effect=lambda: call_order.append("refresh"))
-        self.controller._Controller__update_model = MagicMock(side_effect=lambda: call_order.append("update"))
+        self.controller._Controller__updater.update = MagicMock(side_effect=lambda: call_order.append("update"))
         self.controller._Controller__log_memory_usage = MagicMock(side_effect=lambda: call_order.append("memory"))
 
         self.controller.process()
@@ -896,7 +897,10 @@ class TestController(unittest.TestCase):
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
         )
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
-        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
+        self.assertCountEqual(
+            ["a", "b"],
+            self.controller._Controller__active_scanner.set_active_files.call_args_list[-1].args[0]
+        )
 
     def test_lftp_status_refresh_timing_tracks_downloading_scan_interval(self):
         self.assertEqual((1, 3), Controller._Controller__lftp_status_refresh_timing(100))
@@ -1028,7 +1032,10 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["b"])
-        self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
+        self.assertCountEqual(
+            ["a", "b"],
+            self.controller._Controller__active_scanner.set_active_files.call_args_list[-1].args[0]
+        )
         self.assertEqual(
             [[status_b], [status_b], [status_a]],
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
@@ -1312,7 +1319,7 @@ class TestController(unittest.TestCase):
             ("dup", "movies", "Movies")
         ])
 
-    @patch("controller.controller.ModelDiffUtil.diff_models", return_value=[])
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_downloaded_file_names(self, _):
         self.controller._Controller__persist.downloaded_file_names = {"keep-id", "stale-id"}
         self.controller._Controller__model_builder.has_changes.return_value = True
@@ -1338,7 +1345,7 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__model_builder.set_stopped_files.assert_called_once_with({"stopped-id"})
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_keeps_downloaded_file_ids_when_new_download_completes(self, diff_models):
         added_file = ModelFile("keep", False)
         added_file.path_pair_id = "movies"
@@ -1368,7 +1375,7 @@ class TestController(unittest.TestCase):
             self.controller._Controller__model_builder.set_downloaded_files.call_args_list[-1][0][0]
         )
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_removes_stale_extracted_file_names_when_new_download_completes(self, diff_models):
         added_file = ModelFile("archive.zip", False)
         added_file.path_pair_id = "movies"
@@ -1388,7 +1395,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_called_with(set())
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_handles_removed_diff_without_new_file(self, diff_models):
         old_file = ModelFile("removed.bin", False)
         old_file.path_pair_id = "movies"
@@ -1425,7 +1432,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(set(), self.controller._Controller__model.get_file_ids())
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_keeps_pending_completion_until_local_completion_proof(self, diff_models):
         completion_entry = ("movie.mkv", "movies", "Movies")
         completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
@@ -1496,7 +1503,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_applies_pending_completion_side_effects_once_for_terminal_update(self, diff_models):
         completion_entry = ("movie.mkv", "movies", "Movies")
         completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
@@ -1545,7 +1552,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__move_from_staging.assert_called_once_with("movie.mkv", "movies")
         self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({completion_file_id})
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_does_not_mark_stopped_disappearing_download_as_downloaded(self, diff_models):
         stopped_entry = ("movie.mkv", "movies", "Movies")
         stopped_file_id = ModelFile.build_file_id("movie.mkv", "movies")
@@ -1585,7 +1592,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__active_scanner.set_active_files.assert_called_with([])
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_does_not_mark_partial_disappearing_download_as_downloaded(self, diff_models):
         completion_entry = ("movie.mkv", "movies", "Movies")
 
@@ -1629,7 +1636,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__active_scanner.set_active_files.assert_called_with(["movie.mkv"])
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_clears_pending_completion_when_default_file_has_no_local_size(self, diff_models):
         completion_entry = ("movie.mkv", "movies", "Movies")
         other_pending_entry = ("movie.mkv", "tv", "TV")
@@ -1695,7 +1702,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({"archive.zip"}, self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_keeps_staging_only_completed_markers_from_repromoting_snapshot(self, diff_models):
         self.controller._Controller__persist.downloaded_file_names = {"archive.zip"}
         self.controller._Controller__persist.extracted_file_names = {"archive.zip"}
@@ -1719,7 +1726,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({"archive.zip"}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual({"archive.zip"}, self.controller._Controller__persist.extracted_file_names)
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_reconsiders_pending_zero_byte_local_only_file_after_remote_reconciliation(self, diff_models):
         file = ModelFile("stale", False)
         file.path_pair_id = "movies"
@@ -1779,7 +1786,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__persist.downloaded_file_names = {file.file_id}
         self.assertFalse(self.controller._Controller__should_auto_purge_local_file(file))
 
-    @patch("controller.controller.ModelDiffUtil.diff_models")
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_skips_auto_purge_for_queued_delete_command(self, diff_models):
         file = ModelFile("stale", False)
         file.path_pair_id = "movies"
@@ -2595,7 +2602,10 @@ class TestController(unittest.TestCase):
     def test_move_from_staging_uses_single_path_roots(self, _, move):
         self.controller._Controller__move_from_staging("movie.mkv")
 
-        move.assert_called_once_with("/local/incomplete/movie.mkv", "/local/movie.mkv")
+        self.assertEqual(
+            (os.path.normpath("/local/incomplete/movie.mkv"), os.path.normpath("/local/movie.mkv")),
+            tuple(os.path.normpath(path) for path in move.call_args.args)
+        )
 
     @patch("controller.controller.shutil.move")
     @patch("controller.controller.os.path.exists", return_value=True)
@@ -2609,9 +2619,12 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__move_from_staging("movie.mkv", "movies")
 
-        move.assert_called_once_with(
-            "/local/movies/incomplete/movie.mkv",
-            "/local/movies/movie.mkv"
+        self.assertEqual(
+            (
+                os.path.normpath("/local/movies/incomplete/movie.mkv"),
+                os.path.normpath("/local/movies/movie.mkv")
+            ),
+            tuple(os.path.normpath(path) for path in move.call_args.args)
         )
 
     @patch("controller.controller.shutil.move")

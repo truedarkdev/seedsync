@@ -74,12 +74,13 @@ class TestValidateProcess(unittest.TestCase):
         }, hashes)
 
     def test_close_queues_releases_owned_queues_and_is_idempotent(self):
+        exception_queue = MagicMock()
         command_queue = MagicMock()
         status_queue = MagicMock()
 
         with patch(
             "controller.validate.validate_process.multiprocessing.Queue",
-            side_effect=[command_queue, status_queue],
+            side_effect=[exception_queue, command_queue, status_queue],
         ), patch("controller.validate.validate_process.Sshcp") as mock_sshcp:
             process = ValidateProcess(
                 remote_address="example.com",

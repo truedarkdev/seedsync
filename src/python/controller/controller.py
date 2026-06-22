@@ -25,6 +25,7 @@ from .scan import (
 )
 from .extract import ExtractProcess, ExtractStatus
 from .validate import ValidateProcess
+from .model_updater import ModelUpdater
 from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
 from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair, Localization
@@ -262,7 +263,7 @@ class Controller:
         self.__model = Model()
         self.__model.set_base_logger(self.logger)
         # Lock for the model. Listeners may re-enter controller model access
-        # while __update_model() is mutating the model, so this must be reentrant.
+        # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
         self.__path_pair_refresh_lock = Lock()
         self.__path_pair_refresh_requested = False
@@ -273,9 +274,6 @@ class Controller:
         # Model builder
         self.__model_builder = ModelBuilder()
         self.__model_builder.set_base_logger(self.logger)
-        self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
-        self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
-        self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
 
         self.__path_pairs_by_id: Dict[str, PathPair] = {}
         self.__path_pair_staging_paths: Dict[str, str] = {}
@@ -390,6 +388,8 @@ class Controller:
         self.__active_command_processes = []
         self.__startup_recovery_done = False
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
+        self.__updater = ModelUpdater(self)
+        self.__updater.sync_persist_to_all_builders()
 
         self.__started = False
 
@@ -777,7 +777,11 @@ class Controller:
                 self.logger.exception("Ignoring path pair refresh failure")
             finally:
                 self.__mark_path_pair_refresh_completed(refresh_generation)
-        self.__update_model()
+        updater = getattr(self, "_Controller__updater", None)
+        if updater is None:
+            updater = ModelUpdater(self)
+            self.__updater = updater
+        updater.update()
         self.__log_memory_usage()
 
     def exit(self):
@@ -1464,491 +1468,11 @@ class Controller:
             self.__active_scanner.set_active_files([name for name, _, _ in active_files])
 
     def __update_model(self):
-        if not hasattr(self, "_Controller__malformed_status_only_file_ids"):
-            self.__malformed_status_only_file_ids = set()
-        if not hasattr(self, "_Controller__pending_auto_purge_file_ids"):
-            self.__pending_auto_purge_file_ids = set()
-        if not hasattr(self, "_Controller__last_lftp_statuses"):
-            self.__last_lftp_statuses = []
-        if not hasattr(self, "_Controller__next_lftp_status_poll_at"):
-            self.__next_lftp_status_poll_at = None
-        if not hasattr(self, "_Controller__lftp_status_poll_retry_seconds"):
-            self.__lftp_status_poll_retry_seconds = 1
-        if not hasattr(self, "_Controller__lftp_status_cache_expires_at"):
-            self.__lftp_status_cache_expires_at = None
-        if not hasattr(self, "_Controller__lftp_status_cache_max_age_seconds"):
-            self.__lftp_status_cache_max_age_seconds = max(3, self.__lftp_status_poll_retry_seconds * 3)
-        if not hasattr(self, "_Controller__lftp_status_poll_retry_active"):
-            self.__lftp_status_poll_retry_active = False
-        if not hasattr(self, "_Controller__prev_downloading_file_names"):
-            self.__prev_downloading_file_names = set()
-        if not hasattr(self, "_Controller__pending_completion_file_names"):
-            self.__pending_completion_file_names = set()
-
-        # Grab the latest scan results
-        latest_remote_scan = self.__remote_scan_process.pop_latest_result()
-        latest_local_scan = self.__local_scan_process.pop_latest_result()
-        latest_active_scan = self.__active_scan_process.pop_latest_result()
-
-        # Grab the Lftp status
-        lftp_statuses = []
-        lftp_status_poll_healthy = True
-        lftp_status_snapshot_fresh = True
-        lftp_status_source = "fresh_healthy"
-        now = datetime.now()
-        current_lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
-        lftp_status_poll_due = self.__next_lftp_status_poll_at is None or \
-            now >= self.__next_lftp_status_poll_at or \
-            (self.__last_lftp_statuses and not current_lftp_status_poll_healthy and
-             not self.__lftp_status_poll_retry_active)
-        if not lftp_status_poll_due:
-            if self.__last_lftp_statuses:
-                lftp_statuses = self.__last_lftp_statuses
-                lftp_status_snapshot_fresh = False
-                lftp_status_source = "cached_retry"
-            else:
-                lftp_status_poll_healthy = False
-                lftp_status_source = "retry_empty"
-        else:
-            try:
-                lftp_statuses = self.__lftp.status()
-                lftp_status_poll_healthy = getattr(self.__lftp, "last_status_poll_healthy", True)
-                poll_finished_at = datetime.now()
-                if lftp_status_poll_healthy:
-                    self.__lftp_status_poll_retry_active = False
-                    self.__last_lftp_statuses = lftp_statuses
-                    self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
-                        seconds=self.__lftp_status_cache_max_age_seconds
-                    )
-                    # Keep healthy polls responsive without hammering lftp on
-                    # every controller tick.
-                    self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
-                        milliseconds=200
-                    )
-                    lftp_status_source = "fresh_healthy"
-                else:
-                    self.__lftp_status_poll_retry_active = True
-                    self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
-                        seconds=self.__lftp_status_poll_retry_seconds
-                    )
-                    if self.__last_lftp_statuses:
-                        lftp_statuses = self.__last_lftp_statuses
-                        lftp_status_snapshot_fresh = False
-                        lftp_status_source = "cached_unhealthy"
-                    elif lftp_statuses:
-                        self.__last_lftp_statuses = lftp_statuses
-                        self.__lftp_status_cache_expires_at = poll_finished_at + timedelta(
-                            seconds=self.__lftp_status_cache_max_age_seconds
-                        )
-                        lftp_status_source = "fresh_unhealthy"
-                    else:
-                        lftp_status_source = "unhealthy_empty"
-            except (LftpError, LftpJobStatusParserError) as e:
-                self.logger.warning("Caught lftp error: {}".format(str(e)))
-                lftp_statuses = []
-                lftp_status_poll_healthy = False
-                self.__lftp_status_poll_retry_active = True
-                poll_finished_at = datetime.now()
-                self.__next_lftp_status_poll_at = poll_finished_at + timedelta(
-                    seconds=self.__lftp_status_poll_retry_seconds
-                )
-                if self.__last_lftp_statuses:
-                    lftp_statuses = self.__last_lftp_statuses
-                    lftp_status_snapshot_fresh = False
-                    lftp_status_source = "cached_error"
-                else:
-                    lftp_status_source = "error_empty"
-
-        # Grab the latest extract results
-        latest_extract_statuses = self.__extract_process.pop_latest_statuses()
-        latest_validation_statuses = self.__validate_process.pop_latest_statuses()
-
-        # Grab the latest extracted file names
-        latest_extracted_results = self.__extract_process.pop_completed()
-        latest_failed_results = self.__extract_process.pop_failed()
-        previous_malformed_status_only_file_ids = set(self.__malformed_status_only_file_ids)
-        if latest_active_scan is not None:
-            self.__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
-
-        # Update list of active file names
-        if lftp_statuses is not None:
-            active_status_file_ids = {status.file_id for status in lftp_statuses}
-            self.__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
-            lftp_statuses = [
-                status for status in lftp_statuses
-                if status.file_id not in self.__malformed_status_only_file_ids
-            ]
-            current_downloading_file_names = [
-                (s.name, s.path_pair_id, s.path_pair_name)
-                for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
-            ]
-            if lftp_status_poll_healthy or lftp_statuses:
-                current_downloading_file_names_set = set(current_downloading_file_names)
-                just_completed_file_names = self.__prev_downloading_file_names - current_downloading_file_names_set
-                just_completed_file_names = {
-                    file_name for file_name in just_completed_file_names
-                    if not self.__is_explicitly_stopped(file_name[0], file_name[1])
-                }
-                if just_completed_file_names:
-                    for name, path_pair_id, _ in just_completed_file_names:
-                        self.logger.info(
-                            "Download completion pending (LFTP job finished): {}".format(
-                                ModelFile.build_file_id(name, path_pair_id)
-                            )
-                        )
-                    self.__pending_completion_file_names.update(just_completed_file_names)
-                    self.__local_scan_process.force_scan()
-                self.__prev_downloading_file_names = current_downloading_file_names_set
-            self.__active_downloading_file_names = current_downloading_file_names
-        if self.__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
-            self.__next_lftp_status_poll_at = None
-        if latest_extract_statuses is not None:
-            self.__active_extracting_file_names = [
-                self.__active_extracting_file_tuple(s)
-                for s in latest_extract_statuses.statuses
-                if s.state == ExtractStatus.State.EXTRACTING
-                and not self.__extract_status_matches_failed_result(s, latest_failed_results)
-            ]
-        self.__temp_diag(
-            "update_model",
-            lftp_status_source=lftp_status_source,
-            lftp_status_poll_healthy=lftp_status_poll_healthy,
-            lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
-            lftp_status_count=len(lftp_statuses) if lftp_statuses is not None else None,
-            active_downloading_count=len(self.__active_downloading_file_names),
-            active_extracting_count=len(self.__active_extracting_file_names),
-            last_lftp_status_count=len(self.__last_lftp_statuses) if self.__last_lftp_statuses is not None else None,
-            next_lftp_status_poll_at=self.__next_lftp_status_poll_at,
-            lftp_status_cache_expires_at=self.__lftp_status_cache_expires_at,
-        )
-
-        # Update the active scanner's state
-        self.__set_active_scanner_files(
-            self.__active_downloading_file_names +
-            self.__active_extracting_file_names +
-            list(self.__pending_completion_file_names)
-        )
-
-        # Update model builder state
-        if latest_remote_scan is not None:
-            self.__model_builder.set_remote_files(latest_remote_scan.files)
-            self.__record_breadcrumb(
-                stage="scan",
-                message="remote_scan_result",
-                details={
-                    "file_count": len(latest_remote_scan.files),
-                    "failed": latest_remote_scan.failed,
-                    "error_message": latest_remote_scan.error_message,
-                },
-                event_type="failure" if latest_remote_scan.failed else "state_transition",
-                corr_id=self.__trace_corr_id_from_files(latest_remote_scan.files, "remote_scan"),
-            )
-        if latest_local_scan is not None:
-            self.__model_builder.set_local_files(latest_local_scan.files)
-            recovered_extracted_file_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
-            if isinstance(recovered_extracted_file_ids, (list, tuple, set)):
-                self.__persist.extracted_file_names.update(recovered_extracted_file_ids)
-            self.__record_breadcrumb(
-                stage="scan",
-                message="local_scan_result",
-                details={
-                    "file_count": len(latest_local_scan.files),
-                    "managed_extract_file_count": len(recovered_extracted_file_ids)
-                    if isinstance(recovered_extracted_file_ids, (list, tuple, set))
-                    else None,
-                },
-                event_type="state_transition",
-                corr_id=self.__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
-            )
-        if latest_active_scan is not None:
-            self.__model_builder.set_active_files(latest_active_scan.files)
-            self.__record_breadcrumb(
-                stage="scan",
-                message="active_scan_result",
-                details={
-                    "file_count": len(latest_active_scan.files),
-                    "malformed_status_only_file_count": len(latest_active_scan.malformed_status_only_file_ids),
-                },
-                event_type="state_transition",
-                corr_id=self.__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
-            )
-        if lftp_statuses is not None:
-            self.__model_builder.set_lftp_statuses(lftp_statuses)
-            if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
-                self.__model_builder.evict_recent_live_transfer_snapshots_missing_roots(
-                    {status.file_id for status in lftp_statuses}
-                )
-        if latest_extract_statuses is not None:
-            self.__model_builder.set_extract_statuses(latest_extract_statuses.statuses)
-            self.__record_breadcrumb(
-                stage="extract",
-                message="extract_status_result",
-                details={
-                    "status_count": len(latest_extract_statuses.statuses),
-                    "extracting_count": len([
-                        s for s in latest_extract_statuses.statuses if s.state == ExtractStatus.State.EXTRACTING
-                    ]),
-                },
-                event_type="state_transition",
-                corr_id="extract:aggregate",
-                trace_scope="aggregate",
-            )
-            if self.__is_target_archive_trace_enabled():
-                for status in latest_extract_statuses.statuses:
-                    trace_target_file = self.__find_target_archive_model_file(status.name)
-                    if trace_target_file is not None:
-                        self.__trace_target_archive_event("extract_status", {
-                            "file": self.__summarize_target_archive_file(trace_target_file),
-                            "is_dir": status.is_dir,
-                            "state": getattr(status.state, "name", status.state),
-                        })
-        if latest_validation_statuses is not None:
-            self.__model_builder.set_validation_statuses(latest_validation_statuses.statuses)
-        if latest_extracted_results:
-            extracted_result_summaries = []
-            for result in latest_extracted_results:
-                extracted_file_ids = {result.name}
-                if result.file_id is not None:
-                    extracted_file_ids.add(result.file_id)
-                self.__persist.extracted_file_names.update(extracted_file_ids)
-                extracted_result_summaries.append({
-                    "name": result.name,
-                    "file_id": result.file_id,
-                    "is_dir": result.is_dir,
-                    "path_pair_id": result.path_pair_id,
-                })
-                trace_target_file = self.__find_target_archive_model_file(result.name, result.file_id)
-                if trace_target_file is not None:
-                    self.__trace_target_archive_event("extracted_marker_added", {
-                        "file": self.__summarize_target_archive_file(trace_target_file),
-                        "is_dir": result.is_dir,
-                    })
-            self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
-            self.__record_breadcrumb(
-                stage="extract",
-                message="extract_completed",
-                details={
-                    "result_count": len(latest_extracted_results),
-                    "results": extracted_result_summaries,
-                },
-                event_type="state_transition",
-                corr_id=self.__trace_corr_id_from_files(latest_extracted_results, "extract"),
-            )
-        if latest_failed_results:
-            failed_result_summaries = []
-            for result in latest_failed_results:
-                failed_result_summaries.append({
-                    "name": result.name,
-                    "file_id": result.file_id,
-                    "is_dir": result.is_dir,
-                    "path_pair_id": result.path_pair_id,
-                })
-            self.__record_breadcrumb(
-                stage="extract",
-                message="extract_failed",
-                details={
-                    "result_count": len(latest_failed_results),
-                    "results": failed_result_summaries,
-                },
-                event_type="failure",
-                corr_id=self.__trace_corr_id_from_files(latest_failed_results, "extract"),
-            )
-        self.__model_builder.set_stopped_files(self.__persist.stopped_file_names)
-
-        # Build the new model, if needed
-        auto_purge_candidate_ids = set()
-        remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
-        if self.__model_builder.has_changes():
-            new_model = self.__model_builder.build_model()
-
-            with self.__model_lock:
-                def pending_completion_file_ids():
-                    return {
-                        ModelFile.build_file_id(file_name, path_pair_id)
-                        for file_name, path_pair_id, _ in self.__pending_completion_file_names
-                    }
-
-                # Diff the new model with old model
-                model_diff = ModelDiffUtil.diff_models(self.__model, new_model)
-
-                # Apply changes to the new model
-                for diff in model_diff:
-                    if diff.change == ModelDiff.Change.ADDED:
-                        assert diff.new_file is not None
-                        self.__model.add_file(diff.new_file)
-                    elif diff.change == ModelDiff.Change.REMOVED:
-                        assert diff.old_file is not None
-                        self.__model.remove_file(diff.old_file.file_id)
-                    elif diff.change == ModelDiff.Change.UPDATED:
-                        assert diff.new_file is not None
-                        self.__model.update_file(diff.new_file)
-
-                    if diff.change == ModelDiff.Change.REMOVED and diff.old_file is not None and \
-                            latest_local_scan is not None and \
-                            diff.old_file.file_id in pending_completion_file_ids():
-                        self.__pending_completion_file_names = {
-                            file_name for file_name in self.__pending_completion_file_names
-                            if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.old_file.file_id
-                        }
-
-                    completion_proved = False
-                    if diff.new_file is not None and diff.old_file is not None and \
-                            diff.new_file.file_id in pending_completion_file_ids() and \
-                            not self.__is_explicitly_stopped(diff.new_file.name, diff.new_file.path_pair_id):
-                        if diff.new_file.state == ModelFile.State.DEFAULT and \
-                                diff.new_file.local_size is None:
-                            self.__pending_completion_file_names = {
-                                file_name for file_name in self.__pending_completion_file_names
-                                if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.new_file.file_id
-                            }
-                        if diff.new_file.state in (
-                                ModelFile.State.DOWNLOADED,
-                                ModelFile.State.EXTRACTED,
-                                ModelFile.State.DELETED
-                        ):
-                            completion_proved = True
-                        elif diff.old_file.remote_size is not None and \
-                                diff.new_file.local_size is not None and \
-                                diff.new_file.local_size >= diff.old_file.remote_size:
-                            completion_proved = True
-
-                    if completion_proved and diff.new_file is not None:
-                        self.__pending_completion_file_names = {
-                            file_name for file_name in self.__pending_completion_file_names
-                            if ModelFile.build_file_id(file_name[0], file_name[1]) != diff.new_file.file_id
-                        }
-                        if diff.new_file.file_id not in self.__persist.downloaded_file_names:
-                            self.__persist.downloaded_file_names.add(diff.new_file.file_id)
-                            self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
-                        self.clear_extracted_marker(diff.new_file)
-                        if self.__target_archive_trace_selector_matches_file(diff.new_file.file_id, diff.new_file.name):
-                            self.__trace_target_archive_event("downloaded_marker_added", {
-                                "file": self.__summarize_target_archive_file(diff.new_file),
-                            })
-                        self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
-
-                    # Detect if a file was just Downloaded through a direct state transition.
-                    # Pending-completion files are handled above so disappearance does not
-                    # immediately count as a completed download.
-                    downloaded = False
-                    if diff.new_file is not None and \
-                            not completion_proved and \
-                            diff.new_file.file_id not in pending_completion_file_ids():
-                        if diff.change == ModelDiff.Change.ADDED and \
-                                diff.new_file.state == ModelFile.State.DOWNLOADED:
-                            downloaded = True
-                        elif diff.change == ModelDiff.Change.UPDATED and \
-                                diff.new_file.state == ModelFile.State.DOWNLOADED and \
-                                diff.old_file is not None and \
-                                diff.old_file.state != ModelFile.State.DOWNLOADED:
-                            downloaded = True
-                    if downloaded:
-                        assert diff.new_file is not None
-                        self.__persist.downloaded_file_names.add(diff.new_file.file_id)
-                        self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
-                        self.clear_extracted_marker(diff.new_file)
-                        if self.__target_archive_trace_selector_matches_file(diff.new_file.file_id, diff.new_file.name):
-                            self.__trace_target_archive_event("downloaded_marker_added", {
-                                "file": self.__summarize_target_archive_file(diff.new_file),
-                            })
-                        self.__move_from_staging(diff.new_file.name, diff.new_file.path_pair_id)
-
-                current_auto_purge_candidate_ids = set()
-                for diff in model_diff:
-                    if diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED) and \
-                            diff.new_file is not None and \
-                            self.__should_auto_purge_local_file(diff.new_file):
-                        current_auto_purge_candidate_ids.add(diff.new_file.file_id)
-                if remote_reconciliation_established:
-                    auto_purge_candidate_ids.update(current_auto_purge_candidate_ids)
-                else:
-                    self.__pending_auto_purge_file_ids.update(
-                        current_auto_purge_candidate_ids
-                    )
-
-                # Prune the extracted files list of any files that were deleted locally
-                # This prevents these files from going to EXTRACTED state if they are re-downloaded
-                remove_extracted_file_names = set()
-                existing_file_ids = self.__model.get_file_ids()
-                for extracted_file_name in self.__persist.extracted_file_names:
-                    if extracted_file_name in existing_file_ids:
-                        file = self.__model.get_file(extracted_file_name)
-                        if file.state == ModelFile.State.DELETED:
-                            # Deleted locally, remove
-                            remove_extracted_file_names.add(extracted_file_name)
-                    elif extracted_file_name in self.__model.get_file_names():
-                        try:
-                            file = self.__model.get_file(extracted_file_name)
-                        except ModelError:
-                            continue
-                        if file.state == ModelFile.State.DELETED:
-                            remove_extracted_file_names.add(extracted_file_name)
-                    else:
-                        # Not in the model at all
-                        # This could be because local and remote scans are not yet available
-                        pass
-                if remove_extracted_file_names:
-                    self.logger.info("Removing from extracted list: {}".format(remove_extracted_file_names))
-                    self.__persist.extracted_file_names.difference_update(remove_extracted_file_names)
-                    if self.__is_target_archive_trace_enabled():
-                        for extracted_file_name in remove_extracted_file_names:
-                            if self.__target_archive_trace_selector_matches_file(extracted_file_name, extracted_file_name):
-                                self.__trace_target_archive_event("extracted_marker_removed", {
-                                    "file_name": extracted_file_name,
-                                    "file_id": ModelFile.build_file_id(extracted_file_name, None),
-                                })
-                    self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
-
-                active_model_names = set(self.__model.get_file_names())
-                active_model_ids = set(self.__model.get_file_ids())
-                if remote_reconciliation_established:
-                    remove_downloaded_file_names = {
-                        downloaded_file_name
-                        for downloaded_file_name in self.__persist.downloaded_file_names
-                        if downloaded_file_name not in active_model_names and
-                        downloaded_file_name not in active_model_ids and
-                        downloaded_file_name not in pending_completion_file_ids()
-                    }
-                    if remove_downloaded_file_names:
-                        self.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
-                        self.__persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
-                        if self.__is_target_archive_trace_enabled():
-                            for downloaded_file_name in remove_downloaded_file_names:
-                                if self.__target_archive_trace_selector_matches_file(downloaded_file_name, downloaded_file_name):
-                                    self.__trace_target_archive_event("downloaded_marker_removed", {
-                                        "file_name": downloaded_file_name,
-                                        "file_id": ModelFile.build_file_id(downloaded_file_name, None),
-                                    })
-                        self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
-
-        if remote_reconciliation_established and self.__pending_auto_purge_file_ids:
-            pending_auto_purge_candidates = set()
-            for file_id in list(self.__pending_auto_purge_file_ids):
-                try:
-                    file = self.__model.get_file(file_id)
-                except ModelError:
-                    self.__pending_auto_purge_file_ids.discard(file_id)
-                    continue
-                if self.__should_auto_purge_local_file(file):
-                    pending_auto_purge_candidates.add(file_id)
-                else:
-                    self.__pending_auto_purge_file_ids.discard(file_id)
-            auto_purge_candidate_ids.update(pending_auto_purge_candidates)
-            self.__pending_auto_purge_file_ids.difference_update(auto_purge_candidate_ids)
-
-        for file_id in auto_purge_candidate_ids:
-            file = self.__model.get_file(file_id)
-            self.__queue_delete_local_process(file, self.__local_scan_process.force_scan)
-
-        # Update the controller status
-        if latest_remote_scan is not None:
-            self.__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
-            self.__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed
-            self.__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
-            if not latest_remote_scan.failed and not self.__startup_recovery_done:
-                self.__recover_interrupted_downloads(latest_remote_scan.files)
-        if latest_local_scan is not None:
-            self.__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
+        updater = getattr(self, "_Controller__updater", None)
+        if not isinstance(updater, ModelUpdater):
+            updater = ModelUpdater(self)
+            self.__updater = updater
+        updater.update()
 
     def __process_commands(self):
         def _notify_failure(_command: Controller.Command,
