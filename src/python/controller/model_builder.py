@@ -1127,467 +1127,64 @@ class ModelBuilder:
                (status and is_dir != (status.type == LftpJobStatus.Type.MIRROR)):
                 raise ModelError("Mismatch in is_dir between sources")
 
-            def __fill_model_file(_model_file: ModelFile,
-                                  _remote: Optional[SystemFile],
-                                  _local: Optional[SystemFile],
-                                  _transfer_state: Optional[LftpJobStatus.TransferState],
-                                  _store_recent_snapshot: bool,
-                                  _recent_snapshot_root_file_id: Optional[str]):
-                # set local and remote sizes
-                if _remote:
-                    _model_file.remote_size = _remote.size
-                if _local:
-                    _model_file.local_size = _local.size
-
-                # Note: no longer use lftp's file sizes
-                #       they represent remaining size for resumed downloads
-
-                # set the downloading speed and eta
-                if _transfer_state:
-                    if _store_recent_snapshot:
-                        self.__store_recent_live_transfer_snapshot(
-                            _model_file.file_id,
-                            _recent_snapshot_root_file_id if _recent_snapshot_root_file_id is not None else _model_file.file_id,
-                            _transfer_state
-                        )
-                    download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
-                    if download_progress is not None:
-                        _model_file.download_progress = download_progress
-                    if _transfer_state.size_local is not None:
-                        _model_file.transferred_size = _transfer_state.size_local
-                        live_transferred_file_ids.add(_model_file.file_id)
-                    _model_file.downloading_speed = _transfer_state.speed
-                    _model_file.eta = _transfer_state.eta
-
-                # set the transferred size (only if file or dir exists on both ends)
-                if _local and _remote:
-                    if _model_file.is_dir:
-                        if _model_file.transferred_size is None:
-                            # dir transferred size is updated by child files
-                            _model_file.transferred_size = 0
-                    else:
-                        if _model_file.transferred_size is None:
-                            if self.__is_authoritative_local_file(_local):
-                                _model_file.transferred_size = min(_local.size, _remote.size)
-
-                        if _model_file.transferred_size is not None:
-                            # also update all parent directories
-                            _parent_file = _model_file.parent
-                            while _parent_file is not None:
-                                if _parent_file.file_id in live_transferred_file_ids:
-                                    break
-                                if _parent_file.transferred_size is None:
-                                    _parent_file.transferred_size = 0
-                                _parent_file.transferred_size += _model_file.transferred_size
-                                _parent_file = _parent_file.parent
-
-                # set the is_extractable flag
-                if not _model_file.is_dir and Extract.is_archive_fast(_model_file.name):
-                    _model_file.is_extractable = True
-                    # Also set the flag for all of its parents
-                    _parent_file = _model_file.parent
-                    while _parent_file is not None:
-                        _parent_file.is_extractable = True
-                        _parent_file = _parent_file.parent
-
-                # set the timestamps
-                if _local:
-                    if _local.timestamp_created:
-                        _model_file.local_created_timestamp = _local.timestamp_created
-                    if _local.timestamp_modified:
-                        _model_file.local_modified_timestamp = _local.timestamp_modified
-                if _remote:
-                    if _remote.timestamp_created:
-                        _model_file.remote_created_timestamp = _remote.timestamp_created
-                    if _remote.timestamp_modified:
-                        _model_file.remote_modified_timestamp = _remote.timestamp_modified
-
             model_file = ModelFile(name, is_dir)
             path_pair_id = remote.path_pair_id if remote and remote.path_pair_id is not None else \
                 local.path_pair_id if local else status.path_pair_id if status else None
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
                 local.path_pair_name if local else status.path_pair_name if status else None
             self.__apply_path_pair_metadata(model_file, path_pair_id, path_pair_name)
-            # set the file state
-            # for now we only set to Queued or Downloading
-            # later after all children are built, we can set to Downloaded after performing a check
-            recent_transfer_state = None
-            retained_transfer_state = None
-            arbitration_source = "scan_only"
-            raw_current_transfer_state = status.total_transfer_state if status and \
-                status.state == LftpJobStatus.State.RUNNING else None
-            current_transfer_state = raw_current_transfer_state if not is_stopped else None
-            if is_stopped and raw_current_transfer_state is not None:
-                retained_transfer_state = self.__build_retained_transfer_state(
-                    raw_current_transfer_state.size_local,
-                    remote.size if remote else None,
-                    raw_current_transfer_state.percent_local
-                )
-                self.__store_recent_live_transfer_snapshot(
-                    model_file.file_id,
-                    status.file_id if status is not None else model_file.file_id,
-                    raw_current_transfer_state
-                )
-                self.__store_retained_stopped_transfer_snapshot(
-                    model_file.file_id,
-                    status.file_id if status is not None else model_file.file_id,
-                    raw_current_transfer_state
-                )
-                arbitration_source = "retained_stopped_snapshot_from_live_status"
-            elif current_transfer_state is not None:
-                current_transfer_state = self.__coalesce_retained_stopped_transfer_state(
-                    file_id,
-                    status.file_id if status is not None else model_file.file_id,
-                    remote,
-                    local,
-                    current_transfer_state
-                )
-                arbitration_source = "live_status"
-                if current_transfer_state != raw_current_transfer_state:
-                    arbitration_source = "live_status_coalesced_with_retained_floor"
-            elif status is not None:
-                retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
-                    file_id,
-                    status.file_id if status is not None else model_file.file_id,
-                    remote,
-                    local,
-                    preserve_when_local_growth_only=is_stopped
-                )
-                arbitration_source = "retained_stopped_snapshot_without_live_progress" \
-                    if retained_transfer_state is not None else \
-                    "suppressed_stopped_live_status" if is_stopped else "live_status_without_transfer_state"
-            if current_transfer_state is None and status is None and not is_stopped:
-                recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
-                if recent_transfer_state is not None:
-                    arbitration_source = "recent_live_snapshot"
-            if retained_transfer_state is None and status is None and is_stopped:
-                retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
-                    file_id,
-                    model_file.file_id,
-                    remote,
-                    local,
-                    preserve_when_local_growth_only=True
-                )
-                if retained_transfer_state is not None:
-                    arbitration_source = "retained_stopped_snapshot"
-            if retained_transfer_state is None and status is None and is_stopped:
-                retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
-                if retained_transfer_state is not None:
-                    arbitration_source = "retained_recent_live_snapshot"
-            if status and not is_stopped:
-                model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
-                                   else ModelFile.State.DOWNLOADING
-                if status.state == LftpJobStatus.State.QUEUED:
-                    self.__evict_recent_live_transfer_snapshots(status.file_id)
-                    if arbitration_source == "scan_only":
-                        arbitration_source = "live_status_queued"
-            elif recent_transfer_state:
-                model_file.state = ModelFile.State.DOWNLOADING
-            # fill the rest
-            __fill_model_file(model_file,
-                              remote,
-                              local,
-                              current_transfer_state if current_transfer_state is not None
-                              else recent_transfer_state if recent_transfer_state is not None
-                              else retained_transfer_state,
-                              current_transfer_state is not None,
-                              status.file_id if status is not None else None)
-
-            # Traverse SystemFile children tree in BFS order
-            # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
-            # correspond to the same node in both remote and local SystemFile trees, status corresponds
-            # to the LFTP status for the entire tree, and model_file corresponds to the generated ModelFile
-            # for the pair
-            # Note: in this case the frontier contains nodes that have already been process, it is
-            #       merely used for traversing children
-            frontier = []
-            if remote or local:
-                frontier.append((remote, local, status, model_file, remote, local))
-            while frontier:
-                _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.pop(0)
-                _remote_children = {sf.name: sf for sf in _remote.children} if _remote else {}
-                _local_children = {sf.name: sf for sf in _local.children} if _local else {}
-                _all_children_names = set().union(_remote_children.keys(), _local_children.keys())
-                for _child_name in _all_children_names:
-                    _remote_child = _remote_children.get(_child_name, None)
-                    _local_child = _local_children.get(_child_name, None)
-                    if _remote_child is not None:
-                        _is_dir = _remote_child.is_dir
-                    else:
-                        assert _local_child is not None
-                        _is_dir = _local_child.is_dir
-                    # sanity check is_dir
-                    if (_remote_child and _is_dir != _remote_child.is_dir) or \
-                       (_local_child and _is_dir != _local_child.is_dir):
-                        raise ModelError("Mismatch in is_dir between child sources")
-                    _child_model_file = ModelFile(_child_name, _is_dir)
-                    self.__apply_path_pair_metadata(
-                        _child_model_file,
-                        _model_file.path_pair_id,
-                        _model_file.path_pair_name
-                    )
-
-                    # add it to the parent right away so we can access the full path
-                    _model_file.add_child(_child_model_file)
-                    seen_file_ids.add(_child_model_file.file_id)
-                    _child_is_stopped = _child_model_file.file_id in self.__stopped_files
-
-                    # Set the state, first matching criteria below decides state
-                    #   child is a directory: Default
-                    #   child is active: Downloading
-                    #   child local_size >= remote_size: Downloaded
-                    #   remote child exists and root is Queued or Downloading: Queued
-                    #   Default
-                    # Result:
-                    #   subdirectories are always Default
-                    #   downloading files are Downloading
-                    #   finished files are Downloaded
-                    #   Queued and Downloading root's unfinished files are Queued
-                    #   Local-only files are Default
-                    _child_current_transfer_state = None
-                    _child_recent_transfer_state = None
-                    _child_arbitration_source = "scan_only"
-                    if _status and _status.state == LftpJobStatus.State.RUNNING and \
-                            not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
-                            not _child_is_stopped:
-                        # Transfer states are in root-relative paths.
-                        _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
-                        _child_current_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
-                                                             if n == _child_status_path), None)
-                        if _child_current_transfer_state is not None:
-                            _child_arbitration_source = "live_status"
-                    if _child_current_transfer_state is None and _status is None:
-                        _child_recent_transfer_state = self.__get_recent_live_transfer_state(
-                            _child_model_file.file_id,
-                            _remote_child,
-                            _local_child,
-                            _root_remote,
-                            _root_local
-                        )
-                        if _child_recent_transfer_state is not None:
-                            _child_arbitration_source = "recent_live_snapshot"
-                    if _is_dir:
-                        _child_model_file.state = ModelFile.State.DEFAULT
-                    elif _child_current_transfer_state:
-                        _child_model_file.state = ModelFile.State.DOWNLOADING
-                    elif _child_recent_transfer_state:
-                        _child_model_file.state = ModelFile.State.DOWNLOADING
-                    elif _remote_child and _local_child is not None and \
-                            self.__is_authoritative_local_file(_local_child) and \
-                            _local_child.size >= _remote_child.size:
-                        _child_model_file.state = ModelFile.State.DOWNLOADED
-                    elif _remote_child and not _child_is_stopped and \
-                            model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
-                        _child_model_file.state = ModelFile.State.QUEUED
-                        _child_arbitration_source = "queued_by_root_state"
-                    else:
-                        _child_model_file.state = ModelFile.State.DEFAULT
-                        if _child_is_stopped and _status is not None:
-                            _child_arbitration_source = "suppressed_stopped_live_status"
-
-                    # fill the rest
-                    __fill_model_file(_child_model_file,
-                                      _remote_child,
-                                      _local_child,
-                                      _child_current_transfer_state if _child_current_transfer_state is not None
-                                      else _child_recent_transfer_state,
-                                      _child_current_transfer_state is not None,
-                                      status.file_id if status is not None else None)
-                    _child_model_file.is_stoppable = self.__is_stoppable_model_file(
-                        _child_model_file,
-                        _local_child,
-                        _child_current_transfer_state
-                    )
-                    if self.__is_stop_resume_trace_enabled():
-                        self.__trace_target_arbitration(
-                            _child_model_file,
-                            model_file.file_id,
-                            _child_is_stopped,
-                            _remote_child is not None,
-                            _local_child is not None,
-                            _local_child,
-                            _child_model_file.file_id in self.__active_file_ids,
-                            ModelBuilder.__summarize_local_freshness(_local_child),
-                            _status,
-                            _child_current_transfer_state,
-                            _child_arbitration_source
-                        )
-                    # add child to frontier
-                    frontier.append((_remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local))
-
-            # estimate the ETA for the root if it's not available
-            if model_file.state == ModelFile.State.DOWNLOADING and \
-                    model_file.eta is None and \
-                    model_file.downloading_speed is not None and \
-                    model_file.downloading_speed > 0 and \
-                    model_file.remote_size is not None and \
-                    model_file.transferred_size is not None:
-                # First-order estimate
-                remaining_size = max(model_file.remote_size - model_file.transferred_size, 0)
-                model_file.eta = int(math.ceil(remaining_size / model_file.downloading_speed))
-
-            if model_file.state == ModelFile.State.DOWNLOADING and \
-                    self.__local_file_proves_download_completion(local, remote):
-                self.__evict_transfer_completion_snapshots(
-                    file_id,
-                    status.file_id if status is not None else model_file.file_id
-                )
-                model_file.state = ModelFile.State.DOWNLOADED
-                model_file.transferred_size = remote.size if remote is not None else model_file.local_size
-                model_file.download_progress = None
-                model_file.downloading_speed = None
-                model_file.eta = None
-                arbitration_source = "suppressed_by_authoritative_local_completion"
-            if model_file.state == ModelFile.State.DOWNLOADING and \
-                    status is None and \
-                    not is_stopped and \
-                    remote is not None and \
-                    local is not None and \
-                    getattr(local, "is_staging", False) and \
-                    local.size is not None and \
-                    remote.size is not None and \
-                    local.size >= remote.size and \
-                    not self.__has_incomplete_remote_file_children(model_file) and \
-                    self.__resolve_recent_live_transfer_snapshot(
-                        file_id,
-                        status.file_id if status is not None else model_file.file_id
-                    )[1] is not None:
-                self.__evict_transfer_completion_snapshots(
-                    file_id,
-                    status.file_id if status is not None else model_file.file_id
-                )
-                model_file.state = ModelFile.State.DOWNLOADED
-                model_file.transferred_size = remote.size
-                model_file.download_progress = None
-                model_file.downloading_speed = None
-                model_file.eta = None
-                arbitration_source = "suppressed_by_staging_completion_after_live_status_lost"
-
-            # now we can determine if root is Downloaded
-            # root is Downloaded if all child remote files are Downloaded
-            # again we use BFS to traverse
-            if model_file.state == ModelFile.State.DEFAULT:
-                if not model_file.is_dir and \
-                        not (is_stopped and retained_transfer_state is not None) and \
-                        model_file.local_size is not None and \
-                        model_file.remote_size is not None and \
-                        self.__is_authoritative_local_file(local) and \
-                        model_file.local_size >= model_file.remote_size:
-                    # root is a finished single file
-                    model_file.state = ModelFile.State.DOWNLOADED
-                elif not model_file.is_dir and \
-                        status is None and \
-                        not is_stopped and \
-                        model_file.local_size is not None and \
-                        model_file.remote_size is not None and \
-                        getattr(local, "is_staging", False) and \
-                        model_file.local_size >= model_file.remote_size:
-                    # Keep scan-only recovery for full-size staging copies so
-                    # they can leave incomplete and continue through the
-                    # normal completion path.
-                    model_file.state = ModelFile.State.DOWNLOADED
-                    arbitration_source = "staging_completion_without_live_status"
-                elif not model_file.is_dir and \
-                        model_file.local_size is not None and \
-                        model_file.remote_size is None and \
-                        self.__is_authoritative_local_file(local) and \
-                        self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
-                    # keep previously-downloaded local-only files recognizable
-                    model_file.state = ModelFile.State.DOWNLOADED
-                elif model_file.is_dir and model_file.remote_size is not None:
-                    if status is None and \
-                            not is_stopped and \
-                            local is not None and \
-                            getattr(local, "is_staging", False) and \
-                            local.size is not None and \
-                            local.size >= model_file.remote_size:
-                        # A fully staged directory copy should be treated as complete even
-                        # if live transfer state has already disappeared.
-                        if not self.__has_incomplete_remote_file_children(model_file):
-                            model_file.state = ModelFile.State.DOWNLOADED
-                            arbitration_source = "staging_completion_without_live_status"
-                    else:
-                        # root is a directory that also exists remotely
-                        # check all the children
-                        all_downloaded = True
-                        has_downloadable_children = False
-                        frontier = []
-                        frontier += model_file.get_children()
-                        while frontier:
-                            _child_file = frontier.pop(0)
-                            if not _child_file.is_dir and \
-                                    _child_file.remote_size is not None:
-                                has_downloadable_children = True
-                                if _child_file.state != ModelFile.State.DOWNLOADED:
-                                    all_downloaded = False
-                                    break
-                            frontier += _child_file.get_children()
-                        if has_downloadable_children and all_downloaded:
-                            model_file.state = ModelFile.State.DOWNLOADED
-
-            # next we determine if root was Deleted
-            # root is Deleted if it does not exist locally, but was downloaded in the past
-            if model_file.state == ModelFile.State.DEFAULT and \
-                    model_file.local_size is None and \
-                    self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
-                model_file.state = ModelFile.State.DELETED
-
-            # next we check if root is Extracting
-            # root is Extracting if it's part of an extract status, in an expected state,
-            # and exists locally
-            # if root is NOT in an expected state, then ignore the extract status
-            # and report a warning message, as this shouldn't be happening
-            if model_file.name in self.__extract_statuses:
-                extract_status = self.__extract_statuses[model_file.name]
-                if model_file.is_dir != extract_status.is_dir:
-                    raise ModelError("Mismatch in is_dir between file and extract status")
-                if model_file.state in (
-                    ModelFile.State.DEFAULT,
-                    ModelFile.State.DOWNLOADED
-                ) and model_file.local_size is not None:
-                    model_file.state = ModelFile.State.EXTRACTING
-                else:
-                    if model_file.local_size is None:
-                        self.logger.warning("File {} has extract status but doesn't exist locally!".format(
-                            model_file.name
-                        ))
-                    else:
-                        self.logger.warning("File {} has extract status but is in state {}".format(
-                            model_file.name,
-                            str(model_file.state)
-                        ))
-
-            # next we check if root is Extracted
-            # root is Extracted if it is in Downloaded state and in extracted files list
-            # Note: Default files aren't marked extracted because they can still be queued
-            #       for download, and it doesn't make sense to queue after extracting
-            #       If a Default file is extracted, it will return back to the Default state
-            has_exact_extracted_marker = model_file.file_id in self.__extracted_files
-            if self.__model_file_matches_persisted_name(model_file, self.__extracted_files) and \
-                    model_file.state == ModelFile.State.DOWNLOADED and \
-                    self.__is_authoritative_local_file(local) and \
-                    (has_exact_extracted_marker or
-                     model_file.name not in self.__suppressed_ambiguous_extracted_file_names):
-                    model_file.state = ModelFile.State.EXTRACTED
-
-            validation_status = self.__validation_statuses.get(model_file.file_id)
-            if validation_status is not None and model_file.state in (
-                    ModelFile.State.DEFAULT,
-                    ModelFile.State.DOWNLOADED,
-                    ModelFile.State.EXTRACTED,
-                    ModelFile.State.VALIDATING,
-                    ModelFile.State.VALIDATED,
-                    ModelFile.State.CORRUPT
-            ) and model_file.local_size is not None and model_file.remote_size is not None:
-                model_file.state = validation_status.state
-                model_file.validation_progress = validation_status.progress
-                model_file.validation_error = validation_status.error
-                model_file.corrupt_chunks = validation_status.corrupt_chunks
-
+            (
+                current_transfer_state,
+                recent_transfer_state,
+                retained_transfer_state,
+                raw_current_transfer_state,
+                arbitration_source,
+            ) = self.__resolve_root_transfer_state(
+                file_id,
+                model_file,
+                remote,
+                local,
+                status,
+                is_stopped,
+            )
+            fill_transfer_state = current_transfer_state
+            if fill_transfer_state is None:
+                fill_transfer_state = recent_transfer_state
+            if fill_transfer_state is None:
+                fill_transfer_state = retained_transfer_state
+            self.__fill_model_file(
+                model_file,
+                remote,
+                local,
+                fill_transfer_state,
+                current_transfer_state is not None,
+                status.file_id if status is not None else None,
+                live_transferred_file_ids,
+            )
+            self.__build_children(
+                model_file,
+                remote,
+                local,
+                status,
+                seen_file_ids,
+                live_transferred_file_ids,
+            )
+            self.__estimate_eta(model_file)
+            incomplete_children, arbitration_source = self.__check_root_downloaded(
+                file_id,
+                model_file,
+                remote,
+                local,
+                status,
+                is_stopped,
+                retained_transfer_state,
+                arbitration_source,
+            )
+            self.__determine_state(model_file, local, incomplete_children)
             model_file.is_stoppable = self.__is_stoppable_model_file(
                 model_file,
                 local,
-                current_transfer_state
+                current_transfer_state,
             )
 
             if self.__is_stop_resume_trace_enabled():
@@ -1624,3 +1221,536 @@ class ModelBuilder:
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         self.__cached_model = model
         return model
+
+    def __resolve_root_transfer_state(
+        self,
+        file_id: str,
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        local: Optional[SystemFile],
+        status: Optional[LftpJobStatus],
+        is_stopped: bool,
+    ) -> Tuple[
+        Optional[LftpJobStatus.TransferState],
+        Optional[LftpJobStatus.TransferState],
+        Optional[LftpJobStatus.TransferState],
+        Optional[LftpJobStatus.TransferState],
+        str
+    ]:
+        # set the file state
+        # for now we only set to Queued or Downloading
+        # later after all children are built, we can set to Downloaded after performing a check
+        recent_transfer_state = None
+        retained_transfer_state = None
+        arbitration_source = "scan_only"
+        raw_current_transfer_state = status.total_transfer_state if status and \
+            status.state == LftpJobStatus.State.RUNNING else None
+        current_transfer_state = raw_current_transfer_state if not is_stopped else None
+        if is_stopped and raw_current_transfer_state is not None:
+            retained_transfer_state = self.__build_retained_transfer_state(
+                raw_current_transfer_state.size_local,
+                remote.size if remote else None,
+                raw_current_transfer_state.percent_local
+            )
+            self.__store_recent_live_transfer_snapshot(
+                model_file.file_id,
+                status.file_id if status is not None else model_file.file_id,
+                raw_current_transfer_state
+            )
+            self.__store_retained_stopped_transfer_snapshot(
+                model_file.file_id,
+                status.file_id if status is not None else model_file.file_id,
+                raw_current_transfer_state
+            )
+            arbitration_source = "retained_stopped_snapshot_from_live_status"
+        elif current_transfer_state is not None:
+            current_transfer_state = self.__coalesce_retained_stopped_transfer_state(
+                file_id,
+                status.file_id if status is not None else model_file.file_id,
+                remote,
+                local,
+                current_transfer_state
+            )
+            arbitration_source = "live_status"
+            if current_transfer_state != raw_current_transfer_state:
+                arbitration_source = "live_status_coalesced_with_retained_floor"
+        elif status is not None:
+            retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
+                file_id,
+                status.file_id if status is not None else model_file.file_id,
+                remote,
+                local,
+                preserve_when_local_growth_only=is_stopped
+            )
+            arbitration_source = "retained_stopped_snapshot_without_live_progress" \
+                if retained_transfer_state is not None else \
+                "suppressed_stopped_live_status" if is_stopped else "live_status_without_transfer_state"
+        if current_transfer_state is None and status is None and not is_stopped:
+            recent_transfer_state = self.__get_recent_live_transfer_state(file_id, remote, local)
+            if recent_transfer_state is not None:
+                arbitration_source = "recent_live_snapshot"
+        if retained_transfer_state is None and status is None and is_stopped:
+            retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
+                file_id,
+                model_file.file_id,
+                remote,
+                local,
+                preserve_when_local_growth_only=True
+            )
+            if retained_transfer_state is not None:
+                arbitration_source = "retained_stopped_snapshot"
+        if retained_transfer_state is None and status is None and is_stopped:
+            retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
+            if retained_transfer_state is not None:
+                arbitration_source = "retained_recent_live_snapshot"
+        if status and not is_stopped:
+            model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
+                               else ModelFile.State.DOWNLOADING
+            if status.state == LftpJobStatus.State.QUEUED:
+                self.__evict_recent_live_transfer_snapshots(status.file_id)
+                if arbitration_source == "scan_only":
+                    arbitration_source = "live_status_queued"
+        elif recent_transfer_state:
+            model_file.state = ModelFile.State.DOWNLOADING
+        return (
+            current_transfer_state,
+            recent_transfer_state,
+            retained_transfer_state,
+            raw_current_transfer_state,
+            arbitration_source,
+        )
+
+    def __build_children(
+        self,
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        local: Optional[SystemFile],
+        status: Optional[LftpJobStatus],
+        seen_file_ids: Set[str],
+        live_transferred_file_ids: Set[str],
+    ):
+        # Traverse SystemFile children tree in BFS order
+        # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
+        # correspond to the same node in both remote and local SystemFile trees, status corresponds
+        # to the LFTP status for the entire tree, and model_file corresponds to the generated ModelFile
+        # for the pair
+        # Note: in this case the frontier contains nodes that have already been process, it is
+        #       merely used for traversing children
+        frontier = []
+        if remote or local:
+            frontier.append((remote, local, status, model_file, remote, local))
+        while frontier:
+            _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.pop(0)
+            _remote_children = {sf.name: sf for sf in _remote.children} if _remote else {}
+            _local_children = {sf.name: sf for sf in _local.children} if _local else {}
+            _all_children_names = set().union(_remote_children.keys(), _local_children.keys())
+            for _child_name in _all_children_names:
+                _remote_child = _remote_children.get(_child_name, None)
+                _local_child = _local_children.get(_child_name, None)
+                if _remote_child is not None:
+                    _is_dir = _remote_child.is_dir
+                else:
+                    assert _local_child is not None
+                    _is_dir = _local_child.is_dir
+                # sanity check is_dir
+                if (_remote_child and _is_dir != _remote_child.is_dir) or \
+                   (_local_child and _is_dir != _local_child.is_dir):
+                    raise ModelError("Mismatch in is_dir between child sources")
+                _child_model_file = ModelFile(_child_name, _is_dir)
+                self.__apply_path_pair_metadata(
+                    _child_model_file,
+                    _model_file.path_pair_id,
+                    _model_file.path_pair_name
+                )
+
+                # add it to the parent right away so we can access the full path
+                _model_file.add_child(_child_model_file)
+                seen_file_ids.add(_child_model_file.file_id)
+                _child_is_stopped = _child_model_file.file_id in self.__stopped_files
+
+                # Set the state, first matching criteria below decides state
+                #   child is a directory: Default
+                #   child is active: Downloading
+                #   child local_size >= remote_size: Downloaded
+                #   remote child exists and root is Queued or Downloading: Queued
+                #   Default
+                # Result:
+                #   subdirectories are always Default
+                #   downloading files are Downloading
+                #   finished files are Downloaded
+                #   Queued and Downloading root's unfinished files are Queued
+                #   Local-only files are Default
+                _child_current_transfer_state = None
+                _child_recent_transfer_state = None
+                _child_arbitration_source = "scan_only"
+                if _status and _status.state == LftpJobStatus.State.RUNNING and \
+                        not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
+                        not _child_is_stopped:
+                    # Transfer states are in root-relative paths.
+                    _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
+                    _child_current_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
+                                                         if n == _child_status_path), None)
+                    if _child_current_transfer_state is not None:
+                        _child_arbitration_source = "live_status"
+                if _child_current_transfer_state is None and _status is None:
+                    _child_recent_transfer_state = self.__get_recent_live_transfer_state(
+                        _child_model_file.file_id,
+                        _remote_child,
+                        _local_child,
+                        _root_remote,
+                        _root_local
+                    )
+                    if _child_recent_transfer_state is not None:
+                        _child_arbitration_source = "recent_live_snapshot"
+                if _is_dir:
+                    _child_model_file.state = ModelFile.State.DEFAULT
+                elif _child_current_transfer_state:
+                    _child_model_file.state = ModelFile.State.DOWNLOADING
+                elif _child_recent_transfer_state:
+                    _child_model_file.state = ModelFile.State.DOWNLOADING
+                elif _remote_child and _local_child is not None and \
+                        self.__is_authoritative_local_file(_local_child) and \
+                        _local_child.size >= _remote_child.size:
+                    _child_model_file.state = ModelFile.State.DOWNLOADED
+                elif _remote_child and not _child_is_stopped and \
+                        model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING):
+                    _child_model_file.state = ModelFile.State.QUEUED
+                    _child_arbitration_source = "queued_by_root_state"
+                else:
+                    _child_model_file.state = ModelFile.State.DEFAULT
+                    if _child_is_stopped and _status is not None:
+                        _child_arbitration_source = "suppressed_stopped_live_status"
+
+                # fill the rest
+                self.__fill_model_file(
+                    _child_model_file,
+                    _remote_child,
+                    _local_child,
+                    _child_current_transfer_state if _child_current_transfer_state is not None
+                    else _child_recent_transfer_state,
+                    _child_current_transfer_state is not None,
+                    status.file_id if status is not None else None,
+                    live_transferred_file_ids,
+                )
+                _child_model_file.is_stoppable = self.__is_stoppable_model_file(
+                    _child_model_file,
+                    _local_child,
+                    _child_current_transfer_state
+                )
+                if self.__is_stop_resume_trace_enabled():
+                    self.__trace_target_arbitration(
+                        _child_model_file,
+                        model_file.file_id,
+                        _child_is_stopped,
+                        _remote_child is not None,
+                        _local_child is not None,
+                        _local_child,
+                        _child_model_file.file_id in self.__active_file_ids,
+                        ModelBuilder.__summarize_local_freshness(_local_child),
+                        _status,
+                        _child_current_transfer_state,
+                        _child_arbitration_source
+                    )
+                # add child to frontier
+                frontier.append((_remote_child, _local_child, _status, _child_model_file, _root_remote, _root_local))
+
+    def __fill_model_file(
+        self,
+        _model_file: ModelFile,
+        _remote: Optional[SystemFile],
+        _local: Optional[SystemFile],
+        _transfer_state: Optional[LftpJobStatus.TransferState],
+        _store_recent_snapshot: bool,
+        _recent_snapshot_root_file_id: Optional[str],
+        live_transferred_file_ids: Set[str],
+    ):
+        # set local and remote sizes
+        if _remote:
+            _model_file.remote_size = _remote.size
+        if _local:
+            _model_file.local_size = _local.size
+
+        # Note: no longer use lftp's file sizes
+        #       they represent remaining size for resumed downloads
+
+        # set the downloading speed and eta
+        if _transfer_state:
+            if _store_recent_snapshot:
+                self.__store_recent_live_transfer_snapshot(
+                    _model_file.file_id,
+                    _recent_snapshot_root_file_id if _recent_snapshot_root_file_id is not None else _model_file.file_id,
+                    _transfer_state
+                )
+            download_progress = ModelBuilder.__normalize_download_progress(_transfer_state.percent_local)
+            if download_progress is not None:
+                _model_file.download_progress = download_progress
+            if _transfer_state.size_local is not None:
+                _model_file.transferred_size = _transfer_state.size_local
+                live_transferred_file_ids.add(_model_file.file_id)
+            _model_file.downloading_speed = _transfer_state.speed
+            _model_file.eta = _transfer_state.eta
+
+        # set the transferred size (only if file or dir exists on both ends)
+        if _local and _remote:
+            self.__update_transferred_size(_model_file, _remote, _local, live_transferred_file_ids)
+
+        # set the is_extractable flag
+        self.__update_extractable_flag(_model_file)
+
+        # set the timestamps
+        self.__update_timestamps(_model_file, _remote, _local)
+
+    @staticmethod
+    def __update_transferred_size(
+        _model_file: ModelFile,
+        _remote: SystemFile,
+        _local: SystemFile,
+        live_transferred_file_ids: Set[str],
+    ):
+        if _model_file.is_dir:
+            if _model_file.transferred_size is None:
+                # dir transferred size is updated by child files
+                _model_file.transferred_size = 0
+        else:
+            if _model_file.transferred_size is None:
+                if ModelBuilder.__is_authoritative_local_file(_local):
+                    _model_file.transferred_size = min(_local.size, _remote.size)
+
+            if _model_file.transferred_size is not None:
+                # also update all parent directories
+                _parent_file = _model_file.parent
+                while _parent_file is not None:
+                    if _parent_file.file_id in live_transferred_file_ids:
+                        break
+                    if _parent_file.transferred_size is None:
+                        _parent_file.transferred_size = 0
+                    _parent_file.transferred_size += _model_file.transferred_size
+                    _parent_file = _parent_file.parent
+
+    @staticmethod
+    def __update_extractable_flag(_model_file: ModelFile):
+        if not _model_file.is_dir and Extract.is_archive_fast(_model_file.name):
+            _model_file.is_extractable = True
+            # Also set the flag for all of its parents
+            _parent_file = _model_file.parent
+            while _parent_file is not None:
+                _parent_file.is_extractable = True
+                _parent_file = _parent_file.parent
+
+    @staticmethod
+    def __update_timestamps(
+        _model_file: ModelFile,
+        _remote: Optional[SystemFile],
+        _local: Optional[SystemFile],
+    ):
+        if _local:
+            if _local.timestamp_created:
+                _model_file.local_created_timestamp = _local.timestamp_created
+            if _local.timestamp_modified:
+                _model_file.local_modified_timestamp = _local.timestamp_modified
+        if _remote:
+            if _remote.timestamp_created:
+                _model_file.remote_created_timestamp = _remote.timestamp_created
+            if _remote.timestamp_modified:
+                _model_file.remote_modified_timestamp = _remote.timestamp_modified
+
+    @staticmethod
+    def __estimate_eta(model_file: ModelFile):
+        # estimate the ETA for the root if it's not available
+        if model_file.state == ModelFile.State.DOWNLOADING and \
+                model_file.eta is None and \
+                model_file.downloading_speed is not None and \
+                model_file.downloading_speed > 0 and \
+                model_file.remote_size is not None and \
+                model_file.transferred_size is not None:
+            # First-order estimate
+            remaining_size = max(model_file.remote_size - model_file.transferred_size, 0)
+            model_file.eta = int(math.ceil(remaining_size / model_file.downloading_speed))
+
+    def __check_root_downloaded(
+        self,
+        file_id: str,
+        model_file: ModelFile,
+        remote: Optional[SystemFile],
+        local: Optional[SystemFile],
+        status: Optional[LftpJobStatus],
+        is_stopped: bool,
+        retained_transfer_state: Optional[LftpJobStatus.TransferState],
+        arbitration_source: str,
+    ) -> Tuple[bool, str]:
+        incomplete_children = False
+
+        if model_file.state == ModelFile.State.DOWNLOADING and \
+                self.__local_file_proves_download_completion(local, remote):
+            self.__evict_transfer_completion_snapshots(
+                file_id,
+                status.file_id if status is not None else model_file.file_id
+            )
+            model_file.state = ModelFile.State.DOWNLOADED
+            model_file.transferred_size = remote.size if remote is not None else model_file.local_size
+            model_file.download_progress = None
+            model_file.downloading_speed = None
+            model_file.eta = None
+            arbitration_source = "suppressed_by_authoritative_local_completion"
+        if model_file.state == ModelFile.State.DOWNLOADING and \
+                status is None and \
+                not is_stopped and \
+                remote is not None and \
+                local is not None and \
+                getattr(local, "is_staging", False) and \
+                local.size is not None and \
+                remote.size is not None and \
+                local.size >= remote.size and \
+                not self.__has_incomplete_remote_file_children(model_file) and \
+                self.__resolve_recent_live_transfer_snapshot(
+                    file_id,
+                    status.file_id if status is not None else model_file.file_id
+                )[1] is not None:
+            self.__evict_transfer_completion_snapshots(
+                file_id,
+                status.file_id if status is not None else model_file.file_id
+            )
+            model_file.state = ModelFile.State.DOWNLOADED
+            model_file.transferred_size = remote.size
+            model_file.download_progress = None
+            model_file.downloading_speed = None
+            model_file.eta = None
+            arbitration_source = "suppressed_by_staging_completion_after_live_status_lost"
+
+        # now we can determine if root is Downloaded
+        # root is Downloaded if all child remote files are Downloaded
+        # again we use BFS to traverse
+        if model_file.state == ModelFile.State.DEFAULT:
+            if not model_file.is_dir and \
+                    not (is_stopped and retained_transfer_state is not None) and \
+                    model_file.local_size is not None and \
+                    model_file.remote_size is not None and \
+                    self.__is_authoritative_local_file(local) and \
+                    model_file.local_size >= model_file.remote_size:
+                # root is a finished single file
+                model_file.state = ModelFile.State.DOWNLOADED
+            elif not model_file.is_dir and \
+                    status is None and \
+                    not is_stopped and \
+                    model_file.local_size is not None and \
+                    model_file.remote_size is not None and \
+                    getattr(local, "is_staging", False) and \
+                    model_file.local_size >= model_file.remote_size:
+                # Keep scan-only recovery for full-size staging copies so
+                # they can leave incomplete and continue through the
+                # normal completion path.
+                model_file.state = ModelFile.State.DOWNLOADED
+                arbitration_source = "staging_completion_without_live_status"
+            elif not model_file.is_dir and \
+                    model_file.local_size is not None and \
+                    model_file.remote_size is None and \
+                    self.__is_authoritative_local_file(local) and \
+                    self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
+                # keep previously-downloaded local-only files recognizable
+                model_file.state = ModelFile.State.DOWNLOADED
+            elif model_file.is_dir and model_file.remote_size is not None:
+                if status is None and \
+                        not is_stopped and \
+                        local is not None and \
+                        getattr(local, "is_staging", False) and \
+                        local.size is not None and \
+                        local.size >= model_file.remote_size:
+                    # A fully staged directory copy should be treated as complete even
+                    # if live transfer state has already disappeared.
+                    if not self.__has_incomplete_remote_file_children(model_file):
+                        model_file.state = ModelFile.State.DOWNLOADED
+                        arbitration_source = "staging_completion_without_live_status"
+                else:
+                    # root is a directory that also exists remotely
+                    # check all the children
+                    all_downloaded = True
+                    has_downloadable_children = False
+                    frontier = []
+                    frontier += model_file.get_children()
+                    while frontier:
+                        _child_file = frontier.pop(0)
+                        if not _child_file.is_dir and \
+                                _child_file.remote_size is not None:
+                            has_downloadable_children = True
+                            if _child_file.state != ModelFile.State.DOWNLOADED:
+                                all_downloaded = False
+                                break
+                        frontier += _child_file.get_children()
+                    if has_downloadable_children and all_downloaded:
+                        model_file.state = ModelFile.State.DOWNLOADED
+                    else:
+                        incomplete_children = True
+
+        return incomplete_children, arbitration_source
+
+    def __determine_state(self, model_file: ModelFile, local: Optional[SystemFile], incomplete_children: bool):
+        self.__check_persist_authority(model_file, incomplete_children)
+        self.__check_extracting(model_file)
+
+        # next we check if root is Extracted
+        # root is Extracted if it is in Downloaded state and in extracted files list
+        # Note: Default files aren't marked extracted because they can still be queued
+        #       for download, and it doesn't make sense to queue after extracting
+        #       If a Default file is extracted, it will return back to the Default state
+        has_exact_extracted_marker = model_file.file_id in self.__extracted_files
+        if self.__model_file_matches_persisted_name(model_file, self.__extracted_files) and \
+                model_file.state == ModelFile.State.DOWNLOADED and \
+                self.__is_authoritative_local_file(local) and \
+                (has_exact_extracted_marker or
+                 model_file.name not in self.__suppressed_ambiguous_extracted_file_names):
+                model_file.state = ModelFile.State.EXTRACTED
+
+        self.__check_validating(model_file)
+
+    def __check_persist_authority(self, model_file: ModelFile, _incomplete_children: bool):
+        # next we check persisted markers for previously downloaded files
+        if self.__downloaded_files is None:
+            return
+        if model_file.state == ModelFile.State.DEFAULT and \
+                model_file.local_size is None and \
+                self.__model_file_matches_persisted_name(model_file, self.__downloaded_files):
+            model_file.state = ModelFile.State.DELETED
+
+    def __check_extracting(self, model_file: ModelFile):
+        # next we check if root is Extracting
+        # root is Extracting if it's part of an extract status, in an expected state,
+        # and exists locally
+        # if root is NOT in an expected state, then ignore the extract status
+        # and report a warning message, as this shouldn't be happening
+        if model_file.name not in self.__extract_statuses:
+            return
+        extract_status = self.__extract_statuses[model_file.name]
+        if model_file.is_dir != extract_status.is_dir:
+            raise ModelError("Mismatch in is_dir between file and extract status")
+        if model_file.state in (
+            ModelFile.State.DEFAULT,
+            ModelFile.State.DOWNLOADED
+        ) and model_file.local_size is not None:
+            model_file.state = ModelFile.State.EXTRACTING
+        else:
+            if model_file.local_size is None:
+                self.logger.warning("File {} has extract status but doesn't exist locally!".format(
+                    model_file.name
+                ))
+            else:
+                self.logger.warning("File {} has extract status but is in state {}".format(
+                    model_file.name,
+                    str(model_file.state)
+                ))
+
+    def __check_validating(self, model_file: ModelFile):
+        # next we check if root is Validating
+        # root is Validating if it has a validate status, is in an expected state, and exists locally
+        validation_status = self.__validation_statuses.get(model_file.file_id)
+        if validation_status is not None and model_file.state in (
+                ModelFile.State.DEFAULT,
+                ModelFile.State.DOWNLOADED,
+                ModelFile.State.EXTRACTED,
+                ModelFile.State.VALIDATING,
+                ModelFile.State.VALIDATED,
+                ModelFile.State.CORRUPT
+        ) and model_file.local_size is not None and model_file.remote_size is not None:
+            model_file.state = validation_status.state
+            model_file.validation_progress = validation_status.progress
+            model_file.validation_error = validation_status.error
+            model_file.corrupt_chunks = validation_status.corrupt_chunks
