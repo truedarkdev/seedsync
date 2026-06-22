@@ -127,6 +127,64 @@ class Sshcp:
                 return True
         return False
 
+    def __check_shell_not_found(self, output: str) -> None:
+        if self.__shell_detection_in_progress:
+            return
+        if self.__is_missing_remote_shell_error(output):
+            raise SshcpError(self.__format_missing_remote_shell_error(output))
+
+    def __classify_expect_result(self,
+                                 command: str,
+                                 sp: Any,
+                                 i: int,
+                                 eof_error: Optional[str],
+                                 password_error: Optional[str],
+                                 scp_permission_denied_is_destination_error: bool) -> None:
+        if i == 0:
+            return
+
+        before = self.__decode_spawn_output(sp.before).strip()
+        after = self.__decode_spawn_output(sp.after).strip()
+        self.logger.warning("Command failed: '{} - {}'".format(before, after))
+        self.__check_shell_not_found(before)
+
+        if i == 1:
+            before_lower = before.lower()
+            if command == "scp" and "no such file or directory" not in before_lower:
+                scp_error = self.__format_spawn_error(sp.before, sp.after)
+                if self.__is_scp_destination_permission_denied(scp_error):
+                    raise SshcpError(scp_error)
+                raise SshcpError("connection closed")
+            if self.__password is not None and self.__host in {"127.0.0.1", "localhost"} and (
+                "bad owner or permissions on" in before_lower
+            ):
+                raise SshcpError("Incorrect password")
+            if eof_error is not None:
+                error_msg = eof_error
+                if before:
+                    error_msg += " - " + before
+                raise SshcpError(error_msg)
+            if password_error is not None:
+                raise SshcpError(password_error)
+        elif i in {3, 5}:
+            raise SshcpError("Bad hostname: {}".format(self.__host))
+        elif i in {2, 4, 6, 7}:
+            error_msg = "Connection refused by server"
+            if before:
+                error_msg += " - " + before
+            raise SshcpError(error_msg)
+        elif i == 8:
+            raise SshcpError(
+                "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
+            )
+        elif i == 9:
+            if command == "scp" and scp_permission_denied_is_destination_error:
+                scp_error = self.__format_spawn_error(sp.before, sp.after)
+                if self.__is_scp_destination_permission_denied(scp_error):
+                    raise SshcpError(scp_error)
+                raise SshcpError("connection closed")
+            raise SshcpError("Incorrect password")
+
     def detect_shell(self) -> str:
         if self.__detected_shell is not None:
             return self.__detected_shell
@@ -354,42 +412,14 @@ class Sshcp:
                     'REMOTE HOST IDENTIFICATION HAS CHANGED',  # i=8, possible MITM
                     'Permission denied',  # i=9, auth rejected before/at prompt
                 ], timeout=self.__TIMEOUT_SECS)
-                if i > 0:
-                    before = self.__decode_spawn_output(sp.before).strip()
-                    after = self.__decode_spawn_output(sp.after).strip()
-                    self.logger.warning("Command failed: '{} - {}'".format(before, after))
-                    if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
-                        raise SshcpError(self.__format_missing_remote_shell_error(before))
-                if i == 1:
-                    before_lower = self.__decode_spawn_output(sp.before).strip().lower()
-                    if command == "scp" and "no such file or directory" not in before_lower:
-                        scp_error = self.__format_spawn_error(sp.before, sp.after)
-                        if self.__is_scp_destination_permission_denied(scp_error):
-                            raise SshcpError(scp_error)
-                        raise SshcpError("connection closed")
-                    if self.__password is not None and self.__host in {"127.0.0.1", "localhost"} and (
-                        "bad owner or permissions on" in before_lower
-                    ):
-                        raise SshcpError("Incorrect password")
-                    error_msg = "Unknown error"
-                    before_text = self.__decode_spawn_output(sp.before).strip()
-                    if before_text:
-                        error_msg += " - " + before_text
-                    raise SshcpError(error_msg)
-                elif i in {3, 5}:
-                    raise SshcpError("Bad hostname: {}".format(self.__host))
-                elif i in {2, 4, 6, 7}:
-                    error_msg = "Connection refused by server"
-                    before_text = self.__decode_spawn_output(sp.before).strip()
-                    if before_text:
-                        error_msg += " - " + before_text
-                    raise SshcpError(error_msg)
-                elif i == 8:
-                    raise SshcpError(
-                        "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
-                    )
-                elif i == 9:
-                    raise SshcpError("Incorrect password")
+                self.__classify_expect_result(
+                    command,
+                    sp,
+                    i,
+                    eof_error="Unknown error",
+                    password_error=None,
+                    scp_permission_denied_is_destination_error=False
+                )
                 sp.sendline(self.__password)
                 timeout_phase = "command execution"
 
@@ -408,39 +438,14 @@ class Sshcp:
                 ],
                 timeout=self.__TIMEOUT_SECS
             )
-            if i > 0:
-                before = self.__decode_spawn_output(sp.before).strip()
-                after = self.__decode_spawn_output(sp.after).strip()
-                self.logger.warning("Command failed: '{} - {}'".format(before, after))
-                if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
-                    raise SshcpError(self.__format_missing_remote_shell_error(before))
-            if i == 1:
-                before_lower = self.__decode_spawn_output(sp.before).strip().lower()
-                if command == "scp" and "no such file or directory" not in before_lower:
-                    scp_error = self.__format_spawn_error(sp.before, sp.after)
-                    if self.__is_scp_destination_permission_denied(scp_error):
-                        raise SshcpError(scp_error)
-                    raise SshcpError("connection closed")
-                raise SshcpError("Incorrect password")
-            elif i in {3, 5}:
-                raise SshcpError("Bad hostname: {}".format(self.__host))
-            elif i in {2, 4, 6, 7}:
-                error_msg = "Connection refused by server"
-                before_text = self.__decode_spawn_output(sp.before).strip()
-                if before_text:
-                    error_msg += " - " + before_text
-                raise SshcpError(error_msg)
-            elif i == 8:
-                raise SshcpError(
-                    "Remote host key has changed. Remove the old key from ~/.ssh/known_hosts to continue."
-                )
-            elif i == 9:
-                if command == "scp":
-                    scp_error = self.__format_spawn_error(sp.before, sp.after)
-                    if self.__is_scp_destination_permission_denied(scp_error):
-                        raise SshcpError(scp_error)
-                    raise SshcpError("connection closed")
-                raise SshcpError("Incorrect password")
+            self.__classify_expect_result(
+                command,
+                sp,
+                i,
+                eof_error=None,
+                password_error="Incorrect password",
+                scp_permission_denied_is_destination_error=True
+            )
 
         except pexpect.exceptions.TIMEOUT:
             self.__log_timeout(timeout_phase, command, sp, start_time)
@@ -466,8 +471,7 @@ class Sshcp:
             before = self.__decode_spawn_output(sp.before).strip()
             after = self.__decode_spawn_output(sp.after).strip()
             self.logger.warning("Command failed: '{} - {}'".format(before, after))
-            if not self.__shell_detection_in_progress and self.__is_missing_remote_shell_error(before):
-                raise SshcpError(self.__format_missing_remote_shell_error(before))
+            self.__check_shell_not_found(before)
             raise SshcpError(self.__decode_spawn_output(sp.before).strip())
 
         before_val = sp.before

@@ -104,6 +104,26 @@ class TestSshcp(unittest.TestCase):
             str(ctx.exception)
         )
 
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_copy_password_auth_permission_denied_before_prompt_maps_to_incorrect_password(
+        self,
+        mock_spawn_process
+    ):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
+
+        spawn = MagicMock()
+        spawn.expect.return_value = 9
+        spawn.before = b"Permission denied"
+        spawn.after = b""
+        spawn.exitstatus = 1
+        mock_spawn_process.return_value = (spawn, False)
+
+        with self.assertRaises(SshcpError) as ctx:
+            sshcp.copy(local_path=self.local_file, remote_path=self.remote_file)
+
+        self.assertEqual("Incorrect password", str(ctx.exception))
+        spawn.sendline.assert_not_called()
+
     @parameterized.expand(_PARAMS)
     def test_copy_error_missing_local_file(self, _, password):
         local_file = os.path.join(self.local_dir, "nofile.txt")
@@ -311,3 +331,64 @@ class TestSshcp(unittest.TestCase):
         with self.assertRaises(SshcpError) as ctx:
             sshcp.shell("./some_bad_command.sh".format(self.local_dir))
         self.assertTrue("./some_bad_command.sh" in str(ctx.exception))
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_run_command_shell_not_found_before_password_prompt_is_remapped(self, mock_spawn_process):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
+
+        spawn = MagicMock()
+        spawn.expect.return_value = 1
+        spawn.before = b"bash: /bin/bash: No such file or directory"
+        spawn.after = b""
+        spawn.exitstatus = 1
+        mock_spawn_process.return_value = (spawn, False)
+
+        with self.assertRaises(SshcpError) as ctx:
+            sshcp._Sshcp__run_command(
+                command="ssh",
+                flags=["-p", str(self.port)],
+                args=[sshcp._Sshcp__remote_address(), "echo hi"]
+            )
+
+        error_message = str(ctx.exception)
+        self.assertIn("Remote user's shell not found", error_message)
+        self.assertIn("bash: /bin/bash: No such file or directory", error_message)
+        self.assertIn("sudo chsh -s /bin/sh {}".format(self.user), error_message)
+        spawn.sendline.assert_not_called()
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_run_command_shell_not_found_exit_status_respects_detection_gate(self, mock_spawn_process):
+        for shell_detection_in_progress, expected_message in (
+            (
+                False,
+                "Remote user's shell not found (login shell not found and no common shells could be detected)"
+            ),
+            (
+                True,
+                "bash: /bin/bash: No such file or directory"
+            )
+        ):
+            with self.subTest(shell_detection_in_progress=shell_detection_in_progress):
+                sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+                sshcp._Sshcp__shell_detection_in_progress = shell_detection_in_progress
+
+                spawn = MagicMock()
+                spawn.expect.return_value = 0
+                spawn.before = b"bash: /bin/bash: No such file or directory"
+                spawn.after = b""
+                spawn.exitstatus = 1
+                mock_spawn_process.return_value = (spawn, False)
+
+                with self.assertRaises(SshcpError) as ctx:
+                    sshcp._Sshcp__run_command(
+                        command="ssh",
+                        flags=["-p", str(self.port)],
+                        args=[sshcp._Sshcp__remote_address(), "echo hi"]
+                    )
+
+                error_message = str(ctx.exception)
+                self.assertIn(expected_message, error_message)
+                if shell_detection_in_progress:
+                    self.assertEqual("bash: /bin/bash: No such file or directory", error_message)
+                else:
+                    self.assertIn("sudo chsh -s /bin/sh {}".format(self.user), error_message)
