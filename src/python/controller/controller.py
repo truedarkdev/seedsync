@@ -178,6 +178,19 @@ class Controller:
         ):
             _append_missing("Controller", field_name, getattr(controller_cfg, field_name, None))
 
+        controller_use_local_path_as_extract_path = getattr(
+            controller_cfg,
+            "use_local_path_as_extract_path",
+            None,
+        )
+        _append_missing(
+            "Controller",
+            "use_local_path_as_extract_path",
+            controller_use_local_path_as_extract_path,
+        )
+        if controller_use_local_path_as_extract_path is False:
+            _append_missing("Controller", "extract_path", getattr(controller_cfg, "extract_path", None))
+
         _append_missing("General", "verbose", getattr(general_cfg, "verbose", None))
         _append_missing("AutoQueue", "auto_delete_remote", getattr(autoqueue_cfg, "auto_delete_remote", None))
 
