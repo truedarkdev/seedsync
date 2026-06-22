@@ -19,7 +19,7 @@ from controller.persist_keys import KEY_SEP
 from common import AppError, PathPairManager
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
-from model import Model, ModelDiff, ModelError, ModelFile
+from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
 
 
@@ -1033,6 +1033,73 @@ class TestController(unittest.TestCase):
             [[status_b], [status_b], [status_a]],
             [call.args[0] for call in self.controller._Controller__model_builder.set_lftp_statuses.call_args_list]
         )
+
+    def test_update_model_allows_listener_reentry_into_get_model_files(self):
+        new_model = Model()
+        new_model.set_base_logger(self.controller.logger)
+        new_file = ModelFile("fresh", False)
+        new_model.add_file(new_file)
+
+        callback_started = threading.Event()
+        callback_finished = threading.Event()
+        callback_result = {}
+        worker_errors = []
+
+        class ReentrantListener(IModelListener):
+            def __init__(self, controller):
+                self._controller = controller
+
+            def file_added(self, file: ModelFile):
+                callback_started.set()
+                callback_result["model_files"] = self._controller.get_model_files()
+                callback_finished.set()
+
+            def file_removed(self, file: ModelFile):
+                raise AssertionError("Unexpected file_removed callback")
+
+            def file_updated(self, old_file: ModelFile, new_file: ModelFile):
+                raise AssertionError("Unexpected file_updated callback")
+
+        context = self._make_startup_context(local_path="/local")
+        with patch("controller.controller.Lftp"), \
+                patch("controller.controller.ScannerProcess") as scanner_process_cls, \
+                patch("controller.controller.ExtractProcess"), \
+                patch("controller.controller.ValidateProcess"), \
+                patch("controller.controller.MultiprocessingLogger"):
+            scanner_process_cls.side_effect = [MagicMock(), MagicMock(), MagicMock()]
+            controller = Controller(context, ControllerPersist())
+
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+        controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        controller._Controller__extract_process.pop_completed.return_value = []
+        controller._Controller__extract_process.pop_failed.return_value = []
+        controller._Controller__model_builder = MagicMock()
+        controller._Controller__model_builder.has_changes.return_value = True
+        controller._Controller__model_builder.build_model.return_value = new_model
+        controller._Controller__model.add_listener(ReentrantListener(controller))
+
+        def run_update_model():
+            try:
+                controller._Controller__update_model()
+            except Exception as exc:  # pragma: no cover - defensive capture
+                worker_errors.append(exc)
+
+        update_thread = threading.Thread(target=run_update_model, daemon=True)
+        update_thread.start()
+
+        self.assertTrue(callback_started.wait(2), "listener did not start")
+        self.assertTrue(callback_finished.wait(2), "listener did not finish re-entering get_model_files()")
+        update_thread.join(2)
+
+        self.assertFalse(update_thread.is_alive(), "controller update deadlocked")
+        self.assertEqual([], worker_errors)
+        self.assertEqual([new_file.file_id], [file.file_id for file in callback_result["model_files"]])
+        self.assertEqual("fresh", callback_result["model_files"][0].name)
 
     def test_get_model_files_uses_file_ids_when_available(self):
         file_movies = ModelFile("dup", False)
