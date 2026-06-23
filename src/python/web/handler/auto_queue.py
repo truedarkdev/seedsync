@@ -1,12 +1,16 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import logging
 from bottle import HTTPResponse
 from urllib.parse import unquote
+from threading import Lock
 
 from common import overrides
 from controller import AutoQueuePersist, AutoQueuePattern
 from ..web_app import IHandler, WebApp
 from ..serialize import SerializeAutoQueue
+
+logger = logging.getLogger(__name__)
 
 
 class AutoQueueHandler(IHandler):
@@ -14,6 +18,7 @@ class AutoQueueHandler(IHandler):
 
     def __init__(self, auto_queue_persist: AutoQueuePersist):
         self.__auto_queue_persist = auto_queue_persist
+        self.__write_lock = Lock()
 
     @staticmethod
     def __plain_text_response(body: str, status: int = 200):
@@ -67,14 +72,21 @@ class AutoQueueHandler(IHandler):
 
         aqp = AutoQueuePattern(pattern=pattern)
 
-        if aqp in self.__auto_queue_persist.patterns:
-            return self.__plain_text_response("Auto-queue pattern '{}' already exists.".format(pattern), status=409)
-        else:
+        with self.__write_lock:
+            if aqp in self.__auto_queue_persist.patterns:
+                return self.__plain_text_response("Auto-queue pattern '{}' already exists.".format(pattern), status=409)
             try:
                 self.__auto_queue_persist.add_pattern(aqp)
-                return self.__plain_text_response("Added auto-queue pattern '{}'.".format(pattern))
             except ValueError as e:
                 return self.__plain_text_response(str(e), status=400)
+            except Exception:
+                try:
+                    self.__auto_queue_persist.remove_pattern(aqp)
+                except Exception:
+                    logger.exception("Failed to roll back auto-queue after adding pattern %r", pattern)
+                logger.exception("Failed to persist auto-queue after adding pattern %r", pattern)
+                return self.__plain_text_response("Failed to persist auto-queue", status=500)
+            return self.__plain_text_response("Added auto-queue pattern '{}'.".format(pattern))
 
     def __handle_remove_autoqueue(self, pattern: str):
         # value is double encoded
@@ -82,8 +94,16 @@ class AutoQueueHandler(IHandler):
 
         aqp = AutoQueuePattern(pattern=pattern)
 
-        if aqp not in self.__auto_queue_persist.patterns:
-            return self.__plain_text_response("Auto-queue pattern '{}' doesn't exist.".format(pattern), status=404)
-        else:
-            self.__auto_queue_persist.remove_pattern(aqp)
+        with self.__write_lock:
+            if aqp not in self.__auto_queue_persist.patterns:
+                return self.__plain_text_response("Auto-queue pattern '{}' doesn't exist.".format(pattern), status=404)
+            try:
+                self.__auto_queue_persist.remove_pattern(aqp)
+            except Exception:
+                try:
+                    self.__auto_queue_persist.add_pattern(aqp)
+                except Exception:
+                    logger.exception("Failed to roll back auto-queue after removing pattern %r", pattern)
+                logger.exception("Failed to persist auto-queue after removing pattern %r", pattern)
+                return self.__plain_text_response("Failed to persist auto-queue", status=500)
             return self.__plain_text_response("Removed auto-queue pattern '{}'.".format(pattern))

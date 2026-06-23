@@ -140,15 +140,27 @@ class AutoQueuePersistListener(IAutoQueuePersistListener):
     """Keeps track of newly added patterns"""
     def __init__(self):
         self.new_patterns = set()
+        self.__lock = Lock()
 
     @overrides(IAutoQueuePersistListener)
     def pattern_added(self, pattern: AutoQueuePattern):
-        self.new_patterns.add(pattern)
+        with self.__lock:
+            self.new_patterns.add(pattern)
 
     @overrides(IAutoQueuePersistListener)
     def pattern_removed(self, pattern: AutoQueuePattern):
-        if pattern in self.new_patterns:
-            self.new_patterns.remove(pattern)
+        with self.__lock:
+            self.new_patterns.discard(pattern)
+
+    def drain_new_patterns(self) -> Set[AutoQueuePattern]:
+        with self.__lock:
+            drained = set(self.new_patterns)
+            self.new_patterns.clear()
+            return drained
+
+    def restore_new_patterns(self, patterns: Set[AutoQueuePattern]):
+        with self.__lock:
+            self.new_patterns.update(patterns)
 
 
 class AutoQueue:
@@ -237,268 +249,279 @@ class AutoQueue:
         if not self.__enabled:
             return
         self.__cycle_sequence += 1
+        new_patterns = self.__persist_listener.drain_new_patterns()
 
-        ###
-        # Queue
-        ###
-        queue_candidates = {}
-        new_files_to_queue = self.__filter_candidates(
-            candidates=self.__model_listener.new_files,
-            accept=lambda f: (
-                f.remote_size is not None and
-                f.state == ModelFile.State.DEFAULT and
-                (f.local_size is None or f.local_size == 0)
+        try:
+            ###
+            # Queue
+            ###
+            queue_candidates = {}
+            new_files_to_queue = self.__filter_candidates(
+                candidates=self.__model_listener.new_files,
+                new_patterns=new_patterns,
+                accept=lambda f: (
+                    f.remote_size is not None and
+                    f.state == ModelFile.State.DEFAULT and
+                    (f.local_size is None or f.local_size == 0)
+                )
             )
-        )
-        queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
+            queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
 
-        modified_candidates_actual_update = []
-        modified_candidates_remote_discovery = []
-        for old_file, new_file in self.__model_listener.modified_files:
-            if old_file.remote_size != new_file.remote_size:
-                if old_file.remote_size is not None:
-                    modified_candidates_actual_update.append(new_file)
-                else:
-                    modified_candidates_remote_discovery.append(new_file)
-        queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
-        queue_candidates.update({file.file_id: file for file in modified_candidates_remote_discovery})
-
-        modified_files_actual_update = self.__filter_candidates(
-            candidates=modified_candidates_actual_update,
-            accept=lambda f: f.remote_size is not None and f.state == ModelFile.State.DEFAULT
-        )
-
-        modified_files_remote_discovery = self.__filter_candidates(
-            candidates=modified_candidates_remote_discovery,
-            accept=lambda f: (
-                f.remote_size is not None and
-                f.state == ModelFile.State.DEFAULT and
-                (f.local_size is None or f.local_size == 0)
-            )
-        )
-
-        files_to_queue_dict = {
-            file.file_id: (file, pattern) for file, pattern in new_files_to_queue
-        }
-        for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
-            files_to_queue_dict[file.file_id] = (file, pattern)
-        files_to_queue = [
-            (file, pattern)
-            for file, pattern in files_to_queue_dict.values()
-            if not self.__controller.is_file_stopped(file.file_id)
-        ]
-        files_to_queue_by_id = {file.file_id: file for file, _ in files_to_queue}
-        queue_blocked_reason_counts, queue_blocked_samples = self.__summarize_auto_queue_decisions(
-            lane="queue",
-            candidate_files=list(queue_candidates.values()),
-            selected_by_id=files_to_queue_by_id,
-        )
-
-        ###
-        # Extract
-        ###
-        files_to_extract = []
-        extract_candidate_files = []
-
-        if self.__auto_extract_enabled:
-            # Candidate all new files
-            extract_candidate_files += self.__model_listener.new_files
-
-            # Candidate modified files that just became DOWNLOADED
-            # But not files that went EXTRACTING -> DOWNLOADED (failed extraction)
+            modified_candidates_actual_update = []
+            modified_candidates_remote_discovery = []
             for old_file, new_file in self.__model_listener.modified_files:
-                if old_file.state != ModelFile.State.DOWNLOADED and \
-                        old_file.state != ModelFile.State.EXTRACTING and \
-                        new_file.state == ModelFile.State.DOWNLOADED:
-                    extract_candidate_files.append(new_file)
+                if old_file.remote_size != new_file.remote_size:
+                    if old_file.remote_size is not None:
+                        modified_candidates_actual_update.append(new_file)
+                    else:
+                        modified_candidates_remote_discovery.append(new_file)
+            queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
+            queue_candidates.update({file.file_id: file for file in modified_candidates_remote_discovery})
 
-            files_to_extract = self.__filter_candidates(
-                candidates=extract_candidate_files,
-                accept=lambda f:
-                    f.state == ModelFile.State.DOWNLOADED and
-                    f.local_size is not None and
-                    f.local_size > 0 and
-                    f.is_extractable
+            modified_files_actual_update = self.__filter_candidates(
+                candidates=modified_candidates_actual_update,
+                new_patterns=new_patterns,
+                accept=lambda f: f.remote_size is not None and f.state == ModelFile.State.DEFAULT
             )
-        files_to_extract_by_id = {file.file_id: file for file, _ in files_to_extract}
-        extract_blocked_reason_counts, extract_blocked_samples = self.__summarize_auto_queue_decisions(
-            lane="extract",
-            candidate_files=extract_candidate_files,
-            selected_by_id=files_to_extract_by_id,
-        )
 
-        trace_target_file = None
-        if self.__is_target_archive_trace_enabled():
-            model_files = self.__controller.get_model_files()
-            trace_target_file = next(
-                (file for file in model_files if self.__target_archive_trace_selector_matches_file(file)),
-                None
+            modified_files_remote_discovery = self.__filter_candidates(
+                candidates=modified_candidates_remote_discovery,
+                new_patterns=new_patterns,
+                accept=lambda f: (
+                    f.remote_size is not None and
+                    f.state == ModelFile.State.DEFAULT and
+                    (f.local_size is None or f.local_size == 0)
+                )
             )
-            if trace_target_file is None:
-                self.__trace_target_archive_event("auto_extract_decision", {
-                    "decision": "not_found",
-                    "reason": "not_present_in_model",
-                })
-            else:
-                trace_target_in_new_files = any(
-                    file.file_id == trace_target_file.file_id for file in self.__model_listener.new_files
+
+            files_to_queue_dict = {
+                file.file_id: (file, pattern) for file, pattern in new_files_to_queue
+            }
+            for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
+                files_to_queue_dict[file.file_id] = (file, pattern)
+            files_to_queue = [
+                (file, pattern)
+                for file, pattern in files_to_queue_dict.values()
+                if not self.__controller.is_file_stopped(file.file_id)
+            ]
+            files_to_queue_by_id = {file.file_id: file for file, _ in files_to_queue}
+            queue_blocked_reason_counts, queue_blocked_samples = self.__summarize_auto_queue_decisions(
+                lane="queue",
+                candidate_files=list(queue_candidates.values()),
+                selected_by_id=files_to_queue_by_id,
+            )
+
+            ###
+            # Extract
+            ###
+            files_to_extract = []
+            extract_candidate_files = []
+
+            if self.__auto_extract_enabled:
+                # Candidate all new files
+                extract_candidate_files += self.__model_listener.new_files
+
+                # Candidate modified files that just became DOWNLOADED
+                # But not files that went EXTRACTING -> DOWNLOADED (failed extraction)
+                for old_file, new_file in self.__model_listener.modified_files:
+                    if old_file.state != ModelFile.State.DOWNLOADED and \
+                            old_file.state != ModelFile.State.EXTRACTING and \
+                            new_file.state == ModelFile.State.DOWNLOADED:
+                        extract_candidate_files.append(new_file)
+
+                files_to_extract = self.__filter_candidates(
+                    candidates=extract_candidate_files,
+                    new_patterns=new_patterns,
+                    accept=lambda f:
+                        f.state == ModelFile.State.DOWNLOADED and
+                        f.local_size is not None and
+                        f.local_size > 0 and
+                        f.is_extractable
                 )
-                trace_target_in_modified_files = any(
-                    new_file.file_id == trace_target_file.file_id
-                    for _, new_file in self.__model_listener.modified_files
-                )
-                trace_target_in_candidates = trace_target_in_new_files or trace_target_in_modified_files
-                trace_target_pattern = next(
-                    (
-                        pattern.pattern if pattern is not None else None
-                        for file, pattern in files_to_extract
-                        if file.file_id == trace_target_file.file_id
-                    ),
+            files_to_extract_by_id = {file.file_id: file for file, _ in files_to_extract}
+            extract_blocked_reason_counts, extract_blocked_samples = self.__summarize_auto_queue_decisions(
+                lane="extract",
+                candidate_files=extract_candidate_files,
+                selected_by_id=files_to_extract_by_id,
+            )
+
+            trace_target_file = None
+            if self.__is_target_archive_trace_enabled():
+                model_files = self.__controller.get_model_files()
+                trace_target_file = next(
+                    (file for file in model_files if self.__target_archive_trace_selector_matches_file(file)),
                     None
                 )
-                trace_target_selected_for_extract = any(
-                    file.file_id == trace_target_file.file_id
-                    for file, _ in files_to_extract
-                )
-                if not self.__auto_extract_enabled:
-                    decision = "disabled"
-                    reason = "auto_extract_disabled"
-                elif trace_target_selected_for_extract:
-                    decision = "queued"
-                    reason = "eligible"
-                elif not trace_target_in_candidates:
-                    decision = "not_considered"
-                    reason = "not_new_or_recently_downloaded"
-                elif trace_target_file.state != ModelFile.State.DOWNLOADED:
-                    decision = "blocked"
-                    reason = "state_not_downloaded"
-                elif trace_target_file.local_size is None:
-                    decision = "blocked"
-                    reason = "missing_local_size"
-                elif trace_target_file.local_size <= 0:
-                    decision = "blocked"
-                    reason = "empty_local_size"
-                elif not trace_target_file.is_extractable:
-                    decision = "blocked"
-                    reason = "not_extractable"
-                elif self.__patterns_only:
-                    decision = "blocked"
-                    reason = "pattern_no_match"
+                if trace_target_file is None:
+                    self.__trace_target_archive_event("auto_extract_decision", {
+                        "decision": "not_found",
+                        "reason": "not_present_in_model",
+                    })
                 else:
-                    decision = "blocked"
-                    reason = "filtered_out"
+                    trace_target_in_new_files = any(
+                        file.file_id == trace_target_file.file_id for file in self.__model_listener.new_files
+                    )
+                    trace_target_in_modified_files = any(
+                        new_file.file_id == trace_target_file.file_id
+                        for _, new_file in self.__model_listener.modified_files
+                    )
+                    trace_target_in_candidates = trace_target_in_new_files or trace_target_in_modified_files
+                    trace_target_pattern = next(
+                        (
+                            pattern.pattern if pattern is not None else None
+                            for file, pattern in files_to_extract
+                            if file.file_id == trace_target_file.file_id
+                        ),
+                        None
+                    )
+                    trace_target_selected_for_extract = any(
+                        file.file_id == trace_target_file.file_id
+                        for file, _ in files_to_extract
+                    )
+                    if not self.__auto_extract_enabled:
+                        decision = "disabled"
+                        reason = "auto_extract_disabled"
+                    elif trace_target_selected_for_extract:
+                        decision = "queued"
+                        reason = "eligible"
+                    elif not trace_target_in_candidates:
+                        decision = "not_considered"
+                        reason = "not_new_or_recently_downloaded"
+                    elif trace_target_file.state != ModelFile.State.DOWNLOADED:
+                        decision = "blocked"
+                        reason = "state_not_downloaded"
+                    elif trace_target_file.local_size is None:
+                        decision = "blocked"
+                        reason = "missing_local_size"
+                    elif trace_target_file.local_size <= 0:
+                        decision = "blocked"
+                        reason = "empty_local_size"
+                    elif not trace_target_file.is_extractable:
+                        decision = "blocked"
+                        reason = "not_extractable"
+                    elif self.__patterns_only:
+                        decision = "blocked"
+                        reason = "pattern_no_match"
+                    else:
+                        decision = "blocked"
+                        reason = "filtered_out"
 
-                self.__trace_target_archive_event("auto_extract_decision", {
-                    "decision": decision,
-                    "reason": reason,
-                    "file": {
-                        "file_id": trace_target_file.file_id,
-                        "name": trace_target_file.name,
-                        "path_pair_id": trace_target_file.path_pair_id,
-                        "path_pair_name": trace_target_file.path_pair_name,
-                        "state": getattr(trace_target_file.state, "name", trace_target_file.state),
-                        "local_size": trace_target_file.local_size,
-                        "remote_size": trace_target_file.remote_size,
-                        "is_extractable": trace_target_file.is_extractable,
-                    },
-                    "observed_in_cycle": {
-                        "new_files": trace_target_in_new_files,
-                        "modified_files": trace_target_in_modified_files,
-                        "candidate": trace_target_in_candidates,
-                    },
-                    "pattern": trace_target_pattern,
+                    self.__trace_target_archive_event("auto_extract_decision", {
+                        "decision": decision,
+                        "reason": reason,
+                        "file": {
+                            "file_id": trace_target_file.file_id,
+                            "name": trace_target_file.name,
+                            "path_pair_id": trace_target_file.path_pair_id,
+                            "path_pair_name": trace_target_file.path_pair_name,
+                            "state": getattr(trace_target_file.state, "name", trace_target_file.state),
+                            "local_size": trace_target_file.local_size,
+                            "remote_size": trace_target_file.remote_size,
+                            "is_extractable": trace_target_file.is_extractable,
+                        },
+                        "observed_in_cycle": {
+                            "new_files": trace_target_in_new_files,
+                            "modified_files": trace_target_in_modified_files,
+                            "candidate": trace_target_in_candidates,
+                        },
+                        "pattern": trace_target_pattern,
+                        "patterns_only": self.__patterns_only,
+                        "auto_extract_enabled": self.__auto_extract_enabled,
+                    })
+
+            if self.__auto_extract_enabled and self.__patterns_only:
+                matched_extract_file_ids = {file.file_id for file, _ in files_to_extract}
+                blocked_extract_candidates = [
+                    new_file
+                    for old_file, new_file in self.__model_listener.modified_files
+                    if old_file.state != ModelFile.State.DOWNLOADED and
+                    old_file.state != ModelFile.State.EXTRACTING and
+                    new_file.state == ModelFile.State.DOWNLOADED and
+                    new_file.local_size is not None and
+                    new_file.local_size > 0 and
+                    new_file.is_extractable and
+                    new_file.file_id not in matched_extract_file_ids
+                ]
+                for file in blocked_extract_candidates:
+                    self.__controller.clear_extracted_marker(file)
+
+            ###
+            # Delete Remote
+            ###
+            files_to_delete_remote = self.__filter_delete_remote_candidates()
+
+            self.__record_breadcrumb(
+                "auto_queue_cycle",
+                {
+                    "cycle": self.__cycle_sequence,
+                    "new_queue_candidates": len(new_files_to_queue),
+                    "modified_queue_candidates": len(modified_files_actual_update) + len(modified_files_remote_discovery),
+                    "queue_count": len(files_to_queue),
+                    "extract_count": len(files_to_extract),
                     "patterns_only": self.__patterns_only,
                     "auto_extract_enabled": self.__auto_extract_enabled,
-                })
-
-        if self.__auto_extract_enabled and self.__patterns_only:
-            matched_extract_file_ids = {file.file_id for file, _ in files_to_extract}
-            blocked_extract_candidates = [
-                new_file
-                for old_file, new_file in self.__model_listener.modified_files
-                if old_file.state != ModelFile.State.DOWNLOADED and
-                old_file.state != ModelFile.State.EXTRACTING and
-                new_file.state == ModelFile.State.DOWNLOADED and
-                new_file.local_size is not None and
-                new_file.local_size > 0 and
-                new_file.is_extractable and
-                new_file.file_id not in matched_extract_file_ids
-            ]
-            for file in blocked_extract_candidates:
-                self.__controller.clear_extracted_marker(file)
-
-        ###
-        # Delete Remote
-        ###
-        files_to_delete_remote = self.__filter_delete_remote_candidates()
-
-        self.__record_breadcrumb(
-            "auto_queue_cycle",
-            {
-                "cycle": self.__cycle_sequence,
-                "new_queue_candidates": len(new_files_to_queue),
-                "modified_queue_candidates": len(modified_files_actual_update) + len(modified_files_remote_discovery),
-                "queue_count": len(files_to_queue),
-                "extract_count": len(files_to_extract),
-                "patterns_only": self.__patterns_only,
-                "auto_extract_enabled": self.__auto_extract_enabled,
-                "queue_blocked_reason_counts": queue_blocked_reason_counts,
-                "extract_blocked_reason_counts": extract_blocked_reason_counts,
-                "blocked_samples": (queue_blocked_samples + extract_blocked_samples)[:5],
-            }
-        )
-
-        ###
-        # Send commands
-        ###
-
-        # Send the queue commands
-        for file, pattern in files_to_queue:
-            self.logger.info(
-                "Auto queueing '{}'".format(file.name) +
-                (" for pattern '{}'".format(pattern.pattern) if pattern else "")
+                    "queue_blocked_reason_counts": queue_blocked_reason_counts,
+                    "extract_blocked_reason_counts": extract_blocked_reason_counts,
+                    "blocked_samples": (queue_blocked_samples + extract_blocked_samples)[:5],
+                }
             )
-            command = Controller.Command(
-                Controller.Command.Action.QUEUE,
-                file.file_id,
-                flow_id="autoq:{}:QUEUE:{}".format(self.__cycle_sequence, file.file_id),
-                origin="auto_queue",
-            )
-            self.__controller.queue_command(command)
 
-        # Send the extract commands
-        for file, pattern in files_to_extract:
-            self.logger.info(
-                "Auto extracting '{}'".format(file.name) +
-                (" for pattern '{}'".format(pattern.pattern) if pattern else "")
-            )
-            command = Controller.Command(
-                Controller.Command.Action.EXTRACT,
-                file.file_id,
-                flow_id="autoq:{}:EXTRACT:{}".format(self.__cycle_sequence, file.file_id),
-                origin="auto_queue",
-            )
-            self.__controller.queue_command(command)
+            ###
+            # Send commands
+            ###
 
-        # Send the delete remote commands (after extract so extraction happens first)
-        for file, pattern in files_to_delete_remote:
-            self.logger.info(
-                "Auto deleting remote '{}'".format(file.name) +
-                (" for pattern '{}'".format(pattern.pattern) if pattern else "")
-            )
-            command = Controller.Command(
-                Controller.Command.Action.DELETE_REMOTE,
-                file.file_id,
-                flow_id="autoq:{}:DELETE_REMOTE:{}".format(self.__cycle_sequence, file.file_id),
-                origin="auto_queue",
-            )
-            self.__controller.queue_command(command)
+            # Send the queue commands
+            for file, pattern in files_to_queue:
+                self.logger.info(
+                    "Auto queueing '{}'".format(file.name) +
+                    (" for pattern '{}'".format(pattern.pattern) if pattern else "")
+                )
+                command = Controller.Command(
+                    Controller.Command.Action.QUEUE,
+                    file.file_id,
+                    flow_id="autoq:{}:QUEUE:{}".format(self.__cycle_sequence, file.file_id),
+                    origin="auto_queue",
+                )
+                self.__controller.queue_command(command)
 
-        # Clear the processed files
-        self.__model_listener.new_files.clear()
-        self.__model_listener.modified_files.clear()
-        # Clear the new patterns
-        self.__persist_listener.new_patterns.clear()
+            # Send the extract commands
+            for file, pattern in files_to_extract:
+                self.logger.info(
+                    "Auto extracting '{}'".format(file.name) +
+                    (" for pattern '{}'".format(pattern.pattern) if pattern else "")
+                )
+                command = Controller.Command(
+                    Controller.Command.Action.EXTRACT,
+                    file.file_id,
+                    flow_id="autoq:{}:EXTRACT:{}".format(self.__cycle_sequence, file.file_id),
+                    origin="auto_queue",
+                )
+                self.__controller.queue_command(command)
+
+            # Send the delete remote commands (after extract so extraction happens first)
+            for file, pattern in files_to_delete_remote:
+                self.logger.info(
+                    "Auto deleting remote '{}'".format(file.name) +
+                    (" for pattern '{}'".format(pattern.pattern) if pattern else "")
+                )
+                command = Controller.Command(
+                    Controller.Command.Action.DELETE_REMOTE,
+                    file.file_id,
+                    flow_id="autoq:{}:DELETE_REMOTE:{}".format(self.__cycle_sequence, file.file_id),
+                    origin="auto_queue",
+                )
+                self.__controller.queue_command(command)
+
+            # Clear the processed files
+            self.__model_listener.new_files.clear()
+            self.__model_listener.modified_files.clear()
+
+        except Exception:
+            current_patterns = self.__persist.patterns
+            self.__persist_listener.restore_new_patterns({
+                pattern for pattern in new_patterns if pattern in current_patterns
+            })
+            raise
 
     def __record_breadcrumb(self, message: str, details: dict):
         if self.__breadcrumb_trace is None:
@@ -514,6 +537,7 @@ class AutoQueue:
 
     def __filter_candidates(self,
                             candidates: List[ModelFile],
+                            new_patterns: Set[AutoQueuePattern],
                             accept: Callable[[ModelFile], bool]) -> List[Tuple[ModelFile, Optional[AutoQueuePattern]]]:
         """
         Given a list of candidate files, filter out those that match the accept criteria
@@ -540,9 +564,9 @@ class AutoQueue:
                 files_matched[file.file_id] = (file, None)
 
         # Step 2: run new pattern through all the files
-        if self.__persist_listener.new_patterns:
+        if new_patterns:
             model_files = self.__controller.get_model_files()
-            for new_pattern in self.__persist_listener.new_patterns:
+            for new_pattern in new_patterns:
                 for file in model_files:
                     if accept(file) and self.__match(new_pattern, file):
                         files_matched[file.file_id] = (file, new_pattern)
