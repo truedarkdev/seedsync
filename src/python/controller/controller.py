@@ -784,6 +784,15 @@ class Controller:
         updater.update()
         self.__log_memory_usage()
 
+    def __best_effort_teardown(self, label: str, teardown: Callable[[], None]):
+        try:
+            teardown()
+        except Exception:
+            self.logger.exception(
+                "Ignoring controller teardown failure during %s; continuing shutdown",
+                label
+            )
+
     def exit(self):
         self.logger.debug("Exiting controller")
         if self.__started:
@@ -791,24 +800,27 @@ class Controller:
                 self.__lftp.exit()
             except LftpError as exc:
                 self.logger.warning("Ignoring lftp teardown failure: {}".format(exc))
-            self.__active_scan_process.terminate()
-            self.__local_scan_process.terminate()
-            self.__remote_scan_process.terminate()
-            self.__extract_process.terminate()
-            self.__validate_process.terminate()
-            self.__active_scan_process.join()
-            self.__active_scan_process.close_queues()
-            self.__local_scan_process.join()
-            self.__local_scan_process.close_queues()
-            self.__remote_scan_process.join()
-            self.__remote_scan_process.close_queues()
-            self.__extract_process.join()
-            self.__extract_process.close_queues()
-            self.__validate_process.join()
-            self.__validate_process.close_queues()
-            self.__mp_logger.stop()
-            self.__started = False
-            self.logger.info("Exited controller")
+            except Exception:
+                self.logger.exception("Ignoring lftp teardown failure; continuing shutdown")
+            finally:
+                self.__best_effort_teardown("active scan process terminate", self.__active_scan_process.terminate)
+                self.__best_effort_teardown("local scan process terminate", self.__local_scan_process.terminate)
+                self.__best_effort_teardown("remote scan process terminate", self.__remote_scan_process.terminate)
+                self.__best_effort_teardown("extract process terminate", self.__extract_process.terminate)
+                self.__best_effort_teardown("validate process terminate", self.__validate_process.terminate)
+                self.__best_effort_teardown("active scan process join", self.__active_scan_process.join)
+                self.__best_effort_teardown("active scan process close_queues", self.__active_scan_process.close_queues)
+                self.__best_effort_teardown("local scan process join", self.__local_scan_process.join)
+                self.__best_effort_teardown("local scan process close_queues", self.__local_scan_process.close_queues)
+                self.__best_effort_teardown("remote scan process join", self.__remote_scan_process.join)
+                self.__best_effort_teardown("remote scan process close_queues", self.__remote_scan_process.close_queues)
+                self.__best_effort_teardown("extract process join", self.__extract_process.join)
+                self.__best_effort_teardown("extract process close_queues", self.__extract_process.close_queues)
+                self.__best_effort_teardown("validate process join", self.__validate_process.join)
+                self.__best_effort_teardown("validate process close_queues", self.__validate_process.close_queues)
+                self.__best_effort_teardown("mp logger stop", self.__mp_logger.stop)
+                self.__started = False
+                self.logger.info("Exited controller")
 
     def get_model_files(self) -> List[ModelFile]:
         """
@@ -1732,7 +1744,21 @@ class Controller:
                         self.__trace_target_archive_event("extract_command_queued", {
                             "file": self.__summarize_target_archive_file(file),
                         })
-                    self.__extract_process.extract(file, flow_id=command.flow_id)
+                    try:
+                        self.__extract_process.extract(file, flow_id=command.flow_id)
+                    except Exception:
+                        self.logger.warning(
+                            "Extract worker dispatch failed for %s",
+                            file.file_id,
+                            exc_info=True
+                        )
+                        _notify_failure(
+                            command,
+                            "Extract worker unavailable",
+                            500,
+                            file
+                        )
+                        continue
                     self.__temp_diag(
                         "extract_command_dispatched",
                         file_id=file.file_id,
@@ -1772,7 +1798,21 @@ class Controller:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
                 else:
-                    self.__validate_process.validate(file)
+                    try:
+                        self.__validate_process.validate(file)
+                    except Exception:
+                        self.logger.warning(
+                            "Validate worker dispatch failed for %s",
+                            file.file_id,
+                            exc_info=True
+                        )
+                        _notify_failure(
+                            command,
+                            "Validate worker unavailable",
+                            500,
+                            file
+                        )
+                        continue
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",
@@ -1950,8 +1990,20 @@ class Controller:
             self.__record_first_remote_scan_failure(str(error))
             raise
         self.__mp_logger.propagate_exception()
-        self.__extract_process.propagate_exception()
-        self.__validate_process.propagate_exception()
+        try:
+            self.__extract_process.propagate_exception()
+        except Exception as exc:
+            self.logger.warning(
+                "Ignoring extract worker failure during controller loop: {}".format(str(exc)),
+                exc_info=True
+            )
+        try:
+            self.__validate_process.propagate_exception()
+        except Exception as exc:
+            self.logger.warning(
+                "Ignoring validate worker failure during controller loop: {}".format(str(exc)),
+                exc_info=True
+            )
 
     def __record_first_remote_scan_failure(self, error_message: str):
         self.logger.warning("Fatal remote scan failure recorded: {}".format(error_message))
