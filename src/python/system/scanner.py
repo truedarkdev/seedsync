@@ -105,7 +105,7 @@ class SystemScanner:
             PseudoDirEntry(
                 name=name,
                 path=path,
-                is_dir=os.path.isdir(path),
+                is_dir=os.path.isdir(path) and not os.path.islink(path),
                 stat=os.stat(path)
             )
         )
@@ -186,6 +186,8 @@ class SystemScanner:
         children = []
         # Files may get deleted while scanning, ignore the error
         for entry in os.scandir(path):
+            if entry.is_symlink() and entry.is_dir():
+                continue
             # Skip excluded entries
             skip = False
             for prefix in self.exclude_prefixes:

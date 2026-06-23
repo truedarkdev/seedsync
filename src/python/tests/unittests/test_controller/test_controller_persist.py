@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import threading
 import unittest
 import json
 
@@ -67,6 +68,37 @@ class TestControllerPersist(unittest.TestCase):
             persist.stopped_file_names,
             persist_actual.stopped_file_names
         )
+
+    def test_to_str_is_stable_while_sets_change(self):
+        persist = ControllerPersist()
+        persist.downloaded_file_names.update({"one", "two"})
+        persist.extracted_file_names.update({"three", "four"})
+        persist.stopped_file_names.update({"five"})
+
+        stop = threading.Event()
+
+        def mutate_sets():
+            names = ("alpha", "beta", "gamma")
+            i = 0
+            while not stop.is_set():
+                name = names[i % len(names)]
+                persist.downloaded_file_names.add(name)
+                persist.extracted_file_names.add(name)
+                persist.stopped_file_names.add(name)
+                persist.downloaded_file_names.discard(name)
+                persist.extracted_file_names.discard(name)
+                persist.stopped_file_names.discard(name)
+                i += 1
+
+        thread = threading.Thread(target=mutate_sets)
+        thread.start()
+        try:
+            for _ in range(250):
+                round_tripped = ControllerPersist.from_str(persist.to_str())
+                self.assertIsInstance(round_tripped, ControllerPersist)
+        finally:
+            stop.set()
+            thread.join()
 
     def test_persist_key_helpers(self):
         self.assertEqual("plain-name", persist_key(None, "plain-name"))

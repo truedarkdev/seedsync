@@ -53,6 +53,25 @@ describe("Testing version check service", () => {
         );
     }));
 
+    it("should stop waiting when the github request stalls", fakeAsync(() => {
+        const subject = new Subject<WebReaction>();
+        sendRequestSpy.and.returnValue(subject);
+
+        // Note: can't spy on compareVersions, so just replace the private method instead
+        spyOn<any>(VersionCheckService, "isVersionNewer").and.returnValue(true);
+
+        // Recreate the service
+        versionCheckService = createVersionCheckService();
+        tick(10001);
+        subject.next(new WebReaction(true, JSON.stringify({
+            "tag_name": "v99.0.0",
+            "html_url": "https://example.invalid/releases/v99.0.0"
+        }), null));
+        tick();
+
+        expect(notifService.show).not.toHaveBeenCalled();
+    }));
+
     it("should fail gracefully on failed request to github", fakeAsync(() => {
         const subject = new Subject<WebReaction>();
         sendRequestSpy.and.returnValue(subject);

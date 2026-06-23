@@ -7,6 +7,8 @@ import unittest
 from threading import Thread
 from datetime import datetime
 
+import pytest
+
 from system import SystemScanner, SystemScannerError
 
 
@@ -760,3 +762,31 @@ class TestSystemScanner(unittest.TestCase):
         self.assertEqual("dir�dir", folder.name)
         self.assertEqual("file�file", file.name)
         self.assertEqual(128, file.size)
+
+    @unittest.skipIf(os.name == "nt", "Directory symlinks require elevated Windows privileges")
+    def test_scan_skips_directory_symlink_outside_root(self):
+        outside = tempfile.mkdtemp(prefix="test_scanner_outside_")
+        link_path = os.path.join(TestSystemScanner.temp_dir, "link_to_outside")
+        try:
+            with open(os.path.join(outside, "secret.txt"), "wb") as f:
+                f.write(b"x" * 100)
+            os.symlink(outside, link_path)
+
+            files = SystemScanner(TestSystemScanner.temp_dir).scan()
+            self.assertEqual([], files)
+        finally:
+            if os.path.lexists(link_path):
+                os.unlink(link_path)
+            shutil.rmtree(outside)
+
+    @unittest.skipIf(os.name == "nt", "Directory symlink cycles require elevated Windows privileges")
+    @pytest.mark.timeout(15)
+    def test_scan_skips_cyclic_directory_symlink(self):
+        loop_path = os.path.join(TestSystemScanner.temp_dir, "loop")
+        os.symlink(TestSystemScanner.temp_dir, loop_path)
+        try:
+            files = SystemScanner(TestSystemScanner.temp_dir).scan()
+            self.assertEqual([], files)
+        finally:
+            if os.path.lexists(loop_path):
+                os.unlink(loop_path)

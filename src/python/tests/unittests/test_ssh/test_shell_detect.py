@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import shlex
 import unittest
 from unittest.mock import call, patch
 
@@ -142,6 +143,35 @@ class TestShellDetection(unittest.TestCase):
 class TestShellCommandExecution(unittest.TestCase):
     def setUp(self):
         self.sshcp = Sshcp(host="testhost", port=22, user="testuser", password="testpass")
+
+    @patch.object(Sshcp, "_Sshcp__run_command")
+    def test_shell_quotes_detected_shell_and_command(self, mock_run_command):
+        self.sshcp._Sshcp__detected_shell = "/bin/bash"
+
+        for command in (
+            "ls -la",
+            'echo "hi"',
+            "don't",
+            'a\'b"c',
+        ):
+            with self.subTest(command=command):
+                mock_run_command.reset_mock()
+                self.sshcp.shell(command)
+                self.assertEqual(
+                    {
+                        "command": "ssh",
+                        "flags": ["-p", "22"],
+                        "args": [
+                            "testuser@testhost",
+                            "/bin/bash -c {}".format(shlex.quote(command))
+                        ]
+                    },
+                    mock_run_command.call_args.kwargs
+                )
+
+    def test_shell_rejects_mixed_quotes_before_shell_detection(self):
+        with self.assertRaises(ValueError):
+            self.sshcp.shell('echo "hi" && printf \'bye\'')
 
     @patch.object(Sshcp, "_Sshcp__run_command")
     def test_shell_uses_cached_detected_shell_for_command_execution(self, mock_run_command):

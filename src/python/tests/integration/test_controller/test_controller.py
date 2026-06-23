@@ -17,7 +17,7 @@ import stat
 
 import pytest
 
-from tests.utils import TestUtils
+from tests.utils import TestUtils, requires_live_ssh
 from common import overrides, Context, Config, Args, AppError, Localization, Status
 from controller import Controller, ControllerPersist
 from model import ModelFile, IModelListener
@@ -52,6 +52,7 @@ class DummyCommandCallback(Controller.Command.ICallback):
 
 
 # noinspection SpellCheckingInspection
+@requires_live_ssh
 class TestController(unittest.TestCase):
     __KEEP_FILES = False  # for debugging
 

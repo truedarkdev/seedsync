@@ -235,6 +235,11 @@ cd src/python
 poetry run pytest
 ```
 
+If you are running the live SSH/LFTP/controller suites, keep `src/python` as
+the working directory and export `SEEDSYNC_LIVE_SSH_TESTS=1` first. The
+default local pytest lane should leave that variable unset so the mock/unit
+SSH and LFTP coverage still runs.
+
 If you need junit XML for a local run, create the repo-root `tmp/pytest/`
 tree first and write the file there. From `src/python`, a typical path looks
 like:

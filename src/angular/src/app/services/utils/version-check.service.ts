@@ -1,6 +1,8 @@
 import {Injectable} from "@angular/core";
 
 import compareVersions from "compare-versions";
+import {EMPTY} from "rxjs";
+import {catchError, timeout} from "rxjs/operators";
 
 import {RestService} from "./rest.service";
 import {LoggerService} from "./logger.service";
@@ -28,7 +30,13 @@ export class VersionCheckService {
     }
 
     private checkVersion() {
-        this._restService.sendRequest(this.GITHUB_LATEST_RELEASE_URL).subscribe({
+        this._restService.sendRequest(this.GITHUB_LATEST_RELEASE_URL).pipe(
+            timeout(10000),
+            catchError(error => {
+                this._logger.warn("Unable to fetch latest version info: %O", error);
+                return EMPTY;
+            })
+        ).subscribe({
             next: reaction => {
                 if (reaction.success) {
                     let jsonResponse;
