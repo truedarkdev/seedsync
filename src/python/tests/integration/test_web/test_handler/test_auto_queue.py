@@ -1,10 +1,29 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import json
+import threading
 from urllib.parse import quote
 
 from controller import AutoQueuePattern
+from controller.auto_queue import AutoQueuePersistListener
 from tests.integration.test_web.test_web_app import BaseTestWebApp
+
+
+class ThrowingAutoQueuePersistListener(AutoQueuePersistListener):
+    def __init__(self, add_error=None, remove_error=None):
+        super().__init__()
+        self._add_error = add_error
+        self._remove_error = remove_error
+
+    def pattern_added(self, pattern):
+        super().pattern_added(pattern)
+        if self._add_error is not None:
+            raise self._add_error
+
+    def pattern_removed(self, pattern):
+        super().pattern_removed(pattern)
+        if self._remove_error is not None:
+            raise self._remove_error
 
 
 class TestAutoQueueHandler(BaseTestWebApp):
@@ -95,6 +114,65 @@ class TestAutoQueueHandler(BaseTestWebApp):
         self.assertEqual("Auto-queue pattern 'one' already exists.", resp.text)
         self.__assert_plain_text_response(resp)
 
+    def test_add_serializes_concurrent_requests_under_write_lock(self):
+        handler = self.web_app_builder.auto_queue_handler
+        enter_to_add = threading.Event()
+        release_to_add = threading.Event()
+        results = {}
+
+        class ProbingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.second_acquire_attempted = threading.Event()
+
+            def __enter__(self):
+                if self._lock.locked():
+                    self.second_acquire_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self._lock.release()
+                return False
+
+        class BlockingListener(AutoQueuePersistListener):
+            def pattern_added(self, pattern):
+                super().pattern_added(pattern)
+                enter_to_add.set()
+                if not release_to_add.wait(timeout=5):
+                    results["release_timeout"] = True
+
+        handler._AutoQueueHandler__write_lock = ProbingLock()
+        self.auto_queue_persist.add_listener(BlockingListener())
+
+        def writer_a():
+            response = handler._AutoQueueHandler__handle_add_autoqueue("onepattern")
+            results["a"] = response.status_code
+
+        def writer_b():
+            response = handler._AutoQueueHandler__handle_add_autoqueue("onepattern")
+            results["b"] = response.status_code
+
+        t_a = threading.Thread(target=writer_a)
+        t_a.start()
+        self.assertTrue(enter_to_add.wait(timeout=5))
+
+        t_b = threading.Thread(target=writer_b)
+        t_b.start()
+        self.assertTrue(handler._AutoQueueHandler__write_lock.second_acquire_attempted.wait(timeout=5))
+        self.assertNotIn("b", results)
+
+        release_to_add.set()
+        t_a.join(timeout=10)
+        t_b.join(timeout=10)
+
+        self.assertFalse(t_a.is_alive())
+        self.assertFalse(t_b.is_alive())
+        self.assertFalse(results.get("release_timeout", False))
+        self.assertEqual(200, results["a"])
+        self.assertEqual(409, results["b"])
+        self.assertIn(AutoQueuePattern("onepattern"), self.auto_queue_persist.patterns)
+
     def test_add_empty_value(self):
         uri = quote(quote("  ", safe=""), safe="")
         resp = self.test_app.post("/server/autoqueue/add/" + uri, expect_errors=True)
@@ -153,6 +231,34 @@ class TestAutoQueueHandler(BaseTestWebApp):
         self.assertEqual(404, resp.status_int)
         self.assertEqual("Auto-queue pattern 'one' doesn't exist.", resp.text)
         self.__assert_plain_text_response(resp)
+
+    def test_add_failure_rolls_back_listener_state_on_non_oserror(self):
+        listener = ThrowingAutoQueuePersistListener(add_error=RuntimeError("serialize boom"))
+        self.auto_queue_persist.add_listener(listener)
+
+        resp = self.test_app.post("/server/autoqueue/add/onepattern", expect_errors=True)
+
+        self.assertEqual(500, resp.status_int)
+        self.assertEqual("Failed to persist auto-queue", resp.text)
+        self.__assert_plain_text_response(resp)
+        self.assertNotIn(AutoQueuePattern("onepattern"), self.auto_queue_persist.patterns)
+        self.assertNotIn(AutoQueuePattern("onepattern"), listener.new_patterns)
+
+    def test_remove_failure_rolls_back_listener_state_on_non_oserror(self):
+        listener = ThrowingAutoQueuePersistListener(remove_error=RuntimeError("serialize boom"))
+        self.auto_queue_persist.add_listener(listener)
+        add_resp = self.test_app.post("/server/autoqueue/add/onepattern")
+        self.assertEqual(200, add_resp.status_int)
+        self.assertIn(AutoQueuePattern("onepattern"), self.auto_queue_persist.patterns)
+        self.assertIn(AutoQueuePattern("onepattern"), listener.new_patterns)
+
+        resp = self.test_app.post("/server/autoqueue/remove/onepattern", expect_errors=True)
+
+        self.assertEqual(500, resp.status_int)
+        self.assertEqual("Failed to persist auto-queue", resp.text)
+        self.__assert_plain_text_response(resp)
+        self.assertIn(AutoQueuePattern("onepattern"), self.auto_queue_persist.patterns)
+        self.assertIn(AutoQueuePattern("onepattern"), listener.new_patterns)
 
     def test_remove_empty_value(self):
         uri = quote(quote("  ", safe=""), safe="")

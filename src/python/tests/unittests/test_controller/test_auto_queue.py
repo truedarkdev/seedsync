@@ -10,6 +10,7 @@ import threading
 
 from common import overrides, PersistError, Config
 from controller import AutoQueue, AutoQueuePersist, IAutoQueuePersistListener, AutoQueuePattern
+from controller.auto_queue import AutoQueuePersistListener
 from controller import Controller
 from model import IModelListener, ModelFile
 
@@ -306,6 +307,7 @@ class TestAutoQueuePersist(unittest.TestCase):
                 done.set()
 
         thread = threading.Thread(target=run)
+        thread.daemon = True
         with lock:
             thread.start()
             self.assertTrue(started.wait(1), f"{op_name}: worker thread never started")
@@ -340,6 +342,42 @@ class TestAutoQueuePersist(unittest.TestCase):
 
         self.assertEqual({AutoQueuePattern(pattern="one")}, snapshot)
         self.assertEqual({AutoQueuePattern(pattern="two")}, persist.patterns)
+
+    def test_new_pattern_listener_mutations_block_while_listener_lock_is_held(self):
+        listener = AutoQueuePersistListener()
+        listener.pattern_added(AutoQueuePattern(pattern="seed"))
+        lock = listener._AutoQueuePersistListener__lock
+
+        cases = [
+            ("pattern_added", lambda: listener.pattern_added(AutoQueuePattern(pattern="new"))),
+            ("pattern_removed", lambda: listener.pattern_removed(AutoQueuePattern(pattern="seed"))),
+            ("drain_new_patterns", listener.drain_new_patterns),
+        ]
+        for op_name, op in cases:
+            with self.subTest(op=op_name):
+                self._assert_blocks_until_lock_released(lock, op, op_name)
+
+    def test_drain_new_patterns_returns_copy_and_clears(self):
+        listener = AutoQueuePersistListener()
+        listener.pattern_added(AutoQueuePattern(pattern="one"))
+
+        drained = listener.drain_new_patterns()
+
+        self.assertEqual({AutoQueuePattern(pattern="one")}, drained)
+        listener.pattern_added(AutoQueuePattern(pattern="two"))
+        listener.pattern_removed(AutoQueuePattern(pattern="one"))
+        self.assertEqual({AutoQueuePattern(pattern="one")}, drained)
+        self.assertEqual({AutoQueuePattern(pattern="two")}, listener.new_patterns)
+
+    def test_drain_does_not_drop_pattern_added_after_drain(self):
+        listener = AutoQueuePersistListener()
+        listener.pattern_added(AutoQueuePattern(pattern="first"))
+
+        self.assertEqual({AutoQueuePattern(pattern="first")}, listener.drain_new_patterns())
+
+        # A pattern added after the drain must survive to the next cycle.
+        listener.pattern_added(AutoQueuePattern(pattern="second"))
+        self.assertEqual({AutoQueuePattern(pattern="second")}, listener.drain_new_patterns())
 
 
 class TestAutoQueue(unittest.TestCase):
@@ -507,6 +545,35 @@ class TestAutoQueue(unittest.TestCase):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual("auto_queue", command.origin)
         self.assertTrue(command.flow_id.startswith("autoq:1:QUEUE:"))
+
+    def test_process_failure_restores_drained_new_patterns_for_next_cycle(self):
+        persist = AutoQueuePersist()
+
+        file_one = ModelFile("File.One", True)
+        file_one.remote_size = 100
+        self.initial_model = [file_one]
+
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        persist.add_pattern(AutoQueuePattern(pattern="File.One"))
+        self.controller.queue_command.side_effect = RuntimeError("queue boom")
+
+        with self.assertRaises(RuntimeError):
+            auto_queue.process()
+
+        self.assertEqual(
+            {AutoQueuePattern(pattern="File.One")},
+            auto_queue._AutoQueue__persist_listener.new_patterns,
+        )
+
+        self.controller.queue_command.side_effect = None
+        self.controller.queue_command.reset_mock()
+
+        auto_queue.process()
+
+        self.assertEqual(1, self.controller.queue_command.call_count)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("File.One", command.filename)
 
     def test_matching_initial_files_are_queued(self):
         persist = AutoQueuePersist()
