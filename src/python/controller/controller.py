@@ -28,7 +28,7 @@ from .validate import ValidateProcess
 from .model_updater import ModelUpdater
 from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
-from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, Constants, PathPair, Localization
+from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, AppProcess, Constants, PathPair, Localization
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from .controller_persist import ControllerPersist
@@ -795,7 +795,7 @@ class Controller:
                 label
             )
 
-    def __report_dead_worker_once(self, worker, worker_name: str):
+    def __report_dead_worker_once(self, worker: AppProcess | None, worker_name: str) -> None:
         if worker is None:
             return
         worker_id = id(worker)
