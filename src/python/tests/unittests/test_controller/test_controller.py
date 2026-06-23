@@ -3042,6 +3042,179 @@ class TestController(unittest.TestCase):
         )
 
     @patch("controller.controller.shutil.move")
+    def test_move_from_staging_moves_single_file_named_lftp(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_file = os.path.join(staging_root, "notes.lftp")
+            os.makedirs(staging_root)
+            os.makedirs(final_root)
+            with open(source_file, "w", encoding="utf-8") as temp_file:
+                temp_file.write("complete")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("notes.lftp")
+
+        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"))
+        self.assertTrue(result)
+        self.controller.logger.warning.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_ignores_unrelated_lftp_sibling_for_single_file_source(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_file = os.path.join(staging_root, "movie.mkv")
+            os.makedirs(staging_root)
+            os.makedirs(final_root)
+            with open(source_file, "w", encoding="utf-8") as source_handle:
+                source_handle.write("complete")
+            with open(os.path.join(staging_root, "unrelated.mkv.lftp"), "w", encoding="utf-8") as temp_handle:
+                temp_handle.write("partial")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("movie.mkv")
+
+        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"))
+        self.assertTrue(result)
+        self.controller.logger.warning.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_same_path_wins_over_lftp_temp_deferral(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source_tree = os.path.join(temp_dir, "movie.mkv")
+            os.makedirs(source_tree)
+            with open(os.path.join(source_tree, "movie.mkv"), "w", encoding="utf-8") as final_file:
+                final_file.write("complete")
+            with open(os.path.join(source_tree, "movie.mkv.lftp"), "w", encoding="utf-8") as temp_file:
+                temp_file.write("partial")
+
+            self.controller._Controller__staging_path = temp_dir
+            self.controller._Controller__legacy_local_path = temp_dir
+
+            result = self.controller._Controller__move_from_staging("movie.mkv")
+
+        move.assert_not_called()
+        self.assertTrue(result)
+        self.controller.logger.warning.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_moves_directory_with_legitimate_lftp_child_name(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "movie.mkv")
+            os.makedirs(source_tree)
+            os.makedirs(final_root)
+            with open(os.path.join(source_tree, "notes.lftp"), "w", encoding="utf-8") as child_file:
+                child_file.write("complete payload")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("movie.mkv")
+
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie.mkv"))
+        self.assertTrue(result)
+        self.controller.logger.warning.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_moves_directory_with_legitimate_lftp_child_pair(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "movie")
+            os.makedirs(source_tree)
+            os.makedirs(final_root)
+            with open(os.path.join(source_tree, "foo"), "w", encoding="utf-8") as child_file:
+                child_file.write("complete payload")
+            with open(os.path.join(source_tree, "foo.lftp"), "w", encoding="utf-8") as child_file:
+                child_file.write("also complete payload")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("movie")
+
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"))
+        self.assertTrue(result)
+        self.controller.logger.warning.assert_not_called()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_defers_when_lftp_temp_artifact_matches_path_pair_source(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "movies")
+            staging_root = os.path.join(final_root, "incomplete")
+            source_file = os.path.join(staging_root, "movie.mkv")
+            os.makedirs(staging_root)
+            with open(source_file, "w", encoding="utf-8") as final_file:
+                final_file.write("complete")
+            with open(source_file + ".lftp", "w", encoding="utf-8") as temp_file:
+                temp_file.write("partial")
+
+            self.controller._Controller__path_pairs_by_id = {
+                "movies": SimpleNamespace(local_path=final_root)
+            }
+            self.controller._Controller__path_pair_staging_paths = {
+                "movies": staging_root
+            }
+
+            result = self.controller._Controller__move_from_staging("movie.mkv", "movies")
+
+        move.assert_not_called()
+        self.assertFalse(result)
+        self.controller.logger.warning.assert_called_once_with(
+            "Deferring move of '%s' from staging '%s' to '%s': staging source still has an lftp temp artifact",
+            "movie.mkv",
+            staging_root,
+            final_root,
+        )
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    @patch("controller.controller.shutil.move")
+    def test_move_from_staging_does_not_walk_symlink_source_tree(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            target_root = os.path.join(temp_dir, "target")
+            final_root = os.path.join(temp_dir, "final")
+            src_link = os.path.join(staging_root, "movie.mkv")
+            target_source_tree = os.path.join(target_root, "movie.mkv")
+            os.makedirs(staging_root)
+            os.makedirs(final_root)
+            os.makedirs(target_source_tree)
+            with open(os.path.join(target_source_tree, "movie.mkv.lftp"), "w", encoding="utf-8") as temp_file:
+                temp_file.write("partial")
+
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            with patch("controller.controller.os.path.exists", side_effect=lambda path: path == src_link), \
+                    patch("controller.controller.os.path.islink", side_effect=lambda path: path == src_link), \
+                    patch(
+                        "controller.controller.os.path.realpath",
+                        side_effect=lambda path: target_source_tree if path == src_link else path,
+                    ), \
+                    patch(
+                        "controller.controller.os.walk",
+                        side_effect=AssertionError("os.walk should not be called for symlink roots"),
+                    ) as walk:
+                result = self.controller._Controller__move_from_staging("movie.mkv")
+
+        walk.assert_not_called()
+        move.assert_called_once_with(src_link, os.path.join(final_root, "movie.mkv"))
+        self.assertTrue(result)
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+
+    @patch("controller.controller.shutil.move")
     def test_move_from_staging_logs_target_archive_trace(self, move):
         self.controller._Controller__target_archive_trace_file_id = "movie.mkv"
         trace_logger = self.controller._Controller__target_archive_trace_logger

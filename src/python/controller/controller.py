@@ -1377,6 +1377,20 @@ class Controller:
                     "result": "same_path",
                 })
             return True
+        if self.__source_has_lftp_temp_artifact(staging_path, src):
+            self.logger.warning(
+                "Deferring move of '%s' from staging '%s' to '%s': staging source still has an lftp temp artifact",
+                name,
+                staging_path,
+                final_path,
+            )
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "deferred_temp_files",
+                })
+            return False
 
         try:
             shutil.move(src, dst)
@@ -1404,6 +1418,41 @@ class Controller:
                     "result": "failed",
                     "error": str(error),
                 })
+            return False
+
+    @staticmethod
+    def __source_has_lftp_temp_artifact(staging_path: str, src: str) -> bool:
+        suffix = Constants.LFTP_TEMP_FILE_SUFFIX
+        try:
+            resolved_staging_root = os.path.realpath(staging_path)
+            resolved_src = os.path.realpath(src)
+        except OSError:
+            return False
+
+        if os.path.islink(src):
+            return False
+
+        try:
+            if os.path.normcase(os.path.commonpath([resolved_staging_root, resolved_src])) != os.path.normcase(resolved_staging_root):
+                return False
+        except ValueError:
+            return False
+
+        temp_candidate = src + suffix
+        try:
+            resolved_temp_candidate = os.path.realpath(temp_candidate)
+        except OSError:
+            return False
+
+        try:
+            if os.path.normcase(os.path.commonpath([resolved_staging_root, resolved_temp_candidate])) != os.path.normcase(resolved_staging_root):
+                return False
+        except ValueError:
+            return False
+
+        try:
+            return os.path.isfile(resolved_temp_candidate)
+        except OSError:
             return False
 
     def __get_delete_local_target(self, file: ModelFile) -> Tuple[str, str]:
