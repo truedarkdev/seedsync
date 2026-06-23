@@ -77,6 +77,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__temp_diag_file_id = None
         self.controller._Controller__temp_diag_last_signature = None
         self.controller._Controller__staging_path = "/local/incomplete"
+        self.controller._Controller__reported_dead_workers = set()
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
         self.controller._Controller__last_lftp_statuses = []
@@ -474,6 +475,22 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scan_process.join.assert_called_once_with()
         self.controller._Controller__remote_scan_process.close_queues.assert_called_once_with()
         self.controller._Controller__extract_process.join.assert_called_once_with()
+        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
+        self.controller._Controller__validate_process.join.assert_called_once_with()
+        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
+        self.controller._Controller__mp_logger.stop.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__started)
+
+    def test_exit_continues_shutdown_when_process_join_fails(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__extract_process.join.side_effect = RuntimeError("join failed")
+
+        self.controller.exit()
+
+        self.controller.logger.exception.assert_any_call(
+            "Ignoring controller teardown failure during %s; continuing shutdown",
+            "extract process join"
+        )
         self.controller._Controller__extract_process.close_queues.assert_called_once_with()
         self.controller._Controller__validate_process.join.assert_called_once_with()
         self.controller._Controller__validate_process.close_queues.assert_called_once_with()
@@ -1292,6 +1309,82 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__extract_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
+
+    def test_propagate_exceptions_reports_dead_extract_and_validate_workers_once(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.propagate_exception.side_effect = [
+            Exception("extract failed"),
+            None,
+        ]
+        self.controller._Controller__validate_process.propagate_exception.side_effect = [
+            Exception("validate failed"),
+            None,
+        ]
+        self.controller._Controller__extract_process.is_alive.return_value = False
+        self.controller._Controller__validate_process.is_alive.return_value = False
+
+        self.controller._Controller__propagate_exceptions()
+        self.controller._Controller__propagate_exceptions()
+
+        self.controller.logger.error.assert_any_call(
+            "%s worker has died; %s is disabled until restart.",
+            "extract",
+            "extract"
+        )
+        self.controller.logger.error.assert_any_call(
+            "%s worker has died; %s is disabled until restart.",
+            "validate",
+            "validate"
+        )
+        self.assertEqual(2, self.controller.logger.error.call_count)
+        self.assertEqual(2, self.controller._Controller__extract_process.propagate_exception.call_count)
+        self.assertEqual(2, self.controller._Controller__validate_process.propagate_exception.call_count)
+
+    def test_propagate_exceptions_does_not_report_alive_extract_and_validate_workers_dead(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.propagate_exception.return_value = None
+        self.controller._Controller__validate_process.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.is_alive.return_value = True
+        self.controller._Controller__validate_process.is_alive.return_value = True
+
+        self.controller._Controller__propagate_exceptions()
+
+        self.controller.logger.error.assert_not_called()
+        self.controller._Controller__extract_process.is_alive.assert_called_once_with()
+        self.controller._Controller__validate_process.is_alive.assert_called_once_with()
+
+    def test_propagate_exceptions_reports_workers_dead_once_when_is_alive_raises(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.propagate_exception.return_value = None
+        self.controller._Controller__validate_process.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.is_alive.side_effect = AssertionError("not started")
+        self.controller._Controller__validate_process.is_alive.side_effect = ValueError("already closed")
+
+        self.controller._Controller__propagate_exceptions()
+        self.controller._Controller__propagate_exceptions()
+
+        self.controller.logger.error.assert_any_call(
+            "%s worker has died; %s is disabled until restart.",
+            "extract",
+            "extract"
+        )
+        self.controller.logger.error.assert_any_call(
+            "%s worker has died; %s is disabled until restart.",
+            "validate",
+            "validate"
+        )
+        self.assertEqual(2, self.controller.logger.error.call_count)
+        self.controller._Controller__extract_process.is_alive.assert_called_once_with()
+        self.controller._Controller__validate_process.is_alive.assert_called_once_with()
 
     def test_propagate_exceptions_records_first_remote_scan_failure(self):
         self.controller._Controller__context.status.controller = SimpleNamespace(

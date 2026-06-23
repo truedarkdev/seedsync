@@ -233,6 +233,7 @@ class Controller:
         self.__lftp_status_poll_retry_active = False
         self.__active_command_processes = []
         self.__startup_recovery_done = False
+        self.__reported_dead_workers = set()
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
         self.__started = False
 
@@ -387,6 +388,7 @@ class Controller:
         # Keep track of active command processes
         self.__active_command_processes = []
         self.__startup_recovery_done = False
+        self.__reported_dead_workers = set()
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
         self.__updater = ModelUpdater(self)
         self.__updater.sync_persist_to_all_builders()
@@ -792,6 +794,26 @@ class Controller:
                 "Ignoring controller teardown failure during %s; continuing shutdown",
                 label
             )
+
+    def __report_dead_worker_once(self, worker, worker_name: str):
+        if worker is None:
+            return
+        worker_id = id(worker)
+        if worker_id in self.__reported_dead_workers:
+            return
+        try:
+            alive = worker.is_alive()
+        except (AssertionError, ValueError):
+            alive = False
+        if alive:
+            return
+
+        self.__reported_dead_workers.add(worker_id)
+        self.logger.error(
+            "%s worker has died; %s is disabled until restart.",
+            worker_name,
+            worker_name,
+        )
 
     def exit(self):
         self.logger.debug("Exiting controller")
@@ -1997,6 +2019,7 @@ class Controller:
                 "Ignoring extract worker failure during controller loop: {}".format(str(exc)),
                 exc_info=True
             )
+        self.__report_dead_worker_once(self.__extract_process, "extract")
         try:
             self.__validate_process.propagate_exception()
         except Exception as exc:
@@ -2004,6 +2027,7 @@ class Controller:
                 "Ignoring validate worker failure during controller loop: {}".format(str(exc)),
                 exc_info=True
             )
+        self.__report_dead_worker_once(self.__validate_process, "validate")
 
     def __record_first_remote_scan_failure(self, error_message: str):
         self.logger.warning("Fatal remote scan failure recorded: {}".format(error_message))
