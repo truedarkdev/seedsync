@@ -65,6 +65,12 @@ export class ConfigService extends BaseWebService {
                     false, null, Localization.Notification.CONFIG_VALUE_BLANK(section, option))
                 );
             });
+        } else if (this.wouldCreateBlankFtpsPassword(currentConfig, section, option, normalizedValue)) {
+            return new Observable<WebReaction>(observer => {
+                observer.next(new WebReaction(
+                    false, null, Localization.Notification.FTPS_TRANSFER_PASSWORD_REQUIRED)
+                );
+            });
         } else {
             const url = this.CONFIG_SET_URL(section, option);
             const obs = this._restService.sendPostRequest(url, {value: normalizedValue});
@@ -141,6 +147,24 @@ export class ConfigService extends BaseWebService {
             return valueStr;
         }
         return valueStr.toLowerCase();
+    }
+
+    private wouldCreateBlankFtpsPassword(currentConfig: Config, section: string, option: string, value: any): boolean {
+        if (section !== "lftp") {
+            return false;
+        }
+
+        const protocol = option === "protocol"
+            ? String(value).trim().toLowerCase()
+            : currentConfig.getValue("lftp", "protocol");
+        const remotePassword = option === "remote_password"
+            ? value
+            : currentConfig.getValue("lftp", "remote_password");
+        return protocol === "ftps" && this.isBlankText(remotePassword);
+    }
+
+    private isBlankText(value: any): boolean {
+        return value === null || value === undefined || (typeof value === "string" && value.trim().length === 0);
     }
 }
 

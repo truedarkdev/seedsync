@@ -41,6 +41,9 @@ interface ILftp {
     rate_limit: string;
     net_socket_buffer: string;
     staging_path: string;
+    protocol: string;
+    remote_ftp_port: number;
+    ftp_ssl_verify_certificate: boolean;
 }
 const DefaultLftp: ILftp = {
     remote_address: null,
@@ -60,6 +63,9 @@ const DefaultLftp: ILftp = {
     rate_limit: "0",
     net_socket_buffer: "8M",
     staging_path: "",
+    protocol: "sftp",
+    remote_ftp_port: 21,
+    ftp_ssl_verify_certificate: true,
 };
 const LftpRecord = Record(DefaultLftp);
 

@@ -10,7 +10,7 @@
         <input
                type="text"
                class="form-control"
-               [disabled]="value === null || value === undefined"
+               [disabled]="disabled || value === null || value === undefined"
                [ngModel]="value"
                (ngModelChange)="onChange($event)" />
         <span *ngIf="description"
@@ -22,7 +22,7 @@
         <input
                type="checkbox"
                class="form-control"
-               [disabled]="value === null || value === undefined"
+               [disabled]="disabled || value === null || value === undefined"
                [ngModel]="value"
            (ngModelChange)="onChange($event)" />
         <span class="name">{{label}}</span>
@@ -36,7 +36,7 @@
         <input
                type="password"
                class="form-control"
-               [disabled]="value === null || value === undefined"
+               [disabled]="disabled || value === null || value === undefined"
                [ngModel]="value"
                (ngModelChange)="onChange($event)" />
         <span *ngIf="description"
@@ -48,7 +48,7 @@
         <span class="name">{{label}}</span>
         <select
                class="form-control"
-               [disabled]="value === null || value === undefined"
+               [disabled]="disabled || value === null || value === undefined"
                (change)="onChange($event.target.value)">
             <option *ngFor="let choice of choices"
                     [value]="choice.value"

@@ -3,6 +3,7 @@
 import unittest
 
 from lftp import LftpJobStatusParser, LftpJobStatus, LftpJobStatusParserError
+from lftp.job_status_parser import redact_credentials
 
 
 # noinspection PyPep8
@@ -97,6 +98,23 @@ class TestLftpJobStatusParser(unittest.TestCase):
         parser = LftpJobStatusParser()
         statuses = parser.parse(output)
         self.assertEqual(0, len(statuses))
+
+    def test_redact_credentials_handles_ftp_and_ftps_urls_with_reserved_characters(self):
+        output = (
+            "jobs -v\n"
+            "[0] queue (ftps://alice:pa:ss@seedbox.example.com:21)\n"
+            "ftps://alice:pa:ss@seedbox.example.com:21/downloads\n"
+            "ftp://bob:pa/ss@mirror.example.net/downloads\n"
+        )
+
+        redacted = redact_credentials(output)
+
+        self.assertNotIn("pa:ss", redacted)
+        self.assertNotIn("pa/ss", redacted)
+        self.assertNotIn("seedbox.example.com", redacted)
+        self.assertNotIn("mirror.example.net", redacted)
+        self.assertIn("ftps://**REDACTED**@**REDACTED**:21/downloads", redacted)
+        self.assertIn("ftp://**REDACTED**@**REDACTED**/downloads", redacted)
 
     def test_queued_items(self):
         """Queued items, no jobs running"""

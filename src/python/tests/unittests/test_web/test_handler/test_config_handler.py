@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 from wsgiref.util import setup_testing_defaults
 
-from common import Config, ConfigError, BreadcrumbTraceCollector
+from common import Config, ConfigError, BreadcrumbTraceCollector, Localization
 from web.auth_store import ApiKeyStore
 from web.handler.config import ConfigHandler
 from web.web_app import WebApp
@@ -144,6 +144,41 @@ class TestConfigHandlerSet(unittest.TestCase):
         )
 
         self.assertEqual(400, response.status_code)
+
+    def test_set_protocol_to_ftps_rejects_blank_transfer_password(self):
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.protocol = "sftp"
+        inner.remote_password = ""
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "protocol",
+            "ftps"
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual("sftp", inner.protocol)
+        self.assertEqual("", inner.remote_password)
+        self.assertEqual("FTPS requires a transfer password.", response.body)
+
+    def test_set_blank_remote_password_remains_valid_for_sftp_key_auth(self):
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.protocol = "sftp"
+        inner.use_ssh_key = True
+        inner.remote_password = ""
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "remote_password",
+            ""
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("", inner.remote_password)
 
     def test_set_sensitive_field_success_response_is_redacted(self):
         self.config.has_section.return_value = True
@@ -342,6 +377,8 @@ class TestConfigHandlerRoutes(unittest.TestCase):
     def test_set_route_allows_empty_remote_password_from_body(self):
         config = self._new_config()
         config.lftp.remote_password = "existing-password"
+        config.lftp.use_ssh_key = True
+        config.lftp.protocol = "sftp"
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -354,6 +391,42 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual(200, status_code)
         self.assertEqual("", config.lftp.remote_password)
         self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), body)
+
+    def test_set_route_rejects_ftps_with_blank_remote_password_from_body(self):
+        config = self._new_config()
+        config.lftp.remote_password = ""
+        config.lftp.use_ssh_key = True
+        config.lftp.protocol = "sftp"
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/protocol",
+            {"value": "ftps"},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(400, status_code)
+        self.assertEqual("sftp", config.lftp.protocol)
+        self.assertIn(Localization.Error.FTPS_TRANSFER_PASSWORD_REQUIRED, body)
+
+    def test_set_route_rejects_noncanonical_ftps_with_blank_remote_password_from_body(self):
+        config = self._new_config()
+        config.lftp.remote_password = ""
+        config.lftp.use_ssh_key = True
+        config.lftp.protocol = "sftp"
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/protocol",
+            {"value": " FTPS "},
+            api_token=self.admin_api_token,
+        )
+
+        self.assertEqual(400, status_code)
+        self.assertEqual("sftp", config.lftp.protocol)
+        self.assertIn(Localization.Error.FTPS_TRANSFER_PASSWORD_REQUIRED, body)
 
     def test_set_route_rejects_whitespace_remote_password_from_body(self):
         config = self._new_config()

@@ -6,11 +6,15 @@ from typing import List
 import logging
 
 from common import AppError
+from common.redaction import redact_sensitive_text
 from .job_status import LftpJobStatus
 
 
 class LftpJobStatusParserError(AppError):
     pass
+
+
+redact_credentials = redact_sensitive_text
 
 
 class LftpJobStatusParser:
@@ -104,13 +108,13 @@ class LftpJobStatusParser:
             statuses += self.__parse_queue(lines)
         except ValueError as e:
             self.logger.warning("LftpJobStateParser skipping bad queue output: {}".format(str(e)))
-            self.logger.debug("Bad status output:\n{}".format(output))
+            self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
             return statuses
         try:
             statuses += self.__parse_jobs(lines)
         except ValueError as e:
             self.logger.warning("LftpJobStateParser skipping bad job output: {}".format(str(e)))
-            self.logger.debug("Bad status output:\n{}".format(output))
+            self.logger.debug("Bad status output:\n{}".format(redact_credentials(output)))
         if has_wrong_type_failure and statuses and not any(
             status.state == LftpJobStatus.State.RUNNING for status in statuses
         ):
@@ -571,9 +575,9 @@ class LftpJobStatusParser:
             # Look for the header lines
             if len(lines) < 2:
                 raise ValueError("Missing queue header")
-            header1_pattern = r"^\[\d+\] queue \(sftp://.*@.*\)(?:\s+--\s+(?:\d+\.\d+|\d+)\s(?:{})\/s)?$"\
+            header1_pattern = r"^\[\d+\] queue \((?:sftp|ftp|ftps)://.*@.*\)(?:\s+--\s+(?:\d+\.\d+|\d+)\s(?:{})\/s)?$"\
                               .format(LftpJobStatusParser.__SIZE_UNITS_REGEX)
-            header2_pattern = "^sftp://.*@.*$"
+            header2_pattern = "^(?:sftp|ftp|ftps)://.*@.*$"
             line = lines.pop(0)
             if not re.match(header1_pattern, line):
                 raise ValueError("Missing queue header line 1: {}".format(line))

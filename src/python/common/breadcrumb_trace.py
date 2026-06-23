@@ -4,11 +4,12 @@ import copy
 import json
 import multiprocessing
 import queue
-import re
 import time
 from collections import deque
 from threading import Lock
 from typing import Any, Callable, Deque, Dict, List, Optional
+
+from .redaction import redact_sensitive_text
 
 
 class BreadcrumbTraceEmitter:
@@ -84,20 +85,6 @@ class BreadcrumbTraceCollector:
         "args",
         "script",
         "shell",
-    )
-    __COMMAND_VALUE_PATTERNS = (
-        (re.compile(r'(-u\s+\S+,)\S+', re.IGNORECASE), r'\1**REDACTED**'),
-        (re.compile(r'((?:remote_)?password\s*[=:]\s*)\S+', re.IGNORECASE), r'\1**REDACTED**'),
-        (re.compile(r'((?:api[_-]?key|token|secret|credential|authorization|passwd)\s*[=:]\s*)\S+', re.IGNORECASE), r'\1**REDACTED**'),
-        (re.compile(r'sftp://\S+@\S+', re.IGNORECASE), 'sftp://**REDACTED**@**REDACTED**'),
-        (re.compile(
-            r'(^|[\s\'"\[])([a-zA-Z0-9_][\w.\-]*)@('
-            r'(?:\d{1,3}(?:\.\d{1,3}){3})|'
-            r'(?:[a-zA-Z0-9_][a-zA-Z0-9_-]*)|'
-            r'(?:[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)+)'
-            r')(?=[\s\'"\],:/>])',
-            re.MULTILINE
-        ), r'\1**REDACTED**@**REDACTED**'),
     )
 
     def __init__(self, enabled_getter: Callable[[], bool], max_entries: int = 128):
@@ -571,11 +558,7 @@ class BreadcrumbTraceCollector:
     def __sanitize_string_content(self, value: str) -> str:
         if value is None:
             return None
-
-        sanitized = value
-        for pattern, replacement in BreadcrumbTraceCollector.__COMMAND_VALUE_PATTERNS:
-            sanitized = pattern.sub(replacement, sanitized)
-        return sanitized
+        return redact_sensitive_text(value)
 
     def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False):
         if self.__external_records is None:

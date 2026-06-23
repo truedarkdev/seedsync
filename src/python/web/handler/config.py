@@ -7,7 +7,7 @@ import threading
 import bottle
 from bottle import HTTPResponse
 
-from common import overrides, Config, ConfigError
+from common import overrides, Config, ConfigError, Localization
 from ..web_app import IHandler, WebApp
 from ..serialize import SerializeConfig
 
@@ -27,6 +27,29 @@ class ConfigHandler(IHandler):
         self.__config = config
         self.__breadcrumb_trace_sync = breadcrumb_trace_sync
         self.__write_lock = threading.Lock()
+
+    @staticmethod
+    def __is_blank_text(value) -> bool:
+        return value is None or (isinstance(value, str) and value.strip() == "")
+
+    @staticmethod
+    def __normalize_transfer_protocol_for_guard(value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @staticmethod
+    def __would_create_blank_ftps_password(inner_config, section: str, key: str, value) -> bool:
+        if section != "lftp":
+            return False
+
+        protocol = getattr(inner_config, "protocol", None)
+        remote_password = getattr(inner_config, "remote_password", None)
+        if key == "protocol":
+            protocol = value
+        elif key == "remote_password":
+            remote_password = value
+
+        protocol = ConfigHandler.__normalize_transfer_protocol_for_guard(protocol)
+        return protocol == "ftps" and ConfigHandler.__is_blank_text(remote_password)
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -92,6 +115,11 @@ class ConfigHandler(IHandler):
             return HTTPResponse(
                 body="Section '{}' option '{}' cannot be set via request body".format(section, key),
                 status=403
+            )
+        if ConfigHandler.__would_create_blank_ftps_password(inner_config, section, key, value):
+            return HTTPResponse(
+                body=Localization.Error.FTPS_TRANSFER_PASSWORD_REQUIRED,
+                status=400
             )
         with self.__write_lock:
             old_value = ConfigHandler.__read_current_value(inner_config, section, key)

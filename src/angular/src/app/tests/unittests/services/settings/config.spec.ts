@@ -29,7 +29,10 @@ describe("Testing config record initialization", () => {
                 use_temp_file: true,
                 rate_limit: "1M",
                 net_socket_buffer: "8M",
-                staging_path: "/some/local/path/incomplete"
+                staging_path: "/some/local/path/incomplete",
+                protocol: "ftps",
+                remote_ftp_port: 2121,
+                ftp_ssl_verify_certificate: true
             },
             controller: {
                 interval_ms_remote_scan: 30000,
@@ -76,6 +79,9 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.rate_limit).toBe("1M");
         expect(config.lftp.net_socket_buffer).toBe("8M");
         expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
+        expect(config.lftp.protocol).toBe("ftps");
+        expect(config.lftp.remote_ftp_port).toBe(2121);
+        expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
         expect(config.controller.interval_ms_remote_scan).toBe(30000);
         expect(config.controller.interval_ms_local_scan).toBe(10000);
         expect(config.controller.interval_ms_downloading_scan).toBe(1000);
@@ -114,6 +120,9 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
         expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
+        expect(partialConfig.getValue("lftp", "protocol")).toBe("sftp");
+        expect(partialConfig.getValue("lftp", "remote_ftp_port")).toBe(21);
+        expect(partialConfig.getValue("lftp", "ftp_ssl_verify_certificate")).toBe(true);
         expect(partialConfig.getValue("logging", "log_format")).toBe("standard");
         expect(partialConfig.getValue("missing", "value")).toBe(null);
     });

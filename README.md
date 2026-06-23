@@ -38,7 +38,8 @@ SeedSync will connect to your remote server and sync files to the local machine 
 they become available.
 
 You don't need to install anything on the remote server.
-All you need are the SSH credentials for the remote server.
+All you need are the SSH credentials for the remote server. Bulk transfers use SFTP by default.
+FTPS is available as an explicit opt-in transfer protocol in Settings; file discovery still uses SSH, and FTPS certificate verification is enabled by default.
 
 ## Recommended Workflow
 
@@ -66,6 +67,8 @@ Please refer to the documentation in this repository:
 If the remote scanner cannot copy to the configured `Server Script Path`, or the path collides with an existing `scanfs` directory, see the FAQ troubleshooting notes for the fallback and cleanup steps.
 
 If you enable the Staging Directory, mount `/staging` in Docker and set `lftp.staging_path` in Settings so in-progress downloads land on fast storage before moving to the final location.
+
+To use FTPS for bulk transfers, keep your SSH settings configured for file discovery, then choose `FTPS` under Settings > Transfer Protocol and set the remote FTP port. Leave certificate verification enabled unless you need the insecure compatibility mode for a self-signed or legacy server.
 
 ## Report an Issue
 

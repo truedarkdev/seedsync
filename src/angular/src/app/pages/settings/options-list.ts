@@ -6,6 +6,7 @@ export interface IOption {
     valuePath: [string, string];
     description: string;
     choices?: {label: string; value: any;}[];
+    disabledWhenSftp?: boolean;
 }
 export interface IOptionsContext {
     header: string;
@@ -33,7 +34,7 @@ export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
             type: OptionType.Password,
             label: "Server Password",
             valuePath: ["lftp", "remote_password"],
-            description: "Leave blank when using SSH key authentication."
+            description: "Leave blank when using SSH key authentication. FTPS requires a transfer password."
         },
         {
             type: OptionType.Checkbox,
@@ -53,6 +54,37 @@ export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
             valuePath: ["lftp", "remote_path_to_scan_script"],
             description: "Where to install scanner script on remote server"
         }
+    ]
+};
+
+export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
+    header: "Transfer Protocol",
+    id: "transfer-protocol",
+    options: [
+        {
+            type: OptionType.Select,
+            label: "Transfer Protocol",
+            valuePath: ["lftp", "protocol"],
+            description: "SFTP is the default. FTPS applies only to bulk file transfers; file discovery still uses SSH.",
+            choices: [
+                {label: "SFTP", value: "sftp"},
+                {label: "FTPS", value: "ftps"},
+            ],
+        },
+        {
+            type: OptionType.Text,
+            label: "Remote FTP Port",
+            valuePath: ["lftp", "remote_ftp_port"],
+            description: "Used only when Transfer Protocol is FTPS.",
+            disabledWhenSftp: true,
+        },
+        {
+            type: OptionType.Checkbox,
+            label: "Verify FTPS certificate",
+            valuePath: ["lftp", "ftp_ssl_verify_certificate"],
+            description: "Recommended. Turn off only for self-signed or legacy servers.",
+            disabledWhenSftp: true,
+        },
     ]
 };
 

@@ -41,6 +41,7 @@ T = TypeVar('T', bound='InnerConfig')
 _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORECASE)
 _LOG_LEVEL_VALUES = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
 _LOG_FORMAT_VALUES = frozenset(("standard", "json"))
+_TRANSFER_PROTOCOL_VALUES = frozenset(("sftp", "ftps"))
 
 
 def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
@@ -72,6 +73,23 @@ def _normalize_log_format(config_cls: Any, name: str, value: Any) -> str:
         ))
     if normalized not in _LOG_FORMAT_VALUES:
         raise ConfigError("Bad config: {}.{} ({}) must be either standard or json".format(
+            config_cls.__name__, name, value
+        ))
+    return normalized
+
+
+def _normalize_transfer_protocol(config_cls: Any, name: str, value: Any) -> str:
+    if not isinstance(value, str):
+        raise ConfigError("Bad config: {}.{} ({}) must be either sftp or ftps".format(
+            config_cls.__name__, name, value
+        ))
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ConfigError("Bad config: {}.{} is empty".format(
+            config_cls.__name__, name
+        ))
+    if normalized not in _TRANSFER_PROTOCOL_VALUES:
+        raise ConfigError("Bad config: {}.{} ({}) must be either sftp or ftps".format(
             config_cls.__name__, name, value
         ))
     return normalized
@@ -114,6 +132,10 @@ class Converters:
     def log_level(config_cls: Any, name: str, value: str) -> str:
         return _normalize_log_level(config_cls, name, value)
 
+    @staticmethod
+    def transfer_protocol(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_transfer_protocol(config_cls, name, value)
+
 
 class Checkers:
     @staticmethod
@@ -151,6 +173,10 @@ class Checkers:
     @staticmethod
     def log_format(config_cls: Any, name: str, value: str) -> str:
         return _normalize_log_format(config_cls, name, value)
+
+    @staticmethod
+    def transfer_protocol(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_transfer_protocol(config_cls, name, value)
 
     @staticmethod
     def int_non_negative(config_cls: Any, name: str, value: int) -> int:
@@ -460,6 +486,9 @@ class Config(Persist):
         rate_limit = PROP("rate_limit", Checkers.null, Converters.null)
         net_socket_buffer = PROP("net_socket_buffer", Checkers.byte_size_or_empty, Converters.null)
         staging_path = PROP("staging_path", Checkers.null, Converters.null)
+        protocol = PROP("protocol", Checkers.transfer_protocol, Converters.transfer_protocol)
+        remote_ftp_port = PROP("remote_ftp_port", Checkers.int_positive, Converters.int)
+        ftp_ssl_verify_certificate = PROP("ftp_ssl_verify_certificate", Checkers.bool_value, Converters.bool)
 
         def __init__(self):
             super().__init__()
@@ -480,15 +509,23 @@ class Config(Persist):
             self.rate_limit = None
             self.net_socket_buffer = None
             self.staging_path = None
+            self.protocol = "sftp"
+            self.remote_ftp_port = 21
+            self.ftp_ssl_verify_certificate = True
 
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            config_dict = dict(config_dict)
             if "net_socket_buffer" not in config_dict:
-                config_dict = dict(config_dict)
                 config_dict["net_socket_buffer"] = "8M"
             if "staging_path" not in config_dict:
-                config_dict = dict(config_dict)
                 config_dict["staging_path"] = ""
+            if "protocol" not in config_dict:
+                config_dict["protocol"] = "sftp"
+            if "remote_ftp_port" not in config_dict:
+                config_dict["remote_ftp_port"] = 21
+            if "ftp_ssl_verify_certificate" not in config_dict:
+                config_dict["ftp_ssl_verify_certificate"] = True
             return super().from_dict(config_dict)
 
     class Controller(IC):

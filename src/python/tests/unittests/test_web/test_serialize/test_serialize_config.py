@@ -61,6 +61,9 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.num_max_connections_per_dir_file = 3
         config.lftp.num_max_total_connections = 4
         config.lftp.net_socket_buffer = "512K"
+        config.lftp.protocol = "ftps"
+        config.lftp.remote_ftp_port = 2121
+        config.lftp.ftp_ssl_verify_certificate = True
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
@@ -77,6 +80,9 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(3, out_dict["lftp"]["num_max_connections_per_dir_file"])
         self.assertEqual(4, out_dict["lftp"]["num_max_total_connections"])
         self.assertEqual("512K", out_dict["lftp"]["net_socket_buffer"])
+        self.assertEqual("ftps", out_dict["lftp"]["protocol"])
+        self.assertEqual(2121, out_dict["lftp"]["remote_ftp_port"])
+        self.assertEqual(True, out_dict["lftp"]["ftp_ssl_verify_certificate"])
         self.assertNotIn("server.remote.com", out)
         self.assertNotIn("user-on-remote-server", out)
         self.assertNotIn("secret123", out)
@@ -93,6 +99,9 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.local_path = "/local/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
         config.lftp.net_socket_buffer = "8M"
+        config.lftp.protocol = "sftp"
+        config.lftp.remote_ftp_port = 21
+        config.lftp.ftp_ssl_verify_certificate = False
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
@@ -105,6 +114,9 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
         self.assertEqual("/remote/server/path/to/script", out_dict["lftp"]["remote_path_to_scan_script"])
         self.assertEqual("8M", out_dict["lftp"]["net_socket_buffer"])
+        self.assertEqual("sftp", out_dict["lftp"]["protocol"])
+        self.assertEqual(21, out_dict["lftp"]["remote_ftp_port"])
+        self.assertEqual(False, out_dict["lftp"]["ftp_ssl_verify_certificate"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
     def test_section_controller(self):
