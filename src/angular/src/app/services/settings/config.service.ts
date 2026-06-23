@@ -36,6 +36,13 @@ export class ConfigService extends BaseWebService {
     }
 
     /**
+     * Loads config from the backend without waiting for the SSE stream.
+     */
+    public refresh() {
+        this.getConfig();
+    }
+
+    /**
      * Sets a value in the config
      * @param {string} section
      * @param {string} option
@@ -77,7 +84,7 @@ export class ConfigService extends BaseWebService {
 
     protected onConnected() {
         // Retry the get
-        this.getConfig();
+        this.refresh();
     }
 
     protected onDisconnected() {
@@ -147,6 +154,8 @@ export let configServiceFactory = (
 ) => {
   const configService = new ConfigService(_streamServiceRegistry, _restService, _logger);
   configService.onInit();
+  // Bootstrap config even if the SSE stream is still waiting on auth.
+  configService.refresh();
   return configService;
 };
 
