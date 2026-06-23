@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 
 import bottle
 from bottle import HTTPResponse
@@ -25,6 +26,7 @@ class ConfigHandler(IHandler):
     def __init__(self, config: Config, breadcrumb_trace_sync=None):
         self.__config = config
         self.__breadcrumb_trace_sync = breadcrumb_trace_sync
+        self.__write_lock = threading.Lock()
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -91,19 +93,17 @@ class ConfigHandler(IHandler):
                 body="Section '{}' option '{}' cannot be set via request body".format(section, key),
                 status=403
             )
-        old_value = ConfigHandler.__read_current_value(inner_config, section, key)
-        updated_value = old_value
-        try:
-            inner_config.set_property(key, value)
-            updated_value = ConfigHandler.__read_current_value(inner_config, section, key)
-            self.__config.to_file()
-        except ConfigError as e:
-            return HTTPResponse(body=str(e), status=400)
-        except Exception:
-            if ConfigHandler.__read_current_value(inner_config, section, key) == updated_value:
+        with self.__write_lock:
+            old_value = ConfigHandler.__read_current_value(inner_config, section, key)
+            try:
+                inner_config.set_property(key, value)
+                self.__config.to_file()
+            except ConfigError as e:
+                return HTTPResponse(body=str(e), status=400)
+            except Exception:
                 ConfigHandler.__restore_previous_value(inner_config, section, key, old_value)
-            logger.exception("Failed to persist config %s.%s", section, key)
-            return HTTPResponse(body="Failed to persist config {}.{}".format(section, key), status=500)
+                logger.exception("Failed to persist config %s.%s", section, key)
+                return HTTPResponse(body="Failed to persist config {}.{}".format(section, key), status=500)
         if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
             self.__breadcrumb_trace_sync()
         if Config.is_sensitive_field(section, key):

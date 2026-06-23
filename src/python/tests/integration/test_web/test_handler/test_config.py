@@ -122,26 +122,72 @@ class TestConfigHandler(BaseTestWebApp):
         mock_to_file.assert_called_once()
         sync_hook.assert_not_called()
 
-    def test_set_persistence_failure_skips_rollback_when_concurrent_update(self):
+    def test_set_serializes_concurrent_writers(self):
+        import threading
+
         self.context.config.general.log_level = "INFO"
+        handler = self.web_app_builder.config_handler
         before_contents = self._read_config_contents()
 
-        def fail_then_simulate_concurrent_write(*_args, **_kwargs):
-            self.context.config.general.log_level = "WARNING"
+        enter_to_file = threading.Event()
+        release_to_file = threading.Event()
+        results = {"release_timeout": False}
+
+        class ProbingLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+                self.second_acquire_attempted = threading.Event()
+
+            def __enter__(self):
+                if self._lock.locked():
+                    self.second_acquire_attempted.set()
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                self._lock.release()
+                return False
+
+        handler._ConfigHandler__write_lock = ProbingLock()
+
+        def slow_failing_write(*_args, **_kwargs):
+            enter_to_file.set()
+            if not release_to_file.wait(timeout=5):
+                results["release_timeout"] = True
             raise OSError("disk full")
 
-        with patch.object(Config, "to_file", side_effect=fail_then_simulate_concurrent_write) as mock_to_file:
-            resp = self.test_app.post_json(
-                "/server/config/set/general/log_level",
-                {"value": "DEBUG"},
-                expect_errors=True
-            )
+        def writer_a():
+            with patch.object(Config, "to_file", side_effect=slow_failing_write):
+                response = handler._ConfigHandler__handle_set_config("general", "log_level", "DEBUG")
+                results["a"] = response.status_code
 
-        self.assertEqual(500, resp.status_int)
-        self.assertIn("Failed to persist config general.log_level", str(resp.html))
-        self.assertEqual("WARNING", self.context.config.general.log_level)
+        def writer_b():
+            response = handler._ConfigHandler__handle_set_config("general", "log_level", "WARNING")
+            results["b"] = response.status_code
+
+        t_a = threading.Thread(target=writer_a)
+        t_a.start()
+        self.assertTrue(enter_to_file.wait(timeout=5))
+
+        t_b = threading.Thread(target=writer_b)
+        t_b.start()
+        self.assertTrue(handler._ConfigHandler__write_lock.second_acquire_attempted.wait(timeout=5))
+
+        self.assertEqual("DEBUG", self.context.config.general.log_level)
         self.assertEqual(before_contents, self._read_config_contents())
-        mock_to_file.assert_called_once()
+        self.assertNotIn("b", results)
+
+        release_to_file.set()
+        t_a.join(timeout=10)
+        t_b.join(timeout=10)
+
+        self.assertFalse(t_a.is_alive())
+        self.assertFalse(t_b.is_alive())
+        self.assertFalse(results["release_timeout"])
+        self.assertEqual(500, results["a"])
+        self.assertEqual(200, results["b"])
+        self.assertEqual("WARNING", self.context.config.general.log_level)
+        self.assertIn("log_level = WARNING", self._read_config_contents())
 
     def test_set_redacted_sentinel_is_rejected_for_sensitive_fields(self):
         self.context.config.general.api_token = "existing-api-token"
