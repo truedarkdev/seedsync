@@ -831,9 +831,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 812 | `8806d96e96a3b9fa44a9b83ad03d5ff15d0d91ec` | 2026-05-17 | Merge pull request #493 from nitrobass24/dependabot/npm_and_yarn/website/postcss-8.5.14 | covered elsewhere - merge wrapper for row `811` |
 | 813 | `b5aa1b15da2671a78d2d32074c28f1d7a38c3d98` | 2026-05-18 | Add notify_on_download_start option (#486) | needs new integration task - belongs with existing task `notify-download-start-row813`; upstream introduces `notify_on_download_start` across backend config, notification plumbing, Angular settings UI, and tests, so it needs a dedicated feature lane rather than a drive-by import in the audit pass |
 | 814 | `eedf8631994dbf497584f91ce41923ab631562e0` | 2026-05-19 | Merge pull request #494 from nitrobass24/feat/notify-download-start | covered elsewhere - merge wrapper for row `813` |
-| 815 | `e20d02aca74eab906a2427b384bbf47fcce13845` | 2026-05-19 | Roll back config handler on persistence failure (#469.2) | pending |
-| 816 | `8d107e8100e1599c01ee6c0e146965985c587cff` | 2026-05-19 | Skip rollback when concurrent update changed the value | pending |
-| 817 | `155ac1b3f4a03955418ef409caed98b42113d3cd` | 2026-05-19 | Apply ruff format to test_config.py | pending |
+| 815 | `e20d02aca74eab906a2427b384bbf47fcce13845` | 2026-05-19 | Roll back config handler on persistence failure (#469.2) | adapted locally - config handler now persists after mutation, restores the prior value only when the failing request still owns the current in-memory value, and defers the breadcrumb sync callback until the write succeeds |
+| 816 | `8d107e8100e1599c01ee6c0e146965985c587cff` | 2026-05-19 | Skip rollback when concurrent update changed the value | adapted locally - the rollback guard skips stale restoration when another request has already changed the field |
+| 817 | `155ac1b3f4a03955418ef409caed98b42113d3cd` | 2026-05-19 | Apply ruff format to test_config.py | adapted locally - formatting-only cleanup around the touched config handler tests |
 | 818 | `2b907cbad366945c4613303e4e4a9fd74d7d25cc` | 2026-05-19 | Serialize config writers with a per-handler lock | pending |
 | 819 | `eda0a369d03bbdcbca21a9c04fb1bbc06273cba2` | 2026-05-19 | Merge pull request #495 from nitrobass24/fix/config-handler-atomicity | pending |
 | 820 | `4ea8f6c1e05409a869415c5e70b08f5e408284d0` | 2026-05-19 | Persist path_pairs before integrations on detach (#469.3) | pending |

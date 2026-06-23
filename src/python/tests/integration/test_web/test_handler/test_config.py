@@ -1,12 +1,24 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import json
+import os
+from unittest.mock import MagicMock, patch
 
 from common import Config
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
 class TestConfigHandler(BaseTestWebApp):
+    def setUp(self):
+        super().setUp()
+        self.config_path = os.path.join(self.temp_dir, "settings.cfg")
+        self.context.config.file_path = self.config_path
+        self.context.config.to_file()
+
+    def _read_config_contents(self):
+        with open(self.config_path, "r", encoding="utf-8") as config_file:
+            return config_file.read()
+
     def test_get(self):
         self.context.config.general.log_level = "DEBUG"
         self.context.config.general.api_token = "super-secret-token"
@@ -66,6 +78,70 @@ class TestConfigHandler(BaseTestWebApp):
         resp = self.test_app.post_json("/server/config/set/web/port", {"value": 8080})
         self.assertEqual(200, resp.status_int)
         self.assertEqual(8080, self.context.config.web.port)
+
+        persisted_contents = self._read_config_contents()
+        self.assertIn("log_level = DEBUG", persisted_contents)
+        self.assertIn("breadcrumb_trace_enabled = True", persisted_contents)
+        self.assertIn("remote_path = /path/to/somewhere", persisted_contents)
+        self.assertIn("port = 8080", persisted_contents)
+
+    def test_set_persistence_failure_rolls_back(self):
+        self.context.config.general.log_level = "INFO"
+        before_contents = self._read_config_contents()
+
+        with patch.object(Config, "to_file", side_effect=OSError("disk full")) as mock_to_file:
+            resp = self.test_app.post_json(
+                "/server/config/set/general/log_level",
+                {"value": "DEBUG"},
+                expect_errors=True
+            )
+
+        self.assertEqual(500, resp.status_int)
+        self.assertIn("Failed to persist config general.log_level", str(resp.html))
+        self.assertEqual("INFO", self.context.config.general.log_level)
+        self.assertEqual(before_contents, self._read_config_contents())
+        mock_to_file.assert_called_once()
+
+    def test_set_persistence_failure_skips_callback_and_rolls_back(self):
+        self.context.config.general.breadcrumb_trace_enabled = False
+        sync_hook = MagicMock()
+        self.web_app_builder.config_handler._ConfigHandler__breadcrumb_trace_sync = sync_hook
+        before_contents = self._read_config_contents()
+
+        with patch.object(Config, "to_file", side_effect=OSError("disk full")) as mock_to_file:
+            resp = self.test_app.post_json(
+                "/server/config/set/general/breadcrumb_trace_enabled",
+                {"value": True},
+                expect_errors=True
+            )
+
+        self.assertEqual(500, resp.status_int)
+        self.assertIn("Failed to persist config general.breadcrumb_trace_enabled", str(resp.html))
+        self.assertEqual(False, self.context.config.general.breadcrumb_trace_enabled)
+        self.assertEqual(before_contents, self._read_config_contents())
+        mock_to_file.assert_called_once()
+        sync_hook.assert_not_called()
+
+    def test_set_persistence_failure_skips_rollback_when_concurrent_update(self):
+        self.context.config.general.log_level = "INFO"
+        before_contents = self._read_config_contents()
+
+        def fail_then_simulate_concurrent_write(*_args, **_kwargs):
+            self.context.config.general.log_level = "WARNING"
+            raise OSError("disk full")
+
+        with patch.object(Config, "to_file", side_effect=fail_then_simulate_concurrent_write) as mock_to_file:
+            resp = self.test_app.post_json(
+                "/server/config/set/general/log_level",
+                {"value": "DEBUG"},
+                expect_errors=True
+            )
+
+        self.assertEqual(500, resp.status_int)
+        self.assertIn("Failed to persist config general.log_level", str(resp.html))
+        self.assertEqual("WARNING", self.context.config.general.log_level)
+        self.assertEqual(before_contents, self._read_config_contents())
+        mock_to_file.assert_called_once()
 
     def test_set_redacted_sentinel_is_rejected_for_sensitive_fields(self):
         self.context.config.general.api_token = "existing-api-token"

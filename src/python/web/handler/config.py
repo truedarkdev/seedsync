@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import json
+import logging
 
 import bottle
 from bottle import HTTPResponse
@@ -8,6 +9,8 @@ from bottle import HTTPResponse
 from common import overrides, Config, ConfigError
 from ..web_app import IHandler, WebApp
 from ..serialize import SerializeConfig
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigHandler(IHandler):
@@ -47,6 +50,19 @@ class ConfigHandler(IHandler):
             raise ValueError("Missing config value")
         return json.loads(raw_body)
 
+    @staticmethod
+    def __read_current_value(inner_config, section: str, key: str):
+        if section == "general" and key == "debug":
+            return getattr(inner_config, "log_level", None) == "DEBUG"
+        return getattr(inner_config, key)
+
+    @staticmethod
+    def __restore_previous_value(inner_config, section: str, key: str, value):
+        if section == "general" and key == "debug":
+            inner_config.set_property("debug", value)
+            return
+        inner_config.set_property(key, value)
+
     def __handle_set_config(self, section: str, key: str, value=None):
         if value is None:
             try:
@@ -75,16 +91,25 @@ class ConfigHandler(IHandler):
                 body="Section '{}' option '{}' cannot be set via request body".format(section, key),
                 status=403
             )
+        old_value = ConfigHandler.__read_current_value(inner_config, section, key)
+        updated_value = old_value
         try:
             inner_config.set_property(key, value)
-            if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
-                self.__breadcrumb_trace_sync()
-            if Config.is_sensitive_field(section, key):
-                response_value = Config.REDACTED_SENTINEL
-            elif isinstance(getattr(type(inner_config), key, None), property):
-                response_value = getattr(inner_config, key)
-            else:
-                response_value = value
-            return HTTPResponse(body="{}.{} set to {}".format(section, key, response_value))
+            updated_value = ConfigHandler.__read_current_value(inner_config, section, key)
+            self.__config.to_file()
         except ConfigError as e:
             return HTTPResponse(body=str(e), status=400)
+        except Exception:
+            if ConfigHandler.__read_current_value(inner_config, section, key) == updated_value:
+                ConfigHandler.__restore_previous_value(inner_config, section, key, old_value)
+            logger.exception("Failed to persist config %s.%s", section, key)
+            return HTTPResponse(body="Failed to persist config {}.{}".format(section, key), status=500)
+        if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
+            self.__breadcrumb_trace_sync()
+        if Config.is_sensitive_field(section, key):
+            response_value = Config.REDACTED_SENTINEL
+        elif isinstance(getattr(type(inner_config), key, None), property):
+            response_value = getattr(inner_config, key)
+        else:
+            response_value = value
+        return HTTPResponse(body="{}.{} set to {}".format(section, key, response_value))

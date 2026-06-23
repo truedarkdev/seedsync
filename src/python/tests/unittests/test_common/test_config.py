@@ -864,6 +864,14 @@ class TestConfig(unittest.TestCase):
         finally:
             os.remove(config_file_path)
 
+    def test_to_file_requires_bound_path(self):
+        config = Config()
+
+        with self.assertRaises(PersistError) as error:
+            config.to_file()
+
+        self.assertEqual("Config file path is not bound", str(error.exception))
+
     def test_persist_read_error(self):
         # bad section
         content = """
