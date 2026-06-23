@@ -2,7 +2,7 @@ import {CommonModule} from "@angular/common";
 import {ComponentFixture, fakeAsync, TestBed, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
 
-import {OptionComponent, OptionType} from "../../../../pages/settings/option.component";
+import {DEBOUNCE_TIME_MS, OptionComponent, OptionType} from "../../../../pages/settings/option.component";
 
 
 describe("Testing option component", () => {
@@ -42,7 +42,7 @@ describe("Testing option component", () => {
         select.value = "json";
         select.dispatchEvent(new Event("change"));
 
-        tick(1000);
+        tick(DEBOUNCE_TIME_MS);
 
         expect(changeSpy).toHaveBeenCalledWith("json");
     }));

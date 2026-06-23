@@ -786,11 +786,11 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 767 | `a958f6abccb96910397c0a29c5d956eccff9ef15` | 2026-05-05 | Address round-2 CodeRabbit test-quality findings (#470) | covered elsewhere - local HEAD has no `src/e2e-playwright` tree or `PathPairsConfig` symbol, and the overlapping Python test hardening is already present in `test_active_scanner.py` and `test_web_app_job.py` |
 | 768 | `65c1339e084860f98194c1d365903d9a9c1fc4c6` | 2026-05-05 | Address round-3 CodeRabbit findings (#471) | covered elsewhere - local HEAD has no `CHANGELOG.md` or `src/e2e-playwright` tree, and the local Angular/Python test layout already avoids the snapshot-helper and notification-array indexing shapes from the upstream round |
 | 769 | `7cc5de450e9a747be57075645e123eb3bc9995d9` | 2026-05-05 | Pin Python builder to alpine3.23 to match the runtime stage (#472) | intentionally skipped - local Dockerfile already uses Debian-slim builder/runtime stages (`python:3.11-slim-buster` -> `python:3.12-slim-bullseye`), so the Alpine 3.23 pin does not apply |
-| 770 | `a317805215bf22bf9f3b7c989b07c818bc1d4960` | 2026-05-05 | Address round-4 CodeRabbit findings on PR #467 | pending |
-| 771 | `e0f7ee6e352d808d44e76d9218677d716b54dd95` | 2026-05-05 | Address round-5 CodeRabbit findings on PR #467 | pending |
-| 772 | `1c3241c23e49e53a3194f9d752e994e4507c8d57` | 2026-05-05 | Address round-6 CodeRabbit findings on PR #467 | pending |
-| 773 | `5bc7aa5ceef3ae4d61890b80c1aa11ad65d409c1` | 2026-05-06 | Address round-7 CodeRabbit findings on PR #467 | pending |
-| 774 | `686d6f2df1c34d58cae098fffefbc88836cb4573` | 2026-05-06 | Merge pull request #467 from nitrobass24/develop | pending |
+| 770 | `a317805215bf22bf9f3b7c989b07c818bc1d4960` | 2026-05-05 | Address round-4 CodeRabbit findings on PR #467 | adapted locally; active-scanner log-level assertion added, while the upstream Dockerfile/Playwright patterns are absent or not applicable locally |
+| 771 | `e0f7ee6e352d808d44e76d9218677d716b54dd95` | 2026-05-05 | Address round-5 CodeRabbit findings on PR #467 | adapted locally; option debounce constant and path-pair update coverage added, while the upstream Dockerfile/Playwright/web-job patterns are absent or not applicable locally |
+| 772 | `1c3241c23e49e53a3194f9d752e994e4507c8d57` | 2026-05-05 | Address round-6 CodeRabbit findings on PR #467 | adapted locally; unused version-check import removed and no extra settings surface is needed |
+| 773 | `5bc7aa5ceef3ae4d61890b80c1aa11ad65d409c1` | 2026-05-06 | Address round-7 CodeRabbit findings on PR #467 | covered elsewhere; CHANGELOG.md is absent locally and the remaining spec cleanups are represented in rows 771-772 |
+| 774 | `686d6f2df1c34d58cae098fffefbc88836cb4573` | 2026-05-06 | Merge pull request #467 from nitrobass24/develop | covered elsewhere; merge wrapper only |
 | 775 | `4bbe4cf02f4fe3be42eeb22a66fdfb90f9ace07f` | 2026-05-13 | Update README to remove fork note | pending |
 | 776 | `96f71f51bbef72cf18a3213627a75f232f237314` | 2026-05-07 | chore(deps): bump ip-address and express-rate-limit in /src/angular | pending |
 | 777 | `973d4fb235d609cffaa140fecd7a68230d041858` | 2026-05-06 | Merge pull request #473 from nitrobass24/dependabot/npm_and_yarn/src/angular/multi-7bdfbe8666 | pending |

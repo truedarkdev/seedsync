@@ -99,6 +99,42 @@ describe("Testing path pair service", () => {
         httpMock.verify();
     });
 
+    it("should include warnings in update responses and refresh the list", () => {
+        httpMock.expectOne("/server/path-pairs").flush({success: true, data: []});
+
+        let warnings: string[] = [];
+        pathPairService.update({
+            id: "movies",
+            name: "Movies",
+            remote_path: "/remote/movies",
+            local_path: "/media/movies",
+            enabled: true,
+            auto_queue: true
+        }).subscribe({
+            next: result => warnings = result.warnings
+        });
+
+        const updateRequest = httpMock.expectOne("/server/path-pairs/movies");
+        expect(updateRequest.request.method).toBe("PUT");
+        updateRequest.flush({
+            success: true,
+            data: {
+                id: "movies",
+                name: "Movies",
+                remote_path: "/remote/movies",
+                local_path: "/media/movies",
+                enabled: true,
+                auto_queue: true
+            },
+            warnings: ["Docker path warning"]
+        });
+
+        httpMock.expectOne("/server/path-pairs").flush({success: true, data: []});
+
+        expect(warnings).toEqual(["Docker path warning"]);
+        httpMock.verify();
+    });
+
     it("should reorder path pairs and publish the new order", () => {
         httpMock.expectOne("/server/path-pairs").flush({success: true, data: []});
 

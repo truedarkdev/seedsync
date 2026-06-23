@@ -62,15 +62,16 @@ class TestActiveScanner(unittest.TestCase):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
         self.addCleanup(scanner.close)
         scanner.set_active_files(["download.zip"])
-        scanner.logger = MagicMock()
 
         with open(os.path.join(self.temp_dir, "download.zip.lftp.lftp-pget-status"), "w") as handle:
             handle.write("size=-2\n0.pos=0\n")
 
-        files = scanner.scan()
+        with self.assertLogs("ActiveScanner", level="DEBUG") as captured:
+            files = scanner.scan()
 
         self.assertEqual([], files)
-        scanner.logger.warning.assert_called_once()
+        self.assertEqual(1, len(captured.output))
+        self.assertTrue(captured.output[0].startswith("WARNING:ActiveScanner:"))
 
     def test_scan_returns_malformed_status_only_file_ids(self):
         scanner = ActiveScanner(self.temp_dir, use_temp_file=True)
