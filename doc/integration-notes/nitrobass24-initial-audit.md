@@ -895,13 +895,13 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 876 | `0043d5e0e3167ebd381419d4c1a3627466d33075` | 2026-06-02 | Bound worker joins in Controller.exit() (#537 review) | adapted locally in `src/python/controller/controller.py` and `src/python/tests/unittests/test_controller/test_controller.py`; `Controller.exit()` now bounds worker joins and warns if a worker is still alive after the timeout |
 | 877 | `bd61dd285b645d697a860d708d1912ceb9927138` | 2026-06-02 | Assert join in partial-start teardown test (#537 review) | adapted locally in `src/python/tests/unittests/test_controller/test_controller.py`; the partial-start teardown test now asserts the bounded join path, the failed-start process rejection, and terminate/close cleanup |
 | 878 | `416047c4bc98744646860fabc649eeee5a5562e2` | 2026-06-02 | Merge pull request #537 from nitrobass24/fix/backend-bugs-bucket-531 | covered elsewhere - merge wrapper for rows `873`-`877` |
-| 879 | `7509a76491eba9012885a0a8fb6c4eec15db96eb` | 2026-06-02 | Fix auth-enabled init deadlock: bootstrap config off the stream + persist api key (#514) | pending |
-| 880 | `4f8b5a570e7d8a5e6a5b1ef8b3065d66ff2cefff` | 2026-06-02 | Guard SSE handler JSON.parse with try/catch (#516) | pending |
-| 881 | `f9cf2cceb4ec6f5140386d48c1c251f37524cf67` | 2026-06-02 | Surface single-file action errors and recover stuck rows (#513) | pending |
-| 882 | `e6788e83e5bd922428cc331f6658d0a19022ab23` | 2026-06-02 | Require two-click confirm for bulk Delete Local/Remote (#515) | pending |
-| 883 | `faa9a077b2ea5cd65eb135da7a6a0e462c529125` | 2026-06-02 | Reuse the shared REDACTED_SENTINEL constant (#514 review) | pending |
-| 884 | `db22d895518bb63785e8b464973ea8e8b65f22ac` | 2026-06-02 | Complete #516: autoqueue parse guard, log-history failure state, path-pair toggle errors | pending |
-| 885 | `81e358bdcb301941473bcc0d66f664dac3cdff36` | 2026-06-02 | Don't persist the api_key client-side (#514 / CodeQL) | pending |
+| 879 | `7509a76491eba9012885a0a8fb6c4eec15db96eb` | 2026-06-02 | Fix auth-enabled init deadlock: bootstrap config off the stream + persist api key (#514) | adapted locally in `src/angular/src/app/services/settings/config.service.ts` and `src/angular/src/app/tests/unittests/services/settings/config.service.spec.ts`; config now refreshes independently of SSE so auth-enabled startup can bootstrap before the stream connects, while reconnects still refresh; the upstream client-side API-key persistence half is intentionally excluded per row `885` |
+| 880 | `4f8b5a570e7d8a5e6a5b1ef8b3065d66ff2cefff` | 2026-06-02 | Guard SSE handler JSON.parse with try/catch (#516) | already integrated |
+| 881 | `f9cf2cceb4ec6f5140386d48c1c251f37524cf67` | 2026-06-02 | Surface single-file action errors and recover stuck rows (#513) | already integrated |
+| 882 | `e6788e83e5bd922428cc331f6658d0a19022ab23` | 2026-06-02 | Require two-click confirm for bulk Delete Local/Remote (#515) | already integrated |
+| 883 | `faa9a077b2ea5cd65eb135da7a6a0e462c529125` | 2026-06-02 | Reuse the shared REDACTED_SENTINEL constant (#514 review) | covered elsewhere - superseded by the no-client-side-persistence outcome; this branch has no local API-key storage path to reuse the sentinel in |
+| 884 | `db22d895518bb63785e8b464973ea8e8b65f22ac` | 2026-06-02 | Complete #516: autoqueue parse guard, log-history failure state, path-pair toggle errors | already integrated |
+| 885 | `81e358bdcb301941473bcc0d66f664dac3cdff36` | 2026-06-02 | Don't persist the api_key client-side (#514 / CodeQL) | already integrated - the branch does not add client-side API-key persistence |
 | 886 | `257d4806c20819471e743933a5e9f02791e311c3` | 2026-06-02 | Use a distinct class for the log-history error banner (#516 / E2E) | pending |
 | 887 | `d9598496e1fcc96d0ca16ce016bc88adbbdd8bfb` | 2026-06-02 | Address CodeRabbit review on #538 | pending |
 | 888 | `1f0db282c7a2c8ea717977cbaaa96eec81e54f3c` | 2026-06-02 | Merge pull request #538 from nitrobass24/fix/frontend-bugs-bucket-531 | pending |

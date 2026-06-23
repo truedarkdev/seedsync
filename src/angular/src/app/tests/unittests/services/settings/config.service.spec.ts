@@ -57,6 +57,38 @@ describe("Testing config service", () => {
         expect(configService).toBeDefined();
     });
 
+    it("should refresh config before any SSE connection is established", () => {
+        const standaloneRegistry = {
+            connectedService: new ConnectedService()
+        } as StreamServiceRegistry;
+        const standaloneService = new ConfigService(
+            standaloneRegistry,
+            TestBed.get(RestService),
+            TestBed.get(LoggerService)
+        );
+
+        standaloneService.onInit();
+
+        let latestConfig = null;
+        standaloneService.config.subscribe({
+            next: config => {
+                latestConfig = config;
+            }
+        });
+
+        httpMock.expectOne("/server/config/get").flush({});
+        standaloneService.refresh();
+        httpMock.expectOne("/server/config/get").flush({
+            general: {
+                log_level: "DEBUG"
+            }
+        });
+
+        expect(latestConfig).not.toBe(null);
+        expect(latestConfig.general.log_level).toBe("DEBUG");
+        httpMock.verify();
+    });
+
     it("should parse config json correctly", () => {
         const configJson = {
             general: {
