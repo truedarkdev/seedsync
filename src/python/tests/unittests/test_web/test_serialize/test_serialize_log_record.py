@@ -284,6 +284,19 @@ class TestRedactSensitive(unittest.TestCase):
         self.assertIn("sftp://", result)
         self.assertIn("**REDACTED**", result)
 
+    def test_redact_ftp_and_ftps_urls_with_reserved_characters(self):
+        result = SerializeLogRecord._redact_sensitive(
+            "Connecting to ftp://alice:pa:ss@seedbox.example.com/downloads "
+            "and ftps://bob:pa/ss@mirror.example.net:21/files"
+        )
+
+        self.assertNotIn("pa:ss", result)
+        self.assertNotIn("pa/ss", result)
+        self.assertNotIn("seedbox.example.com", result)
+        self.assertNotIn("mirror.example.net", result)
+        self.assertIn("ftp://**REDACTED**@**REDACTED**/downloads", result)
+        self.assertIn("ftps://**REDACTED**@**REDACTED**:21/files", result)
+
     def test_redact_ssh_command_args_user_at_host(self):
         result = SerializeLogRecord._redact_sensitive(
             "Command: ['ssh', '-p', '22', 'myuser@seedbox.example.com', 'ls']"

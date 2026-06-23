@@ -9,3 +9,4 @@ class Localization:
         LOCAL_SERVER_SCAN = "An error occurred while scanning the local system."
         SETTINGS_INCOMPLETE = "The settings are not fully configured."
         SETTINGS_INCOMPLETE_FIELDS = "Please configure the following settings: {}"
+        FTPS_TRANSFER_PASSWORD_REQUIRED = "FTPS requires a transfer password."

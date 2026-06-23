@@ -153,8 +153,12 @@ class Controller:
         # even when key-based auth is enabled. Password auth is conditional.
         _append_missing("Lftp", "remote_address", getattr(lftp_cfg, "remote_address", None))
         _append_missing("Lftp", "remote_username", getattr(lftp_cfg, "remote_username", None))
-        if getattr(lftp_cfg, "use_ssh_key", None) is False:
+        transfer_protocol = getattr(lftp_cfg, "protocol", "sftp")
+        _append_missing("Lftp", "protocol", transfer_protocol)
+        if getattr(lftp_cfg, "use_ssh_key", None) is False or transfer_protocol == "ftps":
             _append_missing("Lftp", "remote_password", getattr(lftp_cfg, "remote_password", None))
+        if transfer_protocol == "ftps":
+            _append_missing("Lftp", "remote_ftp_port", getattr(lftp_cfg, "remote_ftp_port", None))
         for field_name in (
             "remote_port",
             "remote_path_to_scan_script",
@@ -207,6 +211,8 @@ class Controller:
         self.__context.status.server.error_msg = error_message
         self.logger.error(error_message)
         self.__password = None
+        self.__ssh_password = None
+        self.__transfer_password = None
         self.__legacy_local_path = None
         self.__legacy_remote_path = None
         self.__staging_path = ""
@@ -298,7 +304,11 @@ class Controller:
         lftp_cfg = config.lftp
         controller_cfg = config.controller
         general_cfg = config.general
-        self.__password = lftp_cfg.remote_password if not lftp_cfg.use_ssh_key else None
+        self.__ssh_password = lftp_cfg.remote_password if not lftp_cfg.use_ssh_key else None
+        self.__transfer_password = (
+            lftp_cfg.remote_password if lftp_cfg.protocol == "ftps" else self.__ssh_password
+        )
+        self.__password = self.__ssh_password
 
         enabled_path_pairs = self.__get_enabled_path_pairs()
         first_path_pair = enabled_path_pairs[0] if enabled_path_pairs else None
@@ -318,7 +328,10 @@ class Controller:
         self.__lftp = Lftp(address=lftp_cfg.remote_address,
                            port=lftp_cfg.remote_port,
                            user=lftp_cfg.remote_username,
-                           password=self.__password)
+                           password=self.__transfer_password,
+                           protocol=lftp_cfg.protocol,
+                           remote_ftp_port=lftp_cfg.remote_ftp_port,
+                           ssl_verify_certificate=lftp_cfg.ftp_ssl_verify_certificate)
         self.__lftp.set_base_logger(self.logger)
         self.__lftp.set_base_remote_dir_path(self.__legacy_remote_path)
         self.__lftp.set_base_local_dir_path(self.__staging_path)
@@ -353,7 +366,7 @@ class Controller:
         self.__validate_process = ValidateProcess(
             remote_address=lftp_cfg.remote_address,
             remote_username=lftp_cfg.remote_username,
-            remote_password=self.__password,
+            remote_password=self.__ssh_password,
             remote_port=lftp_cfg.remote_port,
             local_path=self.__legacy_local_path,
             remote_path=self.__legacy_remote_path,
@@ -565,7 +578,7 @@ class Controller:
                 RemoteScanner(
                     remote_address=config.lftp.remote_address,
                     remote_username=config.lftp.remote_username,
-                    remote_password=self.__password,
+                    remote_password=self.__ssh_password,
                     remote_port=config.lftp.remote_port,
                     remote_path_to_scan=pair.remote_path,
                     local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
@@ -577,7 +590,7 @@ class Controller:
         return RemoteScanner(
             remote_address=config.lftp.remote_address,
             remote_username=config.lftp.remote_username,
-            remote_password=self.__password,
+            remote_password=self.__ssh_password,
             remote_port=config.lftp.remote_port,
             remote_path_to_scan=self.__legacy_remote_path,
             local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
@@ -2002,7 +2015,7 @@ class Controller:
                     process = DeleteRemoteProcess(
                         remote_address=config.lftp.remote_address,
                         remote_username=config.lftp.remote_username,
-                        remote_password=self.__password,
+                        remote_password=self.__ssh_password,
                         remote_port=config.lftp.remote_port,
                         remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
                         else self.__legacy_remote_path,

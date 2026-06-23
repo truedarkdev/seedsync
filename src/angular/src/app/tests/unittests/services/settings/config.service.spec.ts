@@ -6,6 +6,7 @@ import * as Immutable from "immutable";
 import {ConfigService} from "../../../../services/settings/config.service";
 import {LoggerService} from "../../../../services/utils/logger.service";
 import {Config} from "../../../../services/settings/config";
+import {Localization} from "../../../../common/localization";
 import {MockStreamServiceRegistry} from "../../../mocks/mock-stream-service.registry";
 import {ConnectedService} from "../../../../services/utils/connected.service";
 import {RestService} from "../../../../services/utils/rest.service";
@@ -113,6 +114,9 @@ describe("Testing config service", () => {
                 rate_limit: "1M",
                 net_socket_buffer: "8M",
                 staging_path: "/some/local/path/incomplete",
+                protocol: "ftps",
+                remote_ftp_port: 2121,
+                ftp_ssl_verify_certificate: true,
             },
             controller: {
                 interval_ms_remote_scan: 30000,
@@ -153,6 +157,9 @@ describe("Testing config service", () => {
                 expect(config.lftp.rate_limit).toBe("1M");
                 expect(config.lftp.net_socket_buffer).toBe("8M");
                 expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
+                expect(config.lftp.protocol).toBe("ftps");
+                expect(config.lftp.remote_ftp_port).toBe(2121);
+                expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
                 expect(config.controller.interval_ms_remote_scan).toBe(30000);
                 expect(config.controller.interval_ms_local_scan).toBe(10000);
                 expect(config.controller.interval_ms_downloading_scan).toBe(1000);
@@ -399,12 +406,41 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
-    it("should allow empty remote password values", () => {
-        httpMock.expectOne("/server/config/get").flush({lftp: {remote_password: "initial"}});
+    it("should allow empty remote password values for SFTP key auth", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            lftp: {
+                remote_password: "initial",
+                use_ssh_key: true,
+                protocol: "sftp",
+            }
+        });
 
         configService.set("lftp", "remote_password", "").subscribe(DoNothing);
 
         expectConfigSetRequest("lftp", "remote_password", "");
+        httpMock.verify();
+    });
+
+    it("should reject ftps when the transfer password would be blank", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            lftp: {
+                remote_password: "",
+                use_ssh_key: true,
+                protocol: "sftp",
+            }
+        });
+
+        let configSubscriberIndex = 0;
+        configService.set("lftp", "protocol", "ftps").subscribe({
+            next: reaction => {
+                configSubscriberIndex++;
+                expect(reaction.success).toBe(false);
+                expect(reaction.errorMessage).toBe(Localization.Notification.FTPS_TRANSFER_PASSWORD_REQUIRED);
+            }
+        });
+
+        expect(configSubscriberIndex).toBe(1);
+        httpMock.expectNone("/server/config/set/lftp/protocol");
         httpMock.verify();
     });
 

@@ -42,6 +42,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__context.config.lftp.net_socket_buffer = ""
         self.controller._Controller__password = None
+        self.controller._Controller__ssh_password = None
+        self.controller._Controller__transfer_password = None
         self.controller._Controller__legacy_local_path = "/local"
         self.controller._Controller__legacy_remote_path = "/remote"
         self.controller._Controller__persist = MagicMock()
@@ -137,6 +139,9 @@ class TestController(unittest.TestCase):
         use_ssh_key=False,
         verbose=False,
         auto_delete_remote=False,
+        protocol="sftp",
+        remote_ftp_port=21,
+        ftp_ssl_verify_certificate=True,
     ):
         return SimpleNamespace(
             logger=MagicMock(),
@@ -160,6 +165,9 @@ class TestController(unittest.TestCase):
                     rate_limit=None,
                     net_socket_buffer="8M",
                     staging_path=None,
+                    protocol=protocol,
+                    remote_ftp_port=remote_ftp_port,
+                    ftp_ssl_verify_certificate=ftp_ssl_verify_certificate,
                 ),
                 controller=SimpleNamespace(
                     interval_ms_remote_scan=1,
@@ -256,6 +264,56 @@ class TestController(unittest.TestCase):
 
         self.assertIsNone(controller._Controller__startup_validation_error)
         self.assertTrue(mock_lftp.called)
+
+    def test_constructor_passes_sftp_defaults_to_lftp(self):
+        context = self._make_startup_context(local_path="/local")
+
+        with patch("controller.controller.Lftp") as mock_lftp:
+            Controller(context, ControllerPersist())
+
+        mock_lftp.assert_called_once()
+        kwargs = mock_lftp.call_args.kwargs
+        self.assertEqual(22, kwargs["port"])
+        self.assertEqual("password", kwargs["password"])
+        self.assertEqual("sftp", kwargs["protocol"])
+        self.assertEqual(21, kwargs["remote_ftp_port"])
+        self.assertEqual(True, kwargs["ssl_verify_certificate"])
+
+    def test_constructor_passes_ftps_transfer_password_without_forcing_ssh_password(self):
+        context = self._make_startup_context(
+            local_path="/local",
+            use_ssh_key=True,
+            protocol="ftps",
+            remote_ftp_port=2121,
+            ftp_ssl_verify_certificate=True,
+        )
+
+        with patch("controller.controller.Lftp") as mock_lftp:
+            controller = Controller(context, ControllerPersist())
+
+        kwargs = mock_lftp.call_args.kwargs
+        self.assertEqual(22, kwargs["port"])
+        self.assertEqual("password", kwargs["password"])
+        self.assertEqual("ftps", kwargs["protocol"])
+        self.assertEqual(2121, kwargs["remote_ftp_port"])
+        self.assertEqual(True, kwargs["ssl_verify_certificate"])
+        self.assertIsNone(controller._Controller__ssh_password)
+        self.assertEqual("password", controller._Controller__transfer_password)
+
+    def test_constructor_requires_password_for_ftps_even_when_ssh_key_is_enabled(self):
+        context = self._make_startup_context(
+            local_path="/local",
+            remote_password="",
+            use_ssh_key=True,
+            protocol="ftps",
+        )
+
+        with patch("controller.controller.Lftp") as mock_lftp:
+            controller = Controller(context, ControllerPersist())
+
+        self.assertIsNotNone(controller._Controller__startup_validation_error)
+        self.assertIn("Lftp.remote_password", controller._Controller__startup_validation_error)
+        mock_lftp.assert_not_called()
 
     def test_constructor_uses_path_pair_fallback_when_legacy_paths_missing(self):
         manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))

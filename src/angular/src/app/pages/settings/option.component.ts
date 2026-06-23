@@ -19,6 +19,7 @@ export class OptionComponent implements OnInit {
     @Input() value: any;
     @Input() description: string;
     @Input() choices: IOptionChoice[];
+    @Input() disabled = false;
 
     @Output() changeEvent = new EventEmitter<any>();
 

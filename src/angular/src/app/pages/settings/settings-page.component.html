@@ -18,6 +18,7 @@
                             [label]="option.label"
                             [description]="option.description"
                             [choices]="option.choices"
+                            [disabled]="isOptionDisabled(option, config | async)"
                             [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
                             (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
                         </app-option>
@@ -42,6 +43,11 @@
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_SERVER">
+            </ng-container>
+
+            <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
+            <ng-container
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_DISCOVERY">
             </ng-container>
 
             <div class="card custom-section-card">
@@ -106,7 +112,7 @@
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_DISCOVERY">
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_TRANSFER_PROTOCOL">
             </ng-container>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->

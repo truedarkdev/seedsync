@@ -160,6 +160,30 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertIn("**REDACTED**", details["error_message"])
         self.assertIn("**REDACTED**", details["reason"])
 
+    def test_record_redacts_ftp_and_ftps_urls_with_reserved_characters(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+
+        collector.record(
+            "controller",
+            "command_failed",
+            {
+                "error_message": "ftp://alice:pa:ss@seedbox.example.com/downloads",
+                "reason": "ftps://bob:pa/ss@mirror.example.net:21/files",
+            },
+            stage="command",
+            event_type="failure",
+            corr_id="flow-1"
+        )
+
+        snapshot = collector.snapshot()
+        details = snapshot["entries"][0]["details"]
+        self.assertNotIn("pa:ss", details["error_message"])
+        self.assertNotIn("pa/ss", details["reason"])
+        self.assertNotIn("seedbox.example.com", details["error_message"])
+        self.assertNotIn("mirror.example.net", details["reason"])
+        self.assertIn("ftp://**REDACTED**@**REDACTED**/downloads", details["error_message"])
+        self.assertIn("ftps://**REDACTED**@**REDACTED**:21/files", details["reason"])
+
     def test_record_coalesces_identical_entries_without_window_growth(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 

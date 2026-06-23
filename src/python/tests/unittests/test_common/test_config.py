@@ -344,7 +344,10 @@ class TestConfig(unittest.TestCase):
             "use_temp_file": "True",
             "rate_limit": "1M",
             "net_socket_buffer": "512K",
-            "staging_path": "/path/on/local/server/incomplete"
+            "staging_path": "/path/on/local/server/incomplete",
+            "protocol": "ftps",
+            "remote_ftp_port": "2121",
+            "ftp_ssl_verify_certificate": "True",
         }
         lftp = Config.Lftp.from_dict(good_dict)
         self.assertEqual("remote.server.com", lftp.remote_address)
@@ -364,6 +367,9 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("1M", lftp.rate_limit)
         self.assertEqual("512K", lftp.net_socket_buffer)
         self.assertEqual("/path/on/local/server/incomplete", lftp.staging_path)
+        self.assertEqual("ftps", lftp.protocol)
+        self.assertEqual(2121, lftp.remote_ftp_port)
+        self.assertEqual(True, lftp.ftp_ssl_verify_certificate)
 
         self.check_common(Config.Lftp,
                           good_dict,
@@ -403,6 +409,36 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
         self.check_bad_value_error(Config.Lftp, good_dict, "net_socket_buffer", "512KB")
+        self.check_bad_value_error(Config.Lftp, good_dict, "protocol", "ftp")
+        self.check_bad_value_error(Config.Lftp, good_dict, "remote_ftp_port", "0")
+        self.check_bad_value_error(Config.Lftp, good_dict, "ftp_ssl_verify_certificate", "SomeString")
+
+    def test_lftp_backfills_transfer_protocol_defaults(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "True",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "net_socket_buffer": "512K",
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+
+        self.assertEqual("sftp", lftp.protocol)
+        self.assertEqual(21, lftp.remote_ftp_port)
+        self.assertEqual(True, lftp.ftp_ssl_verify_certificate)
 
     def test_lftp_allows_empty_net_socket_buffer(self):
         good_dict = {
@@ -413,7 +449,7 @@ class TestConfig(unittest.TestCase):
             "remote_path": "/path/on/remote/server",
             "local_path": "/path/on/local/server",
             "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
-            "use_ssh_key": "False",
+            "use_ssh_key": "True",
             "num_max_parallel_downloads": "2",
             "num_max_parallel_files_per_download": "3",
             "num_max_connections_per_root_file": "4",
@@ -438,7 +474,7 @@ class TestConfig(unittest.TestCase):
             "remote_path": "/path/on/remote/server",
             "local_path": "/path/on/local/server",
             "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
-            "use_ssh_key": "False",
+            "use_ssh_key": "True",
             "num_max_parallel_downloads": "2",
             "num_max_parallel_files_per_download": "3",
             "num_max_connections_per_root_file": "4",
@@ -463,7 +499,7 @@ class TestConfig(unittest.TestCase):
             "remote_path": "/path/on/remote/server",
             "local_path": "/path/on/local/server",
             "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
-            "use_ssh_key": "False",
+            "use_ssh_key": "True",
             "num_max_parallel_downloads": "2",
             "num_max_parallel_files_per_download": "3",
             "num_max_connections_per_root_file": "4",
@@ -477,6 +513,7 @@ class TestConfig(unittest.TestCase):
         lftp = Config.Lftp.from_dict(good_dict)
 
         self.assertEqual("", lftp.remote_password)
+        self.assertEqual(True, lftp.use_ssh_key)
 
         self.check_common(Config.Lftp,
                           good_dict,
@@ -542,6 +579,9 @@ class TestConfig(unittest.TestCase):
         lftp = Config.Lftp.from_dict(good_dict)
 
         self.assertEqual("8M", lftp.net_socket_buffer)
+        self.assertEqual("sftp", lftp.protocol)
+        self.assertEqual(21, lftp.remote_ftp_port)
+        self.assertEqual(True, lftp.ftp_ssl_verify_certificate)
 
     def test_controller(self):
         good_dict = {
@@ -727,6 +767,9 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(False, config.lftp.use_temp_file)
             self.assertEqual("500K", config.lftp.rate_limit)
             self.assertEqual("/path/on/local/server/incomplete", config.lftp.staging_path)
+            self.assertEqual("sftp", config.lftp.protocol)
+            self.assertEqual(21, config.lftp.remote_ftp_port)
+            self.assertEqual(True, config.lftp.ftp_ssl_verify_certificate)
 
             self.assertEqual(30000, config.controller.interval_ms_remote_scan)
             self.assertEqual(10000, config.controller.interval_ms_local_scan)
@@ -785,6 +828,9 @@ class TestConfig(unittest.TestCase):
             config.lftp.num_max_total_connections = 4
             config.lftp.use_temp_file = True
             config.lftp.staging_path = "/local/server/path/incomplete"
+            config.lftp.protocol = "sftp"
+            config.lftp.remote_ftp_port = 21
+            config.lftp.ftp_ssl_verify_certificate = True
             config.controller.interval_ms_remote_scan = 1234
             config.controller.interval_ms_local_scan = 5678
             config.controller.interval_ms_downloading_scan = 9012
@@ -831,6 +877,9 @@ class TestConfig(unittest.TestCase):
             rate_limit = None
             net_socket_buffer = None
             staging_path = /local/server/path/incomplete
+            protocol = sftp
+            remote_ftp_port = 21
+            ftp_ssl_verify_certificate = True
 
             [Controller]
             interval_ms_remote_scan = 1234

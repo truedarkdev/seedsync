@@ -11,6 +11,7 @@ Requirements for the remote server are:
 
 * Linux-based system (64-bit)
 * SSH access
+* Optional: FTPS access if you explicitly select FTPS for bulk transfers
 
 ### Local Machine
 
@@ -65,6 +66,7 @@ Select the section for your platform:
 3. Go to the Settings page and fill out the required information.
    Under the Local Directory setting, enter `/downloads` for ordinary local storage.
    If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
+   SFTP is the default transfer protocol. To opt in to FTPS for bulk transfers, keep SSH configured for file discovery, then set the Transfer Protocol and Remote FTP Port for your server. FTPS certificate verification is enabled by default; disable it only for self-signed or legacy servers.
 
 4. **While password-based login is supported, key-based authentication is highly recommended!**
    See the [Key-Based Authentication Setup](#key-auth) section for details.
@@ -106,6 +108,7 @@ SeedSync supports Windows via the Docker container.
 6. Go to the Settings page and fill out the required information.
    Under the Local Directory setting, enter `/downloads` for ordinary local storage.
    If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
+   SFTP is the default transfer protocol. To opt in to FTPS for bulk transfers, keep SSH configured for file discovery, then set the Transfer Protocol and Remote FTP Port for your server. FTPS certificate verification is enabled by default; disable it only for self-signed or legacy servers.
 
 7. **While password-based login is supported, key-based authentication is highly recommended!**
    See the [Key-Based Authentication Setup](#key-auth) section for details.
@@ -145,9 +148,11 @@ It is strongly recommended that you set up key-based authentication.
 3. Update the settings
 
     1. Access the web GUI and choose the Settings page from the menu.
-    2. Replace your password in the "Server Password" field with anything else (it can't be empty).
-    3. Select "Use password-less key-based authentication".
-    4. Restart SeedSync
+   2. If you are staying on SFTP, you can leave the "Server Password" field blank when using key-based authentication.
+   3. Select "Use password-less key-based authentication".
+   4. Restart SeedSync
+
+   If you also select FTPS as the Transfer Protocol, the Server Password field is used for the FTPS transfer login even when SSH file discovery uses a key, so FTPS still requires a transfer password.
 
 
 ### <a name="keys-inside-docker"></a> Using SSH Keys with Docker

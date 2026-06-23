@@ -45,6 +45,9 @@ def mock_context(test_logger):
     context.config.lftp.remote_password = "password"
     context.config.lftp.use_ssh_key = False
     context.config.lftp.remote_port = 22
+    context.config.lftp.protocol = "sftp"
+    context.config.lftp.remote_ftp_port = 21
+    context.config.lftp.ftp_ssl_verify_certificate = True
     context.config.lftp.remote_path = "/remote/path"
     context.config.lftp.remote_path_to_scan_script = "/usr/bin/scanfs"
     context.config.lftp.use_temp_file = False

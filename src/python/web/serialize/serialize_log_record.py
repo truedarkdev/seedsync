@@ -2,7 +2,8 @@
 
 import json
 import logging
-import re
+
+from common.redaction import redact_sensitive_text
 
 from .serialize import Serialize
 
@@ -29,32 +30,7 @@ class SerializeLogRecord(Serialize):
 
     @staticmethod
     def _redact_sensitive(message):
-        if message is None:
-            return None
-
-        message = re.sub(r'(-u\s+\S+,)\S+', r'\1**REDACTED**', message)
-        message = re.sub(
-            r'((?:remote_)?password\s*[=:]\s*)\S+',
-            r'\1**REDACTED**',
-            message,
-            flags=re.IGNORECASE
-        )
-        message = re.sub(
-            r'sftp://\S+@\S+',
-            'sftp://**REDACTED**@**REDACTED**',
-            message
-        )
-        message = re.sub(
-            r'(^|[\s\'"\[])([a-zA-Z0-9_][\w.\-]*)@('
-            r'(?:\d{1,3}(?:\.\d{1,3}){3})|'
-            r'(?:[a-zA-Z0-9_][a-zA-Z0-9_-]*)|'
-            r'(?:[a-zA-Z0-9][a-zA-Z0-9-]*(?:\.[a-zA-Z0-9-]+)+)'
-            r')(?=[\s\'"\],:/>])',
-            r'\1**REDACTED**@**REDACTED**',
-            message,
-            flags=re.MULTILINE
-        )
-        return message
+        return redact_sensitive_text(message)
 
     def record(self, record: logging.LogRecord) -> str:
         json_dict = dict()
