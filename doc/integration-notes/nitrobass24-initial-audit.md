@@ -810,11 +810,11 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 791 | `db5d8bfe7a77d89836532da1a93e014307542bb2` | 2026-05-10 | Merge pull request #481 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/typescript-eslint-8.59.2 | covered elsewhere - merge wrapper for row `790` |
 | 792 | `ce7d9a5ca8c9bf386ad0996dfb52ecc8b83d4460` | 2026-05-10 | chore(deps): bump react-dom from 19.2.5 to 19.2.6 in /website | intentionally skipped - website-only dependency bump against the absent local `website/` subtree |
 | 793 | `48f73fa62b8a91b945404ef9d3f7b0d3e3dab7d3` | 2026-05-10 | Merge pull request #479 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-dom-19.2.6 | covered elsewhere - merge wrapper for row `792` |
-| 794 | `89a30aaed2e472b6124ab22609c0701fd231a104` | 2026-05-13 | Update README.md | pending |
-| 795 | `5e1c2948fdac78e8cd1eb103a9faa11531041d49` | 2026-05-16 | Set explicit User-Agent on Discord webhook payloads | pending |
-| 796 | `c2d5c0d1fcc1b690134fd9f241ff215f573e1a91` | 2026-05-16 | Merge pull request #484 from nitrobass24/fix/discord-webhook-user-agent | pending |
-| 797 | `7902319ed87afea4655598dabbd78910c25382cd` | 2026-05-16 | Release v0.18.1 - Fix Discord webhook 403, dependency bumps | pending |
-| 798 | `6fc8342614feb29f90bd1cf2997972f4d6db469a` | 2026-05-16 | Release v0.18.1 - Sync develop → master | pending |
+| 794 | `89a30aaed2e472b6124ab22609c0701fd231a104` | 2026-05-13 | Update README.md | intentionally skipped - local README deliberately identifies this repo as a maintained integration fork, so the upstream fork-note cleanup is not imported |
+| 795 | `5e1c2948fdac78e8cd1eb103a9faa11531041d49` | 2026-05-16 | Set explicit User-Agent on Discord webhook payloads | needs new integration task - existing follow-up `discord-webhook-user-agent-row795` owns mapping whether the local notification/webhook outbound path has a Discord-equivalent request surface; no unused formatter helper is imported |
+| 796 | `c2d5c0d1fcc1b690134fd9f241ff215f573e1a91` | 2026-05-16 | Merge pull request #484 from nitrobass24/fix/discord-webhook-user-agent | covered elsewhere - merge wrapper for the row `795` deferred notification/webhook follow-up |
+| 797 | `7902319ed87afea4655598dabbd78910c25382cd` | 2026-05-16 | Release v0.18.1 - Fix Discord webhook 403, dependency bumps | intentionally skipped - release bookkeeping and version identity do not map to the local maintained integration fork, so the changelog/package-version sync is not imported here |
+| 798 | `6fc8342614feb29f90bd1cf2997972f4d6db469a` | 2026-05-16 | Release v0.18.1 - Sync develop → master | covered elsewhere - release sync wrapper with no independent payload |
 | 799 | `a4bfaeedf533af39626cc8e1656ecda902b1a115` | 2026-05-17 | chore(deps-dev): bump vitest from 4.1.5 to 4.1.6 in /src/angular | pending |
 | 800 | `dc9fa065a461f4b0844b8310cad0b9d8ab611f78` | 2026-05-17 | Merge pull request #492 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/vitest-4.1.6 | pending |
 | 801 | `5a241af76c33da954bb79d40114f2d84aae6e5ff` | 2026-05-17 | chore(deps-dev): bump angular-eslint in /src/angular | pending |
