@@ -11,7 +11,7 @@ import shutil
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, AppError
+from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, ServiceRestart, AppError
 from controller import AutoQueuePattern, AutoQueuePersist
 from seedsync import Seedsync
 from web.auth_store import ApiKeyStore
@@ -677,8 +677,9 @@ class TestSeedsync(unittest.TestCase):
         seedsync.context = SimpleNamespace(
             logger=MagicMock(),
             config=SimpleNamespace(),
-            args=SimpleNamespace(exit=True),
+            args=SimpleNamespace(exit=True, web_bind_host=None),
         )
+        seedsync.api_key_store = MagicMock()
         seedsync.persist = MagicMock()
 
         with patch("seedsync.Seedsync._emit_startup_warnings"), \
@@ -705,8 +706,9 @@ class TestSeedsync(unittest.TestCase):
         seedsync.context = SimpleNamespace(
             logger=MagicMock(),
             config=SimpleNamespace(),
-            args=SimpleNamespace(exit=True),
+            args=SimpleNamespace(exit=True, web_bind_host=None),
         )
+        seedsync.api_key_store = MagicMock()
         seedsync.persist = MagicMock()
 
         with patch("seedsync.Seedsync._emit_startup_warnings"), \
@@ -758,11 +760,12 @@ class TestSeedsync(unittest.TestCase):
                 general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
-            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan", web_bind_host=None),
             status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
-            path_pair_manager=None,
+            path_pair_manager=MagicMock(),
             create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
         )
+        seedsync.api_key_store = MagicMock()
         seedsync.controller_persist = MagicMock()
         seedsync.auto_queue_persist = MagicMock()
         seedsync.persist = MagicMock()
@@ -825,11 +828,12 @@ class TestSeedsync(unittest.TestCase):
                 general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
-            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan", web_bind_host=None),
             status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
-            path_pair_manager=None,
+            path_pair_manager=MagicMock(),
             create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
         )
+        seedsync.api_key_store = MagicMock()
         seedsync.controller_persist = MagicMock()
         seedsync.auto_queue_persist = MagicMock()
         seedsync.persist = MagicMock()
@@ -899,11 +903,12 @@ class TestSeedsync(unittest.TestCase):
                 general=SimpleNamespace(log_level="INFO", verbose=False),
                 web=SimpleNamespace(port=8800),
             ),
-            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan"),
+            args=SimpleNamespace(exit=False, debug=False, local_path_to_scanfs="/scan", web_bind_host=None),
             status=SimpleNamespace(server=SimpleNamespace(up=True, error_msg=None)),
-            path_pair_manager=None,
+            path_pair_manager=MagicMock(),
             create_child_context=MagicMock(side_effect=lambda name: SimpleNamespace(logger=MagicMock())),
         )
+        seedsync.api_key_store = MagicMock()
         seedsync.controller_persist = MagicMock()
         seedsync.auto_queue_persist = MagicMock()
         seedsync.persist = MagicMock()
@@ -939,6 +944,56 @@ class TestSeedsync(unittest.TestCase):
         seedsync.context.logger.warning.assert_any_call(
             "Restart requested while controller startup is degraded; exiting instead of restarting"
         )
+
+    def test_shutdown_cause_intentional_exit_logged_at_info(self):
+        for exc in (ServiceExit(), ServiceRestart()):
+            with self.subTest(exc=type(exc).__name__):
+                seedsync = Seedsync.__new__(Seedsync)
+                seedsync.context = SimpleNamespace(logger=MagicMock())
+
+                try:
+                    raise exc
+                except (ServiceExit, ServiceRestart) as e:
+                    seedsync._log_shutdown_cause(e)
+
+                seedsync.context.logger.info.assert_called_once_with("Exiting Seedsync")
+                seedsync.context.logger.exception.assert_not_called()
+
+    def test_shutdown_cause_unexpected_error_logged_at_exception(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(logger=MagicMock())
+
+        try:
+            raise RuntimeError("child thread blew up")
+        except RuntimeError as e:
+            seedsync._log_shutdown_cause(e)
+
+        seedsync.context.logger.exception.assert_called_once_with("Seedsync exiting due to unexpected error")
+        seedsync.context.logger.info.assert_not_called()
+
+    def test_final_persist_failure_is_swallowed_and_logged(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(logger=MagicMock())
+        seedsync.persist = MagicMock(side_effect=OSError("ENOSPC"))
+
+        seedsync._final_persist()
+
+        seedsync.persist.assert_called_once_with()
+        seedsync.context.logger.exception.assert_called_once_with("Final persist during shutdown failed")
+
+    def test_final_persist_success_no_error_log(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(logger=MagicMock())
+        seedsync.persist = MagicMock()
+
+        seedsync._final_persist()
+
+        seedsync.persist.assert_called_once_with()
+        seedsync.context.logger.exception.assert_not_called()
+
+    def test_service_exit_and_restart_are_app_errors_caught_by_shutdown_handler(self):
+        self.assertIsInstance(ServiceExit(), Exception)
+        self.assertIsInstance(ServiceRestart(), Exception)
 
     def test_emit_startup_warnings_skips_webhook_secret_warning_when_field_absent(self):
         config = SimpleNamespace(general=SimpleNamespace(api_token="configured-token"))
