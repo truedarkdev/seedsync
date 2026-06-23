@@ -1253,7 +1253,7 @@ class Controller:
         self.__persist.extracted_file_names.difference_update(stale_extracted_file_names)
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
-    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None):
+    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> bool:
         if path_pair_id:
             staging_path = self.__get_staging_path(path_pair_id)
             path_pair = self.__get_path_pair(path_pair_id)
@@ -1263,7 +1263,15 @@ class Controller:
             final_path = self.__legacy_local_path
 
         if not staging_path or not final_path:
-            return
+            self.logger.warning(
+                "Failed to move '%s' from staging to final path: missing move root "
+                "(path_pair_id=%s, staging_path=%s, final_path=%s)",
+                name,
+                path_pair_id,
+                staging_path,
+                final_path,
+            )
+            return False
 
         src = os.path.join(staging_path, name)
         dst = os.path.join(final_path, name)
@@ -1282,13 +1290,22 @@ class Controller:
                 "same_path": os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)),
             })
         if not os.path.exists(src):
+            destination_exists = os.path.exists(dst)
+            if not destination_exists:
+                self.logger.warning(
+                    "Failed to move '%s' from staging '%s' to '%s': source does not exist",
+                    name,
+                    staging_path,
+                    final_path,
+                )
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
                     "file_id": trace_file_id,
                     "file_name": name,
                     "result": "missing_source",
+                    "destination_exists": destination_exists,
                 })
-            return
+            return destination_exists
         if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
@@ -1296,7 +1313,7 @@ class Controller:
                     "file_name": name,
                     "result": "same_path",
                 })
-            return
+            return True
 
         try:
             shutil.move(src, dst)
@@ -1308,6 +1325,7 @@ class Controller:
                     "result": "moved",
                 })
             self.__local_scan_process.force_scan()
+            return True
         except OSError as error:
             self.logger.warning(
                 "Failed to move '%s' from staging '%s' to '%s': %s",
@@ -1323,6 +1341,7 @@ class Controller:
                     "result": "failed",
                     "error": str(error),
                 })
+            return False
 
     def __get_delete_local_target(self, file: ModelFile) -> Tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
