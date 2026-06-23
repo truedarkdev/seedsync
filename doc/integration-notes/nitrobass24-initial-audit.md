@@ -870,12 +870,12 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 851 | `dc01b21b6b83546f6a59b76824bf8dae3404e4b0` | 2026-06-01 | Merge pull request #533 from nitrobass24/chore/ci-reenable-mock-tests-529 | covered elsewhere - merge wrapper for row 849 |
 | 852 | `d2388c32605c5d3cc016d6daf02f03ec7d15d1b7` | 2026-06-01 | Merge remote-tracking branch 'origin/develop' into test/cover-security-critical-paths-530 | covered elsewhere - branch-sync wrapper for row 847 |
 | 853 | `af53304161db4728c7bffa1bc14bd70ce12fbf02` | 2026-06-01 | Merge pull request #534 from nitrobass24/test/cover-security-critical-paths-530 | covered elsewhere - merge wrapper for row 847 |
-| 854 | `6e98254079c1f1118eca3524202f733b84e3ebe3` | 2026-06-01 | Roll back config on any persist failure, not just OSError (#507) | pending |
-| 855 | `8448ae67e2c82d59fad4fc04197fef944f05cf92` | 2026-06-01 | Harden periodic and shutdown persist against transient write failures (#512) | pending |
-| 856 | `22c31fd3bb40ab62672ef75f48180e267cb55764` | 2026-06-01 | Fix job status parser robustness bugs (#517) | pending |
-| 857 | `62215130aca1130859d583947a76a39c876d08ce` | 2026-06-01 | Fix tilde expansion in remote validate find/hash commands (#519) | pending |
-| 858 | `61b330119b18c900004f8a4a1800a3a65d4cc0cb` | 2026-06-01 | Lock-guard AutoQueuePersist patterns and listener set (#509) | pending |
-| 859 | `7ccae901214a6a2f888b08c67e071a2f58f3d339` | 2026-06-01 | Roll back auto-queue add/remove on persist failure (#518) | pending |
+| 854 | `6e98254079c1f1118eca3524202f733b84e3ebe3` | 2026-06-01 | Roll back config on any persist failure, not just OSError (#507) | already integrated locally in `src/python/web/handler/config.py`; tests in `src/python/tests/integration/test_web/test_handler/test_config.py` |
+| 855 | `8448ae67e2c82d59fad4fc04197fef944f05cf92` | 2026-06-01 | Harden periodic and shutdown persist against transient write failures (#512) | already integrated locally in `src/python/seedsync.py`; tests in `src/python/tests/unittests/test_seedsync.py` |
+| 856 | `22c31fd3bb40ab62672ef75f48180e267cb55764` | 2026-06-01 | Fix job status parser robustness bugs (#517) | already integrated locally in `src/python/lftp/job_status_parser.py`; tests in `src/python/tests/unittests/test_lftp/test_job_status_parser.py` |
+| 857 | `62215130aca1130859d583947a76a39c876d08ce` | 2026-06-01 | Fix tilde expansion in remote validate find/hash commands (#519) | adapted locally in `src/python/controller/validate/validate_process.py` and `src/python/tests/unittests/test_controller/test_validate/test_validate_process.py` |
+| 858 | `61b330119b18c900004f8a4a1800a3a65d4cc0cb` | 2026-06-01 | Lock-guard AutoQueuePersist patterns and listener set (#509) | already integrated locally in `src/python/controller/auto_queue.py`; tests in `src/python/tests/unittests/test_controller/test_auto_queue.py` |
+| 859 | `7ccae901214a6a2f888b08c67e071a2f58f3d339` | 2026-06-01 | Roll back auto-queue add/remove on persist failure (#518) | already integrated locally in `src/python/web/handler/auto_queue.py`; tests in `src/python/tests/integration/test_web/test_handler/test_auto_queue.py` |
 | 860 | `ea0cc8c29237a9f790331e5d5430f7146a866767` | 2026-06-01 | Surface staging->final move failures via result queue with retry (#510) | pending |
 | 861 | `35bf824156d1bf2a390860581ae367920fd8f9f7` | 2026-06-01 | Isolate extract/validate worker faults from controller loop (#511) | pending |
 | 862 | `24712b30658ecd19d33982506ab4e08fd176168d` | 2026-06-01 | Make Controller.exit() best-effort so hung lftp doesn't leak processes/FDs (#508) | pending |

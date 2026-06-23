@@ -8,7 +8,7 @@ import queue
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple, cast
 
-from common import overrides, AppProcess
+from common import escape_remote_path_for_shell, overrides, AppProcess
 from model import ModelFile
 from ssh import Sshcp
 
@@ -233,22 +233,20 @@ class ValidateProcess(AppProcess):
                 digest.update(chunk)
         return digest.hexdigest()
 
-    @staticmethod
-    def __shell_double_quote(value: str) -> str:
-        escaped = value.replace("\\", "\\\\").replace("\"", "\\\"").replace("$", "\\$").replace("`", "\\`")
-        return "\"{}\"".format(escaped)
-
     def __run_remote_command(self, path_pair_id: Optional[str], command: str) -> str:
         remote_base = self.__get_remote_base_path(path_pair_id)
         output = self.__ssh.shell(
-            "cd {} && {}".format(self.__shell_double_quote(remote_base), command)
+            "cd {} && {}".format(
+                escape_remote_path_for_shell(remote_base, allow_tilde_expansion=True),
+                command
+            )
         )
         return output.decode()
 
     def __hash_remote_file(self, path_pair_id: Optional[str], file_name: str) -> str:
         output = self.__run_remote_command(
             path_pair_id,
-            "sha256sum {}".format(self.__shell_double_quote(file_name))
+            "sha256sum {}".format(escape_remote_path_for_shell(file_name))
         ).strip()
         return output.split(None, 1)[0]
 
@@ -257,13 +255,13 @@ class ValidateProcess(AppProcess):
                                           root_name: str) -> Tuple[Set[str], Dict[str, str]]:
         dirs_output = self.__run_remote_command(
             path_pair_id,
-            "find {} -type d | sort".format(self.__shell_double_quote(root_name))
+            "find {} -type d | sort".format(escape_remote_path_for_shell(root_name))
         )
         dirs = set(filter(None, dirs_output.splitlines()))
 
         files_output = self.__run_remote_command(
             path_pair_id,
-            "find {} -type f -exec sha256sum {{}} \\; | sort".format(self.__shell_double_quote(root_name))
+            "find {} -type f -exec sha256sum {{}} \\; | sort".format(escape_remote_path_for_shell(root_name))
         )
         hashes = {}
         for line in filter(None, files_output.splitlines()):
