@@ -453,6 +453,48 @@ class TestController(unittest.TestCase):
         self.controller._Controller__mp_logger.stop.assert_called_once_with()
         self.assertFalse(self.controller._Controller__started)
 
+    def test_exit_continues_shutdown_when_process_terminate_fails(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__active_scan_process.terminate.side_effect = RuntimeError("terminate failed")
+
+        self.controller.exit()
+
+        self.controller.logger.exception.assert_any_call(
+            "Ignoring controller teardown failure during %s; continuing shutdown",
+            "active scan process terminate"
+        )
+        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__extract_process.terminate.assert_called_once_with()
+        self.controller._Controller__validate_process.terminate.assert_called_once_with()
+        self.controller._Controller__active_scan_process.join.assert_called_once_with()
+        self.controller._Controller__active_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__local_scan_process.join.assert_called_once_with()
+        self.controller._Controller__local_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.join.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.close_queues.assert_called_once_with()
+        self.controller._Controller__extract_process.join.assert_called_once_with()
+        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
+        self.controller._Controller__validate_process.join.assert_called_once_with()
+        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
+        self.controller._Controller__mp_logger.stop.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__started)
+
+    def test_exit_continues_shutdown_when_lftp_raises_unexpected_error(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.exit.side_effect = RuntimeError("lftp died")
+
+        self.controller.exit()
+
+        self.controller.logger.exception.assert_any_call("Ignoring lftp teardown failure; continuing shutdown")
+        self.controller._Controller__active_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
+        self.controller._Controller__extract_process.terminate.assert_called_once_with()
+        self.controller._Controller__validate_process.terminate.assert_called_once_with()
+        self.controller._Controller__mp_logger.stop.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__started)
+
     @patch("controller.controller.os.makedirs")
     def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
         self.controller._Controller__context.breadcrumb_trace = MagicMock()
@@ -1227,6 +1269,27 @@ class TestController(unittest.TestCase):
         self.controller._Controller__local_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__remote_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__mp_logger.propagate_exception.assert_called_once_with()
+        self.controller._Controller__extract_process.propagate_exception.assert_called_once_with()
+        self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
+
+    def test_propagate_exceptions_ignores_extract_and_validate_worker_failures(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.propagate_exception.side_effect = Exception("extract failed")
+        self.controller._Controller__validate_process.propagate_exception.side_effect = Exception("validate failed")
+
+        self.controller._Controller__propagate_exceptions()
+
+        self.controller.logger.warning.assert_any_call(
+            "Ignoring extract worker failure during controller loop: extract failed",
+            exc_info=True
+        )
+        self.controller.logger.warning.assert_any_call(
+            "Ignoring validate worker failure during controller loop: validate failed",
+            exc_info=True
+        )
         self.controller._Controller__extract_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
 
@@ -2656,6 +2719,66 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.controller._Controller__extract_process.extract.assert_called_once_with(file, flow_id="flow-123")
+
+    def test_process_commands_extract_failure_still_processes_later_commands(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__extract_process.extract.side_effect = RuntimeError("extract worker dead")
+        self.controller._Controller__validate_process.validate.return_value = None
+
+        extract_command = Controller.Command(Controller.Command.Action.EXTRACT, "dup")
+        extract_callback = MagicMock()
+        extract_command.add_callback(extract_callback)
+        validate_command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        validate_callback = MagicMock()
+        validate_command.add_callback(validate_callback)
+        self.controller.queue_command(extract_command)
+        self.controller.queue_command(validate_command)
+
+        self.controller._Controller__process_commands()
+
+        extract_callback.on_failure.assert_called_once_with("Extract worker unavailable", 500)
+        validate_callback.on_success.assert_called_once_with()
+        self.controller.logger.warning.assert_any_call(
+            "Extract worker dispatch failed for %s",
+            file.file_id,
+            exc_info=True
+        )
+        self.controller._Controller__validate_process.validate.assert_called_once_with(file)
+
+    def test_process_commands_validate_failure_still_processes_later_commands(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__validate_process.validate.side_effect = [
+            RuntimeError("validate worker dead"),
+            None
+        ]
+
+        first_command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        first_callback = MagicMock()
+        first_command.add_callback(first_callback)
+        second_command = Controller.Command(Controller.Command.Action.VALIDATE, "dup")
+        second_callback = MagicMock()
+        second_command.add_callback(second_callback)
+        self.controller.queue_command(first_command)
+        self.controller.queue_command(second_command)
+
+        self.controller._Controller__process_commands()
+
+        first_callback.on_failure.assert_called_once_with("Validate worker unavailable", 500)
+        second_callback.on_success.assert_called_once_with()
+        self.controller.logger.warning.assert_any_call(
+            "Validate worker dispatch failed for %s",
+            file.file_id,
+            exc_info=True
+        )
+        self.assertEqual(2, self.controller._Controller__validate_process.validate.call_count)
 
     def test_process_commands_validate_rejects_missing_remote_file(self):
         file = ModelFile("dup", False)
