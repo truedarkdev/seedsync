@@ -6,6 +6,7 @@ from unittest.mock import patch
 import logging
 import sys
 import json
+import threading
 
 from common import overrides, PersistError, Config
 from controller import AutoQueue, AutoQueuePersist, IAutoQueuePersistListener, AutoQueuePattern
@@ -289,6 +290,56 @@ class TestAutoQueuePersist(unittest.TestCase):
 
         with self.assertRaises(PersistError):
             AutoQueuePersist.from_str("[]")
+
+    def _assert_blocks_until_lock_released(self, lock, op, op_name):
+        started = threading.Event()
+        done = threading.Event()
+        errors = []
+
+        def run():
+            started.set()
+            try:
+                op()
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run)
+        with lock:
+            thread.start()
+            self.assertTrue(started.wait(1), f"{op_name}: worker thread never started")
+            self.assertFalse(done.wait(0.1), f"{op_name}: operation did not block on the shared lock")
+        thread.join(1)
+        self.assertTrue(done.is_set(), f"{op_name}: operation did not finish after lock release")
+        self.assertEqual([], errors, f"{op_name}: raised {errors}")
+
+    def test_persist_listener_mutations_block_while_listener_lock_is_held(self):
+        persist = AutoQueuePersist()
+        listener = MagicMock()
+        persist.add_listener(listener)
+        persist.add_pattern(AutoQueuePattern(pattern="seed"))
+        lock = persist._AutoQueuePersist__listeners_lock
+
+        cases = [
+            ("add_pattern", lambda: persist.add_pattern(AutoQueuePattern(pattern="new"))),
+            ("remove_pattern", lambda: persist.remove_pattern(AutoQueuePattern(pattern="seed"))),
+            ("add_listener", lambda: persist.add_listener(MagicMock())),
+        ]
+        for op_name, op in cases:
+            with self.subTest(op=op_name):
+                self._assert_blocks_until_lock_released(lock, op, op_name)
+
+    def test_patterns_returns_snapshot_copy(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="one"))
+
+        snapshot = persist.patterns
+        persist.add_pattern(AutoQueuePattern(pattern="two"))
+        persist.remove_pattern(AutoQueuePattern(pattern="one"))
+
+        self.assertEqual({AutoQueuePattern(pattern="one")}, snapshot)
+        self.assertEqual({AutoQueuePattern(pattern="two")}, persist.patterns)
 
 
 class TestAutoQueue(unittest.TestCase):
