@@ -16,6 +16,16 @@ services:
       SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION: "${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"
       SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES: "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}"
       SEEDSYNC_WEB_BIND_HOST: "${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+      - FOWNER
     command:
       - /bin/bash
       - -lc

@@ -102,3 +102,10 @@ and keep the artifact name descriptive.
 - Native Windows Poetry validation: blocked on this machine because the local
   Python version is outside the repo-supported range. Use a supported Python
   environment first if Windows host validation becomes necessary.
+- CI/Docker/live-suite hardening from the 845-849 row slice has verifier/final
+  validation on the Docker-served app and Docker Python harness. The default
+  SSH/LFTP lane keeps mock/unit coverage active while live cases stay gated by
+  `SEEDSYNC_LIVE_SSH_TESTS`.
+- Scanner directory-symlink coverage is Linux/WSL-only on this host because
+  Windows lacks the required symlink privilege. Keep the new symlink tests in
+  the Linux/WSL verifier path.

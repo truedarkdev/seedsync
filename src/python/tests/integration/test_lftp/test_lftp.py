@@ -10,12 +10,13 @@ from filecmp import dircmp
 
 import pytest
 
-from tests.utils import TestUtils
+from tests.utils import TestUtils, requires_live_ssh
 from lftp import Lftp
 
 
 pytestmark = pytest.mark.timeout(5)
 
+@requires_live_ssh
 class TestLftp(unittest.TestCase):
     temp_dir = None
 

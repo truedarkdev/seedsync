@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import os
+import unittest
 
 
 class TestUtils:
@@ -24,3 +25,10 @@ class TestUtils:
                 os.chmod(path, mode)
             except PermissionError:
                 pass
+
+
+def requires_live_ssh(test_item):
+    return unittest.skipUnless(
+        os.environ.get("SEEDSYNC_LIVE_SSH_TESTS") == "1",
+        "Set SEEDSYNC_LIVE_SSH_TESTS=1 to run the live SSH/LFTP/controller suites",
+    )(test_item)

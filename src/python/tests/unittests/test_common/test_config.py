@@ -662,7 +662,7 @@ class TestConfig(unittest.TestCase):
         [Lftp]
         remote_address=remote.server.com
         remote_username=remote-user
-        remote_password=remote-pass
+        remote_password=remote-pass%value
         remote_port = 3456
         remote_path=/path/on/remote/server
         local_path=/path/on/local/server
@@ -713,7 +713,7 @@ class TestConfig(unittest.TestCase):
 
             self.assertEqual("remote.server.com", config.lftp.remote_address)
             self.assertEqual("remote-user", config.lftp.remote_username)
-            self.assertEqual("remote-pass", config.lftp.remote_password)
+            self.assertEqual("remote-pass%value", config.lftp.remote_password)
             self.assertEqual(3456, config.lftp.remote_port)
             self.assertEqual("/path/on/remote/server", config.lftp.remote_path)
             self.assertEqual("/path/on/local/server", config.lftp.local_path)
@@ -772,7 +772,7 @@ class TestConfig(unittest.TestCase):
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
-            config.lftp.remote_password = "pass-on-remote-server"
+            config.lftp.remote_password = "pass-on-remote%server"
             config.lftp.remote_port = 3456
             config.lftp.remote_path = "/remote/server/path"
             config.lftp.local_path = "/local/server/path"
@@ -816,7 +816,7 @@ class TestConfig(unittest.TestCase):
             [Lftp]
             remote_address = server.remote.com
             remote_username = user-on-remote-server
-            remote_password = pass-on-remote-server
+            remote_password = pass-on-remote%server
             remote_port = 3456
             remote_path = /remote/server/path
             local_path = /local/server/path

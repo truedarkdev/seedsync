@@ -14,7 +14,7 @@ from unittest.mock import patch
 import pexpect
 import pytest
 
-from tests.utils import TestUtils
+from tests.utils import TestUtils, requires_live_ssh
 from common import ConfigError
 from lftp import Lftp, LftpJobStatus, LftpError, LftpJobStatusParser, LftpJobStatusParserError
 
@@ -122,6 +122,7 @@ class TestLftp(unittest.TestCase):
         lftp._Lftp__base_remote_dir_path = "/remote/default"
         lftp._Lftp__base_local_dir_path = "/local/default"
         lftp._Lftp__run_command = MagicMock(return_value="")
+        lftp._Lftp__pending_error = None
         lftp._Lftp__last_command_timed_out = False
         lftp._Lftp__last_status_poll_healthy = True
         return lftp
@@ -812,6 +813,8 @@ class TestLftp(unittest.TestCase):
             "test_status_logs_bounded_summary_when_verbose",
             "test_status_uses_short_timeout_budget_for_jobs_command",
             "test_run_command_logs_verbose_output_when_not_status_poll",
+            "test_run_command_status_poll_exhausts_to_empty_snapshot",
+            "test_run_command_preserves_process_read_delays_when_not_status_poll",
             "test_status_poll_preserves_pending_error_before_prompt_timeout",
             "test_run_command_status_poll_preserves_recovered_connecting_output",
             "test_run_command_records_pending_error_for_common_failure_outputs",
@@ -825,6 +828,12 @@ class TestLftp(unittest.TestCase):
             "test_run_command_recovers_prompt_readiness_after_retry_before_send",
             "test_kill_all_skips_prompt_readiness_probe",
             "test_run_command_logs_warning_on_error_recovery_timeout",
+            "test_queue_dir_uses_override_paths",
+            "test_status_poll_loop_retries_until_deadline_on_timeouts",
+            "test_status_restores_process_read_delays_after_poll",
+            "test_status_returns_none_when_parser_error_is_tolerated_during_connection_grace_retry",
+            "test_docker_runtime_user_ssh_config_guardrail",
+            "test_net_socket_buffer",
         }
         if self._testMethodName in unit_only_methods:
             return
@@ -862,24 +871,28 @@ class TestLftp(unittest.TestCase):
         self.lftp.raise_pending_error()
         self.lftp.exit()
 
+    @requires_live_ssh
     def test_num_connections_per_dir_file(self):
         self.lftp.num_connections_per_dir_file = 5
         self.assertEqual(5, self.lftp.num_connections_per_dir_file)
         with self.assertRaises(ValueError):
             self.lftp.num_connections_per_dir_file = -1
 
+    @requires_live_ssh
     def test_num_connections_per_root_file(self):
         self.lftp.num_connections_per_root_file = 5
         self.assertEqual(5, self.lftp.num_connections_per_root_file)
         with self.assertRaises(ValueError):
             self.lftp.num_connections_per_root_file = -1
 
+    @requires_live_ssh
     def test_num_parallel_files(self):
         self.lftp.num_parallel_files = 5
         self.assertEqual(5, self.lftp.num_parallel_files)
         with self.assertRaises(ValueError):
             self.lftp.num_parallel_files = -1
 
+    @requires_live_ssh
     def test_num_max_total_connections(self):
         self.lftp.num_max_total_connections = 5
         self.assertEqual(5, self.lftp.num_max_total_connections)
@@ -888,6 +901,7 @@ class TestLftp(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.lftp.num_max_total_connections = -1
 
+    @requires_live_ssh
     def test_rate_limit(self):
         self.lftp.rate_limit = 500
         self.assertEqual("500", self.lftp.rate_limit)
@@ -931,6 +945,7 @@ class TestLftp(unittest.TestCase):
         with self.assertRaises(ConfigError):
             lftp.net_socket_buffer = "512KB"
 
+    @requires_live_ssh
     def test_min_chunk_size(self):
         self.lftp.min_chunk_size = 500
         self.assertEqual("500", self.lftp.min_chunk_size)
@@ -939,46 +954,54 @@ class TestLftp(unittest.TestCase):
         self.lftp.min_chunk_size = "1M"
         self.assertEqual("1M", self.lftp.min_chunk_size)
 
+    @requires_live_ssh
     def test_num_parallel_jobs(self):
         self.lftp.num_parallel_jobs = 5
         self.assertEqual(5, self.lftp.num_parallel_jobs)
         with self.assertRaises(ValueError):
             self.lftp.num_parallel_jobs = -1
 
+    @requires_live_ssh
     def test_move_background_on_exit(self):
         self.lftp.move_background_on_exit = True
         self.assertEqual(True, self.lftp.move_background_on_exit)
         self.lftp.move_background_on_exit = False
         self.assertEqual(False, self.lftp.move_background_on_exit)
 
+    @requires_live_ssh
     def test_use_temp_file(self):
         self.lftp.use_temp_file = True
         self.assertEqual(True, self.lftp.use_temp_file)
         self.lftp.use_temp_file = False
         self.assertEqual(False, self.lftp.use_temp_file)
 
+    @requires_live_ssh
     def test_temp_file_name(self):
         self.lftp.temp_file_name = "*.lftp"
         self.assertEqual("*.lftp", self.lftp.temp_file_name)
         self.lftp.temp_file_name = "*.temp"
         self.assertEqual("*.temp", self.lftp.temp_file_name)
 
+    @requires_live_ssh
     def test_sftp_auto_confirm(self):
         self.lftp.sftp_auto_confirm = True
         self.assertEqual(True, self.lftp.sftp_auto_confirm)
         self.lftp.sftp_auto_confirm = False
         self.assertEqual(False, self.lftp.sftp_auto_confirm)
 
+    @requires_live_ssh
     def test_sftp_connect_program(self):
         self.lftp.sftp_connect_program = "program -a -f"
         self.assertEqual("\"program -a -f\"", self.lftp.sftp_connect_program)
         self.lftp.sftp_connect_program = "\"abc -d\""
         self.assertEqual("\"abc -d\"", self.lftp.sftp_connect_program)
 
+    @requires_live_ssh
     def test_status_empty(self):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queue_file(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("c", False)
@@ -991,6 +1014,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.PGET, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_dir(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("a", True)
@@ -1003,6 +1027,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.MIRROR, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_file_with_spaces(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("d d", False)
@@ -1016,6 +1041,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.PGET, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_dir_with_spaces(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("e e", True)
@@ -1028,6 +1054,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.MIRROR, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_file_with_unicode(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("üæÒ", False)
@@ -1040,6 +1067,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.PGET, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_dir_with_latin(self):
         self.lftp.rate_limit = 100  # so jobs don't finish right away
         self.lftp.queue("latin", True)
@@ -1060,6 +1088,7 @@ class TestLftp(unittest.TestCase):
             if size_local and size_local > 100:
                 break
 
+    @requires_live_ssh
     def test_queue_dir_with_unicode(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("áßç", True)
@@ -1073,6 +1102,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.MIRROR, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_queue_num_parallel_jobs(self):
         self.lftp.num_parallel_jobs = 2
         self.lftp.rate_limit = 10  # so jobs don't finish right away
@@ -1097,6 +1127,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.PGET, statuses[2].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[2].state)
 
+    @requires_live_ssh
     def test_kill_all(self):
         self.lftp.num_parallel_jobs = 2
         self.lftp.rate_limit = 10  # so jobs don't finish right away
@@ -1119,6 +1150,7 @@ class TestLftp(unittest.TestCase):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_kill_all_and_queue_again(self):
         self.lftp.num_parallel_jobs = 2
         self.lftp.rate_limit = 10  # so jobs don't finish right away
@@ -1149,6 +1181,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual(LftpJobStatus.Type.MIRROR, statuses[0].type)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_kill_queued_job(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.num_parallel_jobs = 1
@@ -1174,6 +1207,7 @@ class TestLftp(unittest.TestCase):
         self.assertEqual("a", statuses[0].name)
         self.assertEqual(LftpJobStatus.State.RUNNING, statuses[0].state)
 
+    @requires_live_ssh
     def test_kill_running_job(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("a", True)
@@ -1193,6 +1227,7 @@ class TestLftp(unittest.TestCase):
                 break
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_kill_missing_job(self):
         self.lftp.rate_limit = 10  # so jobs don't finish right away
         self.lftp.queue("a", True)
@@ -1213,6 +1248,7 @@ class TestLftp(unittest.TestCase):
                 break
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_kill_job_1(self):
         """Queued and running jobs killed one at a time"""
         self.lftp.rate_limit = 10  # so jobs don't finish right away
@@ -1282,6 +1318,7 @@ class TestLftp(unittest.TestCase):
                 break
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queued_and_kill_jobs_1(self):
         """Queued and running jobs killed one at a time"""
         self.lftp.rate_limit = 10  # so jobs don't finish right away
@@ -1367,6 +1404,7 @@ class TestLftp(unittest.TestCase):
                 break
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queue_dir_wrong_file_type(self):
         """check that queueing a dir with PGET fails gracefully"""
         # passing dir as a file
@@ -1382,6 +1420,7 @@ class TestLftp(unittest.TestCase):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queue_file_wrong_file_type(self):
         """check that queueing a file with MIRROR fails gracefully"""
         # passing file as a dir
@@ -1397,6 +1436,7 @@ class TestLftp(unittest.TestCase):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queue_missing_file(self):
         """check that queueing non-existing file fails gracefully"""
         self.lftp.queue("non-existing-file", False)
@@ -1410,6 +1450,7 @@ class TestLftp(unittest.TestCase):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_queue_missing_dir(self):
         """check that queueing non-existing directory fails gracefully"""
 
@@ -1424,6 +1465,7 @@ class TestLftp(unittest.TestCase):
         statuses = self.lftp.status()
         self.assertEqual(0, len(statuses))
 
+    @requires_live_ssh
     def test_password_auth(self):
         # exit the default instance
         self.lftp.exit()
@@ -1459,6 +1501,7 @@ class TestLftp(unittest.TestCase):
         self.lftp.raise_pending_error()
 
     @pytest.mark.timeout(15)
+    @requires_live_ssh
     def test_error_bad_password(self):
         # exit the default instance
         self.lftp.exit()

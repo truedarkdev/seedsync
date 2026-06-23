@@ -585,7 +585,8 @@ class Config(Persist):
     @classmethod
     @overrides(Persist)
     def from_str(cls: type["Config"], content: str) -> "Config":
-        config_parser = configparser.ConfigParser()
+        # Values are opaque user data and must survive '%' round-trips verbatim.
+        config_parser = configparser.ConfigParser(interpolation=None)
         try:
             config_parser.read_string(content)
         except (
@@ -610,7 +611,8 @@ class Config(Persist):
 
     @overrides(Persist)
     def to_str(self) -> str:
-        config_parser = configparser.ConfigParser()
+        # Keep write/read behavior aligned with from_str for percent-bearing values.
+        config_parser = configparser.ConfigParser(interpolation=None)
         config_dict = self.as_dict()
         for section in config_dict:
             config_parser.add_section(section)

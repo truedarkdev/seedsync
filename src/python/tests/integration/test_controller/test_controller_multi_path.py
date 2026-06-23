@@ -16,11 +16,12 @@ import pytest
 from common import Args, Config, Context, Status, overrides
 from common.path_pair import PathPair, PathPairManager
 from controller import Controller, ControllerPersist
-from tests.utils import TestUtils
+from tests.utils import TestUtils, requires_live_ssh
 
 
 pytestmark = pytest.mark.timeout(30)
 
+@requires_live_ssh
 class TestControllerMultiPath(unittest.TestCase):
     __KEEP_FILES = False
 

@@ -20,6 +20,7 @@ jobs:
   unittests-python:
     name: Python unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout
@@ -33,6 +34,7 @@ jobs:
   unittests-angular:
     name: Angular unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -45,6 +47,7 @@ jobs:
   build-deb:
     name: Build Deb
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [ unittests-python, unittests-angular ]
     steps:
       - name: Checkout
@@ -52,10 +55,10 @@ jobs:
 
       # Sets up build environment
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
           driver-opts: |
             image=moby/buildkit:master
@@ -93,6 +96,7 @@ jobs:
   build-docker-image:
     name: Build Docker Image
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     needs: [ unittests-python, unittests-angular ]
     permissions:
       contents: read
@@ -103,10 +107,10 @@ jobs:
 
       # Sets up build environment
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
           driver-opts: |
             image=moby/buildkit:master
@@ -130,6 +134,7 @@ jobs:
   e2etests-deb:
     name: End-to-end tests on Deb
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     needs: [ build-deb ]
     strategy:
       matrix:
@@ -157,6 +162,7 @@ jobs:
   e2etests-docker-image:
     name: End-to-end tests on Docker Image
     needs: [ build-docker-image ]
+    timeout-minutes: 120
     strategy:
       matrix:
         include:
@@ -181,10 +187,10 @@ jobs:
           sudo service docker restart
           docker version
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
           driver-opts: |
             image=moby/buildkit:master
@@ -215,6 +221,7 @@ jobs:
     name: Publish Docker Image
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [ e2etests-deb, e2etests-docker-image ]
     permissions:
       contents: read
@@ -227,10 +234,10 @@ jobs:
 
       # Sets up build environment
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
           driver-opts: |
             image=moby/buildkit:master
@@ -269,6 +276,7 @@ jobs:
     name: Publish Deb package
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [ e2etests-deb, e2etests-docker-image ]
     permissions:
       contents: write

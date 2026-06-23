@@ -14,9 +14,9 @@ class SystemFile:
                  is_dir: bool = False,
                  time_created: datetime | None = None,
                  time_modified: datetime | None = None,
-                 is_staging: bool = False):
+        is_staging: bool = False):
         if size < 0:
-            raise ValueError("File size must be greater than zero")
+            raise ValueError("File size must be zero or greater")
         self.__name = name
         self.__size = size  # in bytes
         self.__is_dir = is_dir

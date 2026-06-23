@@ -1,4 +1,6 @@
 .idea
+.DS_Store
+**/.DS_Store
 *.pyc
 /build
 .venv
@@ -8,7 +10,10 @@ src/python/site
 htmlcov/
 .coverage
 AGENTS.md
+.claude/
 .mcp-tasklist/
+REVIEW.md
+SECURITY_FINDINGS.md
 
 # SSH private keys
 id_rsa
