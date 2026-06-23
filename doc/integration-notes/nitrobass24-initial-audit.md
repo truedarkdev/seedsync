@@ -802,14 +802,14 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 783 | `c4d72a3765be5ee317668d640a5007de5e2459a1` | 2026-05-08 | Merge pull request #476 from nitrobass24/dependabot/npm_and_yarn/src/angular/fast-uri-3.1.2 | covered elsewhere - merge wrapper for row `782` |
 | 784 | `0ecc19350bcf9b44d1b1c53fa1cac2d7c80a7910` | 2026-05-09 | chore(deps): bump @babel/plugin-transform-modules-systemjs in /website | intentionally skipped - website-only dependency bump; local repo has no tracked `website/` subtree or website lockfile surface |
 | 785 | `2bf54f6fce43241b96c31dae1176938843df7c6c` | 2026-05-09 | Merge pull request #477 from nitrobass24/dependabot/npm_and_yarn/website/babel/plugin-transform-modules-systemjs-7.29.4 | covered elsewhere - merge wrapper for row `784` |
-| 786 | `62fa0eb928cb30d9deda98c9f139fe66d8dca17b` | 2026-05-10 | chore(deps): bump react from 19.2.5 to 19.2.6 in /website | pending |
-| 787 | `5dc470b9109395b48b28cd9f830c7fdddcf43dc0` | 2026-05-10 | Merge pull request #478 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-19.2.6 | pending |
-| 788 | `ea84cc10e8c6ce79a3c35d13284103161baa3d7d` | 2026-05-10 | chore(deps): bump the angular group in /src/angular with 10 updates | pending |
-| 789 | `b6c485bbe2971dc5fc7f9c5b3a9b8f2b36f0ed2d` | 2026-05-10 | Merge pull request #480 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-e0fbc3eb56 | pending |
-| 790 | `0890c9e467e75f3b0f96d16578b3162d357bdeaf` | 2026-05-10 | chore(deps-dev): bump typescript-eslint in /src/angular | pending |
-| 791 | `db5d8bfe7a77d89836532da1a93e014307542bb2` | 2026-05-10 | Merge pull request #481 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/typescript-eslint-8.59.2 | pending |
-| 792 | `ce7d9a5ca8c9bf386ad0996dfb52ecc8b83d4460` | 2026-05-10 | chore(deps): bump react-dom from 19.2.5 to 19.2.6 in /website | pending |
-| 793 | `48f73fa62b8a91b945404ef9d3f7b0d3e3dab7d3` | 2026-05-10 | Merge pull request #479 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-dom-19.2.6 | pending |
+| 786 | `62fa0eb928cb30d9deda98c9f139fe66d8dca17b` | 2026-05-10 | chore(deps): bump react from 19.2.5 to 19.2.6 in /website | intentionally skipped - website-only dependency bump against the absent local `website/` subtree |
+| 787 | `5dc470b9109395b48b28cd9f830c7fdddcf43dc0` | 2026-05-10 | Merge pull request #478 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-19.2.6 | covered elsewhere - merge wrapper for row `786` |
+| 788 | `ea84cc10e8c6ce79a3c35d13284103161baa3d7d` | 2026-05-10 | chore(deps): bump the angular group in /src/angular with 10 updates | adapted locally in `src/angular/package.json` - bumped the tracked Angular dependencies/devDependencies to the matching `21.2.12` / `21.2.10` patch set, including local `@angular/animations`, `@angular/platform-browser-dynamic`, and `@angular-devkit/build-angular`, while leaving the ignored lockfile out of versioned state |
+| 789 | `b6c485bbe2971dc5fc7f9c5b3a9b8f2b36f0ed2d` | 2026-05-10 | Merge pull request #480 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-e0fbc3eb56 | covered elsewhere - merge wrapper for row `788` |
+| 790 | `0890c9e467e75f3b0f96d16578b3162d357bdeaf` | 2026-05-10 | chore(deps-dev): bump typescript-eslint in /src/angular | covered elsewhere - same Angular lint/tooling lane already tracked by rows `615`/`622`/`625`; local manifest has no direct `typescript-eslint` dependency to update |
+| 791 | `db5d8bfe7a77d89836532da1a93e014307542bb2` | 2026-05-10 | Merge pull request #481 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/typescript-eslint-8.59.2 | covered elsewhere - merge wrapper for row `790` |
+| 792 | `ce7d9a5ca8c9bf386ad0996dfb52ecc8b83d4460` | 2026-05-10 | chore(deps): bump react-dom from 19.2.5 to 19.2.6 in /website | intentionally skipped - website-only dependency bump against the absent local `website/` subtree |
+| 793 | `48f73fa62b8a91b945404ef9d3f7b0d3e3dab7d3` | 2026-05-10 | Merge pull request #479 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-dom-19.2.6 | covered elsewhere - merge wrapper for row `792` |
 | 794 | `89a30aaed2e472b6124ab22609c0701fd231a104` | 2026-05-13 | Update README.md | pending |
 | 795 | `5e1c2948fdac78e8cd1eb103a9faa11531041d49` | 2026-05-16 | Set explicit User-Agent on Discord webhook payloads | pending |
 | 796 | `c2d5c0d1fcc1b690134fd9f241ff215f573e1a91` | 2026-05-16 | Merge pull request #484 from nitrobass24/fix/discord-webhook-user-agent | pending |
