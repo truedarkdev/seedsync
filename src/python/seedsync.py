@@ -263,7 +263,10 @@ class Seedsync:
         # Save the persists
         self.context.logger.debug("Persisting states to file")
         self.controller_persist.to_file(self.controller_persist_path)
-        self.auto_queue_persist.to_file(self.auto_queue_persist_path)
+        try:
+            self.auto_queue_persist.to_file(self.auto_queue_persist_path)
+        except OSError:
+            self.context.logger.exception("Failed to persist auto-queue state")
         if hasattr(self, "api_key_store") and hasattr(self, "api_key_store_path"):
             self.api_key_store.save()
         new_config_str = self.context.config.to_str()
