@@ -94,10 +94,10 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `762` (`fe7f2d18a6b23923f78c1a75efdd9af0be013fa1`)
+- Last dispositioned fork-unique row: `763` (`21614b976416474c88acc132803739e0873369f6`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Resume checkpoint: rows `761`-`762` are dispositioned as a provenance mini-batch; row `763` is next and is the first local implementation boundary in the inspected range.
+- Resume checkpoint: rows `761`-`763` are dispositioned; row `764` is next.
 - Row `668`: adapted locally in a focused `ModelUpdater.sync_persist_to_all_builders()` test; upstream-only `command_pipeline.py` and `model_registry.py` tests were not imported because those module surfaces do not exist in this HEAD.
 - Row `669`: intentionally skipped because upstream only updates absent tracked `CLAUDE.md` wording for C901 enforcement; local Ruff C901 enforcement remains tracked separately in row `639`, and gitignored `AGENTS.md` is not a repository submission surface.
 - Row `670`: covered elsewhere because upstream only formats an `_make_persist` helper signature that does not exist in the locally adapted row `668` test; the committed local `TestModelUpdater` file already uses compact formatter-friendly structure.
