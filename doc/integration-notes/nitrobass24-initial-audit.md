@@ -791,11 +791,11 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 772 | `1c3241c23e49e53a3194f9d752e994e4507c8d57` | 2026-05-05 | Address round-6 CodeRabbit findings on PR #467 | adapted locally; unused version-check import removed and no extra settings surface is needed |
 | 773 | `5bc7aa5ceef3ae4d61890b80c1aa11ad65d409c1` | 2026-05-06 | Address round-7 CodeRabbit findings on PR #467 | covered elsewhere; CHANGELOG.md is absent locally and the remaining spec cleanups are represented in rows 771-772 |
 | 774 | `686d6f2df1c34d58cae098fffefbc88836cb4573` | 2026-05-06 | Merge pull request #467 from nitrobass24/develop | covered elsewhere; merge wrapper only |
-| 775 | `4bbe4cf02f4fe3be42eeb22a66fdfb90f9ace07f` | 2026-05-13 | Update README to remove fork note | pending |
-| 776 | `96f71f51bbef72cf18a3213627a75f232f237314` | 2026-05-07 | chore(deps): bump ip-address and express-rate-limit in /src/angular | pending |
-| 777 | `973d4fb235d609cffaa140fecd7a68230d041858` | 2026-05-06 | Merge pull request #473 from nitrobass24/dependabot/npm_and_yarn/src/angular/multi-7bdfbe8666 | pending |
-| 778 | `8317993985ad2313b7e4b4d0c6d3ec9b0943028d` | 2026-05-07 | chore(deps): bump hono from 4.12.14 to 4.12.18 in /src/angular | pending |
-| 779 | `48991b8883f2d34604b22367057536377b203049` | 2026-05-06 | Merge pull request #474 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.18 | pending |
+| 775 | `4bbe4cf02f4fe3be42eeb22a66fdfb90f9ace07f` | 2026-05-13 | Update README to remove fork note | intentionally skipped - local `README.md` deliberately identifies this repository as a maintained integration fork, so upstream's fork-note removal does not match local repo identity |
+| 776 | `96f71f51bbef72cf18a3213627a75f232f237314` | 2026-05-07 | chore(deps): bump ip-address and express-rate-limit in /src/angular | intentionally skipped - upstream changes only ignored `src/angular/package-lock.json`; local tracked Angular dependency surface is `package.json` only |
+| 777 | `973d4fb235d609cffaa140fecd7a68230d041858` | 2026-05-06 | Merge pull request #473 from nitrobass24/dependabot/npm_and_yarn/src/angular/multi-7bdfbe8666 | covered elsewhere - merge wrapper for row 776's ignored Angular lockfile-only dependency bump |
+| 778 | `8317993985ad2313b7e4b4d0c6d3ec9b0943028d` | 2026-05-07 | chore(deps): bump hono from 4.12.14 to 4.12.18 in /src/angular | intentionally skipped - upstream changes only ignored `src/angular/package-lock.json`; no tracked local Angular file changes apply |
+| 779 | `48991b8883f2d34604b22367057536377b203049` | 2026-05-06 | Merge pull request #474 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.18 | covered elsewhere - merge wrapper for row 778's ignored Angular lockfile-only dependency bump |
 | 780 | `689b25b1ff6b7aecc128d55f0bfb36123fa63151` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /website | pending |
 | 781 | `0f5eb7434b3090abd9c452f8bef86b6cecf6e97b` | 2026-05-08 | Merge pull request #475 from nitrobass24/dependabot/npm_and_yarn/website/fast-uri-3.1.2 | pending |
 | 782 | `78ea06e4fec4acfcebe526e73b2dffdd4601ac97` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /src/angular | pending |
