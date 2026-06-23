@@ -834,8 +834,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 815 | `e20d02aca74eab906a2427b384bbf47fcce13845` | 2026-05-19 | Roll back config handler on persistence failure (#469.2) | adapted locally - config handler now persists after mutation, restores the prior value only when the failing request still owns the current in-memory value, and defers the breadcrumb sync callback until the write succeeds |
 | 816 | `8d107e8100e1599c01ee6c0e146965985c587cff` | 2026-05-19 | Skip rollback when concurrent update changed the value | adapted locally - the rollback guard skips stale restoration when another request has already changed the field |
 | 817 | `155ac1b3f4a03955418ef409caed98b42113d3cd` | 2026-05-19 | Apply ruff format to test_config.py | adapted locally - formatting-only cleanup around the touched config handler tests |
-| 818 | `2b907cbad366945c4613303e4e4a9fd74d7d25cc` | 2026-05-19 | Serialize config writers with a per-handler lock | pending |
-| 819 | `eda0a369d03bbdcbca21a9c04fb1bbc06273cba2` | 2026-05-19 | Merge pull request #495 from nitrobass24/fix/config-handler-atomicity | pending |
+| 818 | `2b907cbad366945c4613303e4e4a9fd74d7d25cc` | 2026-05-19 | Serialize config writers with a per-handler lock | adapted locally - config handler now serializes mutate → persist → rollback under a per-handler lock and rolls back unconditionally inside that critical section |
+| 819 | `eda0a369d03bbdcbca21a9c04fb1bbc06273cba2` | 2026-05-19 | Merge pull request #495 from nitrobass24/fix/config-handler-atomicity | covered elsewhere - merge wrapper for row `818` with no independent payload beyond the lock batch |
 | 820 | `4ea8f6c1e05409a869415c5e70b08f5e408284d0` | 2026-05-19 | Persist path_pairs before integrations on detach (#469.3) | pending |
 | 821 | `f3b5faea1490966d900995588f4666db32ef523a` | 2026-05-19 | Tighten PR ref and assert 500 on persistence-failure test | pending |
 | 822 | `8579b45d500eea163e9e2d0a90509cdcc0cca9e1` | 2026-05-19 | Merge pull request #496 from nitrobass24/fix/integrations-detach-ordering | pending |
