@@ -902,9 +902,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 883 | `faa9a077b2ea5cd65eb135da7a6a0e462c529125` | 2026-06-02 | Reuse the shared REDACTED_SENTINEL constant (#514 review) | covered elsewhere - superseded by the no-client-side-persistence outcome; this branch has no local API-key storage path to reuse the sentinel in |
 | 884 | `db22d895518bb63785e8b464973ea8e8b65f22ac` | 2026-06-02 | Complete #516: autoqueue parse guard, log-history failure state, path-pair toggle errors | already integrated |
 | 885 | `81e358bdcb301941473bcc0d66f664dac3cdff36` | 2026-06-02 | Don't persist the api_key client-side (#514 / CodeQL) | already integrated - the branch does not add client-side API-key persistence |
-| 886 | `257d4806c20819471e743933a5e9f02791e311c3` | 2026-06-02 | Use a distinct class for the log-history error banner (#516 / E2E) | pending |
-| 887 | `d9598496e1fcc96d0ca16ce016bc88adbbdd8bfb` | 2026-06-02 | Address CodeRabbit review on #538 | pending |
-| 888 | `1f0db282c7a2c8ea717977cbaaa96eec81e54f3c` | 2026-06-02 | Merge pull request #538 from nitrobass24/fix/frontend-bugs-bucket-531 | pending |
+| 886 | `257d4806c20819471e743933a5e9f02791e311c3` | 2026-06-02 | Use a distinct class for the log-history error banner (#516 / E2E) | needs new integration task `historical-log-cursor-row756`; local logs page lacks the exact upstream history-error banner surface, so handle with the deferred historical/log-history applicability review instead of forcing a standalone UI hunk |
+| 887 | `d9598496e1fcc96d0ca16ce016bc88adbbdd8bfb` | 2026-06-02 | Address CodeRabbit review on #538 | needs new integration tasks; the log-history banner/accessibility hunk belongs with `historical-log-cursor-row756`, while the config redacted-sentinel, malformed model-file SSE payload, and stream-dispatch spec hardening hunks are tracked in `frontend-hardening-row887` |
+| 888 | `1f0db282c7a2c8ea717977cbaaa96eec81e54f3c` | 2026-06-02 | Merge pull request #538 from nitrobass24/fix/frontend-bugs-bucket-531 | covered elsewhere - merge wrapper for row `887` and the broader frontend-bugs bucket |
 | 889 | `a03d21ac988198d227dc64585484f5e06a223b72` | 2026-06-02 | Perf: O(1) BFS frontiers + skip child-list copy in model_builder (#520) | pending |
 | 890 | `906df1bf625d76e7b48b373c11480cbe94a56de8` | 2026-06-02 | Perf: coalesce SSE view rebuilds, memoize filter, single-pass bulk remove (#521) | pending |
 | 891 | `5f1392e81f715d28ec3a123e16c0531200edf3b9` | 2026-06-02 | Cap live-log buffer and add stable trackBy on logs page (#522) | pending |
