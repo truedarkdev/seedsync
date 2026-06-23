@@ -94,10 +94,10 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `870` (`44d053d406fea1bed0f37ac09b5839b9c232a4c2`)
+- Last dispositioned fork-unique row: `872` (`1aae69a9caa29c78481d99028edccc7b287c502f`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Resume checkpoint: rows `761`-`870` are dispositioned; row `871` is next.
+- Resume checkpoint: rows `761`-`872` are dispositioned; row `873` is next.
 - Rows `794`-`798`: row `794` is intentionally skipped because local `README.md` deliberately identifies this repository as a maintained integration fork; row `795` needs follow-up task `discord-webhook-user-agent-row795` because the upstream Discord User-Agent fix targets a notification formatter surface that is not wired in this checkout; row `796` is covered as its merge wrapper; row `797` is intentionally skipped as upstream release/version bookkeeping; row `798` is covered as the release sync wrapper.
 - Rows `775`-`779`: row `775` is intentionally skipped because local `README.md` deliberately identifies this repository as a maintained integration fork; rows `776` and `778` are intentionally skipped as ignored Angular lockfile-only dependency bumps, and rows `777`/`779` are their merge wrappers.
 - Rows `780`-`785`: row `780` is intentionally skipped because local repo has no tracked `website/` subtree; row `781` is covered elsewhere as its merge wrapper; row `782` is intentionally skipped because the only candidate `src/angular/package-lock.json` is ignored and untracked locally; row `783` is covered elsewhere as its merge wrapper; row `784` is intentionally skipped because local repo has no tracked `website/` subtree; row `785` is covered elsewhere as its merge wrapper.
