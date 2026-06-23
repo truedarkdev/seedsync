@@ -2,6 +2,8 @@ import {Component, Input, Output, ChangeDetectionStrategy, EventEmitter, OnInit}
 import {Subject} from "rxjs";
 import {debounceTime, distinctUntilChanged} from "rxjs/operators";
 
+export const DEBOUNCE_TIME_MS = 1000;
+
 @Component({
     selector: "app-option",
     standalone: false,
@@ -23,8 +25,6 @@ export class OptionComponent implements OnInit {
     // expose to template
     public OptionType = OptionType;
 
-    private readonly DEBOUNCE_TIME_MS: number = 1000;
-
     private newValue = new Subject<any>();
 
     // noinspection JSUnusedGlobalSymbols
@@ -34,7 +34,7 @@ export class OptionComponent implements OnInit {
         //      https://angular.io/tutorial/toh-pt6#fix-the-herosearchcomponent-class
         //      https://stackoverflow.com/a/41965515
         this.newValue.pipe(
-            debounceTime(this.DEBOUNCE_TIME_MS),
+            debounceTime(DEBOUNCE_TIME_MS),
             distinctUntilChanged()
         )
             .subscribe({next: val => this.changeEvent.emit(val)});
