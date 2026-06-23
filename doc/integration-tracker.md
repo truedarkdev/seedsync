@@ -94,11 +94,12 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `779` (`48991b8883f2d34604b22367057536377b203049`)
+- Last dispositioned fork-unique row: `785` (`2bf54f6fce43241b96c31dae1176938843df7c6c`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Resume checkpoint: rows `761`-`779` are dispositioned; row `780` is next.
+- Resume checkpoint: rows `761`-`785` are dispositioned; row `786` is next.
 - Rows `775`-`779`: row `775` is intentionally skipped because local `README.md` deliberately identifies this repository as a maintained integration fork; rows `776` and `778` are intentionally skipped as ignored Angular lockfile-only dependency bumps, and rows `777`/`779` are their merge wrappers.
+- Rows `780`-`785`: row `780` is intentionally skipped because local repo has no tracked `website/` subtree; row `781` is covered elsewhere as its merge wrapper; row `782` is intentionally skipped because the only candidate `src/angular/package-lock.json` is ignored and untracked locally; row `783` is covered elsewhere as its merge wrapper; row `784` is intentionally skipped because local repo has no tracked `website/` subtree; row `785` is covered elsewhere as its merge wrapper.
 - Rows `767`-`769`: rows `767` and `768` are covered elsewhere because the local checkout already has the overlapping Python test hardening or lacks the upstream Playwright/CHANGELOG surfaces, and row `769` is intentionally skipped because the local Dockerfile already uses Debian-slim builder/runtime stages.
 - Row `668`: adapted locally in a focused `ModelUpdater.sync_persist_to_all_builders()` test; upstream-only `command_pipeline.py` and `model_registry.py` tests were not imported because those module surfaces do not exist in this HEAD.
 - Row `669`: intentionally skipped because upstream only updates absent tracked `CLAUDE.md` wording for C901 enforcement; local Ruff C901 enforcement remains tracked separately in row `639`, and gitignored `AGENTS.md` is not a repository submission surface.

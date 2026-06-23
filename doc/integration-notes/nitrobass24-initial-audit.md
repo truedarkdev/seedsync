@@ -796,12 +796,12 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 777 | `973d4fb235d609cffaa140fecd7a68230d041858` | 2026-05-06 | Merge pull request #473 from nitrobass24/dependabot/npm_and_yarn/src/angular/multi-7bdfbe8666 | covered elsewhere - merge wrapper for row 776's ignored Angular lockfile-only dependency bump |
 | 778 | `8317993985ad2313b7e4b4d0c6d3ec9b0943028d` | 2026-05-07 | chore(deps): bump hono from 4.12.14 to 4.12.18 in /src/angular | intentionally skipped - upstream changes only ignored `src/angular/package-lock.json`; no tracked local Angular file changes apply |
 | 779 | `48991b8883f2d34604b22367057536377b203049` | 2026-05-06 | Merge pull request #474 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.18 | covered elsewhere - merge wrapper for row 778's ignored Angular lockfile-only dependency bump |
-| 780 | `689b25b1ff6b7aecc128d55f0bfb36123fa63151` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /website | pending |
-| 781 | `0f5eb7434b3090abd9c452f8bef86b6cecf6e97b` | 2026-05-08 | Merge pull request #475 from nitrobass24/dependabot/npm_and_yarn/website/fast-uri-3.1.2 | pending |
-| 782 | `78ea06e4fec4acfcebe526e73b2dffdd4601ac97` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /src/angular | pending |
-| 783 | `c4d72a3765be5ee317668d640a5007de5e2459a1` | 2026-05-08 | Merge pull request #476 from nitrobass24/dependabot/npm_and_yarn/src/angular/fast-uri-3.1.2 | pending |
-| 784 | `0ecc19350bcf9b44d1b1c53fa1cac2d7c80a7910` | 2026-05-09 | chore(deps): bump @babel/plugin-transform-modules-systemjs in /website | pending |
-| 785 | `2bf54f6fce43241b96c31dae1176938843df7c6c` | 2026-05-09 | Merge pull request #477 from nitrobass24/dependabot/npm_and_yarn/website/babel/plugin-transform-modules-systemjs-7.29.4 | pending |
+| 780 | `689b25b1ff6b7aecc128d55f0bfb36123fa63151` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /website | intentionally skipped - website-only dependency bump; local repo has no tracked `website/` subtree or website lockfile surface |
+| 781 | `0f5eb7434b3090abd9c452f8bef86b6cecf6e97b` | 2026-05-08 | Merge pull request #475 from nitrobass24/dependabot/npm_and_yarn/website/fast-uri-3.1.2 | covered elsewhere - merge wrapper for row `780` |
+| 782 | `78ea06e4fec4acfcebe526e73b2dffdd4601ac97` | 2026-05-09 | chore(deps): bump fast-uri from 3.1.0 to 3.1.2 in /src/angular | intentionally skipped - the only candidate `src/angular/package-lock.json` is ignored and untracked locally, so there is no committed Angular lockfile surface to update |
+| 783 | `c4d72a3765be5ee317668d640a5007de5e2459a1` | 2026-05-08 | Merge pull request #476 from nitrobass24/dependabot/npm_and_yarn/src/angular/fast-uri-3.1.2 | covered elsewhere - merge wrapper for row `782` |
+| 784 | `0ecc19350bcf9b44d1b1c53fa1cac2d7c80a7910` | 2026-05-09 | chore(deps): bump @babel/plugin-transform-modules-systemjs in /website | intentionally skipped - website-only dependency bump; local repo has no tracked `website/` subtree or website lockfile surface |
+| 785 | `2bf54f6fce43241b96c31dae1176938843df7c6c` | 2026-05-09 | Merge pull request #477 from nitrobass24/dependabot/npm_and_yarn/website/babel/plugin-transform-modules-systemjs-7.29.4 | covered elsewhere - merge wrapper for row `784` |
 | 786 | `62fa0eb928cb30d9deda98c9f139fe66d8dca17b` | 2026-05-10 | chore(deps): bump react from 19.2.5 to 19.2.6 in /website | pending |
 | 787 | `5dc470b9109395b48b28cd9f830c7fdddcf43dc0` | 2026-05-10 | Merge pull request #478 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-19.2.6 | pending |
 | 788 | `ea84cc10e8c6ce79a3c35d13284103161baa3d7d` | 2026-05-10 | chore(deps): bump the angular group in /src/angular with 10 updates | pending |
