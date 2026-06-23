@@ -400,6 +400,30 @@ class ModelUpdater:
                         for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
                     }
 
+                def keep_completion_pending_after_failed_staging_move(file: ModelFile):
+                    previous_downloaded_file_names = set(persist.downloaded_file_names)
+                    controller._Controller__clear_persist_key(  # type: ignore[attr-defined]
+                        persist.downloaded_file_names,
+                        file.name,
+                        file.path_pair_id,
+                    )
+                    if persist.downloaded_file_names != previous_downloaded_file_names:
+                        model_builder.set_downloaded_files(persist.downloaded_file_names)
+                    path_pair_name = file.path_pair_name
+                    if path_pair_name is None:
+                        path_pair = controller._Controller__get_path_pair(file.path_pair_id)  # type: ignore[attr-defined]
+                        path_pair_name = getattr(path_pair, "name", None)
+                    controller._Controller__pending_completion_file_names.add((
+                        file.name,
+                        file.path_pair_id,
+                        path_pair_name,
+                    ))
+                    controller.logger.warning(
+                        "Keeping download completion pending after failed staging move: %s",
+                        file.file_id,
+                    )
+                    controller._Controller__local_scan_process.force_scan()  # type: ignore[attr-defined]
+
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
 
@@ -476,10 +500,12 @@ class ModelUpdater:
                             controller._Controller__trace_target_archive_event("downloaded_marker_added", {  # type: ignore[attr-defined]
                                 "file": controller._Controller__summarize_target_archive_file(new_file),  # type: ignore[attr-defined]
                             })
-                        controller._Controller__move_from_staging(  # type: ignore[attr-defined]
+                        staging_move_succeeded = controller._Controller__move_from_staging(  # type: ignore[attr-defined]
                             new_file.name,
                             new_file.path_pair_id,
                         )
+                        if staging_move_succeeded is False:
+                            keep_completion_pending_after_failed_staging_move(new_file)
 
                     # Detect if a file was just downloaded through a direct state transition.
                     # Pending-completion files are handled above so disappearance does not
@@ -511,10 +537,12 @@ class ModelUpdater:
                             controller._Controller__trace_target_archive_event("downloaded_marker_added", {  # type: ignore[attr-defined]
                                 "file": controller._Controller__summarize_target_archive_file(new_file),  # type: ignore[attr-defined]
                             })
-                        controller._Controller__move_from_staging(  # type: ignore[attr-defined]
+                        staging_move_succeeded = controller._Controller__move_from_staging(  # type: ignore[attr-defined]
                             new_file.name,
                             new_file.path_pair_id,
                         )
+                        if staging_move_succeeded is False:
+                            keep_completion_pending_after_failed_staging_move(new_file)
 
                 current_auto_purge_candidate_ids = set()
                 for diff in model_diff:
