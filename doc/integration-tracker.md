@@ -94,10 +94,11 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `914` (`4b32fde8f12bb4288a056442a973a156dc1de335`)
+- Last dispositioned fork-unique row: `916` (`f139c481cb02de941a418bda9380753e33a3d72d`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Resume checkpoint: rows `761`-`914` are dispositioned; row `915` is next.
+- Resume checkpoint: rows `761`-`916` are dispositioned; row `917` is next.
+- Rows `915`-`916`: row `915` is intentionally skipped because the repo has no tracked `website/` subtree for the React DOM dependency bump; row `916` is covered as its merge wrapper.
 - Rows `906`-`914`: row `906` needs area reopen through `config-remote-python-path-row906`; row `907` is intentionally skipped because local repo lacks the upstream-only `command_pipeline.py` surface; row `908` is covered as the refactor-bucket merge wrapper; row `909` is intentionally skipped because the matching workflow surface is absent; row `910` is covered as its merge wrapper; row `911` is covered elsewhere by the evolved Angular dependency state / noncanonical ignored lockfile surface; row `912` is covered as its merge wrapper; row `913` is intentionally skipped because local Angular testing remains Karma/Jasmine rather than Vitest; row `914` is covered as its merge wrapper.
 - Rows `902`-`905`: row `902` needs area reopen through `lftp-job-parser-refactor-row902`; row `903` is covered elsewhere by the evolved ViewFileService / file-selection split, with any exact capabilities-module review kept in `view-file-performance-rows890-894`; row `904` needs area reopen through `controller-decomposition-row680`; row `905` is already integrated by local parser typing coverage.
 - Rows `889`-`895`: row `889` is deferred to `model-builder-performance-row889`; row `890` and the ViewFileService hunk of row `894` are deferred to `view-file-performance-rows890-894`; row `891` is already integrated by local logs-page buffering/trackBy behavior; row `892` is deferred to `logs-page-performance-rows891-892`; row `893` is covered as a frontend-bugs/performance merge wrapper; row `894` is split by surface with the file-component hunk in `file-component-action-guard-row894` and the config/API-key hunk in `auth-api-key-bootstrap-rows879-885`; row `895` is covered as the performance bucket merge wrapper.

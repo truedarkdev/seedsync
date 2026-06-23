@@ -931,8 +931,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 912 | `965d57b4427cd1e324cc8cd78d370bd38e27c893` | 2026-06-08 | Merge pull request #554 from nitrobass24/dependabot/npm_and_yarn/src/angular/hono-4.12.24 | covered elsewhere - merge wrapper for row `911` |
 | 913 | `3add27772ce8a9f2c63bde7f1eff609934756a1b` | 2026-06-08 | chore(deps-dev): bump vitest from 4.1.7 to 4.1.8 in /src/angular | intentionally skipped - local Angular test surface remains Karma/Jasmine rather than Vitest |
 | 914 | `4b32fde8f12bb4288a056442a973a156dc1de335` | 2026-06-08 | Merge pull request #553 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/vitest-4.1.8 | covered elsewhere - merge wrapper for row `913` |
-| 915 | `b1879fceb963b18f3fa975e640c899c50755c361` | 2026-06-08 | chore(deps): bump react-dom from 19.2.6 to 19.2.7 in /website | pending |
-| 916 | `f139c481cb02de941a418bda9380753e33a3d72d` | 2026-06-08 | Merge pull request #548 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-dom-19.2.7 | pending |
+| 915 | `b1879fceb963b18f3fa975e640c899c50755c361` | 2026-06-08 | chore(deps): bump react-dom from 19.2.6 to 19.2.7 in /website | intentionally skipped - website-only React DOM dependency bump against absent local `website/` subtree |
+| 916 | `f139c481cb02de941a418bda9380753e33a3d72d` | 2026-06-08 | Merge pull request #548 from nitrobass24/dependabot/npm_and_yarn/website/develop/react-dom-19.2.7 | covered elsewhere - merge wrapper for row `915` |
 | 917 | `471fbf256857b3fd8e3545ab65ca0cc0b34d5588` | 2026-06-08 | refactor(angular): migrate ConfigService/AutoQueueService to tap-based mutating-service contract (#542) | pending |
 | 918 | `028d681455cbb38564d8c21e06e098b2e6250453` | 2026-06-08 | refactor(angular): extract ViewFileCommandService from ViewFileService (#541) | pending |
 | 919 | `8b542599ba84f420779d90a52913cb9203a56ba0` | 2026-06-08 | perf(angular): virtualize logs list + batch change detection (#539) | pending |
