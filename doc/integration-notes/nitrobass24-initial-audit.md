@@ -959,17 +959,17 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 940 | `af3971f39ce86c6a3298c7b46b94f62fa8184290` | 2026-06-09 | Merge pull request #562 from nitrobass24/fix/sshcp-password-prompt-timeout | covered elsewhere - merge wrapper for row `939` |
 | 941 | `8caada62bec92b2dea90b017c1c6351ff9f95c9e` | 2026-06-09 | Merge branch 'develop' into feat/ftps-transfer-protocol | covered elsewhere - FTPS branch sync wrapper with no independent local payload beyond rows `935`-`938` |
 | 942 | `07154a4ed99aac31fb88b3e99068acac66a4b203` | 2026-06-09 | Merge pull request #564 from nitrobass24/feat/ftps-transfer-protocol | covered elsewhere - merge wrapper for the FTPS feature lane |
-| 943 | `e13eaf3bb79424403966821126ff8fe6aaeec875` | 2026-06-09 | chore(deps): bump shell-quote from 1.8.3 to 1.8.4 in /website | pending |
-| 944 | `e66d18e33fc8fd306a9043f5f48ea90fc3850e67` | 2026-06-09 | Merge pull request #565 from nitrobass24/dependabot/npm_and_yarn/website/shell-quote-1.8.4 | pending |
-| 945 | `70e60d4bc2cdc4fc832bfbe84d92990313c5f7d3` | 2026-06-09 | fix(ssh): remove GSSAPIAuthentication=no — unsupported on Alpine openssh | pending |
-| 946 | `4c3bdca4ce72fa04f24f1eb26906ce80c08f2f12` | 2026-06-09 | Merge pull request #566 from nitrobass24/fix/sshcp-gssapi-unsupported-alpine | pending |
-| 947 | `06bc51029b2758d6243ae229c9ab7fbc9e3f8c66` | 2026-06-09 | fix(move): defer staging->final move while lftp temp files present | pending |
-| 948 | `c374f34249ab9c114c82819d7c678047142087fd` | 2026-06-09 | feat(settings): move FTPS options into a dedicated section | pending |
-| 949 | `3257d9dc6bb9343f6bc5b8aaf49e50efec57c23b` | 2026-06-09 | Merge pull request #567 from nitrobass24/fix/move-process-lftp-temp-race | pending |
-| 950 | `a6a14e657343f42aeefa6942e9ce8022c7de80bf` | 2026-06-09 | fix(lftp): stop overriding Connections settings under FTPS | pending |
-| 951 | `1e86386a6a4e63fa68a909ff04b8d54e34f8938d` | 2026-06-10 | Merge pull request #568 from nitrobass24/fix/ftps-respect-connections-settings | pending |
-| 952 | `a041021a64335c8e9fe330d9fe6c6112a5140aa5` | 2026-06-10 | feat(settings): rename FTPS section to "Transfer Protocol" | pending |
-| 953 | `60eb99b99adef90a3f21a005d586130ec62d0b1b` | 2026-06-10 | Merge pull request #569 from nitrobass24/feat/settings-rename-ftps-section | pending |
-| 954 | `1d800aaa7c8e6815053f8ec53cbbc88c5bba7bb0` | 2026-06-10 | Release v1.0.0 - First stable release | pending |
-| 955 | `686a1e3fbac7c49e32131bc8c3a24f69215482d6` | 2026-06-10 | fix(angular): use action-agnostic log in ViewFileCommandService.createAction | pending |
-| 956 | `38d6ef22d36b6a75c164bc754bac9cd2842e8722` | 2026-06-10 | Release v1.0.0 - Sync develop → master | pending |
+| 943 | `e13eaf3bb79424403966821126ff8fe6aaeec875` | 2026-06-09 | chore(deps): bump shell-quote from 1.8.3 to 1.8.4 in /website | intentionally skipped - website-only dependency bump against absent local `website/` subtree |
+| 944 | `e66d18e33fc8fd306a9043f5f48ea90fc3850e67` | 2026-06-09 | Merge pull request #565 from nitrobass24/dependabot/npm_and_yarn/website/shell-quote-1.8.4 | covered elsewhere - merge wrapper for row `943` |
+| 945 | `70e60d4bc2cdc4fc832bfbe84d92990313c5f7d3` | 2026-06-09 | fix(ssh): remove GSSAPIAuthentication=no — unsupported on Alpine openssh | needs area reopen via existing task `sshcp-run-command-row679`; Alpine/GSSAPI behavior should be decided with the SSHCP command-construction lane |
+| 946 | `4c3bdca4ce72fa04f24f1eb26906ce80c08f2f12` | 2026-06-09 | Merge pull request #566 from nitrobass24/fix/sshcp-gssapi-unsupported-alpine | covered elsewhere - merge wrapper for row `945` |
+| 947 | `06bc51029b2758d6243ae229c9ab7fbc9e3f8c66` | 2026-06-09 | fix(move): defer staging->final move while lftp temp files present | needs new integration task - focused task `controller-staging-temp-row947` owns the `.lftp` temp-file final-move deferral race, distinct from failed-move state surfacing |
+| 948 | `c374f34249ab9c114c82819d7c678047142087fd` | 2026-06-09 | feat(settings): move FTPS options into a dedicated section | needs area reopen via existing task `ftps-transfer-protocol-row935`; protocol settings layout belongs with the optional FTPS feature/UI decision |
+| 949 | `3257d9dc6bb9343f6bc5b8aaf49e50efec57c23b` | 2026-06-09 | Merge pull request #567 from nitrobass24/fix/move-process-lftp-temp-race | covered elsewhere - merge wrapper for row `947` |
+| 950 | `a6a14e657343f42aeefa6942e9ce8022c7de80bf` | 2026-06-09 | fix(lftp): stop overriding Connections settings under FTPS | needs area reopen via existing task `ftps-transfer-protocol-row935`; connection-setting preservation is part of the FTPS runtime contract |
+| 951 | `1e86386a6a4e63fa68a909ff04b8d54e34f8938d` | 2026-06-10 | Merge pull request #568 from nitrobass24/fix/ftps-respect-connections-settings | covered elsewhere - merge wrapper for row `950` |
+| 952 | `a041021a64335c8e9fe330d9fe6c6112a5140aa5` | 2026-06-10 | feat(settings): rename FTPS section to "Transfer Protocol" | needs area reopen via existing task `ftps-transfer-protocol-row935`; visible protocol-section naming belongs with the FTPS settings/UI approval path |
+| 953 | `60eb99b99adef90a3f21a005d586130ec62d0b1b` | 2026-06-10 | Merge pull request #569 from nitrobass24/feat/settings-rename-ftps-section | covered elsewhere - merge wrapper for row `952` |
+| 954 | `1d800aaa7c8e6815053f8ec53cbbc88c5bba7bb0` | 2026-06-10 | Release v1.0.0 - First stable release | already integrated - release commit is already represented in local history and has no independent implementation payload to import |
+| 955 | `686a1e3fbac7c49e32131bc8c3a24f69215482d6` | 2026-06-10 | fix(angular): use action-agnostic log in ViewFileCommandService.createAction | covered elsewhere - command-service logging follow-up belongs with existing task `view-file-performance-rows890-894` |
+| 956 | `38d6ef22d36b6a75c164bc754bac9cd2842e8722` | 2026-06-10 | Release v1.0.0 - Sync develop → master | covered elsewhere - release/sync wrapper with no independent implementation payload beyond already dispositioned rows |
