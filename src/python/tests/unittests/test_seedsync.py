@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, AppError
+from controller import AutoQueuePattern, AutoQueuePersist
 from seedsync import Seedsync
 from web.auth_store import ApiKeyStore
 
@@ -525,6 +526,42 @@ class TestSeedsync(unittest.TestCase):
             self.assertEqual(initial_save_count + 1, updated_save_count)
             self.assertTrue(seedsync.controller_persist.to_file.called)
             self.assertTrue(seedsync.auto_queue_persist.to_file.called)
+
+    def test_persist_logs_auto_queue_write_failures_and_continues(self):
+        old_config = Seedsync._create_default_config()
+        new_config = copy.deepcopy(old_config)
+        new_config.general.log_level = "DEBUG" if old_config.general.log_level != "DEBUG" else "INFO"
+
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.context = SimpleNamespace(
+            logger=MagicMock(),
+            config=new_config,
+        )
+        seedsync.controller_persist = MagicMock()
+        seedsync.auto_queue_persist = AutoQueuePersist()
+        queued_pattern = AutoQueuePattern("queued")
+        seedsync.auto_queue_persist.add_pattern(queued_pattern)
+        seedsync.controller_persist_path = "controller.persist"
+        seedsync.auto_queue_persist_path = "autoqueue.persist"
+        seedsync.api_key_store = MagicMock()
+        seedsync.api_key_store_path = "api-keys.json"
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as f:
+            f.write(old_config.to_str())
+            seedsync.config_path = f.name
+        try:
+            with patch.object(seedsync.auto_queue_persist, "to_file", side_effect=OSError("disk full")) as auto_queue_to_file:
+                seedsync.persist()
+
+            seedsync.controller_persist.to_file.assert_called_once_with("controller.persist")
+            auto_queue_to_file.assert_called_once_with("autoqueue.persist")
+            seedsync.api_key_store.save.assert_called_once_with()
+            seedsync.context.logger.exception.assert_called_once_with("Failed to persist auto-queue state")
+            self.assertIn(queued_pattern, seedsync.auto_queue_persist.patterns)
+            with open(seedsync.config_path, "r") as f:
+                self.assertEqual(new_config.to_str(), f.read())
+        finally:
+            os.remove(seedsync.config_path)
 
     def test_timeout_status_keeps_later_controller_failure_degraded(self):
         context = SimpleNamespace(
