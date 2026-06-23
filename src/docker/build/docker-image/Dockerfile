@@ -48,9 +48,11 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     python3 \
     && rm -rf /var/lib/apt/lists/*
-COPY src/angular/package*.json /app/
+# Copy only the tracked manifest; the repo-local Angular lockfile is ignored.
+COPY src/angular/package.json /app/
 WORKDIR /app
-RUN npm ci --legacy-peer-deps
+# Install from the tracked manifest only; the repo-local Angular lockfile is ignored.
+RUN npm install --legacy-peer-deps --no-package-lock
 
 
 # Builds angular app into html
