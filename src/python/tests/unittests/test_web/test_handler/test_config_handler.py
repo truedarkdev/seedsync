@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import tempfile
 from io import BytesIO
 import unittest
 from unittest.mock import MagicMock, patch
@@ -208,22 +211,28 @@ class TestConfigHandlerSet(unittest.TestCase):
         sync_hook.assert_called_once()
 
     def test_set_breadcrumb_trace_enabled_updates_active_gate(self):
-        config = Config()
-        config.general.breadcrumb_trace_enabled = True
-        collector = BreadcrumbTraceCollector(lambda: config.general.breadcrumb_trace_enabled, max_entries=2)
-        emitter = collector.create_emitter()
-        handler = ConfigHandler(config, breadcrumb_trace_sync=collector.sync_enabled_state)
+        with tempfile.TemporaryDirectory(prefix="test_config_handler_set_") as temp_dir:
+            config_path = os.path.join(temp_dir, "settings.cfg")
+            config = Config()
+            config.file_path = config_path
+            config.to_file()
+            config.general.breadcrumb_trace_enabled = True
+            collector = BreadcrumbTraceCollector(lambda: config.general.breadcrumb_trace_enabled, max_entries=2)
+            emitter = collector.create_emitter()
+            handler = ConfigHandler(config, breadcrumb_trace_sync=collector.sync_enabled_state)
 
-        emitter.record("controller", "start", {"phase": "init"}, stage="scan")
-        self.assertEqual(1, collector.snapshot()["entry_count"])
-        response = handler._ConfigHandler__handle_set_config("general", "breadcrumb_trace_enabled", False)
-        self.assertEqual(200, response.status_code)
-        emitter.record("controller", "start", {"phase": "disabled"}, stage="scan")
+            emitter.record("controller", "start", {"phase": "init"}, stage="scan")
+            self.assertEqual(1, collector.snapshot()["entry_count"])
+            response = handler._ConfigHandler__handle_set_config("general", "breadcrumb_trace_enabled", False)
+            self.assertEqual(200, response.status_code)
+            emitter.record("controller", "start", {"phase": "disabled"}, stage="scan")
 
-        snapshot = collector.snapshot()
-        self.assertEqual(False, snapshot["enabled"])
-        self.assertEqual(1, snapshot["entry_count"])
-        self.assertEqual("init", snapshot["entries"][0]["details"]["phase"])
+            snapshot = collector.snapshot()
+            self.assertEqual(False, snapshot["enabled"])
+            self.assertEqual(1, snapshot["entry_count"])
+            self.assertEqual("init", snapshot["entries"][0]["details"]["phase"])
+            with open(config_path, "r", encoding="utf-8") as config_file:
+                self.assertIn("breadcrumb_trace_enabled = False", config_file.read())
 
     def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
@@ -255,9 +264,22 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.auth_store = ApiKeyStore()
         self.admin_api_token = self.auth_store.create_api_key("unit-admin", ["admin"])["secret"]
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        self.config_dir = tempfile.mkdtemp(prefix="test_config_handler_routes_")
+        self.addCleanup(shutil.rmtree, self.config_dir, ignore_errors=True)
+        self.config_path = os.path.join(self.config_dir, "settings.cfg")
+
+    def _new_config(self):
+        config = Config()
+        config.file_path = self.config_path
+        config.to_file()
+        return config
+
+    def _read_config_contents(self):
+        with open(self.config_path, "r", encoding="utf-8") as config_file:
+            return config_file.read()
 
     def test_get_route_honors_remote_detail_redaction_opt_out(self):
-        config = Config()
+        config = self._new_config()
         config.general.api_token = "super-secret-token"
         config.general.config_api_redact_remote_details = False
         config.lftp.remote_address = "server.remote.com"
@@ -282,7 +304,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
     def test_set_route_blocks_redaction_toggle_from_body(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -300,7 +322,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         )
 
     def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs_from_body(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -318,7 +340,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         )
 
     def test_set_route_allows_empty_remote_password_from_body(self):
-        config = Config()
+        config = self._new_config()
         config.lftp.remote_password = "existing-password"
         ConfigHandler(config).add_routes(self.web_app)
 
@@ -334,7 +356,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), body)
 
     def test_set_route_rejects_whitespace_remote_password_from_body(self):
-        config = Config()
+        config = self._new_config()
         config.lftp.remote_password = "existing-password"
         ConfigHandler(config).add_routes(self.web_app)
 
@@ -350,7 +372,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertIn("Bad config: Lftp.remote_password is empty", body)
 
     def test_set_route_treats_literal_empty_sentinel_as_value(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -365,7 +387,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("lftp.remote_password set to {}".format(Config.REDACTED_SENTINEL), body)
 
     def test_set_route_allows_logging_format_from_body(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -380,7 +402,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertIn("logging.log_format set to json", body)
 
     def test_set_route_rejects_invalid_logging_format_from_body(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_post_json_route(
@@ -395,7 +417,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertIn("Bad config: Logging.log_format (text) must be either standard or json", body)
 
     def test_set_route_rejects_old_url_value_shape(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
         ui_session = self.auth_store.create_ui_session(["admin"])
 
@@ -409,7 +431,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("INFO", config.general.log_level)
 
     def test_set_route_accepts_legacy_debug_body(self):
-        config = Config()
+        config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
         for value, expected_level in ((True, "DEBUG"), (False, "INFO")):
@@ -423,6 +445,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
 
                 self.assertEqual(200, status_code)
                 self.assertEqual(expected_level, config.general.log_level)
+                self.assertIn("log_level = {}".format(expected_level), self._read_config_contents())
                 self.assertIn("general.debug set to {}".format(value), body)
 
     def test_get_route_rejects_legacy_token(self):

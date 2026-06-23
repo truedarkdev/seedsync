@@ -560,6 +560,7 @@ class Config(Persist):
             return super().from_dict(config_dict)
 
     def __init__(self):
+        self.file_path: str | None = None
         self.general = Config.General()
         self.lftp = Config.Lftp()
         self.controller = Config.Controller()
@@ -601,6 +602,12 @@ class Config(Persist):
                 config_dict[section][option] = config_parser.get(section, option)
         return cls.from_dict(config_dict)
 
+    @classmethod
+    def from_file(cls, file_path: str) -> "Config":
+        config = super().from_file(file_path)
+        config.file_path = file_path
+        return config
+
     @overrides(Persist)
     def to_str(self) -> str:
         config_parser = configparser.ConfigParser()
@@ -613,6 +620,14 @@ class Config(Persist):
         str_io = StringIO()
         config_parser.write(str_io)
         return str_io.getvalue()
+
+    def to_file(self, file_path: str | None = None):
+        if file_path is None:
+            file_path = self.file_path
+        if file_path is None:
+            raise PersistError("Config file path is not bound")
+        self.file_path = file_path
+        super().to_file(file_path)
 
     @staticmethod
     def from_dict(config_dict: OuterConfigType) -> "Config":
