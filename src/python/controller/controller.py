@@ -236,6 +236,7 @@ class Controller:
         self.__reported_dead_workers = set()
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
         self.__started = False
+        self.__startup_failed = False
 
     def __init__(self,
                  context: Context,
@@ -394,6 +395,7 @@ class Controller:
         self.__updater.sync_persist_to_all_builders()
 
         self.__started = False
+        self.__startup_failed = False
 
     def __configure_lftp(self):
         # Configure Lftp
@@ -595,6 +597,8 @@ class Controller:
         startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
         if startup_validation_error is not None:
             raise ControllerError(startup_validation_error)
+        if getattr(self, "_Controller__startup_failed", False):
+            raise ControllerError("Cannot refresh path pairs, controller startup failed")
         if not self.__started:
             self.__apply_path_pair_refresh()
             self.__mark_path_pair_refresh_completed(self.__path_pair_refresh_generation)
@@ -739,12 +743,19 @@ class Controller:
         os.makedirs(self.__staging_path, exist_ok=True)
         for staging_path in self.__path_pair_staging_paths.values():
             os.makedirs(staging_path, exist_ok=True)
-        self.__active_scan_process.start()
-        self.__local_scan_process.start()
-        self.__remote_scan_process.start()
-        self.__extract_process.start()
-        self.__validate_process.start()
-        self.__mp_logger.start()
+        # Keep partial startup failure separate so exit() can clean up already
+        # started workers without making process() look fully live.
+        self.__startup_failed = False
+        try:
+            self.__active_scan_process.start()
+            self.__local_scan_process.start()
+            self.__remote_scan_process.start()
+            self.__extract_process.start()
+            self.__validate_process.start()
+            self.__mp_logger.start()
+        except Exception:
+            self.__startup_failed = True
+            raise
         self.__started = True
         self.__record_breadcrumb(
             stage="controller",
@@ -766,6 +777,8 @@ class Controller:
         startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
         if startup_validation_error is not None:
             raise ControllerError(startup_validation_error)
+        if getattr(self, "_Controller__startup_failed", False):
+            raise ControllerError("Cannot process, controller startup failed")
         if not self.__started:
             raise ControllerError("Cannot process, controller is not started")
         self.__propagate_exceptions()
@@ -795,6 +808,21 @@ class Controller:
                 label
             )
 
+    __JOIN_TIMEOUT_IN_SECS = 2
+
+    def __bounded_join(self, label: str, process: AppProcess) -> None:
+        self.__best_effort_teardown(label, lambda: process.join(self.__JOIN_TIMEOUT_IN_SECS))
+        try:
+            still_alive = process.is_alive()
+        except (AssertionError, ValueError):
+            still_alive = False
+        if still_alive:
+            self.logger.warning(
+                "Worker %s did not exit within %ss; continuing teardown",
+                getattr(process, "name", "?"),
+                self.__JOIN_TIMEOUT_IN_SECS,
+            )
+
     def __report_dead_worker_once(self, worker: AppProcess | None, worker_name: str) -> None:
         if worker is None:
             return
@@ -817,7 +845,7 @@ class Controller:
 
     def exit(self):
         self.logger.debug("Exiting controller")
-        if self.__started:
+        if self.__started or getattr(self, "_Controller__startup_failed", False):
             try:
                 self.__lftp.exit()
             except LftpError as exc:
@@ -830,18 +858,19 @@ class Controller:
                 self.__best_effort_teardown("remote scan process terminate", self.__remote_scan_process.terminate)
                 self.__best_effort_teardown("extract process terminate", self.__extract_process.terminate)
                 self.__best_effort_teardown("validate process terminate", self.__validate_process.terminate)
-                self.__best_effort_teardown("active scan process join", self.__active_scan_process.join)
+                self.__bounded_join("active scan process join", self.__active_scan_process)
                 self.__best_effort_teardown("active scan process close_queues", self.__active_scan_process.close_queues)
-                self.__best_effort_teardown("local scan process join", self.__local_scan_process.join)
+                self.__bounded_join("local scan process join", self.__local_scan_process)
                 self.__best_effort_teardown("local scan process close_queues", self.__local_scan_process.close_queues)
-                self.__best_effort_teardown("remote scan process join", self.__remote_scan_process.join)
+                self.__bounded_join("remote scan process join", self.__remote_scan_process)
                 self.__best_effort_teardown("remote scan process close_queues", self.__remote_scan_process.close_queues)
-                self.__best_effort_teardown("extract process join", self.__extract_process.join)
+                self.__bounded_join("extract process join", self.__extract_process)
                 self.__best_effort_teardown("extract process close_queues", self.__extract_process.close_queues)
-                self.__best_effort_teardown("validate process join", self.__validate_process.join)
+                self.__bounded_join("validate process join", self.__validate_process)
                 self.__best_effort_teardown("validate process close_queues", self.__validate_process.close_queues)
                 self.__best_effort_teardown("mp logger stop", self.__mp_logger.stop)
                 self.__started = False
+                self.__startup_failed = False
                 self.logger.info("Exited controller")
 
     def get_model_files(self) -> List[ModelFile]:

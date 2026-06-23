@@ -87,6 +87,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_status_cache_max_age_seconds = 3
         self.controller._Controller__startup_recovery_done = False
         self.controller._Controller__memory_monitor = MagicMock()
+        self.controller._Controller__started = False
+        self.controller._Controller__startup_failed = False
 
         self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
         self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
@@ -94,6 +96,32 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def _set_exit_worker_processes_not_alive(self):
+        for process in (
+            self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process,
+            self.controller._Controller__remote_scan_process,
+            self.controller._Controller__extract_process,
+            self.controller._Controller__validate_process,
+        ):
+            process.is_alive.return_value = False
+
+    def _assert_exit_teardown(self):
+        join_timeout = Controller._Controller__JOIN_TIMEOUT_IN_SECS
+        for process in (
+            self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process,
+            self.controller._Controller__remote_scan_process,
+            self.controller._Controller__extract_process,
+            self.controller._Controller__validate_process,
+        ):
+            process.terminate.assert_called_once_with()
+            process.join.assert_called_once_with(join_timeout)
+            process.close_queues.assert_called_once_with()
+        self.controller._Controller__mp_logger.stop.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__started)
+        self.assertFalse(self.controller._Controller__startup_failed)
 
     def _make_startup_context(
         self,
@@ -432,31 +460,17 @@ class TestController(unittest.TestCase):
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True
         self.controller._Controller__lftp.exit.side_effect = LftpError("teardown failed")
+        self._set_exit_worker_processes_not_alive()
 
         self.controller.exit()
 
         self.controller.logger.warning.assert_called_once()
-        self.controller._Controller__active_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__extract_process.terminate.assert_called_once_with()
-        self.controller._Controller__validate_process.terminate.assert_called_once_with()
-        self.controller._Controller__active_scan_process.join.assert_called_once_with()
-        self.controller._Controller__local_scan_process.join.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.join.assert_called_once_with()
-        self.controller._Controller__extract_process.join.assert_called_once_with()
-        self.controller._Controller__validate_process.join.assert_called_once_with()
-        self.controller._Controller__active_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__local_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
-        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
-        self.controller._Controller__mp_logger.stop.assert_called_once_with()
-        self.assertFalse(self.controller._Controller__started)
+        self._assert_exit_teardown()
 
     def test_exit_continues_shutdown_when_process_terminate_fails(self):
         self.controller._Controller__started = True
         self.controller._Controller__active_scan_process.terminate.side_effect = RuntimeError("terminate failed")
+        self._set_exit_worker_processes_not_alive()
 
         self.controller.exit()
 
@@ -464,26 +478,12 @@ class TestController(unittest.TestCase):
             "Ignoring controller teardown failure during %s; continuing shutdown",
             "active scan process terminate"
         )
-        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__extract_process.terminate.assert_called_once_with()
-        self.controller._Controller__validate_process.terminate.assert_called_once_with()
-        self.controller._Controller__active_scan_process.join.assert_called_once_with()
-        self.controller._Controller__active_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__local_scan_process.join.assert_called_once_with()
-        self.controller._Controller__local_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.join.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.close_queues.assert_called_once_with()
-        self.controller._Controller__extract_process.join.assert_called_once_with()
-        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
-        self.controller._Controller__validate_process.join.assert_called_once_with()
-        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
-        self.controller._Controller__mp_logger.stop.assert_called_once_with()
-        self.assertFalse(self.controller._Controller__started)
+        self._assert_exit_teardown()
 
     def test_exit_continues_shutdown_when_process_join_fails(self):
         self.controller._Controller__started = True
         self.controller._Controller__extract_process.join.side_effect = RuntimeError("join failed")
+        self._set_exit_worker_processes_not_alive()
 
         self.controller.exit()
 
@@ -491,26 +491,32 @@ class TestController(unittest.TestCase):
             "Ignoring controller teardown failure during %s; continuing shutdown",
             "extract process join"
         )
-        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
-        self.controller._Controller__validate_process.join.assert_called_once_with()
-        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
-        self.controller._Controller__mp_logger.stop.assert_called_once_with()
-        self.assertFalse(self.controller._Controller__started)
+        self._assert_exit_teardown()
+
+    def test_exit_continues_when_worker_join_times_out(self):
+        self.controller._Controller__started = True
+        self._set_exit_worker_processes_not_alive()
+        self.controller._Controller__extract_process.is_alive.return_value = True
+        self.controller._Controller__extract_process.name = "extract process"
+
+        self.controller.exit()
+
+        self.controller.logger.warning.assert_called_once_with(
+            "Worker %s did not exit within %ss; continuing teardown",
+            "extract process",
+            Controller._Controller__JOIN_TIMEOUT_IN_SECS
+        )
+        self._assert_exit_teardown()
 
     def test_exit_continues_shutdown_when_lftp_raises_unexpected_error(self):
         self.controller._Controller__started = True
         self.controller._Controller__lftp.exit.side_effect = RuntimeError("lftp died")
+        self._set_exit_worker_processes_not_alive()
 
         self.controller.exit()
 
         self.controller.logger.exception.assert_any_call("Ignoring lftp teardown failure; continuing shutdown")
-        self.controller._Controller__active_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__local_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__remote_scan_process.terminate.assert_called_once_with()
-        self.controller._Controller__extract_process.terminate.assert_called_once_with()
-        self.controller._Controller__validate_process.terminate.assert_called_once_with()
-        self.controller._Controller__mp_logger.stop.assert_called_once_with()
-        self.assertFalse(self.controller._Controller__started)
+        self._assert_exit_teardown()
 
     @patch("controller.controller.os.makedirs")
     def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
@@ -541,6 +547,72 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.start.assert_called_once_with()
         self.controller._Controller__mp_logger.start.assert_called_once_with()
         self.assertTrue(self.controller._Controller__started)
+
+    @patch("controller.controller.os.makedirs")
+    def test_start_leaves_started_false_if_child_start_fails(self, _mock_makedirs):
+        self.controller._Controller__extract_process.start.side_effect = RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            self.controller.start()
+
+        self.assertFalse(self.controller._Controller__started)
+        self.assertTrue(self.controller._Controller__startup_failed)
+        self.controller._Controller__active_scan_process.start.assert_called_once_with()
+        self.controller._Controller__local_scan_process.start.assert_called_once_with()
+        self.controller._Controller__remote_scan_process.start.assert_called_once_with()
+        self.controller._Controller__extract_process.start.assert_called_once_with()
+        self.controller._Controller__validate_process.start.assert_not_called()
+        self.controller._Controller__mp_logger.start.assert_not_called()
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        with self.assertRaises(ControllerError) as error:
+            self.controller.process()
+
+        self.assertIn("startup failed", str(error.exception))
+        self.controller._Controller__propagate_exceptions.assert_not_called()
+        self.controller._Controller__cleanup_commands.assert_not_called()
+        self.controller._Controller__process_commands.assert_not_called()
+        self.controller._Controller__updater.update.assert_not_called()
+        self.controller._Controller__log_memory_usage.assert_not_called()
+        self._set_exit_worker_processes_not_alive()
+        self.controller.exit()
+        self._assert_exit_teardown()
+
+    @patch("controller.controller.os.makedirs")
+    def test_process_rejects_partial_start_failure_before_exit(self, _mock_makedirs):
+        self.controller._Controller__validate_process.start.side_effect = RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            self.controller.start()
+
+        self.assertFalse(self.controller._Controller__started)
+        self.assertTrue(self.controller._Controller__startup_failed)
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__apply_path_pair_refresh = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        with self.assertRaises(ControllerError) as refresh_error:
+            self.controller.refresh_path_pairs()
+
+        self.assertIn("startup failed", str(refresh_error.exception))
+        self.controller._Controller__apply_path_pair_refresh.assert_not_called()
+
+        with self.assertRaises(ControllerError) as error:
+            self.controller.process()
+
+        self.assertIn("startup failed", str(error.exception))
+        self.controller._Controller__propagate_exceptions.assert_not_called()
+        self.controller._Controller__cleanup_commands.assert_not_called()
+        self.controller._Controller__process_commands.assert_not_called()
+        self.controller._Controller__updater.update.assert_not_called()
+        self.controller._Controller__log_memory_usage.assert_not_called()
 
     def test_configure_lftp_applies_net_socket_buffer_when_configured(self):
         self.controller._Controller__context.config.lftp.net_socket_buffer = "512K"
