@@ -829,8 +829,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 810 | `e6aa6ff8f2bd8e0cf40721492f6036ec3970690b` | 2026-05-17 | Merge pull request #488 from nitrobass24/dependabot/npm_and_yarn/src/angular/develop/angular-b53251a3f7 | covered elsewhere - merge wrapper for row `809` |
 | 811 | `89711b48c6a38a9cbe702d7b0a1668aa1521a202` | 2026-05-17 | chore(deps): bump postcss from 8.5.6 to 8.5.14 in /website | intentionally skipped - website-only postcss lockfile bump; local repo has no tracked `website/` subtree |
 | 812 | `8806d96e96a3b9fa44a9b83ad03d5ff15d0d91ec` | 2026-05-17 | Merge pull request #493 from nitrobass24/dependabot/npm_and_yarn/website/postcss-8.5.14 | covered elsewhere - merge wrapper for row `811` |
-| 813 | `b5aa1b15da2671a78d2d32074c28f1d7a38c3d98` | 2026-05-18 | Add notify_on_download_start option (#486) | pending |
-| 814 | `eedf8631994dbf497584f91ce41923ab631562e0` | 2026-05-19 | Merge pull request #494 from nitrobass24/feat/notify-download-start | pending |
+| 813 | `b5aa1b15da2671a78d2d32074c28f1d7a38c3d98` | 2026-05-18 | Add notify_on_download_start option (#486) | needs new integration task - belongs with existing task `notify-download-start-row813`; upstream introduces `notify_on_download_start` across backend config, notification plumbing, Angular settings UI, and tests, so it needs a dedicated feature lane rather than a drive-by import in the audit pass |
+| 814 | `eedf8631994dbf497584f91ce41923ab631562e0` | 2026-05-19 | Merge pull request #494 from nitrobass24/feat/notify-download-start | covered elsewhere - merge wrapper for row `813` |
 | 815 | `e20d02aca74eab906a2427b384bbf47fcce13845` | 2026-05-19 | Roll back config handler on persistence failure (#469.2) | pending |
 | 816 | `8d107e8100e1599c01ee6c0e146965985c587cff` | 2026-05-19 | Skip rollback when concurrent update changed the value | pending |
 | 817 | `155ac1b3f4a03955418ef409caed98b42113d3cd` | 2026-05-19 | Apply ruff format to test_config.py | pending |
