@@ -94,10 +94,11 @@ Refresh rule:
 - Baseline rows already in `origin/master`: `87` rows, `1-87`, through common base `ff2a1039935beccbbf7ec76134b41d2e91137742`
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
-- Last dispositioned fork-unique row: `885` (`81e358bdcb301941473bcc0d66f664dac3cdff36`)
+- Last dispositioned fork-unique row: `888` (`1f0db282c7a2c8ea717977cbaaa96eec81e54f3c`)
 - Status: active / in progress
 - Manifest: [doc/integration-notes/nitrobass24-initial-audit.md](/mnt/c/Git/seedsync/doc/integration-notes/nitrobass24-initial-audit.md)
-- Resume checkpoint: rows `761`-`885` are dispositioned; row `886` is next.
+- Resume checkpoint: rows `761`-`888` are dispositioned; row `889` is next.
+- Rows `886`-`888`: row `886` needs follow-up task `historical-log-cursor-row756` because local logs UI lacks the exact upstream history-error banner surface; row `887` is split between the log-history task for its banner/accessibility hunk and new task `frontend-hardening-row887` for config redacted-sentinel, malformed model-file SSE payload, and stream-dispatch spec hardening; row `888` is covered as the frontend-bugs bucket merge wrapper.
 - Rows `879`-`885`: row `879` is adapted locally in the Angular config/bootstrap path; rows `880`, `881`, `882`, and `884` are already integrated; row `883` is covered elsewhere because the no-persistence outcome supersedes the sentinel reuse; row `885` is already integrated because the branch does not add client-side API-key persistence.
 - Rows `794`-`798`: row `794` is intentionally skipped because local `README.md` deliberately identifies this repository as a maintained integration fork; row `795` needs follow-up task `discord-webhook-user-agent-row795` because the upstream Discord User-Agent fix targets a notification formatter surface that is not wired in this checkout; row `796` is covered as its merge wrapper; row `797` is intentionally skipped as upstream release/version bookkeeping; row `798` is covered as the release sync wrapper.
 - Rows `775`-`779`: row `775` is intentionally skipped because local `README.md` deliberately identifies this repository as a maintained integration fork; rows `776` and `778` are intentionally skipped as ignored Angular lockfile-only dependency bumps, and rows `777`/`779` are their merge wrappers.
