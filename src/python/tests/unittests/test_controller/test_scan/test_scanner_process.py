@@ -5,7 +5,7 @@ import multiprocessing
 import logging
 import sys
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 
 import pytest
 
@@ -241,23 +241,155 @@ class TestScannerProcess(unittest.TestCase):
         process.logger.warning.assert_called_once()
         self.assertIn("Scanner queue read failed", process.logger.warning.call_args[0][0])
 
+    def test_run_loop_applies_targeted_scan_request_to_scanner(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(return_value=[])
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=[])
+        mock_scanner.pop_managed_extract_file_ids = MagicMock(return_value=[])
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        process.run_loop()
+
+        self.assertEqual(
+            [call({"movies"}), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
+    def test_run_loop_coalesces_multiple_targeted_scan_requests(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(return_value=[])
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=[])
+        mock_scanner.pop_managed_extract_file_ids = MagicMock(return_value=[])
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        process.force_scan("tv")
+        process.run_loop()
+
+        self.assertEqual(
+            [call({"movies", "tv"}), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
+    def test_run_loop_prefers_full_scan_over_targeted_requests_when_full_is_queued_first(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(return_value=[])
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=[])
+        mock_scanner.pop_managed_extract_file_ids = MagicMock(return_value=[])
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan()
+        process.force_scan("movies")
+        process.run_loop()
+
+        self.assertEqual(
+            [call(None), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
+    def test_run_loop_prefers_full_scan_over_targeted_requests_when_full_is_queued_last(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(return_value=[])
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=[])
+        mock_scanner.pop_managed_extract_file_ids = MagicMock(return_value=[])
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        process.force_scan()
+        process.run_loop()
+
+        self.assertEqual(
+            [call(None), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
+    def test_run_loop_clears_targeted_scan_state_after_recoverable_exception(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(side_effect=ScannerError("recoverable error", recoverable=True))
+        mock_scanner.pop_malformed_status_only_file_ids = MagicMock(return_value=[])
+        mock_scanner.pop_managed_extract_file_ids = MagicMock(return_value=[])
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        process.run_loop()
+
+        result = process.pop_latest_result()
+        self.assertIsNotNone(result)
+        self.assertTrue(result.failed)
+        self.assertEqual("recoverable error", result.error_message)
+        self.assertEqual(
+            [call({"movies"}), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
+    def test_run_loop_clears_targeted_scan_state_after_nonrecoverable_exception(self):
+        mock_scanner = DummyScanner()
+        mock_scanner.scan = MagicMock(side_effect=ScannerError("fatal error", recoverable=False))
+        mock_scanner.set_scan_target_path_pair_ids = MagicMock()
+
+        process = ScannerProcess(scanner=mock_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.force_scan("movies")
+        with self.assertRaises(ScannerError):
+            process.run_loop()
+
+        self.assertEqual(
+            [call({"movies"}), call(None)],
+            mock_scanner.set_scan_target_path_pair_ids.mock_calls,
+        )
+        mock_scanner.scan.assert_called_once_with()
+
     def test_close_queues_releases_owned_queue_and_is_idempotent(self):
-        queue = MagicMock()
+        exception_queue = MagicMock()
+        result_queue = MagicMock()
+        target_queue = MagicMock()
         wake_event = MagicMock()
 
-        with patch("controller.scan.scanner_process.multiprocessing.Queue", return_value=queue), \
+        with patch(
+            "controller.scan.scanner_process.multiprocessing.Queue",
+            side_effect=[exception_queue, result_queue, target_queue],
+        ), \
                 patch("controller.scan.scanner_process.multiprocessing.Event", return_value=wake_event):
             process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False)
 
         process.mp_logger = MagicMock()
-        process._AppProcess__exception_queue = MagicMock()
+        self.assertIs(process._AppProcess__exception_queue, exception_queue)
+        self.assertIs(process._ScannerProcess__queue, result_queue)
+        self.assertIs(process._ScannerProcess__scan_target_queue, target_queue)
 
         process.close_queues()
         process.close_queues()
 
-        queue.close.assert_called_once_with()
-        queue.join_thread.assert_called_once_with()
+        exception_queue.close.assert_called_once_with()
+        exception_queue.join_thread.assert_called_once_with()
+        result_queue.close.assert_called_once_with()
+        result_queue.join_thread.assert_called_once_with()
+        target_queue.close.assert_called_once_with()
+        target_queue.join_thread.assert_called_once_with()
         self.assertIsNone(process._ScannerProcess__queue)
+        self.assertIsNone(process._ScannerProcess__scan_target_queue)
         self.assertIsNone(process._ScannerProcess__wake_event)
         self.assertIsNone(process._AppProcess__exception_queue)
         self.assertIsNone(process._terminate)

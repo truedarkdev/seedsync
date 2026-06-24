@@ -1568,7 +1568,10 @@ class Controller:
                     "file_name": name,
                     "result": "moved",
                 })
-            self.__local_scan_process.force_scan()
+            if path_pair_id is None:
+                self.__local_scan_process.force_scan()
+            else:
+                self.__local_scan_process.force_scan(path_pair_id)
             return True
         except OSError as error:
             self.logger.warning(
