@@ -189,9 +189,17 @@ class AutoQueue:
         self.__patterns_only = context.config.autoqueue.patterns_only
         self.__auto_extract_enabled = context.config.autoqueue.auto_extract
         self.__auto_delete_remote_enabled = context.config.autoqueue.auto_delete_remote
+        self.__path_pair_manager = getattr(context, "path_pair_manager", None)
+        self.__pair_auto_queue: Dict[str, bool] = {}
+        self.__queue_enabled = self.__enabled
         self.__cycle_sequence = 0
 
-        if self.__enabled:
+        self.__refresh_queue_state()
+
+        # Register listeners whenever queueing might become active, including
+        # when path pairs are present and own the queue decision.
+        if self.__enabled or self.__queue_enabled or self.__auto_extract_enabled or self.__auto_delete_remote_enabled \
+                or self.__path_pair_manager is not None:
             persist.add_listener(self.__persist_listener)
 
             initial_model_files = self.__controller.get_model_files_and_add_listener(self.__model_listener)
@@ -246,7 +254,9 @@ class AutoQueue:
         Advance the auto queue state
         :return:
         """
-        if not self.__enabled:
+        self.__refresh_queue_state()
+        if not self.__enabled and not self.__queue_enabled:
+            self.__discard_inactive_buffers()
             return
         self.__cycle_sequence += 1
         new_patterns = self.__persist_listener.drain_new_patterns()
@@ -256,60 +266,70 @@ class AutoQueue:
             # Queue
             ###
             queue_candidates = {}
-            new_files_to_queue = self.__filter_candidates(
-                candidates=self.__model_listener.new_files,
-                new_patterns=new_patterns,
-                accept=lambda f: (
-                    f.remote_size is not None and
-                    f.state == ModelFile.State.DEFAULT and
-                    (f.local_size is None or f.local_size == 0)
+            new_files_to_queue = []
+            modified_files_actual_update = []
+            modified_files_remote_discovery = []
+            files_to_queue = []
+            queue_blocked_reason_counts, queue_blocked_samples = {}, []
+            if self.__queue_enabled:
+                new_files_to_queue = self.__filter_candidates(
+                    candidates=self.__model_listener.new_files,
+                    new_patterns=new_patterns,
+                    accept=lambda f: (
+                        f.remote_size is not None and
+                        f.state == ModelFile.State.DEFAULT and
+                        (f.local_size is None or f.local_size == 0) and
+                        self._is_auto_queue_enabled_for_file(f)
+                    )
                 )
-            )
-            queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
+                queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
 
-            modified_candidates_actual_update = []
-            modified_candidates_remote_discovery = []
-            for old_file, new_file in self.__model_listener.modified_files:
-                if old_file.remote_size != new_file.remote_size:
-                    if old_file.remote_size is not None:
-                        modified_candidates_actual_update.append(new_file)
-                    else:
-                        modified_candidates_remote_discovery.append(new_file)
-            queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
-            queue_candidates.update({file.file_id: file for file in modified_candidates_remote_discovery})
+                modified_candidates_actual_update = []
+                modified_candidates_remote_discovery = []
+                for old_file, new_file in self.__model_listener.modified_files:
+                    if old_file.remote_size != new_file.remote_size:
+                        if old_file.remote_size is not None:
+                            modified_candidates_actual_update.append(new_file)
+                        else:
+                            modified_candidates_remote_discovery.append(new_file)
+                queue_candidates.update({file.file_id: file for file in modified_candidates_actual_update})
+                queue_candidates.update({file.file_id: file for file in modified_candidates_remote_discovery})
 
-            modified_files_actual_update = self.__filter_candidates(
-                candidates=modified_candidates_actual_update,
-                new_patterns=new_patterns,
-                accept=lambda f: f.remote_size is not None and f.state == ModelFile.State.DEFAULT
-            )
-
-            modified_files_remote_discovery = self.__filter_candidates(
-                candidates=modified_candidates_remote_discovery,
-                new_patterns=new_patterns,
-                accept=lambda f: (
-                    f.remote_size is not None and
+                modified_files_actual_update = self.__filter_candidates(
+                    candidates=modified_candidates_actual_update,
+                    new_patterns=new_patterns,
+                    accept=lambda f: f.remote_size is not None and
                     f.state == ModelFile.State.DEFAULT and
-                    (f.local_size is None or f.local_size == 0)
+                    self._is_auto_queue_enabled_for_file(f)
                 )
-            )
 
-            files_to_queue_dict = {
-                file.file_id: (file, pattern) for file, pattern in new_files_to_queue
-            }
-            for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
-                files_to_queue_dict[file.file_id] = (file, pattern)
-            files_to_queue = [
-                (file, pattern)
-                for file, pattern in files_to_queue_dict.values()
-                if not self.__controller.is_file_stopped(file.file_id)
-            ]
-            files_to_queue_by_id = {file.file_id: file for file, _ in files_to_queue}
-            queue_blocked_reason_counts, queue_blocked_samples = self.__summarize_auto_queue_decisions(
-                lane="queue",
-                candidate_files=list(queue_candidates.values()),
-                selected_by_id=files_to_queue_by_id,
-            )
+                modified_files_remote_discovery = self.__filter_candidates(
+                    candidates=modified_candidates_remote_discovery,
+                    new_patterns=new_patterns,
+                    accept=lambda f: (
+                        f.remote_size is not None and
+                        f.state == ModelFile.State.DEFAULT and
+                        (f.local_size is None or f.local_size == 0) and
+                        self._is_auto_queue_enabled_for_file(f)
+                    )
+                )
+
+                files_to_queue_dict = {
+                    file.file_id: (file, pattern) for file, pattern in new_files_to_queue
+                }
+                for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
+                    files_to_queue_dict[file.file_id] = (file, pattern)
+                files_to_queue = [
+                    (file, pattern)
+                    for file, pattern in files_to_queue_dict.values()
+                    if not self.__controller.is_file_stopped(file.file_id)
+                ]
+                files_to_queue_by_id = {file.file_id: file for file, _ in files_to_queue}
+                queue_blocked_reason_counts, queue_blocked_samples = self.__summarize_auto_queue_decisions(
+                    lane="queue",
+                    candidate_files=list(queue_candidates.values()),
+                    selected_by_id=files_to_queue_by_id,
+                )
 
             ###
             # Extract
@@ -317,7 +337,7 @@ class AutoQueue:
             files_to_extract = []
             extract_candidate_files = []
 
-            if self.__auto_extract_enabled:
+            if self.__enabled and self.__auto_extract_enabled:
                 # Candidate all new files
                 extract_candidate_files += self.__model_listener.new_files
 
@@ -429,7 +449,7 @@ class AutoQueue:
                         "auto_extract_enabled": self.__auto_extract_enabled,
                     })
 
-            if self.__auto_extract_enabled and self.__patterns_only:
+            if self.__enabled and self.__auto_extract_enabled and self.__patterns_only:
                 matched_extract_file_ids = {file.file_id for file, _ in files_to_extract}
                 blocked_extract_candidates = [
                     new_file
@@ -448,7 +468,7 @@ class AutoQueue:
             ###
             # Delete Remote
             ###
-            files_to_delete_remote = self.__filter_delete_remote_candidates()
+            files_to_delete_remote = self.__filter_delete_remote_candidates() if self.__enabled else []
 
             self.__record_breadcrumb(
                 "auto_queue_cycle",
@@ -534,6 +554,30 @@ class AutoQueue:
             event_type="state_transition",
             corr_id="auto_queue",
         )
+
+    def __refresh_queue_state(self):
+        self.__queue_enabled = self.__enabled
+        self.__pair_auto_queue = {}
+        if self.__path_pair_manager is None:
+            return
+        try:
+            enabled_pairs = list(self.__path_pair_manager.get_enabled_pairs() or [])
+        except Exception:
+            return
+        if not enabled_pairs:
+            return
+        self.__pair_auto_queue = {pair.id: pair.auto_queue for pair in enabled_pairs}
+        self.__queue_enabled = any(self.__pair_auto_queue.values())
+
+    def __discard_inactive_buffers(self):
+        self.__model_listener.new_files.clear()
+        self.__model_listener.modified_files.clear()
+        self.__persist_listener.drain_new_patterns()
+
+    def _is_auto_queue_enabled_for_file(self, file: ModelFile) -> bool:
+        if self.__pair_auto_queue:
+            return self.__pair_auto_queue.get(file.path_pair_id, False)
+        return True
 
     def __filter_candidates(self,
                             candidates: List[ModelFile],

@@ -17,7 +17,7 @@ export class OptionComponent implements OnInit {
     @Input() type: OptionType;
     @Input() label: string;
     @Input() value: any;
-    @Input() description: string;
+    @Input() description: string | null;
     @Input() choices: IOptionChoice[];
     @Input() disabled = false;
 

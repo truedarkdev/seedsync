@@ -12,6 +12,7 @@ import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
 import {Config} from "../../services/settings/config";
 import {ConfigService} from "../../services/settings/config.service";
+import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 
 
 @Component({
@@ -33,21 +34,30 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
     public connected: boolean;
     public enabled: boolean;
     public patternsOnly: boolean;
+    public disabledMessage: string;
 
     private _connectedService: ConnectedService;
+    private _pathPairService: PathPairService;
     private _destroy$: Subject<void> = new Subject<void>();
+    private _configEnabled: boolean;
+    private _enabledPathPairs: PathPair[];
 
     constructor(private _changeDetector: ChangeDetectorRef,
                 private _autoqueueService: AutoQueueService,
                 private _notifService: NotificationService,
                 private _configService: ConfigService,
+                pathPairService: PathPairService,
                 _streamServiceRegistry: StreamServiceRegistry) {
         this._connectedService = _streamServiceRegistry.connectedService;
+        this._pathPairService = pathPairService;
         this.patterns = _autoqueueService.patterns;
         this.newPattern = "";
         this.connected = false;
         this.enabled = false;
         this.patternsOnly = false;
+        this.disabledMessage = "Auto-Queue is disabled. Enable AutoQueue in Settings to queue files automatically.";
+        this._configEnabled = false;
+        this._enabledPathPairs = [];
     }
 
     // noinspection JSUnusedGlobalSymbols
@@ -65,15 +75,35 @@ export class AutoQueuePageComponent implements OnInit, OnDestroy {
         this._configService.config.pipe(takeUntil(this._destroy$)).subscribe({
             next: config => {
                 if(config != null) {
-                    this.enabled = config.autoqueue.enabled;
+                    this._configEnabled = config.autoqueue.enabled;
                     this.patternsOnly = config.autoqueue.patterns_only;
                 } else {
-                    this.enabled = false;
+                    this._configEnabled = false;
                     this.patternsOnly = false;
                 }
-                this._changeDetector.detectChanges();
+                this._refreshEffectiveAutoqueueState();
             }
         });
+
+        this._pathPairService.pathPairs.pipe(takeUntil(this._destroy$)).subscribe({
+            next: pathPairs => {
+                this._enabledPathPairs = (pathPairs || []).filter(pair => pair.enabled);
+                this._refreshEffectiveAutoqueueState();
+            }
+        });
+    }
+
+    private _refreshEffectiveAutoqueueState() {
+        if (this._enabledPathPairs.length > 0) {
+            this.enabled = this._enabledPathPairs.some(pair => pair.auto_queue);
+            this.disabledMessage = "Auto-Queue is disabled. Enable AutoQueue on a path pair in Settings to queue files automatically.";
+        } else {
+            this.enabled = this._configEnabled;
+            this.disabledMessage = "Auto-Queue is disabled. Enable AutoQueue in Settings to queue files automatically.";
+        }
+        if (!this._destroy$.isStopped) {
+            this._changeDetector.detectChanges();
+        }
     }
 
     ngOnDestroy() {

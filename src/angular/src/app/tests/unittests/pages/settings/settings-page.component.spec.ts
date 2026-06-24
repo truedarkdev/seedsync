@@ -12,6 +12,7 @@ import {LoggerService} from "../../../../services/utils/logger.service";
 import {NotificationService} from "../../../../services/utils/notification.service";
 import {ServerCommandService} from "../../../../services/server/server-command.service";
 import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
+import {PathPair, PathPairService} from "../../../../services/settings/path-pair.service";
 
 
 class MockConfigService {
@@ -24,6 +25,18 @@ class MockConfigService {
 
 class MockConnectedService {
     connected = new BehaviorSubject(false);
+}
+
+class MockPathPairService {
+    private _pathPairs = new BehaviorSubject<PathPair[]>([]);
+
+    get pathPairs() {
+        return this._pathPairs.asObservable();
+    }
+
+    push(pathPairs: PathPair[]) {
+        this._pathPairs.next(pathPairs);
+    }
 }
 
 class MockStreamServiceRegistry {
@@ -98,6 +111,7 @@ describe("Testing settings page component", () => {
                 {provide: ServerCommandService, useClass: MockServerCommandService},
                 {provide: Modal, useClass: MockModal},
                 {provide: ModalAccessibilityService, useClass: MockModalAccessibilityService},
+                {provide: PathPairService, useClass: MockPathPairService},
                 {provide: ConnectedService, useClass: MockConnectedService},
                 {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry}
             ]
@@ -130,5 +144,40 @@ describe("Testing settings page component", () => {
         expect(logLevelOption.label).toBe("Log Level");
         expect(logLevelOption.valuePath).toEqual(["general", "log_level"]);
         expect(logLevelOption.choices![0]).toEqual({label: "Debug", value: "DEBUG"});
+    });
+
+    it("should disable legacy directory and autoqueue toggles when path pairs are enabled", () => {
+        const pathPairService = TestBed.get(PathPairService) as MockPathPairService;
+        pathPairService.push([
+            {
+                id: "movies",
+                name: "Movies",
+                remote_path: "/remote/movies",
+                local_path: "/downloads/movies",
+                enabled: true,
+                auto_queue: true
+            }
+        ]);
+        fixture.detectChanges();
+
+        const serverDirectory = component.serverContext.options.find(option => option.valuePath[1] === "remote_path")!;
+        const localDirectory = component.serverContext.options.find(option => option.valuePath[1] === "local_path")!;
+        const autoqueueEnabled = component.autoqueueContext.options.find(option => option.valuePath[1] === "enabled")!;
+        const autoqueuePatternsOnly = component.autoqueueContext.options.find(option => option.valuePath[1] === "patterns_only")!;
+
+        expect(serverDirectory.disabled).toBe(true);
+        expect(serverDirectory.description).toContain("Path pairs override");
+        expect(localDirectory.disabled).toBe(true);
+        expect(localDirectory.description).toContain("Path pairs override");
+        expect(autoqueueEnabled.disabled).toBe(true);
+        expect(autoqueueEnabled.description).toContain("Path pairs override");
+        expect(autoqueuePatternsOnly.disabled).toBeUndefined();
+
+        pathPairService.push([]);
+        fixture.detectChanges();
+
+        expect(component.serverContext.options.find(option => option.valuePath[1] === "remote_path")!.disabled).toBeUndefined();
+        expect(component.serverContext.options.find(option => option.valuePath[1] === "local_path")!.disabled).toBeUndefined();
+        expect(component.autoqueueContext.options.find(option => option.valuePath[1] === "enabled")!.disabled).toBeUndefined();
     });
 });

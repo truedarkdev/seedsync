@@ -18,7 +18,7 @@
                             [label]="option.label"
                             [description]="option.description"
                             [choices]="option.choices"
-                            [disabled]="isOptionDisabled(option, config | async)"
+                            [disabled]="!!option.disabled || isOptionDisabled(option, config | async)"
                             [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
                             (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
                         </app-option>
@@ -42,7 +42,7 @@
         <div id="left">
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_SERVER">
+                *ngTemplateOutlet="optionsList;context:serverContext">
             </ng-container>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
@@ -73,7 +73,7 @@
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_AUTOQUEUE">
+                *ngTemplateOutlet="optionsList;context:autoqueueContext">
             </ng-container>
         </div>
         <div id="right">

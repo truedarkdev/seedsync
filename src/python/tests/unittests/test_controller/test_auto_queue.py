@@ -8,7 +8,7 @@ import sys
 import json
 import threading
 
-from common import overrides, PersistError, Config
+from common import overrides, PersistError, Config, PathPair
 from controller import AutoQueue, AutoQueuePersist, IAutoQueuePersistListener, AutoQueuePattern
 from controller.auto_queue import AutoQueuePersistListener
 from controller import Controller
@@ -396,6 +396,7 @@ class TestAutoQueue(unittest.TestCase):
         self.context.config.autoqueue.enabled = True
         self.context.config.autoqueue.patterns_only = True
         self.context.config.autoqueue.auto_extract = True
+        self.context.path_pair_manager = None
         self.context.logger = self.logger
         self.context.breadcrumb_trace = MagicMock()
         self.controller = MagicMock()
@@ -414,6 +415,12 @@ class TestAutoQueue(unittest.TestCase):
         self.controller.get_model_files.side_effect = get_model
         self.controller.get_model_files_and_add_listener.side_effect = get_model_and_capture_listener
         self.controller.is_file_stopped.return_value = False
+
+    def _set_enabled_path_pairs(self, *pairs):
+        path_pair_manager = MagicMock()
+        path_pair_manager.get_enabled_pairs.return_value = list(pairs)
+        self.context.path_pair_manager = path_pair_manager
+        return path_pair_manager
 
     def test_matching_new_files_are_queued(self):
         persist = AutoQueuePersist()
@@ -1155,12 +1162,140 @@ class TestAutoQueue(unittest.TestCase):
         auto_queue.process()
         self.controller.queue_command.assert_not_called()
 
+    def test_path_pair_auto_queue_overrides_global_autoqueue_setting(self):
+        self.context.config.autoqueue.enabled = False
+        movies_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/downloads/movies",
+            enabled=True,
+            auto_queue=True,
+        )
+        tv_pair = PathPair(
+            id="tv",
+            name="TV",
+            remote_path="/remote/tv",
+            local_path="/downloads/tv",
+            enabled=True,
+            auto_queue=False,
+        )
+        self._set_enabled_path_pairs(movies_pair, tv_pair)
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        movie_file = ModelFile("Release", True)
+        movie_file.remote_size = 100
+        movie_file.path_pair_id = movies_pair.id
+
+        tv_file = ModelFile("Release", True)
+        tv_file.remote_size = 100
+        tv_file.path_pair_id = tv_pair.id
+
+        unpaired_file = ModelFile("Release", True)
+        unpaired_file.remote_size = 100
+        unpaired_file.path_pair_id = None
+
+        self.model_listener.file_added(movie_file)
+        self.model_listener.file_added(tv_file)
+        self.model_listener.file_added(unpaired_file)
+        auto_queue.process()
+
+        calls = self.controller.queue_command.call_args_list
+        self.assertEqual(1, len(calls))
+        command = calls[0][0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual(movie_file.file_id, command.filename)
+
+    def test_path_pair_auto_queue_respects_pair_level_opt_out(self):
+        self.context.config.autoqueue.enabled = True
+        movies_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/downloads/movies",
+            enabled=True,
+            auto_queue=False,
+        )
+        tv_pair = PathPair(
+            id="tv",
+            name="TV",
+            remote_path="/remote/tv",
+            local_path="/downloads/tv",
+            enabled=True,
+            auto_queue=False,
+        )
+        self._set_enabled_path_pairs(movies_pair, tv_pair)
+
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        movie_file = ModelFile("Release", True)
+        movie_file.remote_size = 100
+        movie_file.path_pair_id = movies_pair.id
+
+        tv_file = ModelFile("Release", True)
+        tv_file.remote_size = 100
+        tv_file.path_pair_id = tv_pair.id
+
+        self.model_listener.file_added(movie_file)
+        self.model_listener.file_added(tv_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_not_called()
+
         # Second with patterns_only OFF
         self.context.config.autoqueue.patterns_only = False
         # noinspection PyTypeChecker
         auto_queue = AutoQueue(self.context, persist, self.controller)
         auto_queue.process()
         self.controller.queue_command.assert_not_called()
+
+    def test_inactive_buffers_are_dropped_before_path_pair_enablement(self):
+        self.context.config.autoqueue.enabled = False
+        self.context.config.autoqueue.patterns_only = True
+        path_pair_manager = self._set_enabled_path_pairs()
+        path_pair_manager.get_enabled_pairs.return_value = []
+
+        persist = AutoQueuePersist()
+        # noinspection PyTypeChecker
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        stale_file = ModelFile("Release.Old", True)
+        stale_file.remote_size = 100
+        stale_file.path_pair_id = "movies"
+        self.model_listener.file_added(stale_file)
+
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        active_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/downloads/movies",
+            enabled=True,
+            auto_queue=True,
+        )
+        path_pair_manager.get_enabled_pairs.return_value = [active_pair]
+
+        new_file = ModelFile("Release.New", True)
+        new_file.remote_size = 200
+        new_file.path_pair_id = active_pair.id
+        self.model_listener.file_added(new_file)
+        auto_queue.process()
+
+        calls = self.controller.queue_command.call_args_list
+        self.assertEqual(1, len(calls))
+        command = calls[0][0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual(new_file.file_id, command.filename)
 
     def test_all_files_are_queued_when_patterns_only_disabled(self):
         self.context.config.autoqueue.patterns_only = False
