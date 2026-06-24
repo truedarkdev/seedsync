@@ -60,7 +60,12 @@ export class FileComponent implements OnChanges {
         const oldFile: ViewFile = changes.file.previousValue;
         const newFile: ViewFile = changes.file.currentValue;
         if (oldFile != null && newFile != null) {
-            if (oldFile.status !== newFile.status) {
+            const oldFileKey = oldFile.fileId || oldFile.name;
+            const newFileKey = newFile.fileId || newFile.name;
+
+            if (oldFileKey !== newFileKey) {
+                this.resetActiveAction();
+            } else if (oldFile.status !== newFile.status) {
                 this.resetActiveAction();
             } else if (this.activeAction === FileAction.DELETE_REMOTE &&
                        oldFile.isRemotelyDeletable && !newFile.isRemotelyDeletable) {
@@ -196,7 +201,19 @@ export class FileComponent implements OnChanges {
         this.validateEvent.emit(file);
     }
 
-    resetActiveAction(): void {
+    // Late async callbacks can arrive after this row has been rebound by the
+    // virtual scroll, so only clear when the row still represents the same
+    // file and the same in-flight action.
+    resetActiveAction(forFile?: ViewFile, forAction?: FileAction): void {
+        if (forFile != null) {
+            const currentFileKey = this.file != null ? (this.file.fileId || this.file.name) : null;
+            const targetFileKey = forFile.fileId || forFile.name;
+
+            if (currentFileKey !== targetFileKey || this.activeAction !== forAction) {
+                return;
+            }
+        }
+
         this.activeAction = null;
         this._changeDetector.markForCheck();
     }

@@ -3,7 +3,7 @@ import {BehaviorSubject, of, throwError} from "rxjs";
 import * as Immutable from "immutable";
 
 import {FileListComponent} from "../../../../pages/files/file-list.component";
-import {FileComponent} from "../../../../pages/files/file.component";
+import {FileAction, FileComponent} from "../../../../pages/files/file.component";
 import {ViewFile} from "../../../../services/files/view-file";
 import {ViewFileOptions} from "../../../../services/files/view-file-options";
 import {WebReaction} from "../../../../services/utils/rest.service";
@@ -88,10 +88,12 @@ describe("Testing file list component", () => {
     });
 
     it("should clear the stop loading state when the stop request fails", () => {
-        component.onStop(createViewFile());
+        const file = createViewFile();
+
+        component.onStop(file);
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.STOP);
     });
 
     it("should clear the stop loading state when the stop request succeeds", () => {
@@ -99,14 +101,21 @@ describe("Testing file list component", () => {
             of(new WebReaction(true, "ok", null))
         );
 
-        component.onStop(createViewFile());
+        const file = createViewFile();
+
+        component.onStop(file);
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.STOP);
     });
 
     it("should reset stop loading on the matching row when duplicate display names are re-instantiated with the same file id", () => {
         const matchingFile = createViewFile();
+        const requestedFile = createViewFile({
+            fileId: matchingFile.fileId,
+            name: matchingFile.name,
+            isStoppable: true
+        });
         const matchingFileComponent = {
             file: matchingFile,
             resetActiveAction: jasmine.createSpy("matchingResetActiveAction")
@@ -123,31 +132,31 @@ describe("Testing file list component", () => {
             toArray: () => [otherFileComponent, matchingFileComponent]
         };
 
-        component.onStop(createViewFile({
-            fileId: matchingFile.fileId,
-            name: matchingFile.name,
-            isStoppable: true
-        }));
+        component.onStop(requestedFile);
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
-        expect(matchingFileComponent.resetActiveAction).toHaveBeenCalledTimes(1);
+        expect(matchingFileComponent.resetActiveAction).toHaveBeenCalledWith(requestedFile, FileAction.STOP);
         expect(otherFileComponent.resetActiveAction).not.toHaveBeenCalled();
     });
 
     it("should clear the stop loading state when the stop request errors", () => {
         mockViewFileService.stop.and.returnValue(throwError("boom"));
 
-        component.onStop(createViewFile());
+        const file = createViewFile();
+
+        component.onStop(file);
 
         expect(mockViewFileService.stop).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.STOP);
     });
 
     it("should clear the delete local loading state when the delete request succeeds", () => {
-        component.onDeleteLocal(createViewFile());
+        const file = createViewFile();
+
+        component.onDeleteLocal(file);
 
         expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.DELETE_LOCAL);
     });
 
     it("should clear the delete local loading state when the delete request fails", () => {
@@ -155,10 +164,12 @@ describe("Testing file list component", () => {
             of(new WebReaction(false, null, "Operation timed out"))
         );
 
-        component.onDeleteLocal(createViewFile());
+        const file = createViewFile();
+
+        component.onDeleteLocal(file);
 
         expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
-        expect(mockFileComponent.resetActiveAction).toHaveBeenCalled();
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.DELETE_LOCAL);
     });
 
     it("should switch Smart Status to Status Reverse when the status header is clicked", () => {

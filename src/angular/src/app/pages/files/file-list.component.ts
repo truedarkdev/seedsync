@@ -10,7 +10,7 @@ import {LoggerService} from "../../services/utils/logger.service";
 import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ViewFileOptionsService} from "../../services/files/view-file-options.service";
 import {FileSelectionService} from "../../services/files/file-selection.service";
-import {FileComponent} from "./file.component";
+import {FileAction, FileComponent} from "./file.component";
 
 @Component({
     selector: "app-file-list",
@@ -143,10 +143,10 @@ export class FileListComponent implements OnInit, OnDestroy {
         this.viewFileService.stop(file).subscribe(
             data => {
                 this._logger.info(data);
-                this.resetFileLoading(file);
+                this.resetFileLoading(file, FileAction.STOP);
             },
             () => {
-                this.resetFileLoading(file);
+                this.resetFileLoading(file, FileAction.STOP);
             }
         );
     }
@@ -160,9 +160,9 @@ export class FileListComponent implements OnInit, OnDestroy {
     onDeleteLocal(file: ViewFile) {
         this.viewFileService.deleteLocal(file).subscribe(data => {
             this._logger.info(data);
-            this.resetFileLoading(file);
+            this.resetFileLoading(file, FileAction.DELETE_LOCAL);
         }, () => {
-            this.resetFileLoading(file);
+            this.resetFileLoading(file, FileAction.DELETE_LOCAL);
         });
     }
 
@@ -200,7 +200,7 @@ export class FileListComponent implements OnInit, OnDestroy {
         return Math.min((this.currentPage + 1) * this.pageSize, this.totalCount);
     }
 
-    private resetFileLoading(file: ViewFile): void {
+    private resetFileLoading(file: ViewFile, action: FileAction): void {
         if (this.fileComponents == null) {
             return;
         }
@@ -215,7 +215,7 @@ export class FileListComponent implements OnInit, OnDestroy {
         });
 
         if (fileComponent != null) {
-            fileComponent.resetActiveAction();
+            fileComponent.resetActiveAction(file, action);
         }
     }
 }
