@@ -30,11 +30,11 @@ class MockViewFileOptionsService {
         this._options.next(options);
     }
 
-    public setNameFilter() {}
-    public setSelectedStatusFilter() {}
-    public setSortMethod() {}
-    public setShowDetails() {}
-    public setPinFilter() {}
+    public setNameFilter(_name: string) {}
+    public setSelectedStatusFilter(_status: ViewFile.Status) {}
+    public setSortMethod(_sortMethod: ViewFileOptions.SortMethod) {}
+    public setShowDetails(_show: boolean) {}
+    public setPinFilter(_pinned: boolean) {}
 }
 
 class MockViewFileService {
@@ -105,6 +105,73 @@ describe("Testing file options component", () => {
         expect(menu.classList.contains("show")).toBe(false);
         expect(button.classList.contains("show")).toBe(false);
         expect(button.getAttribute("aria-expanded")).toBe("false");
+    });
+
+    it("should keep status filters in sync with the file list and current selection", () => {
+        expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(0);
+        expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(true);
+        expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(true);
+
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.QUEUED}),
+            new ViewFile({status: ViewFile.Status.QUEUED}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+        ]));
+
+        expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(2);
+        expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(1);
+        expect(component.isStatusAvailable(ViewFile.Status.QUEUED)).toBe(true);
+        expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(false);
+        expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(true);
+
+        viewFileOptionsService.emitOptions(new ViewFileOptions({
+            showDetails: false,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
+            selectedStatusFilter: ViewFile.Status.STOPPED,
+            nameFilter: null,
+            pinFilter: false
+        }));
+
+        expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(false);
+
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.EXTRACTED})
+        ]));
+
+        expect(component.getStatusCount(ViewFile.Status.EXTRACTED)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(0);
+        expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(0);
+        expect(component.isStatusAvailable(ViewFile.Status.EXTRACTED)).toBe(true);
+        expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(true);
+        expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(false);
+    });
+
+    it("should delegate filter and sort changes to the service", () => {
+        const setNameFilterSpy = spyOn(viewFileOptionsService, "setNameFilter");
+        const setSelectedStatusFilterSpy = spyOn(viewFileOptionsService, "setSelectedStatusFilter");
+        const setSortMethodSpy = spyOn(viewFileOptionsService, "setSortMethod");
+        const setShowDetailsSpy = spyOn(viewFileOptionsService, "setShowDetails");
+        const setPinFilterSpy = spyOn(viewFileOptionsService, "setPinFilter");
+
+        viewFileOptionsService.emitOptions(new ViewFileOptions({
+            showDetails: true,
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
+            selectedStatusFilter: null,
+            nameFilter: null,
+            pinFilter: true
+        }));
+
+        component.onFilterByName("queued");
+        component.onFilterByStatus(ViewFile.Status.DOWNLOADED);
+        component.onSort(ViewFileOptions.SortMethod.NAME_DESC);
+        component.onToggleShowDetails();
+        component.onTogglePinFilter();
+
+        expect(setNameFilterSpy).toHaveBeenCalledWith("queued");
+        expect(setSelectedStatusFilterSpy).toHaveBeenCalledWith(ViewFile.Status.DOWNLOADED);
+        expect(setSortMethodSpy).toHaveBeenCalledWith(ViewFileOptions.SortMethod.NAME_DESC);
+        expect(setShowDetailsSpy).toHaveBeenCalledWith(false);
+        expect(setPinFilterSpy).toHaveBeenCalledWith(false);
     });
 
     it("should stop reacting to file and option updates after destroy", () => {
