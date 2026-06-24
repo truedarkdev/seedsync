@@ -663,6 +663,53 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("release").state)
 
+    @staticmethod
+    def __build_deep_wide_tree(name: str, depth: int, breadth: int, leaf_size):
+        """Build a balanced tree for traversal-shaped model-builder coverage."""
+        if depth == 0:
+            size = leaf_size(name) if callable(leaf_size) else leaf_size
+            return SystemFile(name, size, False)
+        children = [
+            TestModelBuilder.__build_deep_wide_tree(f"{name}.{i}", depth - 1, breadth, leaf_size)
+            for i in range(breadth)
+        ]
+        sized = SystemFile(name, sum(c.size for c in children), True)
+        for child in children:
+            sized.add_child(child)
+        return sized
+
+    def test_build_state_deep_wide_tree_downloaded(self):
+        remote = TestModelBuilder.__build_deep_wide_tree("a", depth=4, breadth=4, leaf_size=10)
+        local = TestModelBuilder.__build_deep_wide_tree("a", depth=4, breadth=4, leaf_size=10)
+
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("a").state)
+
+    def test_build_state_deep_wide_tree_incomplete_leaf(self):
+        remote = TestModelBuilder.__build_deep_wide_tree("a", depth=4, breadth=4, leaf_size=10)
+        incomplete_leaf = "a.3.3.3.3"
+
+        def local_leaf_size(leaf_name: str) -> int:
+            return 1 if leaf_name == incomplete_leaf else 10
+
+        local = TestModelBuilder.__build_deep_wide_tree(
+            "a",
+            depth=4,
+            breadth=4,
+            leaf_size=local_leaf_size,
+        )
+
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file("a").state)
+
     def test_build_state_keeps_final_root_remote_size_match_completed(self):
         self.model_builder.set_remote_files([SystemFile("archive.zip", 100, False)])
         self.model_builder.set_local_files([SystemFile("archive.zip", 100, False)])
