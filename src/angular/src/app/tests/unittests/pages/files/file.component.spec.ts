@@ -46,7 +46,7 @@ class MockEtaPipe implements PipeTransform {
     }
 }
 
-function createViewFile(props): ViewFile {
+function createViewFile(props: any = {}): ViewFile {
     return new ViewFile({
         fileId: props.fileId || "file-1",
         name: props.name || "sample",
@@ -140,6 +140,30 @@ describe("Testing file component", () => {
         })).not.toThrow();
     });
 
+    it("should clear the active action when ngOnChanges rebinding changes the file identity", () => {
+        const oldFile = createViewFile({
+            fileId: "file-1",
+            name: "old",
+            status: ViewFile.Status.DOWNLOADING,
+            isStoppable: true
+        });
+        const newFile = createViewFile({
+            fileId: "file-2",
+            name: "new",
+            status: ViewFile.Status.DOWNLOADING,
+            isStoppable: true
+        });
+        component.file = newFile;
+        component.activeAction = FileAction.STOP;
+
+        component.ngOnChanges({
+            file: new SimpleChange(oldFile, newFile, false)
+        });
+
+        expect(component.activeAction).toBe(null);
+        expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
     it("should clear the active remote delete action when remote deletability drops without a status change", () => {
         const oldFile = createViewFile({
             status: ViewFile.Status.DOWNLOADED,
@@ -221,6 +245,39 @@ describe("Testing file component", () => {
 
         expect(component.activeAction).toBe(null);
         expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
+    it("should clear the active action when resetActiveAction is called for the same file and action", () => {
+        const file = createViewFile();
+        component.file = file;
+        component.activeAction = FileAction.STOP;
+
+        component.resetActiveAction(file, FileAction.STOP);
+
+        expect(component.activeAction).toBe(null);
+        expect(changeDetector.markForCheck).toHaveBeenCalled();
+    });
+
+    it("should ignore stale reset callbacks after the component is rebound to another file", () => {
+        const oldFile = createViewFile({fileId: "file-1", name: "old"});
+        component.file = createViewFile({fileId: "file-2", name: "new"});
+        component.activeAction = FileAction.STOP;
+
+        component.resetActiveAction(oldFile, FileAction.STOP);
+
+        expect(component.activeAction).toBe(FileAction.STOP);
+        expect(changeDetector.markForCheck).not.toHaveBeenCalled();
+    });
+
+    it("should ignore stale reset callbacks when the file keeps the same identity but the action changes", () => {
+        const file = createViewFile();
+        component.file = file;
+        component.activeAction = FileAction.DELETE_LOCAL;
+
+        component.resetActiveAction(file, FileAction.STOP);
+
+        expect(component.activeAction).toBe(FileAction.DELETE_LOCAL);
+        expect(changeDetector.markForCheck).not.toHaveBeenCalled();
     });
 
     it("should render the stop action as a disabled button for stopped rows", () => {
