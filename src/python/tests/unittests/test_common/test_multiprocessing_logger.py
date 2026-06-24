@@ -40,6 +40,7 @@ class TestMultiprocessingLogger(unittest.TestCase):
         self.logger = logging.getLogger(TestMultiprocessingLogger.__name__)
         handler = logging.StreamHandler(sys.stdout)
         self.logger.addHandler(handler)
+        self.addCleanup(self.logger.removeHandler, handler)
         self.logger.setLevel(logging.DEBUG)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
         handler.setFormatter(formatter)

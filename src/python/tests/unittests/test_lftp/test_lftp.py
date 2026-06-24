@@ -864,6 +864,7 @@ class TestLftp(unittest.TestCase):
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
         handler.setFormatter(formatter)
         logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
 
     def tearDown(self):
         if not hasattr(self, "lftp"):
