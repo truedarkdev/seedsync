@@ -8,6 +8,10 @@ import {LoggerService} from "../../../../services/utils/logger.service";
 import {MockRestService} from "../../../mocks/mock-rest.service";
 import {Subject} from "rxjs";
 
+declare function require(moduleName: string): any;
+const {version: appVersion} = require("../../../../../../package.json");
+const knownNewerReleaseTag = "v99.0.0";
+
 
 describe("Testing version check service", () => {
     let versionCheckService: VersionCheckService;
@@ -58,15 +62,12 @@ describe("Testing version check service", () => {
         const subject = new Subject<WebReaction>();
         sendRequestSpy.and.returnValue(subject);
 
-        // Note: can't spy on compareVersions, so just replace the private method instead
-        spyOn<any>(VersionCheckService, "isVersionNewer").and.returnValue(true);
-
         // Recreate the service
         versionCheckService = createVersionCheckService();
         tick(10001);
         subject.next(new WebReaction(true, JSON.stringify({
-            "tag_name": "v99.0.0",
-            "html_url": "https://example.invalid/releases/v99.0.0"
+            "tag_name": knownNewerReleaseTag,
+            "html_url": `https://example.invalid/releases/${knownNewerReleaseTag}`
         }), null));
         tick();
 
@@ -107,14 +108,12 @@ describe("Testing version check service", () => {
             }
         });
 
-        // Note: can't spy on compareVersions, so just replace the private method instead
-        spyOn<any>(VersionCheckService, "isVersionNewer").and.returnValue(true);
-
         // Recreate the service
         versionCheckService = createVersionCheckService();
-        const releaseUrl = "https://example.invalid/releases/v0.0-0";
+        const releaseTag = knownNewerReleaseTag;
+        const releaseUrl = `https://example.invalid/releases/${releaseTag}`;
         subject.next(new WebReaction(true, JSON.stringify({
-            "tag_name": "v0.0-0",
+            "tag_name": releaseTag,
             "html_url": releaseUrl
         }), null));
         tick();
@@ -124,16 +123,31 @@ describe("Testing version check service", () => {
         expect(notifService.show).toHaveBeenCalled();
     }));
 
+    it("should not fire a notification when github reports the current version", fakeAsync(() => {
+        const subject = new Subject<WebReaction>();
+        sendRequestSpy.and.returnValue(subject);
+
+        // Recreate the service
+        versionCheckService = createVersionCheckService();
+        subject.next(new WebReaction(true, JSON.stringify({
+            "tag_name": `v${appVersion}`,
+            "html_url": `https://example.invalid/releases/v${appVersion}`
+        }), null));
+        tick();
+
+        expect(notifService.show).not.toHaveBeenCalled();
+    }));
+
     it("should not fire a notification on old version", fakeAsync(() => {
         const subject = new Subject<WebReaction>();
         sendRequestSpy.and.returnValue(subject);
 
-        // Note: can't spy on compareVersions, so just replace the private method instead
-        spyOn<any>(VersionCheckService, "isVersionNewer").and.returnValue(false);
-
         // Recreate the service
         versionCheckService = createVersionCheckService();
-        subject.next(new WebReaction(true, JSON.stringify({"tag_name": "v0.0-0"}), null));
+        subject.next(new WebReaction(true, JSON.stringify({
+            "tag_name": "v0.0-0",
+            "html_url": "https://example.invalid/releases/v0.0-0"
+        }), null));
         tick();
 
         expect(notifService.show).not.toHaveBeenCalled();
