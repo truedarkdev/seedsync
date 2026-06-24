@@ -6,6 +6,7 @@ import re
 from typing import List
 import os
 import posixpath
+import shlex
 from typing import Optional
 import hashlib
 
@@ -65,6 +66,17 @@ class RemoteScanner(IScanner):
                 return True
         return False
 
+    @staticmethod
+    def _normalize_remote_python_path(remote_python_path: Optional[str]) -> str:
+        if remote_python_path is None:
+            return "python3"
+        if not isinstance(remote_python_path, str):
+            remote_python_path = str(remote_python_path)
+        normalized = remote_python_path.strip()
+        if not normalized:
+            return "python3"
+        return normalized
+
     def __init__(self,
                  remote_address: str,
                  remote_username: str,
@@ -73,12 +85,14 @@ class RemoteScanner(IScanner):
                  remote_path_to_scan: str,
                  local_path_to_scan_script: str,
                  remote_path_to_scan_script: str,
+                 remote_python_path: Optional[str] = "python3",
                  path_pair_id: str = None,
                  path_pair_name: str = None):
         self.logger = logging.getLogger("RemoteScanner")
         self.__remote_path_to_scan = remote_path_to_scan
         self.__local_path_to_scan_script = local_path_to_scan_script
         self.__remote_path_to_scan_script = remote_path_to_scan_script
+        self.__remote_python_path = remote_python_path
         self.__ssh = Sshcp(host=remote_address,
                            port=remote_port,
                            user=remote_username,
@@ -122,7 +136,9 @@ class RemoteScanner(IScanner):
             self._install_scanfs()
 
         try:
-            out = self.__ssh.shell("{} {}".format(
+            remote_python_path = shlex.quote(self._normalize_remote_python_path(self.__remote_python_path))
+            out = self.__ssh.shell("{} {} {}".format(
+                remote_python_path,
                 escape_remote_path_for_shell(self.__remote_path_to_scan_script, allow_tilde_expansion=True),
                 escape_remote_path_for_shell(self.__remote_path_to_scan, allow_tilde_expansion=True)
             ))

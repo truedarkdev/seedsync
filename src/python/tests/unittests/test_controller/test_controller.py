@@ -138,6 +138,7 @@ class TestController(unittest.TestCase):
         use_local_path_as_extract_path=False,
         remote_username="user",
         remote_password="password",
+        remote_python_path="python3",
         use_ssh_key=False,
         verbose=False,
         auto_delete_remote=False,
@@ -157,6 +158,7 @@ class TestController(unittest.TestCase):
                     remote_path=remote_path,
                     local_path=local_path,
                     remote_path_to_scan_script="/scanfs",
+                    remote_python_path=remote_python_path,
                     use_ssh_key=use_ssh_key,
                     num_max_parallel_downloads=1,
                     num_max_parallel_files_per_download=1,
@@ -301,6 +303,43 @@ class TestController(unittest.TestCase):
         self.assertEqual(True, kwargs["ssl_verify_certificate"])
         self.assertIsNone(controller._Controller__ssh_password)
         self.assertEqual("password", controller._Controller__transfer_password)
+
+    @patch("controller.controller.RemoteScanner")
+    def test_build_remote_scanner_passes_remote_python_path(self, mock_remote_scanner):
+        self.controller._Controller__context.config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                remote_address="remote.server.com",
+                remote_username="user",
+                remote_password="password",
+                remote_port=22,
+                remote_path_to_scan_script="/scanfs",
+                remote_python_path="/opt/python/bin/python3",
+            )
+        )
+        self.controller._Controller__context.args = SimpleNamespace(local_path_to_scanfs="/local-scanfs")
+        path_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/local/movies",
+            enabled=True,
+            auto_queue=False,
+        )
+
+        self.controller._Controller__build_remote_scanner([path_pair])
+
+        mock_remote_scanner.assert_called_once_with(
+            remote_address="remote.server.com",
+            remote_username="user",
+            remote_password=None,
+            remote_port=22,
+            remote_path_to_scan="/remote/movies",
+            local_path_to_scan_script="/local-scanfs",
+            remote_path_to_scan_script="/scanfs",
+            remote_python_path="/opt/python/bin/python3",
+            path_pair_id="movies",
+            path_pair_name="Movies",
+        )
 
     def test_constructor_requires_password_for_ftps_even_when_ssh_key_is_enabled(self):
         context = self._make_startup_context(

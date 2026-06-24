@@ -407,6 +407,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         config.lftp.remote_password = "secret123"
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+        config.lftp.remote_python_path = "/home/user/.pyenv/shims/python3"
         ConfigHandler(config).add_routes(self.web_app)
 
         status_code, body = _invoke_get_route(
@@ -420,6 +421,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("server.remote.com", out_dict["lftp"]["remote_address"])
         self.assertEqual("user-on-remote-server", out_dict["lftp"]["remote_username"])
         self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
+        self.assertEqual("/home/user/.pyenv/shims/python3", out_dict["lftp"]["remote_python_path"])
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 

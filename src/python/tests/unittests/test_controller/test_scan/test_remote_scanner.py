@@ -56,6 +56,20 @@ class TestRemoteScanner(unittest.TestCase):
             escaped_remote_path
         )
 
+    @staticmethod
+    def _scan_command(remote_python_path, remote_script, remote_path):
+        if remote_python_path is None:
+            normalized_remote_python_path = "python3"
+        elif isinstance(remote_python_path, str):
+            normalized_remote_python_path = remote_python_path.strip() or "python3"
+        else:
+            normalized_remote_python_path = str(remote_python_path).strip() or "python3"
+        return "{} {} {}".format(
+            shlex.quote(normalized_remote_python_path),
+            escape_remote_path_for_shell(remote_script, allow_tilde_expansion=True),
+            escape_remote_path_for_shell(remote_path, allow_tilde_expansion=True)
+        )
+
     def test_correctly_initializes_ssh(self):
         self.ssh_args = {}
 
@@ -367,7 +381,7 @@ class TestRemoteScanner(unittest.TestCase):
         scanner.scan()
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_called_with(
-            "/remote/path/to/scan/script /remote/path/to/scan"
+            self._scan_command("python3", "/remote/path/to/scan/script", "/remote/path/to/scan")
         )
 
     def test_uses_home_expansion_for_tilde_remote_paths(self):
@@ -395,7 +409,7 @@ class TestRemoteScanner(unittest.TestCase):
 
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_called_with(
-            "/remote/path/to/scan/script ~/data/torrents"
+            self._scan_command("python3", "/remote/path/to/scan/script", "~/data/torrents")
         )
 
     def test_supports_tilde_remote_script_paths(self):
@@ -429,10 +443,7 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_has_calls([
             call(self._scanfs_probe_command(expected_remote_script)),
-            call("{} {}".format(
-                escape_remote_path_for_shell(expected_remote_script, allow_tilde_expansion=True),
-                "/remote/path/to/scan"
-            ))
+            call(self._scan_command("python3", expected_remote_script, "/remote/path/to/scan"))
         ])
 
     def test_quotes_scan_commands_with_spaces_in_remote_paths(self):
@@ -466,11 +477,78 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_has_calls([
             call(self._scanfs_probe_command(expected_remote_script)),
-            call("{} {}".format(
-                shlex.quote(expected_remote_script),
-                shlex.quote("/remote/path with spaces/to/scan dir")
-            ))
+            call(self._scan_command("python3", expected_remote_script, "/remote/path with spaces/to/scan dir"))
         ])
+
+    def test_quotes_custom_remote_python_path_in_scan_command(self):
+        for remote_python_path in (
+            "/opt/custom python/bin/python3;rm -rf /",
+            "/opt/custom's/bin/python3",
+            '/opt/mixed "quote\'s" path/python3;$(whoami) & echo',
+        ):
+            with self.subTest(remote_python_path=remote_python_path):
+                scanner = RemoteScanner(
+                    remote_address="my remote address",
+                    remote_username="my remote user",
+                    remote_password="my password",
+                    remote_port=1234,
+                    remote_path_to_scan="/remote/path/to/scan",
+                    local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+                    remote_path_to_scan_script="/remote/path/to/scan/script",
+                    remote_python_path=remote_python_path
+                )
+
+                self.ssh_run_command_count = 0
+
+                def ssh_shell(*args):
+                    self.ssh_run_command_count += 1
+                    if self.ssh_run_command_count == 1:
+                        return "".encode()
+                    return json.dumps([]).encode()
+
+                self.mock_ssh.shell.side_effect = ssh_shell
+
+                scanner.scan()
+
+                self.assertEqual(2, self.mock_ssh.shell.call_count)
+                self.mock_ssh.shell.assert_called_with(
+                    self._scan_command(remote_python_path, "/remote/path/to/scan/script", "/remote/path/to/scan")
+                )
+                self.mock_ssh.shell.reset_mock()
+                self.mock_ssh.copy.reset_mock()
+
+    def test_falls_back_to_python3_for_blank_remote_python_path(self):
+        for remote_python_path in (None, "", "   "):
+            with self.subTest(remote_python_path=remote_python_path):
+                scanner = RemoteScanner(
+                    remote_address="my remote address",
+                    remote_username="my remote user",
+                    remote_password="my password",
+                    remote_port=1234,
+                    remote_path_to_scan="/remote/path/to/scan",
+                    local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+                    remote_path_to_scan_script="/remote/path/to/scan/script",
+                    remote_python_path=remote_python_path
+                )
+
+                self.ssh_run_command_count = 0
+
+                def ssh_shell(*args):
+                    self.ssh_run_command_count += 1
+                    if self.ssh_run_command_count == 1:
+                        return "".encode()
+                    return json.dumps([]).encode()
+
+                self.mock_ssh.shell.side_effect = ssh_shell
+
+                scanner.scan()
+
+                self.assertEqual(2, self.mock_ssh.shell.call_count)
+                self.mock_ssh.shell.assert_called_with(
+                    self._scan_command(remote_python_path, "/remote/path/to/scan/script", "/remote/path/to/scan")
+                )
+                self.mock_ssh.shell.reset_mock()
+                self.mock_ssh.copy.reset_mock()
 
     def test_raises_nonrecoverable_error_on_first_failed_ssh(self):
         scanner = RemoteScanner(
@@ -849,10 +927,7 @@ class TestRemoteScanner(unittest.TestCase):
         self.mock_ssh.shell.assert_has_calls([
             call(self._scanfs_probe_command(expected_primary_script)),
             call(self._scanfs_probe_command(expected_fallback_script)),
-            call("{} {}".format(
-                escape_remote_path_for_shell(expected_fallback_script, allow_tilde_expansion=True),
-                "/remote/path/to/scan"
-            ))
+            call(self._scan_command("python3", expected_fallback_script, "/remote/path/to/scan"))
         ])
         self.assertEqual(2, self.copy_run_count)
         self.mock_ssh.copy.assert_has_calls([
@@ -905,10 +980,7 @@ class TestRemoteScanner(unittest.TestCase):
             call(local_path=TestRemoteScanner.temp_scan_script, remote_path=expected_fallback_script)
         ])
         self.mock_ssh.shell.assert_called_with(
-            "{} {}".format(
-                escape_remote_path_for_shell(expected_fallback_script, allow_tilde_expansion=True),
-                "/remote/path/to/scan"
-            )
+            self._scan_command("python3", expected_fallback_script, "/remote/path/to/scan")
         )
 
     def test_preserves_original_permission_denied_context_when_fallback_copy_fails(self):

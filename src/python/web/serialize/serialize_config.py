@@ -8,7 +8,7 @@ from common import Config
 
 _SENSITIVE_FIELDS = Config.SENSITIVE_FIELDS
 
-_REMOTE_DETAIL_FIELDS = ("remote_address", "remote_username", "remote_path")
+_REMOTE_DETAIL_FIELDS = ("remote_address", "remote_username", "remote_path", "remote_python_path")
 
 _REDACTED = Config.REDACTED_SENTINEL
 

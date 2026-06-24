@@ -55,6 +55,7 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.local_path = "/local/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+        config.lftp.remote_python_path = "/home/user/.pyenv/shims/python3"
         config.lftp.num_max_parallel_downloads = 6
         config.lftp.num_max_parallel_files_per_download = 7
         config.lftp.num_max_connections_per_root_file = 2
@@ -74,6 +75,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_path"])
         self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
         self.assertEqual("/remote/server/path/to/script", out_dict["lftp"]["remote_path_to_scan_script"])
+        self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_python_path"])
         self.assertEqual(6, out_dict["lftp"]["num_max_parallel_downloads"])
         self.assertEqual(7, out_dict["lftp"]["num_max_parallel_files_per_download"])
         self.assertEqual(2, out_dict["lftp"]["num_max_connections_per_root_file"])
@@ -98,6 +100,7 @@ class TestSerializeConfig(unittest.TestCase):
         config.lftp.remote_path = "/remote/server/path"
         config.lftp.local_path = "/local/server/path"
         config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+        config.lftp.remote_python_path = "/home/user/.pyenv/shims/python3"
         config.lftp.net_socket_buffer = "8M"
         config.lftp.protocol = "sftp"
         config.lftp.remote_ftp_port = 21
@@ -113,6 +116,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
         self.assertEqual("/local/server/path", out_dict["lftp"]["local_path"])
         self.assertEqual("/remote/server/path/to/script", out_dict["lftp"]["remote_path_to_scan_script"])
+        self.assertEqual("/home/user/.pyenv/shims/python3", out_dict["lftp"]["remote_python_path"])
         self.assertEqual("8M", out_dict["lftp"]["net_socket_buffer"])
         self.assertEqual("sftp", out_dict["lftp"]["protocol"])
         self.assertEqual(21, out_dict["lftp"]["remote_ftp_port"])

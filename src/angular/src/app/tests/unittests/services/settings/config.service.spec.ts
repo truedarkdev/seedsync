@@ -453,6 +453,15 @@ describe("Testing config service", () => {
         httpMock.verify();
     });
 
+    it("should allow empty remote_python_path values for backend default fallback", () => {
+        httpMock.expectOne("/server/config/get").flush({lftp: {remote_python_path: "python3"}});
+
+        configService.set("lftp", "remote_python_path", "").subscribe(DoNothing);
+
+        expectConfigSetRequest("lftp", "remote_python_path", "");
+        httpMock.verify();
+    });
+
     it("should return error on empty log_format values", () => {
         httpMock.expectOne("/server/config/get").flush({logging: {log_format: "standard"}});
 

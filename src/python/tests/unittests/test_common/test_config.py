@@ -348,6 +348,7 @@ class TestConfig(unittest.TestCase):
             "protocol": "ftps",
             "remote_ftp_port": "2121",
             "ftp_ssl_verify_certificate": "True",
+            "remote_python_path": "/opt/python/bin/python3",
         }
         lftp = Config.Lftp.from_dict(good_dict)
         self.assertEqual("remote.server.com", lftp.remote_address)
@@ -357,6 +358,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("/path/on/remote/server", lftp.remote_path)
         self.assertEqual("/path/on/local/server", lftp.local_path)
         self.assertEqual("/path/on/remote/server/to/scan/script", lftp.remote_path_to_scan_script)
+        self.assertEqual("/opt/python/bin/python3", lftp.remote_python_path)
         self.assertEqual(False, lftp.use_ssh_key)
         self.assertEqual(2, lftp.num_max_parallel_downloads)
         self.assertEqual(3, lftp.num_max_parallel_files_per_download)
@@ -413,6 +415,32 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_ftp_port", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "ftp_ssl_verify_certificate", "SomeString")
 
+    def test_lftp_backfills_remote_python_path_to_python3_for_blank_values(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "True",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "net_socket_buffer": "512K",
+            "staging_path": "/path/on/local/server/incomplete"
+        }
+
+        for remote_python_path in ("", "   "):
+            with self.subTest(remote_python_path=remote_python_path):
+                lftp = Config.Lftp.from_dict(dict(good_dict, remote_python_path=remote_python_path))
+                self.assertEqual("python3", lftp.remote_python_path)
+
     def test_lftp_backfills_transfer_protocol_defaults(self):
         good_dict = {
             "remote_address": "remote.server.com",
@@ -439,6 +467,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("sftp", lftp.protocol)
         self.assertEqual(21, lftp.remote_ftp_port)
         self.assertEqual(True, lftp.ftp_ssl_verify_certificate)
+        self.assertEqual("python3", lftp.remote_python_path)
 
     def test_lftp_allows_empty_net_socket_buffer(self):
         good_dict = {
@@ -565,6 +594,7 @@ class TestConfig(unittest.TestCase):
             "remote_path": "/path/on/remote/server",
             "local_path": "/path/on/local/server",
             "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "remote_python_path": "/opt/python/bin/python3",
             "use_ssh_key": "False",
             "num_max_parallel_downloads": "2",
             "num_max_parallel_files_per_download": "3",
@@ -758,6 +788,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("/path/on/remote/server", config.lftp.remote_path)
             self.assertEqual("/path/on/local/server", config.lftp.local_path)
             self.assertEqual("/path/on/remote/server/to/scan/script", config.lftp.remote_path_to_scan_script)
+            self.assertEqual("python3", config.lftp.remote_python_path)
             self.assertEqual(True, config.lftp.use_ssh_key)
             self.assertEqual(2, config.lftp.num_max_parallel_downloads)
             self.assertEqual(3, config.lftp.num_max_parallel_files_per_download)
@@ -820,6 +851,7 @@ class TestConfig(unittest.TestCase):
             config.lftp.remote_path = "/remote/server/path"
             config.lftp.local_path = "/local/server/path"
             config.lftp.remote_path_to_scan_script = "/remote/server/path/to/script"
+            config.lftp.remote_python_path = "python3"
             config.lftp.use_ssh_key = True
             config.lftp.num_max_parallel_downloads = 6
             config.lftp.num_max_parallel_files_per_download = 7
@@ -867,6 +899,7 @@ class TestConfig(unittest.TestCase):
             remote_path = /remote/server/path
             local_path = /local/server/path
             remote_path_to_scan_script = /remote/server/path/to/script
+            remote_python_path = python3
             use_ssh_key = True
             num_max_parallel_downloads = 6
             num_max_parallel_files_per_download = 7
