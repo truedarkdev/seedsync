@@ -59,6 +59,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_refresh_generation = 0
         self.controller._Controller__path_pair_refresh_completed_generation = 0
         self.controller._Controller__path_pair_runtime_error = None
+        self.controller._Controller__lftp_reconfigure_lock = Lock()
+        self.controller._Controller__lftp_reconfigure_requested = False
         self.controller._Controller__lftp = MagicMock()
         self.controller._Controller__lftp.net_socket_buffer = ""
         self.controller._Controller__active_scan_process = MagicMock()
@@ -679,12 +681,86 @@ class TestController(unittest.TestCase):
 
         self.assertEqual("512K", self.controller._Controller__lftp.net_socket_buffer)
 
-    def test_configure_lftp_skips_empty_net_socket_buffer(self):
-        self.controller._Controller__context.config.lftp.net_socket_buffer = ""
+    def test_configure_lftp_applies_rate_limit_when_configured(self):
+        self.controller._Controller__context.config.lftp.rate_limit = "512K"
 
         self.controller._Controller__configure_lftp()
 
-        self.assertEqual("", self.controller._Controller__lftp.net_socket_buffer)
+        self.assertEqual("512K", self.controller._Controller__lftp.rate_limit)
+
+    def test_configure_lftp_clears_blank_rate_limit_and_net_socket_buffer(self):
+        self.controller._Controller__context.config.general = SimpleNamespace(verbose=True)
+        self.controller._Controller__context.config.lftp.rate_limit = ""
+        self.controller._Controller__context.config.lftp.net_socket_buffer = ""
+        self.controller._Controller__lftp.rate_limit = "2048"
+        self.controller._Controller__lftp.net_socket_buffer = "16M"
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertEqual(0, self.controller._Controller__lftp.rate_limit)
+        self.assertEqual(0, self.controller._Controller__lftp.net_socket_buffer)
+        self.controller._Controller__lftp.set_verbose_logging.assert_called_once_with(True)
+
+    def test_request_lftp_reconfigure_marks_pending_request(self):
+        self.controller.request_lftp_reconfigure()
+
+        self.assertTrue(self.controller._Controller__lftp_reconfigure_requested)
+
+    def test_process_reapplies_lftp_settings_and_clears_pending_request(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+        self.controller._Controller__configure_lftp = MagicMock()
+        self.controller.request_lftp_reconfigure()
+
+        self.controller.process()
+
+        self.controller._Controller__configure_lftp.assert_called_once_with()
+        self.assertFalse(self.controller._Controller__lftp_reconfigure_requested)
+        self.controller._Controller__propagate_exceptions.assert_called_once_with()
+        self.controller._Controller__cleanup_commands.assert_called_once_with()
+        self.controller._Controller__process_commands.assert_called_once_with()
+        self.controller._Controller__updater.update.assert_called_once_with()
+        self.controller._Controller__log_memory_usage.assert_called_once_with()
+
+    def test_process_clears_blank_lftp_settings_during_reconfigure(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+        self.controller._Controller__context.config.general = SimpleNamespace(verbose=True)
+        self.controller._Controller__context.config.lftp.rate_limit = ""
+        self.controller._Controller__context.config.lftp.net_socket_buffer = ""
+        self.controller._Controller__lftp.rate_limit = "2048"
+        self.controller._Controller__lftp.net_socket_buffer = "16M"
+        self.controller.request_lftp_reconfigure()
+
+        self.controller.process()
+
+        self.assertEqual(0, self.controller._Controller__lftp.rate_limit)
+        self.assertEqual(0, self.controller._Controller__lftp.net_socket_buffer)
+        self.controller._Controller__lftp.set_verbose_logging.assert_called_once_with(True)
+        self.assertFalse(self.controller._Controller__lftp_reconfigure_requested)
+
+    def test_process_keeps_lftp_reconfigure_pending_after_failure(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+        self.controller._Controller__configure_lftp = MagicMock(side_effect=RuntimeError("boom"))
+        self.controller.request_lftp_reconfigure()
+
+        self.controller.process()
+
+        self.controller._Controller__configure_lftp.assert_called_once_with()
+        self.assertTrue(self.controller._Controller__lftp_reconfigure_requested)
 
     def test_update_model_records_scan_and_extract_breadcrumbs(self):
         remote_scan = SimpleNamespace(

@@ -22,10 +22,20 @@ class ConfigHandler(IHandler):
             "trusted_browser_bootstrap_remote_addrs",
         },
     }
+    __LFTP_TUNING_FIELDS = frozenset((
+        "num_max_parallel_downloads",
+        "num_max_parallel_files_per_download",
+        "num_max_connections_per_root_file",
+        "num_max_connections_per_dir_file",
+        "num_max_total_connections",
+        "rate_limit",
+        "net_socket_buffer",
+    ))
 
-    def __init__(self, config: Config, breadcrumb_trace_sync=None):
+    def __init__(self, config: Config, breadcrumb_trace_sync=None, lftp_reconfigure_request=None):
         self.__config = config
         self.__breadcrumb_trace_sync = breadcrumb_trace_sync
+        self.__lftp_reconfigure_request = lftp_reconfigure_request
         self.__write_lock = threading.Lock()
 
     @staticmethod
@@ -134,6 +144,14 @@ class ConfigHandler(IHandler):
                 return HTTPResponse(body="Failed to persist config {}.{}".format(section, key), status=500)
         if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":
             self.__breadcrumb_trace_sync()
+        if (
+            self.__lftp_reconfigure_request is not None
+            and (
+                (section == "lftp" and key in ConfigHandler.__LFTP_TUNING_FIELDS)
+                or (section == "general" and key == "verbose")
+            )
+        ):
+            self.__lftp_reconfigure_request()
         if Config.is_sensitive_field(section, key):
             response_value = Config.REDACTED_SENTINEL
         elif isinstance(getattr(type(inner_config), key, None), property):

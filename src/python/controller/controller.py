@@ -243,6 +243,8 @@ class Controller:
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
         self.__started = False
         self.__startup_failed = False
+        self.__lftp_reconfigure_lock = Lock()
+        self.__lftp_reconfigure_requested = False
 
     def __init__(self,
                  context: Context,
@@ -278,6 +280,8 @@ class Controller:
         self.__path_pair_refresh_generation = 0
         self.__path_pair_refresh_completed_generation = 0
         self.__path_pair_runtime_error = None
+        self.__lftp_reconfigure_lock = Lock()
+        self.__lftp_reconfigure_requested = False
 
         # Model builder
         self.__model_builder = ModelBuilder()
@@ -421,11 +425,10 @@ class Controller:
         self.__lftp.num_connections_per_dir_file = lftp_cfg.num_max_connections_per_dir_file
         self.__lftp.num_max_total_connections = lftp_cfg.num_max_total_connections
         self.__lftp.use_temp_file = lftp_cfg.use_temp_file
-        if lftp_cfg.rate_limit:
-            self.__lftp.rate_limit = lftp_cfg.rate_limit
+        rate_limit = lftp_cfg.rate_limit
+        self.__lftp.rate_limit = 0 if rate_limit in (None, "") else rate_limit
         net_socket_buffer = lftp_cfg.net_socket_buffer
-        if net_socket_buffer is not None and net_socket_buffer != "":
-            self.__lftp.net_socket_buffer = net_socket_buffer
+        self.__lftp.net_socket_buffer = 0 if net_socket_buffer in (None, "") else net_socket_buffer
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
         self.__lftp.set_verbose_logging(general_cfg.verbose)
 
@@ -640,6 +643,21 @@ class Controller:
         if self.__path_pair_runtime_error is not None:
             raise ControllerError(self.__path_pair_runtime_error)
 
+    def request_lftp_reconfigure(self):
+        with self.__lftp_reconfigure_lock:
+            self.__lftp_reconfigure_requested = True
+
+    def __consume_lftp_reconfigure_request(self) -> bool:
+        with self.__lftp_reconfigure_lock:
+            if not self.__lftp_reconfigure_requested:
+                return False
+            self.__lftp_reconfigure_requested = False
+            return True
+
+    def __restore_lftp_reconfigure_request(self):
+        with self.__lftp_reconfigure_lock:
+            self.__lftp_reconfigure_requested = True
+
     def __consume_path_pair_refresh_request(self):
         with self.__path_pair_refresh_lock:
             if not self.__path_pair_refresh_requested:
@@ -805,6 +823,13 @@ class Controller:
                 self.logger.exception("Ignoring path pair refresh failure")
             finally:
                 self.__mark_path_pair_refresh_completed(refresh_generation)
+        lftp_reconfigure_requested = self.__consume_lftp_reconfigure_request()
+        if lftp_reconfigure_requested:
+            try:
+                self.__configure_lftp()
+            except Exception:
+                self.__restore_lftp_reconfigure_request()
+                self.logger.exception("Ignoring lftp reconfigure failure")
         updater = getattr(self, "_Controller__updater", None)
         if updater is None:
             updater = ModelUpdater(self)

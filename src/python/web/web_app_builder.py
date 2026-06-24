@@ -37,7 +37,11 @@ class WebAppBuilder:
 
         self.controller_handler = ControllerHandler(controller, local_path=local_path)
         self.server_handler = ServerHandler(context)
-        self.config_handler = ConfigHandler(context.config, breadcrumb_trace_sync=context.breadcrumb_trace.sync_enabled_state)
+        self.config_handler = ConfigHandler(
+            context.config,
+            breadcrumb_trace_sync=context.breadcrumb_trace.sync_enabled_state,
+            lftp_reconfigure_request=self.__controller.request_lftp_reconfigure,
+        )
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
