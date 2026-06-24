@@ -25,6 +25,16 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__path_pairs_by_id = path_pairs_by_id
         return controller, model_builder
 
+    def _make_lftp_completion_controller(self, prev_downloading_file_names=None):
+        controller = SimpleNamespace(
+            _Controller__prev_downloading_file_names=set(prev_downloading_file_names or []),
+            _Controller__pending_completion_file_names=set(),
+            _Controller__is_explicitly_stopped=MagicMock(return_value=False),
+            _Controller__local_scan_process=MagicMock(),
+            logger=MagicMock(),
+        )
+        return controller
+
     def test_sync_persist_to_all_builders_forwards_persisted_categories(self):
         downloaded_file_names = {"downloaded-a", "downloaded-b"}
         extracted_file_names = {"extracted-a"}
@@ -120,3 +130,56 @@ class TestModelUpdater(unittest.TestCase):
             ],
             model_builder.mock_calls,
         )
+
+    def test_handle_lftp_completion_detection_records_completed_downloads_and_forces_rescan(self):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        still_downloading_entry = ("episode.mkv", "tv", "TV")
+        explicitly_stopped_entry = ("stopped.mkv", "movies", "Movies")
+
+        controller = self._make_lftp_completion_controller(
+            prev_downloading_file_names={
+                completion_entry,
+                still_downloading_entry,
+                explicitly_stopped_entry,
+            }
+        )
+        controller._Controller__is_explicitly_stopped.side_effect = (
+            lambda name, path_pair_id: (name, path_pair_id) == explicitly_stopped_entry[:2]
+        )
+
+        updater = ModelUpdater(controller)
+        updater._handle_lftp_completion_detection(
+            [still_downloading_entry],
+            True,
+        )
+
+        self.assertEqual(
+            {still_downloading_entry},
+            controller._Controller__prev_downloading_file_names,
+        )
+        self.assertEqual(
+            {completion_entry},
+            controller._Controller__pending_completion_file_names,
+        )
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        controller.logger.info.assert_called_once_with(
+            "Download completion pending (LFTP job finished): {}".format(
+                ModelFile.build_file_id(*completion_entry[:2])
+            )
+        )
+
+    def test_handle_lftp_completion_detection_skips_when_detection_is_not_ready(self):
+        previous_entry = ("movie.mkv", "movies", "Movies")
+        controller = self._make_lftp_completion_controller({previous_entry})
+
+        updater = ModelUpdater(controller)
+        updater._handle_lftp_completion_detection([], False)
+
+        self.assertEqual(
+            {previous_entry},
+            controller._Controller__prev_downloading_file_names,
+        )
+        self.assertEqual(set(), controller._Controller__pending_completion_file_names)
+        controller._Controller__local_scan_process.force_scan.assert_not_called()
+        controller._Controller__is_explicitly_stopped.assert_not_called()
+        controller.logger.info.assert_not_called()
