@@ -113,6 +113,12 @@ export const OPTIONS_CONTEXT_DISCOVERY: IOptionsContext = {
     options: [
         {
             type: OptionType.Text,
+            label: "Exclude Patterns",
+            valuePath: ["general", "exclude_patterns"],
+            description: "Comma-separated glob patterns for remote files to skip. Matching files are hidden from the UI and never downloaded. Use a trailing slash for directory-only matches, like Sample/."
+        },
+        {
+            type: OptionType.Text,
             label: "Remote Scan Interval (ms)",
             valuePath: ["controller", "interval_ms_remote_scan"],
             description: "How often the remote server is scanned for new files"

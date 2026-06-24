@@ -5,7 +5,7 @@ import re
 import os
 import time
 from functools import wraps
-from typing import Any, Callable, Union, List, Optional, Dict
+from typing import Any, Callable, Union, List, Optional, Dict, Iterable
 
 # 3rd party libs
 import pexpect
@@ -13,6 +13,7 @@ import pexpect
 # my libs
 from common import AppError
 from common.config import Checkers
+from common.exclude_patterns import parse_exclude_patterns
 from common.redaction import redact_sensitive_text
 from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatusParserError
 
@@ -73,6 +74,13 @@ class Lftp:
         if isinstance(output, bytes):
             return output.decode("utf8", "replace")
         return str(output)
+
+    @staticmethod
+    def __quote_command_argument(value: str) -> str:
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise LftpError("LFTP command arguments cannot contain control characters")
+        escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
+        return "\"{}\"".format(escaped)
 
     def __init__(self,
                  address: str,
@@ -702,7 +710,8 @@ class Lftp:
               name: str,
               is_dir: bool,
               remote_base_dir_path: Optional[str] = None,
-              local_base_dir_path: Optional[str] = None):
+              local_base_dir_path: Optional[str] = None,
+              exclude_patterns: str | Iterable[str] | None = None):
         """
         Queues a job for download
         This method may cause an exception to be generated in a later method call:
@@ -712,24 +721,33 @@ class Lftp:
         :param is_dir: true if folder, false if file
         :return:
         """
-        # Escape single and double quotes in any string used in queue command
-        def escape(s: str) -> str:
-            return s.replace("'", "\\'").replace("\"", "\\\"")
-
         remote_dir = remote_base_dir_path if remote_base_dir_path is not None else self.__base_remote_dir_path
         local_dir = local_base_dir_path if local_base_dir_path is not None else self.__base_local_dir_path
 
         parts = [
             "queue",
-            "'",
-            "pget" if not is_dir else "mirror",
+            "mirror" if is_dir else "pget",
             "-c",
-            "\"{remote_dir}/{filename}\"".format(remote_dir=escape(remote_dir),
-                                                 filename=escape(name)),
-            "-o" if not is_dir else None,
-            "\"{local_dir}/\"".format(local_dir=escape(local_dir)),
-            "'"
         ]
+        if is_dir:
+            parsed_exclude_patterns = parse_exclude_patterns(exclude_patterns)
+            if parsed_exclude_patterns:
+                parts.extend(
+                    "--exclude-glob {}".format(Lftp.__quote_command_argument(pattern))
+                    for pattern in parsed_exclude_patterns
+                )
+
+        parts.append(Lftp.__quote_command_argument("{remote_dir}/{filename}".format(
+            remote_dir=remote_dir,
+            filename=name,
+        )))
+        if is_dir:
+            parts.append(Lftp.__quote_command_argument("{local_dir}/".format(local_dir=local_dir)))
+        else:
+            parts.extend([
+                "-o",
+                Lftp.__quote_command_argument("{local_dir}/".format(local_dir=local_dir)),
+            ])
         command = " ".join(part for part in parts if part is not None)
         self.logger.debug("queue command: %s", command)
         self.__run_command(command, require_prompt_ready=False)  # type: ignore[arg-type]

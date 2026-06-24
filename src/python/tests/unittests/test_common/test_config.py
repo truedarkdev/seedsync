@@ -197,6 +197,7 @@ class TestConfig(unittest.TestCase):
         good_dict = {
             "log_level": "DEBUG",
             "verbose": "False",
+            "exclude_patterns": "*.nfo,Sample/",
             "api_token": "token-value",
             "allowed_hostname": "",
             "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
@@ -208,6 +209,7 @@ class TestConfig(unittest.TestCase):
         general = Config.General.from_dict(good_dict)
         self.assertEqual("DEBUG", general.log_level)
         self.assertEqual(False, general.verbose)
+        self.assertEqual("*.nfo,Sample/", general.exclude_patterns)
         self.assertEqual("token-value", general.api_token)
         self.assertEqual("", general.allowed_hostname)
         self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
@@ -243,6 +245,20 @@ class TestConfig(unittest.TestCase):
         })
 
         self.assertEqual("INFO", general.log_level)
+
+    def test_general_defaults_exclude_patterns_to_empty_string_when_missing(self):
+        general = Config.General.from_dict({
+            "log_level": "DEBUG",
+            "verbose": "False",
+            "api_token": "token-value",
+            "allowed_hostname": "",
+            "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
+            "browser_handover_recovery_version": "2026.04.03",
+            "breadcrumb_trace_enabled": "False",
+            "config_api_redact_remote_details": "False",
+        })
+
+        self.assertEqual("", general.exclude_patterns)
 
     def test_general_legacy_debug_maps_to_log_level(self):
         for debug_value, expected_level in ((True, "DEBUG"), (False, "INFO")):
@@ -774,6 +790,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("DEBUG", config.general.log_level)
             self.assertEqual(True, config.general.verbose)
             self.assertEqual("", config.general.api_token)
+            self.assertEqual("", config.general.exclude_patterns)
             self.assertEqual("", config.general.allowed_hostname)
             self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
             self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
@@ -837,6 +854,7 @@ class TestConfig(unittest.TestCase):
             config = Config()
             config.general.log_level = "DEBUG"
             config.general.verbose = False
+            config.general.exclude_patterns = "*.nfo,Sample/"
             config.general.api_token = "api-token-value"
             config.general.allowed_hostname = ""
             config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
@@ -883,6 +901,7 @@ class TestConfig(unittest.TestCase):
             [General]
             log_level = DEBUG
             verbose = False
+            exclude_patterns = *.nfo,Sample/
             api_token = api-token-value
             allowed_hostname =
             trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32

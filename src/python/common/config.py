@@ -399,6 +399,7 @@ class Config(Persist):
     class General(IC):
         log_level = PROP("log_level", Checkers.log_level, Converters.log_level)
         verbose = PROP("verbose", Checkers.null, Converters.bool)
+        exclude_patterns = PROP("exclude_patterns", Checkers.string_allow_empty, Converters.null)
         api_token = PROP("api_token", Checkers.null, Converters.null)
         allowed_hostname = PROP("allowed_hostname", Checkers.null, Converters.null)
         trusted_browser_bootstrap_remote_addrs = PROP("trusted_browser_bootstrap_remote_addrs",
@@ -421,6 +422,7 @@ class Config(Persist):
             super().__init__()
             self.log_level = "INFO"
             self.verbose = None
+            self.exclude_patterns = ""
             self.api_token = None
             self.allowed_hostname = None
             self.trusted_browser_bootstrap_remote_addrs = None
@@ -431,6 +433,9 @@ class Config(Persist):
 
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "exclude_patterns" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["exclude_patterns"] = ""
             if "api_token" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["api_token"] = ""

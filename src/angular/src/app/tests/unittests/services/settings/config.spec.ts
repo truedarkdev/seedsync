@@ -10,6 +10,7 @@ describe("Testing config record initialization", () => {
             general: {
                 log_level: "DEBUG",
                 verbose: false,
+                exclude_patterns: "*.nfo,Sample/",
                 breadcrumb_trace_enabled: true
             },
             lftp: {
@@ -62,6 +63,7 @@ describe("Testing config record initialization", () => {
     it("should initialize with correct values", () => {
         expect(config.general.log_level).toBe("DEBUG");
         expect(config.general.verbose).toBe(false);
+        expect(config.general.exclude_patterns).toBe("*.nfo,Sample/");
         expect(config.general.breadcrumb_trace_enabled).toBe(true);
         expect(config.lftp.remote_address).toBe("remote.server.com");
         expect(config.lftp.remote_username).toBe("some.user");
@@ -115,6 +117,7 @@ describe("Testing config record initialization", () => {
 
         expect(partialConfig.general.log_level).toBe("DEBUG");
         expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
+        expect(partialConfig.general.exclude_patterns).toBe("");
         expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
         expect(partialConfig.logging.log_format).toBe("standard");
         expect(partialConfig.getValue("general", "log_level")).toBe("DEBUG");

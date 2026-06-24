@@ -12,12 +12,14 @@ class TestSerializeConfig(unittest.TestCase):
     def test_section_general(self):
         config = Config()
         config.general.log_level = "DEBUG"
+        config.general.exclude_patterns = "*.nfo,Sample/"
         config.general.config_api_redact_remote_details = True
         config.general.api_token = "super-secret-token"
         out = SerializeConfig.config(config)
         out_dict = json.loads(out)
         self.assertIn("general", out_dict)
         self.assertEqual("DEBUG", out_dict["general"]["log_level"])
+        self.assertEqual("*.nfo,Sample/", out_dict["general"]["exclude_patterns"])
         self.assertEqual(True, out_dict["general"]["config_api_redact_remote_details"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
         self.assertNotIn("super-secret-token", out)

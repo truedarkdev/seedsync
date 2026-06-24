@@ -16,6 +16,8 @@ from typing import Any
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 
+from common.exclude_patterns import filter_excluded_files
+
 from .extract import ExtractStatus
 from .persist_keys import KEY_SEP
 
@@ -31,6 +33,16 @@ class ModelUpdater:
 
     def __init__(self, controller: Any):
         self._controller = controller
+
+    @staticmethod
+    def _get_exclude_patterns(controller: Any) -> str:
+        exclude_patterns = getattr(controller, "_Controller__exclude_patterns", None)
+        if isinstance(exclude_patterns, str):
+            return exclude_patterns
+        config = getattr(getattr(controller, "_Controller__context", None), "config", None)
+        general = getattr(config, "general", None)
+        exclude_patterns = getattr(general, "exclude_patterns", "")
+        return exclude_patterns if isinstance(exclude_patterns, str) else ""
 
     def sync_persist_to_all_builders(self):
         controller = self._controller
@@ -276,17 +288,21 @@ class ModelUpdater:
 
         # Update model builder state.
         if latest_remote_scan is not None:
-            model_builder.set_remote_files(latest_remote_scan.files)
+            remote_files = filter_excluded_files(
+                latest_remote_scan.files,
+                self._get_exclude_patterns(controller),
+            )
+            model_builder.set_remote_files(remote_files)
             controller._Controller__record_breadcrumb(
                 stage="scan",
                 message="remote_scan_result",
                 details={
-                    "file_count": len(latest_remote_scan.files),
+                    "file_count": len(remote_files),
                     "failed": latest_remote_scan.failed,
                     "error_message": latest_remote_scan.error_message,
                 },
                 event_type="failure" if latest_remote_scan.failed else "state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_remote_scan.files, "remote_scan"),  # type: ignore[attr-defined]
+                corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),  # type: ignore[attr-defined]
             )
         if latest_local_scan is not None:
             model_builder.set_local_files(latest_local_scan.files)
@@ -646,6 +662,6 @@ class ModelUpdater:
             controller._Controller__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed  # type: ignore[attr-defined]
             controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message  # type: ignore[attr-defined]
             if not latest_remote_scan.failed and not controller._Controller__startup_recovery_done:  # type: ignore[attr-defined]
-                controller._Controller__recover_interrupted_downloads(latest_remote_scan.files)  # type: ignore[attr-defined]
+                controller._Controller__recover_interrupted_downloads(remote_files)  # type: ignore[attr-defined]
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp  # type: ignore[attr-defined]

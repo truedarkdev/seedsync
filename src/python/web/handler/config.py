@@ -148,7 +148,7 @@ class ConfigHandler(IHandler):
             self.__lftp_reconfigure_request is not None
             and (
                 (section == "lftp" and key in ConfigHandler.__LFTP_TUNING_FIELDS)
-                or (section == "general" and key == "verbose")
+                or (section == "general" and key in {"verbose", "exclude_patterns"})
             )
         ):
             self.__lftp_reconfigure_request()

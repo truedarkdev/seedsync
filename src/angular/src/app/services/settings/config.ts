@@ -11,11 +11,13 @@ import {Record} from "immutable";
 interface IGeneral {
     log_level: string;
     verbose: boolean;
+    exclude_patterns: string;
     breadcrumb_trace_enabled: boolean;
 }
 const DefaultGeneral: IGeneral = {
     log_level: "INFO",
     verbose: null,
+    exclude_patterns: "",
     breadcrumb_trace_enabled: null
 };
 const GeneralRecord = Record(DefaultGeneral);
@@ -201,6 +203,9 @@ export class Config extends ConfigRecord implements IConfig {
             }
         } else if (normalized.log_level === undefined || normalized.log_level === null) {
             delete normalized.log_level;
+        }
+        if (normalized.exclude_patterns === undefined || normalized.exclude_patterns === null) {
+            delete normalized.exclude_patterns;
         }
         delete normalized.debug;
         return normalized as IGeneral;

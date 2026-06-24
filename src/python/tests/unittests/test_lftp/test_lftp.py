@@ -159,12 +159,12 @@ class TestLftp(unittest.TestCase):
         lftp.queue("dup", False, remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies")
 
         lftp._Lftp__run_command.assert_called_once_with(
-            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '",
+            "queue pget -c \"/remote/movies/dup\" -o \"/local/movies/\"",
             require_prompt_ready=False
         )
         lftp.logger.debug.assert_called_once_with(
             "queue command: %s",
-            "queue ' pget -c \"/remote/movies/dup\" -o \"/local/movies/\" '"
+            "queue pget -c \"/remote/movies/dup\" -o \"/local/movies/\""
         )
 
     def test_queue_dir_uses_override_paths(self):
@@ -173,7 +173,7 @@ class TestLftp(unittest.TestCase):
         lftp.queue("dup", True, remote_base_dir_path="/remote/movies", local_base_dir_path="/local/movies")
 
         lftp._Lftp__run_command.assert_called_once_with(
-            "queue ' mirror -c \"/remote/movies/dup\" \"/local/movies/\" '",
+            "queue mirror -c \"/remote/movies/dup\" \"/local/movies/\"",
             require_prompt_ready=False
         )
 

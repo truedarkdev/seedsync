@@ -841,12 +841,18 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands = MagicMock()
         self.controller._Controller__updater.update = MagicMock()
         self.controller._Controller__log_memory_usage = MagicMock()
+        self.controller._Controller__context.config.general = SimpleNamespace(
+            verbose=True,
+            exclude_patterns="*.nfo,Season */*.nfo",
+        )
         self.controller._Controller__configure_lftp = MagicMock()
+        self.controller._Controller__exclude_patterns = "stale"
         self.controller.request_lftp_reconfigure()
 
         self.controller.process()
 
         self.controller._Controller__configure_lftp.assert_called_once_with()
+        self.assertEqual("*.nfo,Season */*.nfo", self.controller._Controller__exclude_patterns)
         self.assertFalse(self.controller._Controller__lftp_reconfigure_requested)
         self.controller._Controller__propagate_exceptions.assert_called_once_with()
         self.controller._Controller__cleanup_commands.assert_called_once_with()
@@ -2444,6 +2450,8 @@ class TestController(unittest.TestCase):
         file.path_pair_id = "movies"
         file.remote_size = 10
         self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__exclude_patterns = "*.nfo,Sample/"
+        self.controller._Controller__context.config.general.exclude_patterns = ""
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
         }
@@ -2460,7 +2468,8 @@ class TestController(unittest.TestCase):
             "dup",
             False,
             remote_base_dir_path="/remote/movies",
-            local_base_dir_path="/local/movies/incomplete"
+            local_base_dir_path="/local/movies/incomplete",
+            exclude_patterns="*.nfo,Sample/"
         )
 
     def test_process_commands_stop_uses_path_pair_identity(self):
@@ -3769,6 +3778,8 @@ class TestController(unittest.TestCase):
 
     def test_recover_interrupted_downloads_queues_path_pair_directory(self):
         self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__exclude_patterns = "*.nfo,Sample/"
+        self.controller._Controller__context.config.general.exclude_patterns = ""
         self.controller._Controller__path_pairs_by_id = {
             "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
         }
@@ -3793,7 +3804,8 @@ class TestController(unittest.TestCase):
             "season1",
             True,
             remote_base_dir_path="/remote/movies",
-            local_base_dir_path="/local/movies/incomplete"
+            local_base_dir_path="/local/movies/incomplete",
+            exclude_patterns="*.nfo,Sample/"
         )
 
     def test_process_commands_queue_logs_fresh_and_resume_like_trace_details(self):
