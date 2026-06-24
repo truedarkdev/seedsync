@@ -20,6 +20,8 @@ DOCKER_IMAGE_PLATFORMS:=linux/amd64,linux/arm64,linux/arm/v7
 DEB_GLIBC_MAX:=2.31
 SCANFS_PLATFORM?=linux/amd64
 SCANFS_PLATFORM_SUPPORTED:=linux/amd64 linux/arm64 linux/arm/v7
+# Optional prebuilt Angular output can shadow the in-Docker Angular build stage.
+SEEDSYNC_ANGULAR_BUILD_CONTEXT_ARG:=$(if $(SEEDSYNC_ANGULAR_BUILD_CONTEXT),--build-context seedsync_build_angular=$(SEEDSYNC_ANGULAR_BUILD_CONTEXT),)
 
 ifeq ($(value SCANFS_PLATFORM),linux/amd64)
 else ifeq ($(value SCANFS_PLATFORM),linux/arm64)
@@ -72,6 +74,7 @@ docker-image: docker-buildx
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
 		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
+		$(SEEDSYNC_ANGULAR_BUILD_CONTEXT_ARG) \
 		--target seedsync_run \
 		--tag $${STAGING_REGISTRY}/seedsync:$${STAGING_VERSION} \
 		--cache-to=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache,mode=max \
@@ -98,6 +101,7 @@ docker-image-release:
 	$(DOCKER) buildx build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
 		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
+		$(SEEDSYNC_ANGULAR_BUILD_CONTEXT_ARG) \
 		--target seedsync_run \
 		--tag ${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION} \
 		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \

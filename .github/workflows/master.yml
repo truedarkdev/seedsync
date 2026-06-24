@@ -105,6 +105,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install Angular dependencies
+        working-directory: src/angular
+        run: npm install --legacy-peer-deps
+
+      - name: Build Angular frontend
+        working-directory: src/angular
+        run: npx ng build --configuration production --output-path /tmp/angular-output/build/dist
+
       # Sets up build environment
       - name: Set up QEMU
         uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4.1.0
@@ -129,7 +142,11 @@ jobs:
 
       # Build docker image
       - name: Build docker image
-        run: make docker-image STAGING_REGISTRY=${{ env.staging_registry }} STAGING_VERSION=${{ github.run_number }}
+        run: |
+          make docker-image \
+            STAGING_REGISTRY=${{ env.staging_registry }} \
+            STAGING_VERSION=${{ github.run_number }} \
+            SEEDSYNC_ANGULAR_BUILD_CONTEXT=/tmp/angular-output
 
   e2etests-deb:
     name: End-to-end tests on Deb
