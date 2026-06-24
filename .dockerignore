@@ -1,0 +1,15 @@
+# Keep Docker build contexts small without excluding tracked source files.
+**/*.pyc
+**/__pycache__
+**/node_modules
+**/.venv
+**/.pytest_cache
+**/.ruff_cache
+**/.mypy_cache
+.git
+.idea
+build
+tmp
+src/angular/dist
+src/angular/.angular/cache
+src/python/build
