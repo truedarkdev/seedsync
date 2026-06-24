@@ -285,11 +285,16 @@ class LftpJobStatusParser:
                     raise ValueError("Missing the 'sftp' line for pget header '{}'".format(line))
                 lines.pop(0)  # pop the 'sftp' line
 
-                # Data line may not exist
+                # Data line may not exist. Peek before consuming so a following
+                # job header stays in the outer loop when no chunk data exists.
                 result_at = None
                 result_at2 = None
                 result_got = None
-                if lines:
+                if lines and (
+                        chunk_at_m.search(lines[0]) or
+                        chunk_at2_m.search(lines[0]) or
+                        chunk_got_m.search(lines[0])
+                ):
                     line = lines.pop(0)  # data line
                     result_at = chunk_at_m.search(line)
                     result_at2 = chunk_at2_m.search(line)
@@ -425,8 +430,10 @@ class LftpJobStatusParser:
             result = filename_m.search(line)
             if result:
                 name = result.group("name")
-                if not lines:
-                    raise ValueError("Missing chunk data for filename '{}'".format(name))
+                # Peek before consuming so a following job header stays in the
+                # outer loop when this transfer emitted no chunk data.
+                if not lines or not lines[0].startswith("`"):
+                    continue
                 line = lines.pop(0)
                 result_at = chunk_at_m.search(line)
                 result_at2 = chunk_at2_m.search(line)
