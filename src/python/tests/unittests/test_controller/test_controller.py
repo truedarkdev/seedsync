@@ -458,6 +458,95 @@ class TestController(unittest.TestCase):
             )
         )
 
+    def test_queue_command_coalesces_duplicate_delete_local_requests_without_success(self):
+        first_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup")
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller._Controller__command_queue.put(
+            first_command
+        )
+
+        self.controller.queue_command(command)
+
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_not_called()
+        self.assertEqual([callback], first_command.callbacks)
+        self.assertEqual(1, first_command.duplicate_waiter_count)
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+
+    def test_queue_command_rejects_duplicate_delete_when_waiter_cap_is_full(self):
+        first_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup")
+        attached_callbacks = [
+            MagicMock()
+            for _ in range(Controller._MAX_DUPLICATE_DELETE_WAITERS)
+        ]
+        first_command.callbacks.extend(attached_callbacks)
+        first_command.duplicate_waiter_count = Controller._MAX_DUPLICATE_DELETE_WAITERS
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller._Controller__command_queue.put(first_command)
+
+        self.controller.queue_command(command)
+
+        callback.on_failure.assert_called_once_with(
+            "Controller is busy with too many duplicate delete waiters",
+            429
+        )
+        callback.on_success.assert_not_called()
+        self.assertEqual(attached_callbacks, first_command.callbacks)
+        self.assertEqual(
+            Controller._MAX_DUPLICATE_DELETE_WAITERS,
+            first_command.duplicate_waiter_count
+        )
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+
+    def test_duplicate_delete_local_callback_receives_original_dispatch_failure(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__model.get_file.return_value = file
+        first_callback = MagicMock()
+        duplicate_callback = MagicMock()
+        first_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        first_command.add_callback(first_callback)
+        duplicate_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        duplicate_command.add_callback(duplicate_callback)
+
+        self.controller.queue_command(first_command)
+        self.controller.queue_command(duplicate_command)
+        self.controller._Controller__process_commands()
+
+        first_callback.on_success.assert_not_called()
+        duplicate_callback.on_success.assert_not_called()
+        first_callback.on_failure.assert_called_once_with(
+            "Local file '{}' cannot be deleted in state State.DOWNLOADING".format(file.file_id),
+            409
+        )
+        duplicate_callback.on_failure.assert_called_once_with(
+            "Local file '{}' cannot be deleted in state State.DOWNLOADING".format(file.file_id),
+            409
+        )
+        self.assertEqual(0, self.controller._Controller__command_queue.qsize())
+
+    def test_queue_command_rejects_delete_requests_when_delete_backlog_is_full(self):
+        for index in range(Controller._MAX_PENDING_DELETE_COMMANDS):
+            self.controller._Controller__command_queue.put(
+                Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup{}".format(index))
+            )
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "dup-next")
+        callback = MagicMock()
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+
+        callback.on_failure.assert_called_once_with(
+            "Controller is busy with too many pending delete commands",
+            429
+        )
+        self.assertEqual(Controller._MAX_PENDING_DELETE_COMMANDS, self.controller._Controller__command_queue.qsize())
+
     def test_update_model_ignores_lftp_status_parser_errors(self):
         self.controller._Controller__lftp.status.side_effect = LftpJobStatusParserError("bad status")
 
@@ -2545,6 +2634,42 @@ class TestController(unittest.TestCase):
             len(self.controller._Controller__active_command_processes)
         )
 
+    def test_process_commands_delete_local_deferred_command_coalesces_duplicate_during_requeue_window(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies")
+        }
+        self.controller._Controller__active_command_processes = [
+            MagicMock()
+            for _ in range(Controller._MAX_CONCURRENT_COMMAND_PROCESSES)
+        ]
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        duplicate_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        duplicate_callback = MagicMock()
+        duplicate_command.add_callback(duplicate_callback)
+        self.controller.queue_command(command)
+
+        def queue_duplicate_while_deferred(*_args):
+            self.controller.queue_command(duplicate_command)
+
+        self.controller.logger.debug.side_effect = queue_duplicate_while_deferred
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            self.controller._Controller__process_commands()
+
+        delete_local_process.assert_not_called()
+        callback.on_success.assert_not_called()
+        duplicate_callback.on_success.assert_not_called()
+        self.assertEqual([callback, duplicate_callback], command.callbacks)
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+        self.assertIs(command, self.controller._Controller__command_queue.get_nowait())
+
     def test_process_commands_delete_local_invalid_state_fails_even_when_delete_cap_reached(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
@@ -2907,6 +3032,100 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with()
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
+
+    def test_cleanup_commands_delete_local_times_out_stale_processes(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        duplicate_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.name)
+        duplicate_callback = MagicMock()
+        duplicate_command.add_callback(duplicate_callback)
+        process = MagicMock()
+        process.name = "DeleteLocalProcess"
+        process.is_alive.return_value = True
+        process.propagate_exception.return_value = None
+        process.terminate.return_value = None
+        post_callback = self.controller._Controller__local_scan_process.force_scan
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=True,
+                started_at_monotonic=0.0
+            )
+        ]
+
+        self.controller.queue_command(duplicate_command)
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_not_called()
+        duplicate_callback.on_success.assert_not_called()
+        process.terminate.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
+        callback.on_failure.assert_called_once_with("Delete command for file 'dup' timed out", 504)
+        duplicate_callback.on_failure.assert_called_once_with("Delete command for file 'dup' timed out", 504)
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+        breadcrumb_calls = [
+            call
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] == "command_failed"
+        ]
+        self.assertEqual(1, len(breadcrumb_calls))
+        self.assertEqual(504, breadcrumb_calls[0].args[2]["error_code"])
+        self.assertEqual("timed_out", breadcrumb_calls[0].args[2]["completion"])
+
+    def test_cleanup_commands_delete_remote_times_out_stale_processes(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        process = MagicMock()
+        process.name = "DeleteRemoteProcess"
+        process.is_alive.return_value = True
+        process.propagate_exception.return_value = None
+        process.terminate.return_value = None
+        post_callback = self.controller._Controller__remote_scan_process.force_scan
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                command=command,
+                file_id=file.file_id,
+                file_name=file.name,
+                process=process,
+                post_callback=post_callback,
+                await_completion=False,
+                started_at_monotonic=0.0
+            )
+        ]
+
+        self.controller._Controller__cleanup_commands()
+
+        post_callback.assert_not_called()
+        process.terminate.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_called_once_with()
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+        breadcrumb_calls = [
+            call
+            for call in self.controller._Controller__context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] == "command_failed"
+        ]
+        self.assertEqual(1, len(breadcrumb_calls))
+        self.assertEqual(504, breadcrumb_calls[0].args[2]["error_code"])
+        self.assertEqual("timed_out", breadcrumb_calls[0].args[2]["completion"])
 
     def test_queue_delete_local_process_without_command_uses_synthetic_no_callback_command(self):
         file = ModelFile("dup", False)

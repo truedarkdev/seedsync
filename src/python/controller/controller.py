@@ -99,7 +99,8 @@ class Controller:
             file_name: str,
             process: AppOneShotProcess,
             post_callback: Callable,
-            await_completion: bool
+            await_completion: bool,
+            started_at_monotonic: float | None = None
         ):
             self.command = command
             self.file_id = file_id
@@ -107,8 +108,12 @@ class Controller:
             self.process = process
             self.post_callback = post_callback
             self.await_completion = await_completion
+            self.started_at_monotonic = time.monotonic() if started_at_monotonic is None else started_at_monotonic
 
     _MAX_CONCURRENT_COMMAND_PROCESSES = 8
+    _MAX_PENDING_DELETE_COMMANDS = _MAX_CONCURRENT_COMMAND_PROCESSES * 2
+    _MAX_DUPLICATE_DELETE_WAITERS = _MAX_CONCURRENT_COMMAND_PROCESSES
+    _DELETE_COMMAND_STALE_TIMEOUT_IN_SECS = 10 * 60
 
     @staticmethod
     def __lftp_status_refresh_timing(interval_ms_downloading_scan: int):
@@ -974,7 +979,122 @@ class Controller:
             return
         if getattr(command, "flow_id", None) is None:
             command.flow_id = self.__next_command_flow_id(command)
-        self.__command_queue.put(command)
+        is_delete_command = self.__is_delete_command_action(command.action)
+        duplicate_delete_command: Optional[Controller.Command] = None
+        delete_backpressure = False
+        duplicate_waiter_backpressure = False
+        queued_delete_count = 0
+        duplicate_waiter_count = 0
+        queue_size = None
+
+        if is_delete_command:
+            delete_identity = self.__canonical_delete_command_identity(command)
+            with self.__command_state_lock():
+                duplicate_delete_command = self.__find_pending_delete_command_unlocked(
+                    delete_identity,
+                    command.action
+                )
+                if not duplicate_delete_command:
+                    queued_delete_count = self.__pending_delete_command_count_unlocked()
+                    delete_backpressure = queued_delete_count >= Controller._MAX_PENDING_DELETE_COMMANDS
+                if not duplicate_delete_command and not delete_backpressure:
+                    self.__command_queue.put(command)
+                    queue_size = self.__safe_command_queue_size()
+                if duplicate_delete_command:
+                    duplicate_waiter_count = getattr(duplicate_delete_command, "duplicate_waiter_count", 0)
+                    requested_waiters = len(command.callbacks)
+                    duplicate_waiter_backpressure = (
+                        duplicate_waiter_count + requested_waiters >
+                        Controller._MAX_DUPLICATE_DELETE_WAITERS
+                    )
+                    if not duplicate_waiter_backpressure:
+                        duplicate_delete_command.callbacks.extend(command.callbacks)
+                        duplicate_delete_command.duplicate_waiter_count = \
+                            duplicate_waiter_count + requested_waiters
+        else:
+            self.__command_queue.put(command)
+            queue_size = self.__safe_command_queue_size()
+
+        if duplicate_waiter_backpressure:
+            self.logger.warning(
+                "Rejecting duplicate %s for '%s': %d duplicate delete waiters at limit %d",
+                command.action,
+                command.filename,
+                duplicate_waiter_count,
+                Controller._MAX_DUPLICATE_DELETE_WAITERS
+            )
+            self.__record_command_breadcrumb(
+                command=command,
+                message="command_failed",
+                details={
+                    "command": getattr(command.action, "name", str(command.action)),
+                    "origin": getattr(command, "origin", "manual"),
+                    "file_name": command.filename,
+                    "queue_size": self.__safe_command_queue_size(),
+                    "error_code": 429,
+                    "reason": "duplicate_delete_waiters_full",
+                    "duplicate_waiter_count": duplicate_waiter_count,
+                    "limit": Controller._MAX_DUPLICATE_DELETE_WAITERS,
+                },
+                event_type="failure",
+            )
+            for callback in command.callbacks:
+                callback.on_failure(
+                    "Controller is busy with too many duplicate delete waiters",
+                    429
+                )
+            return
+
+        if duplicate_delete_command:
+            self.logger.info(
+                "Coalescing duplicate %s command for '%s'",
+                command.action,
+                command.filename
+            )
+            self.__record_command_breadcrumb(
+                command=command,
+                message="command_coalesced",
+                details={
+                    "command": getattr(command.action, "name", str(command.action)),
+                    "origin": getattr(command, "origin", "manual"),
+                    "file_name": command.filename,
+                    "queue_size": self.__safe_command_queue_size(),
+                    "reason": "duplicate_pending",
+                },
+                event_type="state_transition",
+            )
+            return
+
+        if delete_backpressure:
+            self.logger.warning(
+                "Rejecting %s for '%s': %d queued delete commands at limit %d",
+                command.action,
+                command.filename,
+                queued_delete_count,
+                Controller._MAX_PENDING_DELETE_COMMANDS
+            )
+            self.__record_command_breadcrumb(
+                command=command,
+                message="command_failed",
+                details={
+                    "command": getattr(command.action, "name", str(command.action)),
+                    "origin": getattr(command, "origin", "manual"),
+                    "file_name": command.filename,
+                    "queue_size": self.__safe_command_queue_size(),
+                    "error_code": 429,
+                    "reason": "delete_backlog_full",
+                    "queued_delete_count": queued_delete_count,
+                    "limit": Controller._MAX_PENDING_DELETE_COMMANDS,
+                },
+                event_type="failure",
+            )
+            for callback in command.callbacks:
+                callback.on_failure(
+                    "Controller is busy with too many pending delete commands",
+                    429
+                )
+            return
+
         self.__record_command_breadcrumb(
             command=command,
             message="command_queued",
@@ -982,7 +1102,7 @@ class Controller:
                 "command": getattr(command.action, "name", str(command.action)),
                 "origin": getattr(command, "origin", "manual"),
                 "file_name": command.filename,
-                "queue_size": self.__safe_command_queue_size(),
+                "queue_size": queue_size,
             },
             event_type="state_transition",
         )
@@ -1219,11 +1339,15 @@ class Controller:
             trace_scope=trace_scope,
         )
 
-    def __next_command_flow_id(self, command: "Controller.Command") -> str:
+    def __command_state_lock(self):
         lock = getattr(self, "_Controller__command_flow_lock", None)
         if lock is None:
             lock = Lock()
             self.__command_flow_lock = lock
+        return lock
+
+    def __next_command_flow_id(self, command: "Controller.Command") -> str:
+        lock = self.__command_state_lock()
         with lock:
             sequence = getattr(self, "_Controller__command_flow_sequence", 0) + 1
             self.__command_flow_sequence = sequence
@@ -1517,18 +1641,137 @@ class Controller:
 
         return final_path, file.name
 
-    def __has_active_command_for_file(self, file_id: str) -> bool:
-        return any(command_process.file_id == file_id for command_process in self.__active_command_processes)
+    @staticmethod
+    def __is_delete_command_action(action: "Controller.Command.Action") -> bool:
+        return action in (
+            Controller.Command.Action.DELETE_LOCAL,
+            Controller.Command.Action.DELETE_REMOTE,
+        )
+
+    def __canonical_delete_command_identity(self, command: "Controller.Command") -> str:
+        identity = command.filename
+        try:
+            file = self.__model.get_file(command.filename)
+        except Exception:
+            file = None
+        file_id = getattr(file, "file_id", None)
+        if isinstance(file_id, str) and file_id:
+            identity = file_id
+        command.delete_identity = identity
+        return identity
+
+    @staticmethod
+    def __delete_command_identity(command: "Controller.Command") -> str:
+        return getattr(command, "delete_identity", command.filename)
+
+    def __deferred_delete_commands(self) -> List["Controller.Command"]:
+        commands = getattr(self, "_Controller__deferred_delete_command_refs", None)
+        if commands is None:
+            commands = []
+            self.__deferred_delete_command_refs = commands
+        return commands
+
+    def __active_command_matches_delete(
+        self,
+        command_process: "Controller.CommandProcessWrapper",
+        file_id: str,
+        action: Optional["Controller.Command.Action"] = None
+    ) -> bool:
+        if action is not None and command_process.command.action != action:
+            return False
+        return command_process.file_id == file_id or \
+            self.__delete_command_identity(command_process.command) == file_id
+
+    def __queued_command_matches_delete(
+        self,
+        command: "Controller.Command",
+        file_id: str,
+        action: Optional["Controller.Command.Action"] = None
+    ) -> bool:
+        return self.__is_delete_command_action(command.action) and \
+            (action is None or command.action == action) and \
+            self.__delete_command_identity(command) == file_id
+
+    def __find_pending_delete_command_unlocked(
+        self,
+        file_id: str,
+        action: Optional["Controller.Command.Action"] = None
+    ) -> Optional["Controller.Command"]:
+        for command_process in self.__active_command_processes:
+            if self.__active_command_matches_delete(command_process, file_id, action):
+                return command_process.command
+
+        with self.__command_queue.mutex:
+            for command in self.__command_queue.queue:
+                if self.__queued_command_matches_delete(command, file_id, action):
+                    return command
+
+        for command in self.__deferred_delete_commands():
+            if self.__queued_command_matches_delete(command, file_id, action):
+                return command
+        return None
+
+    def __has_active_command_for_file_unlocked(self, file_id: str, action: Optional["Controller.Command.Action"] = None) -> bool:
+        return any(
+            self.__active_command_matches_delete(command_process, file_id, action)
+            for command_process in self.__active_command_processes
+        )
+
+    def __has_active_command_for_file(self, file_id: str, action: Optional["Controller.Command.Action"] = None) -> bool:
+        with self.__command_state_lock():
+            return self.__has_active_command_for_file_unlocked(file_id, action)
+
+    def __has_pending_delete_command_unlocked(
+        self,
+        file_id: str,
+        action: Optional["Controller.Command.Action"] = None
+    ) -> bool:
+        return self.__find_pending_delete_command_unlocked(file_id, action) is not None
+
+    def __has_pending_delete_command(
+        self,
+        file_id: str,
+        action: Optional["Controller.Command.Action"] = None
+    ) -> bool:
+        with self.__command_state_lock():
+            return self.__has_pending_delete_command_unlocked(file_id, action)
 
     def __has_pending_delete_local_command(self, file_id: str) -> bool:
-        if self.__has_active_command_for_file(file_id):
-            return True
+        return self.__has_pending_delete_command(file_id, Controller.Command.Action.DELETE_LOCAL)
+
+    def __pending_delete_command_count_unlocked(self) -> int:
         with self.__command_queue.mutex:
-            return any(
-                command.action == Controller.Command.Action.DELETE_LOCAL and
-                command.filename == file_id
+            queued_count = sum(
+                1
                 for command in self.__command_queue.queue
+                if self.__is_delete_command_action(command.action)
             )
+        return queued_count + len(self.__deferred_delete_commands())
+
+    def __defer_delete_command(
+        self,
+        command: "Controller.Command",
+        deferred_commands: List["Controller.Command"]
+    ) -> None:
+        with self.__command_state_lock():
+            deferred_commands.append(command)
+            self.__deferred_delete_commands().append(command)
+
+    def __requeue_deferred_delete_commands(self, deferred_commands: List["Controller.Command"]) -> None:
+        with self.__command_state_lock():
+            deferred_refs = self.__deferred_delete_commands()
+            for deferred_command in deferred_commands:
+                if deferred_command in deferred_refs:
+                    deferred_refs.remove(deferred_command)
+                self.__command_queue.put(deferred_command)
+
+    def __delete_command_is_stale(self, command_process: "Controller.CommandProcessWrapper", now_monotonic: float) -> bool:
+        started_at_monotonic = getattr(command_process, "started_at_monotonic", None)
+        if started_at_monotonic is None:
+            return False
+        if not self.__is_delete_command_action(command_process.command.action):
+            return False
+        return (now_monotonic - started_at_monotonic) >= Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS
 
     def __should_auto_purge_local_file(self, file: ModelFile) -> bool:
         if file.is_dir or file.remote_size is not None or file.local_size != 0:
@@ -1562,7 +1805,8 @@ class Controller:
             post_callback=post_callback,
             await_completion=True
         )
-        self.__active_command_processes.append(command_wrapper)
+        with self.__command_state_lock():
+            self.__active_command_processes.append(command_wrapper)
         command_wrapper.process.start()
 
     def __recover_interrupted_downloads(self, remote_files):
@@ -1986,13 +2230,13 @@ class Controller:
                     continue
                 else:
                     if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        self.__defer_delete_command(command, deferred_commands)
                         self.logger.debug(
                             "Deferring %s for '%s': %d active processes at cap",
                             command.action,
                             command.filename,
                             len(self.__active_command_processes)
                         )
-                        deferred_commands.append(command)
                         continue
                     self.__queue_delete_local_process(
                         file,
@@ -2033,13 +2277,13 @@ class Controller:
                     continue
                 else:
                     if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:
+                        self.__defer_delete_command(command, deferred_commands)
                         self.logger.debug(
                             "Deferring %s for '%s': %d active processes at cap",
                             command.action,
                             command.filename,
                             len(self.__active_command_processes)
                         )
-                        deferred_commands.append(command)
                         continue
                     config = cast(Any, self.__context.config)
                     process = DeleteRemoteProcess(
@@ -2061,7 +2305,8 @@ class Controller:
                         post_callback=post_callback,
                         await_completion=False
                     )
-                    self.__active_command_processes.append(command_wrapper)
+                    with self.__command_state_lock():
+                        self.__active_command_processes.append(command_wrapper)
                     command_wrapper.process.start()
                     self.__validate_process.clear(file.file_id)
                     self.__record_command_breadcrumb(
@@ -2081,7 +2326,7 @@ class Controller:
                 Controller.Command.Action.STOP
             ):
                 self.__validate_process.clear(file.file_id)
-            if command.action != Controller.Command.Action.DELETE_LOCAL:
+            if not self.__is_delete_command_action(command.action):
                 for callback in command.callbacks:
                     callback.on_success()
                 self.__record_command_breadcrumb(
@@ -2095,8 +2340,7 @@ class Controller:
                         file=file,
                     )
 
-        for deferred_command in deferred_commands:
-            self.__command_queue.put(deferred_command)
+        self.__requeue_deferred_delete_commands(deferred_commands)
 
     def __log_memory_usage(self):
         with self.__model_lock:
@@ -2172,9 +2416,56 @@ class Controller:
         :return:
         """
         self.__temp_diag("cleanup_commands", active_command_count=len(self.__active_command_processes))
+        now_monotonic = time.monotonic()
         still_active_processes = []
         for command_process in self.__active_command_processes:
             if command_process.process.is_alive():
+                if self.__delete_command_is_stale(command_process, now_monotonic):
+                    started_at_monotonic = getattr(command_process, "started_at_monotonic", now_monotonic)
+                    elapsed_seconds = now_monotonic - started_at_monotonic
+                    self.logger.warning(
+                        "Stale delete command %s for file %s timed out after %.1fs; terminating",
+                        command_process.command.action,
+                        command_process.file_name,
+                        elapsed_seconds,
+                    )
+                    try:
+                        command_process.process.terminate()
+                    except Exception as error:
+                        self.logger.warning(
+                            "Failed to terminate stale delete command %s for file %s: %s",
+                            command_process.command.action,
+                            command_process.file_name,
+                            error,
+                            exc_info=True
+                        )
+                    try:
+                        self.__record_command_breadcrumb(
+                            command=command_process.command,
+                            message="command_failed",
+                            details={
+                                "command": getattr(command_process.command.action, "name", str(command_process.command.action)),
+                                "message": "Delete command timed out",
+                                "error_code": 504,
+                                "file_name": command_process.file_name,
+                                "lifecycle_phase": "cleanup",
+                                "completion": "timed_out",
+                                "timeout_seconds": Controller._DELETE_COMMAND_STALE_TIMEOUT_IN_SECS,
+                                "elapsed_seconds": elapsed_seconds,
+                            },
+                            event_type="failure",
+                        )
+                        if command_process.await_completion:
+                            self.__persist.stopped_file_names.discard(command_process.file_id)
+                        for callback in command_process.command.callbacks:
+                            callback.on_failure(
+                                "Delete command for file '{}' timed out".format(command_process.file_name),
+                                504
+                            )
+                    finally:
+                        self.__bounded_join("stale delete command process join", command_process.process)
+                        command_process.process.close_queues()
+                    continue
                 still_active_processes.append(command_process)
             else:
                 try:
@@ -2270,7 +2561,14 @@ class Controller:
                                 },
                                 event_type="failure",
                             )
+                            for callback in command_process.command.callbacks:
+                                callback.on_failure(
+                                    "Failed to delete remote file '{}'".format(command_process.file_name),
+                                    500
+                                )
                         else:
+                            for callback in command_process.command.callbacks:
+                                callback.on_success()
                             self.__record_command_breadcrumb(
                                 command=command_process.command,
                                 message="command_finished",
@@ -2283,4 +2581,5 @@ class Controller:
                 finally:
                     command_process.process.join()
                     command_process.process.close_queues()
-        self.__active_command_processes = still_active_processes
+        with self.__command_state_lock():
+            self.__active_command_processes = still_active_processes
