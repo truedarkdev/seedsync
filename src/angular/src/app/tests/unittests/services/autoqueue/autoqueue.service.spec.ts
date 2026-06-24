@@ -306,7 +306,11 @@ describe("Testing autoqueue service", () => {
             }
         });
 
-        aqService.add("one").subscribe(DoNothing);
+        const addRequest = aqService.add("one");
+        httpMock.expectNone("/server/autoqueue/add/one");
+        expect(actualCount).toBe(1);
+
+        addRequest.subscribe(DoNothing);
         httpMock.expectOne("/server/autoqueue/add/one").flush("{}");
 
         tick();
@@ -315,12 +319,11 @@ describe("Testing autoqueue service", () => {
         httpMock.verify();
     }));
 
-    it("should NOT send updated patterns after a failed add", fakeAsync(() => {
-        httpMock.expectOne("/server/autoqueue/get").flush([
-            new AutoQueuePattern({pattern: "one"})
-        ]);
+    it("should send updated patterns once for multiple subscribers on an add pattern", fakeAsync(() => {
+        httpMock.expectOne("/server/autoqueue/get").flush([]);
 
         const expectedPatterns = [
+            Immutable.List([]),
             Immutable.List([new AutoQueuePattern({pattern: "one"})])
         ];
 
@@ -331,8 +334,51 @@ describe("Testing autoqueue service", () => {
             }
         });
 
-        aqService.add("one").subscribe(DoNothing);
+        const addRequest = aqService.add("one");
         httpMock.expectNone("/server/autoqueue/add/one");
+        expect(actualCount).toBe(1);
+
+        let reactionCount = 0;
+        const reactionObserver = {
+            next: () => {
+                reactionCount++;
+            }
+        };
+        addRequest.subscribe(reactionObserver);
+        addRequest.subscribe(reactionObserver);
+        httpMock.expectOne("/server/autoqueue/add/one").flush("{}");
+
+        tick();
+
+        expect(reactionCount).toBe(2);
+        expect(actualCount).toBe(2);
+        httpMock.verify();
+    }));
+
+    it("should NOT send updated patterns after a failed add", fakeAsync(() => {
+        httpMock.expectOne("/server/autoqueue/get").flush([]);
+
+        const expectedPatterns = [
+            Immutable.List([])
+        ];
+
+        let actualCount = 0;
+        aqService.patterns.subscribe({
+            next: patterns => {
+                expect(Immutable.is(patterns, expectedPatterns[actualCount++])).toBe(true);
+            }
+        });
+
+        const addRequest = aqService.add("one");
+        httpMock.expectNone("/server/autoqueue/add/one");
+        expect(actualCount).toBe(1);
+
+        addRequest.subscribe(DoNothing);
+        const request = httpMock.expectOne("/server/autoqueue/add/one");
+        request.flush(
+            "Not found",
+            {status: 404, statusText: "Bad Request"}
+        );
 
         tick();
 
@@ -461,12 +507,59 @@ describe("Testing autoqueue service", () => {
             }
         });
 
-        aqService.remove("one").subscribe(DoNothing);
+        const removeRequest = aqService.remove("one");
+        httpMock.expectNone("/server/autoqueue/remove/one");
+        expect(actualCount).toBe(1);
+
+        removeRequest.subscribe(DoNothing);
         httpMock.expectOne("/server/autoqueue/remove/one").flush("{}");
 
         tick();
 
         expect(actualCount).toBe(2);
+        httpMock.verify();
+    }));
+
+    it("should send updated patterns once for multiple subscribers on a remove pattern", fakeAsync(() => {
+        httpMock.expectOne("/server/autoqueue/get").flush([]);
+
+        const duplicatePatterns = Immutable.List([
+            new AutoQueuePattern({pattern: "one"}),
+            new AutoQueuePattern({pattern: "one"})
+        ]);
+        (<any>aqService)._patterns.next(duplicatePatterns);
+
+        const expectedPatterns = [
+            duplicatePatterns,
+            Immutable.List([new AutoQueuePattern({pattern: "one"})])
+        ];
+
+        let actualCount = 0;
+        aqService.patterns.subscribe({
+            next: patterns => {
+                expect(Immutable.is(patterns, expectedPatterns[actualCount++])).toBe(true);
+            }
+        });
+
+        const removeRequest = aqService.remove("one");
+        httpMock.expectNone("/server/autoqueue/remove/one");
+        expect(actualCount).toBe(1);
+
+        let reactionCount = 0;
+        const reactionObserver = {
+            next: () => {
+                reactionCount++;
+            }
+        };
+        removeRequest.subscribe(reactionObserver);
+        removeRequest.subscribe(reactionObserver);
+        httpMock.expectOne("/server/autoqueue/remove/one").flush("{}");
+
+        tick();
+
+        expect(reactionCount).toBe(2);
+        expect(actualCount).toBe(2);
+        expect(Immutable.is((<any>aqService)._patterns.getValue(), Immutable.List([new AutoQueuePattern({pattern: "one"})]))).toBe(true);
         httpMock.verify();
     }));
 
@@ -486,8 +579,16 @@ describe("Testing autoqueue service", () => {
             }
         });
 
-        aqService.remove("two").subscribe(DoNothing);
-        httpMock.expectNone("/server/autoqueue/remove/two");
+        const removeRequest = aqService.remove("one");
+        httpMock.expectNone("/server/autoqueue/remove/one");
+        expect(actualCount).toBe(1);
+
+        removeRequest.subscribe(DoNothing);
+        const request = httpMock.expectOne("/server/autoqueue/remove/one");
+        request.flush(
+            "Not found",
+            {status: 404, statusText: "Bad Request"}
+        );
 
         tick();
 

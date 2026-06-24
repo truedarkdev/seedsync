@@ -1,5 +1,6 @@
 import {Injectable} from "@angular/core";
 import {BehaviorSubject, Observable} from "rxjs";
+import {shareReplay, tap} from "rxjs/operators";
 
 import {Config, IConfig} from "./config";
 import {LoggerService} from "../utils/logger.service";
@@ -77,18 +78,17 @@ export class ConfigService extends BaseWebService {
             });
         } else {
             const url = this.CONFIG_SET_URL(section, option);
-            const obs = this._restService.sendPostRequest(url, {value: normalizedValue});
-            obs.subscribe({
-                next: reaction => {
+            return this._restService.sendPostRequest(url, {value: normalizedValue}).pipe(
+                tap(reaction => {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const config = this._config.getValue();
                         const newConfig = new Config(config.updateIn([section, option], (_) => normalizedValue));
                         this._config.next(newConfig);
                     }
-                }
-            });
-            return obs;
+                }),
+                shareReplay(1)
+            );
         }
     }
 
