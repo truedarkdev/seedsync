@@ -54,7 +54,6 @@ services:
             TRUSTED_BOOTSTRAP_SOURCES=$$(printf "%d.%d.%d.%d" 0x$${gateway_hex:6:2} 0x$${gateway_hex:4:2} 0x$${gateway_hex:2:2} 0x$${gateway_hex:0:2});
           fi;
         fi;
-        /scripts/setup_default_config.sh &&
         set_general_option config_api_redact_remote_details False &&
         set_general_option trusted_browser_bootstrap_remote_addrs "$$TRUSTED_BOOTSTRAP_SOURCES" &&
         exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/scanfs --web-bind-host "$$SEEDSYNC_WEB_BIND_HOST"

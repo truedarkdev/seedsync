@@ -1551,6 +1551,8 @@ class TestLftp(unittest.TestCase):
         contents = dockerfile.read_text(encoding="utf-8")
         entrypoint = repo_root / Path("src/docker/build/docker-image/entrypoint.sh")
         entrypoint_contents = entrypoint.read_text(encoding="utf-8")
+        compose = repo_root / Path("compose.local.yml")
+        compose_contents = compose.read_text(encoding="utf-8")
 
         self.assertIn("mkdir -p /home/seedsync/.ssh", contents)
         self.assertIn("StrictHostKeyChecking accept-new", contents)
@@ -1558,6 +1560,46 @@ class TestLftp(unittest.TestCase):
         self.assertIn("mkdir /staging", contents)
         self.assertIn("chown seedsync:seedsync /staging", contents)
         self.assertIn('VOLUME [ "/config", "/downloads" ]', contents)
+        self.assertIn("RUN /scripts/entrypoint.sh --bootstrap-default-config", contents)
+        self.assertNotIn("setup_default_config.sh", contents)
+        self.assertNotIn("run_as_user", contents)
+        self.assertNotIn("/usr/local/sbin/ssh", contents)
+        self.assertNotIn("/usr/local/sbin/scp", contents)
+        self.assertIn('SETTINGS_FILE="${CONFIG_DIR}/settings.cfg"', entrypoint_contents)
+        self.assertIn('SCRIPT_PATH="/app/python/seedsync.py"', entrypoint_contents)
+        self.assertIn('DEFAULT_LOCAL_PATH="/downloads/"', entrypoint_contents)
+        self.assertIn(
+            'DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION="${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"',
+            entrypoint_contents,
+        )
+        self.assertIn("ensure_ssh_host_key_config()", entrypoint_contents)
+        self.assertIn('safe_chown "home SSH config" "${ssh_config}"', entrypoint_contents)
+        self.assertIn("unset BASH_ENV ENV", entrypoint_contents)
+        self.assertLess(
+            entrypoint_contents.index('SETTINGS_FILE="${CONFIG_DIR}/settings.cfg"'),
+            entrypoint_contents.index("bootstrap_default_config()"),
+        )
+        self.assertLess(
+            entrypoint_contents.index('SCRIPT_PATH="/app/python/seedsync.py"'),
+            entrypoint_contents.index("bootstrap_default_config()"),
+        )
+        self.assertLess(
+            entrypoint_contents.index(
+                'DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION="${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"'
+            ),
+            entrypoint_contents.index("bootstrap_default_config()"),
+        )
+        self.assertLess(
+            entrypoint_contents.index("ensure_ssh_host_key_config()"),
+            entrypoint_contents.index("unset BASH_ENV ENV"),
+        )
+        self.assertIn("bootstrap_default_config()", entrypoint_contents)
+        self.assertIn('local ssh_config="${USER_HOME}/.ssh/config"', entrypoint_contents)
+        self.assertIn("if [ ! -f \"${ssh_config}\" ]; then", entrypoint_contents)
+        self.assertIn("elif ! grep -Eq '^[[:space:]]*StrictHostKeyChecking[[:space:]]+' \"${ssh_config}\"; then", entrypoint_contents)
+        self.assertIn('printf \'\\n%s\\n\' "StrictHostKeyChecking accept-new" >> "${ssh_config}"', entrypoint_contents)
+        self.assertIn('safe_chown "home SSH config" "${ssh_config}"', entrypoint_contents)
+        self.assertNotIn('printf \'%s\\n\' "StrictHostKeyChecking accept-new" > "${USER_HOME}/.ssh/config"', entrypoint_contents)
         self.assertIn('safe_chown "staging directory" /staging', entrypoint_contents)
         self.assertIn("check_writable_path \"$DOWNLOADS_DIR\"", entrypoint_contents)
         self.assertIn('mktemp "$path/.seedsync_write_test.XXXXXX"', entrypoint_contents)
@@ -1566,6 +1608,9 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn("touch '$test_file' && rm '$test_file'", entrypoint_contents)
         self.assertIn("if mountpoint -q /staging 2>/dev/null; then", entrypoint_contents)
         self.assertIn("ERROR: invalid UMASK value", entrypoint_contents)
+        self.assertNotIn("setup_default_config.sh", compose_contents)
+        self.assertIn("set_general_option config_api_redact_remote_details False", compose_contents)
+        self.assertIn("set_general_option trusted_browser_bootstrap_remote_addrs", compose_contents)
 
 
 class TestLftpPromptClassification(unittest.TestCase):

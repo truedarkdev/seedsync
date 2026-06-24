@@ -127,7 +127,6 @@ FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY --from=seedsync_build_scanfs /build/dist/scanfs /app/scanfs
-COPY src/docker/build/docker-image/setup_default_config.sh /scripts/
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
 RUN set -eux; \
     if dpkg -s p7zip-rar >/dev/null 2>&1; then \
@@ -139,18 +138,6 @@ RUN set -eux; \
 # Accept new host keys on first connection while still rejecting changed keys.
 RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking accept-new" > /root/.ssh/config
 
-# SSH as any user fix
-# https://stackoverflow.com/a/57531352
-COPY src/docker/build/docker-image/run_as_user /usr/local/bin/
-RUN sed -i 's/\r$//' /scripts/setup_default_config.sh /scripts/entrypoint.sh /usr/local/bin/run_as_user
-RUN chmod 755 /usr/local/bin/run_as_user
-COPY src/docker/build/docker-image/ssh /usr/local/sbin
-RUN sed -i 's/\r$//' /usr/local/sbin/ssh
-RUN chmod 755 /usr/local/sbin/ssh
-COPY src/docker/build/docker-image/scp /usr/local/sbin
-RUN sed -i 's/\r$//' /usr/local/sbin/scp
-RUN chmod 755 /usr/local/sbin/scp
-RUN chmod 755 /scripts/setup_default_config.sh
 RUN chmod 755 /scripts/entrypoint.sh
 
 
@@ -175,7 +162,8 @@ RUN mkdir /config && \
 USER seedsync
 
 # First time config setup and replacement
-RUN /scripts/setup_default_config.sh
+# Seed the default config during image build; runtime bootstrap uses the same tracked code path.
+RUN /scripts/entrypoint.sh --bootstrap-default-config
 
 # Switch back to root so the runtime entrypoint can validate IDs, fix ownership,
 # and drop privileges with setpriv before launching the app.
@@ -188,7 +176,7 @@ ENTRYPOINT [ "/scripts/entrypoint.sh" ]
 CMD [ \
     "/bin/bash", \
     "-lc", \
-    "/scripts/setup_default_config.sh && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs --web-bind-host \"${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}\"" \
+    "exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs --web-bind-host \"${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}\"" \
 ]
 
 EXPOSE 8800
