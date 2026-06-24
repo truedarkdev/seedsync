@@ -3,6 +3,7 @@
 import ipaddress
 from typing import Any, Type, Callable, Optional, Tuple
 from abc import ABC, abstractmethod
+from functools import wraps
 import time
 from urllib.parse import urlparse
 
@@ -62,6 +63,9 @@ class WebApp(bottle.Bottle):
     _STREAM_POLL_INTERVAL_IN_MS = 100
     _STREAM_EVENT_YIELD_INTERVAL_IN_MS = 10
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
+    _X_CONTENT_TYPE_OPTIONS = "nosniff"
+    _X_FRAME_OPTIONS = "DENY"
+    _REFERRER_POLICY = "strict-origin-when-cross-origin"
     _UI_SESSION_COOKIE_NAME = "seedsync_ui_session"
     _BOOTSTRAP_EXCHANGE_COOKIE_NAME = "seedsync_bootstrap_exchange"
     _BOOTSTRAP_SAFE_STATIC_ASSET_PATHS = {
@@ -84,47 +88,17 @@ class WebApp(bottle.Bottle):
 
         @self.hook("before_request")
         def __gate_server_request():
-            if not WebApp.__is_server_path(bottle.request.path):
-                return
-
-            allowed_hostname = WebApp.__normalize_hostname(
-                WebApp.__get_allowed_hostname(self.__config)
-            )
-            if allowed_hostname:
-                host = WebApp.__normalize_hostname(
-                    WebApp.__strip_host_port(bottle.request.get_header("Host", ""))
-                )
-
-                # Best-effort local protection only: preserve loopback/container/dev access
-                # while letting an explicit configured hostname narrow exposure.
-                if host not in {"localhost", "127.0.0.1", "[::1]", allowed_hostname}:
-                    bottle.abort(400)
-
-            route: Any = None
             try:
-                route, _ = self.match(bottle.request.environ)
-            except bottle.HTTPError:
-                bottle.abort(404)
+                return self.__gate_server_request()
+            except bottle.HTTPResponse as response:
+                WebApp.__apply_security_headers(response)
+                raise
 
-            assert route is not None
-            if not WebApp.__is_server_path(route.rule):
-                bottle.abort(404)
-
-            required_scope = route.config.get("required_scope")
-            if not isinstance(required_scope, str):
-                bottle.abort(404)
-
-            required_scope = required_scope.strip().lower()
-            if required_scope not in WebApp._AUTH_SCOPES:
-                bottle.abort(404)
-
-            self.__authorize_server_route(
-                required_scope,
-                bool(route.config.get("allow_sessionless_ui", False)),
-                bool(route.config.get("allow_first_admin_bootstrap", False)),
-                bool(route.config.get("allow_bootstrap_proof_exchange", False)),
-                bool(route.config.get("allow_browser_api_key_entry", False)),
-            )
+        @self.hook("after_request")
+        def __apply_security_headers():
+            # Keep the browser-facing security headers attached to HTML, JSON,
+            # redirect, and error responses without spreading policy across handlers.
+            self.__apply_security_headers(bottle.response)
 
     def add_default_routes(self):
         """
@@ -170,6 +144,49 @@ class WebApp(bottle.Bottle):
     def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs):
         self.__streaming_handlers.append((handler, kwargs))
 
+    def __gate_server_request(self):
+        if not WebApp.__is_server_path(bottle.request.path):
+            return
+
+        allowed_hostname = WebApp.__normalize_hostname(
+            WebApp.__get_allowed_hostname(self.__config)
+        )
+        if allowed_hostname:
+            host = WebApp.__normalize_hostname(
+                WebApp.__strip_host_port(bottle.request.get_header("Host", ""))
+            )
+
+            # Best-effort local protection only: preserve loopback/container/dev access
+            # while letting an explicit configured hostname narrow exposure.
+            if host not in {"localhost", "127.0.0.1", "[::1]", allowed_hostname}:
+                bottle.abort(400)
+
+        route: Any = None
+        try:
+            route, _ = self.match(bottle.request.environ)
+        except bottle.HTTPError:
+            bottle.abort(404)
+
+        assert route is not None
+        if not WebApp.__is_server_path(route.rule):
+            bottle.abort(404)
+
+        required_scope = route.config.get("required_scope")
+        if not isinstance(required_scope, str):
+            bottle.abort(404)
+
+        required_scope = required_scope.strip().lower()
+        if required_scope not in WebApp._AUTH_SCOPES:
+            bottle.abort(404)
+
+        self.__authorize_server_route(
+            required_scope,
+            bool(route.config.get("allow_sessionless_ui", False)),
+            bool(route.config.get("allow_first_admin_bootstrap", False)),
+            bool(route.config.get("allow_bootstrap_proof_exchange", False)),
+            bool(route.config.get("allow_browser_api_key_entry", False)),
+        )
+
     def process(self):
         """
         Advance the web app state
@@ -209,7 +226,50 @@ class WebApp(bottle.Bottle):
                 if type(flag_value) is not bool:
                     raise ValueError("{} must be a boolean for /server routes".format(flag_name))
                 config[flag_name] = flag_value
-        return super().route(path=path, method=method, callback=callback, name=name, apply=apply, skip=skip, **config)
+        if callback is not None:
+            return super().route(
+                path=path,
+                method=method,
+                callback=self.__with_security_headers(callback),
+                name=name,
+                apply=apply,
+                skip=skip,
+                **config
+            )
+
+        def _route_decorator(route_callback):
+            return super(WebApp, self).route(
+                path=path,
+                method=method,
+                callback=self.__with_security_headers(route_callback),
+                name=name,
+                apply=apply,
+                skip=skip,
+                **config
+            )
+
+        return _route_decorator
+
+    @staticmethod
+    def __apply_security_headers(response):
+        response.set_header("Content-Security-Policy", WebApp._CONTENT_SECURITY_POLICY)
+        response.set_header("X-Content-Type-Options", WebApp._X_CONTENT_TYPE_OPTIONS)
+        response.set_header("X-Frame-Options", WebApp._X_FRAME_OPTIONS)
+        response.set_header("Referrer-Policy", WebApp._REFERRER_POLICY)
+
+    def __with_security_headers(self, callback):
+        @wraps(callback)
+        def _wrapped_callback(*args, **kwargs):
+            try:
+                result = callback(*args, **kwargs)
+            except bottle.HTTPResponse as response:
+                WebApp.__apply_security_headers(response)
+                raise
+            target_response = result if isinstance(result, bottle.HTTPResponse) else bottle.response
+            WebApp.__apply_security_headers(target_response)
+            return result
+
+        return _wrapped_callback
 
     @staticmethod
     def __get_allowed_hostname(config) -> str:

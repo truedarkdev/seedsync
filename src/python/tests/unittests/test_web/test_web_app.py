@@ -17,6 +17,13 @@ from web.web_app_builder import WebAppBuilder
 LEGACY_TEST_API_TOKEN = "legacy-test-token"
 
 
+def _assert_security_headers(testcase, response):
+    testcase.assertEqual("connect-src 'self' https://api.github.com", response.headers["Content-Security-Policy"])
+    testcase.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+    testcase.assertEqual("DENY", response.headers["X-Frame-Options"])
+    testcase.assertEqual("strict-origin-when-cross-origin", response.headers["Referrer-Policy"])
+
+
 class QueueStreamHandler(IStreamHandler):
     def __init__(self, values, cleanup_log):
         self.values = list(values)
@@ -91,6 +98,7 @@ class TestWebAppStream(unittest.TestCase):
 
         self.assertEqual(200, response.status_int)
         self.assertIn("<html></html>", response.text)
+        _assert_security_headers(self, response)
 
     def test_bootstrap_page_serves_browser_remember_form(self):
         self.web_app.add_default_routes()
@@ -101,6 +109,7 @@ class TestWebAppStream(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("/server/browser/v1/remember", response.text)
         self.assertIn("Save this browser for next time", response.text)
+        _assert_security_headers(self, response)
 
     def test_stop_does_not_raise_and_stops_active_stream(self):
         cleanup_log = []
@@ -510,6 +519,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(201, response.status_int)
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        _assert_security_headers(self, response)
 
     def test_loopback_index_auto_grants_first_admin_access_before_first_admin_exists(self):
         empty_store = ApiKeyStore()
@@ -550,6 +560,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.assertEqual(302, response.status_int)
         self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
+        _assert_security_headers(self, response)
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, bootstrap_response.status_int)
         self.assertIn("Claim the first local session", bootstrap_response.text)
