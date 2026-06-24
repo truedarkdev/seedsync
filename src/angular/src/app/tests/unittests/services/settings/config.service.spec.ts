@@ -513,11 +513,49 @@ describe("Testing config service", () => {
         });
 
         // issue the set
-        configService.set("general", "log_level", "DEBUG").subscribe(DoNothing);
+        const setRequest = configService.set("general", "log_level", "DEBUG");
+        httpMock.expectNone("/server/config/set/general/log_level");
+        expect(configSubscriberIndex).toBe(1);
+
+        setRequest.subscribe(DoNothing);
 
         // set request
         expectConfigSetRequest("general", "log_level", "DEBUG", "");
 
+        expect(configSubscriberIndex).toBe(2);
+        httpMock.verify();
+    });
+
+    it("should send updated config once for multiple subscribers on a successful set", () => {
+        const configJson = {general: {log_level: "INFO"}};
+        // first connect
+        httpMock.expectOne("/server/config/get").flush(configJson);
+
+        const expectedLogLevels = ["INFO", "DEBUG"];
+        let configSubscriberIndex = 0;
+        configService.config.subscribe({
+            next: config => {
+                expect(config.general.log_level).toBe(expectedLogLevels[configSubscriberIndex++]);
+            }
+        });
+
+        const setRequest = configService.set("general", "log_level", "DEBUG");
+        httpMock.expectNone("/server/config/set/general/log_level");
+        expect(configSubscriberIndex).toBe(1);
+
+        let reactionCount = 0;
+        const reactionObserver = {
+            next: () => {
+                reactionCount++;
+            }
+        };
+        setRequest.subscribe(reactionObserver);
+        setRequest.subscribe(reactionObserver);
+
+        // set request
+        expectConfigSetRequest("general", "log_level", "DEBUG", "");
+
+        expect(reactionCount).toBe(2);
         expect(configSubscriberIndex).toBe(2);
         httpMock.verify();
     });

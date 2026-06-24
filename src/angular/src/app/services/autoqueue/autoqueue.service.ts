@@ -1,5 +1,6 @@
 import {Injectable} from "@angular/core";
 import {BehaviorSubject, Observable} from "rxjs";
+import {shareReplay, tap} from "rxjs/operators";
 
 import * as Immutable from "immutable";
 
@@ -63,9 +64,8 @@ export class AutoQueueService extends BaseWebService {
             // Double-encode the value
             const patternEncoded = encodeURIComponent(encodeURIComponent(pattern));
             const url = this.AUTOQUEUE_ADD_URL(patternEncoded);
-            const obs = this._restService.post(url);
-            obs.subscribe({
-                next: reaction => {
+            return this._restService.post(url).pipe(
+                tap(reaction => {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const patterns = this._patterns.getValue();
@@ -76,9 +76,9 @@ export class AutoQueueService extends BaseWebService {
                         );
                         this._patterns.next(newPatterns);
                     }
-                }
-            });
-            return obs;
+                }),
+                shareReplay(1)
+            );
         }
     }
 
@@ -100,9 +100,8 @@ export class AutoQueueService extends BaseWebService {
             // Double-encode the value
             const patternEncoded = encodeURIComponent(encodeURIComponent(pattern));
             const url = this.AUTOQUEUE_REMOVE_URL(patternEncoded);
-            const obs = this._restService.post(url);
-            obs.subscribe({
-                next: reaction => {
+            return this._restService.post(url).pipe(
+                tap(reaction => {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const patterns = this._patterns.getValue();
@@ -112,9 +111,9 @@ export class AutoQueueService extends BaseWebService {
                             this._patterns.next(newPatterns);
                         }
                     }
-                }
-            });
-            return obs;
+                }),
+                shareReplay(1)
+            );
         }
     }
 
