@@ -34,7 +34,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
+.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -128,7 +128,7 @@ verify-scanfs-glibc:
 preflight-linux-wsl:
 	bash ${SOURCEDIR}/docker/test/check_linux_wsl_baseline.sh
 
-tests-python:
+test-image:
 	# python run
 	$(DOCKER) build \
 		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
@@ -136,14 +136,18 @@ tests-python:
 		--tag seedsync/run/python/devenv \
 		${ROOTDIR}
 	# python tests
-	$(DOCKER_COMPOSE) \
-		-f ${SOURCEDIR}/docker/test/python/compose.yml \
-		build
+	$(DOCKER) build \
+		-f ${SOURCEDIR}/docker/test/python/Dockerfile \
+		--target seedsync_test_python \
+		--tag seedsync/test/python \
+		${ROOTDIR}
 
-run-tests-python: tests-python
+tests-python: test-image
+
+run-tests-python: test-image
 	$(DOCKER_COMPOSE) \
 		-f ${SOURCEDIR}/docker/test/python/compose.yml \
-		up --force-recreate --exit-code-from tests
+		up --force-recreate --no-build --exit-code-from tests
 
 run-tests-python-native:
 	# native host python tests
