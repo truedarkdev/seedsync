@@ -192,15 +192,14 @@ export class ViewFileService {
                 this._indices.set(ViewFileService.getViewFileKey(viewFile), newViewFiles.size - 1);
             }
         );
-        // Do the removes (no re-sort required)
-        removedNames.forEach(
-            name => {
-                updateIndices = true;
-                const index = newViewFiles.findIndex(value => ViewFileService.getViewFileKey(value) === name);
-                newViewFiles = newViewFiles.remove(index);
-                this._indices.delete(name);
-            }
-        );
+        // Do the removes in a single pass while preserving survivor order.
+        if (removedNames.length > 0) {
+            updateIndices = true;
+            const removedNameSet = new Set<string>(removedNames);
+            newViewFiles = newViewFiles.filter(
+                value => !removedNameSet.has(ViewFileService.getViewFileKey(value))
+            ).toList();
+        }
 
         if (reSort && this._sortComparator != null) {
             this._logger.debug("Re-sorting view files");

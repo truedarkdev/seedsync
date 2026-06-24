@@ -54,20 +54,21 @@ describe("Testing file selection service", () => {
         expect(allVisibleSelected).toBe(false);
     });
 
-    it("should prune hidden files from the selection", () => {
+    it("should prune interleaved removed files from the selection", () => {
         const one = createViewFile("one");
         const two = createViewFile("two");
-        let selectedFiles = Immutable.List<ViewFile>();
+        const three = createViewFile("three");
+        const four = createViewFile("four");
+        const five = createViewFile("five");
+        let selectedFileIds = Immutable.Set<string>();
 
-        fileSelectionService.selectedFiles.subscribe(value => selectedFiles = value);
+        fileSelectionService.selectedFileIds.subscribe(value => selectedFileIds = value);
 
-        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([one, two]));
-        fileSelectionService.toggle(one);
-        fileSelectionService.toggle(two);
-        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([two]));
+        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([one, two, three, four, five]));
+        fileSelectionService.setAllVisibleSelected(true);
+        fileSelectionService.setVisibleFiles(Immutable.List<ViewFile>([one, three, five]));
 
-        expect(selectedFiles.size).toBe(1);
-        expect(selectedFiles.get(0).name).toBe("two");
+        expect(selectedFileIds.toArray().sort()).toEqual(["five", "one", "three"]);
     });
 
     it("should keep duplicate names independently selected by file id", () => {

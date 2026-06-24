@@ -1069,6 +1069,43 @@ describe("Testing view file service", () => {
         expect(filesById.get(tvId).isSelected).toBe(true);
     }));
 
+    it("should remove interleaved files in one pass and refresh surviving indices", fakeAsync(() => {
+        let model = Immutable.Map<string, ModelFile>()
+            .set("a", new ModelFile({file_id: "a", name: "a"}))
+            .set("b", new ModelFile({file_id: "b", name: "b"}))
+            .set("c", new ModelFile({file_id: "c", name: "c"}))
+            .set("d", new ModelFile({file_id: "d", name: "d"}))
+            .set("e", new ModelFile({file_id: "e", name: "e"}));
+
+        let viewFileList: Immutable.List<ViewFile> = null;
+
+        viewService.files.subscribe({
+            next: list => viewFileList = list
+        });
+
+        mockModelService._files.next(model);
+        tick();
+
+        let filesById = getViewFilesById(viewFileList);
+        model = model.remove("b").remove("d");
+        mockModelService._files.next(model);
+        tick();
+
+        filesById = getViewFilesById(viewFileList);
+        expect(viewFileList.map(file => file.name).toArray()).toEqual(["a", "c", "e"]);
+        expect(filesById.has("b")).toBe(false);
+        expect(filesById.has("d")).toBe(false);
+
+        viewService.setSelected(filesById.get("c"));
+        tick();
+
+        filesById = getViewFilesById(viewFileList);
+        expect(viewFileList.map(file => file.name).toArray()).toEqual(["a", "c", "e"]);
+        expect(viewFileList.map(file => file.isSelected).toArray()).toEqual([false, true, false]);
+        expect(filesById.get("c").isSelected).toBe(true);
+        expect(filesById.get("e").isSelected).toBe(false);
+    }));
+
     it("should should correctly set ViewFile isLocallyDeletable", fakeAsync(() => {
         // Test and expected result vectors
         // test - [ModelFile.State, local size, remote size]
