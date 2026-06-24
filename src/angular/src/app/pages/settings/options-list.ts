@@ -53,6 +53,12 @@ export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
             label: "Server Script Path",
             valuePath: ["lftp", "remote_path_to_scan_script"],
             description: "Where to install scanner script on remote server"
+        },
+        {
+            type: OptionType.Text,
+            label: "Remote Python Path",
+            valuePath: ["lftp", "remote_python_path"],
+            description: "Defaults to python3; leave blank to use the default."
         }
     ]
 };

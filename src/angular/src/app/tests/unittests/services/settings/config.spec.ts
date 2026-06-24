@@ -20,6 +20,7 @@ describe("Testing config record initialization", () => {
                 remote_path: "/some/remote/path",
                 local_path: "/some/local/path",
                 remote_path_to_scan_script: "/another/remote/path",
+                remote_python_path: "/opt/python/bin/python3",
                 use_ssh_key: true,
                 num_max_parallel_downloads: 2,
                 num_max_parallel_files_per_download: 8,
@@ -69,6 +70,7 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.remote_path).toBe("/some/remote/path");
         expect(config.lftp.local_path).toBe("/some/local/path");
         expect(config.lftp.remote_path_to_scan_script).toBe("/another/remote/path");
+        expect(config.lftp.remote_python_path).toBe("/opt/python/bin/python3");
         expect(config.lftp.use_ssh_key).toBe(true);
         expect(config.lftp.num_max_parallel_downloads).toBe(2);
         expect(config.lftp.num_max_parallel_files_per_download).toBe(8);
@@ -120,6 +122,7 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
         expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
+        expect(partialConfig.getValue("lftp", "remote_python_path")).toBe("python3");
         expect(partialConfig.getValue("lftp", "protocol")).toBe("sftp");
         expect(partialConfig.getValue("lftp", "remote_ftp_port")).toBe(21);
         expect(partialConfig.getValue("lftp", "ftp_ssl_verify_certificate")).toBe(true);

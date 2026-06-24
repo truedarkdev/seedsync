@@ -95,6 +95,19 @@ def _normalize_transfer_protocol(config_cls: Any, name: str, value: Any) -> str:
     return normalized
 
 
+def _normalize_remote_python_path(config_cls: Any, name: str, value: Any) -> str:
+    if value is None:
+        return "python3"
+    if not isinstance(value, str):
+        raise ConfigError("Bad config: {}.{} ({}) must be a string value".format(
+            config_cls.__name__, name, value
+        ))
+    normalized = value.strip()
+    if not normalized:
+        return "python3"
+    return normalized
+
+
 class Converters:
     @staticmethod
     def null(_: Any, __: str, value: str) -> str:
@@ -135,6 +148,10 @@ class Converters:
     @staticmethod
     def transfer_protocol(config_cls: Any, name: str, value: str) -> str:
         return _normalize_transfer_protocol(config_cls, name, value)
+
+    @staticmethod
+    def remote_python_path(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_remote_python_path(config_cls, name, value)
 
 
 class Checkers:
@@ -177,6 +194,10 @@ class Checkers:
     @staticmethod
     def transfer_protocol(config_cls: Any, name: str, value: str) -> str:
         return _normalize_transfer_protocol(config_cls, name, value)
+
+    @staticmethod
+    def remote_python_path(config_cls: Any, name: str, value: str) -> str:
+        return _normalize_remote_python_path(config_cls, name, value)
 
     @staticmethod
     def int_non_negative(config_cls: Any, name: str, value: int) -> int:
@@ -468,6 +489,7 @@ class Config(Persist):
         remote_path = PROP("remote_path", Checkers.string_nonempty, Converters.null)
         local_path = PROP("local_path", Checkers.string_nonempty, Converters.null)
         remote_path_to_scan_script = PROP("remote_path_to_scan_script", Checkers.string_nonempty, Converters.null)
+        remote_python_path = PROP("remote_python_path", Checkers.remote_python_path, Converters.remote_python_path)
         use_ssh_key = PROP("use_ssh_key", Checkers.null, Converters.bool)
         num_max_parallel_downloads = PROP("num_max_parallel_downloads", Checkers.int_positive, Converters.int)
         num_max_parallel_files_per_download = PROP("num_max_parallel_files_per_download",
@@ -499,6 +521,7 @@ class Config(Persist):
             self.remote_path = None
             self.local_path = None
             self.remote_path_to_scan_script = None
+            self.remote_python_path = "python3"
             self.use_ssh_key = None
             self.num_max_parallel_downloads = None
             self.num_max_parallel_files_per_download = None
@@ -516,6 +539,8 @@ class Config(Persist):
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
             config_dict = dict(config_dict)
+            if "remote_python_path" not in config_dict:
+                config_dict["remote_python_path"] = "python3"
             if "net_socket_buffer" not in config_dict:
                 config_dict["net_socket_buffer"] = "8M"
             if "staging_path" not in config_dict:

@@ -31,6 +31,7 @@ interface ILftp {
     remote_path: string;
     local_path: string;
     remote_path_to_scan_script: string;
+    remote_python_path: string;
     use_ssh_key: boolean;
     num_max_parallel_downloads: number;
     num_max_parallel_files_per_download: number;
@@ -53,6 +54,7 @@ const DefaultLftp: ILftp = {
     remote_path: null,
     local_path: null,
     remote_path_to_scan_script: null,
+    remote_python_path: "python3",
     use_ssh_key: null,
     num_max_parallel_downloads: null,
     num_max_parallel_files_per_download: null,

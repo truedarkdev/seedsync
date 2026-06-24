@@ -576,6 +576,9 @@ class Controller:
 
     def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]):
         config = cast(Any, self.__context.config)
+        remote_python_path = getattr(config.lftp, "remote_python_path", None)
+        if not isinstance(remote_python_path, str):
+            remote_python_path = None
         if enabled_path_pairs:
             return MultiPathRemoteScanner([
                 RemoteScanner(
@@ -586,6 +589,7 @@ class Controller:
                     remote_path_to_scan=pair.remote_path,
                     local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
                     remote_path_to_scan_script=config.lftp.remote_path_to_scan_script,
+                    remote_python_path=remote_python_path,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
@@ -597,7 +601,8 @@ class Controller:
             remote_port=config.lftp.remote_port,
             remote_path_to_scan=self.__legacy_remote_path,
             local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
-            remote_path_to_scan_script=config.lftp.remote_path_to_scan_script
+            remote_path_to_scan_script=config.lftp.remote_path_to_scan_script,
+            remote_python_path=remote_python_path
         )
 
     def __mark_path_pair_refresh_completed(self, generation: Optional[int] = None):
