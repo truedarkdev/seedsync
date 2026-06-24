@@ -348,7 +348,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 329 | `5cb2a7a9793908186f73236a870ecb35d8e43671` | 2026-03-04 | feat: replace pickle serialization with JSON in scanfs (#129) | already integrated |
 | 330 | `fd3dc0a2eaa8fd7ba55f611269d882e84e158730` | 2026-03-04 | fix: add isChecked to test helper for ViewFile spec | covered elsewhere |
 | 331 | `74f9c08c55ae84e009b462e26176e50f552b9abf` | 2026-03-04 | feat: add webhook notifications on file events (#128) | needs area reopen |
-| 332 | `bb5f6023a2c3df9b719f57e6036bdac8dd8d27c9` | 2026-03-04 | feat: add historical log query endpoint with search/filter UI (#124) | needs new integration task |
+| 332 | `bb5f6023a2c3df9b719f57e6036bdac8dd8d27c9` | 2026-03-04 | feat: add historical log query endpoint with search/filter UI (#124) | maintainer decision needed - product/UI decision for historical log query/search/filter feature; task `historical-log-query-row332` |
 | 333 | `87d11b036ce8412b8840224c7ad00fbb30f30801` | 2026-03-05 | ci: enable build and publish for feat/v0.13.0 branch | needs area reopen |
 | 334 | `be3ff0b60fa317ba2daea2e2ccbc3abf7902da2f` | 2026-03-05 | Merge branch 'develop' into feat/v0.13.0 | covered elsewhere |
 | 335 | `6ba47dd35688925bf09fc21a81af2e137cee5e9c` | 2026-03-05 | ci: retrigger build | covered elsewhere |
@@ -362,12 +362,12 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 343 | `08118e118104d903d778bc42e3c0686c068792a6` | 2026-03-05 | fix: remove stale paste reference and dead modal localization strings | covered elsewhere |
 | 344 | `e0b1839a8f2ae7fcf2b219e420cb7c0bb1dfebf0` | 2026-03-05 | fix: make scan_fs.py self-contained for remote execution | needs area reopen |
 | 345 | `27cf0e259a5cdb7998ca76c55ea1d2c32b09623e` | 2026-03-05 | feat: replace patool with direct subprocess calls (#141) (#145) | needs area reopen |
-| 346 | `c8826cbebe81294b34b1d4aaedd0131de1f6663e` | 2026-03-05 | feat: add exclude patterns config for filtering remote files (#26) (#146) | needs new integration task |
+| 346 | `c8826cbebe81294b34b1d4aaedd0131de1f6663e` | 2026-03-05 | feat: add exclude patterns config for filtering remote files (#26) (#146) | maintainer decision needed - product/config decision for exclude-pattern filtering; task `exclude-patterns-row346` |
 | 347 | `059c6c79dfd468841bdcda54af7635cb00480b78` | 2026-03-05 | test: add composite key test coverage for ViewFileService (#159) | adapted locally in `e50166d2` |
 | 348 | `66ac4a0ec1462cbe3fb7c63cd713b4f3df019663` | 2026-03-05 | feat: Settings UI for path pairs CRUD (#160) | covered elsewhere |
 | 349 | `f33f1103e92e734225c13796c33272ff3958a25e` | 2026-03-05 | feat: per-pair LFTP and scanner instances in Controller (#155, #151) (#161) | covered elsewhere |
 | 350 | `c1bfecbfc255305a500a679cbc0a591e7ead3fc5` | 2026-03-05 | fix: improve Path Pairs settings UX (#162) | intentionally skipped |
-| 351 | `eea09145ae73864e18b6adf6a11f8774f0445ff8` | 2026-03-05 | fix: disable Server/Local Directory fields when path pairs active (#163) | needs new integration task |
+| 351 | `eea09145ae73864e18b6adf6a11f8774f0445ff8` | 2026-03-05 | fix: disable Server/Local Directory fields when path pairs active (#163) | maintainer decision needed - UI/product decision for path-pair-active legacy directory fields; task `path-pair-directory-fields-row351` |
 | 352 | `faba6c1168cb5cd8f3fa97056a44ac3d19ff865a` | 2026-03-06 | feat: Alpine Docker image + dual-image CI (#164) | needs area reopen |
 | 353 | `4580795021a17113fd6598fae9f6ed971e3cbb1e` | 2026-03-06 | fix: clean up startup logs — add path pairs, remove GUID (#165) | adapted locally in `76902780` |
 | 354 | `dde649dcc0f6aceb38e4a5be5a852e40f977494c` | 2026-03-06 | Release v0.13.0 — Multiple path pairs, Alpine image, and more | intentionally skipped |
