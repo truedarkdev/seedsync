@@ -14,7 +14,6 @@ mkdocs-material = "*"
 parameterized = "*"
 patool = "*"
 pexpect = ">=4.9.0"
-pytz = "*"
 tblib = ">=3.2.2"
 six = "^1.17.0"
 

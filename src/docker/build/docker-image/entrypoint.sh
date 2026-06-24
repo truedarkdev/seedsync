@@ -118,7 +118,7 @@ safe_chown_recursive() {
 check_writable_path() {
     local path="$1"
 
-    if ! gosu "$USER_NAME:$GROUP_NAME" bash -c '
+    if ! setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- bash -c '
         path="$1"
         test_file=$(mktemp "$path/.seedsync_write_test.XXXXXX") || {
             printf "ERROR: failed to create writable-path probe under %s\n" "$path" >&2
@@ -177,4 +177,4 @@ fi
 export HOME="$USER_HOME"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME)" >&2
 
-exec gosu "$USER_NAME:$GROUP_NAME" "$@"
+exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- "$@"
