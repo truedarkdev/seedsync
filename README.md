@@ -68,6 +68,8 @@ If the remote scanner cannot copy to the configured `Server Script Path`, or the
 
 If you enable the Staging Directory, mount `/staging` in Docker and set `lftp.staging_path` in Settings so in-progress downloads land on fast storage before moving to the final location.
 
+If you run SeedSync in Docker and need a different default permission mask, set `UMASK` to an octal value such as `002` before starting the container. Invalid values abort startup.
+
 To use FTPS for bulk transfers, keep your SSH settings configured for file discovery, then choose `FTPS` under Settings > Transfer Protocol and set the remote FTP port. Leave certificate verification enabled unless you need the insecure compatibility mode for a self-signed or legacy server.
 
 ## Report an Issue
