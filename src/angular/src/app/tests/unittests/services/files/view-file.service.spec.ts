@@ -1,5 +1,5 @@
 import {fakeAsync, TestBed, tick} from "@angular/core/testing";
-import {of} from "rxjs";
+import {Observable, of} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -955,6 +955,57 @@ describe("Testing view file service", () => {
         expect(queueSpy.calls.mostRecent().args[0].path_pair_id).toBe("tv");
         expect(latestReaction.success).toBe(true);
         expect(latestReaction.data).toBe(tvId);
+    }));
+
+    it("should cancel an in-flight action when unsubscribed", fakeAsync(() => {
+        const tvId = "[\"tv\",\"dup\"]";
+        const model = Immutable.Map<string, ModelFile>()
+            .set(tvId, createDuplicateNamedModelFile(tvId, "tv", "TV"));
+
+        mockModelService._files.next(model);
+        tick();
+
+        const queueReaction = new WebReaction(true, tvId, null);
+        let cancelled = false;
+        const queueSpy = jasmine.createSpy("queue").and.callFake(() => {
+            return new Observable<WebReaction>(observer => {
+                const timeoutId = setTimeout(() => {
+                    observer.next(queueReaction);
+                    observer.complete();
+                }, 25);
+                return () => {
+                    cancelled = true;
+                    clearTimeout(timeoutId);
+                };
+            });
+        });
+        (mockModelService as any).queue = queueSpy;
+
+        let latestReaction: WebReaction = null;
+        const subscription = viewService.queue(new ViewFile({fileId: tvId, name: "dup"})).subscribe({
+            next: reaction => latestReaction = reaction
+        });
+        subscription.unsubscribe();
+        tick(25);
+
+        expect(queueSpy).toHaveBeenCalledTimes(1);
+        expect(cancelled).toBe(true);
+        expect(latestReaction).toBeNull();
+    }));
+
+    it("should log a generic not-found message for missing actions", fakeAsync(() => {
+        const missingFileId = "[\"tv\",\"missing\"]";
+        const errorSpy = spyOn(console, "error");
+
+        let latestReaction: WebReaction = null;
+        viewService.queue(new ViewFile({fileId: missingFileId, name: "missing"})).subscribe({
+            next: reaction => latestReaction = reaction
+        });
+        tick();
+
+        expect(errorSpy).toHaveBeenCalledWith("File not found: " + missingFileId);
+        expect(latestReaction.success).toBe(false);
+        expect(latestReaction.errorMessage).toBe("File 'missing' not found");
     }));
 
     it("should preserve duplicate-name identity across update and remove diffs", fakeAsync(() => {
