@@ -15,6 +15,13 @@ from webtest import TestApp
 LEGACY_TEST_API_TOKEN = "legacy-test-token"
 
 
+def _assert_security_headers(testcase, response):
+    testcase.assertEqual("connect-src 'self' https://api.github.com", response.headers["Content-Security-Policy"])
+    testcase.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
+    testcase.assertEqual("DENY", response.headers["X-Frame-Options"])
+    testcase.assertEqual("strict-origin-when-cross-origin", response.headers["Referrer-Policy"])
+
+
 class TestAdminHandler(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp(prefix="test_admin_handler")
@@ -118,6 +125,7 @@ class TestAdminHandler(unittest.TestCase):
             expect_errors=True
         )
         self.assertEqual(401, rejected_cross_origin.status_int)
+        _assert_security_headers(self, rejected_cross_origin)
         self.assertEqual(0, empty_store.active_admin_key_count)
 
         allowed = test_app.post_json(
@@ -127,6 +135,7 @@ class TestAdminHandler(unittest.TestCase):
         )
         allowed_payload = json.loads(allowed.text)
         self.assertEqual(201, allowed.status_int)
+        _assert_security_headers(self, allowed)
         self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
         self.assertIn("secret", allowed_payload)
 
