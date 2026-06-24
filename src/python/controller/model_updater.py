@@ -79,6 +79,34 @@ class ModelUpdater:
             return False
         return key.startswith(f"{path_pair_id}:")
 
+    def _handle_lftp_completion_detection(
+        self,
+        current_downloading_file_names: list[tuple[str, str | None, str | None]],
+        should_process_completion_detection: bool,
+    ) -> None:
+        if not should_process_completion_detection:
+            return
+
+        controller = self._controller
+        current_downloading_file_names_set = set(current_downloading_file_names)
+        just_completed_file_names = (
+            controller._Controller__prev_downloading_file_names - current_downloading_file_names_set
+        )
+        just_completed_file_names = {
+            file_name for file_name in just_completed_file_names
+            if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])  # type: ignore[attr-defined]
+        }
+        if just_completed_file_names:
+            for name, path_pair_id, _ in just_completed_file_names:
+                controller.logger.info(
+                    "Download completion pending (LFTP job finished): {}".format(
+                        ModelFile.build_file_id(name, path_pair_id)
+                    )
+                )
+            controller._Controller__pending_completion_file_names.update(just_completed_file_names)
+            controller._Controller__local_scan_process.force_scan()  # type: ignore[attr-defined]
+        controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
+
     def update(self):  # noqa: C901 - extracted controller refresh loop
         controller = self._controller
         model_builder = controller._Controller__model_builder  # type: ignore[attr-defined]
@@ -208,25 +236,10 @@ class ModelUpdater:
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
             ]
-            if lftp_status_poll_healthy or lftp_statuses:
-                current_downloading_file_names_set = set(current_downloading_file_names)
-                just_completed_file_names = (
-                    controller._Controller__prev_downloading_file_names - current_downloading_file_names_set
-                )
-                just_completed_file_names = {
-                    file_name for file_name in just_completed_file_names
-                    if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])  # type: ignore[attr-defined]
-                }
-                if just_completed_file_names:
-                    for name, path_pair_id, _ in just_completed_file_names:
-                        controller.logger.info(
-                            "Download completion pending (LFTP job finished): {}".format(
-                                ModelFile.build_file_id(name, path_pair_id)
-                            )
-                        )
-                    controller._Controller__pending_completion_file_names.update(just_completed_file_names)
-                    controller._Controller__local_scan_process.force_scan()  # type: ignore[attr-defined]
-                controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
+            self._handle_lftp_completion_detection(
+                current_downloading_file_names,
+                lftp_status_poll_healthy or bool(lftp_statuses),
+            )
             controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             controller._Controller__next_lftp_status_poll_at = None
