@@ -291,7 +291,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 272 | `aef64c9b81963399065045899cdbf36061df38cf` | 2026-02-28 | Merge pull request #90 from nitrobass24/dependabot/npm_and_yarn/src/angular/angular/core-21.1.6 | covered elsewhere |
 | 273 | `848894327331dac57c9651a02abc0d5a6acefcbe` | 2026-02-28 | Parallelize CI builds and add Angular unit tests | needs area reopen via task `ci-build-topology-rows273-282-286` |
 | 274 | `b5be932551a64719b2b5520f90bcb2ade47c8e8f` | 2026-02-28 | Merge pull request #93 from nitrobass24/ci/parallel-builds-unit-tests | covered elsewhere |
-| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | needs new integration task via task `docker-docs-runtime-rows275-285-287` - docs/runtime lane for UMASK and Unraid docs |
+| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | adapted locally in `README.md` and `src/python/docs/install.md` |
 | 276 | `a976b9e52d227b6a601f9ca8f98e683eae11d5c8` | 2026-02-28 | Merge pull request #94 from nitrobass24/docs/add-umask-to-readme | covered elsewhere |
 | 277 | `7edb32561b1b192ba20e2b606d68e1ceaf8ab35e` | 2026-02-28 | Update website dependencies to address transitive vulnerabilities | intentionally skipped |
 | 278 | `bdfb0ba4e8460fb529ccdd09b056ada10b5384f3` | 2026-02-28 | Merge pull request #95 from nitrobass24/fix/dependabot-security-alerts | covered elsewhere |
@@ -303,7 +303,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 284 | `4cb1ea7787a8be7dead50b144760b0391f4fb111` | 2026-02-28 | Release v0.12.5 — update CHANGELOG with CI optimization | intentionally skipped |
 | 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | needs new integration task via task `docker-docs-runtime-rows275-285-287` - Docker/runtime packaging lane |
 | 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | needs area reopen via task `ci-build-topology-rows273-282-286` |
-| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | needs new integration task via task `docker-docs-runtime-rows275-285-287` - docs/runtime lane |
+| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | intentionally skipped - local repo has no tracked Unraid install-doc surface; adding one would be a new docs/product choice |
 | 288 | `5f37c1c13eaf99ff4eb1217d24b318af58cef9b8` | 2026-02-28 | Merge pull request #99 from nitrobass24/develop | covered elsewhere |
 | 289 | `68800b4356cb3e50699a9fc35e946418672e4e32` | 2026-02-28 | Merge branch 'master' into develop | covered elsewhere |
 | 290 | `33fec0d7700ae0cc6b2996401efcc99532b477cb` | 2026-02-28 | Release v0.12.6 — Unraid docs, Docker build optimizations | covered elsewhere |
