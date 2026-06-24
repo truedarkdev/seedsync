@@ -138,7 +138,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 119 | `5f203bedcfcc9c7424592fc0c0a7740ddd726f7b` | 2026-01-26 | Update Dockerfile | covered elsewhere |
 | 120 | `037709a08976c609ba87ca4c7e63ec0bb9a202ef` | 2026-01-26 | Update Dockerfile | intentionally skipped |
 | 121 | `c2cebd403176852ce1670a8f5a5c016903ac9fb3` | 2026-01-26 | Merge pull request #11 from nitrobass24/nitrobass24-patch-1 | covered elsewhere |
-| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | needs area reopen via task `angular17-migration-row122` - likely needs supersession/mapping against the current Angular framework lanes before implementation |
+| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | maintainer decision needed via task `angular17-migration-row122` - stale Angular 4-to-17 standalone migration against the current Angular 21 module-based app; retire or remap it before any framework modernization work |
 | 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | adapted locally in `c5d042018043cc274603e075b166bfa6b519b354` |
 | 124 | `b39d67b67fd6f0889a2fb852e6aef9ff57dd3a93` | 2026-01-26 | Switch scanfs builder to Debian Bullseye | intentionally skipped |
 | 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | covered elsewhere |
