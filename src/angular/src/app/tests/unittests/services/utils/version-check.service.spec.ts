@@ -3,6 +3,7 @@ import {fakeAsync, TestBed, tick} from "@angular/core/testing";
 import {VersionCheckService} from "../../../../services/utils/version-check.service";
 import {RestService, WebReaction} from "../../../../services/utils/rest.service";
 import {NotificationService} from "../../../../services/utils/notification.service";
+import {Notification} from "../../../../services/utils/notification";
 import {LoggerService} from "../../../../services/utils/logger.service";
 import {MockRestService} from "../../../mocks/mock-rest.service";
 import {Subject} from "rxjs";
@@ -28,7 +29,7 @@ describe("Testing version check service", () => {
         notifService = TestBed.get(NotificationService);
         restService = TestBed.get(RestService);
 
-        spyOn(notifService, "show");
+        spyOn(notifService, "show").and.callThrough();
         sendRequestSpy = spyOn(restService, "sendRequest").and.returnValue(
             new Subject<WebReaction>());
 
@@ -99,15 +100,27 @@ describe("Testing version check service", () => {
     it("should fire a notification on new version", fakeAsync(() => {
         const subject = new Subject<WebReaction>();
         sendRequestSpy.and.returnValue(subject);
+        const notifications: Notification[] = [];
+        notifService.notifications.subscribe({
+            next: list => {
+                notifications.splice(0, notifications.length, ...list.toArray());
+            }
+        });
 
         // Note: can't spy on compareVersions, so just replace the private method instead
         spyOn<any>(VersionCheckService, "isVersionNewer").and.returnValue(true);
 
         // Recreate the service
         versionCheckService = createVersionCheckService();
-        subject.next(new WebReaction(true, JSON.stringify({"tag_name": "v0.0-0"}), null));
+        const releaseUrl = "https://example.invalid/releases/v0.0-0";
+        subject.next(new WebReaction(true, JSON.stringify({
+            "tag_name": "v0.0-0",
+            "html_url": releaseUrl
+        }), null));
         tick();
 
+        expect(notifications.length).toBe(1);
+        expect(notifications[0].text).toContain(releaseUrl);
         expect(notifService.show).toHaveBeenCalled();
     }));
 
