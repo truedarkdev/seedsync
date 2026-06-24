@@ -1,5 +1,6 @@
 import {Injectable} from "@angular/core";
-import {BehaviorSubject, Observable} from "rxjs";
+import {BehaviorSubject, Observable, of} from "rxjs";
+import {catchError, tap} from "rxjs/operators";
 
 import * as Immutable from "immutable";
 
@@ -590,20 +591,21 @@ export class ViewFileService {
     private createAction(file: ViewFile,
                          action: (file: ModelFile) => Observable<WebReaction>)
             : Observable<WebReaction> {
-        return new Observable<WebReaction>(observer => {
-            const fileKey = file.fileId || file.name;
-            if (!this._prevModelFiles.has(fileKey)) {
-                // File not found, exit early
-                this._logger.error("File to queue not found: " + file.name);
-                observer.next(new WebReaction(false, null, `File '${file.name}' not found`));
-            } else {
-                const modelFile = this._prevModelFiles.get(fileKey);
-                return action(modelFile).subscribe(reaction => {
-                    this._logger.debug("Received model reaction: %O", reaction);
-                    observer.next(reaction);
-                });
-            }
-        });
+        const fileKey = file.fileId || file.name;
+        if (!this._prevModelFiles.has(fileKey)) {
+            // File not found, exit early
+            this._logger.error("File not found: " + fileKey);
+            return of(new WebReaction(false, null, `File '${file.name}' not found`));
+        }
+
+        const modelFile = this._prevModelFiles.get(fileKey);
+        return action(modelFile).pipe(
+            tap(reaction => this._logger.debug("Received model reaction: %O", reaction)),
+            catchError(err => {
+                this._logger.error("Action failed for file: " + fileKey, err);
+                return of(new WebReaction(false, null, String(err?.message ?? err)));
+            })
+        );
     }
 
     private pushViewFiles() {
