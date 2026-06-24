@@ -108,8 +108,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 89 | `9ea6d980594eaabb8eabe95b768ac631ede674c8` | 2024-11-29 | Update Dockerfile | covered elsewhere |
 | 90 | `009eade5876cb8f522259c863b16b2789631233e` | 2024-11-29 | Create docker-image.yml | covered elsewhere |
 | 91 | `3154172f7eb38b12b8e597766ce5602baa27e5ab` | 2026-01-25 | Fix Docker image build - complete multi-stage Dockerfile | covered elsewhere |
-| 92 | `0b4a6c249a2ad04700f7dd3cec0189f73dad48b9` | 2026-01-25 | Docker-only deployment with optimized image (240MB) | needs area reopen |
-| 93 | `541b63093adaa7fbd214b2bc864238257b423061` | 2026-01-25 | Update CI/CD and documentation for Docker-only deployment | needs area reopen |
+| 92 | `0b4a6c249a2ad04700f7dd3cec0189f73dad48b9` | 2026-01-25 | Docker-only deployment with optimized image (240MB) | needs area reopen via task `docker-only-deployment-rows92-93` - Docker-only deployment image optimization lane |
+| 93 | `541b63093adaa7fbd214b2bc864238257b423061` | 2026-01-25 | Update CI/CD and documentation for Docker-only deployment | needs area reopen via task `docker-only-deployment-rows92-93` - CI/CD and docs follow-up for Docker-only deployment |
 | 94 | `18643263e6e48e520058f6f2251e0fdfbccc69d5` | 2026-01-25 | Fix Python 3.12 regex escape sequence warnings | adapted locally in `1d30a9ec7c85a80801f8a04d2e56a6e3db269f95` |
 | 95 | `0e0a7d159f470faa970ff566fdb8bca46807ac95` | 2026-01-25 | Fix release workflow to mark new releases as latest | adapted locally in `391b171a0797d45745e5908d513181b7e97a8751` |
 | 96 | `e310c0582a98645ca4c2bb566a9c0b691a8232be` | 2026-01-25 | Update CHANGELOG for v0.9.2 [skip ci] | intentionally skipped |
@@ -138,7 +138,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 119 | `5f203bedcfcc9c7424592fc0c0a7740ddd726f7b` | 2026-01-26 | Update Dockerfile | covered elsewhere |
 | 120 | `037709a08976c609ba87ca4c7e63ec0bb9a202ef` | 2026-01-26 | Update Dockerfile | intentionally skipped |
 | 121 | `c2cebd403176852ce1670a8f5a5c016903ac9fb3` | 2026-01-26 | Merge pull request #11 from nitrobass24/nitrobass24-patch-1 | covered elsewhere |
-| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | needs area reopen |
+| 122 | `575629393f42eb238bb1fe1c25129f305f28987e` | 2026-01-26 | Migrate Angular 4 to Angular 17 with standalone components | needs area reopen via task `angular17-migration-row122` - likely needs supersession/mapping against the current Angular framework lanes before implementation |
 | 123 | `c59bccc6e1cefe371f11ceba683e117c4d397028` | 2026-01-26 | Fix scanfs builder to use Python 3.11 for buster compatibility | adapted locally in `c5d042018043cc274603e075b166bfa6b519b354` |
 | 124 | `b39d67b67fd6f0889a2fb852e6aef9ff57dd3a93` | 2026-01-26 | Switch scanfs builder to Debian Bullseye | intentionally skipped |
 | 125 | `053cc36385ed89d5fe370d6c3852aa27a49b6e47` | 2026-01-26 | Merge pull request #10 from nitrobass24/angular-upgrade | covered elsewhere |
@@ -289,21 +289,21 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 270 | `27c0b4baee364da59371df18b85d51fd6a8302a0` | 2026-02-28 | Bump @angular/core from 21.1.3 to 21.1.6 in /src/angular | covered elsewhere |
 | 271 | `cee4775c43878a12db8a96371d959b93f0765dc3` | 2026-02-28 | Bump all Angular packages to 21.2.0 | covered elsewhere |
 | 272 | `aef64c9b81963399065045899cdbf36061df38cf` | 2026-02-28 | Merge pull request #90 from nitrobass24/dependabot/npm_and_yarn/src/angular/angular/core-21.1.6 | covered elsewhere |
-| 273 | `848894327331dac57c9651a02abc0d5a6acefcbe` | 2026-02-28 | Parallelize CI builds and add Angular unit tests | needs area reopen |
+| 273 | `848894327331dac57c9651a02abc0d5a6acefcbe` | 2026-02-28 | Parallelize CI builds and add Angular unit tests | needs area reopen via task `ci-build-topology-rows273-282-286` |
 | 274 | `b5be932551a64719b2b5520f90bcb2ade47c8e8f` | 2026-02-28 | Merge pull request #93 from nitrobass24/ci/parallel-builds-unit-tests | covered elsewhere |
-| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | needs new integration task |
+| 275 | `2126a1275056974bdf6bde7e5d5ca91b5506363e` | 2026-02-28 | Add UMASK environment variable to README | needs new integration task via task `docker-docs-runtime-rows275-285-287` - docs/runtime lane for UMASK and Unraid docs |
 | 276 | `a976b9e52d227b6a601f9ca8f98e683eae11d5c8` | 2026-02-28 | Merge pull request #94 from nitrobass24/docs/add-umask-to-readme | covered elsewhere |
 | 277 | `7edb32561b1b192ba20e2b606d68e1ceaf8ab35e` | 2026-02-28 | Update website dependencies to address transitive vulnerabilities | intentionally skipped |
 | 278 | `bdfb0ba4e8460fb529ccdd09b056ada10b5384f3` | 2026-02-28 | Merge pull request #95 from nitrobass24/fix/dependabot-security-alerts | covered elsewhere |
 | 279 | `94af5b7095e89961b7d4ff4162c454f74f37d6c9` | 2026-02-28 | Mask SSH password in debug log output | adapted locally in `a9d02db2feaf03923207fc394356eef126c3c6e0` |
 | 280 | `c9538d4f80b30f25cf885fceb9d84f4af80318fc` | 2026-02-28 | Merge pull request #98 from nitrobass24/fix/mask-password-in-debug-logs | covered elsewhere |
 | 281 | `2d9ed7ecb2053c20b73a51a5569b7837a0573738` | 2026-02-28 | Release v0.12.5 — update CHANGELOG and bump version | intentionally skipped |
-| 282 | `94bc62df5aa58d57847c1b95b714373e8394d160` | 2026-02-28 | Skip Angular build on arm64 via build-contexts override | needs area reopen |
+| 282 | `94bc62df5aa58d57847c1b95b714373e8394d160` | 2026-02-28 | Skip Angular build on arm64 via build-contexts override | needs area reopen via task `ci-build-topology-rows273-282-286` |
 | 283 | `e5b41f22a59fab4695bc21a1364f677b4744a081` | 2026-02-28 | Fix CHANGELOG heading spacing and align Angular version declarations | intentionally skipped |
 | 284 | `4cb1ea7787a8be7dead50b144760b0391f4fb111` | 2026-02-28 | Release v0.12.5 — update CHANGELOG with CI optimization | intentionally skipped |
-| 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | needs new integration task |
-| 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | needs area reopen |
-| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | needs new integration task |
+| 285 | `19efc550f406a2a7337491ed0d78b3d6ddd44f0e` | 2026-02-28 | Slim Docker image: remove ~25 MB of unnecessary packages (#100) | needs new integration task via task `docker-docs-runtime-rows275-285-287` - Docker/runtime packaging lane |
+| 286 | `e7467fb52d385a2c0e81cc94c264bb78a4dcb244` | 2026-02-28 | Performance optimizations: Docker, CI, and runtime (#101) | needs area reopen via task `ci-build-topology-rows273-282-286` |
+| 287 | `533cce1b0cc1d0a2d26f7488f19299f2bb9cf5ad` | 2026-02-28 | Performance optimizations and Unraid install docs (#102) | needs new integration task via task `docker-docs-runtime-rows275-285-287` - docs/runtime lane |
 | 288 | `5f37c1c13eaf99ff4eb1217d24b318af58cef9b8` | 2026-02-28 | Merge pull request #99 from nitrobass24/develop | covered elsewhere |
 | 289 | `68800b4356cb3e50699a9fc35e946418672e4e32` | 2026-02-28 | Merge branch 'master' into develop | covered elsewhere |
 | 290 | `33fec0d7700ae0cc6b2996401efcc99532b477cb` | 2026-02-28 | Release v0.12.6 — Unraid docs, Docker build optimizations | covered elsewhere |
