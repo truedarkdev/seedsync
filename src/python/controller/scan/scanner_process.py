@@ -82,6 +82,7 @@ class ScannerProcess(AppProcess):
         """
         super().__init__(name=scanner.__class__.__name__)
         self.__queue: Any | None = multiprocessing.Queue()
+        self.__scan_target_queue: Any | None = multiprocessing.Queue()
         self.__wake_event: Any | None = multiprocessing.Event()
         self.__scanner = scanner
         self.__interval_in_ms = interval_in_ms
@@ -112,6 +113,10 @@ class ScannerProcess(AppProcess):
             },
             flow_id=flow_id,
         )
+        scan_target_path_pair_ids = self.__drain_scan_target_path_pair_ids()
+        set_scan_target_path_pair_ids = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
+        if callable(set_scan_target_path_pair_ids):
+            set_scan_target_path_pair_ids(scan_target_path_pair_ids)
         try:
             files = self.__scanner.scan()
             malformed_status_only_file_ids = self.__scanner.pop_malformed_status_only_file_ids()
@@ -182,6 +187,9 @@ class ScannerProcess(AppProcess):
                 path_pair_id=self.__trace_path_pair_id(),
                 path_pair_name=self.__trace_path_pair_name(),
             )
+        finally:
+            if callable(set_scan_target_path_pair_ids):
+                set_scan_target_path_pair_ids(None)
         assert self.__queue is not None
         self.__queue.put(result)
         delta_in_s = (datetime.now() - timestamp_start).total_seconds()
@@ -202,6 +210,10 @@ class ScannerProcess(AppProcess):
             self.__queue.close()
             self.__queue.join_thread()
             self.__queue = None
+        if self.__scan_target_queue is not None:
+            self.__scan_target_queue.close()
+            self.__scan_target_queue.join_thread()
+            self.__scan_target_queue = None
         if self.__wake_event is not None:
             self.__wake_event = None
         super().close_queues()
@@ -251,7 +263,31 @@ class ScannerProcess(AppProcess):
                 return latest_scan
         return latest_scan
 
-    def force_scan(self):
+    def force_scan(self, path_pair_id: Optional[str] = None):
         """Force process to wake and do an immediate scan"""
+        assert self.__scan_target_queue is not None
+        self.__scan_target_queue.put(path_pair_id)
         assert self.__wake_event is not None
         self.__wake_event.set()
+
+    def __drain_scan_target_path_pair_ids(self) -> Optional[set[str]]:
+        scan_target_path_pair_ids = set()
+        full_scan_requested = False
+        while True:
+            try:
+                assert self.__scan_target_queue is not None
+                scan_target_path_pair_id = self.__scan_target_queue.get(block=False)
+            except queue.Empty:
+                break
+            except (OSError, EOFError) as exc:
+                self.logger.warning("Scanner target queue read failed: {}".format(exc))
+                break
+            if scan_target_path_pair_id is None:
+                full_scan_requested = True
+            elif not full_scan_requested:
+                scan_target_path_pair_ids.add(scan_target_path_pair_id)
+        if full_scan_requested:
+            return None
+        if not scan_target_path_pair_ids:
+            return None
+        return scan_target_path_pair_ids

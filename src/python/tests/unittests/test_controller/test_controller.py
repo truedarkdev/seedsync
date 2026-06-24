@@ -2025,7 +2025,20 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
         self.controller.clear_extracted_marker = MagicMock()
-        self.controller._Controller__move_from_staging = MagicMock()
+        move_snapshots = []
+
+        def move_from_staging(name, path_pair_id):
+            move_snapshots.append(
+                (
+                    name,
+                    path_pair_id,
+                    set(self.controller._Controller__persist.downloaded_file_names),
+                    self.controller.clear_extracted_marker.call_count,
+                )
+            )
+            return True
+
+        self.controller._Controller__move_from_staging = MagicMock(side_effect=move_from_staging)
         diff_models.return_value = [
             SimpleNamespace(
                 change=ModelDiff.Change.UPDATED,
@@ -2036,6 +2049,7 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
+        self.assertEqual([("movie.mkv", "movies", set(), 0)], move_snapshots)
         self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
         self.controller.clear_extracted_marker.assert_called_once_with(terminal_file)
@@ -2043,7 +2057,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({completion_file_id})
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
-    def test_update_model_clears_downloaded_aliases_when_staging_move_fails(self, diff_models):
+    def test_update_model_leaves_downloaded_aliases_untouched_when_staging_move_fails(self, diff_models):
         completion_entry = ("movie.mkv", "movies", "Movies")
         completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
         plain_alias = "movie.mkv"
@@ -2100,17 +2114,15 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
-        self.assertEqual({unrelated_marker}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(
+            {plain_alias, scoped_alias, legacy_alias, unrelated_marker},
+            self.controller._Controller__persist.downloaded_file_names,
+        )
         self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__move_from_staging.assert_called_once_with("movie.mkv", "movies")
-        self.assertEqual(
-            [
-                {plain_alias, scoped_alias, legacy_alias, unrelated_marker, completion_file_id},
-                {unrelated_marker},
-            ],
-            downloaded_file_snapshots
-        )
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual([], downloaded_file_snapshots)
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
+        self.controller.clear_extracted_marker.assert_not_called()
         self.controller.logger.warning.assert_any_call(
             "Keeping download completion pending after failed staging move: %s",
             completion_file_id,
@@ -2160,11 +2172,9 @@ class TestController(unittest.TestCase):
         self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual({completion_entry}, self.controller._Controller__pending_completion_file_names)
         self.controller._Controller__move_from_staging.assert_called_once_with("movie.mkv", "movies")
-        self.assertEqual(
-            [{completion_file_id}, set()],
-            downloaded_file_snapshots
-        )
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual([], downloaded_file_snapshots)
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
+        self.controller.clear_extracted_marker.assert_not_called()
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_does_not_mark_stopped_disappearing_download_as_downloaded(self, diff_models):
@@ -3432,6 +3442,7 @@ class TestController(unittest.TestCase):
             ),
             tuple(os.path.normpath(path) for path in move.call_args.args)
         )
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
 
     @patch("controller.controller.shutil.move")
     def test_move_from_staging_moves_single_file_named_lftp(self, move):

@@ -1,7 +1,7 @@
 # Copyright 2024, RapidCopy Contributors, All rights reserved.
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from .scanner_process import IScanner, ScannerError
 from .local_scanner import LocalScanner
@@ -18,6 +18,7 @@ class MultiPathLocalScanner(IScanner):
     def __init__(self, scanners: List[LocalScanner]):
         self.logger = logging.getLogger("MultiPathLocalScanner")
         self.__scanners = scanners
+        self.__scan_target_path_pair_ids: Optional[set[str]] = None
 
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger):
@@ -25,10 +26,18 @@ class MultiPathLocalScanner(IScanner):
         for scanner in self.__scanners:
             scanner.set_base_logger(self.logger)
 
+    def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]):
+        self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
+
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         all_files = []
         for scanner in self.__scanners:
+            if (
+                self.__scan_target_path_pair_ids is not None
+                and scanner.path_pair_id not in self.__scan_target_path_pair_ids
+            ):
+                continue
             try:
                 files = scanner.scan()
                 for system_file in files:

@@ -55,6 +55,30 @@ class TestMultiPathLocalScanner(unittest.TestCase):
             scanner.pop_managed_extract_file_ids()
         )
 
+    def test_scans_only_targeted_path_pair_when_targeted(self):
+        movie_file = SystemFile("movie.mkv", 1234, False)
+        movie_scanner = MagicMock()
+        movie_scanner.path_pair_id = "movies"
+        movie_scanner.path_pair_name = "Movies"
+        movie_scanner.scan.return_value = [movie_file]
+
+        episode_file = SystemFile("episode.mkv", 4321, False)
+        episode_scanner = MagicMock()
+        episode_scanner.path_pair_id = "tv"
+        episode_scanner.path_pair_name = "TV"
+        episode_scanner.scan.return_value = [episode_file]
+
+        scanner = MultiPathLocalScanner([movie_scanner, episode_scanner])
+        scanner.set_scan_target_path_pair_ids({"tv"})
+
+        results = scanner.scan()
+
+        self.assertEqual([episode_file], results)
+        movie_scanner.scan.assert_not_called()
+        episode_scanner.scan.assert_called_once_with()
+        self.assertEqual("tv", results[0].path_pair_id)
+        self.assertEqual("TV", results[0].path_pair_name)
+
 
 if __name__ == "__main__":
     unittest.main()
