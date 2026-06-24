@@ -283,6 +283,20 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.assertTrue(inner.verbose)
         reconfigure_hook.assert_called_once_with()
 
+    def test_set_general_exclude_patterns_requests_reconfigure_after_persist(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.General()
+        inner.exclude_patterns = ""
+        self.config.general = inner
+
+        response = handler._ConfigHandler__handle_set_config("general", "exclude_patterns", "*.nfo,Season */*.nfo")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("*.nfo,Season */*.nfo", inner.exclude_patterns)
+        reconfigure_hook.assert_called_once_with()
+
     def test_set_lftp_tuning_key_requests_reconfigure_after_persist(self):
         reconfigure_hook = MagicMock()
         handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)

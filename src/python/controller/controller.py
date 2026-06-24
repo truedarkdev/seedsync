@@ -131,6 +131,16 @@ class Controller:
         )
 
     @staticmethod
+    def __get_exclude_patterns(config: Any) -> str:
+        controller_exclude_patterns = getattr(config, "_Controller__exclude_patterns", None)
+        if isinstance(controller_exclude_patterns, str):
+            return controller_exclude_patterns
+        config_obj = getattr(config, "config", config)
+        general_cfg = getattr(config_obj, "general", None)
+        exclude_patterns = getattr(general_cfg, "exclude_patterns", "")
+        return exclude_patterns if isinstance(exclude_patterns, str) else ""
+
+    @staticmethod
     def collect_missing_startup_fields(
         config: Any,
         args: Any | None = None,
@@ -237,6 +247,7 @@ class Controller:
         self.__pending_completion_file_names = set()
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
+        self.__exclude_patterns = ""
         self.__last_lftp_statuses = []
         self.__next_lftp_status_poll_at = None
         self.__lftp_status_poll_retry_seconds = 1
@@ -296,6 +307,7 @@ class Controller:
         self.__path_pair_staging_paths: Dict[str, str] = {}
 
         config = cast(Any, self.__context.config)
+        self.__exclude_patterns = Controller.__get_exclude_patterns(config)
         startup_args = getattr(self.__context, "args", None)
         if startup_args is None:
             startup_args = SimpleNamespace(local_path_to_scanfs=None)
@@ -837,6 +849,7 @@ class Controller:
         if lftp_reconfigure_requested:
             try:
                 self.__configure_lftp()
+                self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
             except Exception:
                 self.__restore_lftp_reconfigure_request()
                 self.logger.exception("Ignoring lftp reconfigure failure")
@@ -1867,11 +1880,16 @@ class Controller:
                         staging_path,
                         False
                     )
+                    queue_kwargs = {}
+                    exclude_patterns = Controller.__get_exclude_patterns(self)
+                    if exclude_patterns.strip():
+                        queue_kwargs["exclude_patterns"] = exclude_patterns
                     self.__lftp.queue(
                         file_name,
                         is_dir,
                         remote_base_dir_path=path_pair.remote_path if path_pair is not None else None,
-                        local_base_dir_path=staging_path
+                        local_base_dir_path=staging_path,
+                        **queue_kwargs
                     )
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
                 except LftpError as error:
@@ -1976,11 +1994,16 @@ class Controller:
                         local_base_dir_path,
                         stopped_marked
                     )
+                    queue_kwargs = {}
+                    exclude_patterns = Controller.__get_exclude_patterns(self)
+                    if exclude_patterns.strip():
+                        queue_kwargs["exclude_patterns"] = exclude_patterns
                     self.__lftp.queue(
                         file.name,
                         file.is_dir,
                         remote_base_dir_path=path_pair.remote_path if path_pair else None,
-                        local_base_dir_path=local_base_dir_path
+                        local_base_dir_path=local_base_dir_path,
+                        **queue_kwargs
                     )
                     Controller.__clear_persist_key(
                         self.__persist.stopped_file_names,

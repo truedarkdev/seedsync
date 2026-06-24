@@ -2,6 +2,7 @@ import {OptionType} from "./option.component";
 import {
     OPTIONS_CONTEXT_AUTOQUEUE,
     OPTIONS_CONTEXT_CONNECTIONS,
+    OPTIONS_CONTEXT_DISCOVERY,
     OPTIONS_CONTEXT_SERVER,
     OPTIONS_CONTEXT_TRANSFER_PROTOCOL
 } from "./options-list";
@@ -46,6 +47,18 @@ describe("settings options list", () => {
         expect(remotePythonPath.type).toBe(OptionType.Text);
         expect(remotePythonPath.label).toBe("Remote Python Path");
         expect(remotePythonPath.description).toContain("python3");
+    });
+
+    it("exposes exclude patterns in File Discovery", () => {
+        const excludePatterns = OPTIONS_CONTEXT_DISCOVERY.options.find(
+            option => option.valuePath[1] === "exclude_patterns"
+        )!;
+
+        expect(OPTIONS_CONTEXT_DISCOVERY.header).toBe("File Discovery");
+        expect(excludePatterns.type).toBe(OptionType.Text);
+        expect(excludePatterns.label).toBe("Exclude Patterns");
+        expect(excludePatterns.description).toContain("directory-only");
+        expect(excludePatterns.valuePath).toEqual(["general", "exclude_patterns"]);
     });
 
     it("keeps the legacy directory fields in Server and the global AutoQueue toggle", () => {
