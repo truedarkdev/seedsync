@@ -4,9 +4,10 @@ export interface IOption {
     type: OptionType;
     label: string;
     valuePath: [string, string];
-    description: string;
+    description: string | null;
     choices?: {label: string; value: any;}[];
     disabledWhenSftp?: boolean;
+    disabled?: boolean;
 }
 export interface IOptionsContext {
     header: string;
@@ -41,6 +42,18 @@ export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
             label: "Use password-less key-based authentication",
             valuePath: ["lftp", "use_ssh_key"],
             description: null
+        },
+        {
+            type: OptionType.Text,
+            label: "Server Directory",
+            valuePath: ["lftp", "remote_path"],
+            description: "Path to your files on the remote server."
+        },
+        {
+            type: OptionType.Text,
+            label: "Local Directory",
+            valuePath: ["lftp", "local_path"],
+            description: "Downloaded files are placed here."
         },
         {
             type: OptionType.Text,

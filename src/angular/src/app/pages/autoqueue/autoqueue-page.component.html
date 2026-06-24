@@ -13,8 +13,7 @@
         </ng-container>
 
         <ng-container *ngIf="!enabled">
-            Auto-Queue is disabled. <br />
-            Enable AutoQueue in Settings to queue files automatically.
+            {{disabledMessage}}
         </ng-container>
     </span>
     <div id="controls" [class.disabled]="!isPatternEditingEnabled()">

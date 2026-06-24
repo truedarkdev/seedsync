@@ -1,9 +1,29 @@
 import {CommonModule} from "@angular/common";
+import {Component} from "@angular/core";
 import {ComponentFixture, fakeAsync, TestBed, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
+import {By} from "@angular/platform-browser";
 
 import {DEBOUNCE_TIME_MS, OptionComponent, OptionType} from "../../../../pages/settings/option.component";
 
+
+@Component({
+    standalone: false,
+    template: `
+        <app-option
+            [type]="type"
+            [label]="label"
+            [value]="value"
+            [disabled]="disabled">
+        </app-option>
+    `
+})
+class OptionHostComponent {
+    type = OptionType.Text;
+    label = "Server Directory";
+    value = "/remote/movies";
+    disabled = true;
+}
 
 describe("Testing option component", () => {
     let fixture: ComponentFixture<OptionComponent>;
@@ -78,4 +98,24 @@ describe("Testing option component", () => {
         expect(changeSpy).toHaveBeenCalledTimes(1);
         expect(changeSpy).toHaveBeenCalledWith("same");
     }));
+
+    it("should disable the control when the disabled input is set", () => {
+        TestBed.resetTestingModule();
+        TestBed.configureTestingModule({
+            imports: [
+                CommonModule,
+                FormsModule
+            ],
+            declarations: [
+                OptionComponent,
+                OptionHostComponent
+            ]
+        });
+
+        const hostFixture = TestBed.createComponent(OptionHostComponent);
+        hostFixture.detectChanges();
+
+        const option = hostFixture.debugElement.query(By.directive(OptionComponent)).componentInstance as OptionComponent;
+        expect(option.disabled).toBe(true);
+    });
 });

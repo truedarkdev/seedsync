@@ -1,6 +1,6 @@
-import {ChangeDetectionStrategy, Component, OnDestroy, OnInit} from "@angular/core";
+import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {Observable, Subject} from "rxjs";
-import {takeUntil} from "rxjs/operators";
+import {distinctUntilChanged, map, takeUntil} from "rxjs/operators";
 import {Modal} from "../../services/utils/modal.service";
 
 import {LoggerService} from "../../services/utils/logger.service";
@@ -13,11 +13,12 @@ import {ServerCommandService} from "../../services/server/server-command.service
 import {
     OPTIONS_CONTEXT_CONNECTIONS, OPTIONS_CONTEXT_DISCOVERY, OPTIONS_CONTEXT_OTHER,
     OPTIONS_CONTEXT_SERVER, OPTIONS_CONTEXT_AUTOQUEUE, OPTIONS_CONTEXT_EXTRACT,
-    OPTIONS_CONTEXT_TRANSFER_PROTOCOL, IOption
+    OPTIONS_CONTEXT_TRANSFER_PROTOCOL, IOption, IOptionsContext
 } from "./options-list";
 import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
 import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
+import {PathPairService} from "../../services/settings/path-pair.service";
 
 @Component({
     selector: "app-settings-page",
@@ -29,6 +30,8 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 })
 
 export class SettingsPageComponent implements OnInit, OnDestroy {
+    public serverContext: IOptionsContext = OPTIONS_CONTEXT_SERVER;
+    public autoqueueContext: IOptionsContext = OPTIONS_CONTEXT_AUTOQUEUE;
     public OPTIONS_CONTEXT_SERVER = OPTIONS_CONTEXT_SERVER;
     public OPTIONS_CONTEXT_DISCOVERY = OPTIONS_CONTEXT_DISCOVERY;
     public OPTIONS_CONTEXT_CONNECTIONS = OPTIONS_CONTEXT_CONNECTIONS;
@@ -42,20 +45,25 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     public commandsEnabled: boolean;
 
     private _connectedService: ConnectedService;
+    private _pathPairService: PathPairService;
     private _destroy$: Subject<void> = new Subject<void>();
     private _destroyed = false;
 
     private _configRestartNotif: Notification;
     private _badValueNotifs: Map<string, Notification>;
+    private static readonly OVERRIDE_NOTE = "Path pairs override this setting when any pair is enabled.";
 
     constructor(private _logger: LoggerService,
                 _streamServiceRegistry: StreamServiceRegistry,
                 private _configService: ConfigService,
+                pathPairService: PathPairService,
                 private _notifService: NotificationService,
                 private _commandService: ServerCommandService,
                 private _modal: Modal,
-                private _modalAccessibility: ModalAccessibilityService) {
+                private _modalAccessibility: ModalAccessibilityService,
+                private _changeDetector: ChangeDetectorRef) {
         this._connectedService = _streamServiceRegistry.connectedService;
+        this._pathPairService = pathPairService;
         this.config = _configService.config;
         this.commandsEnabled = false;
         this._configRestartNotif = new Notification({
@@ -76,6 +84,18 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
 
                 // Enable/disable commands based on server connection
                 this.commandsEnabled = connected;
+            }
+        });
+
+        this._pathPairService.pathPairs.pipe(
+            takeUntil(this._destroy$),
+            map((pathPairs) => (pathPairs || []).some((pathPair) => pathPair.enabled)),
+            distinctUntilChanged(),
+        ).subscribe({
+            next: (hasEnabledPairs: boolean) => {
+                this.serverContext = SettingsPageComponent.buildServerContext(hasEnabledPairs);
+                this.autoqueueContext = SettingsPageComponent.buildAutoqueueContext(hasEnabledPairs);
+                this._changeDetector.markForCheck();
             }
         });
     }
@@ -118,6 +138,30 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                 }
             }
         });
+    }
+
+    private static buildServerContext(hasEnabledPairs: boolean): IOptionsContext {
+        return {
+            ...OPTIONS_CONTEXT_SERVER,
+            options: OPTIONS_CONTEXT_SERVER.options.map((option) => {
+                if (hasEnabledPairs && (option.valuePath[1] === "remote_path" || option.valuePath[1] === "local_path")) {
+                    return { ...option, description: SettingsPageComponent.OVERRIDE_NOTE, disabled: true };
+                }
+                return option;
+            }),
+        };
+    }
+
+    private static buildAutoqueueContext(hasEnabledPairs: boolean): IOptionsContext {
+        return {
+            ...OPTIONS_CONTEXT_AUTOQUEUE,
+            options: OPTIONS_CONTEXT_AUTOQUEUE.options.map((option) => {
+                if (hasEnabledPairs && option.valuePath[1] === "enabled") {
+                    return { ...option, description: SettingsPageComponent.OVERRIDE_NOTE, disabled: true };
+                }
+                return option;
+            }),
+        };
     }
 
     isOptionDisabled(option: IOption, config: Config): boolean {

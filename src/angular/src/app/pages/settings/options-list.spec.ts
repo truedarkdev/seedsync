@@ -1,5 +1,10 @@
 import {OptionType} from "./option.component";
-import {OPTIONS_CONTEXT_CONNECTIONS, OPTIONS_CONTEXT_SERVER, OPTIONS_CONTEXT_TRANSFER_PROTOCOL} from "./options-list";
+import {
+    OPTIONS_CONTEXT_AUTOQUEUE,
+    OPTIONS_CONTEXT_CONNECTIONS,
+    OPTIONS_CONTEXT_SERVER,
+    OPTIONS_CONTEXT_TRANSFER_PROTOCOL
+} from "./options-list";
 
 describe("settings options list", () => {
     it("keeps transfer protocol options out of Connections", () => {
@@ -41,5 +46,29 @@ describe("settings options list", () => {
         expect(remotePythonPath.type).toBe(OptionType.Text);
         expect(remotePythonPath.label).toBe("Remote Python Path");
         expect(remotePythonPath.description).toContain("python3");
+    });
+
+    it("keeps the legacy directory fields in Server and the global AutoQueue toggle", () => {
+        const serverDirectory = OPTIONS_CONTEXT_SERVER.options.find(
+            option => option.valuePath[1] === "remote_path"
+        )!;
+        const localDirectory = OPTIONS_CONTEXT_SERVER.options.find(
+            option => option.valuePath[1] === "local_path"
+        )!;
+        const autoqueueEnabled = OPTIONS_CONTEXT_AUTOQUEUE.options.find(
+            option => option.valuePath[1] === "enabled"
+        )!;
+
+        expect(serverDirectory.type).toBe(OptionType.Text);
+        expect(serverDirectory.label).toBe("Server Directory");
+        expect(serverDirectory.description).toContain("remote server");
+
+        expect(localDirectory.type).toBe(OptionType.Text);
+        expect(localDirectory.label).toBe("Local Directory");
+        expect(localDirectory.description).toContain("Downloaded files");
+
+        expect(autoqueueEnabled.type).toBe(OptionType.Checkbox);
+        expect(autoqueueEnabled.label).toBe("Enable AutoQueue");
+        expect(autoqueueEnabled.disabled).toBeUndefined();
     });
 });
