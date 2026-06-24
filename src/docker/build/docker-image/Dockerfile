@@ -125,11 +125,16 @@ RUN chmod -R a+rX /app/python
 # Full Seedsync docker image
 FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
-RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY --from=seedsync_build_scanfs /build/dist/scanfs /app/scanfs
 COPY src/docker/build/docker-image/setup_default_config.sh /scripts/
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
+RUN set -eux; \
+    if dpkg -s p7zip-rar >/dev/null 2>&1; then \
+        apt-get purge -y p7zip-rar; \
+    fi; \
+    rm -f /usr/lib/p7zip/Codecs/Rar29.so; \
+    python3 -m pip uninstall -y pip setuptools
 
 # Accept new host keys on first connection while still rejecting changed keys.
 RUN mkdir -p /root/.ssh && echo "StrictHostKeyChecking accept-new" > /root/.ssh/config
@@ -173,7 +178,7 @@ USER seedsync
 RUN /scripts/setup_default_config.sh
 
 # Switch back to root so the runtime entrypoint can validate IDs, fix ownership,
-# and drop privileges with gosu before launching the app.
+# and drop privileges with setpriv before launching the app.
 USER root
 
 ENTRYPOINT [ "/scripts/entrypoint.sh" ]

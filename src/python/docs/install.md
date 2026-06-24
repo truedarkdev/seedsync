@@ -53,7 +53,7 @@ Select the section for your platform:
     By default the docker image is run under the default user (uid=1000).
     To run as a different user, include the option `--user <uid>:<gid>`.
 
-    If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup.
+    If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
 
     If you receive errors related to locale when connecting to the remote server, then also include
     the following options.
@@ -95,7 +95,7 @@ SeedSync supports Windows via the Docker container.
     `http://localhost:8800`, and prepares the trusted local bootstrap source
     used by the browser bootstrap flow.
 
-    If you need different container file permissions, set `UMASK` to an octal value such as `002` in the Compose environment before starting the container. Invalid values abort startup.
+    If you need different container file permissions, set `UMASK` to an octal value such as `002` in the Compose environment before starting the container. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
 
 4. Read the one-time bootstrap proof from the running container:
 
