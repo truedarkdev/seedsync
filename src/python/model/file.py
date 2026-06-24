@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from collections.abc import Iterator
 from datetime import datetime
 from enum import Enum
 import json
@@ -318,6 +319,12 @@ class ModelFile:
 
     def get_children(self) -> List["ModelFile"]:
         return copy.copy(self.__children)
+
+    def iter_children(self) -> Iterator["ModelFile"]:
+        # Read-only iterator over the live child list. Do not add or remove
+        # children while consuming it; use get_children() if a mutation-tolerant
+        # snapshot copy is needed.
+        return iter(self.__children)
 
     @property
     def parent(self) -> Optional["ModelFile"]:

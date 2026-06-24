@@ -2,6 +2,7 @@
 
 import os
 import logging
+from collections import deque
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 import math
@@ -554,11 +555,11 @@ class ModelBuilder:
 
     @staticmethod
     def __has_incomplete_remote_file_children(model_file: ModelFile) -> bool:
-        frontier = list(model_file.get_children())
+        frontier = deque(model_file.iter_children())
         while frontier:
-            child_file = frontier.pop(0)
+            child_file = frontier.popleft()
             if child_file.is_dir:
-                frontier += child_file.get_children()
+                frontier.extend(child_file.iter_children())
             elif child_file.remote_size is not None and \
                     (child_file.local_size is None or child_file.local_size < child_file.remote_size):
                 return True
@@ -1336,11 +1337,11 @@ class ModelBuilder:
         # for the pair
         # Note: in this case the frontier contains nodes that have already been process, it is
         #       merely used for traversing children
-        frontier = []
+        frontier = deque()
         if remote or local:
             frontier.append((remote, local, status, root_model_file, remote, local))
         while frontier:
-            _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.pop(0)
+            _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.popleft()
             _remote_children = {sf.name: sf for sf in _remote.children} if _remote else {}
             _local_children = {sf.name: sf for sf in _local.children} if _local else {}
             _all_children_names = set().union(_remote_children.keys(), _local_children.keys())
@@ -1665,17 +1666,16 @@ class ModelBuilder:
                     # check all the children
                     all_downloaded = True
                     has_downloadable_children = False
-                    frontier = []
-                    frontier += model_file.get_children()
+                    frontier = deque(model_file.iter_children())
                     while frontier:
-                        _child_file = frontier.pop(0)
+                        _child_file = frontier.popleft()
                         if not _child_file.is_dir and \
                                 _child_file.remote_size is not None:
                             has_downloadable_children = True
                             if _child_file.state != ModelFile.State.DOWNLOADED:
                                 all_downloaded = False
                                 break
-                        frontier += _child_file.get_children()
+                        frontier.extend(_child_file.iter_children())
                     if has_downloadable_children and all_downloaded:
                         model_file.state = ModelFile.State.DOWNLOADED
                     else:
