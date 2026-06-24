@@ -268,6 +268,50 @@ class TestSshcp(unittest.TestCase):
             "Command output before:\n{}".format(spawn.before)
         )
 
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_run_command_password_prompt_uses_full_timeout_and_omits_gssapi_option(
+        self,
+        mock_spawn_process
+    ):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
+        sshcp.logger = MagicMock()
+
+        spawn = MagicMock()
+        spawn.expect.side_effect = pexpect.exceptions.TIMEOUT("timed out")
+        spawn.before = b"waiting for password"
+        spawn.after = b""
+        mock_spawn_process.return_value = (spawn, False)
+
+        with patch("ssh.sshcp.time.time", side_effect=[100.0, 103.25]):
+            with self.assertRaises(SshcpError) as ctx:
+                sshcp._Sshcp__run_command(
+                    command="ssh",
+                    flags=["-p", str(self.port)],
+                    args=[sshcp._Sshcp__remote_address(), "echo hi"]
+                )
+
+        self.assertEqual("Timed out", str(ctx.exception))
+        mock_spawn_process.assert_called_once_with(
+            "ssh",
+            [
+                "-p",
+                str(self.port),
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-o",
+                "LogLevel=error",
+                "-o",
+                "PubkeyAuthentication=no",
+                sshcp._Sshcp__remote_address(),
+                "echo hi",
+            ]
+        )
+        self.assertNotIn("GSSAPIAuthentication=no", mock_spawn_process.call_args.args[1])
+        self.assertEqual(
+            sshcp._Sshcp__TIMEOUT_SECS,
+            spawn.expect.call_args.kwargs["timeout"]
+        )
+
     def test_spawn_fallback_forwards_argv_list(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
         spawn = MagicMock()
