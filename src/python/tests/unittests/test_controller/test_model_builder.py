@@ -23,6 +23,7 @@ class TestModelBuilder(unittest.TestCase):
         logger = logging.getLogger(TestModelBuilder.__name__)
         handler = logging.StreamHandler(sys.stdout)
         logger.addHandler(handler)
+        self.addCleanup(logger.removeHandler, handler)
         logger.setLevel(logging.DEBUG)
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s")
         handler.setFormatter(formatter)
