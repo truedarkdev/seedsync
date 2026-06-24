@@ -6,9 +6,119 @@ DEFAULT_ID=1000
 APP_USER=seedsync
 APP_HOME_DIR=/home/seedsync
 CONFIG_DIR=/config
+SETTINGS_FILE="${CONFIG_DIR}/settings.cfg"
+SCRIPT_PATH="/app/python/seedsync.py"
+DEFAULT_LOCAL_PATH="/downloads/"
+DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION="${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"
 DOWNLOADS_DIR=/downloads
 MOUNTS_DIR=/mounts
 USER_HOME="$APP_HOME_DIR"
+
+bootstrap_default_config() {
+    if [ ! -f "${SETTINGS_FILE}" ]; then
+        echo "Generating default SeedSync config in ${CONFIG_DIR}"
+    fi
+
+    generate_default_config
+
+    if [ ! -f "${SETTINGS_FILE}" ]; then
+        echo "Skipping config bootstrap because ${SETTINGS_FILE} does not exist"
+        return 0
+    fi
+
+    CURRENT_LOCAL_PATH="$(grep -E '^[[:space:]]*local_path[[:space:]]*=' "${SETTINGS_FILE}" | head -n 1 | sed -E 's/^[[:space:]]*local_path[[:space:]]*=[[:space:]]*//' | tr -d '\r')"
+
+    case "${CURRENT_LOCAL_PATH}" in
+        ""|"<replace me>"|"<replace me>/")
+            if grep -Eq '^[[:space:]]*local_path[[:space:]]*=' "${SETTINGS_FILE}"; then
+                echo "Setting local_path to ${DEFAULT_LOCAL_PATH}"
+                replace_local_path
+            else
+                echo "Adding local_path to the [Lftp] section"
+                append_local_path_to_lftp_section
+            fi
+            ;;
+        *)
+            echo "Keeping existing local_path from settings.cfg"
+            ;;
+    esac
+
+    if [ -n "${DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION}" ]; then
+        if grep -Eq '^[[:space:]]*browser_handover_recovery_version[[:space:]]*=' "${SETTINGS_FILE}"; then
+            echo "Setting browser_handover_recovery_version to ${DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION}"
+            replace_browser_handover_recovery_version
+        fi
+    fi
+}
+
+generate_default_config() {
+    python "${SCRIPT_PATH}" \
+        -c "${CONFIG_DIR}" \
+        --html / \
+        --scanfs / \
+        --exit > /dev/null 2>&1 || true
+}
+
+replace_local_path() {
+    sed -i -E "s|^[[:space:]]*local_path[[:space:]]*=.*$|local_path = ${DEFAULT_LOCAL_PATH}|" "${SETTINGS_FILE}"
+}
+
+replace_browser_handover_recovery_version() {
+    sed -i -E "s|^[[:space:]]*browser_handover_recovery_version[[:space:]]*=.*$|browser_handover_recovery_version = ${DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION}|" "${SETTINGS_FILE}"
+}
+
+append_local_path_to_lftp_section() {
+    awk -v local_path="${DEFAULT_LOCAL_PATH}" '
+        BEGIN { in_lftp = 0; inserted = 0 }
+        /^\[Lftp\][[:space:]]*$/ {
+            in_lftp = 1
+            print
+            next
+        }
+        /^\[[^]]+\][[:space:]]*$/ {
+            if (in_lftp && !inserted) {
+                print "local_path = " local_path
+                inserted = 1
+            }
+            in_lftp = 0
+            print
+            next
+        }
+        {
+            print
+        }
+        END {
+            if (in_lftp && !inserted) {
+                print "local_path = " local_path
+            }
+        }
+    ' "${SETTINGS_FILE}" > "${SETTINGS_FILE}.tmp"
+    mv "${SETTINGS_FILE}.tmp" "${SETTINGS_FILE}"
+}
+
+ensure_ssh_host_key_config() {
+    local ssh_config="${USER_HOME}/.ssh/config"
+
+    if [ ! -f "${ssh_config}" ]; then
+        printf '%s\n' "StrictHostKeyChecking accept-new" > "${ssh_config}"
+    elif ! grep -Eq '^[[:space:]]*StrictHostKeyChecking[[:space:]]+' "${ssh_config}"; then
+        if [ -s "${ssh_config}" ]; then
+            printf '\n%s\n' "StrictHostKeyChecking accept-new" >> "${ssh_config}"
+        else
+            printf '%s\n' "StrictHostKeyChecking accept-new" > "${ssh_config}"
+        fi
+    fi
+
+    safe_chown "home SSH config" "${ssh_config}"
+    chmod 600 "${ssh_config}" 2>/dev/null || true
+}
+
+export CONFIG_DIR SETTINGS_FILE SCRIPT_PATH DEFAULT_LOCAL_PATH DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION
+
+if [ "${1:-}" = "--bootstrap-default-config" ]; then
+    bootstrap_default_config
+    exit 0
+fi
 
 validate_id() {
     local label="$1"
@@ -168,13 +278,18 @@ safe_chown "downloads directory" "$DOWNLOADS_DIR"
 safe_chown "mounts directory" "$MOUNTS_DIR"
 safe_chown "staging directory" /staging
 chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
+ensure_ssh_host_key_config
 
 check_writable_path "$DOWNLOADS_DIR"
 if mountpoint -q /staging 2>/dev/null; then
     check_writable_path /staging
 fi
 
+unset BASH_ENV ENV
+
 export HOME="$USER_HOME"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME)" >&2
 
-exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- "$@"
+export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_local_path
+
+exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
