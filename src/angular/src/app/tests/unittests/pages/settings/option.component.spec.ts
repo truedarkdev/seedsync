@@ -42,8 +42,40 @@ describe("Testing option component", () => {
         select.value = "json";
         select.dispatchEvent(new Event("change"));
 
+        expect(changeSpy).not.toHaveBeenCalled();
+
         tick(DEBOUNCE_TIME_MS);
 
         expect(changeSpy).toHaveBeenCalledWith("json");
+    }));
+
+    it("should emit the last value after the debounce window", fakeAsync(() => {
+        const changeSpy = jasmine.createSpy("change");
+        component.changeEvent.subscribe(changeSpy);
+
+        fixture.detectChanges();
+
+        component.onChange("first");
+        tick(DEBOUNCE_TIME_MS - 1);
+        component.onChange("second");
+        tick(DEBOUNCE_TIME_MS);
+
+        expect(changeSpy).toHaveBeenCalledTimes(1);
+        expect(changeSpy).toHaveBeenCalledWith("second");
+    }));
+
+    it("should suppress duplicate values after debouncing", fakeAsync(() => {
+        const changeSpy = jasmine.createSpy("change");
+        component.changeEvent.subscribe(changeSpy);
+
+        fixture.detectChanges();
+
+        component.onChange("same");
+        tick(DEBOUNCE_TIME_MS);
+        component.onChange("same");
+        tick(DEBOUNCE_TIME_MS);
+
+        expect(changeSpy).toHaveBeenCalledTimes(1);
+        expect(changeSpy).toHaveBeenCalledWith("same");
     }));
 });
