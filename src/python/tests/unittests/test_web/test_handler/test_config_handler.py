@@ -269,6 +269,91 @@ class TestConfigHandlerSet(unittest.TestCase):
             with open(config_path, "r", encoding="utf-8") as config_file:
                 self.assertIn("breadcrumb_trace_enabled = False", config_file.read())
 
+    def test_set_general_verbose_requests_reconfigure_after_persist(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.General()
+        inner.verbose = False
+        self.config.general = inner
+
+        response = handler._ConfigHandler__handle_set_config("general", "verbose", True)
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(inner.verbose)
+        reconfigure_hook.assert_called_once_with()
+
+    def test_set_lftp_tuning_key_requests_reconfigure_after_persist(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.net_socket_buffer = "512K"
+        self.config.lftp = inner
+
+        response = handler._ConfigHandler__handle_set_config("lftp", "net_socket_buffer", "8M")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("8M", inner.net_socket_buffer)
+        reconfigure_hook.assert_called_once_with()
+
+    def test_set_lftp_non_tuning_key_does_not_request_reconfigure(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.remote_path = "/old/path"
+        self.config.lftp = inner
+
+        response = handler._ConfigHandler__handle_set_config("lftp", "remote_path", "/new/path")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("/new/path", inner.remote_path)
+        reconfigure_hook.assert_not_called()
+
+    def test_set_lftp_scanner_dependent_key_does_not_request_reconfigure(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.use_temp_file = False
+        self.config.lftp = inner
+
+        response = handler._ConfigHandler__handle_set_config("lftp", "use_temp_file", True)
+
+        self.assertEqual(200, response.status_code)
+        self.assertTrue(inner.use_temp_file)
+        reconfigure_hook.assert_not_called()
+
+    def test_set_lftp_tuning_key_does_not_request_reconfigure_on_validation_failure(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        self.config.lftp = inner
+
+        response = handler._ConfigHandler__handle_set_config("lftp", "net_socket_buffer", "bad")
+
+        self.assertEqual(400, response.status_code)
+        self.assertEqual(None, inner.net_socket_buffer)
+        reconfigure_hook.assert_not_called()
+
+    def test_set_lftp_tuning_key_skips_reconfigure_on_persist_failure(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        self.config.lftp = inner
+
+        with patch.object(self.config, "to_file", side_effect=OSError("disk full")) as mock_to_file:
+            response = handler._ConfigHandler__handle_set_config("lftp", "rate_limit", "512K")
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual("Failed to persist config lftp.rate_limit", response.body)
+        self.assertIsNone(inner.rate_limit)
+        mock_to_file.assert_called_once_with()
+        reconfigure_hook.assert_not_called()
+
     def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
         self.config.has_section.return_value = True
         inner = MagicMock()

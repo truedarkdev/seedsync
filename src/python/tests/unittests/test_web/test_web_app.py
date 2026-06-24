@@ -153,6 +153,20 @@ class TestWebAppStream(unittest.TestCase):
 
         self.assertIsNone(builder.controller_handler._ControllerHandler__local_path_root)
 
+    def test_builder_wires_lftp_reconfigure_callback_into_config_handler(self):
+        controller = MagicMock()
+        controller.request_lftp_reconfigure = MagicMock()
+        self.context.config = Config()
+        self.context.breadcrumb_trace = MagicMock(
+            sync_enabled_state=MagicMock(),
+        )
+
+        builder = WebAppBuilder(self.context, controller, MagicMock())
+
+        self.assertIs(
+            builder.config_handler._ConfigHandler__lftp_reconfigure_request,
+            controller.request_lftp_reconfigure,
+        )
 
 class TestWebAppHostValidation(unittest.TestCase):
     def setUp(self):
