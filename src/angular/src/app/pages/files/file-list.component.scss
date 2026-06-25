@@ -1,18 +1,7 @@
 @use '../../common/common' as *;
 
-#file-list {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-}
-
 app-bulk-actions-bar {
     display: block;
-}
-
-#list-viewport {
-    flex: 1 1 auto;
-    min-height: 0;
 }
 
 #file-list #header {
@@ -20,30 +9,40 @@ app-bulk-actions-bar {
 }
 
 /* striped rows */
-#list-viewport > div:nth-child(even){
+#file-list > .file-row:nth-child(even of .file-row) {
     background-color: $primary-lighter-color;
 }
 
 /* list separator */
-#list-viewport > div {border-bottom: 1px solid #ddd;}
-#list-viewport > div:last-child{border-bottom: none;}
+#file-list > .file-row {
+    border-bottom: 1px solid #ddd;
+}
+
+#file-list > .file-row:last-child {
+    border-bottom: none;
+}
 
 /* Pagination bar */
 #pagination-bar {
-    display: flex;
+    display: grid;
+    grid-template-columns: 1fr;
     align-items: center;
-    justify-content: space-between;
     padding: 8px 12px;
     border-top: 1px solid #ddd;
     font-size: 0.85rem;
     gap: 8px;
-    flex-wrap: wrap;
+    justify-items: center;
+}
+
+#pagination-bar .pagination-info {
+    justify-self: center;
 }
 
 #pagination-bar .pagination-controls {
     display: flex;
     align-items: center;
     gap: 8px;
+    justify-self: center;
 }
 
 #pagination-bar .page-btn {
@@ -63,14 +62,24 @@ app-bulk-actions-bar {
     display: flex;
     align-items: center;
     gap: 6px;
+    justify-self: center;
+    white-space: nowrap;
 }
-
 
 /* Medium and large screens */
 @media only screen and (min-width: $medium-min-width) {
-    #list-viewport {
-        max-height: calc(100vh - 260px);
-        overflow-y: auto;
+    #pagination-bar {
+        grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+        justify-items: stretch;
+    }
+
+    #pagination-bar .pagination-info {
+        justify-self: start;
+    }
+
+    #pagination-bar .page-size-selector {
+        grid-column: 3;
+        justify-self: end;
     }
 
     #file-list #header {

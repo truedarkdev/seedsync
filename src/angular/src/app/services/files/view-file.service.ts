@@ -1,4 +1,4 @@
-import {Injectable} from "@angular/core";
+import {Inject, Injectable} from "@angular/core";
 import {BehaviorSubject, Observable, of} from "rxjs";
 import {catchError, tap} from "rxjs/operators";
 
@@ -12,6 +12,8 @@ import {MOCK_MODEL_FILES} from "./mock-model-files";
 import {StreamServiceRegistry} from "../base/stream-service.registry";
 import {WebReaction} from "../utils/rest.service";
 import {FileSelectionService} from "./file-selection.service";
+import {LOCAL_STORAGE, StorageService} from "../utils/storage.service";
+import {StorageKeys} from "../../common/storage-keys";
 
 
 /**
@@ -71,6 +73,7 @@ export interface ViewFileComparator {
  */
 @Injectable()
 export class ViewFileService {
+    private static readonly PAGE_SIZES = new Set<number>([25, 50, 100, 1000, 0]);
 
     private readonly USE_MOCK_MODEL = false;
 
@@ -93,8 +96,10 @@ export class ViewFileService {
 
     constructor(private _logger: LoggerService,
                 private _streamServiceRegistry: StreamServiceRegistry,
-                private _fileSelectionService: FileSelectionService) {
+                private _fileSelectionService: FileSelectionService,
+                @Inject(LOCAL_STORAGE) private _storage: StorageService) {
         this.modelFileService = _streamServiceRegistry.modelFileService;
+        this._restorePageSizeFromStorage();
         const _viewFileService = this;
 
         if (!this.USE_MOCK_MODEL) {
@@ -240,10 +245,15 @@ export class ViewFileService {
     }
 
     public setPageSize(size: number): void {
+        if (!ViewFileService.PAGE_SIZES.has(size)) {
+            return;
+        }
+
         this._pageSize = size;
         this._currentPage = 0;
         this._pageSizeSubject.next(size);
         this._currentPageSubject.next(this._currentPage);
+        this._storage.set(StorageKeys.FILES_PAGE_SIZE, size);
         this.pushViewFiles();
     }
 
@@ -254,6 +264,10 @@ export class ViewFileService {
     }
 
     public nextPage(): void {
+        if (this._pageSize <= 0) {
+            return;
+        }
+
         const totalPages = Math.ceil(this._totalFilteredCountSubject.getValue() / this._pageSize);
         if (this._currentPage < totalPages - 1) {
             this._currentPage++;
@@ -263,6 +277,10 @@ export class ViewFileService {
     }
 
     public prevPage(): void {
+        if (this._pageSize <= 0) {
+            return;
+        }
+
         if (this._currentPage > 0) {
             this._currentPage--;
             this._currentPageSubject.next(this._currentPage);
@@ -581,6 +599,21 @@ export class ViewFileService {
         });
     }
 
+    private _restorePageSizeFromStorage(): void {
+        const storedPageSize = this._storage.get(StorageKeys.FILES_PAGE_SIZE);
+        if (storedPageSize == null) {
+            return;
+        }
+
+        const parsedPageSize = +storedPageSize;
+        if (Number.isNaN(parsedPageSize) || !ViewFileService.PAGE_SIZES.has(parsedPageSize)) {
+            return;
+        }
+
+        this._pageSize = parsedPageSize;
+        this._pageSizeSubject.next(this._pageSize);
+    }
+
     /**
      * Helper method to execute an action on ModelFileService and generate a ViewFileReaction
      * @param {ViewFile} file
@@ -623,14 +656,14 @@ export class ViewFileService {
         this._totalFilteredCountSubject.next(totalCount);
 
         const totalPages = this._pageSize > 0 ? Math.ceil(totalCount / this._pageSize) : 1;
-        if (this._currentPage >= totalPages) {
+        if (this._pageSize > 0 && this._currentPage >= totalPages) {
             this._currentPage = Math.max(0, totalPages - 1);
             this._currentPageSubject.next(this._currentPage);
         }
 
         const start = this._currentPage * this._pageSize;
         const end = start + this._pageSize;
-        const pagedFiles = filteredFiles.slice(start, end).toList();
+        const pagedFiles = this._pageSize > 0 ? filteredFiles.slice(start, end).toList() : filteredFiles;
         this._filteredFilesSubject.next(pagedFiles);
     }
 }
