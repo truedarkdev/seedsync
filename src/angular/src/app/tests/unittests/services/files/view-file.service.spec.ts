@@ -14,6 +14,9 @@ import {ViewFile} from "../../../../services/files/view-file";
 import {ViewFileFilterCriteria} from "../../../../services/files/view-file.service";
 import {FileSelectionService} from "../../../../services/files/file-selection.service";
 import {WebReaction} from "../../../../services/utils/rest.service";
+import {LOCAL_STORAGE, StorageService} from "../../../../services/utils/storage.service";
+import {MockStorageService} from "../../../mocks/mock-storage.service";
+import {StorageKeys} from "../../../../common/storage-keys";
 
 
 function createDuplicateNamedModelFile(fileId: string,
@@ -36,9 +39,34 @@ function getViewFilesById(viewFiles: Immutable.List<ViewFile>): Map<string, View
 }
 
 
+function createModelFiles(count: number): Immutable.Map<string, ModelFile> {
+    let modelFiles = Immutable.Map<string, ModelFile>();
+    for (let index = 0; index < count; index++) {
+        const fileId = `file-${index}`;
+        modelFiles = modelFiles.set(fileId, new ModelFile({
+            file_id: fileId,
+            name: fileId
+        }));
+    }
+
+    return modelFiles;
+}
+
+
+function createViewService(): ViewFileService {
+    return new ViewFileService(
+        TestBed.get(LoggerService),
+        TestBed.get(StreamServiceRegistry),
+        TestBed.get(FileSelectionService),
+        TestBed.get(LOCAL_STORAGE)
+    );
+}
+
+
 describe("Testing view file service", () => {
     let viewService: ViewFileService;
     let mockModelService: MockModelFileService;
+    let storageService: StorageService;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -47,13 +75,15 @@ describe("Testing view file service", () => {
                 FileSelectionService,
                 LoggerService,
                 ConnectedService,
-                {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry}
+                {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry},
+                {provide: LOCAL_STORAGE, useClass: MockStorageService}
             ]
         });
 
-        viewService = TestBed.get(ViewFileService);
+        viewService = createViewService();
         let mockRegistry: MockStreamServiceRegistry = TestBed.get(StreamServiceRegistry);
         mockModelService = mockRegistry.modelFileService;
+        storageService = TestBed.get(LOCAL_STORAGE);
     });
 
     it("should create an instance", () => {
@@ -1503,5 +1533,79 @@ describe("Testing view file service", () => {
         tick();
 
         expect(selectedNames.size).toBe(0);
+    }));
+
+    it("should restore the stored page size before emitting paging state", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.FILES_PAGE_SIZE) {
+                return 0;
+            }
+        });
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
+        expect(storageService.get).toHaveBeenCalledWith(StorageKeys.FILES_PAGE_SIZE);
+        expect(latestPageSize).toBe(0);
+    }));
+
+    it("should ignore unsupported stored page sizes", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.FILES_PAGE_SIZE) {
+                return 75;
+            }
+        });
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
+        expect(latestPageSize).toBe(50);
+    }));
+
+    it("should save the page size to storage when it changes", () => {
+        spyOn(storageService, "set");
+
+        viewService.setPageSize(1000);
+        expect(storageService.set).toHaveBeenCalledWith(StorageKeys.FILES_PAGE_SIZE, 1000);
+
+        viewService.setPageSize(0);
+        expect(storageService.set).toHaveBeenCalledWith(StorageKeys.FILES_PAGE_SIZE, 0);
+    });
+
+    it("should page larger file lists and return all files when page size is zero", fakeAsync(() => {
+        let latestFiles: Immutable.List<ViewFile> = null;
+        let currentPage = -1;
+
+        viewService.filteredFiles.subscribe(list => latestFiles = list);
+        viewService.currentPage.subscribe(page => currentPage = page);
+
+        mockModelService._files.next(createModelFiles(600));
+        tick();
+
+        expect(latestFiles.size).toBe(50);
+        expect(currentPage).toBe(0);
+
+        viewService.setPageSize(1000);
+        tick();
+        expect(latestFiles.size).toBe(600);
+        expect(currentPage).toBe(0);
+
+        viewService.setPageSize(0);
+        tick();
+        expect(latestFiles.size).toBe(600);
+        expect(currentPage).toBe(0);
+
+        viewService.nextPage();
+        viewService.prevPage();
+        tick();
+
+        expect(latestFiles.size).toBe(600);
+        expect(currentPage).toBe(0);
     }));
 });

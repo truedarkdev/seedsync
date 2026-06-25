@@ -350,6 +350,33 @@
 @media only screen and (min-width: $large-min-width) {
     // Bit of extra padding at top when title disappears
     #file-options {
-        padding-top: 8px;
+        align-items: center;
+        column-gap: 12px;
+        row-gap: 8px;
+        padding: 10px 16px 10px 12px;
+
+        #filter-search {
+            flex: 1 1 24rem;
+            max-width: 44rem;
+            min-width: 20rem;
+        }
+
+        #filter-status,
+        #sort-status,
+        #toggle-details {
+            margin-top: 0;
+        }
+
+        #sort-status,
+        #toggle-details {
+            margin-left: 0;
+        }
+
+        #small-buttons {
+            flex: 0 0 auto;
+            margin-left: 2px;
+            padding-top: 0;
+            padding-right: 2px;
+        }
     }
 }

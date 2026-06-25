@@ -201,9 +201,8 @@ export class FileComponent implements OnChanges {
         this.validateEvent.emit(file);
     }
 
-    // Late async callbacks can arrive after this row has been rebound by the
-    // virtual scroll, so only clear when the row still represents the same
-    // file and the same in-flight action.
+    // Late async callbacks can arrive after this row has been rebound, so only
+    // clear when the row still represents the same file and in-flight action.
     resetActiveAction(forFile?: ViewFile, forAction?: FileAction): void {
         if (forFile != null) {
             const currentFileKey = this.file != null ? (this.file.fileId || this.file.name) : null;

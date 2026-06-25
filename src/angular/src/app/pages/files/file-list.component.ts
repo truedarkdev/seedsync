@@ -36,7 +36,7 @@ export class FileListComponent implements OnInit, OnDestroy {
     public currentPage = 0;
     public pageSize = 50;
     public totalPages = 0;
-    public readonly PAGE_SIZES = [25, 50, 100];
+    public readonly PAGE_SIZES = [25, 50, 100, 1000, 0];
 
     constructor(private _logger: LoggerService,
                 private viewFileService: ViewFileService,
@@ -52,12 +52,6 @@ export class FileListComponent implements OnInit, OnDestroy {
     }
 
     ngOnInit(): void {
-        const savedPageSize = localStorage.getItem("dashboard_page_size");
-        if (savedPageSize && this.PAGE_SIZES.indexOf(+savedPageSize) >= 0) {
-            this.pageSize = +savedPageSize;
-            this.viewFileService.setPageSize(this.pageSize);
-        }
-
         this._paginationSubscription = combineLatest([
             this.viewFileService.totalFilteredCount,
             this.viewFileService.currentPage,
@@ -178,10 +172,14 @@ export class FileListComponent implements OnInit, OnDestroy {
         });
     }
 
-    onPageSizeChange(newSize: number): void {
-        this.pageSize = newSize;
-        localStorage.setItem("dashboard_page_size", String(newSize));
-        this.viewFileService.setPageSize(newSize);
+    onPageSizeChange(newSize: number | string): void {
+        const pageSize = +newSize;
+        if (Number.isNaN(pageSize)) {
+            return;
+        }
+
+        this.pageSize = pageSize;
+        this.viewFileService.setPageSize(pageSize);
     }
 
     onPrevPage(): void {
@@ -193,10 +191,18 @@ export class FileListComponent implements OnInit, OnDestroy {
     }
 
     get pageStart(): number {
+        if (this.pageSize <= 0) {
+            return this.totalCount === 0 ? 0 : 1;
+        }
+
         return this.totalCount === 0 ? 0 : this.currentPage * this.pageSize + 1;
     }
 
     get pageEnd(): number {
+        if (this.pageSize <= 0) {
+            return this.totalCount;
+        }
+
         return Math.min((this.currentPage + 1) * this.pageSize, this.totalCount);
     }
 

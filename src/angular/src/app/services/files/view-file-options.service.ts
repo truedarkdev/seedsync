@@ -35,8 +35,10 @@ export class ViewFileOptionsService {
             this._storage.get(StorageKeys.VIEW_OPTION_SELECTED_STATUS_FILTER) || null;
         const nameFilter: string =
             this._storage.get(StorageKeys.VIEW_OPTION_NAME_FILTER) || null;
+        const storedPinFilter: boolean =
+            this._storage.get(StorageKeys.VIEW_OPTION_PIN);
         const pinFilter: boolean =
-            this._storage.get(StorageKeys.VIEW_OPTION_PIN) || false;
+            storedPinFilter == null ? true : storedPinFilter;
 
         this._options = new BehaviorSubject(
             new ViewFileOptions({

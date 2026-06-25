@@ -17,15 +17,38 @@ class MockLoggerService {
 
 class MockViewFileService {
     private _filteredFiles = new BehaviorSubject(Immutable.List<ViewFile>());
+    private _totalFilteredCount = new BehaviorSubject(0);
+    private _currentPage = new BehaviorSubject(0);
+    private _pageSize = new BehaviorSubject(50);
     stop = jasmine.createSpy("stop").and.returnValue(
         of(new WebReaction(false, null, "Operation timed out"))
     );
     deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
         of(new WebReaction(true, "ok", null))
     );
+    setPageSize = jasmine.createSpy("setPageSize");
+    prevPage = jasmine.createSpy("prevPage");
+    nextPage = jasmine.createSpy("nextPage");
 
     get filteredFiles() {
         return this._filteredFiles.asObservable();
+    }
+
+    get totalFilteredCount() {
+        return this._totalFilteredCount.asObservable();
+    }
+
+    get currentPage() {
+        return this._currentPage.asObservable();
+    }
+
+    get pageSize() {
+        return this._pageSize.asObservable();
+    }
+
+    setFilteredFiles(files: Immutable.List<ViewFile>) {
+        this._filteredFiles.next(files);
+        this._totalFilteredCount.next(files.size);
     }
 }
 
@@ -45,6 +68,7 @@ class MockFileSelectionService {
     selectedFiles = new BehaviorSubject(Immutable.List<ViewFile>()).asObservable();
     areAllVisibleSelected = new BehaviorSubject(false).asObservable();
     setVisibleFiles = jasmine.createSpy("setVisibleFiles");
+    setAllVisibleSelected = jasmine.createSpy("setAllVisibleSelected");
 }
 
 class MockChangeDetectorRef {
@@ -194,5 +218,32 @@ describe("Testing file list component", () => {
         expect(mockViewFileOptionsService.setSortMethod).toHaveBeenCalledWith(
             ViewFileOptions.SortMethod.SMART_STATUS
         );
+    });
+
+    it("should expose all page size choices including All", () => {
+        expect(component.PAGE_SIZES).toEqual([25, 50, 100, 1000, 0]);
+    });
+
+    it("should forward the selected page size and treat All as zero", () => {
+        component.onPageSizeChange("1000");
+
+        expect(mockViewFileService.setPageSize).toHaveBeenCalledWith(1000);
+        expect(component.pageSize).toBe(1000);
+
+        component.onPageSizeChange("0");
+
+        expect(mockViewFileService.setPageSize).toHaveBeenCalledWith(0);
+        expect(component.pageSize).toBe(0);
+    });
+
+    it("should report the full range when All is selected", () => {
+        component.pageSize = 0;
+        component.totalCount = 17;
+        component.currentPage = 3;
+        component.totalPages = 1;
+
+        expect(component.pageStart).toBe(1);
+        expect(component.pageEnd).toBe(17);
+        expect(component.totalPages).toBe(1);
     });
 });
