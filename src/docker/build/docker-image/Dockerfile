@@ -1,47 +1,3 @@
-# Build scanfs for the remote seedbox architecture, not the local build host.
-ARG SCANFS_PLATFORM=linux/amd64
-
-# Creates environment to build scanfs binaries
-FROM --platform=${SCANFS_PLATFORM} python:3.11-slim-buster AS seedsync_build_scanfs_env
-RUN set -eux; \
-    printf '%s\n' \
-        'deb http://archive.debian.org/debian buster main' \
-        'deb http://archive.debian.org/debian-security buster/updates main' \
-        > /etc/apt/sources.list; \
-    rm -f /etc/apt/sources.list.d/debian.sources; \
-    printf '%s\n' \
-        'Acquire::Check-Valid-Until "false";' \
-        > /etc/apt/apt.conf.d/99archive-no-check-valid-until; \
-    apt-get update && apt-get install -y \
-    binutils \
-    build-essential \
-    libffi-dev \
-    zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN pip3 install "poetry==2.3.2" \
-    && poetry config virtualenvs.create false
-COPY src/python/pyproject.toml /app/python/
-COPY src/python/poetry.lock /app/python/
-WORKDIR /app/python
-ENV LC_ALL=C.UTF-8
-ENV LANG=C.UTF-8
-RUN poetry install
-
-
-# Builds scanfs with pyinstaller
-FROM seedsync_build_scanfs_env AS seedsync_build_scanfs
-COPY src/python /python
-RUN mkdir -p /build
-RUN pyinstaller /python/scan_fs.py \
-    -y \
-    --onefile \
-    -p /python \
-    --distpath /build/dist \
-    --workpath /build/work \
-    --specpath /build \
-    --name scanfs
-
-
 # Creates environment for angular
 FROM node:24-bookworm-slim AS seedsync_build_angular_env
 RUN apt-get update && apt-get install -y \
@@ -126,7 +82,6 @@ RUN chmod -R a+rX /app/python
 FROM seedsync_run_python AS seedsync_run
 LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
-COPY --from=seedsync_build_scanfs /build/dist/scanfs /app/scanfs
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
 RUN set -eux; \
     if dpkg -s p7zip-rar >/dev/null 2>&1; then \
@@ -176,7 +131,7 @@ ENTRYPOINT [ "/scripts/entrypoint.sh" ]
 CMD [ \
     "/bin/bash", \
     "-lc", \
-    "exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/scanfs --web-bind-host \"${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}\"" \
+    "exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/python/scan_fs.py --web-bind-host \"${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}\"" \
 ]
 
 EXPOSE 8800
