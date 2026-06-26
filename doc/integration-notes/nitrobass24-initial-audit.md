@@ -494,7 +494,7 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 475 | `f3de4cdd2005a45f4857277a6d0c3e91a8e2da93` | 2026-03-12 | Fix CI: inline SHOULD_PUBLISH expression in job-level if | needs area reopen - upstream job-level `SHOULD_PUBLISH` logic depends on the absent `ci.yml` workflow graph; keep this with the same CI/Docker topology decision lane |
 | 476 | `c4ca0ac30b7e2afddc47b1c5373ca2634e2ed00b` | 2026-03-12 | Prepare v0.14.0 release | intentionally skipped |
 | 477 | `cceea49d6b0670dfab0a072655f3d21b4f78559e` | 2026-03-12 | Release v0.13.5 - Exclude-glob fix and queue logging | intentionally skipped |
-| 478 | `bdc3d7d9e0dc14c580f915bfdd058de808dd18e8` | 2026-03-12 | Resolve merge conflicts and address PR review findings | needs new integration task |
+| 478 | `bdc3d7d9e0dc14c580f915bfdd058de808dd18e8` | 2026-03-12 | Resolve merge conflicts and address PR review findings | covered elsewhere / split disposition: verbose logging UI text covered by row 447; changelog/release bookkeeping skipped because local root `CHANGELOG.md` is absent; upstream `ci.yml` retry loop remains with the CI/Docker topology decision lane because local CI uses `master.yml` |
 | 479 | `7b106632f967d74b886e727f9d56ce4c8a7343f9` | 2026-03-13 | Improve integrity check settings clarity and validate button UX | needs area reopen |
 | 480 | `dbfb2ae69e2dbede214437414fcf1bf6b1c229b2` | 2026-03-13 | Merge pull request #276 from nitrobass24/fix/validate-ui-clarity | covered elsewhere |
 | 481 | `4160d794f908aee1e158d14c45c4b859d0bdca3f` | 2026-03-14 | Update docs and changelog for v0.14.0 release | intentionally skipped |
