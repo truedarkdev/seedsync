@@ -4,6 +4,7 @@ import json
 import collections
 
 from common import Config
+from ..config_restart import requires_restart
 
 
 _SENSITIVE_FIELDS = Config.SENSITIVE_FIELDS
@@ -38,4 +39,13 @@ class SerializeConfig:
                 if field in section_dict:
                     section_dict[field] = _REDACTED
 
-        return json.dumps(config_dict_lowercase)
+        restart_required = collections.OrderedDict()
+        for section, section_dict in config_dict_lowercase.items():
+            restart_required[section] = collections.OrderedDict(
+                (field, requires_restart(section, field))
+                for field in section_dict.keys()
+            )
+
+        out_dict = collections.OrderedDict(config_dict_lowercase)
+        out_dict["restart_required"] = restart_required
+        return json.dumps(out_dict)

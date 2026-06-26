@@ -10,6 +10,7 @@ from bottle import HTTPResponse
 from common import overrides, Config, ConfigError, Localization
 from ..web_app import IHandler, WebApp
 from ..serialize import SerializeConfig
+from ..config_restart import GENERAL_RUNTIME_RECONFIGURE_FIELDS, LFTP_RUNTIME_RECONFIGURE_FIELDS
 
 logger = logging.getLogger(__name__)
 
@@ -22,16 +23,6 @@ class ConfigHandler(IHandler):
             "trusted_browser_bootstrap_remote_addrs",
         },
     }
-    __LFTP_TUNING_FIELDS = frozenset((
-        "num_max_parallel_downloads",
-        "num_max_parallel_files_per_download",
-        "num_max_connections_per_root_file",
-        "num_max_connections_per_dir_file",
-        "num_max_total_connections",
-        "rate_limit",
-        "net_socket_buffer",
-    ))
-
     def __init__(self, config: Config, breadcrumb_trace_sync=None, lftp_reconfigure_request=None):
         self.__config = config
         self.__breadcrumb_trace_sync = breadcrumb_trace_sync
@@ -147,8 +138,8 @@ class ConfigHandler(IHandler):
         if (
             self.__lftp_reconfigure_request is not None
             and (
-                (section == "lftp" and key in ConfigHandler.__LFTP_TUNING_FIELDS)
-                or (section == "general" and key in {"verbose", "exclude_patterns"})
+                (section == "lftp" and key in LFTP_RUNTIME_RECONFIGURE_FIELDS)
+                or (section == "general" and key in GENERAL_RUNTIME_RECONFIGURE_FIELDS)
             )
         ):
             self.__lftp_reconfigure_request()

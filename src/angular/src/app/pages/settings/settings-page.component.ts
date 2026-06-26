@@ -50,7 +50,10 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     private _destroyed = false;
 
     private _configRestartNotif: Notification;
+    private _configAppliedImmediatelyNotif: Notification;
+    private _configAppliedImmediatelyHideTimer: ReturnType<typeof setTimeout> | null = null;
     private _badValueNotifs: Map<string, Notification>;
+    private static readonly CONFIG_APPLIED_IMMEDIATELY_HIDE_MS = 7000;
     private static readonly OVERRIDE_NOTE = "Path pairs override this setting when any pair is enabled.";
 
     constructor(private _logger: LoggerService,
@@ -70,6 +73,11 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
             level: Notification.Level.INFO,
             text: Localization.Notification.CONFIG_RESTART
         });
+        this._configAppliedImmediatelyNotif = new Notification({
+            level: Notification.Level.SUCCESS,
+            dismissible: true,
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        });
         this._badValueNotifs = new Map();
     }
 
@@ -78,8 +86,9 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
         this._connectedService.connected.pipe(takeUntil(this._destroy$)).subscribe({
             next: (connected: boolean) => {
                 if (!connected) {
-                    // Server went down, hide the config restart notification
+                    // Server went down, hide config status notifications.
                     this._notifService.hide(this._configRestartNotif);
+                    this.hideConfigAppliedImmediatelyNotification();
                 }
 
                 // Enable/disable commands based on server connection
@@ -102,6 +111,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
 
     ngOnDestroy() {
         this._destroyed = true;
+        this.clearConfigAppliedImmediatelyHideTimer();
         this._destroy$.next();
         this._destroy$.complete();
     }
@@ -119,9 +129,18 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                         this._badValueNotifs.delete(notifKey);
                     }
 
-                    // Show the restart notification
-                    this._notifService.show(this._configRestartNotif);
+                    // Only show the restart notification when the backend says this setting needs it.
+                    if (this._configService.requiresRestart(section, option)) {
+                        this.hideConfigAppliedImmediatelyNotification();
+                        this._notifService.show(this._configRestartNotif);
+                    } else {
+                        this._notifService.hide(this._configRestartNotif);
+                        this.showConfigAppliedImmediatelyNotification();
+                    }
                 } else {
+                    this._notifService.hide(this._configRestartNotif);
+                    this.hideConfigAppliedImmediatelyNotification();
+
                     // Show bad value notification
                     const notif = new Notification({
                         level: Notification.Level.DANGER,
@@ -138,6 +157,27 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
                 }
             }
         });
+    }
+
+    private showConfigAppliedImmediatelyNotification() {
+        this.clearConfigAppliedImmediatelyHideTimer();
+        this._notifService.show(this._configAppliedImmediatelyNotif);
+        this._configAppliedImmediatelyHideTimer = setTimeout(() => {
+            this._configAppliedImmediatelyHideTimer = null;
+            this._notifService.hide(this._configAppliedImmediatelyNotif);
+        }, SettingsPageComponent.CONFIG_APPLIED_IMMEDIATELY_HIDE_MS);
+    }
+
+    private hideConfigAppliedImmediatelyNotification() {
+        this.clearConfigAppliedImmediatelyHideTimer();
+        this._notifService.hide(this._configAppliedImmediatelyNotif);
+    }
+
+    private clearConfigAppliedImmediatelyHideTimer() {
+        if (this._configAppliedImmediatelyHideTimer !== null) {
+            clearTimeout(this._configAppliedImmediatelyHideTimer);
+            this._configAppliedImmediatelyHideTimer = null;
+        }
     }
 
     private static buildServerContext(hasEnabledPairs: boolean): IOptionsContext {

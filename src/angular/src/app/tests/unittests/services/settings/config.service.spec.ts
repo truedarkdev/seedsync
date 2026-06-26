@@ -118,6 +118,17 @@ describe("Testing config service", () => {
                 remote_ftp_port: 2121,
                 ftp_ssl_verify_certificate: true,
             },
+            restart_required: {
+                general: {
+                    log_level: true,
+                    verbose: false,
+                    breadcrumb_trace_enabled: false
+                },
+                lftp: {
+                    remote_address: true,
+                    net_socket_buffer: false
+                }
+            },
             controller: {
                 interval_ms_remote_scan: 30000,
                 interval_ms_local_scan: 10000,
@@ -160,6 +171,11 @@ describe("Testing config service", () => {
                 expect(config.lftp.protocol).toBe("ftps");
                 expect(config.lftp.remote_ftp_port).toBe(2121);
                 expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
+                expect(configService.requiresRestart("general", "log_level")).toBe(true);
+                expect(configService.requiresRestart("general", "verbose")).toBe(false);
+                expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
+                expect(configService.requiresRestart("lftp", "remote_address")).toBe(true);
+                expect(configService.requiresRestart("lftp", "net_socket_buffer")).toBe(false);
                 expect(config.controller.interval_ms_remote_scan).toBe(30000);
                 expect(config.controller.interval_ms_local_scan).toBe(10000);
                 expect(config.controller.interval_ms_downloading_scan).toBe(1000);
@@ -172,6 +188,37 @@ describe("Testing config service", () => {
         });
 
         httpMock.verify();
+    });
+
+    it("should expose backend restart metadata from the config response", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            general: {
+                log_level: "DEBUG",
+                verbose: false,
+                breadcrumb_trace_enabled: true
+            },
+            lftp: {
+                remote_path: "/remote/server/path",
+                net_socket_buffer: "8M"
+            },
+            restart_required: {
+                general: {
+                    log_level: true,
+                    verbose: false,
+                    breadcrumb_trace_enabled: false
+                },
+                lftp: {
+                    remote_path: true,
+                    net_socket_buffer: false
+                }
+            }
+        });
+
+        expect(configService.requiresRestart("general", "log_level")).toBe(true);
+        expect(configService.requiresRestart("general", "verbose")).toBe(false);
+        expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
+        expect(configService.requiresRestart("lftp", "remote_path")).toBe(true);
+        expect(configService.requiresRestart("lftp", "net_socket_buffer")).toBe(false);
     });
 
     it("should get null on get error 404", () => {

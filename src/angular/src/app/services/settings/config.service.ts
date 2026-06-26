@@ -10,6 +10,17 @@ import {StreamServiceRegistry} from "../base/stream-service.registry";
 import {RestService, WebReaction} from "../utils/rest.service";
 
 
+interface IRestartRequiredOptions {
+    [section: string]: {
+        [option: string]: boolean;
+    };
+}
+
+interface IConfigResponse extends IConfig {
+    restart_required?: IRestartRequiredOptions;
+}
+
+
 /**
  * ConfigService provides the store for the config
  */
@@ -21,6 +32,7 @@ export class ConfigService extends BaseWebService {
         (section, option) => `/server/config/set/${section}/${option}`
 
     private _config: BehaviorSubject<Config> = new BehaviorSubject(null);
+    private _restartRequiredOptions: IRestartRequiredOptions = {};
 
     constructor(_streamServiceProvider: StreamServiceRegistry,
                 private _restService: RestService,
@@ -41,6 +53,11 @@ export class ConfigService extends BaseWebService {
      */
     public refresh() {
         this.getConfig();
+    }
+
+    public requiresRestart(section: string, option: string): boolean {
+        const sectionRestartOptions = this._restartRequiredOptions[section];
+        return Boolean(sectionRestartOptions && sectionRestartOptions[option]);
     }
 
     /**
@@ -99,6 +116,7 @@ export class ConfigService extends BaseWebService {
 
     protected onDisconnected() {
         // Send null config
+        this._restartRequiredOptions = {};
         this._config.next(null);
     }
 
@@ -108,13 +126,16 @@ export class ConfigService extends BaseWebService {
             next: reaction => {
                 if (reaction.success) {
                     try {
-                        const config_json: IConfig = JSON.parse(reaction.data);
+                        const config_json: IConfigResponse = JSON.parse(reaction.data);
+                        this._restartRequiredOptions = config_json.restart_required || {};
                         this._config.next(new Config(config_json));
                     } catch (error) {
                         this._logger.error("Failed to parse config response");
+                        this._restartRequiredOptions = {};
                         this._config.next(null);
                     }
                 } else {
+                    this._restartRequiredOptions = {};
                     this._config.next(null);
                 }
             }
