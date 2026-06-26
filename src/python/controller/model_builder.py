@@ -25,6 +25,14 @@ class _RecentLiveTransferSnapshot:
     eta: Optional[int]
 
 
+@dataclass
+class _BuiltRootFile:
+    model_file: ModelFile
+    normalized_local_root_path: Optional[str]
+    is_local_only: bool
+    seen_file_ids: Set[str]
+
+
 class ModelBuilder:
     """
     ModelBuilder combines all the difference sources of file system info
@@ -423,6 +431,18 @@ class ModelBuilder:
         if resolved_root is None:
             return None
         return os.path.join(resolved_root, model_file.full_path)
+
+    def __resolve_normalized_local_root_path(self,
+                                             local_file: Optional[SystemFile],
+                                             path_pair_id: Optional[str]) -> Optional[str]:
+        if local_file is not None and getattr(local_file, "is_staging", False):
+            return None
+        resolved_root = self.__local_root_paths.get(path_pair_id)
+        if resolved_root is None and path_pair_id is not None:
+            resolved_root = self.__local_root_paths.get(None)
+        if resolved_root is None:
+            return None
+        return os.path.normcase(os.path.normpath(resolved_root.replace("\\", "/")))
 
     def __get_allocated_local_size(self, model_file: ModelFile, local_file: Optional[SystemFile]) -> Optional[int]:
         local_path = self.__resolve_local_disk_path(model_file, local_file)
@@ -1075,37 +1095,15 @@ class ModelBuilder:
         model = Model()
         model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
         live_transferred_file_ids = set()
-        seen_file_ids = set()
         effective_local_files = self.__build_effective_local_files()
         all_file_ids = set().union(effective_local_files.keys(), self.__remote_files.keys())
-        ambiguous_file_names = set()
-        file_name_counts = dict()
         source_file_ids = set(effective_local_files.keys()).union(self.__remote_files.keys())
         for status_file_id in self.__lftp_statuses.keys():
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
 
+        built_root_files: List[_BuiltRootFile] = []
         for file_id in all_file_ids:
-            source_file = effective_local_files.get(file_id)
-            if source_file is None:
-                source_file = self.__remote_files.get(file_id)
-            if source_file is None:
-                continue
-            file_name_counts[source_file.name] = file_name_counts.get(source_file.name, 0) + 1
-        ambiguous_file_names = {
-            file_name
-            for file_name, file_name_count in file_name_counts.items()
-            if file_name_count > 1
-        }
-        self.__suppressed_ambiguous_extracted_file_names.intersection_update(self.__extracted_files)
-        self.__suppressed_ambiguous_extracted_file_names.update(
-            file_name
-            for file_name in ambiguous_file_names
-            if file_name in self.__extracted_files
-        )
-
-        for file_id in all_file_ids:
-            seen_file_ids.add(file_id)
             remote = self.__remote_files.get(file_id, None)
             local = effective_local_files.get(file_id, None)
             status = self.__lftp_statuses.get(file_id, None)
@@ -1134,6 +1132,7 @@ class ModelBuilder:
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
                 local.path_pair_name if local else status.path_pair_name if status else None
             self.__apply_path_pair_metadata(model_file, path_pair_id, path_pair_name)
+            root_seen_file_ids = set()
             (
                 current_transfer_state,
                 recent_transfer_state,
@@ -1167,7 +1166,7 @@ class ModelBuilder:
                 remote,
                 local,
                 status,
-                seen_file_ids,
+                root_seen_file_ids,
                 live_transferred_file_ids,
             )
             self.__estimate_eta(model_file)
@@ -1217,7 +1216,79 @@ class ModelBuilder:
                     arbitration_source
                 )
 
-            model.add_file(model_file)
+            built_root_files.append(_BuiltRootFile(
+                model_file=model_file,
+                normalized_local_root_path=self.__resolve_normalized_local_root_path(
+                    local,
+                    path_pair_id,
+                ),
+                is_local_only=local is not None and remote is None and status is None,
+                seen_file_ids=root_seen_file_ids,
+            ))
+
+        seen_names_by_path: Dict[str, Set[str]] = {}
+        for built_root_file in built_root_files:
+            normalized_local_root_path = built_root_file.normalized_local_root_path
+            if normalized_local_root_path is None or built_root_file.is_local_only:
+                continue
+            if normalized_local_root_path not in seen_names_by_path:
+                seen_names_by_path[normalized_local_root_path] = set()
+            seen_names_by_path[normalized_local_root_path].add(built_root_file.model_file.name)
+
+        local_only_root_winners: Dict[Tuple[str, str], _BuiltRootFile] = {}
+        for built_root_file in built_root_files:
+            normalized_local_root_path = built_root_file.normalized_local_root_path
+            if normalized_local_root_path is None or not built_root_file.is_local_only:
+                continue
+            dedupe_key = (normalized_local_root_path, built_root_file.model_file.name)
+            candidate_priority = (
+                built_root_file.model_file.state.value,
+                built_root_file.model_file.file_id,
+            )
+            current_winner = local_only_root_winners.get(dedupe_key)
+            current_priority = (
+                current_winner.model_file.state.value,
+                current_winner.model_file.file_id,
+            ) if current_winner is not None else None
+            if current_priority is None or candidate_priority > current_priority:
+                local_only_root_winners[dedupe_key] = built_root_file
+
+        visible_root_files: List[_BuiltRootFile] = []
+        for built_root_file in built_root_files:
+            normalized_local_root_path = built_root_file.normalized_local_root_path
+            if normalized_local_root_path is not None and normalized_local_root_path not in seen_names_by_path:
+                seen_names_by_path[normalized_local_root_path] = set()
+            if built_root_file.is_local_only and normalized_local_root_path is not None:
+                if built_root_file.model_file.name in seen_names_by_path[normalized_local_root_path]:
+                    continue
+                dedupe_key = (normalized_local_root_path, built_root_file.model_file.name)
+                if local_only_root_winners.get(dedupe_key) is not built_root_file:
+                    continue
+            visible_root_files.append(built_root_file)
+            if normalized_local_root_path is not None:
+                seen_names_by_path[normalized_local_root_path].add(built_root_file.model_file.name)
+
+        file_name_counts = dict()
+        for built_root_file in visible_root_files:
+            file_name_counts[built_root_file.model_file.name] = \
+                file_name_counts.get(built_root_file.model_file.name, 0) + 1
+        ambiguous_file_names = {
+            file_name
+            for file_name, file_name_count in file_name_counts.items()
+            if file_name_count > 1
+        }
+        self.__suppressed_ambiguous_extracted_file_names.intersection_update(self.__extracted_files)
+        self.__suppressed_ambiguous_extracted_file_names.update(
+            file_name
+            for file_name in ambiguous_file_names
+            if file_name in self.__extracted_files
+        )
+
+        seen_file_ids = set()
+        for built_root_file in visible_root_files:
+            seen_file_ids.add(built_root_file.model_file.file_id)
+            seen_file_ids.update(built_root_file.seen_file_ids)
+            model.add_file(built_root_file.model_file)
 
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         self.__cached_model = model
