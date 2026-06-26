@@ -736,10 +736,18 @@ class Controller:
         old_remote_scanner = self.__remote_scanner
         new_state_applied = False
 
-        def stop_process_if_alive(process):
-            if process is not None and process.is_alive():
-                process.terminate()
-                process.join()
+        def stop_process(process) -> bool:
+            return self.__teardown_process(
+                "refresh process {}".format(getattr(process, "name", "?")) if process is not None else "refresh process",
+                process,
+            )
+
+        def close_active_scanner(label: str, scanner) -> None:
+            if scanner is None:
+                return
+            close = getattr(scanner, "close", None)
+            if callable(close):
+                self.__best_effort_teardown(label, close)
 
         try:
             self.__refresh_path_pair_runtime_state()
@@ -761,15 +769,19 @@ class Controller:
                 self.__local_scan_process.force_scan()
                 self.__remote_scan_process.force_scan()
                 self.__next_lftp_status_poll_at = None
-                stop_process_if_alive(old_active_scan_process)
-                stop_process_if_alive(old_local_scan_process)
-                stop_process_if_alive(old_remote_scan_process)
+                old_active_scan_process_stopped = stop_process(old_active_scan_process)
+                stop_process(old_local_scan_process)
+                stop_process(old_remote_scan_process)
+                if old_active_scan_process_stopped:
+                    close_active_scanner("old active scanner close", old_active_scanner)
             self.__clear_path_pair_runtime_error()
         except Exception as exc:
             if new_state_applied:
-                stop_process_if_alive(self.__active_scan_process)
-                stop_process_if_alive(self.__local_scan_process)
-                stop_process_if_alive(self.__remote_scan_process)
+                new_active_scan_process_stopped = stop_process(self.__active_scan_process)
+                stop_process(self.__local_scan_process)
+                stop_process(self.__remote_scan_process)
+                if new_active_scan_process_stopped:
+                    close_active_scanner("new active scanner close", self.__active_scanner)
                 self.__restore_path_pair_runtime_state(
                     old_path_pairs_by_id,
                     old_path_pair_staging_paths,
@@ -871,7 +883,7 @@ class Controller:
 
     __JOIN_TIMEOUT_IN_SECS = 2
 
-    def __bounded_join(self, label: str, process: AppProcess) -> None:
+    def __bounded_join(self, label: str, process: AppProcess) -> bool:
         self.__best_effort_teardown(label, lambda: process.join(self.__JOIN_TIMEOUT_IN_SECS))
         try:
             still_alive = process.is_alive()
@@ -883,6 +895,35 @@ class Controller:
                 getattr(process, "name", "?"),
                 self.__JOIN_TIMEOUT_IN_SECS,
             )
+        return not still_alive
+
+    def __teardown_process(self,
+                           label: str,
+                           process: AppProcess | None,
+                           *,
+                           terminate: bool = True) -> bool:
+        if process is None:
+            return True
+        if terminate:
+            self.__best_effort_teardown("{} terminate".format(label), process.terminate)
+        process_stopped = self.__bounded_join("{} join".format(label), process)
+        if process_stopped:
+            self.__best_effort_teardown("{} close_queues".format(label), process.close_queues)
+        return process_stopped
+
+    def __cleanup_active_command_processes_for_exit(self) -> None:
+        active_command_processes = list(getattr(self, "_Controller__active_command_processes", []))
+        if not active_command_processes:
+            return
+
+        for command_process in active_command_processes:
+            self.__teardown_process(
+                "active command process {}".format(getattr(command_process.process, "name", "?")),
+                command_process.process,
+            )
+
+        with self.__command_state_lock():
+            self.__active_command_processes = []
 
     def __report_dead_worker_once(self, worker: AppProcess | None, worker_name: str) -> None:
         if worker is None:
@@ -914,21 +955,14 @@ class Controller:
             except Exception:
                 self.logger.exception("Ignoring lftp teardown failure; continuing shutdown")
             finally:
-                self.__best_effort_teardown("active scan process terminate", self.__active_scan_process.terminate)
-                self.__best_effort_teardown("local scan process terminate", self.__local_scan_process.terminate)
-                self.__best_effort_teardown("remote scan process terminate", self.__remote_scan_process.terminate)
-                self.__best_effort_teardown("extract process terminate", self.__extract_process.terminate)
-                self.__best_effort_teardown("validate process terminate", self.__validate_process.terminate)
-                self.__bounded_join("active scan process join", self.__active_scan_process)
-                self.__best_effort_teardown("active scan process close_queues", self.__active_scan_process.close_queues)
-                self.__bounded_join("local scan process join", self.__local_scan_process)
-                self.__best_effort_teardown("local scan process close_queues", self.__local_scan_process.close_queues)
-                self.__bounded_join("remote scan process join", self.__remote_scan_process)
-                self.__best_effort_teardown("remote scan process close_queues", self.__remote_scan_process.close_queues)
-                self.__bounded_join("extract process join", self.__extract_process)
-                self.__best_effort_teardown("extract process close_queues", self.__extract_process.close_queues)
-                self.__bounded_join("validate process join", self.__validate_process)
-                self.__best_effort_teardown("validate process close_queues", self.__validate_process.close_queues)
+                self.__cleanup_active_command_processes_for_exit()
+                active_scan_process_stopped = self.__teardown_process("active scan process", self.__active_scan_process)
+                self.__teardown_process("local scan process", self.__local_scan_process)
+                self.__teardown_process("remote scan process", self.__remote_scan_process)
+                self.__teardown_process("extract process", self.__extract_process)
+                self.__teardown_process("validate process", self.__validate_process)
+                if active_scan_process_stopped:
+                    self.__best_effort_teardown("active scanner close", self.__active_scanner.close)
                 self.__best_effort_teardown("mp logger stop", self.__mp_logger.stop)
                 self.__started = False
                 self.__startup_failed = False
@@ -2489,8 +2523,7 @@ class Controller:
                                 504
                             )
                     finally:
-                        self.__bounded_join("stale delete command process join", command_process.process)
-                        command_process.process.close_queues()
+                        self.__teardown_process("stale delete command process", command_process.process, terminate=False)
                     continue
                 still_active_processes.append(command_process)
             else:
@@ -2605,7 +2638,6 @@ class Controller:
                                 },
                             )
                 finally:
-                    command_process.process.join()
-                    command_process.process.close_queues()
+                    self.__teardown_process("completed command process", command_process.process, terminate=False)
         with self.__command_state_lock():
             self.__active_command_processes = still_active_processes

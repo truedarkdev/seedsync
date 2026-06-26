@@ -111,8 +111,9 @@ class TestController(unittest.TestCase):
         ):
             process.is_alive.return_value = False
 
-    def _assert_exit_teardown(self):
+    def _assert_exit_teardown(self, *, still_alive_processes=None, active_scanner_closed=True):
         join_timeout = Controller._Controller__JOIN_TIMEOUT_IN_SECS
+        still_alive_processes = set() if still_alive_processes is None else set(still_alive_processes)
         for process in (
             self.controller._Controller__active_scan_process,
             self.controller._Controller__local_scan_process,
@@ -122,7 +123,14 @@ class TestController(unittest.TestCase):
         ):
             process.terminate.assert_called_once_with()
             process.join.assert_called_once_with(join_timeout)
-            process.close_queues.assert_called_once_with()
+            if process in still_alive_processes:
+                process.close_queues.assert_not_called()
+            else:
+                process.close_queues.assert_called_once_with()
+        if active_scanner_closed:
+            self.controller._Controller__active_scanner.close.assert_called_once_with()
+        else:
+            self.controller._Controller__active_scanner.close.assert_not_called()
         self.controller._Controller__mp_logger.stop.assert_called_once_with()
         self.assertFalse(self.controller._Controller__started)
         self.assertFalse(self.controller._Controller__startup_failed)
@@ -684,8 +692,9 @@ class TestController(unittest.TestCase):
     def test_exit_continues_when_worker_join_times_out(self):
         self.controller._Controller__started = True
         self._set_exit_worker_processes_not_alive()
-        self.controller._Controller__extract_process.is_alive.return_value = True
-        self.controller._Controller__extract_process.name = "extract process"
+        stuck_process = self.controller._Controller__extract_process
+        stuck_process.is_alive.return_value = True
+        stuck_process.name = "extract process"
 
         self.controller.exit()
 
@@ -694,7 +703,26 @@ class TestController(unittest.TestCase):
             "extract process",
             Controller._Controller__JOIN_TIMEOUT_IN_SECS
         )
-        self._assert_exit_teardown()
+        self._assert_exit_teardown(still_alive_processes={stuck_process})
+
+    def test_exit_skips_active_scanner_close_when_active_scan_join_times_out(self):
+        self.controller._Controller__started = True
+        self._set_exit_worker_processes_not_alive()
+        stuck_process = self.controller._Controller__active_scan_process
+        stuck_process.is_alive.return_value = True
+        stuck_process.name = "active scan process"
+
+        self.controller.exit()
+
+        self.controller.logger.warning.assert_called_once_with(
+            "Worker %s did not exit within %ss; continuing teardown",
+            "active scan process",
+            Controller._Controller__JOIN_TIMEOUT_IN_SECS
+        )
+        self._assert_exit_teardown(
+            still_alive_processes={stuck_process},
+            active_scanner_closed=False,
+        )
 
     def test_exit_continues_shutdown_when_lftp_raises_unexpected_error(self):
         self.controller._Controller__started = True
@@ -705,6 +733,39 @@ class TestController(unittest.TestCase):
 
         self.controller.logger.exception.assert_any_call("Ignoring lftp teardown failure; continuing shutdown")
         self._assert_exit_teardown()
+
+    def test_exit_terminates_and_clears_active_command_processes(self):
+        self.controller._Controller__started = True
+        self._set_exit_worker_processes_not_alive()
+        command_process = MagicMock()
+        command_process.name = "DeleteRemoteProcess"
+        command_process.is_alive.return_value = False
+        self.controller._Controller__active_command_processes = [
+            SimpleNamespace(process=command_process)
+        ]
+
+        self.controller.exit()
+
+        command_process.terminate.assert_called_once_with()
+        command_process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        command_process.close_queues.assert_called_once_with()
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+
+    def test_teardown_process_skips_close_queues_when_join_times_out(self):
+        process = MagicMock()
+        process.name = "stuck worker"
+        process.is_alive.return_value = True
+
+        self.controller._Controller__teardown_process("stuck worker", process)
+
+        process.terminate.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        process.close_queues.assert_not_called()
+        self.controller.logger.warning.assert_called_once_with(
+            "Worker %s did not exit within %ss; continuing teardown",
+            "stuck worker",
+            Controller._Controller__JOIN_TIMEOUT_IN_SECS
+        )
 
     @patch("controller.controller.os.makedirs")
     def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
@@ -1105,6 +1166,7 @@ class TestController(unittest.TestCase):
         old_active_process = self.controller._Controller__active_scan_process
         old_local_process = self.controller._Controller__local_scan_process
         old_remote_process = self.controller._Controller__remote_scan_process
+        old_active_scanner = self.controller._Controller__active_scanner
         validate_process = self.controller._Controller__validate_process
         model_builder = self.controller._Controller__model_builder
 
@@ -1125,6 +1187,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_downloading_file_names = [("dup", "movies", "Movies")]
         self.controller._Controller__active_extracting_file_names = []
         self.controller._Controller__set_active_scanner_files = MagicMock()
+        old_active_process.is_alive.return_value = False
+        old_local_process.is_alive.return_value = False
+        old_remote_process.is_alive.return_value = False
         new_active_process = MagicMock()
         new_local_process = MagicMock()
         new_remote_process = MagicMock()
@@ -1137,9 +1202,13 @@ class TestController(unittest.TestCase):
         old_active_process.terminate.assert_called_once_with()
         old_local_process.terminate.assert_called_once_with()
         old_remote_process.terminate.assert_called_once_with()
-        old_active_process.join.assert_called_once_with()
-        old_local_process.join.assert_called_once_with()
-        old_remote_process.join.assert_called_once_with()
+        old_active_process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        old_local_process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        old_remote_process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        old_active_process.close_queues.assert_called_once_with()
+        old_local_process.close_queues.assert_called_once_with()
+        old_remote_process.close_queues.assert_called_once_with()
+        old_active_scanner.close.assert_called_once_with()
 
         new_active_process.start.assert_called_once_with()
         new_local_process.start.assert_called_once_with()
@@ -1173,6 +1242,55 @@ class TestController(unittest.TestCase):
             os.path.join("/local/movies", "incomplete"),
             self.controller._Controller__path_pair_staging_paths["movies"]
         )
+
+    @patch("controller.controller.ScannerProcess")
+    def test_refresh_path_pairs_skips_old_active_scanner_close_when_old_active_process_stays_alive(self, scanner_process_cls):
+        movies_pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/local/movies",
+            enabled=True,
+            auto_queue=False,
+        )
+        old_active_process = self.controller._Controller__active_scan_process
+        old_local_process = self.controller._Controller__local_scan_process
+        old_remote_process = self.controller._Controller__remote_scan_process
+        old_active_scanner = self.controller._Controller__active_scanner
+
+        self.controller._Controller__context.path_pair_manager = MagicMock()
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [movies_pair]
+        self.controller._Controller__context.config.lftp.staging_path = None
+        self.controller._Controller__context.config.lftp.use_temp_file = False
+        self.controller._Controller__context.config.controller.managed_extract_folders_enabled = False
+        self.controller._Controller__context.config.controller.interval_ms_downloading_scan = 100
+        self.controller._Controller__context.config.controller.interval_ms_local_scan = 200
+        self.controller._Controller__context.config.controller.interval_ms_remote_scan = 300
+        self.controller._Controller__context.config.lftp.remote_address = "host"
+        self.controller._Controller__context.config.lftp.remote_port = 22
+        self.controller._Controller__context.config.lftp.remote_username = "user"
+        self.controller._Controller__context.config.lftp.remote_path_to_scan_script = "/scanfs"
+        self.controller._Controller__context.args.local_path_to_scanfs = "/local-scanfs"
+        self.controller._Controller__started = True
+        self.controller._Controller__set_active_scanner_files = MagicMock()
+        old_active_process.is_alive.return_value = True
+        old_active_process.name = "old active scan process"
+        old_local_process.is_alive.return_value = False
+        old_remote_process.is_alive.return_value = False
+        new_active_process = MagicMock()
+        new_local_process = MagicMock()
+        new_remote_process = MagicMock()
+        scanner_process_cls.side_effect = [new_active_process, new_local_process, new_remote_process]
+
+        with patch("controller.controller.os.makedirs"):
+            self.controller._Controller__apply_path_pair_refresh()
+
+        old_active_process.terminate.assert_called_once_with()
+        old_active_process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
+        old_active_process.close_queues.assert_not_called()
+        old_active_scanner.close.assert_not_called()
+        old_local_process.close_queues.assert_called_once_with()
+        old_remote_process.close_queues.assert_called_once_with()
 
     def test_refresh_path_pairs_marks_pending_refresh_when_started(self):
         self.controller._Controller__started = True
@@ -2933,7 +3051,7 @@ class TestController(unittest.TestCase):
         post_callback.assert_called_once_with()
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
-        process.join.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
@@ -2967,7 +3085,7 @@ class TestController(unittest.TestCase):
         post_callback.assert_not_called()
         callback.on_success.assert_not_called()
         callback.on_failure.assert_called_once_with("File 'dup' does not exist locally", 404)
-        process.join.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
@@ -3010,7 +3128,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(["command_failed"], [call.args[1] for call in breadcrumb_calls])
         self.assertEqual(500, breadcrumb_calls[0].args[2]["error_code"])
         self.assertNotIn("completion", breadcrumb_calls[0].args[2])
-        process.join.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
 
@@ -3048,7 +3166,7 @@ class TestController(unittest.TestCase):
         ]
         self.assertEqual(["command_finished"], [call.args[1] for call in breadcrumb_calls])
         self.assertEqual("completed", breadcrumb_calls[0].args[2]["completion"])
-        process.join.assert_called_once_with()
+        process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
 
@@ -3091,7 +3209,7 @@ class TestController(unittest.TestCase):
         duplicate_callback.on_success.assert_not_called()
         process.terminate.assert_called_once_with()
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
-        process.close_queues.assert_called_once_with()
+        process.close_queues.assert_not_called()
         callback.on_failure.assert_called_once_with("Delete command for file 'dup' timed out", 504)
         duplicate_callback.on_failure.assert_called_once_with("Delete command for file 'dup' timed out", 504)
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
@@ -3135,7 +3253,7 @@ class TestController(unittest.TestCase):
         post_callback.assert_not_called()
         process.terminate.assert_called_once_with()
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
-        process.close_queues.assert_called_once_with()
+        process.close_queues.assert_not_called()
         self.assertEqual([], self.controller._Controller__active_command_processes)
         breadcrumb_calls = [
             call
