@@ -56,6 +56,7 @@ describe("settings options list", () => {
         ]);
         expect(OPTIONS_CONTEXT_OTHER.options.map(option => option.valuePath.join("."))).toEqual([
             "general.log_level",
+            "general.verbose",
             "logging.log_format",
             "general.breadcrumb_trace_enabled",
             "validate.xfer_verify",
@@ -78,6 +79,11 @@ describe("settings options list", () => {
             {label: "Standard", value: "standard"},
             {label: "JSON", value: "json"},
         ]);
+        const verboseLogging = diagnostics.options.find(option => option.valuePath[1] === "verbose")!;
+        expect(verboseLogging.type).toBe(OptionType.Checkbox);
+        expect(verboseLogging.label).toBe("Verbose LFTP Logging");
+        expect(verboseLogging.valuePath).toEqual(["general", "verbose"]);
+        expect(verboseLogging.description).toContain("Debug");
         expect(breadcrumbTrace.type).toBe(OptionType.Checkbox);
         expect(breadcrumbTrace.label).toBe("Enable breadcrumb trace recorder");
         expect(breadcrumbTrace.valuePath).toEqual(["general", "breadcrumb_trace_enabled"]);

@@ -233,6 +233,12 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
                     ]
                 },
                 {
+                    type: OptionType.Checkbox,
+                    label: "Verbose LFTP Logging",
+                    valuePath: ["general", "verbose"],
+                    description: "Logs all LFTP command output. Set Log Level to Debug to see it."
+                },
+                {
                     type: OptionType.Select,
                     label: "Log Format",
                     valuePath: ["logging", "log_format"],
@@ -285,6 +291,12 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
                 {label: "Warning", value: "WARNING"},
                 {label: "Error", value: "ERROR"},
             ]
+        },
+        {
+            type: OptionType.Checkbox,
+            label: "Verbose LFTP Logging",
+            valuePath: ["general", "verbose"],
+            description: "Logs all LFTP command output. Set Log Level to Debug to see it."
         },
         {
             type: OptionType.Select,

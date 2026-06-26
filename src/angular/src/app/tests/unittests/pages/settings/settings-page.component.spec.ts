@@ -247,6 +247,7 @@ describe("Testing settings page component", () => {
     it("should expose grouped diagnostics, validation, and application options in other settings", () => {
         const [diagnostics, validation, application] = component.OPTIONS_CONTEXT_OTHER.groups!;
         const logLevelOption = diagnostics.options.find(option => option.label === "Log Level")!;
+        const verboseLoggingOption = diagnostics.options.find(option => option.label === "Verbose LFTP Logging")!;
         const logFormatOption = diagnostics.options.find(option => option.label === "Log Format")!;
         const breadcrumbTraceOption = diagnostics.options.find(option => option.label === "Enable breadcrumb trace recorder")!;
         const xferVerifyOption = validation.options[0]!;
@@ -259,6 +260,9 @@ describe("Testing settings page component", () => {
         expect(logLevelOption.choices![1]).toEqual({label: "Info", value: "INFO"});
         expect(logLevelOption.choices![2]).toEqual({label: "Warning", value: "WARNING"});
         expect(logLevelOption.choices![3]).toEqual({label: "Error", value: "ERROR"});
+        expect(verboseLoggingOption.label).toBe("Verbose LFTP Logging");
+        expect(verboseLoggingOption.valuePath).toEqual(["general", "verbose"]);
+        expect(verboseLoggingOption.description).toContain("Debug");
         expect(logFormatOption.label).toBe("Log Format");
         expect(logFormatOption.valuePath).toEqual(["logging", "log_format"]);
         expect(logFormatOption.choices![0]).toEqual({label: "Standard", value: "standard"});
