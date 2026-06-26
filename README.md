@@ -5,11 +5,20 @@
 > This repository is a maintained integration fork of [ipsingh06/seedsync](https://github.com/ipsingh06/seedsync).
 
 <p align="center">
+  <a href="https://github.com/truedarkdev/seedsync/actions/workflows/master.yml">
+    <img src="https://img.shields.io/github/actions/workflow/status/truedarkdev/seedsync/master.yml?branch=master" alt="CI">
+  </a>
   <a href="https://github.com/truedarkdev/seedsync">
     <img src="https://img.shields.io/github/stars/truedarkdev/seedsync" alt="Stars">
   </a>
   <a href="https://github.com/truedarkdev/seedsync/releases/latest">
     <img src="https://img.shields.io/github/v/release/truedarkdev/seedsync" alt="Release">
+  </a>
+  <a href="https://github.com/truedarkdev/seedsync/blob/master/src/angular/package.json">
+    <img src="https://img.shields.io/badge/Angular-21-DD0031?logo=angular&logoColor=white" alt="Angular 21">
+  </a>
+  <a href="https://github.com/truedarkdev/seedsync/blob/master/src/python/pyproject.toml">
+    <img src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white" alt="Python 3.11 | 3.12">
   </a>
   <a href="https://github.com/truedarkdev/seedsync/blob/master/LICENSE.txt">
     <img src="https://img.shields.io/github/license/truedarkdev/seedsync" alt="License">
