@@ -6,6 +6,16 @@
 **/.pytest_cache
 **/.ruff_cache
 **/.mypy_cache
+src/docker/build/test-image
+src/python/.local
+src/python/venv
+**/*.pyo
+**/*.egg-info
+.env
+.env.*
+*.log
+Makefile
+docker-compose*.yml
 .git
 .idea
 build
