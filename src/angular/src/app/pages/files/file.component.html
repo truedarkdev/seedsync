@@ -9,29 +9,41 @@
         </div>
         <div class="status">
             <img src="assets/icons/default-remote.svg" id="default-remote"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize > 0" />
+                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize > 0"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/default-local.svg" id="default-local"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize === 0 && file.localSize > 0" />
+                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize === 0 && file.localSize > 0"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/queued.svg" id="queued"
-                 *ngIf="file.status === ViewFile.Status.QUEUED" />
+                 *ngIf="file.status === ViewFile.Status.QUEUED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/downloading.svg" id="downloading"
-                 *ngIf="file.status === ViewFile.Status.DOWNLOADING" />
+                 *ngIf="file.status === ViewFile.Status.DOWNLOADING"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/downloaded.svg" id="downloaded"
-                 *ngIf="file.status === ViewFile.Status.DOWNLOADED" />
+                 *ngIf="file.status === ViewFile.Status.DOWNLOADED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/stopped.svg" id="stopped"
-                 *ngIf="file.status === ViewFile.Status.STOPPED" />
+                 *ngIf="file.status === ViewFile.Status.STOPPED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/deleted.svg" id="deleted"
-                 *ngIf="file.status === ViewFile.Status.DELETED" />
+                 *ngIf="file.status === ViewFile.Status.DELETED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/extracting.svg" id="extracting"
-                 *ngIf="file.status === ViewFile.Status.EXTRACTING" />
+                 *ngIf="file.status === ViewFile.Status.EXTRACTING"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/extracted.svg" id="extracted"
-                 *ngIf="file.status === ViewFile.Status.EXTRACTED" />
+                 *ngIf="file.status === ViewFile.Status.EXTRACTED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/validating.svg" id="validating"
-                 *ngIf="file.status === ViewFile.Status.VALIDATING" />
+                 *ngIf="file.status === ViewFile.Status.VALIDATING"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/validated.svg" id="validated"
-                 *ngIf="file.status === ViewFile.Status.VALIDATED" />
+                 *ngIf="file.status === ViewFile.Status.VALIDATED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/corrupt.svg" id="corrupt"
-                 *ngIf="file.status === ViewFile.Status.CORRUPT" />
+                 *ngIf="file.status === ViewFile.Status.CORRUPT"
+                 alt="" aria-hidden="true" />
             <!-- don't show text for default status unless the file is local-only -->
             <span *ngIf="file.status != ViewFile.Status.DEFAULT"
                   class="text">{{file.status | capitalize}}</span>
@@ -39,10 +51,10 @@
                   class="text">Local Only</span>
         </div>
         <div class="name">
-            <img src="assets/icons/file-light.svg" *ngIf="!file.isDir && !file.isArchive" />
-            <img src="assets/icons/file-archive-light.svg" *ngIf="!file.isDir && file.isArchive" />
-            <img src="assets/icons/directory-light.svg" *ngIf="file.isDir && !file.isArchive" />
-            <img src="assets/icons/directory-archive-light.svg" *ngIf="file.isDir && file.isArchive" />
+            <img src="assets/icons/file-light.svg" *ngIf="!file.isDir && !file.isArchive" alt="" aria-hidden="true" />
+            <img src="assets/icons/file-archive-light.svg" *ngIf="!file.isDir && file.isArchive" alt="" aria-hidden="true" />
+            <img src="assets/icons/directory-light.svg" *ngIf="file.isDir && !file.isArchive" alt="" aria-hidden="true" />
+            <img src="assets/icons/directory-archive-light.svg" *ngIf="file.isDir && file.isArchive" alt="" aria-hidden="true" />
             <div class="text">
                 <div class="title">
                     {{file.name}}
@@ -107,15 +119,15 @@
 
     <!-- actions div, visible on selection -->
     <div class="actions" *ngIf="showActions">
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isQueueable() ? null : true"
+        <button type="button" class="button" appClickStopPropagation
+             [disabled]="!isQueueable()"
              [class.disabled]="!isQueueable()"
-             (click)="!isQueueable() || onQueue(file)"
+             (click)="onQueue(file)"
              [class.loading]="activeAction == FileAction.QUEUE">
             <div class="loader"></div>
-            <img src="assets/icons/queue.svg" />
+            <img src="assets/icons/queue.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Queue</span></div>
-        </div>
+        </button>
         <button type="button" class="button stop-action" appClickStopPropagation
              [disabled]="!isStoppable()"
              [attr.aria-disabled]="!isStoppable()"
@@ -123,44 +135,44 @@
              (click)="onStop(file)"
              [class.loading]="activeAction == FileAction.STOP">
             <div class="loader"></div>
-            <img src="assets/icons/stop.svg" />
+            <img src="assets/icons/stop.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Stop</span></div>
         </button>
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isExtractable() ? null : true"
+        <button type="button" class="button" appClickStopPropagation
+             [disabled]="!isExtractable()"
              [class.disabled]="!isExtractable()"
-             (click)="!isExtractable() || onExtract(file)"
+             (click)="onExtract(file)"
              [class.loading]="activeAction == FileAction.EXTRACT">
             <div class="loader"></div>
-            <img src="assets/icons/extract.svg" />
+            <img src="assets/icons/extract.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Extract</span></div>
-        </div>
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isLocallyDeletable() ? null : true"
+        </button>
+        <button type="button" class="button" appClickStopPropagation
+             [disabled]="!isLocallyDeletable()"
              [class.disabled]="!isLocallyDeletable()"
-             (click)="!isLocallyDeletable() || onDeleteLocal(file)"
+             (click)="onDeleteLocal(file)"
              [class.loading]="activeAction == FileAction.DELETE_LOCAL">
             <div class="loader"></div>
-            <img src="assets/icons/delete-local.svg" />
+            <img src="assets/icons/delete-local.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Delete Local</span></div>
-        </div>
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isRemotelyDeletable() ? null : true"
+        </button>
+        <button type="button" class="button" appClickStopPropagation
+             [disabled]="!isRemotelyDeletable()"
              [class.disabled]="!isRemotelyDeletable()"
-             (click)="!isRemotelyDeletable() || onDeleteRemote(file)"
+             (click)="onDeleteRemote(file)"
              [class.loading]="activeAction == FileAction.DELETE_REMOTE">
             <div class="loader"></div>
-            <img src="assets/icons/delete-remote.svg" />
+            <img src="assets/icons/delete-remote.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Delete Remote</span></div>
-        </div>
-        <div class="button" appClickStopPropagation
-             [attr.disabled]="isValidatable() ? null : true"
+        </button>
+        <button type="button" class="button" appClickStopPropagation
+             [disabled]="!isValidatable()"
              [class.disabled]="!isValidatable()"
-             (click)="!isValidatable() || onValidate(file)"
+             (click)="onValidate(file)"
              [class.loading]="activeAction == FileAction.VALIDATE">
             <div class="loader"></div>
-            <img src="assets/icons/validate.svg" />
+            <img src="assets/icons/validate.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Validate</span></div>
-        </div>
+        </button>
     </div>
 </div>

@@ -171,6 +171,13 @@
 }
 .actions .button {
     @extend %button;
+    -moz-appearance: none;
+    appearance: none;
+    -webkit-appearance: none;
+    box-sizing: border-box;
+    font: inherit;
+    line-height: inherit;
+    margin: 0;
     padding: 0;
 
     /* bottom margin for when buttons get wrapped to multiple rows */
