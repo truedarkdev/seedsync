@@ -50,7 +50,7 @@
                class="form-control"
                [disabled]="disabled || value === null || value === undefined"
                (change)="onChange($event.target.value)">
-            <option *ngFor="let choice of choices"
+            <option *ngFor="let choice of effectiveChoices"
                     [value]="choice.value"
                     [selected]="choice.value === value">{{choice.label}}</option>
         </select>

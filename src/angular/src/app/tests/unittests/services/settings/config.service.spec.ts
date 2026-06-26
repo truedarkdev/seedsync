@@ -87,6 +87,7 @@ describe("Testing config service", () => {
 
         expect(latestConfig).not.toBe(null);
         expect(latestConfig.general.log_level).toBe("DEBUG");
+        expect(latestConfig.general.debug).toBe(true);
         httpMock.verify();
     });
 
@@ -148,7 +149,7 @@ describe("Testing config service", () => {
                 patterns_only: false
             },
             logging: {
-                log_format: "JSON"
+                log_format: "MiXeD"
             }
         };
         httpMock.expectOne("/server/config/get").flush(configJson);
@@ -156,6 +157,7 @@ describe("Testing config service", () => {
         configService.config.subscribe({
             next: config => {
                 expect(config.general.log_level).toBe("DEBUG");
+                expect(config.general.debug).toBe(true);
                 expect(config.general.verbose).toBe(false);
                 expect(config.general.breadcrumb_trace_enabled).toBe(true);
                 expect(config.lftp.remote_address).toBe("remote.server.com");
@@ -179,6 +181,7 @@ describe("Testing config service", () => {
                 expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
                 expect(config.validate.xfer_verify).toBe(true);
                 expect(configService.requiresRestart("general", "log_level")).toBe(true);
+                expect(configService.requiresRestart("general", "debug")).toBe(true);
                 expect(configService.requiresRestart("general", "verbose")).toBe(false);
                 expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
                 expect(configService.requiresRestart("lftp", "remote_address")).toBe(true);
@@ -191,7 +194,7 @@ describe("Testing config service", () => {
                 expect(config.autoqueue.enabled).toBe(true);
                 expect(config.autoqueue.patterns_only).toBe(false);
                 expect(config.autoqueue.auto_delete_remote).toBe(false);
-                expect(config.logging.log_format).toBe("json");
+                expect(config.logging.log_format).toBe("MiXeD");
             }
         });
 
@@ -362,9 +365,39 @@ describe("Testing config service", () => {
     it("should send a POST on setting log format", () => {
         httpMock.expectOne("/server/config/get").flush({logging: {log_format: "standard"}});
 
-        configService.set("logging", "log_format", "STANDARD").subscribe(DoNothing);
+        configService.set("logging", "log_format", "MiXeD").subscribe(DoNothing);
 
-        expectConfigSetRequest("logging", "log_format", "standard");
+        expectConfigSetRequest("logging", "log_format", "MiXeD");
+        httpMock.verify();
+    });
+
+    it("should send debug updates through the log level endpoint and keep derived config in sync", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            general: {log_level: "INFO"},
+            restart_required: {
+                general: {log_level: true}
+            }
+        });
+
+        let latestConfig = null;
+        configService.config.subscribe({
+            next: config => {
+                latestConfig = config;
+            }
+        });
+
+        expect(configService.requiresRestart("general", "debug")).toBe(true);
+
+        configService.set("general", "debug", true).subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "DEBUG");
+        expect(latestConfig.general.log_level).toBe("DEBUG");
+        expect(latestConfig.general.debug).toBe(true);
+
+        configService.set("general", "debug", false).subscribe(DoNothing);
+        expectConfigSetRequest("general", "log_level", "INFO");
+        expect(latestConfig.general.log_level).toBe("INFO");
+        expect(latestConfig.general.debug).toBe(false);
+
         httpMock.verify();
     });
 

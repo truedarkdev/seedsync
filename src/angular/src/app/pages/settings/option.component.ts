@@ -28,6 +28,15 @@ export class OptionComponent implements OnInit {
 
     private newValue = new Subject<any>();
 
+    get effectiveChoices(): IOptionChoice[] {
+        const choices = this.choices || [];
+        const currentValue = this.value;
+        if (typeof currentValue === "string" && currentValue.length > 0 && !choices.some(choice => choice.value === currentValue)) {
+            return [{label: currentValue, value: currentValue}, ...choices];
+        }
+        return choices;
+    }
+
     // noinspection JSUnusedGlobalSymbols
     ngOnInit(): void {
         // Debounce

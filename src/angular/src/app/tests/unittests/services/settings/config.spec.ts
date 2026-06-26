@@ -56,7 +56,7 @@ describe("Testing config record initialization", () => {
                 auto_extract: true,
             },
             logging: {
-                log_format: "JSON"
+                log_format: "MiXeD"
             }
         };
         config = new Config(configJson);
@@ -65,6 +65,7 @@ describe("Testing config record initialization", () => {
 
     it("should initialize with correct values", () => {
         expect(config.general.log_level).toBe("DEBUG");
+        expect(config.general.debug).toBe(true);
         expect(config.general.verbose).toBe(false);
         expect(config.general.exclude_patterns).toBe("*.nfo,Sample/");
         expect(config.general.breadcrumb_trace_enabled).toBe(true);
@@ -101,7 +102,7 @@ describe("Testing config record initialization", () => {
         expect(config.autoqueue.patterns_only).toBe(false);
         expect(config.autoqueue.auto_extract).toBe(true);
         expect(config.autoqueue.auto_delete_remote).toBe(false);
-        expect(config.logging.log_format).toBe("json");
+        expect(config.logging.log_format).toBe("MiXeD");
     });
 
     it("should be immutable", () => {
@@ -120,11 +121,13 @@ describe("Testing config record initialization", () => {
         const partialConfig = new Config({general: {log_level: "DEBUG"}});
 
         expect(partialConfig.general.log_level).toBe("DEBUG");
+        expect(partialConfig.general.debug).toBe(true);
         expect(partialConfig.general.breadcrumb_trace_enabled).toBe(null);
         expect(partialConfig.general.exclude_patterns).toBe("");
         expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
         expect(partialConfig.logging.log_format).toBe("standard");
         expect(partialConfig.getValue("general", "log_level")).toBe("DEBUG");
+        expect(partialConfig.getValue("general", "debug")).toBe(true);
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
@@ -138,10 +141,18 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("missing", "value")).toBe(null);
     });
 
-    it("should normalize logging format values", () => {
-        const normalizedConfig = new Config({
+    it("should derive debug from legacy debug input when log_level is absent", () => {
+        const legacyDebugConfig = new Config({general: {debug: "yes"}});
+
+        expect(legacyDebugConfig.general.log_level).toBe("DEBUG");
+        expect(legacyDebugConfig.general.debug).toBe(true);
+        expect(legacyDebugConfig.getValue("general", "debug")).toBe(true);
+    });
+
+    it("should preserve logging format values exactly while defaulting blanks", () => {
+        const preservedConfig = new Config({
             logging: {
-                log_format: "Standard"
+                log_format: "MiXeD"
             }
         });
         const blankLoggingConfig = new Config({
@@ -150,7 +161,9 @@ describe("Testing config record initialization", () => {
             }
         });
 
-        expect(normalizedConfig.logging.log_format).toBe("standard");
+        expect(preservedConfig.logging.log_format).toBe("MiXeD");
         expect(blankLoggingConfig.logging.log_format).toBe("standard");
+        expect(preservedConfig.getValue("logging", "log_format")).toBe("MiXeD");
+        expect(blankLoggingConfig.getValue("logging", "log_format")).toBe("standard");
     });
 });

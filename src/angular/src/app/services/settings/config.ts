@@ -10,12 +10,14 @@ import {Record} from "immutable";
  */
 interface IGeneral {
     log_level: string;
+    debug: boolean;
     verbose: boolean;
     exclude_patterns: string;
     breadcrumb_trace_enabled: boolean;
 }
 const DefaultGeneral: IGeneral = {
     log_level: "INFO",
+    debug: false,
     verbose: null,
     exclude_patterns: "",
     breadcrumb_trace_enabled: null
@@ -201,10 +203,7 @@ export class Config extends ConfigRecord implements IConfig {
             : {...general};
         if (normalized.log_level === undefined || normalized.log_level === null) {
             if (normalized.debug !== undefined) {
-                const debugValue = typeof normalized.debug === "string"
-                    ? normalized.debug.trim().toLowerCase()
-                    : normalized.debug;
-                normalized.log_level = ["y", "yes", "t", "true", "on", "1"].includes(String(debugValue))
+                normalized.log_level = Config.normalizeLegacyDebugValue(normalized.debug)
                     ? "DEBUG"
                     : "INFO";
             }
@@ -222,7 +221,7 @@ export class Config extends ConfigRecord implements IConfig {
         if (normalized.exclude_patterns === undefined || normalized.exclude_patterns === null) {
             delete normalized.exclude_patterns;
         }
-        delete normalized.debug;
+        normalized.debug = Config.isDebugLogLevel(normalized.log_level);
         return normalized as IGeneral;
     }
 
@@ -231,11 +230,8 @@ export class Config extends ConfigRecord implements IConfig {
             ? {...logging.toJS()}
             : {...logging};
         if (typeof normalized.log_format === "string") {
-            const logFormat = normalized.log_format.trim().toLowerCase();
-            if (logFormat.length === 0) {
+            if (normalized.log_format.trim().length === 0) {
                 delete normalized.log_format;
-            } else {
-                normalized.log_format = logFormat;
             }
         } else if (normalized.log_format === undefined || normalized.log_format === null) {
             delete normalized.log_format;
@@ -249,5 +245,23 @@ export class Config extends ConfigRecord implements IConfig {
             return sectionRecord.get(option);
         }
         return null;
+    }
+
+    private static normalizeLegacyDebugValue(debugValue: any): boolean {
+        if (debugValue === null || debugValue === undefined) {
+            return false;
+        }
+        if (typeof debugValue === "string") {
+            const normalizedDebugValue = debugValue.trim().toLowerCase();
+            if (normalizedDebugValue.length === 0) {
+                return false;
+            }
+            return ["y", "yes", "t", "true", "on", "1", "debug"].includes(normalizedDebugValue);
+        }
+        return Boolean(debugValue);
+    }
+
+    private static isDebugLogLevel(logLevel: any): boolean {
+        return typeof logLevel === "string" && logLevel.trim().toUpperCase() === "DEBUG";
     }
 }

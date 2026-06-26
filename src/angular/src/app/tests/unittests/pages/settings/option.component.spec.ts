@@ -69,6 +69,24 @@ describe("Testing option component", () => {
         expect(changeSpy).toHaveBeenCalledWith("json");
     }));
 
+    it("should keep unknown select values visible as the current option", () => {
+        component.type = OptionType.Select;
+        component.label = "Log Format";
+        component.value = "text";
+        component.choices = [
+            {label: "Standard", value: "standard"},
+            {label: "JSON", value: "json"},
+        ];
+
+        fixture.detectChanges();
+
+        const select = fixture.nativeElement.querySelector("select") as HTMLSelectElement;
+        const optionLabels = Array.from(select.options).map(option => option.textContent.trim());
+
+        expect(optionLabels[0]).toBe("text");
+        expect(select.selectedIndex).toBe(0);
+    });
+
     it("should emit the last value after the debounce window", fakeAsync(() => {
         const changeSpy = jasmine.createSpy("change");
         component.changeEvent.subscribe(changeSpy);
