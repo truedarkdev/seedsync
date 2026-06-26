@@ -226,16 +226,16 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
     id: "other-settings",
     options: [
         {
-            type: OptionType.Text,
-            label: "Web GUI Port",
-            valuePath: ["web", "port"],
-            description: null
-        },
-        {
-            type: OptionType.Checkbox,
-            label: "Enable breadcrumb trace recorder",
-            valuePath: ["general", "breadcrumb_trace_enabled"],
-            description: "Keeps a low-overhead recent-context window for debugging failures."
+            type: OptionType.Select,
+            label: "Log Level",
+            valuePath: ["general", "log_level"],
+            description: "Controls how much detail is written to the logs.",
+            choices: [
+                {label: "Debug", value: "DEBUG"},
+                {label: "Info", value: "INFO"},
+                {label: "Warning", value: "WARNING"},
+                {label: "Error", value: "ERROR"},
+            ]
         },
         {
             type: OptionType.Select,
@@ -248,17 +248,16 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
             ]
         },
         {
-            type: OptionType.Select,
-            label: "Log Level",
-            valuePath: ["general", "log_level"],
-            description: "Controls how much detail is written to the logs.",
-            choices: [
-                {label: "Debug", value: "DEBUG"},
-                {label: "Info", value: "INFO"},
-                {label: "Warning", value: "WARNING"},
-                {label: "Error", value: "ERROR"},
-                {label: "Critical", value: "CRITICAL"},
-            ]
+            type: OptionType.Text,
+            label: "Web GUI Port",
+            valuePath: ["web", "port"],
+            description: null
+        },
+        {
+            type: OptionType.Checkbox,
+            label: "Enable breadcrumb trace recorder",
+            valuePath: ["general", "breadcrumb_trace_enabled"],
+            description: "Keeps a low-overhead recent-context window for debugging failures."
         },
     ]
 };

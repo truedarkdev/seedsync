@@ -3,6 +3,7 @@ import {
     OPTIONS_CONTEXT_AUTOQUEUE,
     OPTIONS_CONTEXT_CONNECTIONS,
     OPTIONS_CONTEXT_DISCOVERY,
+    OPTIONS_CONTEXT_OTHER,
     OPTIONS_CONTEXT_SERVER,
     OPTIONS_CONTEXT_TRANSFER_PROTOCOL,
     OPTIONS_CONTEXT_VALIDATE
@@ -50,6 +51,29 @@ describe("settings options list", () => {
         expect(xferVerify.label).toBe("Verify transfers inline (recommended)");
         expect(xferVerify.valuePath).toEqual(["validate", "xfer_verify"]);
         expect(xferVerify.description).toContain("xfer:verify");
+    });
+
+    it("keeps log level and log format in Other Settings", () => {
+        const logLevel = OPTIONS_CONTEXT_OTHER.options.find(option => option.valuePath[1] === "log_level")!;
+        const logFormat = OPTIONS_CONTEXT_OTHER.options.find(option => option.valuePath[1] === "log_format")!;
+
+        expect(OPTIONS_CONTEXT_OTHER.header).toBe("Other Settings");
+        expect(logLevel.type).toBe(OptionType.Select);
+        expect(logLevel.label).toBe("Log Level");
+        expect(logLevel.valuePath).toEqual(["general", "log_level"]);
+        expect(logLevel.choices).toEqual([
+            {label: "Debug", value: "DEBUG"},
+            {label: "Info", value: "INFO"},
+            {label: "Warning", value: "WARNING"},
+            {label: "Error", value: "ERROR"},
+        ]);
+        expect(logFormat.type).toBe(OptionType.Select);
+        expect(logFormat.label).toBe("Log Format");
+        expect(logFormat.valuePath).toEqual(["logging", "log_format"]);
+        expect(logFormat.choices).toEqual([
+            {label: "Standard", value: "standard"},
+            {label: "JSON", value: "json"},
+        ]);
     });
 
     it("exposes remote python path under Server", () => {

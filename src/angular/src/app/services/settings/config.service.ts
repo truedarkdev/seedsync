@@ -56,8 +56,9 @@ export class ConfigService extends BaseWebService {
     }
 
     public requiresRestart(section: string, option: string): boolean {
+        const canonicalOption = this.resolveCanonicalOption(section, option);
         const sectionRestartOptions = this._restartRequiredOptions[section];
-        return Boolean(sectionRestartOptions && sectionRestartOptions[option]);
+        return Boolean(sectionRestartOptions && sectionRestartOptions[canonicalOption]);
     }
 
     /**
@@ -69,6 +70,7 @@ export class ConfigService extends BaseWebService {
      */
     public set(section: string, option: string, value: any): Observable<WebReaction> {
         const normalizedValue = this.normalizeValue(section, option, value);
+        const canonicalOption = this.resolveCanonicalOption(section, option);
         const valueStr: string = String(normalizedValue);
         const allowBlankValue = section === "lftp" &&
             (
@@ -94,13 +96,13 @@ export class ConfigService extends BaseWebService {
                 );
             });
         } else {
-            const url = this.CONFIG_SET_URL(section, option);
+            const url = this.CONFIG_SET_URL(section, canonicalOption);
             return this._restService.sendPostRequest(url, {value: normalizedValue}).pipe(
                 tap(reaction => {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const config = this._config.getValue();
-                        const newConfig = new Config(config.updateIn([section, option], (_) => normalizedValue));
+                        const newConfig = new Config(config.updateIn([section, canonicalOption], (_) => normalizedValue));
                         this._config.next(newConfig);
                     }
                 }),
@@ -143,6 +145,9 @@ export class ConfigService extends BaseWebService {
     }
 
     private normalizeValue(section: string, option: string, value: any): any {
+        if (section === "general" && option === "debug") {
+            return this.normalizeDebugValue(value);
+        }
         if (section === "lftp" && option === "net_socket_buffer") {
             return this.normalizeNetSocketBufferValue(value);
         }
@@ -150,6 +155,13 @@ export class ConfigService extends BaseWebService {
             return this.normalizeLogFormatValue(value);
         }
         return value;
+    }
+
+    private resolveCanonicalOption(section: string, option: string): string {
+        if (section === "general" && option === "debug") {
+            return "log_level";
+        }
+        return option;
     }
 
     private normalizeNetSocketBufferValue(value: any): string {
@@ -171,7 +183,28 @@ export class ConfigService extends BaseWebService {
         if (valueStr.length === 0) {
             return valueStr;
         }
-        return valueStr.toLowerCase();
+        return String(value);
+    }
+
+    private normalizeDebugValue(value: any): string {
+        if (value === null || value === undefined) {
+            return "";
+        }
+        if (typeof value === "string") {
+            const trimmed = value.trim();
+            if (trimmed.length === 0) {
+                return trimmed;
+            }
+            const lowered = trimmed.toLowerCase();
+            if (["y", "yes", "t", "true", "on", "1", "debug"].includes(lowered)) {
+                return "DEBUG";
+            }
+            if (["n", "no", "f", "false", "off", "0", "info"].includes(lowered)) {
+                return "INFO";
+            }
+            return trimmed.toUpperCase();
+        }
+        return value ? "DEBUG" : "INFO";
     }
 
     private wouldCreateBlankFtpsPassword(currentConfig: Config, section: string, option: string, value: any): boolean {

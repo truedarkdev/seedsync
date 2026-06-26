@@ -167,7 +167,7 @@ describe("Testing settings page component", () => {
         const notifService = TestBed.get(NotificationService) as MockNotificationService;
         configService.setRequiresRestart("general", "log_level", true);
 
-        component.onSetConfig("general", "log_level", "DEBUG");
+        component.onSetConfig("general", "log_level", "WARNING");
 
         expect(notifService.show).toHaveBeenCalledTimes(1);
         expect(notifService.show).toHaveBeenCalledWith(jasmine.objectContaining({
@@ -210,14 +210,13 @@ describe("Testing settings page component", () => {
     it("should not show config success notifications when a save fails", () => {
         const configService = TestBed.get(ConfigService) as MockConfigService;
         const notifService = TestBed.get(NotificationService) as MockNotificationService;
-        configService.setRequiresRestart("general", "log_level", true);
-        configService.setSaveResult(false, "Setting general.log_level cannot be blank.");
+        configService.setSaveResult(false, "Setting general.log_level failed.");
 
-        component.onSetConfig("general", "log_level", "");
+        component.onSetConfig("general", "log_level", "WARNING");
 
         expect(notifService.show).toHaveBeenCalledWith(jasmine.objectContaining({
             level: "danger",
-            text: "Setting general.log_level cannot be blank."
+            text: "Setting general.log_level failed."
         }));
         expect(notifService.show).not.toHaveBeenCalledWith(jasmine.objectContaining({
             text: Localization.Notification.CONFIG_RESTART
@@ -227,18 +226,32 @@ describe("Testing settings page component", () => {
         }));
     });
 
-    it("should expose the log format and log level options in other settings", () => {
-        const logFormatOption = component.OPTIONS_CONTEXT_OTHER.options[2]!;
-        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options[3]!;
+    it("should render other settings after validation without a standalone logging section", () => {
+        const rightHeaders = Array.from(
+            fixture.nativeElement.querySelectorAll("#right .card-header button")
+        ).map((button: HTMLButtonElement) => button.textContent.trim());
 
+        expect(rightHeaders).not.toContain("Logging");
+        expect(rightHeaders).toContain("Other Settings");
+        expect(rightHeaders.indexOf("Validation")).toBeLessThan(rightHeaders.indexOf("Other Settings"));
+    });
+
+    it("should expose log level and log format options in other settings", () => {
+        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options.find(option => option.label === "Log Level")!;
+        const logFormatOption = component.OPTIONS_CONTEXT_OTHER.options.find(option => option.label === "Log Format")!;
+
+        expect(component.OPTIONS_CONTEXT_OTHER.header).toBe("Other Settings");
+        expect(logLevelOption.label).toBe("Log Level");
+        expect(logLevelOption.valuePath).toEqual(["general", "log_level"]);
+        expect(logLevelOption.choices![0]).toEqual({label: "Debug", value: "DEBUG"});
+        expect(logLevelOption.choices![1]).toEqual({label: "Info", value: "INFO"});
+        expect(logLevelOption.choices![2]).toEqual({label: "Warning", value: "WARNING"});
+        expect(logLevelOption.choices![3]).toEqual({label: "Error", value: "ERROR"});
         expect(logFormatOption.label).toBe("Log Format");
         expect(logFormatOption.valuePath).toEqual(["logging", "log_format"]);
         expect(logFormatOption.choices![0]).toEqual({label: "Standard", value: "standard"});
         expect(logFormatOption.choices![1]).toEqual({label: "JSON", value: "json"});
-
-        expect(logLevelOption.label).toBe("Log Level");
-        expect(logLevelOption.valuePath).toEqual(["general", "log_level"]);
-        expect(logLevelOption.choices![0]).toEqual({label: "Debug", value: "DEBUG"});
+        expect(component.OPTIONS_CONTEXT_OTHER.options.some(option => option.label === "Enable Debug")).toBe(false);
     });
 
     it("should expose transfer verification in validation settings", () => {

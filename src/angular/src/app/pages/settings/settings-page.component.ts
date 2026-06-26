@@ -11,8 +11,8 @@ import {Localization} from "../../common/localization";
 import {NotificationService} from "../../services/utils/notification.service";
 import {ServerCommandService} from "../../services/server/server-command.service";
 import {
-    OPTIONS_CONTEXT_CONNECTIONS, OPTIONS_CONTEXT_DISCOVERY, OPTIONS_CONTEXT_OTHER,
-    OPTIONS_CONTEXT_SERVER, OPTIONS_CONTEXT_AUTOQUEUE, OPTIONS_CONTEXT_EXTRACT,
+    OPTIONS_CONTEXT_CONNECTIONS, OPTIONS_CONTEXT_DISCOVERY,
+    OPTIONS_CONTEXT_OTHER, OPTIONS_CONTEXT_SERVER, OPTIONS_CONTEXT_AUTOQUEUE, OPTIONS_CONTEXT_EXTRACT,
     OPTIONS_CONTEXT_TRANSFER_PROTOCOL, OPTIONS_CONTEXT_VALIDATE, IOption, IOptionsContext
 } from "./options-list";
 import {ConnectedService} from "../../services/utils/connected.service";
