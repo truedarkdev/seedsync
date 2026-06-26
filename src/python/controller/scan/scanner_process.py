@@ -206,14 +206,8 @@ class ScannerProcess(AppProcess):
 
     @overrides(AppProcess)
     def close_queues(self):
-        if self.__queue is not None:
-            self.__queue.close()
-            self.__queue.join_thread()
-            self.__queue = None
-        if self.__scan_target_queue is not None:
-            self.__scan_target_queue.close()
-            self.__scan_target_queue.join_thread()
-            self.__scan_target_queue = None
+        self.__queue = self._close_multiprocessing_queue(self.__queue)
+        self.__scan_target_queue = self._close_multiprocessing_queue(self.__scan_target_queue)
         if self.__wake_event is not None:
             self.__wake_event = None
         super().close_queues()

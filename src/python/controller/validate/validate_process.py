@@ -128,14 +128,8 @@ class ValidateProcess(AppProcess):
 
     @overrides(AppProcess)
     def close_queues(self):
-        if self.__command_queue is not None:
-            self.__command_queue.close()
-            self.__command_queue.join_thread()
-            self.__command_queue = None
-        if self.__status_result_queue is not None:
-            self.__status_result_queue.close()
-            self.__status_result_queue.join_thread()
-            self.__status_result_queue = None
+        self.__command_queue = self._close_multiprocessing_queue(self.__command_queue)
+        self.__status_result_queue = self._close_multiprocessing_queue(self.__status_result_queue)
         super().close_queues()
 
     def __publish_statuses(self):

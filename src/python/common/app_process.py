@@ -138,14 +138,19 @@ class AppProcess(Process):
         """
         Release multiprocessing resources after the process has been joined.
         """
-        if self.__exception_queue is not None:
-            self.__exception_queue.close()
-            self.__exception_queue.join_thread()
-            self.__exception_queue = None
+        self.__exception_queue = self._close_multiprocessing_queue(self.__exception_queue)
         self.mp_logger = None
         self._terminate = None
         self._mp_log_queue = None
         self._mp_log_level = None
+
+    @staticmethod
+    def _close_multiprocessing_queue(mp_queue):
+        if mp_queue is None:
+            return None
+        mp_queue.close()
+        mp_queue.join_thread()
+        return None
 
     def propagate_exception(self):
         """
