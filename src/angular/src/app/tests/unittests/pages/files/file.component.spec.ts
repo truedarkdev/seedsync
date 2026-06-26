@@ -95,6 +95,10 @@ describe("Testing file component", () => {
         fixture = TestBed.createComponent(FileComponent);
     });
 
+    function getActionButtons() {
+        return fixture.debugElement.queryAll(By.css(".actions .button"));
+    }
+
     it("should return false for action predicates when file is missing", () => {
         component.file = null;
 
@@ -357,5 +361,84 @@ describe("Testing file component", () => {
         expect(stopButton.disabled).toBe(true);
         expect(stopButton.classList.contains("loading")).toBe(false);
         expect(stopButton.getAttribute("aria-disabled")).toBe("true");
+    });
+
+    it("should render the action controls as native buttons with the expected disabled states", () => {
+        fixture.componentInstance.file = createViewFile({
+            isQueueable: true,
+            isStoppable: true,
+            isExtractable: true,
+            isArchive: true,
+            isLocallyDeletable: false,
+            isRemotelyDeletable: true,
+            isValidatable: false
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const actionButtons = getActionButtons().map(button => button.nativeElement as HTMLButtonElement);
+
+        expect(actionButtons.map(button => button.tagName.toLowerCase())).toEqual([
+            "button",
+            "button",
+            "button",
+            "button",
+            "button",
+            "button"
+        ]);
+        expect(actionButtons.map(button => (button.querySelector(".text span") as HTMLSpanElement).textContent?.trim())).toEqual([
+            "Queue",
+            "Stop",
+            "Extract",
+            "Delete Local",
+            "Delete Remote",
+            "Validate"
+        ]);
+        expect(actionButtons.map(button => button.disabled)).toEqual([
+            false,
+            false,
+            false,
+            true,
+            false,
+            true
+        ]);
+    });
+
+    it("should ignore clicks on a disabled native queue button", () => {
+        const queueSpy = spyOn(fixture.componentInstance.queueEvent, "emit");
+        fixture.componentInstance.file = createViewFile({isQueueable: false});
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const queueButton = getActionButtons()[0].nativeElement as HTMLButtonElement;
+        expect(queueButton.tagName.toLowerCase()).toBe("button");
+        expect(queueButton.disabled).toBe(true);
+
+        queueButton.click();
+
+        expect(queueSpy).not.toHaveBeenCalled();
+        expect(fixture.componentInstance.activeAction).toBe(null);
+    });
+
+    it("should invoke the native queue button when enabled", () => {
+        const queueSpy = spyOn(fixture.componentInstance.queueEvent, "emit");
+        fixture.componentInstance.file = createViewFile({isQueueable: true});
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const queueButton = getActionButtons()[0].nativeElement as HTMLButtonElement;
+        expect(queueButton.tagName.toLowerCase()).toBe("button");
+        expect(queueButton.disabled).toBe(false);
+
+        queueButton.click();
+
+        expect(fixture.componentInstance.activeAction).toBe(FileAction.QUEUE);
+        expect(queueSpy).toHaveBeenCalledWith(fixture.componentInstance.file);
     });
 });
