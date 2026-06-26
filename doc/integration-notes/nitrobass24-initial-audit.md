@@ -354,9 +354,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 335 | `6ba47dd35688925bf09fc21a81af2e137cee5e9c` | 2026-03-05 | ci: retrigger build | covered elsewhere |
 | 336 | `2f7675353545a633c2bbc62ccfec0811de4f395a` | 2026-03-04 | feat: replace paste WSGI server with Bottle built-in (#140) | adapted locally in `8b21f9f0` |
 | 337 | `139d97cc472a8fcbfed73d5337ada1857030dee5` | 2026-03-04 | feat: add multiple path pairs support (#122) | covered elsewhere |
-| 338 | `85f289492e20d9c29c475675791e856152f34f20` | 2026-03-05 | fix: address code review findings for path pairs PR | needs area reopen |
-| 339 | `61db57e7398215b2d469246e4279b50b2e4fef80` | 2026-03-05 | fix: address round 2 code review findings for path pairs PR | needs area reopen |
-| 340 | `06d1e0f76b57af7798991ec67f2760a5286ab8a1` | 2026-03-05 | fix: address round 3 code review findings for path pairs PR | needs area reopen |
+| 338 | `85f289492e20d9c29c475675791e856152f34f20` | 2026-03-05 | fix: address code review findings for path pairs PR | adapted locally in current path-pair hardening slice - existing local path-pair config fallback, pair metadata propagation, and server lifecycle architecture cover the mappable row-338 behavior |
+| 339 | `61db57e7398215b2d469246e4279b50b2e4fef80` | 2026-03-05 | fix: address round 2 code review findings for path pairs PR | adapted locally in current path-pair hardening slice - added bounded path-pair manager locking plus strict handler JSON-object and field-type validation |
+| 340 | `06d1e0f76b57af7798991ec67f2760a5286ab8a1` | 2026-03-05 | fix: address round 3 code review findings for path pairs PR | adapted locally in current path-pair hardening slice - added strict persisted `enabled`/`auto_queue` boolean validation while preserving existing delete/not-found handling |
 | 341 | `7aaceb68cc359969ef6a4a4d256e7cdc062eb326` | 2026-03-05 | Merge pull request #149 from nitrobass24/feat/multiple-path-pairs | covered elsewhere |
 | 342 | `41b2893ec56e572fd2dcee1ad2d84789a2cc645c` | 2026-03-05 | feat: make Python scanfs the primary scanner, drop PyInstaller (#80) (#148) | needs area reopen |
 | 343 | `08118e118104d903d778bc42e3c0686c068792a6` | 2026-03-05 | fix: remove stale paste reference and dead modal localization strings | covered elsewhere |

@@ -1,5 +1,6 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
+import json
 import os
 import shutil
 import tempfile
@@ -116,6 +117,54 @@ class TestPathPairManager(unittest.TestCase):
 
         with self.assertRaises(PathPairError):
             PathPair(name="Invalid", remote_path="/remote", local_path=[]).validate()
+
+    def test_validate_rejects_non_string_name_and_id(self):
+        cases = [
+            (dict(name=123, remote_path="/remote", local_path="/local"), "name must be a string"),
+            (dict(id=123, name="Invalid", remote_path="/remote", local_path="/local"), "id must be a string"),
+        ]
+
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(PathPairError) as context:
+                    PathPair(**kwargs).validate()
+                self.assertIn(expected, str(context.exception))
+
+    def test_validate_rejects_non_boolean_flags(self):
+        cases = [
+            (dict(enabled="yes", auto_queue=True), "enabled must be a boolean"),
+            (dict(enabled=True, auto_queue="yes"), "auto_queue must be a boolean"),
+        ]
+
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(PathPairError) as context:
+                    PathPair(
+                        name="Invalid",
+                        remote_path="/remote",
+                        local_path="/local",
+                        **kwargs
+                    ).validate()
+                self.assertIn(expected, str(context.exception))
+
+    def test_load_backs_up_and_recovers_from_non_boolean_flags(self):
+        with open(self.manager.file_path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "path_pairs": [{
+                    "id": "movies",
+                    "name": "Movies",
+                    "remote_path": "/remote/movies",
+                    "local_path": "/local/movies",
+                    "enabled": True,
+                    "auto_queue": "yes",
+                }]
+            }))
+
+        recovered = PathPairManager(self.temp_dir)
+        recovered.load()
+
+        self.assertEqual([], recovered.get_all_pairs())
+        self.assertTrue(os.path.isfile(self.manager.file_path + ".1.bak"))
 
     @patch("common.path_pair.is_running_in_docker", return_value=True)
     def test_validate_returns_docker_warning_for_non_downloads_path(self, _):
