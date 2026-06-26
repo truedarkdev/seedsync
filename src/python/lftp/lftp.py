@@ -50,6 +50,8 @@ class Lftp:
     __SET_COMMAND_AT_EXIT = "cmd:at-exit"
     __SET_USE_TEMP_FILE = "xfer:use-temp-file"
     __SET_TEMP_FILE_NAME = "xfer:temp-file-name"
+    __SET_XFER_VERIFY = "xfer:verify"
+    __SET_XFER_VERIFY_COMMAND = "xfer:verify-command"
     __SET_SFTP_AUTO_CONFIRM = "sftp:auto-confirm"
     __SET_SFTP_CONNECT_PROGRAM = "sftp:connect-program"
     __SET_SFTP_SET_PERMISSIONS = "sftp:set-permissions"
@@ -459,7 +461,7 @@ class Lftp:
         :return:
         """
         out = self.__run_command("set -a | grep {}".format(setting))  # type: ignore[arg-type]
-        m = re.search("set {} (.*)".format(setting), out)
+        m = re.search(r"^set {} (.*)$".format(re.escape(setting)), out, re.MULTILINE)
         if not m or not m.group or not m.group(1):
             raise LftpError("Failed to get setting '{}'. Output: '{}'".format(setting, out))
         return m.group(1).strip()
@@ -566,6 +568,22 @@ class Lftp:
     @use_temp_file.setter
     def use_temp_file(self, use_temp_file: bool):
         self.__set(Lftp.__SET_USE_TEMP_FILE, str(int(use_temp_file)))
+
+    @property
+    def xfer_verify(self) -> bool:
+        return Lftp.__to_bool(self.__get(Lftp.__SET_XFER_VERIFY))
+
+    @xfer_verify.setter
+    def xfer_verify(self, value: bool):
+        self.__set(Lftp.__SET_XFER_VERIFY, str(int(value)))
+
+    @property
+    def xfer_verify_command(self) -> str:
+        return self.__get(Lftp.__SET_XFER_VERIFY_COMMAND)
+
+    @xfer_verify_command.setter
+    def xfer_verify_command(self, command: str):
+        self.__set(Lftp.__SET_XFER_VERIFY_COMMAND, command)
 
     @property
     def temp_file_name(self) -> str:

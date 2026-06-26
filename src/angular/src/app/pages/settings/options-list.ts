@@ -107,6 +107,19 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
     ]
 };
 
+export const OPTIONS_CONTEXT_VALIDATE: IOptionsContext = {
+    header: "Validation",
+    id: "validation",
+    options: [
+        {
+            type: OptionType.Checkbox,
+            label: "Verify transfers inline (recommended)",
+            valuePath: ["validate", "xfer_verify"],
+            description: "Use lftp xfer:verify to validate files during transfer with the same hash command used by local validation."
+        },
+    ]
+};
+
 export const OPTIONS_CONTEXT_DISCOVERY: IOptionsContext = {
     header: "File Discovery",
     id: "file-discovery",

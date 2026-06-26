@@ -13,7 +13,7 @@ import {ServerCommandService} from "../../services/server/server-command.service
 import {
     OPTIONS_CONTEXT_CONNECTIONS, OPTIONS_CONTEXT_DISCOVERY, OPTIONS_CONTEXT_OTHER,
     OPTIONS_CONTEXT_SERVER, OPTIONS_CONTEXT_AUTOQUEUE, OPTIONS_CONTEXT_EXTRACT,
-    OPTIONS_CONTEXT_TRANSFER_PROTOCOL, IOption, IOptionsContext
+    OPTIONS_CONTEXT_TRANSFER_PROTOCOL, OPTIONS_CONTEXT_VALIDATE, IOption, IOptionsContext
 } from "./options-list";
 import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
@@ -36,6 +36,7 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     public OPTIONS_CONTEXT_DISCOVERY = OPTIONS_CONTEXT_DISCOVERY;
     public OPTIONS_CONTEXT_CONNECTIONS = OPTIONS_CONTEXT_CONNECTIONS;
     public OPTIONS_CONTEXT_TRANSFER_PROTOCOL = OPTIONS_CONTEXT_TRANSFER_PROTOCOL;
+    public OPTIONS_CONTEXT_VALIDATE = OPTIONS_CONTEXT_VALIDATE;
     public OPTIONS_CONTEXT_OTHER = OPTIONS_CONTEXT_OTHER;
     public OPTIONS_CONTEXT_AUTOQUEUE = OPTIONS_CONTEXT_AUTOQUEUE;
     public OPTIONS_CONTEXT_EXTRACT = OPTIONS_CONTEXT_EXTRACT;

@@ -74,6 +74,17 @@ const DefaultLftp: ILftp = {
 const LftpRecord = Record(DefaultLftp);
 
 /*
+ * VALIDATE
+ */
+interface IValidate {
+    xfer_verify: boolean;
+}
+const DefaultValidate: IValidate = {
+    xfer_verify: true,
+};
+const ValidateRecord = Record(DefaultValidate);
+
+/*
  * CONTROLLER
  */
 interface IController {
@@ -141,6 +152,7 @@ const LoggingRecord = Record(DefaultLogging);
 export interface IConfig {
     general: IGeneral;
     lftp: ILftp;
+    validate: IValidate;
     controller: IController;
     web: IWeb;
     autoqueue: IAutoQueue;
@@ -150,6 +162,7 @@ export interface IConfig {
 const DefaultConfig: IConfig = {
     general: null,
     lftp: null,
+    validate: null,
     controller: null,
     web: null,
     autoqueue: null,
@@ -161,6 +174,7 @@ const ConfigRecord = Record(DefaultConfig);
 export class Config extends ConfigRecord implements IConfig {
     general: IGeneral;
     lftp: ILftp;
+    validate: IValidate;
     controller: IController;
     web: IWeb;
     autoqueue: IAutoQueue;
@@ -173,6 +187,7 @@ export class Config extends ConfigRecord implements IConfig {
         super({
             general: GeneralRecord(general),
             lftp: LftpRecord((props && props.lftp) || {}),
+            validate: ValidateRecord((props && props.validate) || {}),
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
             autoqueue: AutoQueueRecord((props && props.autoqueue) || {}),

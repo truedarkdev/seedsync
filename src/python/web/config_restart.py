@@ -10,6 +10,10 @@ LFTP_RUNTIME_RECONFIGURE_FIELDS = frozenset((
     "net_socket_buffer",
 ))
 
+VALIDATE_RUNTIME_RECONFIGURE_FIELDS = frozenset((
+    "xfer_verify",
+))
+
 GENERAL_RUNTIME_RECONFIGURE_FIELDS = frozenset((
     "verbose",
     "exclude_patterns",
@@ -26,5 +30,7 @@ def requires_restart(section: str, key: str) -> bool:
     if section == "general" and key in GENERAL_RUNTIME_NO_RESTART_FIELDS:
         return False
     if section == "lftp" and key in LFTP_RUNTIME_RECONFIGURE_FIELDS:
+        return False
+    if section == "validate" and key in VALIDATE_RUNTIME_RECONFIGURE_FIELDS:
         return False
     return True

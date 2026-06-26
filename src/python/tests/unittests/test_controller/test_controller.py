@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from controller import Controller, ControllerPersist, ModelBuilder
 from controller.extract import ExtractStatus
+from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner
 from controller.controller import ControllerError
 from controller.persist_keys import KEY_SEP
@@ -889,6 +890,27 @@ class TestController(unittest.TestCase):
         self.assertEqual(0, self.controller._Controller__lftp.rate_limit)
         self.assertEqual(0, self.controller._Controller__lftp.net_socket_buffer)
         self.controller._Controller__lftp.set_verbose_logging.assert_called_once_with(True)
+
+    def test_configure_lftp_enables_xfer_verify_with_validate_hash_command(self):
+        self.controller._Controller__context.config.general = SimpleNamespace(verbose=False)
+        self.controller._Controller__context.config.validate = SimpleNamespace(xfer_verify=True)
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertTrue(self.controller._Controller__lftp.xfer_verify)
+        self.assertEqual(
+            ValidateProcess.HASH_COMMAND,
+            self.controller._Controller__lftp.xfer_verify_command
+        )
+
+    def test_configure_lftp_disables_xfer_verify_without_setting_verify_command(self):
+        self.controller._Controller__context.config.general = SimpleNamespace(verbose=False)
+        self.controller._Controller__context.config.validate = SimpleNamespace(xfer_verify=False)
+
+        self.controller._Controller__configure_lftp()
+
+        self.assertFalse(self.controller._Controller__lftp.xfer_verify)
+        self.assertNotIn("xfer_verify_command", self.controller._Controller__lftp.__dict__)
 
     def test_request_lftp_reconfigure_marks_pending_request(self):
         self.controller.request_lftp_reconfigure()

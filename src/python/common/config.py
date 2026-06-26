@@ -558,6 +558,20 @@ class Config(Persist):
                 config_dict["ftp_ssl_verify_certificate"] = True
             return super().from_dict(config_dict)
 
+    class Validate(IC):
+        xfer_verify = PROP("xfer_verify", Checkers.bool_value, Converters.bool)
+
+        def __init__(self):
+            super().__init__()
+            self.xfer_verify = True
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            if "xfer_verify" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["xfer_verify"] = True
+            return super().from_dict(config_dict)
+
     class Controller(IC):
         interval_ms_remote_scan = PROP("interval_ms_remote_scan", Checkers.int_positive, Converters.int)
         interval_ms_local_scan = PROP("interval_ms_local_scan", Checkers.int_positive, Converters.int)
@@ -630,6 +644,7 @@ class Config(Persist):
         self.file_path: str | None = None
         self.general = Config.General()
         self.lftp = Config.Lftp()
+        self.validate = Config.Validate()
         self.controller = Config.Controller()
         self.web = Config.Web()
         self.autoqueue = Config.AutoQueue()
@@ -705,6 +720,7 @@ class Config(Persist):
 
         config.general = Config.General.from_dict(Config._check_section(config_dict, "General"))
         config.lftp = Config.Lftp.from_dict(Config._check_section(config_dict, "Lftp"))
+        config.validate = Config.Validate.from_dict(config_dict.pop("Validate", {}))
         config.controller = Config.Controller.from_dict(Config._check_section(config_dict, "Controller"))
         config.web = Config.Web.from_dict(Config._check_section(config_dict, "Web"))
         config.autoqueue = Config.AutoQueue.from_dict(Config._check_section(config_dict, "AutoQueue"))
@@ -719,6 +735,7 @@ class Config(Persist):
         config_dict = collections.OrderedDict()
         config_dict["General"] = self.general.as_dict()
         config_dict["Lftp"] = self.lftp.as_dict()
+        config_dict["Validate"] = self.validate.as_dict()
         config_dict["Controller"] = self.controller.as_dict()
         config_dict["Web"] = self.web.as_dict()
         config_dict["AutoQueue"] = self.autoqueue.as_dict()

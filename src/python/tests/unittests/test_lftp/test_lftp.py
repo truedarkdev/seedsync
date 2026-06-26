@@ -946,6 +946,56 @@ class TestLftp(unittest.TestCase):
         with self.assertRaises(ConfigError):
             lftp.net_socket_buffer = "512KB"
 
+    def test_xfer_verify_and_command(self):
+        lftp = Lftp.__new__(Lftp)
+        state = {
+            "xfer_verify": False,
+            "xfer_verify_command": "sha256sum",
+        }
+
+        def run_command(command, *args, **kwargs):
+            if command == "set xfer:verify 1":
+                state["xfer_verify"] = True
+                return ""
+            if command == "set xfer:verify 0":
+                state["xfer_verify"] = False
+                return ""
+            if command == "set xfer:verify-command md5sum":
+                state["xfer_verify_command"] = "md5sum"
+                return ""
+            if command == "set xfer:verify-command sha256sum":
+                state["xfer_verify_command"] = "sha256sum"
+                return ""
+            if command == "set -a | grep xfer:verify-command":
+                return "set xfer:verify-command {}".format(state["xfer_verify_command"])
+            if command == "set -a | grep xfer:verify":
+                return "set xfer:verify {}".format("true" if state["xfer_verify"] else "false")
+            return ""
+
+        lftp._Lftp__run_command = MagicMock(side_effect=run_command)
+
+        lftp.xfer_verify = True
+        self.assertTrue(lftp.xfer_verify)
+        lftp.xfer_verify_command = "md5sum"
+        self.assertEqual("md5sum", lftp.xfer_verify_command)
+        lftp.xfer_verify = False
+        self.assertFalse(lftp.xfer_verify)
+
+        self.assertEqual(
+            [
+                ("set xfer:verify 1", {"require_prompt_ready": False}),
+                ("set -a | grep xfer:verify", {}),
+                ("set xfer:verify-command md5sum", {"require_prompt_ready": False}),
+                ("set -a | grep xfer:verify-command", {}),
+                ("set xfer:verify 0", {"require_prompt_ready": False}),
+                ("set -a | grep xfer:verify", {}),
+            ],
+            [
+                (call.args[0], call.kwargs)
+                for call in lftp._Lftp__run_command.call_args_list
+            ]
+        )
+
     @requires_live_ssh
     def test_min_chunk_size(self):
         self.lftp.min_chunk_size = 500

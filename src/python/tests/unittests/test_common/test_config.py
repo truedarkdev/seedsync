@@ -185,6 +185,7 @@ class TestConfig(unittest.TestCase):
         config = Config()
         self.assertTrue(config.has_section("general"))
         self.assertTrue(config.has_section("lftp"))
+        self.assertTrue(config.has_section("validate"))
         self.assertTrue(config.has_section("controller"))
         self.assertTrue(config.has_section("web"))
         self.assertTrue(config.has_section("autoqueue"))
@@ -430,6 +431,22 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "protocol", "ftp")
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_ftp_port", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "ftp_ssl_verify_certificate", "SomeString")
+
+    def test_validate(self):
+        good_dict = {
+            "xfer_verify": "True",
+        }
+        validate = Config.Validate.from_dict(good_dict)
+        self.assertEqual(True, validate.xfer_verify)
+        self.__check_unknown_error(Config.Validate, good_dict)
+        self.__check_empty_error(Config.Validate, good_dict, "xfer_verify")
+        self.check_bad_value_error(Config.Validate, good_dict, "xfer_verify", "SomeString")
+        self.check_bad_value_error(Config.Validate, good_dict, "xfer_verify", "-1")
+
+    def test_validate_defaults(self):
+        validate = Config.Validate()
+        self.assertEqual(True, validate.xfer_verify)
+        self.assertEqual(True, Config.Validate.from_dict({}).xfer_verify)
 
     def test_lftp_backfills_remote_python_path_to_python3_for_blank_values(self):
         good_dict = {
@@ -763,6 +780,9 @@ class TestConfig(unittest.TestCase):
         rate_limit=500K
         staging_path=/path/on/local/server/incomplete
 
+        [Validate]
+        xfer_verify=True
+
         [Controller]
         interval_ms_remote_scan=30000
         interval_ms_local_scan=10000
@@ -818,6 +838,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("sftp", config.lftp.protocol)
             self.assertEqual(21, config.lftp.remote_ftp_port)
             self.assertEqual(True, config.lftp.ftp_ssl_verify_certificate)
+            self.assertEqual(True, config.validate.xfer_verify)
 
             self.assertEqual(30000, config.controller.interval_ms_remote_scan)
             self.assertEqual(10000, config.controller.interval_ms_local_scan)
@@ -881,6 +902,7 @@ class TestConfig(unittest.TestCase):
             config.lftp.protocol = "sftp"
             config.lftp.remote_ftp_port = 21
             config.lftp.ftp_ssl_verify_certificate = True
+            config.validate.xfer_verify = True
             config.controller.interval_ms_remote_scan = 1234
             config.controller.interval_ms_local_scan = 5678
             config.controller.interval_ms_downloading_scan = 9012
@@ -932,6 +954,9 @@ class TestConfig(unittest.TestCase):
             protocol = sftp
             remote_ftp_port = 21
             ftp_ssl_verify_certificate = True
+
+            [Validate]
+            xfer_verify = True
 
             [Controller]
             interval_ms_remote_scan = 1234

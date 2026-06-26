@@ -311,6 +311,20 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.assertEqual("8M", inner.net_socket_buffer)
         reconfigure_hook.assert_called_once_with()
 
+    def test_set_validate_xfer_verify_requests_reconfigure_after_persist(self):
+        reconfigure_hook = MagicMock()
+        handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
+        self.config.has_section.return_value = True
+        inner = Config.Validate()
+        inner.xfer_verify = True
+        self.config.validate = inner
+
+        response = handler._ConfigHandler__handle_set_config("validate", "xfer_verify", False)
+
+        self.assertEqual(200, response.status_code)
+        self.assertFalse(inner.xfer_verify)
+        reconfigure_hook.assert_called_once_with()
+
     def test_set_lftp_non_tuning_key_does_not_request_reconfigure(self):
         reconfigure_hook = MagicMock()
         handler = ConfigHandler(self.config, lftp_reconfigure_request=reconfigure_hook)
@@ -436,6 +450,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("user-on-remote-server", out_dict["lftp"]["remote_username"])
         self.assertEqual("/remote/server/path", out_dict["lftp"]["remote_path"])
         self.assertEqual("/home/user/.pyenv/shims/python3", out_dict["lftp"]["remote_python_path"])
+        self.assertEqual(True, out_dict["validate"]["xfer_verify"])
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 

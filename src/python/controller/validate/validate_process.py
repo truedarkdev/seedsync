@@ -31,6 +31,7 @@ class ValidateStatusResult:
 class ValidateProcess(AppProcess):
     __DEFAULT_SLEEP_INTERVAL_IN_SECS = 0.1
     __HASH_CHUNK_SIZE = 1024 * 1024
+    HASH_COMMAND = "sha256sum"
 
     def __init__(self,
                  remote_address: str,
@@ -240,7 +241,7 @@ class ValidateProcess(AppProcess):
     def __hash_remote_file(self, path_pair_id: Optional[str], file_name: str) -> str:
         output = self.__run_remote_command(
             path_pair_id,
-            "sha256sum {}".format(escape_remote_path_for_shell(file_name))
+            "{} {}".format(self.HASH_COMMAND, escape_remote_path_for_shell(file_name))
         ).strip()
         return output.split(None, 1)[0]
 
@@ -255,7 +256,10 @@ class ValidateProcess(AppProcess):
 
         files_output = self.__run_remote_command(
             path_pair_id,
-            "find {} -type f -exec sha256sum {{}} \\; | sort".format(escape_remote_path_for_shell(root_name))
+            "find {} -type f -exec {} {{}} \\; | sort".format(
+                escape_remote_path_for_shell(root_name),
+                self.HASH_COMMAND,
+            )
         )
         hashes = {}
         for line in filter(None, files_output.splitlines()):

@@ -41,6 +41,7 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual("**REDACTED**", json_dict["lftp"]["remote_path"])
         self.assertEqual(2222, json_dict["lftp"]["remote_port"])
         self.assertEqual("512K", json_dict["lftp"]["net_socket_buffer"])
+        self.assertEqual(True, json_dict["validate"]["xfer_verify"])
         self.assertEqual(5678, json_dict["controller"]["interval_ms_local_scan"])
         self.assertEqual(8080, json_dict["web"]["port"])
 
@@ -74,6 +75,11 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(200, resp.status_int)
         self.assertEqual("", self.context.config.lftp.net_socket_buffer)
 
+        self.assertEqual(True, self.context.config.validate.xfer_verify)
+        resp = self.test_app.post_json("/server/config/set/validate/xfer_verify", {"value": False})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual(False, self.context.config.validate.xfer_verify)
+
         self.assertEqual(None, self.context.config.controller.interval_ms_local_scan)
         resp = self.test_app.post_json("/server/config/set/controller/interval_ms_local_scan", {"value": 5678})
         self.assertEqual(200, resp.status_int)
@@ -89,6 +95,7 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertIn("breadcrumb_trace_enabled = True", persisted_contents)
         self.assertIn("remote_path = /path/to/somewhere", persisted_contents)
         self.assertIn("remote_password = pass%word", persisted_contents)
+        self.assertIn("xfer_verify = False", persisted_contents)
         self.assertIn("port = 8080", persisted_contents)
 
     def test_set_persistence_failure_rolls_back(self):
