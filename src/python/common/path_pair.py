@@ -5,6 +5,7 @@ import os
 import shutil
 import uuid
 from dataclasses import asdict, dataclass, field
+from threading import RLock
 from typing import List, Optional
 
 from .error import AppError
@@ -52,10 +53,14 @@ class PathPair:
     auto_queue: bool = True
 
     def __post_init__(self):
-        if not self.name:
+        if type(self.name) != str:
+            raise PathPairError("Path pair '{}': name must be a string".format(self.name))
+        if not self.name and type(self.remote_path) == str:
             self.name = os.path.basename(self.remote_path.rstrip("/")) or "Default"
 
     def validate(self) -> List[str]:
+        if type(self.name) != str:
+            raise PathPairError("Path pair '{}': name must be a string".format(self.name))
         if type(self.remote_path) != str:
             raise PathPairError("Path pair '{}': remote_path must be a string".format(self.name))
         if not self.remote_path.strip():
@@ -68,6 +73,10 @@ class PathPair:
             raise PathPairError("Path pair '{}': id must be a string".format(self.name))
         if not self.id:
             raise PathPairError("Path pair '{}': id cannot be empty".format(self.name))
+        if type(self.enabled) != bool:
+            raise PathPairError("Path pair '{}': enabled must be a boolean".format(self.name))
+        if type(self.auto_queue) != bool:
+            raise PathPairError("Path pair '{}': auto_queue must be a boolean".format(self.name))
         warnings = []
         if is_running_in_docker():
             local_path = os.path.normpath(self.local_path)
@@ -160,6 +169,7 @@ class PathPairManager:
         self._config_dir = config_dir
         self._file_path = os.path.join(config_dir, self.FILENAME)
         self._collection = None
+        self._lock = RLock()
 
     @property
     def file_path(self) -> str:
@@ -167,24 +177,26 @@ class PathPairManager:
 
     @property
     def collection(self) -> PathPairCollection:
-        if self._collection is None:
-            self.load()
-        return self._collection
+        with self._lock:
+            if self._collection is None:
+                self.load()
+            return self._collection
 
     def load(self) -> PathPairCollection:
-        if not os.path.exists(self._file_path):
-            self._collection = PathPairCollection()
-            return self._collection
+        with self._lock:
+            if not os.path.exists(self._file_path):
+                self._collection = PathPairCollection()
+                return self._collection
 
-        try:
-            with open(self._file_path, "r", encoding="utf-8") as handle:
-                self._collection = self.from_str(handle.read())
-        except (OSError, ValueError, PersistError):
-            self.__backup_file()
-            self._collection = PathPairCollection()
-            return self._collection
+            try:
+                with open(self._file_path, "r", encoding="utf-8") as handle:
+                    self._collection = self.from_str(handle.read())
+            except (OSError, ValueError, PersistError):
+                self.__backup_file()
+                self._collection = PathPairCollection()
+                return self._collection
 
-        return self._collection
+            return self._collection
 
     def __backup_file(self):
         file_name = os.path.basename(self._file_path)
@@ -201,42 +213,50 @@ class PathPairManager:
             pass
 
     def save(self):
-        if self._collection is None:
-            raise PathPairError("No path pair collection loaded")
+        with self._lock:
+            if self._collection is None:
+                raise PathPairError("No path pair collection loaded")
 
-        try:
-            os.makedirs(self._config_dir, exist_ok=True)
-            with open(self._file_path, "w", encoding="utf-8") as handle:
-                handle.write(self.to_str())
-        except OSError as exc:
-            raise PersistError("Failed to save path pairs: {}".format(exc)) from exc
+            try:
+                os.makedirs(self._config_dir, exist_ok=True)
+                with open(self._file_path, "w", encoding="utf-8") as handle:
+                    handle.write(self.to_str())
+            except OSError as exc:
+                raise PersistError("Failed to save path pairs: {}".format(exc)) from exc
 
     def get_all_pairs(self) -> List[PathPair]:
-        return self.collection.path_pairs
+        with self._lock:
+            return self.collection.path_pairs
 
     def get_enabled_pairs(self) -> List[PathPair]:
-        return self.collection.get_enabled_pairs()
+        with self._lock:
+            return self.collection.get_enabled_pairs()
 
     def get_pair_by_id(self, pair_id: str) -> Optional[PathPair]:
-        return self.collection.get_pair_by_id(pair_id)
+        with self._lock:
+            return self.collection.get_pair_by_id(pair_id)
 
     def add_pair(self, pair: PathPair):
-        warnings = self.collection.add_pair(pair)
-        self.save()
-        return warnings
+        with self._lock:
+            warnings = self.collection.add_pair(pair)
+            self.save()
+            return warnings
 
     def update_pair(self, pair: PathPair):
-        warnings = self.collection.update_pair(pair)
-        self.save()
-        return warnings
+        with self._lock:
+            warnings = self.collection.update_pair(pair)
+            self.save()
+            return warnings
 
     def remove_pair(self, pair_id: str):
-        self.collection.remove_pair(pair_id)
-        self.save()
+        with self._lock:
+            self.collection.remove_pair(pair_id)
+            self.save()
 
     def reorder_pairs(self, pair_ids: List[str]):
-        self.collection.reorder_pairs(pair_ids)
-        self.save()
+        with self._lock:
+            self.collection.reorder_pairs(pair_ids)
+            self.save()
 
     def from_str(self, content: str) -> PathPairCollection:
         try:
@@ -254,16 +274,16 @@ class PathPairManager:
             for pair_data in raw_path_pairs:
                 if not isinstance(pair_data, dict):
                     raise TypeError("path pair entries must be JSON objects")
-                path_pairs.append(
-                    PathPair(
-                        id=pair_data.get("id", str(uuid.uuid4())),
-                        name=pair_data.get("name", ""),
-                        remote_path=pair_data["remote_path"],
-                        local_path=pair_data["local_path"],
-                        enabled=pair_data.get("enabled", True),
-                        auto_queue=pair_data.get("auto_queue", True),
-                    )
+                pair = PathPair(
+                    id=pair_data.get("id", str(uuid.uuid4())),
+                    name=pair_data.get("name", ""),
+                    remote_path=pair_data["remote_path"],
+                    local_path=pair_data["local_path"],
+                    enabled=pair_data.get("enabled", True),
+                    auto_queue=pair_data.get("auto_queue", True),
                 )
+                pair.validate()
+                path_pairs.append(pair)
 
             version = data.get("version", 1)
             if not isinstance(version, int):
@@ -273,36 +293,38 @@ class PathPairManager:
                 path_pairs=path_pairs,
                 version=version,
             )
-        except (ValueError, TypeError, KeyError) as exc:
+        except (PathPairError, ValueError, TypeError, KeyError) as exc:
             raise PersistError("Invalid path pairs JSON: {}".format(exc)) from exc
 
     def to_str(self) -> str:
-        if self._collection is None:
-            raise PathPairError("No path pair collection loaded")
-        return json.dumps(
-            {
-                "version": self._collection.version,
-                "path_pairs": [asdict(pair) for pair in self._collection.path_pairs],
-            },
-            indent=2,
-        )
+        with self._lock:
+            if self._collection is None:
+                raise PathPairError("No path pair collection loaded")
+            return json.dumps(
+                {
+                    "version": self._collection.version,
+                    "path_pairs": [asdict(pair) for pair in self._collection.path_pairs],
+                },
+                indent=2,
+            )
 
     def migrate_from_config(self, remote_path: str, local_path: str) -> bool:
-        if self.collection.path_pairs:
-            return False
-        if not remote_path or not local_path:
-            return False
-        if remote_path.startswith("<") or local_path.startswith("<"):
-            return False
+        with self._lock:
+            if self.collection.path_pairs:
+                return False
+            if not remote_path or not local_path:
+                return False
+            if remote_path.startswith("<") or local_path.startswith("<"):
+                return False
 
-        self.collection.add_pair(
-            PathPair(
-                name="Default",
-                remote_path=remote_path,
-                local_path=local_path,
-                enabled=True,
-                auto_queue=True,
+            self.collection.add_pair(
+                PathPair(
+                    name="Default",
+                    remote_path=remote_path,
+                    local_path=local_path,
+                    enabled=True,
+                    auto_queue=True,
+                )
             )
-        )
-        self.save()
-        return True
+            self.save()
+            return True
