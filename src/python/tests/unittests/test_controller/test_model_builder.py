@@ -3885,6 +3885,167 @@ class TestModelBuilder(unittest.TestCase):
             model.get_file(ModelFile.build_file_id("dup", "tv")).path_pair_id
         )
 
+    def test_build_deduplicates_local_only_roots_in_shared_local_directory(self):
+        local_movies = SystemFile("dup", 10, False)
+        local_movies.path_pair_id = "movies"
+        local_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\shared",
+                "tv": r"C:\seedsync\downloads\..\downloads\shared",
+            }
+        )
+        self.model_builder.set_local_files([local_movies, local_tv])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual(1, len(model.get_file_ids()))
+        self.assertIn(model.get_file("dup").path_pair_id, {"movies", "tv"})
+
+    def test_build_deduplicates_local_only_downloaded_roots_in_shared_local_directory(self):
+        local_movies = SystemFile("dup", 10, False)
+        local_movies.path_pair_id = "movies"
+        local_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\shared",
+                "tv": r"C:\seedsync\downloads\..\downloads\shared",
+            }
+        )
+        self.model_builder.set_local_files([local_movies, local_tv])
+        self.model_builder.set_downloaded_files({ModelFile.build_file_id("dup", "movies")})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual(1, len(model.get_file_ids()))
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("dup").state)
+        self.assertEqual("movies", model.get_file("dup").path_pair_id)
+
+    def test_build_deduplicates_local_only_extracted_roots_in_shared_local_directory(self):
+        local_movies = SystemFile("dup", 10, False)
+        local_movies.path_pair_id = "movies"
+        local_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\shared",
+                "tv": r"C:\seedsync\downloads\..\downloads\shared",
+            }
+        )
+        self.model_builder.set_local_files([local_movies, local_tv])
+        self.model_builder.set_downloaded_files({ModelFile.build_file_id("dup", "movies")})
+        self.model_builder.set_extracted_files({ModelFile.build_file_id("dup", "movies")})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual(1, len(model.get_file_ids()))
+        self.assertEqual(ModelFile.State.EXTRACTED, model.get_file("dup").state)
+        self.assertEqual("movies", model.get_file("dup").path_pair_id)
+
+    def test_build_keeps_local_only_roots_from_distinct_local_directories(self):
+        local_movies = SystemFile("dup", 10, False)
+        local_movies.path_pair_id = "movies"
+        local_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\movies",
+                "tv": r"C:\seedsync\downloads\tv",
+            }
+        )
+        self.model_builder.set_local_files([local_movies, local_tv])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual(
+            {
+                ModelFile.build_file_id("dup", "movies"),
+                ModelFile.build_file_id("dup", "tv"),
+            },
+            model.get_file_ids()
+        )
+        with self.assertRaises(ModelError):
+            model.get_file("dup")
+
+    def test_build_keeps_managed_entry_over_local_only_twin_in_shared_directory(self):
+        remote_movies = SystemFile("dup", 10, False)
+        remote_movies.path_pair_id = "movies"
+        remote_movies.path_pair_name = "Movies"
+        local_movies = SystemFile("dup", 10, False)
+        local_movies.path_pair_id = "movies"
+        local_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\shared",
+                "tv": r"C:\seedsync\downloads\..\downloads\shared",
+            }
+        )
+        self.model_builder.set_remote_files([remote_movies])
+        self.model_builder.set_local_files([local_movies, local_tv])
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual({"dup"}, model.get_file_names())
+        self.assertEqual({ModelFile.build_file_id("dup", "movies")}, model.get_file_ids())
+        self.assertEqual("movies", model.get_file("dup").path_pair_id)
+
+    def test_build_keeps_status_backed_entry_over_local_only_twin_in_shared_directory(self):
+        remote_movies = SystemFile("dup", 10, False)
+        remote_movies.path_pair_id = "movies"
+        remote_movies.path_pair_name = "Movies"
+        local_tv = SystemFile("dup", 20, False)
+        local_tv.path_pair_id = "tv"
+        local_tv.path_pair_name = "TV"
+
+        self.model_builder.set_local_root_paths(
+            {
+                "movies": r"C:\seedsync\downloads\shared",
+                "tv": r"C:\seedsync\downloads\..\downloads\shared",
+            }
+        )
+        self.model_builder.set_remote_files([remote_movies])
+        self.model_builder.set_local_files([local_tv])
+
+        for status_state, expected_state in (
+            (LftpJobStatus.State.QUEUED, ModelFile.State.QUEUED),
+            (LftpJobStatus.State.RUNNING, ModelFile.State.DOWNLOADING),
+        ):
+            with self.subTest(status_state=status_state):
+                self.model_builder.set_lftp_statuses([])
+                status_movies = LftpJobStatus(0, LftpJobStatus.Type.PGET, status_state, "dup", "")
+                status_movies.path_pair_id = "movies"
+                status_movies.path_pair_name = "Movies"
+                self.model_builder.set_lftp_statuses([status_movies])
+
+                model = self.model_builder.build_model()
+
+                self.assertEqual({"dup"}, model.get_file_names())
+                self.assertEqual({ModelFile.build_file_id("dup", "movies")}, model.get_file_ids())
+                self.assertEqual("movies", model.get_file("dup").path_pair_id)
+                self.assertEqual(expected_state, model.get_file("dup").state)
+
     def test_build_children_inherit_path_pair_metadata(self):
         remote_root = SystemFile("dup", 10, True)
         remote_root.path_pair_id = "movies"
