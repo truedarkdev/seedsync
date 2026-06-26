@@ -1,5 +1,5 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
-import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks} from "@angular/core/testing";
+import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angular/core/testing";
 import {BehaviorSubject, of} from "rxjs";
 import {Modal} from "../../../../services/utils/modal.service";
 
@@ -13,13 +13,43 @@ import {NotificationService} from "../../../../services/utils/notification.servi
 import {ServerCommandService} from "../../../../services/server/server-command.service";
 import {ModalAccessibilityService} from "../../../../services/utils/modal-accessibility.service";
 import {PathPair, PathPairService} from "../../../../services/settings/path-pair.service";
+import {Localization} from "../../../../common/localization";
 
 
 class MockConfigService {
     private _config = new BehaviorSubject<Config>(null);
+    private _restartRequired = new Set<string>();
+    private _setSuccess = true;
+    private _setErrorMessage = "Bad value";
 
     get config() {
         return this._config.asObservable();
+    }
+
+    set(section: string, option: string, value: any) {
+        return of({
+            success: this._setSuccess,
+            data: this._setSuccess ? `${section}.${option} set to ${value}` : null,
+            errorMessage: this._setSuccess ? null : this._setErrorMessage
+        });
+    }
+
+    requiresRestart(section: string, option: string) {
+        return this._restartRequired.has(`${section}.${option}`);
+    }
+
+    setRequiresRestart(section: string, option: string, requiresRestart: boolean) {
+        const key = `${section}.${option}`;
+        if (requiresRestart) {
+            this._restartRequired.add(key);
+        } else {
+            this._restartRequired.delete(key);
+        }
+    }
+
+    setSaveResult(success: boolean, errorMessage = "Bad value") {
+        this._setSuccess = success;
+        this._setErrorMessage = errorMessage;
     }
 }
 
@@ -131,6 +161,71 @@ describe("Testing settings page component", () => {
 
         expect(commandService.restart).not.toHaveBeenCalled();
     }));
+
+    it("should show the restart notification when backend metadata requires a restart", () => {
+        const configService = TestBed.get(ConfigService) as MockConfigService;
+        const notifService = TestBed.get(NotificationService) as MockNotificationService;
+        configService.setRequiresRestart("general", "log_level", true);
+
+        component.onSetConfig("general", "log_level", "DEBUG");
+
+        expect(notifService.show).toHaveBeenCalledTimes(1);
+        expect(notifService.show).toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_RESTART
+        }));
+        expect(notifService.show).not.toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        }));
+    });
+
+    it("should briefly show immediate-applied notification when backend metadata says restart is not needed", fakeAsync(() => {
+        const configService = TestBed.get(ConfigService) as MockConfigService;
+        const notifService = TestBed.get(NotificationService) as MockNotificationService;
+        configService.setRequiresRestart("general", "verbose", false);
+
+        component.onSetConfig("general", "verbose", true);
+
+        expect(notifService.show).toHaveBeenCalledTimes(1);
+        expect(notifService.show).toHaveBeenCalledWith(jasmine.objectContaining({
+            level: "success",
+            dismissible: true,
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        }));
+        expect(notifService.show).not.toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_RESTART
+        }));
+
+        notifService.hide.calls.reset();
+        tick(6999);
+        expect(notifService.hide).not.toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        }));
+
+        tick(1);
+        expect(notifService.hide).toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        }));
+    }));
+
+    it("should not show config success notifications when a save fails", () => {
+        const configService = TestBed.get(ConfigService) as MockConfigService;
+        const notifService = TestBed.get(NotificationService) as MockNotificationService;
+        configService.setRequiresRestart("general", "log_level", true);
+        configService.setSaveResult(false, "Setting general.log_level cannot be blank.");
+
+        component.onSetConfig("general", "log_level", "");
+
+        expect(notifService.show).toHaveBeenCalledWith(jasmine.objectContaining({
+            level: "danger",
+            text: "Setting general.log_level cannot be blank."
+        }));
+        expect(notifService.show).not.toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_RESTART
+        }));
+        expect(notifService.show).not.toHaveBeenCalledWith(jasmine.objectContaining({
+            text: Localization.Notification.CONFIG_APPLIED_IMMEDIATELY
+        }));
+    });
 
     it("should expose the log format and log level options in other settings", () => {
         const logFormatOption = component.OPTIONS_CONTEXT_OTHER.options[2]!;

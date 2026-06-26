@@ -9,6 +9,36 @@ from web.serialize import SerializeConfig
 
 
 class TestSerializeConfig(unittest.TestCase):
+    def test_restart_required_metadata_matches_config_shape_and_hot_fields(self):
+        config = Config()
+        config.general.verbose = False
+        config.general.exclude_patterns = "*.nfo"
+        config.general.breadcrumb_trace_enabled = True
+        config.lftp.net_socket_buffer = "8M"
+        config.lftp.remote_path = "/remote/server/path"
+        config.controller.interval_ms_remote_scan = 30000
+        config.web.port = 8800
+        config.autoqueue.enabled = True
+        config.logging.log_format = "json"
+
+        out = SerializeConfig.config(config)
+        out_dict = json.loads(out)
+
+        self.assertIn("restart_required", out_dict)
+        for section in ("general", "lftp", "controller", "web", "autoqueue", "logging"):
+            self.assertEqual(set(out_dict[section].keys()), set(out_dict["restart_required"][section].keys()))
+
+        self.assertEqual(True, out_dict["restart_required"]["general"]["log_level"])
+        self.assertEqual(False, out_dict["restart_required"]["general"]["verbose"])
+        self.assertEqual(False, out_dict["restart_required"]["general"]["exclude_patterns"])
+        self.assertEqual(False, out_dict["restart_required"]["general"]["breadcrumb_trace_enabled"])
+        self.assertEqual(True, out_dict["restart_required"]["lftp"]["remote_path"])
+        self.assertEqual(False, out_dict["restart_required"]["lftp"]["net_socket_buffer"])
+        self.assertEqual(True, out_dict["restart_required"]["controller"]["interval_ms_remote_scan"])
+        self.assertEqual(True, out_dict["restart_required"]["web"]["port"])
+        self.assertEqual(True, out_dict["restart_required"]["autoqueue"]["enabled"])
+        self.assertEqual(True, out_dict["restart_required"]["logging"]["log_format"])
+
     def test_section_general(self):
         config = Config()
         config.general.log_level = "DEBUG"
