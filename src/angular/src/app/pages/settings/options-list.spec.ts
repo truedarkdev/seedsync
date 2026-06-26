@@ -4,7 +4,8 @@ import {
     OPTIONS_CONTEXT_CONNECTIONS,
     OPTIONS_CONTEXT_DISCOVERY,
     OPTIONS_CONTEXT_SERVER,
-    OPTIONS_CONTEXT_TRANSFER_PROTOCOL
+    OPTIONS_CONTEXT_TRANSFER_PROTOCOL,
+    OPTIONS_CONTEXT_VALIDATE
 } from "./options-list";
 
 describe("settings options list", () => {
@@ -37,6 +38,18 @@ describe("settings options list", () => {
         expect(ftpPort.disabledWhenSftp).toBe(true);
         expect(verifyCertificate.type).toBe(OptionType.Checkbox);
         expect(verifyCertificate.disabledWhenSftp).toBe(true);
+    });
+
+    it("defines inline transfer verification under Validation", () => {
+        const xferVerify = OPTIONS_CONTEXT_VALIDATE.options.find(
+            option => option.valuePath[1] === "xfer_verify"
+        )!;
+
+        expect(OPTIONS_CONTEXT_VALIDATE.header).toBe("Validation");
+        expect(xferVerify.type).toBe(OptionType.Checkbox);
+        expect(xferVerify.label).toBe("Verify transfers inline (recommended)");
+        expect(xferVerify.valuePath).toEqual(["validate", "xfer_verify"]);
+        expect(xferVerify.description).toContain("xfer:verify");
     });
 
     it("exposes remote python path under Server", () => {

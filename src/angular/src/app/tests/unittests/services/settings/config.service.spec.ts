@@ -118,6 +118,9 @@ describe("Testing config service", () => {
                 remote_ftp_port: 2121,
                 ftp_ssl_verify_certificate: true,
             },
+            validate: {
+                xfer_verify: true,
+            },
             restart_required: {
                 general: {
                     log_level: true,
@@ -127,6 +130,9 @@ describe("Testing config service", () => {
                 lftp: {
                     remote_address: true,
                     net_socket_buffer: false
+                },
+                validate: {
+                    xfer_verify: false
                 }
             },
             controller: {
@@ -171,11 +177,13 @@ describe("Testing config service", () => {
                 expect(config.lftp.protocol).toBe("ftps");
                 expect(config.lftp.remote_ftp_port).toBe(2121);
                 expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
+                expect(config.validate.xfer_verify).toBe(true);
                 expect(configService.requiresRestart("general", "log_level")).toBe(true);
                 expect(configService.requiresRestart("general", "verbose")).toBe(false);
                 expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
                 expect(configService.requiresRestart("lftp", "remote_address")).toBe(true);
                 expect(configService.requiresRestart("lftp", "net_socket_buffer")).toBe(false);
+                expect(configService.requiresRestart("validate", "xfer_verify")).toBe(false);
                 expect(config.controller.interval_ms_remote_scan).toBe(30000);
                 expect(config.controller.interval_ms_local_scan).toBe(10000);
                 expect(config.controller.interval_ms_downloading_scan).toBe(1000);

@@ -36,6 +36,9 @@ describe("Testing config record initialization", () => {
                 remote_ftp_port: 2121,
                 ftp_ssl_verify_certificate: true
             },
+            validate: {
+                xfer_verify: true
+            },
             controller: {
                 interval_ms_remote_scan: 30000,
                 interval_ms_local_scan: 10000,
@@ -86,6 +89,7 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.protocol).toBe("ftps");
         expect(config.lftp.remote_ftp_port).toBe(2121);
         expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
+        expect(config.validate.xfer_verify).toBe(true);
         expect(config.controller.interval_ms_remote_scan).toBe(30000);
         expect(config.controller.interval_ms_local_scan).toBe(10000);
         expect(config.controller.interval_ms_downloading_scan).toBe(1000);
@@ -129,6 +133,7 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("lftp", "protocol")).toBe("sftp");
         expect(partialConfig.getValue("lftp", "remote_ftp_port")).toBe(21);
         expect(partialConfig.getValue("lftp", "ftp_ssl_verify_certificate")).toBe(true);
+        expect(partialConfig.validate.xfer_verify).toBe(true);
         expect(partialConfig.getValue("logging", "log_format")).toBe("standard");
         expect(partialConfig.getValue("missing", "value")).toBe(null);
     });

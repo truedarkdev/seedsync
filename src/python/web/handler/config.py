@@ -10,7 +10,11 @@ from bottle import HTTPResponse
 from common import overrides, Config, ConfigError, Localization
 from ..web_app import IHandler, WebApp
 from ..serialize import SerializeConfig
-from ..config_restart import GENERAL_RUNTIME_RECONFIGURE_FIELDS, LFTP_RUNTIME_RECONFIGURE_FIELDS
+from ..config_restart import (
+    GENERAL_RUNTIME_RECONFIGURE_FIELDS,
+    LFTP_RUNTIME_RECONFIGURE_FIELDS,
+    VALIDATE_RUNTIME_RECONFIGURE_FIELDS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +144,7 @@ class ConfigHandler(IHandler):
             and (
                 (section == "lftp" and key in LFTP_RUNTIME_RECONFIGURE_FIELDS)
                 or (section == "general" and key in GENERAL_RUNTIME_RECONFIGURE_FIELDS)
+                or (section == "validate" and key in VALIDATE_RUNTIME_RECONFIGURE_FIELDS)
             )
         ):
             self.__lftp_reconfigure_request()

@@ -241,6 +241,14 @@ describe("Testing settings page component", () => {
         expect(logLevelOption.choices![0]).toEqual({label: "Debug", value: "DEBUG"});
     });
 
+    it("should expose transfer verification in validation settings", () => {
+        const xferVerifyOption = component.OPTIONS_CONTEXT_VALIDATE.options[0]!;
+
+        expect(component.OPTIONS_CONTEXT_VALIDATE.header).toBe("Validation");
+        expect(xferVerifyOption.label).toBe("Verify transfers inline (recommended)");
+        expect(xferVerifyOption.valuePath).toEqual(["validate", "xfer_verify"]);
+    });
+
     it("should disable legacy directory and autoqueue toggles when path pairs are enabled", () => {
         const pathPairService = TestBed.get(PathPairService) as MockPathPairService;
         pathPairService.push([

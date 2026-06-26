@@ -117,6 +117,11 @@
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_VALIDATE">
+            </ng-container>
+
+            <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
+            <ng-container
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_OTHER">
             </ng-container>
         </div>

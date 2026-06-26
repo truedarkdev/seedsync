@@ -435,6 +435,7 @@ class Controller:
         # Configure Lftp
         config = cast(Any, self.__context.config)
         lftp_cfg = config.lftp
+        validate_cfg = getattr(config, "validate", None)
         general_cfg = config.general
         self.__lftp.num_parallel_jobs = lftp_cfg.num_max_parallel_downloads
         self.__lftp.num_parallel_files = lftp_cfg.num_max_parallel_files_per_download
@@ -447,6 +448,11 @@ class Controller:
         net_socket_buffer = lftp_cfg.net_socket_buffer
         self.__lftp.net_socket_buffer = 0 if net_socket_buffer in (None, "") else net_socket_buffer
         self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
+        if getattr(validate_cfg, "xfer_verify", True):
+            self.__lftp.xfer_verify = True
+            self.__lftp.xfer_verify_command = ValidateProcess.HASH_COMMAND
+        else:
+            self.__lftp.xfer_verify = False
         self.__lftp.set_verbose_logging(general_cfg.verbose)
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:

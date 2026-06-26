@@ -16,6 +16,7 @@ class TestSerializeConfig(unittest.TestCase):
         config.general.breadcrumb_trace_enabled = True
         config.lftp.net_socket_buffer = "8M"
         config.lftp.remote_path = "/remote/server/path"
+        config.validate.xfer_verify = True
         config.controller.interval_ms_remote_scan = 30000
         config.web.port = 8800
         config.autoqueue.enabled = True
@@ -25,7 +26,7 @@ class TestSerializeConfig(unittest.TestCase):
         out_dict = json.loads(out)
 
         self.assertIn("restart_required", out_dict)
-        for section in ("general", "lftp", "controller", "web", "autoqueue", "logging"):
+        for section in ("general", "lftp", "validate", "controller", "web", "autoqueue", "logging"):
             self.assertEqual(set(out_dict[section].keys()), set(out_dict["restart_required"][section].keys()))
 
         self.assertEqual(True, out_dict["restart_required"]["general"]["log_level"])
@@ -34,6 +35,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(False, out_dict["restart_required"]["general"]["breadcrumb_trace_enabled"])
         self.assertEqual(True, out_dict["restart_required"]["lftp"]["remote_path"])
         self.assertEqual(False, out_dict["restart_required"]["lftp"]["net_socket_buffer"])
+        self.assertEqual(False, out_dict["restart_required"]["validate"]["xfer_verify"])
         self.assertEqual(True, out_dict["restart_required"]["controller"]["interval_ms_remote_scan"])
         self.assertEqual(True, out_dict["restart_required"]["web"]["port"])
         self.assertEqual(True, out_dict["restart_required"]["autoqueue"]["enabled"])
@@ -120,6 +122,14 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertNotIn("server.remote.com", out)
         self.assertNotIn("user-on-remote-server", out)
         self.assertNotIn("secret123", out)
+
+    def test_section_validate(self):
+        config = Config()
+        config.validate.xfer_verify = False
+        out = SerializeConfig.config(config)
+        out_dict = json.loads(out)
+        self.assertIn("validate", out_dict)
+        self.assertEqual(False, out_dict["validate"]["xfer_verify"])
 
     def test_section_lftp_with_remote_detail_redaction_disabled(self):
         config = Config()
