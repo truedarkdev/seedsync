@@ -59,6 +59,34 @@ describe("Testing rest service", () => {
         httpMock.verify();
     }));
 
+    it("should replay sendRequest results to late subscribers without another GET", fakeAsync(() => {
+        const response = restService.sendRequest("/server/request");
+        let firstReaction = null;
+        let secondReaction = null;
+
+        response.subscribe({
+            next: reaction => {
+                firstReaction = reaction;
+            }
+        });
+
+        httpMock.expectOne("/server/request").flush("shared data");
+
+        expect(firstReaction.success).toBe(true);
+        expect(firstReaction.data).toBe("shared data");
+
+        response.subscribe({
+            next: reaction => {
+                secondReaction = reaction;
+            }
+        });
+
+        expect(secondReaction.success).toBe(true);
+        expect(secondReaction.data).toBe("shared data");
+        httpMock.expectNone("/server/request");
+        httpMock.verify();
+    }));
+
     it("should redact config response logging", fakeAsync(() => {
         const debugSpy = spyOn(console, "debug");
         const responseBody = JSON.stringify({
