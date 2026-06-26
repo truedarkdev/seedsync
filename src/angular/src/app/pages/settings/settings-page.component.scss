@@ -67,6 +67,29 @@
                         border-bottom: 1px solid #e9ecef;
                     }
 
+                    .settings-option-group {
+                        margin: 0;
+                        padding: 12px 0 0;
+
+                        &:first-child {
+                            padding-top: 0;
+                        }
+                    }
+
+                    .settings-option-group-header {
+                        margin: 0 0 6px;
+                        padding: 4px 20px 3px;
+                        background-color: #f8f9fa;
+                        border-top: 1px solid #e9ecef;
+                        border-bottom: 1px solid #e9ecef;
+                        color: #495057;
+                        font-size: 76%;
+                        font-weight: 700;
+                        letter-spacing: .08em;
+                        line-height: 1.2;
+                        text-transform: uppercase;
+                    }
+
                     .card-subsection {
                         margin: 18px 20px 0;
                         padding: 0;

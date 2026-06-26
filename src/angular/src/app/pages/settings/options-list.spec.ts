@@ -5,8 +5,7 @@ import {
     OPTIONS_CONTEXT_DISCOVERY,
     OPTIONS_CONTEXT_OTHER,
     OPTIONS_CONTEXT_SERVER,
-    OPTIONS_CONTEXT_TRANSFER_PROTOCOL,
-    OPTIONS_CONTEXT_VALIDATE
+    OPTIONS_CONTEXT_TRANSFER_PROTOCOL
 } from "./options-list";
 
 describe("settings options list", () => {
@@ -41,23 +40,28 @@ describe("settings options list", () => {
         expect(verifyCertificate.disabledWhenSftp).toBe(true);
     });
 
-    it("defines inline transfer verification under Validation", () => {
-        const xferVerify = OPTIONS_CONTEXT_VALIDATE.options.find(
-            option => option.valuePath[1] === "xfer_verify"
-        )!;
-
-        expect(OPTIONS_CONTEXT_VALIDATE.header).toBe("Validation");
-        expect(xferVerify.type).toBe(OptionType.Checkbox);
-        expect(xferVerify.label).toBe("Verify transfers inline (recommended)");
-        expect(xferVerify.valuePath).toEqual(["validate", "xfer_verify"]);
-        expect(xferVerify.description).toContain("xfer:verify");
-    });
-
-    it("keeps log level and log format in Other Settings", () => {
-        const logLevel = OPTIONS_CONTEXT_OTHER.options.find(option => option.valuePath[1] === "log_level")!;
-        const logFormat = OPTIONS_CONTEXT_OTHER.options.find(option => option.valuePath[1] === "log_format")!;
+    it("groups other settings into diagnostics, validation, and application", () => {
+        const [diagnostics, validation, application] = OPTIONS_CONTEXT_OTHER.groups!;
+        const logLevel = diagnostics.options.find(option => option.valuePath[1] === "log_level")!;
+        const logFormat = diagnostics.options.find(option => option.valuePath[1] === "log_format")!;
+        const breadcrumbTrace = diagnostics.options.find(option => option.valuePath[1] === "breadcrumb_trace_enabled")!;
+        const xferVerify = validation.options[0]!;
+        const webGuiPort = application.options[0]!;
 
         expect(OPTIONS_CONTEXT_OTHER.header).toBe("Other Settings");
+        expect(OPTIONS_CONTEXT_OTHER.groups!.map(group => group.header)).toEqual([
+            "Diagnostics",
+            "Validation",
+            "Application",
+        ]);
+        expect(OPTIONS_CONTEXT_OTHER.options.map(option => option.valuePath.join("."))).toEqual([
+            "general.log_level",
+            "logging.log_format",
+            "general.breadcrumb_trace_enabled",
+            "validate.xfer_verify",
+            "web.port",
+        ]);
+
         expect(logLevel.type).toBe(OptionType.Select);
         expect(logLevel.label).toBe("Log Level");
         expect(logLevel.valuePath).toEqual(["general", "log_level"]);
@@ -74,6 +78,19 @@ describe("settings options list", () => {
             {label: "Standard", value: "standard"},
             {label: "JSON", value: "json"},
         ]);
+        expect(breadcrumbTrace.type).toBe(OptionType.Checkbox);
+        expect(breadcrumbTrace.label).toBe("Enable breadcrumb trace recorder");
+        expect(breadcrumbTrace.valuePath).toEqual(["general", "breadcrumb_trace_enabled"]);
+        expect(breadcrumbTrace.description).toContain("recent-context window");
+
+        expect(xferVerify.type).toBe(OptionType.Checkbox);
+        expect(xferVerify.label).toBe("Verify transfers inline (recommended)");
+        expect(xferVerify.valuePath).toEqual(["validate", "xfer_verify"]);
+        expect(xferVerify.description).toContain("xfer:verify");
+
+        expect(webGuiPort.type).toBe(OptionType.Text);
+        expect(webGuiPort.label).toBe("Web GUI Port");
+        expect(webGuiPort.valuePath).toEqual(["web", "port"]);
     });
 
     it("exposes remote python path under Server", () => {

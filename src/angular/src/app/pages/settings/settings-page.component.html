@@ -1,5 +1,5 @@
 <!--suppress HtmlUnknownAttribute -->
-<ng-template #optionsList let-header="header" let-options="options" let-id="id">
+<ng-template #optionsList let-header="header" let-options="options" let-id="id" let-groups="groups">
     <div class="card">
         <h3 class="card-header" id="heading-{{id}}">
             <button class="btn"
@@ -11,19 +11,38 @@
         </h3>
         <div id="collapse-{{id}}" class="collapse" data-parent="#accordion">
             <div class="card-body">
-                <div [class.autoqueue-core]="id === 'autoqueue'">
-                    <div *ngFor="let option of options">
-                        <app-option
-                            [type]="option.type"
-                            [label]="option.label"
-                            [description]="option.description"
-                            [choices]="option.choices"
-                            [disabled]="!!option.disabled || isOptionDisabled(option, config | async)"
-                            [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
-                            (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
-                        </app-option>
+                <ng-container *ngIf="groups?.length; else flatOptions">
+                    <div *ngFor="let group of groups"
+                         class="settings-option-group">
+                        <div class="settings-option-group-header">{{group.header}}</div>
+                        <div *ngFor="let option of group.options">
+                            <app-option
+                                [type]="option.type"
+                                [label]="option.label"
+                                [description]="option.description"
+                                [choices]="option.choices"
+                                [disabled]="!!option.disabled || isOptionDisabled(option, config | async)"
+                                [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
+                                (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
+                            </app-option>
+                        </div>
                     </div>
-                </div>
+                </ng-container>
+                <ng-template #flatOptions>
+                    <div [class.autoqueue-core]="id === 'autoqueue'">
+                        <div *ngFor="let option of options">
+                            <app-option
+                                [type]="option.type"
+                                [label]="option.label"
+                                [description]="option.description"
+                                [choices]="option.choices"
+                                [disabled]="!!option.disabled || isOptionDisabled(option, config | async)"
+                                [value]="(config | async)?.getValue(option.valuePath[0], option.valuePath[1])"
+                                (changeEvent)="onSetConfig(option.valuePath[0], option.valuePath[1], $event)">
+                            </app-option>
+                        </div>
+                    </div>
+                </ng-template>
                 <div *ngIf="id === 'autoqueue'" class="card-subsection autoqueue-patterns">
                     <div class="subsection-header">
                         <h4>AutoQueue Patterns</h4>
@@ -113,11 +132,6 @@
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_TRANSFER_PROTOCOL">
-            </ng-container>
-
-            <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
-            <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_VALIDATE">
             </ng-container>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->

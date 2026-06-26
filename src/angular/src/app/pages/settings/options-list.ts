@@ -9,10 +9,15 @@ export interface IOption {
     disabledWhenSftp?: boolean;
     disabled?: boolean;
 }
+export interface IOptionsGroup {
+    header: string;
+    options: IOption[];
+}
 export interface IOptionsContext {
     header: string;
     id: string;
     options: IOption[];
+    groups?: IOptionsGroup[];
 }
 
 export const OPTIONS_CONTEXT_SERVER: IOptionsContext = {
@@ -103,19 +108,6 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
             valuePath: ["lftp", "ftp_ssl_verify_certificate"],
             description: "Recommended. Turn off only for self-signed or legacy servers.",
             disabledWhenSftp: true,
-        },
-    ]
-};
-
-export const OPTIONS_CONTEXT_VALIDATE: IOptionsContext = {
-    header: "Validation",
-    id: "validation",
-    options: [
-        {
-            type: OptionType.Checkbox,
-            label: "Verify transfers inline (recommended)",
-            valuePath: ["validate", "xfer_verify"],
-            description: "Use lftp xfer:verify to validate files during transfer with the same hash command used by local validation."
         },
     ]
 };
@@ -224,6 +216,63 @@ export const OPTIONS_CONTEXT_CONNECTIONS: IOptionsContext = {
 export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
     header: "Other Settings",
     id: "other-settings",
+    groups: [
+        {
+            header: "Diagnostics",
+            options: [
+                {
+                    type: OptionType.Select,
+                    label: "Log Level",
+                    valuePath: ["general", "log_level"],
+                    description: "Controls how much detail is written to the logs.",
+                    choices: [
+                        {label: "Debug", value: "DEBUG"},
+                        {label: "Info", value: "INFO"},
+                        {label: "Warning", value: "WARNING"},
+                        {label: "Error", value: "ERROR"},
+                    ]
+                },
+                {
+                    type: OptionType.Select,
+                    label: "Log Format",
+                    valuePath: ["logging", "log_format"],
+                    description: "Choose Standard or JSON log output.",
+                    choices: [
+                        {label: "Standard", value: "standard"},
+                        {label: "JSON", value: "json"},
+                    ]
+                },
+                {
+                    type: OptionType.Checkbox,
+                    label: "Enable breadcrumb trace recorder",
+                    valuePath: ["general", "breadcrumb_trace_enabled"],
+                    description: "Keeps a low-overhead recent-context window for debugging failures."
+                },
+            ]
+        },
+        {
+            header: "Validation",
+            options: [
+                {
+                    type: OptionType.Checkbox,
+                    label: "Verify transfers inline (recommended)",
+                    valuePath: ["validate", "xfer_verify"],
+                    description: "Use lftp xfer:verify to validate files during transfer with the same hash command used by local validation."
+                },
+            ]
+        },
+        {
+            header: "Application",
+            options: [
+                {
+                    type: OptionType.Text,
+                    label: "Web GUI Port",
+                    valuePath: ["web", "port"],
+                    description: null
+                },
+            ]
+        },
+    ],
     options: [
         {
             type: OptionType.Select,
@@ -248,16 +297,22 @@ export const OPTIONS_CONTEXT_OTHER: IOptionsContext = {
             ]
         },
         {
-            type: OptionType.Text,
-            label: "Web GUI Port",
-            valuePath: ["web", "port"],
-            description: null
-        },
-        {
             type: OptionType.Checkbox,
             label: "Enable breadcrumb trace recorder",
             valuePath: ["general", "breadcrumb_trace_enabled"],
             description: "Keeps a low-overhead recent-context window for debugging failures."
+        },
+        {
+            type: OptionType.Checkbox,
+            label: "Verify transfers inline (recommended)",
+            valuePath: ["validate", "xfer_verify"],
+            description: "Use lftp xfer:verify to validate files during transfer with the same hash command used by local validation."
+        },
+        {
+            type: OptionType.Text,
+            label: "Web GUI Port",
+            valuePath: ["web", "port"],
+            description: null
         },
     ]
 };
