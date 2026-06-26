@@ -226,19 +226,31 @@ describe("Testing settings page component", () => {
         }));
     });
 
-    it("should render other settings after validation without a standalone logging section", () => {
+    it("should render other settings without a standalone validation section", () => {
         const rightHeaders = Array.from(
             fixture.nativeElement.querySelectorAll("#right .card-header button")
         ).map((button: HTMLButtonElement) => button.textContent.trim());
+        const otherGroupHeaders = Array.from(
+            fixture.nativeElement.querySelectorAll("#collapse-other-settings .settings-option-group-header")
+        ).map((header: HTMLElement) => header.textContent.trim());
 
         expect(rightHeaders).not.toContain("Logging");
+        expect(rightHeaders).not.toContain("Validation");
         expect(rightHeaders).toContain("Other Settings");
-        expect(rightHeaders.indexOf("Validation")).toBeLessThan(rightHeaders.indexOf("Other Settings"));
+        expect(otherGroupHeaders).toEqual([
+            "Diagnostics",
+            "Validation",
+            "Application",
+        ]);
     });
 
-    it("should expose log level and log format options in other settings", () => {
-        const logLevelOption = component.OPTIONS_CONTEXT_OTHER.options.find(option => option.label === "Log Level")!;
-        const logFormatOption = component.OPTIONS_CONTEXT_OTHER.options.find(option => option.label === "Log Format")!;
+    it("should expose grouped diagnostics, validation, and application options in other settings", () => {
+        const [diagnostics, validation, application] = component.OPTIONS_CONTEXT_OTHER.groups!;
+        const logLevelOption = diagnostics.options.find(option => option.label === "Log Level")!;
+        const logFormatOption = diagnostics.options.find(option => option.label === "Log Format")!;
+        const breadcrumbTraceOption = diagnostics.options.find(option => option.label === "Enable breadcrumb trace recorder")!;
+        const xferVerifyOption = validation.options[0]!;
+        const webGuiPortOption = application.options[0]!;
 
         expect(component.OPTIONS_CONTEXT_OTHER.header).toBe("Other Settings");
         expect(logLevelOption.label).toBe("Log Level");
@@ -251,15 +263,15 @@ describe("Testing settings page component", () => {
         expect(logFormatOption.valuePath).toEqual(["logging", "log_format"]);
         expect(logFormatOption.choices![0]).toEqual({label: "Standard", value: "standard"});
         expect(logFormatOption.choices![1]).toEqual({label: "JSON", value: "json"});
-        expect(component.OPTIONS_CONTEXT_OTHER.options.some(option => option.label === "Enable Debug")).toBe(false);
-    });
-
-    it("should expose transfer verification in validation settings", () => {
-        const xferVerifyOption = component.OPTIONS_CONTEXT_VALIDATE.options[0]!;
-
-        expect(component.OPTIONS_CONTEXT_VALIDATE.header).toBe("Validation");
+        expect(breadcrumbTraceOption.label).toBe("Enable breadcrumb trace recorder");
+        expect(breadcrumbTraceOption.valuePath).toEqual(["general", "breadcrumb_trace_enabled"]);
+        expect(breadcrumbTraceOption.description).toContain("recent-context window");
         expect(xferVerifyOption.label).toBe("Verify transfers inline (recommended)");
         expect(xferVerifyOption.valuePath).toEqual(["validate", "xfer_verify"]);
+        expect(xferVerifyOption.description).toContain("xfer:verify");
+        expect(webGuiPortOption.label).toBe("Web GUI Port");
+        expect(webGuiPortOption.valuePath).toEqual(["web", "port"]);
+        expect(component.OPTIONS_CONTEXT_OTHER.options.some(option => option.label === "Enable Debug")).toBe(false);
     });
 
     it("should disable legacy directory and autoqueue toggles when path pairs are enabled", () => {
