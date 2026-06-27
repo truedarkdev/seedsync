@@ -107,6 +107,7 @@ class TestExtract(unittest.TestCase):
         self.assertTrue(Extract.is_archive_fast("c.bz2"))
         self.assertTrue(Extract.is_archive_fast("d.tar.gz"))
         self.assertTrue(Extract.is_archive_fast("e.7z"))
+        self.assertFalse(Extract.is_archive_fast("f.lz"))
 
         self.assertFalse(Extract.is_archive_fast("a"))
         self.assertFalse(Extract.is_archive_fast("a.b"))
