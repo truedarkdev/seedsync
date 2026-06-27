@@ -42,6 +42,7 @@ _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORE
 _LOG_LEVEL_VALUES = frozenset(("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"))
 _LOG_FORMAT_VALUES = frozenset(("standard", "json"))
 _TRANSFER_PROTOCOL_VALUES = frozenset(("sftp", "ftps"))
+_TRANSFER_BACKEND_VALUES = frozenset(("lftp", "rclone"))
 
 
 def _normalize_log_level(config_cls: Any, name: str, value: Any) -> str:
@@ -95,6 +96,17 @@ def _normalize_transfer_protocol(config_cls: Any, name: str, value: Any) -> str:
     return normalized
 
 
+def _normalize_transfer_backend(value: Any) -> str:
+    if not isinstance(value, str):
+        return "lftp"
+    normalized = value.strip().lower()
+    if not normalized:
+        return "lftp"
+    if normalized not in _TRANSFER_BACKEND_VALUES:
+        return "lftp"
+    return normalized
+
+
 def _normalize_remote_python_path(config_cls: Any, name: str, value: Any) -> str:
     if value is None:
         return "python3"
@@ -106,6 +118,14 @@ def _normalize_remote_python_path(config_cls: Any, name: str, value: Any) -> str
     if not normalized:
         return "python3"
     return normalized
+
+
+def _reject_control_characters(config_cls: Any, name: str, value: str) -> str:
+    if any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ConfigError("Bad config: {}.{} contains control characters".format(
+            config_cls.__name__, name
+        ))
+    return value
 
 
 class Converters:
@@ -150,6 +170,10 @@ class Converters:
         return _normalize_transfer_protocol(config_cls, name, value)
 
     @staticmethod
+    def transfer_backend(_: Any, __: str, value: Any) -> str:
+        return _normalize_transfer_backend(value)
+
+    @staticmethod
     def remote_python_path(config_cls: Any, name: str, value: str) -> str:
         return _normalize_remote_python_path(config_cls, name, value)
 
@@ -176,6 +200,14 @@ class Checkers:
         return value
 
     @staticmethod
+    def string_nonempty_no_control_chars(config_cls: Any, name: str, value: str) -> str:
+        return _reject_control_characters(
+            config_cls,
+            name,
+            Checkers.string_nonempty(config_cls, name, value)
+        )
+
+    @staticmethod
     def string_allow_empty(config_cls: Any, name: str, value: str) -> str:
         if value != "" and (not value or not value.strip()):
             raise ConfigError("Bad config: {}.{} is empty".format(
@@ -194,6 +226,10 @@ class Checkers:
     @staticmethod
     def transfer_protocol(config_cls: Any, name: str, value: str) -> str:
         return _normalize_transfer_protocol(config_cls, name, value)
+
+    @staticmethod
+    def transfer_backend(_: Any, __: str, value: Any) -> str:
+        return _normalize_transfer_backend(value)
 
     @staticmethod
     def remote_python_path(config_cls: Any, name: str, value: str) -> str:
@@ -487,8 +523,9 @@ class Config(Persist):
             super().set_property(name, value)
 
     class Lftp(IC):
-        remote_address = PROP("remote_address", Checkers.string_nonempty, Converters.null)
-        remote_username = PROP("remote_username", Checkers.string_nonempty, Converters.null)
+        transfer_backend = PROP("transfer_backend", Checkers.transfer_backend, Converters.transfer_backend)
+        remote_address = PROP("remote_address", Checkers.string_nonempty_no_control_chars, Converters.null)
+        remote_username = PROP("remote_username", Checkers.string_nonempty_no_control_chars, Converters.null)
         remote_password = PROP("remote_password", Checkers.string_allow_empty, Converters.null)
         remote_port = PROP("remote_port", Checkers.int_positive, Converters.int)
         remote_path = PROP("remote_path", Checkers.string_nonempty, Converters.null)
@@ -519,6 +556,7 @@ class Config(Persist):
 
         def __init__(self):
             super().__init__()
+            self.transfer_backend = "lftp"
             self.remote_address = None
             self.remote_username = None
             self.remote_password = None
@@ -544,6 +582,8 @@ class Config(Persist):
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
             config_dict = dict(config_dict)
+            if "transfer_backend" not in config_dict:
+                config_dict["transfer_backend"] = "lftp"
             if "remote_python_path" not in config_dict:
                 config_dict["remote_python_path"] = "python3"
             if "net_socket_buffer" not in config_dict:
@@ -556,7 +596,15 @@ class Config(Persist):
                 config_dict["remote_ftp_port"] = 21
             if "ftp_ssl_verify_certificate" not in config_dict:
                 config_dict["ftp_ssl_verify_certificate"] = True
+            config_dict["transfer_backend"] = _normalize_transfer_backend(config_dict.get("transfer_backend"))
+            if config_dict["transfer_backend"] == "rclone":
+                config_dict["protocol"] = "sftp"
             return super().from_dict(config_dict)
+
+        def _set_property(self, name: str, value: Any, checker: Callable):
+            super()._set_property(name, value, checker)
+            if name in ("transfer_backend", "protocol") and self.transfer_backend == "rclone" and self.protocol != "sftp":
+                super()._set_property("protocol", "sftp", Checkers.transfer_protocol)
 
     class Validate(IC):
         xfer_verify = PROP("xfer_verify", Checkers.bool_value, Converters.bool)

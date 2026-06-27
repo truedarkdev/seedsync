@@ -35,6 +35,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(False, out_dict["restart_required"]["general"]["breadcrumb_trace_enabled"])
         self.assertEqual(True, out_dict["restart_required"]["lftp"]["remote_path"])
         self.assertEqual(False, out_dict["restart_required"]["lftp"]["net_socket_buffer"])
+        self.assertEqual(True, out_dict["restart_required"]["lftp"]["transfer_backend"])
         self.assertEqual(False, out_dict["restart_required"]["validate"]["xfer_verify"])
         self.assertEqual(True, out_dict["restart_required"]["controller"]["interval_ms_remote_scan"])
         self.assertEqual(True, out_dict["restart_required"]["web"]["port"])
@@ -82,6 +83,7 @@ class TestSerializeConfig(unittest.TestCase):
 
     def test_section_lftp(self):
         config = Config()
+        config.lftp.transfer_backend = "rclone"
         config.lftp.remote_address = "server.remote.com"
         config.lftp.remote_username = "user-on-remote-server"
         config.lftp.remote_password = "secret123"
@@ -103,6 +105,7 @@ class TestSerializeConfig(unittest.TestCase):
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_address"])
+        self.assertEqual("rclone", out_dict["lftp"]["transfer_backend"])
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_username"])
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual(3456, out_dict["lftp"]["remote_port"])
@@ -116,7 +119,7 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(3, out_dict["lftp"]["num_max_connections_per_dir_file"])
         self.assertEqual(4, out_dict["lftp"]["num_max_total_connections"])
         self.assertEqual("512K", out_dict["lftp"]["net_socket_buffer"])
-        self.assertEqual("ftps", out_dict["lftp"]["protocol"])
+        self.assertEqual("sftp", out_dict["lftp"]["protocol"])
         self.assertEqual(2121, out_dict["lftp"]["remote_ftp_port"])
         self.assertEqual(True, out_dict["lftp"]["ftp_ssl_verify_certificate"])
         self.assertNotIn("server.remote.com", out)
@@ -135,6 +138,7 @@ class TestSerializeConfig(unittest.TestCase):
         config = Config()
         config.general.config_api_redact_remote_details = False
         config.general.api_token = "super-secret-token"
+        config.lftp.transfer_backend = "rclone"
         config.lftp.remote_address = "server.remote.com"
         config.lftp.remote_username = "user-on-remote-server"
         config.lftp.remote_password = "secret123"
@@ -151,6 +155,7 @@ class TestSerializeConfig(unittest.TestCase):
         out_dict = json.loads(out)
         self.assertIn("lftp", out_dict)
         self.assertEqual(False, out_dict["general"]["config_api_redact_remote_details"])
+        self.assertEqual("rclone", out_dict["lftp"]["transfer_backend"])
         self.assertEqual("server.remote.com", out_dict["lftp"]["remote_address"])
         self.assertEqual("user-on-remote-server", out_dict["lftp"]["remote_username"])
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])

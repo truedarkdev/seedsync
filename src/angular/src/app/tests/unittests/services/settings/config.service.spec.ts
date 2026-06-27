@@ -99,6 +99,7 @@ describe("Testing config service", () => {
                 breadcrumb_trace_enabled: true
             },
             lftp: {
+                transfer_backend: "rclone",
                 remote_address: "remote.server.com",
                 remote_username: "some.user",
                 remote_password: "my.password",
@@ -129,6 +130,7 @@ describe("Testing config service", () => {
                     breadcrumb_trace_enabled: false
                 },
                 lftp: {
+                    transfer_backend: true,
                     remote_address: true,
                     net_socket_buffer: false
                 },
@@ -161,6 +163,7 @@ describe("Testing config service", () => {
                 expect(config.general.verbose).toBe(false);
                 expect(config.general.breadcrumb_trace_enabled).toBe(true);
                 expect(config.lftp.remote_address).toBe("remote.server.com");
+                expect(config.lftp.transfer_backend).toBe("rclone");
                 expect(config.lftp.remote_username).toBe("some.user");
                 expect(config.lftp.remote_password).toBe("my.password");
                 expect(config.lftp.remote_path).toBe("/some/remote/path");
@@ -176,7 +179,7 @@ describe("Testing config service", () => {
                 expect(config.lftp.rate_limit).toBe("1M");
                 expect(config.lftp.net_socket_buffer).toBe("8M");
                 expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
-                expect(config.lftp.protocol).toBe("ftps");
+                expect(config.lftp.protocol).toBe("sftp");
                 expect(config.lftp.remote_ftp_port).toBe(2121);
                 expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
                 expect(config.validate.xfer_verify).toBe(true);
@@ -185,6 +188,7 @@ describe("Testing config service", () => {
                 expect(configService.requiresRestart("general", "verbose")).toBe(false);
                 expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
                 expect(configService.requiresRestart("lftp", "remote_address")).toBe(true);
+                expect(configService.requiresRestart("lftp", "transfer_backend")).toBe(true);
                 expect(configService.requiresRestart("lftp", "net_socket_buffer")).toBe(false);
                 expect(configService.requiresRestart("validate", "xfer_verify")).toBe(false);
                 expect(config.controller.interval_ms_remote_scan).toBe(30000);
@@ -218,10 +222,11 @@ describe("Testing config service", () => {
                     verbose: false,
                     breadcrumb_trace_enabled: false
                 },
-                lftp: {
-                    remote_path: true,
-                    net_socket_buffer: false
-                }
+            lftp: {
+                transfer_backend: true,
+                remote_path: true,
+                net_socket_buffer: false
+            }
             }
         });
 
@@ -229,6 +234,7 @@ describe("Testing config service", () => {
         expect(configService.requiresRestart("general", "verbose")).toBe(false);
         expect(configService.requiresRestart("general", "breadcrumb_trace_enabled")).toBe(false);
         expect(configService.requiresRestart("lftp", "remote_path")).toBe(true);
+        expect(configService.requiresRestart("lftp", "transfer_backend")).toBe(true);
         expect(configService.requiresRestart("lftp", "net_socket_buffer")).toBe(false);
     });
 
@@ -512,6 +518,7 @@ describe("Testing config service", () => {
     it("should reject ftps when the transfer password would be blank", () => {
         httpMock.expectOne("/server/config/get").flush({
             lftp: {
+                transfer_backend: "lftp",
                 remote_password: "",
                 use_ssh_key: true,
                 protocol: "sftp",
@@ -529,6 +536,43 @@ describe("Testing config service", () => {
 
         expect(configSubscriberIndex).toBe(1);
         httpMock.expectNone("/server/config/set/lftp/protocol");
+        httpMock.verify();
+    });
+
+    it("should force protocol to sftp when backend is rclone", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            lftp: {
+                transfer_backend: "rclone",
+                protocol: "sftp",
+            }
+        });
+
+        configService.set("lftp", "protocol", "ftps").subscribe(DoNothing);
+
+        expectConfigSetRequest("lftp", "protocol", "sftp");
+        httpMock.verify();
+    });
+
+    it("should update local config protocol when backend switches to rclone", () => {
+        httpMock.expectOne("/server/config/get").flush({
+            lftp: {
+                transfer_backend: "lftp",
+                protocol: "ftps",
+            }
+        });
+
+        let latestConfig = null;
+        configService.config.subscribe({
+            next: config => {
+                latestConfig = config;
+            }
+        });
+
+        configService.set("lftp", "transfer_backend", "rclone").subscribe(DoNothing);
+        expectConfigSetRequest("lftp", "transfer_backend", "rclone");
+
+        expect(latestConfig.lftp.transfer_backend).toBe("rclone");
+        expect(latestConfig.lftp.protocol).toBe("sftp");
         httpMock.verify();
     });
 

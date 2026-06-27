@@ -18,6 +18,9 @@ describe("settings options list", () => {
     });
 
     it("defines isolated FTPS controls under Transfer Protocol", () => {
+        const backend = OPTIONS_CONTEXT_TRANSFER_PROTOCOL.options.find(
+            option => option.valuePath[1] === "transfer_backend"
+        );
         const protocol = OPTIONS_CONTEXT_TRANSFER_PROTOCOL.options.find(
             option => option.valuePath[1] === "protocol"
         );
@@ -29,15 +32,23 @@ describe("settings options list", () => {
         );
 
         expect(OPTIONS_CONTEXT_TRANSFER_PROTOCOL.header).toBe("Transfer Protocol");
+        expect(backend.type).toBe(OptionType.Select);
+        expect(backend.choices).toEqual([
+            {label: "LFTP", value: "lftp"},
+            {label: "rclone", value: "rclone"},
+        ]);
         expect(protocol.type).toBe(OptionType.Select);
         expect(protocol.choices).toEqual([
             {label: "SFTP", value: "sftp"},
             {label: "FTPS", value: "ftps"},
         ]);
+        expect(protocol.disabledWhenTransferBackend).toEqual(["rclone"]);
         expect(ftpPort.type).toBe(OptionType.Text);
         expect(ftpPort.disabledWhenSftp).toBe(true);
+        expect(ftpPort.disabledWhenTransferBackend).toEqual(["rclone"]);
         expect(verifyCertificate.type).toBe(OptionType.Checkbox);
         expect(verifyCertificate.disabledWhenSftp).toBe(true);
+        expect(verifyCertificate.disabledWhenTransferBackend).toEqual(["rclone"]);
     });
 
     it("groups other settings into diagnostics, validation, and application", () => {

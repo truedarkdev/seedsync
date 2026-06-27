@@ -210,7 +210,7 @@ class ModelUpdater:
                     else:
                         lftp_status_source = "unhealthy_empty"
             except (LftpError, LftpJobStatusParserError) as e:
-                controller.logger.warning("Caught lftp error: {}".format(str(e)))
+                controller.logger.warning("Caught transfer backend error: {}".format(str(e)))
                 lftp_statuses = []
                 lftp_status_poll_healthy = False
                 controller._Controller__lftp_status_poll_retry_active = True

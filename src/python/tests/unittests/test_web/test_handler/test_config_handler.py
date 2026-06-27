@@ -180,6 +180,56 @@ class TestConfigHandlerSet(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual("", inner.remote_password)
 
+    def test_set_transfer_backend_to_rclone_forces_sftp_protocol(self):
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.transfer_backend = "lftp"
+        inner.protocol = "ftps"
+        inner.remote_password = "password"
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "transfer_backend",
+            "rclone"
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("rclone", inner.transfer_backend)
+        self.assertEqual("sftp", inner.protocol)
+
+    def test_set_remote_username_rejects_control_characters(self):
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "remote_username",
+            "user\r\nname"
+        )
+
+        self.assertEqual(400, response.status_code)
+        self.assertIn("contains control characters", response.body)
+
+    def test_set_protocol_to_ftps_is_ignored_for_rclone_backend(self):
+        self.config.has_section.return_value = True
+        inner = Config.Lftp()
+        inner.transfer_backend = "rclone"
+        inner.protocol = "sftp"
+        inner.remote_password = ""
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp",
+            "protocol",
+            "ftps"
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("rclone", inner.transfer_backend)
+        self.assertEqual("sftp", inner.protocol)
+
     def test_set_sensitive_field_success_response_is_redacted(self):
         self.config.has_section.return_value = True
         inner = MagicMock()

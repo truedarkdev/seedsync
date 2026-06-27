@@ -205,7 +205,14 @@ export class SettingsPageComponent implements OnInit, OnDestroy {
     }
 
     isOptionDisabled(option: IOption, config: Config): boolean {
-        return Boolean(option.disabledWhenSftp && config && config.getValue("lftp", "protocol") === "sftp");
+        if (!config) {
+            return false;
+        }
+        const transferBackend = config.getValue("lftp", "transfer_backend");
+        return Boolean(
+            (option.disabledWhenSftp && config.getValue("lftp", "protocol") === "sftp") ||
+            (option.disabledWhenTransferBackend && option.disabledWhenTransferBackend.includes(transferBackend))
+        );
     }
 
     onCommandRestart() {

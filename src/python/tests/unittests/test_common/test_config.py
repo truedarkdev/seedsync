@@ -345,6 +345,7 @@ class TestConfig(unittest.TestCase):
 
     def test_lftp(self):
         good_dict = {
+            "transfer_backend": "lftp",
             "remote_address": "remote.server.com",
             "remote_username": "remote-user",
             "remote_password": "password",
@@ -369,6 +370,7 @@ class TestConfig(unittest.TestCase):
         }
         lftp = Config.Lftp.from_dict(good_dict)
         self.assertEqual("remote.server.com", lftp.remote_address)
+        self.assertEqual("lftp", lftp.transfer_backend)
         self.assertEqual("remote-user", lftp.remote_username)
         self.assertEqual("password", lftp.remote_password)
         self.assertEqual(3456, lftp.remote_port)
@@ -427,6 +429,8 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_password", "   ")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
+        self.check_bad_value_error(Config.Lftp, good_dict, "remote_address", "remote.server.com\nhost = injected")
+        self.check_bad_value_error(Config.Lftp, good_dict, "remote_username", "remote-user\r\nuser = injected")
         self.check_bad_value_error(Config.Lftp, good_dict, "net_socket_buffer", "512KB")
         self.check_bad_value_error(Config.Lftp, good_dict, "protocol", "ftp")
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_ftp_port", "0")
@@ -476,6 +480,7 @@ class TestConfig(unittest.TestCase):
 
     def test_lftp_backfills_transfer_protocol_defaults(self):
         good_dict = {
+            "transfer_backend": "lftp",
             "remote_address": "remote.server.com",
             "remote_username": "remote-user",
             "remote_password": "password",
@@ -500,7 +505,62 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("sftp", lftp.protocol)
         self.assertEqual(21, lftp.remote_ftp_port)
         self.assertEqual(True, lftp.ftp_ssl_verify_certificate)
+
+    def test_lftp_backfills_transfer_backend_to_lftp_when_missing_or_invalid(self):
+        good_dict = {
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+        }
+
+        self.assertEqual("lftp", Config.Lftp.from_dict(good_dict).transfer_backend)
+        self.assertEqual("lftp", Config.Lftp.from_dict(dict(good_dict, transfer_backend="bad")).transfer_backend)
+
+    def test_rclone_backend_forces_sftp_protocol(self):
+        good_dict = {
+            "transfer_backend": "rclone",
+            "remote_address": "remote.server.com",
+            "remote_username": "remote-user",
+            "remote_password": "password",
+            "remote_port": "3456",
+            "remote_path": "/path/on/remote/server",
+            "local_path": "/path/on/local/server",
+            "remote_path_to_scan_script": "/path/on/remote/server/to/scan/script",
+            "use_ssh_key": "False",
+            "num_max_parallel_downloads": "2",
+            "num_max_parallel_files_per_download": "3",
+            "num_max_connections_per_root_file": "4",
+            "num_max_connections_per_dir_file": "6",
+            "num_max_total_connections": "7",
+            "use_temp_file": "True",
+            "rate_limit": "1M",
+            "protocol": "ftps",
+        }
+
+        lftp = Config.Lftp.from_dict(good_dict)
+        self.assertEqual("rclone", lftp.transfer_backend)
+        self.assertEqual("sftp", lftp.protocol)
         self.assertEqual("python3", lftp.remote_python_path)
+
+    def test_rclone_backend_forces_sftp_protocol_on_direct_property_assignment(self):
+        lftp = Config.Lftp()
+        lftp.transfer_backend = "rclone"
+        lftp.protocol = "ftps"
+
+        self.assertEqual("rclone", lftp.transfer_backend)
+        self.assertEqual("sftp", lftp.protocol)
 
     def test_lftp_allows_empty_net_socket_buffer(self):
         good_dict = {
@@ -933,6 +993,7 @@ class TestConfig(unittest.TestCase):
             config_api_redact_remote_details = True
 
             [Lftp]
+            transfer_backend = lftp
             remote_address = server.remote.com
             remote_username = user-on-remote-server
             remote_password = pass-on-remote%server

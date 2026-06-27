@@ -28,6 +28,7 @@ const GeneralRecord = Record(DefaultGeneral);
  * LFTP
  */
 interface ILftp {
+    transfer_backend: string;
     remote_address: string;
     remote_username: string;
     remote_password: string;
@@ -51,6 +52,7 @@ interface ILftp {
     ftp_ssl_verify_certificate: boolean;
 }
 const DefaultLftp: ILftp = {
+    transfer_backend: "lftp",
     remote_address: null,
     remote_username: null,
     remote_password: null,
@@ -188,7 +190,7 @@ export class Config extends ConfigRecord implements IConfig {
         // Create immutable members
         super({
             general: GeneralRecord(general),
-            lftp: LftpRecord((props && props.lftp) || {}),
+            lftp: LftpRecord(Config.normalizeLftp((props && props.lftp) || {})),
             validate: ValidateRecord((props && props.validate) || {}),
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
@@ -239,6 +241,18 @@ export class Config extends ConfigRecord implements IConfig {
         return normalized as ILogging;
     }
 
+    private static normalizeLftp(lftp: {[key: string]: any}): ILftp {
+        const normalized = typeof lftp.toJS === "function"
+            ? {...lftp.toJS()}
+            : {...lftp};
+        const transferBackend = Config.normalizeTransferBackendValue(normalized.transfer_backend);
+        normalized.transfer_backend = transferBackend;
+        if (transferBackend === "rclone") {
+            normalized.protocol = "sftp";
+        }
+        return normalized as ILftp;
+    }
+
     getValue(section: string, option: string): any {
         const sectionRecord = this.get(section as any);
         if (sectionRecord && typeof sectionRecord.get === "function") {
@@ -263,5 +277,13 @@ export class Config extends ConfigRecord implements IConfig {
 
     private static isDebugLogLevel(logLevel: any): boolean {
         return typeof logLevel === "string" && logLevel.trim().toUpperCase() === "DEBUG";
+    }
+
+    private static normalizeTransferBackendValue(value: any): string {
+        if (typeof value !== "string") {
+            return "lftp";
+        }
+        const normalizedValue = value.trim().toLowerCase();
+        return ["lftp", "rclone"].includes(normalizedValue) ? normalizedValue : "lftp";
     }
 }

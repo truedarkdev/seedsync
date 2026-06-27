@@ -30,7 +30,8 @@ from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
 from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, AppProcess, Constants, PathPair, Localization
 from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
-from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
+from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
+from transfer import create_transfer_backend, RcloneTransferError
 from .controller_persist import ControllerPersist
 from .persist_keys import persist_key, strip_persist_key
 from .delete import DeleteLocalProcess, DeleteRemoteProcess
@@ -41,8 +42,6 @@ class ControllerError(AppError):
     Exception indicating a controller error
     """
     pass
-
-
 class Controller:
     """
     Top-level class that controls the behaviour of the app
@@ -164,15 +163,18 @@ class Controller:
         general_cfg = getattr(config, "general", None)
         autoqueue_cfg = getattr(config, "autoqueue", None)
 
+        transfer_backend = getattr(lftp_cfg, "transfer_backend", "lftp")
         # The controller always starts Lftp, so the username remains required
         # even when key-based auth is enabled. Password auth is conditional.
         _append_missing("Lftp", "remote_address", getattr(lftp_cfg, "remote_address", None))
         _append_missing("Lftp", "remote_username", getattr(lftp_cfg, "remote_username", None))
         transfer_protocol = getattr(lftp_cfg, "protocol", "sftp")
         _append_missing("Lftp", "protocol", transfer_protocol)
-        if getattr(lftp_cfg, "use_ssh_key", None) is False or transfer_protocol == "ftps":
+        if getattr(lftp_cfg, "use_ssh_key", None) is False or (
+            transfer_backend == "lftp" and transfer_protocol == "ftps"
+        ):
             _append_missing("Lftp", "remote_password", getattr(lftp_cfg, "remote_password", None))
-        if transfer_protocol == "ftps":
+        if transfer_backend == "lftp" and transfer_protocol == "ftps":
             _append_missing("Lftp", "remote_ftp_port", getattr(lftp_cfg, "remote_ftp_port", None))
         for field_name in (
             "remote_port",
@@ -221,6 +223,9 @@ class Controller:
 
     def __initialize_startup_validation_failure(self, missing_fields: List[str]) -> None:
         error_message = Localization.Error.SETTINGS_INCOMPLETE_FIELDS.format(", ".join(missing_fields))
+        self.__initialize_startup_failure(error_message)
+
+    def __initialize_startup_failure(self, error_message: str) -> None:
         self.__startup_validation_error = error_message
         self.__context.status.server.up = False
         self.__context.status.server.error_msg = error_message
@@ -327,7 +332,8 @@ class Controller:
         general_cfg = config.general
         self.__ssh_password = lftp_cfg.remote_password if not lftp_cfg.use_ssh_key else None
         self.__transfer_password = (
-            lftp_cfg.remote_password if lftp_cfg.protocol == "ftps" else self.__ssh_password
+            lftp_cfg.remote_password if lftp_cfg.transfer_backend == "lftp" and lftp_cfg.protocol == "ftps"
+            else self.__ssh_password
         )
         self.__password = self.__ssh_password
 
@@ -346,17 +352,15 @@ class Controller:
         )
 
         # Lftp
-        self.__lftp = Lftp(address=lftp_cfg.remote_address,
-                           port=lftp_cfg.remote_port,
-                           user=lftp_cfg.remote_username,
-                           password=self.__transfer_password,
-                           protocol=lftp_cfg.protocol,
-                           remote_ftp_port=lftp_cfg.remote_ftp_port,
-                           ssl_verify_certificate=lftp_cfg.ftp_ssl_verify_certificate)
-        self.__lftp.set_base_logger(self.logger)
-        self.__lftp.set_base_remote_dir_path(self.__legacy_remote_path)
-        self.__lftp.set_base_local_dir_path(self.__staging_path)
-        self.__configure_lftp()
+        try:
+            self.__lftp = create_transfer_backend(lftp_cfg, self.__transfer_password, self.__ssh_password)
+            self.__lftp.set_base_logger(self.logger)
+            self.__lftp.set_base_remote_dir_path(self.__legacy_remote_path)
+            self.__lftp.set_base_local_dir_path(self.__staging_path)
+            self.__configure_lftp()
+        except (LftpError, RcloneTransferError) as exc:
+            self.__initialize_startup_failure(str(exc))
+            return
 
         try:
             self.__refresh_path_pair_runtime_state()
@@ -432,7 +436,8 @@ class Controller:
         self.__startup_failed = False
 
     def __configure_lftp(self):
-        # Configure Lftp
+        # Configure the active transfer backend while preserving the legacy lftp
+        # runtime path unchanged when lftp remains selected.
         config = cast(Any, self.__context.config)
         lftp_cfg = config.lftp
         validate_cfg = getattr(config, "validate", None)
@@ -447,12 +452,13 @@ class Controller:
         self.__lftp.rate_limit = 0 if rate_limit in (None, "") else rate_limit
         net_socket_buffer = lftp_cfg.net_socket_buffer
         self.__lftp.net_socket_buffer = 0 if net_socket_buffer in (None, "") else net_socket_buffer
-        self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
-        if getattr(validate_cfg, "xfer_verify", True):
-            self.__lftp.xfer_verify = True
-            self.__lftp.xfer_verify_command = ValidateProcess.HASH_COMMAND
-        else:
-            self.__lftp.xfer_verify = False
+        if getattr(self.__lftp, "backend_name", "lftp") != "rclone":
+            self.__lftp.temp_file_name = "*" + Constants.LFTP_TEMP_FILE_SUFFIX
+            if getattr(validate_cfg, "xfer_verify", True):
+                self.__lftp.xfer_verify = True
+                self.__lftp.xfer_verify_command = ValidateProcess.HASH_COMMAND
+            else:
+                self.__lftp.xfer_verify = False
         self.__lftp.set_verbose_logging(general_cfg.verbose)
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:
@@ -1959,7 +1965,7 @@ class Controller:
                         **queue_kwargs
                     )
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
-                except LftpError as error:
+                except (LftpError, RcloneTransferError) as error:
                     self.logger.warning(
                         "Failed to recover interrupted download '%s' from '%s': %s",
                         file_name,
@@ -2087,8 +2093,8 @@ class Controller:
                         },
                         file=file,
                     )
-                except LftpError as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
+                except (LftpError, RcloneTransferError) as e:
+                    _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
                     continue
 
             elif command.action == Controller.Command.Action.STOP:
@@ -2157,8 +2163,8 @@ class Controller:
                         },
                         file=file,
                     )
-                except (LftpError, LftpJobStatusParserError) as e:
-                    _notify_failure(command, "Lftp error: {}".format(str(e)), 500, file)
+                except (LftpError, LftpJobStatusParserError, RcloneTransferError) as e:
+                    _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
                     continue
 
             elif command.action == Controller.Command.Action.EXTRACT:
@@ -2469,8 +2475,8 @@ class Controller:
         """
         try:
             self.__lftp.raise_pending_error()
-        except LftpError as e:
-            self.logger.warning("Caught lftp error: {}".format(str(e)))
+        except (LftpError, RcloneTransferError) as e:
+            self.logger.warning("Caught transfer backend error: {}".format(str(e)))
         self.__active_scan_process.propagate_exception()
         self.__local_scan_process.propagate_exception()
         try:

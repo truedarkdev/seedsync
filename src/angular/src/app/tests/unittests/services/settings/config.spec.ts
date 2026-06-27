@@ -14,6 +14,7 @@ describe("Testing config record initialization", () => {
                 breadcrumb_trace_enabled: true
             },
             lftp: {
+                transfer_backend: "rclone",
                 remote_address: "remote.server.com",
                 remote_username: "some.user",
                 remote_password: "my.password",
@@ -69,6 +70,7 @@ describe("Testing config record initialization", () => {
         expect(config.general.verbose).toBe(false);
         expect(config.general.exclude_patterns).toBe("*.nfo,Sample/");
         expect(config.general.breadcrumb_trace_enabled).toBe(true);
+        expect(config.lftp.transfer_backend).toBe("rclone");
         expect(config.lftp.remote_address).toBe("remote.server.com");
         expect(config.lftp.remote_username).toBe("some.user");
         expect(config.lftp.remote_password).toBe("my.password");
@@ -87,7 +89,7 @@ describe("Testing config record initialization", () => {
         expect(config.lftp.rate_limit).toBe("1M");
         expect(config.lftp.net_socket_buffer).toBe("8M");
         expect(config.lftp.staging_path).toBe("/some/local/path/incomplete");
-        expect(config.lftp.protocol).toBe("ftps");
+        expect(config.lftp.protocol).toBe("sftp");
         expect(config.lftp.remote_ftp_port).toBe(2121);
         expect(config.lftp.ftp_ssl_verify_certificate).toBe(true);
         expect(config.validate.xfer_verify).toBe(true);
@@ -131,6 +133,7 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);
         expect(partialConfig.getValue("general", "verbose")).toBe(null);
         expect(partialConfig.getValue("lftp", "remote_address")).toBe(null);
+        expect(partialConfig.getValue("lftp", "transfer_backend")).toBe("lftp");
         expect(partialConfig.getValue("lftp", "net_socket_buffer")).toBe("8M");
         expect(partialConfig.getValue("lftp", "remote_python_path")).toBe("python3");
         expect(partialConfig.getValue("lftp", "protocol")).toBe("sftp");
