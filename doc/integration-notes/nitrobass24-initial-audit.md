@@ -372,8 +372,8 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 353 | `4580795021a17113fd6598fae9f6ed971e3cbb1e` | 2026-03-06 | fix: clean up startup logs — add path pairs, remove GUID (#165) | adapted locally in `76902780` |
 | 354 | `dde649dcc0f6aceb38e4a5be5a852e40f977494c` | 2026-03-06 | Release v0.13.0 — Multiple path pairs, Alpine image, and more | intentionally skipped |
 | 355 | `1385b05924d370d5cd91bd4c9af74610bafbd9da` | 2026-03-06 | docs: update README, website, and modernization plan for v0.13.0 | intentionally skipped |
-| 356 | `46a178fcaa992abf428925352acbcc37b9ea4d1e` | 2026-03-06 | fix: address code review findings across frontend and backend | needs area reopen |
-| 357 | `9ff156dfa36c908802ec3c5339c40ea796eabb7c` | 2026-03-06 | fix: staging extraction bug + round 2 code review fixes | needs area reopen |
+| 356 | `46a178fcaa992abf428925352acbcc37b9ea4d1e` | 2026-03-06 | fix: address code review findings across frontend and backend | covered elsewhere - extraction backend robustness is already present locally; UI/CI/docs/webhook/non-extraction hunks remain excluded from this slice |
+| 357 | `9ff156dfa36c908802ec3c5339c40ea796eabb7c` | 2026-03-06 | fix: staging extraction bug + round 2 code review fixes | adapted locally in `src/python/controller/extract/extract_process.py` and `src/python/tests/unittests/test_controller/test_extract/test_extract_process.py` as the request-object boundary fix |
 | 358 | `95813b589738f1d96415717de837da441e41a9b7` | 2026-03-06 | docs: document v0.13.0 known limitations in CHANGELOG and MODERNIZATION_PLAN | intentionally skipped |
 | 359 | `038de391a18fb64db1423445d74abb23ad1339d2` | 2026-03-06 | docs: remove stale LFTP parsing limitation (fixed in PR #66) | intentionally skipped |
 | 360 | `de0d58068189afc13a9e088bfd84dc043b23c1b5` | 2026-03-06 | Merge feat/v0.13.0 into develop — Multi-pair architecture & infrastructure | covered elsewhere |
@@ -381,9 +381,9 @@ This manifest freezes the full reachable history from `nitrobass24/develop` for 
 | 362 | `b58b8a66121e4f351113d148c9ba306fd4971507` | 2026-03-06 | Merge pull request #172 from nitrobass24/fix/unique-pair-names | covered elsewhere |
 | 363 | `c25fc2c02909ec028b8b482393d388a91e3a33ea` | 2026-03-06 | ci: publish develop branch images to ghcr.io on every push | maintainer decision needed in the CI/Docker topology lane - upstream adds develop-branch GHCR publishes; local Docker publish flow remains tag/master-driven |
 | 364 | `2e37d2c17349381a31499df8b837d6ae859173cb` | 2026-03-06 | Merge pull request #175 from nitrobass24/ci/publish-develop | covered elsewhere |
-| 365 | `9a76b9bf60e723286cd9f8feb31e6177a3f64164` | 2026-03-06 | fix: per-pair extraction paths and staging subdirectories (#167, #168) | needs area reopen |
-| 366 | `fc92bb16985915f53a54e092c8891994ce99ca5b` | 2026-03-06 | fix: propagate pair_id through extraction pipeline and guard None staging path | needs area reopen |
-| 367 | `d1e97e4a6f8de5b870f143f6bfda1818900144dc` | 2026-03-06 | fix: harden extract pipeline — pair_id on status, safer fallback, test updates | needs area reopen |
+| 365 | `9a76b9bf60e723286cd9f8feb31e6177a3f64164` | 2026-03-06 | fix: per-pair extraction paths and staging subdirectories (#167, #168) | adapted locally in `src/python/controller/controller.py`, `src/python/controller/extract/dispatch.py`, and `src/python/tests/unittests/test_controller/test_controller.py` for pair-scoped staging roots and fallback routing |
+| 366 | `fc92bb16985915f53a54e092c8891994ce99ca5b` | 2026-03-06 | fix: propagate pair_id through extraction pipeline and guard None staging path | adapted locally in `src/python/controller/controller.py`, `src/python/controller/extract/extract_process.py`, and `src/python/tests/unittests/test_controller/test_controller.py` for pair-id propagation and safe unknown-pair rejection |
+| 367 | `d1e97e4a6f8de5b870f143f6bfda1818900144dc` | 2026-03-06 | fix: harden extract pipeline — pair_id on status, safer fallback, test updates | adapted locally in `src/python/controller/model_builder.py`, `src/python/controller/model_updater.py`, and `src/python/tests/unittests/test_controller/test_controller.py` for pair-scoped status/result matching and guarded breadcrumbs |
 | 368 | `2805bc07fa7e9e2487bd048d6a8f98a5b3b3fcda` | 2026-03-06 | fix: filter active_extracting_file_names by pair_id | covered elsewhere |
 | 369 | `47d812b740c73c0426a1b03637126d8c6d84e886` | 2026-03-06 | Merge pull request #173 from nitrobass24/fix/per-pair-extraction | covered elsewhere |
 | 370 | `7f9b0f71e198f2ab0249aacc0431109942945ad3` | 2026-03-06 | fix: show warning banner when all path pairs are disabled (#170) | needs new integration task |

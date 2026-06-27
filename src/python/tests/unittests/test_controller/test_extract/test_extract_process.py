@@ -13,7 +13,7 @@ import json
 import pytest
 
 from model import ModelFile
-from controller.extract import ExtractDispatchError, ExtractFailedResult, ExtractProcess, ExtractListener, ExtractStatus
+from controller.extract import ExtractDispatchError, ExtractFailedResult, ExtractProcess, ExtractListener, ExtractRequest, ExtractStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 
 
@@ -389,6 +389,48 @@ class TestExtractProcess(unittest.TestCase):
             [entry["message"] for entry in entries]
         )
         self.assertEqual(["flow-123", "flow-123", "flow-123"], [entry["flow_id"] for entry in entries])
+        self.assertEqual(["pair-1", "pair-1", "pair-1"], [entry["corr_id"] for entry in entries])
+
+    def test_extract_accepts_extract_request_and_forwards_it_through_dispatch(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        process = ExtractProcess(out_dir_path="", local_path="", breadcrumb_trace=collector.create_emitter())
+        process.run_init()
+
+        model_file = ModelFile("archive.zip", False)
+        model_file.path_pair_id = "pair-1"
+        model_file.local_size = 100
+        request = ExtractRequest(
+            model_file=model_file,
+            local_path="/staging/pair-1/incomplete",
+            out_dir_path="/staging/pair-1/incomplete",
+            pair_id="pair-1",
+            local_path_fallback="/local/pair-1",
+            out_dir_path_fallback="/extract",
+        )
+
+        process.extract(request, flow_id="flow-request")
+        time.sleep(0.05)
+        process.run_loop()
+
+        self.mock_dispatch.extract.assert_called_once()
+        dispatched_request = self.mock_dispatch.extract.call_args.args[0]
+        self.assertIsInstance(dispatched_request, ExtractRequest)
+        self.assertEqual("pair-1", dispatched_request.pair_id)
+        self.assertEqual("/staging/pair-1/incomplete", dispatched_request.local_path)
+        self.assertEqual("/staging/pair-1/incomplete", dispatched_request.out_dir_path)
+        self.assertEqual("/local/pair-1", dispatched_request.local_path_fallback)
+        self.assertEqual("/extract", dispatched_request.out_dir_path_fallback)
+        self.assertEqual("archive.zip", dispatched_request.model_file.name)
+        self.assertEqual("pair-1", dispatched_request.model_file.path_pair_id)
+        entries = [
+            entry for entry in collector.snapshot()["entries"]
+            if entry["message"] in {"extract_command_queued", "extract_command_dequeued", "extract_command_dispatched"}
+        ]
+        self.assertEqual(
+            ["extract_command_queued", "extract_command_dequeued", "extract_command_dispatched"],
+            [entry["message"] for entry in entries]
+        )
+        self.assertEqual(["flow-request", "flow-request", "flow-request"], [entry["flow_id"] for entry in entries])
         self.assertEqual(["pair-1", "pair-1", "pair-1"], [entry["corr_id"] for entry in entries])
 
     def test_extract_completion_breadcrumb_reuses_inflight_flow_id(self):

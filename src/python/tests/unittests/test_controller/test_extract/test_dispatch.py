@@ -998,4 +998,4 @@ class TestExtractDispatchThreadSafety(unittest.TestCase):
             os.path.join(self.local_path, "aaa"),
             os.path.join(self.local_path, "bbb")
         ], processed_archives)
-        self.assertTrue(self.dispatch._ExtractDispatch__worker.is_alive())
+        self.assertTrue(self.dispatch._ExtractDispatch__worker_thread.is_alive())

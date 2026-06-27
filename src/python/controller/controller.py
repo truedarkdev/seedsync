@@ -23,7 +23,7 @@ from .scan import (
     MultiPathLocalScanner,
     MultiPathRemoteScanner,
 )
-from .extract import ExtractProcess, ExtractStatus
+from .extract import ExtractProcess, ExtractRequest, ExtractStatus
 from .validate import ValidateProcess
 from .model_updater import ModelUpdater
 from .model_builder import ModelBuilder
@@ -1217,6 +1217,33 @@ class Controller:
             return self.__path_pair_staging_paths.get(path_pair_id)
         return self.__staging_path
 
+    def __build_extract_request(self, file: ModelFile) -> Optional[ExtractRequest]:
+        path_pair = self.__get_path_pair(file.path_pair_id)
+        if file.path_pair_id is not None and path_pair is None:
+            return None
+
+        controller_cfg = cast(Any, self.__context.config).controller
+        staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
+        if staging_path is None:
+            return None
+
+        final_local_path = path_pair.local_path if path_pair is not None else self.__legacy_local_path
+        extract_out_dir = final_local_path if controller_cfg.use_local_path_as_extract_path else getattr(
+            controller_cfg,
+            "extract_path",
+            final_local_path,
+        )
+        local_path_fallback = final_local_path if os.path.normcase(os.path.abspath(final_local_path)) != os.path.normcase(os.path.abspath(staging_path)) else None
+        out_dir_path_fallback = extract_out_dir if os.path.normcase(os.path.abspath(extract_out_dir)) != os.path.normcase(os.path.abspath(staging_path)) else None
+        return ExtractRequest(
+            model_file=file,
+            local_path=staging_path,
+            out_dir_path=staging_path,
+            pair_id=file.path_pair_id,
+            local_path_fallback=local_path_fallback,
+            out_dir_path_fallback=out_dir_path_fallback,
+        )
+
     def __get_stop_resume_trace_file_details(self, path: Optional[str], include_allocated_size: bool = False) -> dict:
         if path is None:
             return {
@@ -1453,18 +1480,18 @@ class Controller:
         status_path_pair_id = getattr(status, "path_pair_id", None)
         for result in failed_results or []:
             result_file_id = getattr(result, "file_id", None)
-            if status_file_id and result_file_id:
+            if status_file_id is not None and result_file_id is not None:
                 if status_file_id == result_file_id:
                     return True
                 continue
 
             result_path_pair_id = getattr(result, "path_pair_id", None)
-            if status_path_pair_id and result_path_pair_id:
+            if status_path_pair_id is not None and result_path_pair_id is not None:
                 if status_path_pair_id == result_path_pair_id and status.name == result.name:
                     return True
                 continue
 
-            if status.name == result.name:
+            if status_path_pair_id is None and result_path_pair_id is None and status.name == result.name:
                 return True
         return False
 
@@ -2198,7 +2225,16 @@ class Controller:
                             "file": self.__summarize_target_archive_file(file),
                         })
                     try:
-                        self.__extract_process.extract(file, flow_id=command.flow_id)
+                        extract_request = self.__build_extract_request(file)
+                        if extract_request is None:
+                            _notify_failure(
+                                command,
+                                "Path pair '{}' is unavailable for extraction".format(file.path_pair_id),
+                                404,
+                                file
+                            )
+                            continue
+                        self.__extract_process.extract(extract_request, flow_id=command.flow_id)
                     except Exception:
                         self.logger.warning(
                             "Extract worker dispatch failed for %s",

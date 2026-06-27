@@ -12,6 +12,7 @@ import json
 from collections import defaultdict, deque
 
 from .dispatch import ExtractDispatch, ExtractStatus, ExtractListener, ExtractDispatchError
+from .extract_request import ExtractRequest
 from common import overrides, AppProcess
 from model import ModelFile
 
@@ -246,64 +247,65 @@ class ExtractProcess(AppProcess):
                 else:
                     file = queue_item
                     flow_id = None
-                assert isinstance(file, ModelFile)
+                model_file = getattr(file, "model_file", file)
+                assert isinstance(model_file, ModelFile)
                 self.__record_breadcrumb(
                     "extract_command_dequeued",
                     {
-                        "file_name": file.name,
-                        "is_dir": file.is_dir,
+                        "file_name": model_file.name,
+                        "is_dir": model_file.is_dir,
                     },
-                    corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                    corr_id=self.__trace_corr_id(model_file.file_id, model_file.path_pair_id, model_file.name),
                     flow_id=flow_id,
-                    file_id=file.file_id,
-                    path_pair_id=file.path_pair_id,
+                    file_id=model_file.file_id,
+                    path_pair_id=model_file.path_pair_id,
                 )
                 try:
-                    self.__track_inflight_flow_id(file, flow_id)
+                    self.__track_inflight_flow_id(model_file, flow_id)
                     self.__dispatch.extract(file)
                     self.__record_breadcrumb(
                         "extract_command_dispatched",
                         {
-                            "file_name": file.name,
-                            "is_dir": file.is_dir,
+                            "file_name": model_file.name,
+                            "is_dir": model_file.is_dir,
                         },
-                        corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                        corr_id=self.__trace_corr_id(model_file.file_id, model_file.path_pair_id, model_file.name),
                         flow_id=flow_id,
-                        file_id=file.file_id,
-                        path_pair_id=file.path_pair_id,
+                        file_id=model_file.file_id,
+                        path_pair_id=model_file.path_pair_id,
                     )
                 except ExtractDispatchError as e:
-                    self.__untrack_inflight_flow_id(file, flow_id)
+                    self.__untrack_inflight_flow_id(model_file, flow_id)
                     self.logger.warning(str(e))
                     self.__record_breadcrumb(
                         "extract_dispatch_blocked",
                         {
-                            "file_name": file.name,
-                            "is_dir": file.is_dir,
+                            "file_name": model_file.name,
+                            "is_dir": model_file.is_dir,
                             "reason": str(e),
                         },
                         event_type="failure",
-                        corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+                        corr_id=self.__trace_corr_id(model_file.file_id, model_file.path_pair_id, model_file.name),
                         flow_id=flow_id,
-                        file_id=file.file_id,
-                        path_pair_id=file.path_pair_id,
+                        file_id=model_file.file_id,
+                        path_pair_id=model_file.path_pair_id,
                     )
-                    if self.__target_archive_trace_selector_matches_name(file.name):
+                    if self.__target_archive_trace_selector_matches_name(model_file.name):
                         self.__trace_target_archive_event("extract_dispatch_blocked", {
-                            "file_name": file.name,
-                            "is_dir": file.is_dir,
+                            "file_name": model_file.name,
+                            "is_dir": model_file.is_dir,
                             "reason": str(e),
                         })
                     failed_result = ExtractFailedResult(
                         timestamp=datetime.now(),
-                        name=file.name,
-                        is_dir=file.is_dir,
-                        file_id=file.file_id,
-                        path_pair_id=file.path_pair_id,
+                        name=model_file.name,
+                        is_dir=model_file.is_dir,
+                        file_id=model_file.file_id,
+                        path_pair_id=model_file.path_pair_id,
                     )
                     self.__failed_result_queue.put(failed_result)
                 except Exception:
-                    self.__untrack_inflight_flow_id(file, flow_id)
+                    self.__untrack_inflight_flow_id(model_file, flow_id)
                     raise
         except queue.Empty:
             pass
@@ -411,22 +413,24 @@ class ExtractProcess(AppProcess):
                     return flow_id
         return None
 
-    def extract(self, file: ModelFile, flow_id: Optional[str] = None):
+    def extract(self, file: ExtractRequest | ModelFile, flow_id: Optional[str] = None):
         """
         Process-safe method to queue an extraction
         :param file:
         :return:
         """
+        model_file = getattr(file, "model_file", file)
+        assert isinstance(model_file, ModelFile)
         self.__record_breadcrumb(
             "extract_command_queued",
             {
-                "file_name": file.name,
-                "is_dir": file.is_dir,
+                "file_name": model_file.name,
+                "is_dir": model_file.is_dir,
             },
-            corr_id=self.__trace_corr_id(file.file_id, file.path_pair_id, file.name),
+            corr_id=self.__trace_corr_id(model_file.file_id, model_file.path_pair_id, model_file.name),
             flow_id=flow_id,
-            file_id=file.file_id,
-            path_pair_id=file.path_pair_id,
+            file_id=model_file.file_id,
+            path_pair_id=model_file.path_pair_id,
         )
         assert self.__command_queue is not None
         self.__command_queue.put((file, flow_id))
