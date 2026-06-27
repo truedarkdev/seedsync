@@ -15,7 +15,7 @@ For each active fork, keep:
 - the last fully processed upstream commit
 - the fork tip seen at the last full review
 - the last review date
-- the current caught-up status
+- the current disposition status
 - a short summary of what is already integrated locally
 - a short note for how to resume when new commits appear
 
@@ -33,7 +33,7 @@ Refresh rule:
 - Last fully processed upstream commit: <commit>
 - Fork tip at last full review: <commit>
 - Last full review date: <YYYY-MM-DD>
-- Status: caught up through this tip | refresh needed
+- Status: fully dispositioned through this tip | refresh needed
 - Integrated so far: <short summary>
 - Resume when new upstream appears: <short instruction>
 - Notes: <optional>
@@ -44,11 +44,11 @@ Refresh rule:
 - Last fully processed upstream commit: `90808e0ef3d2344e174974ef08d38e2db2b76a74`
 - Fork tip at last full review: `90808e0ef3d2344e174974ef08d38e2db2b76a74`
 - Last full review date: `2026-06-27`
-- Status: caught up through this tip; closing lane pending removal
-- Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work through `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, including the host-header guard, the requests lock refresh, the AutoQueue-to-Settings merge, and the `remote_scanner` quoting hardening. Broader auth/CSP/token-flow, dashboard restyle, Playwright/QEMU timing, and planning/release docs remained intentionally out of this refresh so the default SeedSync behavior stays conservative and recognizable; the `bcebdf8eaec5d3abf5586aad2278f2c77667cd71..90808e0ef3d2344e174974ef08d38e2db2b76a74` refresh was dispositioned separately as legacy maintenance noise rather than imported.
-- Resume when new upstream appears: fetch `thejuran/master`, review the remaining legacy commits in strict oldest-to-newest order after `90808e0ef3d2344e174974ef08d38e2db2b76a74`, then remove this lane once that final sweep is complete.
+- Status: fully dispositioned through this tip; legacy lane can be archived or removed after tracker cleanup
+- Integrated so far: conservative imports and local adaptations cover the worthwhile reviewed work through `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, including the host-header guard, the requests lock refresh, the AutoQueue-to-Settings merge, and the `remote_scanner` quoting hardening. Broader auth/CSP/token-flow, dashboard restyle, Playwright/QEMU timing, and planning/release docs remained intentionally out of this refresh so the default SeedSync behavior stays conservative and recognizable; the `bcebdf8eaec5d3abf5586aad2278f2c77667cd71..90808e0ef3d2344e174974ef08d38e2db2b76a74` refresh was fully dispositioned separately as legacy maintenance noise rather than imported, and rebrand/deprecation plus other legacy-maintenance items remain intentionally skipped or deferred, not imported.
+- Resume when new upstream appears: fetch `thejuran/master`, review the remaining legacy commits in strict oldest-to-newest order after `90808e0ef3d2344e174974ef08d38e2db2b76a74`, then archive or remove this lane once that final sweep is complete if that cleanup is still appropriate.
 - Notes:
-  - This is now a closing legacy lane. `thejuran-arr` is the ongoing successor source, and `thejuran` should be removed from this tracker after the final old-fork commit sweep is fully processed.
+  - This is a closing legacy lane. `thejuran-arr` is the ongoing successor source, and `thejuran` can be archived or removed from this tracker after the final old-fork commit sweep is fully processed if that cleanup is still appropriate.
   - This refresh has been folded back into the main tracker; the temporary frozen ledger is retired.
   - Deferred from this refresh: the broader auth/CSP/token bundle, dashboard visual restyles, Playwright/QEMU E2E timing churn, and release/planning bookkeeping.
   - Doc/planning artifacts were intentionally skipped, including the six doc-only commits from `00a0c86214261ad58592eb6978b71a948ae91e47` through `fa96fdf303b99919f10698511f12a3801d9f2cfe` and later phase-opening / completion docs.
@@ -63,14 +63,14 @@ Refresh rule:
 - Last fully processed upstream commit: `unreviewed`
 - Fork tip at last full review: `unreviewed`
 - Last full review date: `pending`
-- Status: refresh planned / integration not started
-- Integrated so far: none yet; this is the renamed `thejuran/seedsyncarr` history and it starts as a separate line, not as a continuation of the old `thejuran/seedsync` checkpoint.
+- Status: tracking only; integration has not started by request
+- Integrated so far: none yet; this is the renamed `thejuran/seedsyncarr` history and remains the durable pending inventory, not a continuation of the old `thejuran/seedsync` checkpoint.
 - Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope.
 - Notes:
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
   - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
-  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; integration has not started.
+  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; integration has not started by request.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
@@ -80,8 +80,8 @@ Refresh rule:
 - Last fully processed upstream commit: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
 - Fork tip at last full review: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
 - Last full review date: `2026-06-27`
-- Status: caught up through this tip
-- Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, and targeted reliability fixes, while branding, theme-system, and other identity-shifting changes remain intentionally out; the `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` refresh was dispositioned separately as backend-migration / rebrand noise rather than imported.
+- Status: fully dispositioned through this tip; no active conservative imports pending
+- Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, and targeted reliability fixes, while branding, theme-system, and other identity-shifting changes remain intentionally out; the `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` refresh was fully dispositioned separately as backend-migration / rebrand noise rather than imported, and the `rclone` backend replacement plus RapidCopy rebrand remain deferred, product-decision, or out-of-scope items rather than imported behavior.
 - Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `b113ae7220d531c2bf200d2cc7c6857c43fb154c` in strict oldest-to-newest order.
 - Notes:
   - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
@@ -89,8 +89,8 @@ Refresh rule:
   - The temporary frozen-refresh ledger was removed after all 13 commits in the pass received individual explorer audits, so the unresolved follow-up work now lives only in this tracker.
   - Commit `c766bd96366a1da7ffbf8f65df05a6bd904c3106` was adapted locally by hardening `lftp.queue()` command construction and adding targeted queue test coverage; WSL verification covered that adaptation.
   - Adapted rapidcopy commit `674992ac09857dc6fa8ca9642bd6a50597e2bb29` as a local `.select-all` header-checkbox alignment fix; did not take its Python `WebApp.stop()` hunk because local code already uses a consistent private stop flag implementation.
-  - `thejuran` is refreshed through `90808e0ef3d2344e174974ef08d38e2db2b76a74`; no separate frozen ledger remains active for that legacy lane.
-  - Refresh delta `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` is deferred/new-task backend migration work: the `rclone` transfer-backend replacement and follow-up plumbing stay out of this conservative fork pass, while the README/docker-compose/docs and RapidCopy rebrand pieces are skipped or wrapper-only.
+  - `thejuran` is fully dispositioned through `90808e0ef3d2344e174974ef08d38e2db2b76a74`; no separate frozen ledger remains active for that legacy lane.
+  - Refresh delta `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` is fully dispositioned as backend-migration / rebrand noise: the `rclone` transfer-backend replacement and follow-up plumbing stay out of this conservative fork pass, while the README/docker-compose/docs and RapidCopy rebrand pieces remain deferred or wrapper-only.
 
 ## nitrobass24
 - Source branch: `nitrobass24/develop`
@@ -99,10 +99,10 @@ Refresh rule:
 - Fork-unique audit rows: `869` rows, `88-956`, `ec38aaf6e6ca0ab2479fcd003d15679007101021` through `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Initial audit frozen tip: `38d6ef22d36b6a75c164bc754bac9cd2842e8722`
 - Last dispositioned fork-unique row: `956` (`38d6ef22d36b6a75c164bc754bac9cd2842e8722`)
-- Status: audit complete / deferred integration tasks open
+- Status: audit complete; latest merge-aware delta fully dispositioned; deferred integration tasks remain open
 - Initial audit scaffold: removed after catch-up completion; durable dispositions now live in this tracker and follow-up tasks.
 - Resume checkpoint: rows `761`-`956` are dispositioned; no frozen nitrobass24 rows remain pending.
-  - Refresh delta `38d6ef22d36b6a75c164bc754bac9cd2842e8722..903012bff0a495d2d33a4cd82407d744c09fb51c` adds 21 merge-aware commits: 11 non-merge dependency payloads and 10 merge wrappers. `nitrobass24/master` is not a first-parent ancestor of `develop`, so treat this as a merge-aware maintenance refresh rather than a linear feature continuation; the dependency bumps are covered/skipped by existing policy and the merge commits are wrapper-only.
+  - Refresh delta `38d6ef22d36b6a75c164bc754bac9cd2842e8722..903012bff0a495d2d33a4cd82407d744c09fb51c` adds 21 merge-aware commits total: 11 non-merge dependency payloads and 10 merge wrappers. `nitrobass24/master` is not a first-parent ancestor of `develop`, so treat this as merge-aware maintenance only rather than a linear feature continuation; the dependency bumps are covered or skipped by existing policy, the merge commits are wrapper-only, and no active runtime imports remain pending from this delta.
 - Row `847` scanner/symlink handling is an intentional local security-policy divergence: `src/python/system/scanner.py` skips directory symlinks before recursion, the existing outside-root and cyclic symlink tests lock that behavior, and any future change would need an explicit product/security decision plus a new containment model rather than bug-fix treatment.
 - Rows `943`-`956`: row `943` is intentionally skipped as a website-only dependency bump against the absent local `website/` subtree, and row `944` is its wrapper; row `945` is covered locally by the SSHCP run-command regression test lane, with row `946` covered as its wrapper; row `947` is adapted locally in `caace313` for the `.lftp` temp-file final-move deferral race, and row `949` is covered as its wrapper; rows `948`, `950`, and `952` are adapted locally through the grouped FTPS transfer protocol integration, with rows `951` and `953` covered as wrappers; row `954` is already integrated as local release history; row `955` is adapted locally in `src/angular/src/app/services/files/view-file.service.ts` and `src/angular/src/app/tests/unittests/services/files/view-file.service.spec.ts`; row `956` is the final release/sync wrapper.
 - Rows `928`-`942`: row `928` requires a maintainer decision before any local Angular 22 framework/bootstrap migration, row `929` is intentionally skipped because the changelog target is absent, row `930` is deferred because it only cleans up row `928` migration shims, row `931` remains coupled to a future Angular 22 migration rather than a standalone lint/tooling bump, and row `932` is the Angular 22 merge wrapper; row `933` is intentionally skipped because local repo has no tracked `MODERNIZATION_PLAN.md`, and row `934` is its wrapper; rows `935`, `936`, and `938` are adapted locally through the grouped FTPS transfer protocol integration, row `937` is covered as formatting-only within that FTPS lane, and rows `941`-`942` are covered as FTPS wrappers; row `939` is covered locally by the SSHCP run-command regression test lane, with row `940` covered as its wrapper.
