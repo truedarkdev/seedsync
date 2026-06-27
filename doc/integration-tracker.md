@@ -41,12 +41,12 @@ Refresh rule:
 
 ## thejuran
 - Source branch: `thejuran/master`
-- Last fully processed upstream commit: `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`
-- Fork tip at last full review: `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`
-- Last full review date: `2026-03-29`
-- Status: closing lane; final legacy commit sweep remaining before removal
-- Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work through `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, including the host-header guard, the requests lock refresh, the AutoQueue-to-Settings merge, and the `remote_scanner` quoting hardening. Broader auth/CSP/token-flow, dashboard restyle, Playwright/QEMU timing, and planning/release docs remained intentionally out of this refresh so the default SeedSync behavior stays conservative and recognizable.
-- Resume when new upstream appears: fetch `thejuran/master`, review the remaining legacy commits in strict oldest-to-newest order, then remove this lane once that final sweep is complete.
+- Last fully processed upstream commit: `90808e0ef3d2344e174974ef08d38e2db2b76a74`
+- Fork tip at last full review: `90808e0ef3d2344e174974ef08d38e2db2b76a74`
+- Last full review date: `2026-06-27`
+- Status: caught up through this tip; closing lane pending removal
+- Integrated so far: conservative imports and local adaptations now cover the worthwhile reviewed work through `bcebdf8eaec5d3abf5586aad2278f2c77667cd71`, including the host-header guard, the requests lock refresh, the AutoQueue-to-Settings merge, and the `remote_scanner` quoting hardening. Broader auth/CSP/token-flow, dashboard restyle, Playwright/QEMU timing, and planning/release docs remained intentionally out of this refresh so the default SeedSync behavior stays conservative and recognizable; the `bcebdf8eaec5d3abf5586aad2278f2c77667cd71..90808e0ef3d2344e174974ef08d38e2db2b76a74` refresh was dispositioned separately as legacy maintenance noise rather than imported.
+- Resume when new upstream appears: fetch `thejuran/master`, review the remaining legacy commits in strict oldest-to-newest order after `90808e0ef3d2344e174974ef08d38e2db2b76a74`, then remove this lane once that final sweep is complete.
 - Notes:
   - This is now a closing legacy lane. `thejuran-arr` is the ongoing successor source, and `thejuran` should be removed from this tracker after the final old-fork commit sweep is fully processed.
   - This refresh has been folded back into the main tracker; the temporary frozen ledger is retired.
@@ -56,37 +56,41 @@ Refresh rule:
   - Phase 48/49 hardening/runtime work split across local adaptations and deferrals: startup warnings (`cd07bfcf`), path-traversal guards and tests, transient SSH scan recovery (`04ed3ace76b760ef6263f22ec376fc97d55f9279`), plus covered-elsewhere items such as `7bf7fb2826b759bf1feb456a250e6d00cb35651c`, `f63e7cf5935433389acce7cc943859a834147ff4`, and `1eae2c56a9f2556d0ead2cafa8cbe93b7fd5349f`.
   - The CI/dependency cluster was treated as Angular-19-specific policy noise against the legacy Angular 4 baseline, with `cea63a27b502869241d704aabe266e18200d167c` split to a separate legacy dependency-audit task.
   - The Angular migration trio landed as `c5eb482bfbf3d8eab73d31f746ef795272a3505a` `intentionally skipped`, `db497146b623aaa860d641c24b78e18919215242` `needs new integration task`, and `3767adafbc3893ad85643de7b2b7212d8dc7b2e9` `needs subject reopen`; the migration-tail commits `c6318bc50b88ab1ffa978852193d61be321cc42a`, `ab74f8c53d9daf1e765315808bf995a6ea01974a`, `32387fca344f2b3c75eb9ab2e0f2cf4eceb58da1`, and `36c13b3f0acf5b9f0df738cd9964a44f31885771` closed the frozen range, and the `c6318bc50b88ab1ffa978852193d61be321cc42a` follow-up is now integrated locally via the Subject 21 note.
+  - Refresh delta `bcebdf8eaec5d3abf5586aad2278f2c77667cd71..90808e0ef3d2344e174974ef08d38e2db2b76a74` is dispositioned as legacy maintenance noise: the TypeScript/CI/security churn is deferred or skipped against the modern SeedSync baseline, and the SeedSyncarr rebrand/deprecation docs (`c4799171`, `14b9b017`, `90808e0f`) are intentionally skipped as identity-shift material.
 
 ## thejuran-arr
 - Source branch: `thejuran-arr/main`
 - Last fully processed upstream commit: `unreviewed`
-- Fork tip at last full review: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`
+- Fork tip at last full review: `unreviewed`
 - Last full review date: `pending`
-- Status: refresh needed
+- Status: refresh planned / integration not started
 - Integrated so far: none yet; this is the renamed `thejuran/seedsyncarr` history and it starts as a separate line, not as a continuation of the old `thejuran/seedsync` checkpoint.
-- Resume when new upstream appears: fetch `thejuran-arr`, then review the history strictly oldest-to-newest from the first commit in this lane.
+- Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope.
 - Notes:
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
-  - Local remote HEAD observed for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
+  - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
+  - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
+  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; integration has not started.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
-- Last fully processed upstream commit: `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`
-- Fork tip at last full review: `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`
-- Last full review date: `2026-04-01`
+- Last fully processed upstream commit: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
+- Fork tip at last full review: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
+- Last full review date: `2026-06-27`
 - Status: caught up through this tip
-- Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, and targeted reliability fixes, while branding, theme-system, and other identity-shifting changes remain intentionally out.
-- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` in strict oldest-to-newest order.
+- Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, and targeted reliability fixes, while branding, theme-system, and other identity-shifting changes remain intentionally out; the `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` refresh was dispositioned separately as backend-migration / rebrand noise rather than imported.
+- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `b113ae7220d531c2bf200d2cc7c6857c43fb154c` in strict oldest-to-newest order.
 - Notes:
   - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
   - Per-commit explorer re-audit finalized the disputed frozen-range dispositions as `cb20dc899ccabce453c2ae4d44e9e0153f7a74ea` `intentionally skipped` because the current workflow shape has moved past that exact `if:` guard pattern, plus `acf1a0c64eb4becb14ffec3104613238bd8cbbd5` and `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` as `needs new integration task` because both are stale failure-cleanup items that should only be revived on fresh repro.
   - The temporary frozen-refresh ledger was removed after all 13 commits in the pass received individual explorer audits, so the unresolved follow-up work now lives only in this tracker.
   - Commit `c766bd96366a1da7ffbf8f65df05a6bd904c3106` was adapted locally by hardening `lftp.queue()` command construction and adding targeted queue test coverage; WSL verification covered that adaptation.
   - Adapted rapidcopy commit `674992ac09857dc6fa8ca9642bd6a50597e2bb29` as a local `.select-all` header-checkbox alignment fix; did not take its Python `WebApp.stop()` hunk because local code already uses a consistent private stop flag implementation.
-  - `thejuran` now has a new active frozen refresh ledger beyond its prior processed checkpoint.
+  - `thejuran` is refreshed through `90808e0ef3d2344e174974ef08d38e2db2b76a74`; no separate frozen ledger remains active for that legacy lane.
+  - Refresh delta `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` is deferred/new-task backend migration work: the `rclone` transfer-backend replacement and follow-up plumbing stay out of this conservative fork pass, while the README/docker-compose/docs and RapidCopy rebrand pieces are skipped or wrapper-only.
 
 ## nitrobass24
 - Source branch: `nitrobass24/develop`
@@ -98,6 +102,7 @@ Refresh rule:
 - Status: audit complete / deferred integration tasks open
 - Initial audit scaffold: removed after catch-up completion; durable dispositions now live in this tracker and follow-up tasks.
 - Resume checkpoint: rows `761`-`956` are dispositioned; no frozen nitrobass24 rows remain pending.
+  - Refresh delta `38d6ef22d36b6a75c164bc754bac9cd2842e8722..903012bff0a495d2d33a4cd82407d744c09fb51c` adds 21 merge-aware commits: 11 non-merge dependency payloads and 10 merge wrappers. `nitrobass24/master` is not a first-parent ancestor of `develop`, so treat this as a merge-aware maintenance refresh rather than a linear feature continuation; the dependency bumps are covered/skipped by existing policy and the merge commits are wrapper-only.
 - Row `847` scanner/symlink handling is an intentional local security-policy divergence: `src/python/system/scanner.py` skips directory symlinks before recursion, the existing outside-root and cyclic symlink tests lock that behavior, and any future change would need an explicit product/security decision plus a new containment model rather than bug-fix treatment.
 - Rows `943`-`956`: row `943` is intentionally skipped as a website-only dependency bump against the absent local `website/` subtree, and row `944` is its wrapper; row `945` is covered locally by the SSHCP run-command regression test lane, with row `946` covered as its wrapper; row `947` is adapted locally in `caace313` for the `.lftp` temp-file final-move deferral race, and row `949` is covered as its wrapper; rows `948`, `950`, and `952` are adapted locally through the grouped FTPS transfer protocol integration, with rows `951` and `953` covered as wrappers; row `954` is already integrated as local release history; row `955` is adapted locally in `src/angular/src/app/services/files/view-file.service.ts` and `src/angular/src/app/tests/unittests/services/files/view-file.service.spec.ts`; row `956` is the final release/sync wrapper.
 - Rows `928`-`942`: row `928` requires a maintainer decision before any local Angular 22 framework/bootstrap migration, row `929` is intentionally skipped because the changelog target is absent, row `930` is deferred because it only cleans up row `928` migration shims, row `931` remains coupled to a future Angular 22 migration rather than a standalone lint/tooling bump, and row `932` is the Angular 22 merge wrapper; row `933` is intentionally skipped because local repo has no tracked `MODERNIZATION_PLAN.md`, and row `934` is its wrapper; rows `935`, `936`, and `938` are adapted locally through the grouped FTPS transfer protocol integration, row `937` is covered as formatting-only within that FTPS lane, and rows `941`-`942` are covered as FTPS wrappers; row `939` is covered locally by the SSHCP run-command regression test lane, with row `940` covered as its wrapper.
