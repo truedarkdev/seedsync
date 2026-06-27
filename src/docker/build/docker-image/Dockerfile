@@ -39,7 +39,6 @@ RUN set -eux; \
         p7zip \
         p7zip-full \
         p7zip-rar \
-        unrar \
         bzip2 \
         curl \
         libnss-wrapper \
@@ -84,10 +83,6 @@ LABEL org.opencontainers.image.source="https://github.com/truedarkdev/seedsync"
 COPY --from=seedsync_build_angular /build/dist /app/html
 COPY src/docker/build/docker-image/entrypoint.sh /scripts/
 RUN set -eux; \
-    if dpkg -s p7zip-rar >/dev/null 2>&1; then \
-        apt-get purge -y p7zip-rar; \
-    fi; \
-    rm -f /usr/lib/p7zip/Codecs/Rar29.so; \
     python3 -m pip uninstall -y pip setuptools
 
 # Accept new host keys on first connection while still rejecting changed keys.

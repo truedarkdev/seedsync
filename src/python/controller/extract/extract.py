@@ -1,9 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-import bz2
-import gzip
 import os
-import shutil
 import tarfile
 import tempfile
 import subprocess
@@ -24,6 +21,18 @@ class Extract:
     Utility to extract archive files
     """
     __SUBPROCESS_TIMEOUT_SECS = 300
+    __SECOND_PASS_TAR_EXTENSIONS = (
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz",
+        ".tar.bz2",
+        ".tbz",
+        ".tbz2",
+    )
+    __SINGLE_FILE_COMPRESSED_EXTENSIONS = (
+        ".gz",
+        ".bz2",
+    )
 
     @staticmethod
     def __detect_archive_kind(archive_path: str) -> str | None:
@@ -72,7 +81,7 @@ class Extract:
                 "bz2",
                 "gz",
                 "rar",
-                "tar", "tgz", "tbz2",
+                "tar", "tgz", "tbz", "tbz2",
                 "zip", "zipx"
             ]
         else:
@@ -102,15 +111,14 @@ class Extract:
                     Extract.__check_member_path(info.filename, real_out_dir)
             return True
 
-        try:
-            with tarfile.open(archive_path, "r:*") as tf:
-                for member in tf.getmembers():
-                    if member.issym() or member.islnk():
-                        raise ExtractError("Symlink/hardlink rejected in archive: '{}'".format(member.name))
-                    Extract.__check_member_path(member.name, real_out_dir)
-            return True
-        except tarfile.TarError:
-            return False
+        with tarfile.open(archive_path, "r:*") as tf:
+            for member in tf.getmembers():
+                if not (member.isdir() or member.isfile()):
+                    raise ExtractError("Unsupported tar member type: '{}'".format(member.name))
+                if member.issym() or member.islnk():
+                    raise ExtractError("Symlink/hardlink rejected in archive: '{}'".format(member.name))
+                Extract.__check_member_path(member.name, real_out_dir)
+        return True
 
     @staticmethod
     def __run_subprocess_extractor(command: list[str], tool_name: str) -> None:
@@ -136,68 +144,120 @@ class Extract:
         raise ExtractError("{} failed with exit code {}".format(tool_name, result.returncode))
 
     @staticmethod
-    def __extract_regular_file(source_handle, destination_path: str) -> None:
+    def __build_7z_extract_command(archive_path: str, out_dir_path: str) -> list[str]:
+        return ["7z", "x", "-y", "-o{}".format(out_dir_path), "--", archive_path]
+
+    @staticmethod
+    def __build_7z_stdout_command(archive_path: str) -> list[str]:
+        return ["7z", "x", "-so", "--", archive_path]
+
+    @staticmethod
+    def __run_7z_extract(archive_path: str, out_dir_path: str) -> None:
+        Extract.__run_subprocess_extractor(
+            Extract.__build_7z_extract_command(archive_path, out_dir_path),
+            "7z",
+        )
+
+    @staticmethod
+    def __run_7z_extract_to_file(archive_path: str, destination_path: str) -> None:
         os.makedirs(os.path.dirname(destination_path), exist_ok=True)
-        with open(destination_path, "wb") as destination_handle:
-            shutil.copyfileobj(source_handle, destination_handle)
+        command = Extract.__build_7z_stdout_command(archive_path)
+        try:
+            with open(destination_path, "wb") as destination_handle:
+                result = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=destination_handle,
+                    stderr=subprocess.DEVNULL,
+                    timeout=Extract.__SUBPROCESS_TIMEOUT_SECS,
+                    check=False,
+                )
+        except FileNotFoundError as e:
+            raise ExtractError("Required extraction tool not found: 7z") from e
+        except subprocess.TimeoutExpired as e:
+            raise ExtractError(
+                "7z failed after {}s timeout".format(Extract.__SUBPROCESS_TIMEOUT_SECS)
+            ) from e
+
+        if result.returncode == 0:
+            return
+
+        raise ExtractError("7z failed with exit code {}".format(result.returncode))
 
     @staticmethod
-    def __extract_tar_payload(archive_path: str, payload_root: str) -> None:
-        real_payload_root = os.path.realpath(payload_root)
-        with tarfile.open(archive_path, "r:*") as tf:
-            for member in tf.getmembers():
-                if member.issym() or member.islnk():
-                    raise ExtractError("Symlink/hardlink rejected in archive: '{}'".format(member.name))
-                Extract.__check_member_path(member.name, real_payload_root)
-
-            for member in tf.getmembers():
-                member_path = os.path.join(payload_root, member.name)
-                if member.isdir():
-                    os.makedirs(member_path, exist_ok=True)
-                    continue
-                if not member.isfile():
-                    raise ExtractError("Unsupported tar member type: '{}'".format(member.name))
-                extracted_handle = tf.extractfile(member)
-                if extracted_handle is None:
-                    raise ExtractError("Unable to read tar member: '{}'".format(member.name))
-                with extracted_handle:
-                    Extract.__extract_regular_file(extracted_handle, member_path)
+    def __is_within_root(path: str, root: str) -> bool:
+        try:
+            common_path = os.path.commonpath([root, path])
+        except ValueError:
+            return False
+        return os.path.normcase(common_path) == os.path.normcase(root)
 
     @staticmethod
-    def __extract_single_file_compressed(archive_kind: str, archive_path: str, payload_root: str) -> None:
+    def __requires_second_tar_pass(archive_path: str) -> bool:
+        archive_path_lower = archive_path.lower()
+        return archive_path_lower.endswith(Extract.__SECOND_PASS_TAR_EXTENSIONS)
+
+    @staticmethod
+    def __strip_archive_suffix(archive_name: str, suffixes: tuple[str, ...]) -> str:
+        archive_name_lower = archive_name.lower()
+        for suffix in sorted(suffixes, key=len, reverse=True):
+            if archive_name_lower.endswith(suffix):
+                stripped_name = archive_name[:-len(suffix)]
+                return stripped_name or archive_name
+        return archive_name
+
+    @staticmethod
+    def __controlled_single_file_output_path(archive_path: str, output_root: str) -> str:
         archive_name = os.path.basename(archive_path)
-        if archive_kind == "gz":
-            suffix = ".gz"
-            opener = gzip.open
-        elif archive_kind == "bz2":
-            suffix = ".bz2"
-            opener = bz2.open
-        else:
-            raise ExtractError("Unsupported compressed archive format: {}".format(archive_kind))
-
-        if archive_name.lower().endswith(suffix):
-            output_name = archive_name[:-len(suffix)]
-        else:
-            output_name = archive_name
-        if not output_name:
-            output_name = archive_name
-
-        output_path = os.path.join(payload_root, output_name)
-        with opener(archive_path, "rb") as source_handle:
-            Extract.__extract_regular_file(source_handle, output_path)
+        output_name = Extract.__strip_archive_suffix(archive_name, Extract.__SINGLE_FILE_COMPRESSED_EXTENSIONS)
+        return os.path.join(output_root, output_name)
 
     @staticmethod
-    def __validate_staged_paths(temp_root: str, payload_root: str) -> None:
-        real_payload_root = os.path.realpath(payload_root)
+    def __controlled_wrapped_tar_output_path(archive_path: str, wrapped_root: str) -> str:
+        archive_name = os.path.basename(archive_path)
+        output_name = Extract.__strip_archive_suffix(archive_name, Extract.__SECOND_PASS_TAR_EXTENSIONS)
+        if not output_name.lower().endswith(".tar"):
+            output_name = "{}.tar".format(output_name)
+        return os.path.join(wrapped_root, output_name)
+
+    @staticmethod
+    def __resolve_single_wrapped_archive(wrapped_root: str) -> str:
+        extracted_files = []
+        real_wrapped_root = os.path.realpath(wrapped_root)
+        for dirpath, dirnames, filenames in os.walk(wrapped_root):
+            for name in dirnames + filenames:
+                candidate_path = os.path.join(dirpath, name)
+                candidate_real_path = os.path.realpath(candidate_path)
+                try:
+                    common_path = os.path.commonpath([real_wrapped_root, candidate_real_path])
+                except ValueError:
+                    common_path = ""
+                if os.path.normcase(common_path) != os.path.normcase(real_wrapped_root):
+                    raise ExtractError(
+                        "Extracted path '{}' escapes staged extraction directory".format(candidate_path)
+                    )
+                if os.path.islink(candidate_path):
+                    raise ExtractError("Link rejected in extracted archive: '{}'".format(candidate_path))
+                if os.path.isfile(candidate_path):
+                    extracted_files.append(candidate_path)
+        if len(extracted_files) != 1:
+            raise ExtractError(
+                "Expected a single wrapped archive member from '{}', found {}".format(
+                    wrapped_root,
+                    len(extracted_files),
+                )
+            )
+        return extracted_files[0]
+
+    @staticmethod
+    def __validate_staged_paths(temp_root: str, allowed_roots: list[str]) -> None:
+        real_allowed_roots = [os.path.realpath(root) for root in allowed_roots]
         for dirpath, dirnames, filenames in os.walk(temp_root):
             for name in dirnames + filenames:
                 full_path = os.path.join(dirpath, name)
                 real_path = os.path.realpath(full_path)
-                try:
-                    common_path = os.path.commonpath([real_payload_root, real_path])
-                except ValueError:
-                    common_path = ""
-                if os.path.normcase(common_path) != os.path.normcase(real_payload_root):
+                if not any(Extract.__is_within_root(real_path, real_allowed_root)
+                           for real_allowed_root in real_allowed_roots):
                     raise ExtractError(
                         "Extracted path '{}' escapes staged extraction directory".format(full_path)
                     )
@@ -253,26 +313,22 @@ class Extract:
         with tempfile.TemporaryDirectory(dir=parent_dir, prefix=".tmp_extract_") as temp_root:
             payload_root = os.path.join(temp_root, "payload")
             os.makedirs(payload_root)
-            if archive_kind == "zip":
-                with zipfile.ZipFile(archive_path, "r") as zf:
-                    zf.extractall(payload_root)
-            elif archive_kind == "tar":
-                Extract.__extract_tar_payload(archive_path, payload_root)
-            elif archive_kind in ("gz", "bz2"):
-                Extract.__extract_single_file_compressed(archive_kind, archive_path, payload_root)
-            elif archive_kind == "rar":
-                Extract.__run_subprocess_extractor(
-                    ["unrar", "x", "-o+", "-y", archive_path, payload_root],
-                    "unrar",
-                )
-            elif archive_kind == "7z":
-                Extract.__run_subprocess_extractor(
-                    ["7z", "x", "-y", "-o{}".format(payload_root), archive_path],
-                    "7z",
-                )
-            else:
+            allowed_roots = [payload_root]
+            if archive_kind not in ("zip", "tar", "gz", "bz2", "rar", "7z"):
                 raise ExtractError("Unsupported archive format: {}".format(archive_path))
-            Extract.__validate_staged_paths(temp_root, payload_root)
+            if archive_kind == "tar" and Extract.__requires_second_tar_pass(archive_path):
+                wrapped_root = os.path.join(temp_root, "wrapped")
+                os.makedirs(wrapped_root)
+                allowed_roots.append(wrapped_root)
+                wrapped_archive_path = Extract.__controlled_wrapped_tar_output_path(archive_path, wrapped_root)
+                Extract.__run_7z_extract_to_file(archive_path, wrapped_archive_path)
+                Extract.__run_7z_extract(wrapped_archive_path, payload_root)
+            elif archive_kind in ("gz", "bz2"):
+                controlled_output_path = Extract.__controlled_single_file_output_path(archive_path, payload_root)
+                Extract.__run_7z_extract_to_file(archive_path, controlled_output_path)
+            else:
+                Extract.__run_7z_extract(archive_path, payload_root)
+            Extract.__validate_staged_paths(temp_root, allowed_roots)
             Extract.__merge_staged_payload(payload_root, out_dir_path)
 
     @staticmethod

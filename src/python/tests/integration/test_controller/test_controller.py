@@ -22,7 +22,7 @@ from common import overrides, Context, Config, Args, AppError, Localization, Sta
 from controller import Controller, ControllerPersist
 from model import ModelFile, IModelListener
 
-HAS_RAR = shutil.which("rar") is not None
+HAS_RAR = shutil.which("rar") is not None and shutil.which("7z") is not None
 
 
 pytestmark = pytest.mark.timeout(20)
