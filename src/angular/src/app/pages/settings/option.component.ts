@@ -37,6 +37,10 @@ export class OptionComponent implements OnInit {
         return choices;
     }
 
+    get isDisabled(): boolean {
+        return this.disabled;
+    }
+
     // noinspection JSUnusedGlobalSymbols
     ngOnInit(): void {
         // Debounce

@@ -1,4 +1,5 @@
 <div class="form-group"
+     [class.disabled]="isDisabled"
      [class.error]="value == '<replace me>'">
 
     <!-- Unfortunately, binding to type attribute breaks functionality, so we
@@ -10,7 +11,7 @@
         <input
                type="text"
                class="form-control"
-               [disabled]="disabled || value === null || value === undefined"
+               [disabled]="isDisabled"
                [ngModel]="value"
                (ngModelChange)="onChange($event)" />
         <span *ngIf="description"
@@ -22,7 +23,7 @@
         <input
                type="checkbox"
                class="form-control"
-               [disabled]="disabled || value === null || value === undefined"
+               [disabled]="isDisabled"
                [ngModel]="value"
            (ngModelChange)="onChange($event)" />
         <span class="name">{{label}}</span>
@@ -36,7 +37,7 @@
         <input
                type="password"
                class="form-control"
-               [disabled]="disabled || value === null || value === undefined"
+               [disabled]="isDisabled"
                [ngModel]="value"
                (ngModelChange)="onChange($event)" />
         <span *ngIf="description"
@@ -48,7 +49,7 @@
         <span class="name">{{label}}</span>
         <select
                class="form-control"
-               [disabled]="disabled || value === null || value === undefined"
+               [disabled]="isDisabled"
                (change)="onChange($event.target.value)">
             <option *ngFor="let choice of effectiveChoices"
                     [value]="choice.value"
