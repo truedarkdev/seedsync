@@ -42,19 +42,32 @@ class ConfigHandler(IHandler):
         return value.strip().lower() if isinstance(value, str) else value
 
     @staticmethod
+    def __normalize_transfer_backend_for_guard(value):
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @staticmethod
+    def __normalize_lftp_backend_constraints(inner_config):
+        if getattr(inner_config, "transfer_backend", "lftp") == "rclone":
+            inner_config.set_property("protocol", "sftp")
+
+    @staticmethod
     def __would_create_blank_ftps_password(inner_config, section: str, key: str, value) -> bool:
         if section != "lftp":
             return False
 
+        transfer_backend = getattr(inner_config, "transfer_backend", "lftp")
         protocol = getattr(inner_config, "protocol", None)
         remote_password = getattr(inner_config, "remote_password", None)
+        if key == "transfer_backend":
+            transfer_backend = value
         if key == "protocol":
             protocol = value
         elif key == "remote_password":
             remote_password = value
 
+        transfer_backend = ConfigHandler.__normalize_transfer_backend_for_guard(transfer_backend)
         protocol = ConfigHandler.__normalize_transfer_protocol_for_guard(protocol)
-        return protocol == "ftps" and ConfigHandler.__is_blank_text(remote_password)
+        return transfer_backend == "lftp" and protocol == "ftps" and ConfigHandler.__is_blank_text(remote_password)
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp):
@@ -93,6 +106,11 @@ class ConfigHandler(IHandler):
             return
         inner_config.set_property(key, value)
 
+    @staticmethod
+    def __restore_previous_snapshot(inner_config, snapshot):
+        for snapshot_key, snapshot_value in snapshot.items():
+            inner_config.set_property(snapshot_key, snapshot_value)
+
     def __handle_set_config(self, section: str, key: str, value=None):
         if value is None:
             try:
@@ -128,13 +146,21 @@ class ConfigHandler(IHandler):
             )
         with self.__write_lock:
             old_value = ConfigHandler.__read_current_value(inner_config, section, key)
+            old_snapshot = inner_config.as_dict() if hasattr(inner_config, "as_dict") else None
             try:
                 inner_config.set_property(key, value)
+                if section == "lftp":
+                    ConfigHandler.__normalize_lftp_backend_constraints(inner_config)
                 self.__config.to_file()
             except ConfigError as e:
+                if old_snapshot is not None:
+                    ConfigHandler.__restore_previous_snapshot(inner_config, old_snapshot)
                 return HTTPResponse(body=str(e), status=400)
             except Exception:
-                ConfigHandler.__restore_previous_value(inner_config, section, key, old_value)
+                if old_snapshot is not None:
+                    ConfigHandler.__restore_previous_snapshot(inner_config, old_snapshot)
+                else:
+                    ConfigHandler.__restore_previous_value(inner_config, section, key, old_value)
                 logger.exception("Failed to persist config %s.%s", section, key)
                 return HTTPResponse(body="Failed to persist config {}.{}".format(section, key), status=500)
         if self.__breadcrumb_trace_sync is not None and section == "general" and key == "breadcrumb_trace_enabled":

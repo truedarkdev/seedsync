@@ -33,6 +33,7 @@ export class ConfigService extends BaseWebService {
 
     private _config: BehaviorSubject<Config> = new BehaviorSubject(null);
     private _restartRequiredOptions: IRestartRequiredOptions = {};
+    private static readonly TRANSFER_BACKENDS = ["lftp", "rclone"];
 
     constructor(_streamServiceProvider: StreamServiceRegistry,
                 private _restService: RestService,
@@ -69,8 +70,9 @@ export class ConfigService extends BaseWebService {
      * @returns {WebReaction}
      */
     public set(section: string, option: string, value: any): Observable<WebReaction> {
-        const normalizedValue = this.normalizeValue(section, option, value);
-        const canonicalOption = this.resolveCanonicalOption(section, option);
+        const normalizedUpdate = this.normalizeConfigUpdate(section, option, value);
+        const normalizedValue = normalizedUpdate.value;
+        const canonicalOption = normalizedUpdate.canonicalOption;
         const valueStr: string = String(normalizedValue);
         const allowBlankValue = section === "lftp" &&
             (
@@ -102,7 +104,14 @@ export class ConfigService extends BaseWebService {
                     if (reaction.success) {
                         // Update our copy and notify clients
                         const config = this._config.getValue();
-                        const newConfig = new Config(config.updateIn([section, canonicalOption], (_) => normalizedValue));
+                        let nextConfigState = config.updateIn([section, canonicalOption], (_) => normalizedValue);
+                        for (const companionUpdate of normalizedUpdate.companionUpdates) {
+                            nextConfigState = nextConfigState.updateIn(
+                                [companionUpdate.section, companionUpdate.option],
+                                (_) => companionUpdate.value
+                            );
+                        }
+                        const newConfig = new Config(nextConfigState);
                         this._config.next(newConfig);
                     }
                 }),
@@ -148,6 +157,12 @@ export class ConfigService extends BaseWebService {
         if (section === "general" && option === "debug") {
             return this.normalizeDebugValue(value);
         }
+        if (section === "lftp" && option === "transfer_backend") {
+            return this.normalizeTransferBackendValue(value);
+        }
+        if (section === "lftp" && option === "protocol" && this.getCurrentTransferBackend() === "rclone") {
+            return "sftp";
+        }
         if (section === "lftp" && option === "net_socket_buffer") {
             return this.normalizeNetSocketBufferValue(value);
         }
@@ -162,6 +177,28 @@ export class ConfigService extends BaseWebService {
             return "log_level";
         }
         return option;
+    }
+
+    private normalizeConfigUpdate(section: string, option: string, value: any): {
+        canonicalOption: string,
+        value: any,
+        companionUpdates: Array<{section: string, option: string, value: any}>
+    } {
+        const normalizedValue = this.normalizeValue(section, option, value);
+        const companionUpdates: Array<{section: string, option: string, value: any}> = [];
+
+        if (section === "lftp" && option === "transfer_backend" && normalizedValue === "rclone") {
+            companionUpdates.push({section: "lftp", option: "protocol", value: "sftp"});
+        }
+        if (section === "lftp" && option === "protocol" && this.getCurrentTransferBackend() === "rclone") {
+            companionUpdates.push({section: "lftp", option: "protocol", value: "sftp"});
+        }
+
+        return {
+            canonicalOption: this.resolveCanonicalOption(section, option),
+            value: normalizedValue,
+            companionUpdates,
+        };
     }
 
     private normalizeNetSocketBufferValue(value: any): string {
@@ -212,17 +249,34 @@ export class ConfigService extends BaseWebService {
             return false;
         }
 
+        const transferBackend = option === "transfer_backend"
+            ? this.normalizeTransferBackendValue(value)
+            : currentConfig.getValue("lftp", "transfer_backend");
         const protocol = option === "protocol"
             ? String(value).trim().toLowerCase()
             : currentConfig.getValue("lftp", "protocol");
         const remotePassword = option === "remote_password"
             ? value
             : currentConfig.getValue("lftp", "remote_password");
-        return protocol === "ftps" && this.isBlankText(remotePassword);
+        return transferBackend === "lftp" && protocol === "ftps" && this.isBlankText(remotePassword);
     }
 
     private isBlankText(value: any): boolean {
         return value === null || value === undefined || (typeof value === "string" && value.trim().length === 0);
+    }
+
+    private getCurrentTransferBackend(): string {
+        const currentConfig = this._config.getValue();
+        const currentBackend = currentConfig ? currentConfig.getValue("lftp", "transfer_backend") : null;
+        return this.normalizeTransferBackendValue(currentBackend);
+    }
+
+    private normalizeTransferBackendValue(value: any): string {
+        if (typeof value !== "string") {
+            return "lftp";
+        }
+        const normalizedValue = value.trim().toLowerCase();
+        return ConfigService.TRANSFER_BACKENDS.includes(normalizedValue) ? normalizedValue : "lftp";
     }
 }
 

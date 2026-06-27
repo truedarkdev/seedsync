@@ -312,4 +312,28 @@ describe("Testing settings page component", () => {
         expect(component.serverContext.options.find(option => option.valuePath[1] === "local_path")!.disabled).toBeUndefined();
         expect(component.autoqueueContext.options.find(option => option.valuePath[1] === "enabled")!.disabled).toBeUndefined();
     });
+
+    it("should disable FTPS-only controls when rclone is selected", () => {
+        const config = new Config({
+            lftp: {
+                transfer_backend: "rclone",
+                protocol: "sftp",
+                remote_ftp_port: 21,
+                ftp_ssl_verify_certificate: true,
+            }
+        });
+        const protocolOption = component.OPTIONS_CONTEXT_TRANSFER_PROTOCOL.options.find(
+            option => option.valuePath[1] === "protocol"
+        )!;
+        const ftpPortOption = component.OPTIONS_CONTEXT_TRANSFER_PROTOCOL.options.find(
+            option => option.valuePath[1] === "remote_ftp_port"
+        )!;
+        const verifyCertificateOption = component.OPTIONS_CONTEXT_TRANSFER_PROTOCOL.options.find(
+            option => option.valuePath[1] === "ftp_ssl_verify_certificate"
+        )!;
+
+        expect(component.isOptionDisabled(protocolOption, config)).toBe(true);
+        expect(component.isOptionDisabled(ftpPortOption, config)).toBe(true);
+        expect(component.isOptionDisabled(verifyCertificateOption, config)).toBe(true);
+    });
 });

@@ -71,6 +71,13 @@ class TestConfigHandler(BaseTestWebApp):
         self.assertEqual(200, resp.status_int)
         self.assertEqual("8M", self.context.config.lftp.net_socket_buffer)
 
+        self.assertEqual("lftp", self.context.config.lftp.transfer_backend)
+        self.context.config.lftp.protocol = "ftps"
+        resp = self.test_app.post_json("/server/config/set/lftp/transfer_backend", {"value": "rclone"})
+        self.assertEqual(200, resp.status_int)
+        self.assertEqual("rclone", self.context.config.lftp.transfer_backend)
+        self.assertEqual("sftp", self.context.config.lftp.protocol)
+
         resp = self.test_app.post_json("/server/config/set/lftp/net_socket_buffer", {"value": ""})
         self.assertEqual(200, resp.status_int)
         self.assertEqual("", self.context.config.lftp.net_socket_buffer)

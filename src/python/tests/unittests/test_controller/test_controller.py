@@ -22,6 +22,7 @@ from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
 from system import SystemFile
+from transfer import RcloneTransferError
 
 
 class TestController(unittest.TestCase):
@@ -152,6 +153,7 @@ class TestController(unittest.TestCase):
         use_ssh_key=False,
         verbose=False,
         auto_delete_remote=False,
+        transfer_backend="lftp",
         protocol="sftp",
         remote_ftp_port=21,
         ftp_ssl_verify_certificate=True,
@@ -161,6 +163,7 @@ class TestController(unittest.TestCase):
             web_access_logger=MagicMock(),
             config=SimpleNamespace(
                 lftp=SimpleNamespace(
+                    transfer_backend=transfer_backend,
                     remote_address="remote.server.com",
                     remote_username=remote_username,
                     remote_password=remote_password,
@@ -273,25 +276,56 @@ class TestController(unittest.TestCase):
             use_local_path_as_extract_path=True,
         )
 
-        with patch("controller.controller.Lftp") as mock_lftp:
+        with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+            mock_backend = MagicMock()
+            mock_create_transfer_backend.return_value = mock_backend
             controller = Controller(context, ControllerPersist())
 
         self.assertIsNone(controller._Controller__startup_validation_error)
-        self.assertTrue(mock_lftp.called)
+        self.assertIs(controller._Controller__lftp, mock_backend)
 
     def test_constructor_passes_sftp_defaults_to_lftp(self):
         context = self._make_startup_context(local_path="/local")
 
-        with patch("controller.controller.Lftp") as mock_lftp:
-            Controller(context, ControllerPersist())
+        with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+            mock_backend = MagicMock()
+            mock_create_transfer_backend.return_value = mock_backend
+            controller = Controller(context, ControllerPersist())
 
-        mock_lftp.assert_called_once()
-        kwargs = mock_lftp.call_args.kwargs
-        self.assertEqual(22, kwargs["port"])
-        self.assertEqual("password", kwargs["password"])
-        self.assertEqual("sftp", kwargs["protocol"])
-        self.assertEqual(21, kwargs["remote_ftp_port"])
-        self.assertEqual(True, kwargs["ssl_verify_certificate"])
+        mock_create_transfer_backend.assert_called_once_with(
+            context.config.lftp,
+            "password",
+            "password",
+        )
+        self.assertEqual("password", controller._Controller__ssh_password)
+        self.assertEqual("password", controller._Controller__transfer_password)
+
+    @patch("controller.controller.create_transfer_backend")
+    def test_constructor_uses_rclone_backend_factory_when_selected(self, mock_create_transfer_backend):
+        mock_backend = MagicMock()
+        mock_backend.backend_name = "rclone"
+        mock_create_transfer_backend.return_value = mock_backend
+        context = self._make_startup_context(local_path="/local", transfer_backend="rclone", protocol="ftps")
+
+        controller = Controller(context, ControllerPersist())
+
+        mock_create_transfer_backend.assert_called_once_with(
+            context.config.lftp,
+            controller._Controller__transfer_password,
+            controller._Controller__ssh_password,
+        )
+        self.assertIs(controller._Controller__lftp, mock_backend)
+
+    @patch("controller.controller.create_transfer_backend", side_effect=RcloneTransferError("rclone missing from PATH"))
+    def test_constructor_reports_rclone_backend_startup_failure(self, _mock_create_transfer_backend):
+        context = self._make_startup_context(local_path="/local", transfer_backend="rclone")
+
+        controller = Controller(context, ControllerPersist())
+
+        self.assertFalse(controller._Controller__started)
+        self.assertEqual("rclone missing from PATH", controller._Controller__startup_validation_error)
+        self.assertFalse(context.status.server.up)
+        self.assertEqual("rclone missing from PATH", context.status.server.error_msg)
 
     def test_constructor_passes_ftps_transfer_password_without_forcing_ssh_password(self):
         context = self._make_startup_context(
@@ -302,15 +336,16 @@ class TestController(unittest.TestCase):
             ftp_ssl_verify_certificate=True,
         )
 
-        with patch("controller.controller.Lftp") as mock_lftp:
+        with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+            mock_backend = MagicMock()
+            mock_create_transfer_backend.return_value = mock_backend
             controller = Controller(context, ControllerPersist())
 
-        kwargs = mock_lftp.call_args.kwargs
-        self.assertEqual(22, kwargs["port"])
-        self.assertEqual("password", kwargs["password"])
-        self.assertEqual("ftps", kwargs["protocol"])
-        self.assertEqual(2121, kwargs["remote_ftp_port"])
-        self.assertEqual(True, kwargs["ssl_verify_certificate"])
+        mock_create_transfer_backend.assert_called_once_with(
+            context.config.lftp,
+            "password",
+            None,
+        )
         self.assertIsNone(controller._Controller__ssh_password)
         self.assertEqual("password", controller._Controller__transfer_password)
 
@@ -359,12 +394,13 @@ class TestController(unittest.TestCase):
             protocol="ftps",
         )
 
-        with patch("controller.controller.Lftp") as mock_lftp:
+        with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+            mock_create_transfer_backend.side_effect = AssertionError("should not construct transfer backend")
             controller = Controller(context, ControllerPersist())
 
         self.assertIsNotNone(controller._Controller__startup_validation_error)
         self.assertIn("Lftp.remote_password", controller._Controller__startup_validation_error)
-        mock_lftp.assert_not_called()
+        mock_create_transfer_backend.assert_not_called()
 
     def test_constructor_uses_path_pair_fallback_when_legacy_paths_missing(self):
         manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
@@ -384,7 +420,9 @@ class TestController(unittest.TestCase):
                 path_pair_manager=manager,
             )
 
-            with patch("controller.controller.Lftp") as mock_lftp:
+            with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+                mock_backend = MagicMock()
+                mock_create_transfer_backend.return_value = mock_backend
                 controller = Controller(context, ControllerPersist())
 
             self.assertIsNone(controller._Controller__startup_validation_error)
@@ -394,7 +432,7 @@ class TestController(unittest.TestCase):
                 os.path.join("/downloads/movies", "incomplete"),
                 controller._Controller__staging_path
             )
-            self.assertTrue(mock_lftp.called)
+            self.assertIs(controller._Controller__lftp, mock_backend)
         finally:
             shutil.rmtree(manager._config_dir)
 
@@ -416,13 +454,14 @@ class TestController(unittest.TestCase):
                 path_pair_manager=manager,
             )
 
-            with patch("controller.controller.Lftp") as mock_lftp:
+            with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+                mock_create_transfer_backend.side_effect = AssertionError("should not construct transfer backend")
                 controller = Controller(context, ControllerPersist())
 
             self.assertIsNotNone(controller._Controller__startup_validation_error)
             self.assertIn("Lftp.remote_path", controller._Controller__startup_validation_error)
             self.assertIn("Lftp.local_path", controller._Controller__startup_validation_error)
-            mock_lftp.assert_not_called()
+            mock_create_transfer_backend.assert_not_called()
         finally:
             shutil.rmtree(manager._config_dir)
 
@@ -557,12 +596,12 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual(Controller._MAX_PENDING_DELETE_COMMANDS, self.controller._Controller__command_queue.qsize())
 
-    def test_update_model_ignores_lftp_status_parser_errors(self):
+    def test_update_model_ignores_transfer_backend_status_parser_errors(self):
         self.controller._Controller__lftp.status.side_effect = LftpJobStatusParserError("bad status")
 
         self.controller._Controller__update_model()
 
-        self.controller.logger.warning.assert_called_once_with("Caught lftp error: bad status")
+        self.controller.logger.warning.assert_called_once_with("Caught transfer backend error: bad status")
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
         self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
@@ -1647,11 +1686,12 @@ class TestController(unittest.TestCase):
                 raise AssertionError("Unexpected file_updated callback")
 
         context = self._make_startup_context(local_path="/local")
-        with patch("controller.controller.Lftp"), \
+        with patch("controller.controller.create_transfer_backend") as create_transfer_backend_mock, \
                 patch("controller.controller.ScannerProcess") as scanner_process_cls, \
                 patch("controller.controller.ExtractProcess"), \
                 patch("controller.controller.ValidateProcess"), \
                 patch("controller.controller.MultiprocessingLogger"):
+            create_transfer_backend_mock.return_value = MagicMock()
             scanner_process_cls.side_effect = [MagicMock(), MagicMock(), MagicMock()]
             controller = Controller(context, ControllerPersist())
 
@@ -1705,7 +1745,7 @@ class TestController(unittest.TestCase):
 
         self.assertEqual({file_movies.file_id, file_tv.file_id}, {file.file_id for file in model_files})
 
-    def test_process_commands_stop_reports_lftp_status_parser_errors(self):
+    def test_process_commands_stop_reports_transfer_backend_status_parser_errors(self):
         file = ModelFile("example", False)
         file.state = ModelFile.State.DOWNLOADING
         file.is_stoppable = True
@@ -1719,7 +1759,7 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__process_commands()
 
-        callback.on_failure.assert_called_once_with("Lftp error: bad status", 500)
+        callback.on_failure.assert_called_once_with("Transfer backend error: bad status", 500)
         callback.on_success.assert_not_called()
 
     def test_process_commands_stop_reports_missing_lftp_job_as_failure(self):
@@ -1796,12 +1836,12 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_called_once_with("File 'example' is not Queued or Downloading", 409)
         callback.on_success.assert_not_called()
 
-    def test_propagate_exceptions_ignores_pending_lftp_errors(self):
+    def test_propagate_exceptions_ignores_pending_transfer_backend_errors(self):
         self.controller._Controller__lftp.raise_pending_error.side_effect = LftpError("pending failure")
 
         self.controller._Controller__propagate_exceptions()
 
-        self.controller.logger.warning.assert_called_once_with("Caught lftp error: pending failure")
+        self.controller.logger.warning.assert_called_once_with("Caught transfer backend error: pending failure")
         self.controller._Controller__active_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__local_scan_process.propagate_exception.assert_called_once_with()
         self.controller._Controller__remote_scan_process.propagate_exception.assert_called_once_with()

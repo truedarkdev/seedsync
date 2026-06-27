@@ -7,6 +7,7 @@ export interface IOption {
     description: string | null;
     choices?: {label: string; value: any;}[];
     disabledWhenSftp?: boolean;
+    disabledWhenTransferBackend?: string[];
     disabled?: boolean;
 }
 export interface IOptionsGroup {
@@ -87,6 +88,16 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
     options: [
         {
             type: OptionType.Select,
+            label: "Transfer Backend",
+            valuePath: ["lftp", "transfer_backend"],
+            description: "Choose the transfer engine. LFTP remains the default; rclone currently supports SFTP only.",
+            choices: [
+                {label: "LFTP", value: "lftp"},
+                {label: "rclone", value: "rclone"},
+            ],
+        },
+        {
+            type: OptionType.Select,
             label: "Transfer Protocol",
             valuePath: ["lftp", "protocol"],
             description: "SFTP is the default. FTPS applies only to bulk file transfers; file discovery still uses SSH.",
@@ -94,6 +105,7 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
                 {label: "SFTP", value: "sftp"},
                 {label: "FTPS", value: "ftps"},
             ],
+            disabledWhenTransferBackend: ["rclone"],
         },
         {
             type: OptionType.Text,
@@ -101,6 +113,7 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
             valuePath: ["lftp", "remote_ftp_port"],
             description: "Used only when Transfer Protocol is FTPS.",
             disabledWhenSftp: true,
+            disabledWhenTransferBackend: ["rclone"],
         },
         {
             type: OptionType.Checkbox,
@@ -108,6 +121,7 @@ export const OPTIONS_CONTEXT_TRANSFER_PROTOCOL: IOptionsContext = {
             valuePath: ["lftp", "ftp_ssl_verify_certificate"],
             description: "Recommended. Turn off only for self-signed or legacy servers.",
             disabledWhenSftp: true,
+            disabledWhenTransferBackend: ["rclone"],
         },
     ]
 };
