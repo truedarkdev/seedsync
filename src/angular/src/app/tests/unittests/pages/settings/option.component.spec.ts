@@ -1,29 +1,9 @@
 import {CommonModule} from "@angular/common";
-import {Component} from "@angular/core";
 import {ComponentFixture, fakeAsync, TestBed, tick} from "@angular/core/testing";
 import {FormsModule} from "@angular/forms";
-import {By} from "@angular/platform-browser";
 
 import {DEBOUNCE_TIME_MS, OptionComponent, OptionType} from "../../../../pages/settings/option.component";
 
-
-@Component({
-    standalone: false,
-    template: `
-        <app-option
-            [type]="type"
-            [label]="label"
-            [value]="value"
-            [disabled]="disabled">
-        </app-option>
-    `
-})
-class OptionHostComponent {
-    type = OptionType.Text;
-    label = "Server Directory";
-    value = "/remote/movies";
-    disabled = true;
-}
 
 describe("Testing option component", () => {
     let fixture: ComponentFixture<OptionComponent>;
@@ -117,23 +97,41 @@ describe("Testing option component", () => {
         expect(changeSpy).toHaveBeenCalledWith("same");
     }));
 
-    it("should disable the control when the disabled input is set", () => {
-        TestBed.resetTestingModule();
-        TestBed.configureTestingModule({
-            imports: [
-                CommonModule,
-                FormsModule
-            ],
-            declarations: [
-                OptionComponent,
-                OptionHostComponent
-            ]
-        });
+    it("should apply disabled styling when the disabled input is set", () => {
+        component.type = OptionType.Select;
+        component.label = "Transfer Protocol";
+        component.value = "sftp";
+        component.choices = [
+            {label: "SFTP", value: "sftp"},
+            {label: "FTPS", value: "ftps"},
+        ];
+        component.disabled = true;
 
-        const hostFixture = TestBed.createComponent(OptionHostComponent);
-        hostFixture.detectChanges();
+        fixture.detectChanges();
 
-        const option = hostFixture.debugElement.query(By.directive(OptionComponent)).componentInstance as OptionComponent;
-        expect(option.disabled).toBe(true);
+        const formGroup = fixture.nativeElement.querySelector(".form-group") as HTMLElement;
+        const select = fixture.nativeElement.querySelector("select") as HTMLSelectElement;
+
+        expect(formGroup.classList.contains("disabled")).toBeTrue();
+        expect(select.disabled).toBeTrue();
+    });
+
+    it("should keep null-valued selects visually normal when disabled is false", () => {
+        component.type = OptionType.Select;
+        component.label = "Transfer Protocol";
+        component.value = null;
+        component.choices = [
+            {label: "SFTP", value: "sftp"},
+            {label: "FTPS", value: "ftps"},
+        ];
+        component.disabled = false;
+
+        fixture.detectChanges();
+
+        const formGroup = fixture.nativeElement.querySelector(".form-group") as HTMLElement;
+        const select = fixture.nativeElement.querySelector("select") as HTMLSelectElement;
+
+        expect(formGroup.classList.contains("disabled")).toBeFalse();
+        expect(select.disabled).toBeFalse();
     });
 });

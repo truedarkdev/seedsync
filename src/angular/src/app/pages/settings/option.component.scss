@@ -4,6 +4,10 @@
     margin-bottom: 0;
     margin-left: 20px;
     margin-right: 20px;
+
+    &.disabled {
+        opacity: .65;
+    }
 }
 
 .error {
