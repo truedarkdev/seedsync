@@ -278,6 +278,12 @@ class ModelBuilder:
         return model_file.file_id in persisted_names or model_file.name in persisted_names
 
     @staticmethod
+    def __extract_status_key(status: ExtractStatus) -> str:
+        if status.file_id is not None:
+            return status.file_id
+        return ModelFile.build_file_id(status.name, status.path_pair_id)
+
+    @staticmethod
     def __candidate_stopped_file_ids(file_id: Optional[str],
                                      remote: Optional[SystemFile] = None,
                                      local: Optional[SystemFile] = None,
@@ -426,8 +432,6 @@ class ModelBuilder:
             return None
         root_paths = self.__local_staging_paths if getattr(local_file, "is_staging", False) else self.__local_root_paths
         resolved_root = root_paths.get(model_file.path_pair_id)
-        if resolved_root is None and model_file.path_pair_id is not None:
-            resolved_root = root_paths.get(None)
         if resolved_root is None:
             return None
         return os.path.join(resolved_root, model_file.full_path)
@@ -438,8 +442,6 @@ class ModelBuilder:
         if local_file is not None and getattr(local_file, "is_staging", False):
             return None
         resolved_root = self.__local_root_paths.get(path_pair_id)
-        if resolved_root is None and path_pair_id is not None:
-            resolved_root = self.__local_root_paths.get(None)
         if resolved_root is None:
             return None
         return os.path.normcase(os.path.normpath(resolved_root.replace("\\", "/")))
@@ -1039,7 +1041,9 @@ class ModelBuilder:
 
     def set_extract_statuses(self, extract_statuses: List[ExtractStatus]):
         prev_extract_statuses = self.__extract_statuses
-        self.__extract_statuses = {status.name: status for status in extract_statuses}
+        self.__extract_statuses = {
+            self.__extract_status_key(status): status for status in extract_statuses
+        }
         # Invalidate the cache
         if self.__extract_statuses != prev_extract_statuses:
             self.__cached_model = None
@@ -1788,13 +1792,13 @@ class ModelBuilder:
         # and exists locally
         # if root is NOT in an expected state, then ignore the extract status
         # and report a warning message, as this shouldn't be happening
-        if model_file.name not in self.__extract_statuses:
+        if model_file.file_id not in self.__extract_statuses:
             return
-        extract_status = self.__extract_statuses[model_file.name]
+        extract_status = self.__extract_statuses[model_file.file_id]
         if model_file.is_dir != extract_status.is_dir:
             raise ModelError("Mismatch in is_dir between file and extract status")
         if model_file.state in (
-            ModelFile.State.DEFAULT,
+                ModelFile.State.DEFAULT,
             ModelFile.State.DOWNLOADED
         ) and model_file.local_size is not None:
             model_file.state = ModelFile.State.EXTRACTING

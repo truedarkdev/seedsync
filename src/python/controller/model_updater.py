@@ -365,9 +365,27 @@ class ModelUpdater:
                         })
         if latest_validation_statuses is not None:
             model_builder.set_validation_statuses(latest_validation_statuses.statuses)
+        def _is_known_extract_result_pair(result, result_kind: str) -> bool:
+            path_pair_id = getattr(result, "path_pair_id", None)
+            if path_pair_id is None:
+                return True
+            if controller._Controller__get_path_pair(path_pair_id) is not None:  # type: ignore[attr-defined]
+                return True
+            controller.logger.warning(
+                "Ignoring extract %s for '%s': pair '%s' no longer exists",
+                result_kind,
+                result.name,
+                path_pair_id,
+            )
+            return False
+
         if latest_extracted_results:
+            known_extracted_results = []
             extracted_result_summaries = []
             for result in latest_extracted_results:
+                if not _is_known_extract_result_pair(result, "completion"):
+                    continue
+                known_extracted_results.append(result)
                 extracted_file_ids = {result.name}
                 if result.file_id is not None:
                     extracted_file_ids.add(result.file_id)
@@ -385,35 +403,41 @@ class ModelUpdater:
                         "is_dir": result.is_dir,
                     })
             model_builder.set_extracted_files(persist.extracted_file_names)
-            controller._Controller__record_breadcrumb(
-                stage="extract",
-                message="extract_completed",
-                details={
-                    "result_count": len(latest_extracted_results),
-                    "results": extracted_result_summaries,
-                },
-                event_type="state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_extracted_results, "extract"),  # type: ignore[attr-defined]
-            )
+            if known_extracted_results:
+                controller._Controller__record_breadcrumb(
+                    stage="extract",
+                    message="extract_completed",
+                    details={
+                        "result_count": len(known_extracted_results),
+                        "results": extracted_result_summaries,
+                    },
+                    event_type="state_transition",
+                    corr_id=controller._Controller__trace_corr_id_from_files(known_extracted_results, "extract"),  # type: ignore[attr-defined]
+                )
         if latest_failed_results:
+            known_failed_results = []
             failed_result_summaries = []
             for result in latest_failed_results:
+                if not _is_known_extract_result_pair(result, "failure"):
+                    continue
+                known_failed_results.append(result)
                 failed_result_summaries.append({
                     "name": result.name,
                     "file_id": result.file_id,
                     "is_dir": result.is_dir,
                     "path_pair_id": result.path_pair_id,
                 })
-            controller._Controller__record_breadcrumb(
-                stage="extract",
-                message="extract_failed",
-                details={
-                    "result_count": len(latest_failed_results),
-                    "results": failed_result_summaries,
-                },
-                event_type="failure",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_failed_results, "extract"),  # type: ignore[attr-defined]
-            )
+            if known_failed_results:
+                controller._Controller__record_breadcrumb(
+                    stage="extract",
+                    message="extract_failed",
+                    details={
+                        "result_count": len(known_failed_results),
+                        "results": failed_result_summaries,
+                    },
+                    event_type="failure",
+                    corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),  # type: ignore[attr-defined]
+                )
         model_builder.set_stopped_files(persist.stopped_file_names)
 
         # Build the new model, if needed.

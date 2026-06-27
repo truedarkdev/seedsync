@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from controller import Controller, ControllerPersist, ModelBuilder
-from controller.extract import ExtractStatus
+from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner
 from controller.controller import ControllerError
@@ -1010,6 +1010,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = extracted_results
         self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-1": SimpleNamespace(local_path="/local/pair-1", remote_path="/remote/pair-1")
+        }
         self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
 
         self.controller._Controller__update_model()
@@ -1034,6 +1037,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_failed.return_value = failed_results
         self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
         self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-1": SimpleNamespace(local_path="/local/pair-1", remote_path="/remote/pair-1")
+        }
         self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
 
         self.controller._Controller__update_model()
@@ -1061,7 +1067,40 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
-        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
+        self.controller._Controller__active_scanner.set_active_files.assert_called_once_with(["archive.zip"])
+
+    def test_update_model_ignores_extract_results_for_removed_path_pair(self):
+        extracted_results = [
+            SimpleNamespace(name="archive.zip", file_id="file-123", is_dir=False, path_pair_id="missing")
+        ]
+        failed_results = [
+            SimpleNamespace(name="archive.zip", file_id="file-123", is_dir=False, path_pair_id="missing")
+        ]
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__extract_process.pop_completed.return_value = extracted_results
+        self.controller._Controller__extract_process.pop_failed.return_value = failed_results
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__path_pairs_by_id = {}
+        self.controller._Controller__context.breadcrumb_trace.record.reset_mock()
+        self.controller.logger.warning.reset_mock()
+
+        self.controller._Controller__update_model()
+
+        self.controller.logger.warning.assert_any_call(
+            "Ignoring extract %s for '%s': pair '%s' no longer exists",
+            "completion",
+            "archive.zip",
+            "missing",
+        )
+        self.controller.logger.warning.assert_any_call(
+            "Ignoring extract %s for '%s': pair '%s' no longer exists",
+            "failure",
+            "archive.zip",
+            "missing",
+        )
+        self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.controller._Controller__model_builder.set_extracted_files.assert_called_once_with(set())
 
     def test_update_model_keeps_duplicate_name_extracting_status_for_other_path_pair_after_failure(self):
         failed_results = [
@@ -2023,6 +2062,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model.set_base_logger(self.controller.logger)
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__move_from_staging = MagicMock(return_value=True)
         diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=added_file)]
 
         self.controller._Controller__update_model()
@@ -3427,6 +3467,11 @@ class TestController(unittest.TestCase):
         file.local_size = 10
         file.remote_size = 20
         file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__context.config.controller = SimpleNamespace(
+            use_local_path_as_extract_path=False,
+            extract_path="/extract",
+            managed_extract_folders_enabled=True,
+        )
         self.controller._Controller__model.get_file.return_value = file
 
         command = Controller.Command(Controller.Command.Action.EXTRACT, "dup", flow_id="flow-123")
@@ -3434,7 +3479,80 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__process_commands()
 
-        self.controller._Controller__extract_process.extract.assert_called_once_with(file, flow_id="flow-123")
+        extract_request = self.controller._Controller__extract_process.extract.call_args.args[0]
+        self.assertIsInstance(extract_request, ExtractRequest)
+        self.assertIs(extract_request.model_file, file)
+        self.assertIsNone(extract_request.pair_id)
+        self.assertEqual("/local/incomplete", extract_request.local_path)
+        self.assertEqual("/local/incomplete", extract_request.out_dir_path)
+        self.assertEqual("/local", extract_request.local_path_fallback)
+        self.assertEqual("/extract", extract_request.out_dir_path_fallback)
+        self.controller._Controller__extract_process.extract.assert_called_once_with(
+            extract_request,
+            flow_id="flow-123",
+        )
+
+    def test_process_commands_extract_rejects_unknown_path_pair(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "missing"
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__context.config.controller = SimpleNamespace(
+            use_local_path_as_extract_path=False,
+            extract_path="/extract",
+            managed_extract_folders_enabled=True,
+        )
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.EXTRACT, "dup")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_failure.assert_called_once_with(
+            "Path pair 'missing' is unavailable for extraction",
+            404,
+        )
+        self.controller._Controller__extract_process.extract.assert_not_called()
+
+    def test_process_commands_extract_uses_pair_specific_staging_request(self):
+        file = ModelFile("dup", False)
+        file.path_pair_id = "movies"
+        file.local_size = 10
+        file.remote_size = 20
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__context.config.controller = SimpleNamespace(
+            use_local_path_as_extract_path=False,
+            extract_path="/extract",
+            managed_extract_folders_enabled=True,
+        )
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(local_path="/local/movies", remote_path="/remote/movies")
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete",
+        }
+        self.controller._Controller__model.get_file.return_value = file
+
+        command = Controller.Command(Controller.Command.Action.EXTRACT, "dup")
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        extract_request = self.controller._Controller__extract_process.extract.call_args.args[0]
+        self.assertIsInstance(extract_request, ExtractRequest)
+        self.assertEqual("movies", extract_request.pair_id)
+        self.assertEqual("/local/movies/incomplete", extract_request.local_path)
+        self.assertEqual("/local/movies/incomplete", extract_request.out_dir_path)
+        self.assertEqual("/local/movies", extract_request.local_path_fallback)
+        self.assertEqual("/extract", extract_request.out_dir_path_fallback)
+        self.controller._Controller__extract_process.extract.assert_called_once_with(
+            extract_request,
+            flow_id=command.flow_id,
+        )
 
     def test_process_commands_extract_failure_still_processes_later_commands(self):
         file = ModelFile("dup", False)

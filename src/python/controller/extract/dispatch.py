@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 import re
 
 from .extract import Extract, ExtractError
+from .extract_request import ExtractRequest
 from common.managed_extract import (
     build_managed_extract_folder_name,
     build_managed_extract_folder_path,
@@ -151,17 +152,33 @@ class ExtractDispatch:
             statuses.append(status)
         return statuses
 
-    def __resolve_archive_path(self, relative_path: str) -> Optional[str]:
-        primary = os.path.join(self.__local_path, relative_path)
+    @staticmethod
+    def __resolve_archive_path(local_path: str,
+                               local_path_fallback: str | None,
+                               relative_path: str) -> tuple[str | None, bool]:
+        primary = os.path.join(local_path, relative_path)
         if Extract.is_archive(primary):
-            return primary
-        if self.__local_path_fallback and self.__local_path_fallback != self.__local_path:
-            fallback = os.path.join(self.__local_path_fallback, relative_path)
+            return primary, False
+        if local_path_fallback and local_path_fallback != local_path:
+            fallback = os.path.join(local_path_fallback, relative_path)
             if Extract.is_archive(fallback):
-                return fallback
-        return None
+                return fallback, True
+        return None, False
 
-    def extract(self, model_file: ModelFile):
+    def __normalize_extract_request(self, extract_item: ExtractRequest | ModelFile) -> ExtractRequest:
+        if isinstance(extract_item, ExtractRequest):
+            return extract_item
+        return ExtractRequest(
+            model_file=extract_item,
+            local_path=self.__local_path,
+            out_dir_path=self.__out_dir_path,
+            pair_id=extract_item.path_pair_id,
+            local_path_fallback=self.__local_path_fallback,
+        )
+
+    def extract(self, extract_item: ExtractRequest | ModelFile):
+        req = self.__normalize_extract_request(extract_item)
+        model_file = req.model_file
         self.logger.debug("Received extract for {}".format(model_file.name))
 
         # Build the task before taking the queue mutex.
@@ -182,14 +199,22 @@ class ExtractDispatch:
                 if curr_file.is_dir:
                     frontier += curr_file.get_children()
                 else:
-                    archive_full_path = self.__resolve_archive_path(curr_file.full_path)
-                    out_dir_path = os.path.join(self.__out_dir_path, os.path.dirname(curr_file.full_path))
+                    archive_full_path, archive_uses_fallback = self.__resolve_archive_path(
+                        req.local_path,
+                        req.local_path_fallback,
+                        curr_file.full_path,
+                    )
+                    out_dir_path = os.path.join(req.out_dir_path, os.path.dirname(curr_file.full_path))
                     if curr_file.local_size is not None \
                             and curr_file.local_size > 0 \
                             and archive_full_path is not None:
+                        resolved_out_dir_path = out_dir_path
+                        if archive_uses_fallback and \
+                                req.out_dir_path_fallback is not None and req.out_dir_path_fallback != req.out_dir_path:
+                            resolved_out_dir_path = os.path.join(req.out_dir_path_fallback, os.path.dirname(curr_file.full_path))
                         task.add_archive(
                             archive_path=archive_full_path,
-                            out_dir_path=out_dir_path,
+                            out_dir_path=resolved_out_dir_path,
                             archive_name=curr_file.name,
                             archive_file_id=curr_file.file_id,
                             path_pair_id=curr_file.path_pair_id
@@ -206,12 +231,20 @@ class ExtractDispatch:
             # For a single file, it must exist locally and must be an archive
             if model_file.local_size in (None, 0):
                 raise ExtractDispatchError("File does not exist locally: {}".format(model_file.name))
-            archive_full_path = self.__resolve_archive_path(model_file.name)
+            archive_full_path, archive_uses_fallback = self.__resolve_archive_path(
+                req.local_path,
+                req.local_path_fallback,
+                model_file.name,
+            )
             if not archive_full_path:
                 raise ExtractDispatchError("File is not an archive: {}".format(model_file.name))
+            base_out = req.out_dir_path
+            if archive_uses_fallback and \
+                    req.out_dir_path_fallback is not None and req.out_dir_path_fallback != req.out_dir_path:
+                base_out = req.out_dir_path_fallback
             task.add_archive(
                 archive_path=archive_full_path,
-                out_dir_path=self.__out_dir_path,
+                out_dir_path=base_out,
                 archive_name=model_file.name,
                 archive_file_id=model_file.file_id,
                 path_pair_id=model_file.path_pair_id
@@ -219,7 +252,7 @@ class ExtractDispatch:
 
         with self.__task_queue.mutex:
             for queued_task in self.__task_queue.queue:
-                if queued_task.root_name == model_file.name:
+                if queued_task.root_file_id == model_file.file_id:
                     self.logger.info("Ignoring extract for {}, already exists".format(model_file.name))
                     return
             self.__task_queue.queue.append(task)
