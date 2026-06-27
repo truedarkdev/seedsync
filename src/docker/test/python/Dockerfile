@@ -9,8 +9,7 @@ RUN apt-get update && \
         p7zip \
         p7zip-full \
         p7zip-rar \
-        rar \
-        unrar
+        rar
 
 RUN ln -sf /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so
 

@@ -99,7 +99,7 @@ check_archive_backed_lane_prereqs() {
   info "Archive-backed lane"
 
   check_command rar
-  check_command unrar
+  check_command 7z
 
   info "  archive-backed lane prerequisites satisfied"
 }
