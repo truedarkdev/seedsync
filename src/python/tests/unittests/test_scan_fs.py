@@ -29,7 +29,7 @@ class TestScanFsScript(unittest.TestCase):
     def _run_scan_fs(self, *scan_args: str, check: bool):
         wrapper = (
             "import runpy, sys; "
-            "sys.hexversion = 0x030C0000; "
+            "sys.hexversion = 0x03080000; "
             "sys.argv = {argv!r}; "
             "runpy.run_path({script!r}, run_name='__main__')"
         ).format(

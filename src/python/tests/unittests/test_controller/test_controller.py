@@ -40,6 +40,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.status.controller = MagicMock()
         self.controller._Controller__context.status.server = SimpleNamespace(up=True, error_msg=None)
         self.controller._Controller__context.breadcrumb_trace = MagicMock()
+        self.controller._Controller__context.path_pair_manager = None
         self.controller._Controller__context.config.lftp.local_path = "/local"
         self.controller._Controller__context.config.lftp.net_socket_buffer = ""
         self.controller._Controller__password = None

@@ -56,7 +56,11 @@ services:
         fi;
         set_general_option config_api_redact_remote_details False &&
         set_general_option trusted_browser_bootstrap_remote_addrs "$$TRUSTED_BOOTSTRAP_SOURCES" &&
-        exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/scanfs --web-bind-host "$$SEEDSYNC_WEB_BIND_HOST"
+        current_remote_python_path="$$(sed -n -E 's|^[[:space:]]*remote_python_path[[:space:]]*=[[:space:]]*||p' /config/settings.cfg | head -n 1 | tr -d '\r')";
+        if [ -z "$$current_remote_python_path" ] || [ "$$current_remote_python_path" = "/usr/bin/env" ]; then
+          sed -i -E "s|^[[:space:]]*remote_python_path[[:space:]]*=.*$$|remote_python_path = python3|" /config/settings.cfg;
+        fi &&
+        exec python /app/python/seedsync.py $$DEBUG_FLAG -c /config --html /app/html --scanfs /app/python/scan_fs.py --web-bind-host "$$SEEDSYNC_WEB_BIND_HOST"
     ports:
       - "127.0.0.1:8800:8800"
     volumes:

@@ -10,7 +10,7 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 class SystemFile:
@@ -21,8 +21,8 @@ class SystemFile:
                  name: str,
                  size: int,
                  is_dir: bool = False,
-                 time_created: datetime | None = None,
-                 time_modified: datetime | None = None,
+                 time_created: Optional[datetime] = None,
+                 time_modified: Optional[datetime] = None,
                  is_staging: bool = False):
         if size < 0:
             raise ValueError("File size must be zero or greater")
@@ -56,11 +56,11 @@ class SystemFile:
         return self.__is_dir
 
     @property
-    def timestamp_created(self) -> datetime | None:
+    def timestamp_created(self) -> Optional[datetime]:
         return self.__timestamp_created
 
     @property
-    def timestamp_modified(self) -> datetime | None:
+    def timestamp_modified(self) -> Optional[datetime]:
         return self.__timestamp_modified
 
     @property
@@ -68,21 +68,21 @@ class SystemFile:
         return self.__children
 
     @property
-    def path_pair_id(self) -> str | None:
+    def path_pair_id(self) -> Optional[str]:
         return self.__path_pair_id
 
     @path_pair_id.setter
-    def path_pair_id(self, path_pair_id: str | None):
+    def path_pair_id(self, path_pair_id: Optional[str]):
         if path_pair_id is not None and type(path_pair_id) != str:
             raise TypeError
         self.__path_pair_id = path_pair_id
 
     @property
-    def path_pair_name(self) -> str | None:
+    def path_pair_name(self) -> Optional[str]:
         return self.__path_pair_name
 
     @path_pair_name.setter
-    def path_pair_name(self, path_pair_name: str | None):
+    def path_pair_name(self, path_pair_name: Optional[str]):
         if path_pair_name is not None and type(path_pair_name) != str:
             raise TypeError
         self.__path_pair_name = path_pair_name
@@ -112,7 +112,7 @@ class SystemFile:
             raise TypeError("Cannot add children to a file")
         self.__children.append(file)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> Dict[str, Any]:
         d = {
             "name": self.__name,
             "size": self.__size,
@@ -244,7 +244,7 @@ class SystemScanner:
         )
 
     @staticmethod
-    def __get_created_time(stat_result) -> datetime:
+    def __get_created_time(stat_result) -> Optional[datetime]:
         try:
             return datetime.fromtimestamp(stat_result.st_birthtime)
         except (AttributeError, OSError, OverflowError, TypeError, ValueError):
@@ -370,8 +370,8 @@ class SystemScanner:
 
 
 if __name__ == "__main__":
-    if sys.hexversion < 0x030B0000 or sys.hexversion >= 0x030D0000:
-        sys.exit("Python 3.11 or 3.12 is required to run this program.")
+    if sys.hexversion < 0x03080000:
+        sys.exit("Python 3.8 or later is required to run this program.")
 
     parser = argparse.ArgumentParser(description="File size scanner")
     parser.add_argument("path", help="Path of the root directory to scan")
