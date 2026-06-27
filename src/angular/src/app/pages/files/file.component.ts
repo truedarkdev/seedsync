@@ -130,6 +130,31 @@ export class FileComponent implements OnChanges {
         return this.activeAction == null && this.file != null && this.file.isValidatable;
     }
 
+    getValidateTooltip() {
+        if (this.file == null) {
+            return null;
+        }
+
+        if (this.activeAction === FileAction.VALIDATE) {
+            return "Validation in progress.";
+        }
+
+        if (this.activeAction != null) {
+            return "Wait for the current action to finish before validating.";
+        }
+
+        if (!this.file.isValidatable) {
+            return "Available after the transfer completes and verification is enabled.";
+        }
+
+        return null;
+    }
+
+    getValidateAriaLabel() {
+        const tooltip = this.getValidateTooltip();
+        return tooltip == null ? null : `Validate. ${tooltip}`;
+    }
+
     onQueue(file: ViewFile) {
         if (!this.isQueueable() || file == null) {
             return;

@@ -99,6 +99,10 @@ describe("Testing file component", () => {
         return fixture.debugElement.queryAll(By.css(".actions .button"));
     }
 
+    function getValidateActionSurface() {
+        return fixture.debugElement.query(By.css(".actions .validate-action-surface"));
+    }
+
     it("should return false for action predicates when file is missing", () => {
         component.file = null;
 
@@ -320,6 +324,115 @@ describe("Testing file component", () => {
         expect(stopButton.disabled).toBe(false);
         expect(fixture.componentInstance.activeAction).toBe(FileAction.STOP);
         expect(stopSpy).toHaveBeenCalledWith(fixture.componentInstance.file);
+    });
+
+    it("should expose a validation tooltip on the wrapper when validate is disabled", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isValidatable: false
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const validateSurface = getValidateActionSurface().nativeElement as HTMLSpanElement;
+        const validateButton = getActionButtons()[5].nativeElement as HTMLButtonElement;
+
+        expect(validateSurface.getAttribute("title")).toBe(
+            "Available after the transfer completes and verification is enabled."
+        );
+        expect(validateSurface.getAttribute("aria-label")).toBe(
+            "Validate. Available after the transfer completes and verification is enabled."
+        );
+        expect(validateSurface.getAttribute("tabindex")).toBe("0");
+        expect(validateButton.disabled).toBe(true);
+        expect(validateButton.getAttribute("title")).toBe(null);
+        expect(validateButton.getAttribute("aria-label")).toBe(null);
+    });
+
+    it("should keep the enabled validate action free of the disabled tooltip and aria copy", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isValidatable: true
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const validateSurface = getValidateActionSurface().nativeElement as HTMLSpanElement;
+        const validateButton = getActionButtons()[5].nativeElement as HTMLButtonElement;
+
+        expect(validateButton.disabled).toBe(false);
+        expect(validateSurface.getAttribute("title")).toBe(null);
+        expect(validateSurface.getAttribute("aria-label")).toBe(null);
+        expect(validateSurface.getAttribute("tabindex")).toBe(null);
+        expect(validateButton.getAttribute("title")).toBe(null);
+        expect(validateButton.getAttribute("aria-label")).toBe(null);
+    });
+
+    it("should emit validate from the enabled inner button inside the wrapper", () => {
+        const file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isValidatable: true
+        });
+        const validateSpy = spyOn(fixture.componentInstance.validateEvent, "emit");
+        fixture.componentInstance.file = file;
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const validateButton = getActionButtons()[5].nativeElement as HTMLButtonElement;
+        validateButton.click();
+
+        expect(validateSpy).toHaveBeenCalledWith(file);
+        expect(fixture.componentInstance.activeAction).toBe(FileAction.VALIDATE);
+    });
+
+    it("should expose the in-progress reason when validate is the active action", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isValidatable: true
+        });
+        fixture.componentInstance.activeAction = FileAction.VALIDATE;
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const validateSurface = getValidateActionSurface().nativeElement as HTMLSpanElement;
+        const validateButton = getActionButtons()[5].nativeElement as HTMLButtonElement;
+
+        expect(validateButton.disabled).toBe(true);
+        expect(validateSurface.getAttribute("title")).toBe("Validation in progress.");
+        expect(validateSurface.getAttribute("aria-label")).toBe("Validate. Validation in progress.");
+        expect(validateSurface.getAttribute("tabindex")).toBe("0");
+    });
+
+    it("should expose the wait reason when another action is active", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isValidatable: true
+        });
+        fixture.componentInstance.activeAction = FileAction.STOP;
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const validateSurface = getValidateActionSurface().nativeElement as HTMLSpanElement;
+        const validateButton = getActionButtons()[5].nativeElement as HTMLButtonElement;
+
+        expect(validateButton.disabled).toBe(true);
+        expect(validateSurface.getAttribute("title")).toBe(
+            "Wait for the current action to finish before validating."
+        );
+        expect(validateSurface.getAttribute("aria-label")).toBe(
+            "Validate. Wait for the current action to finish before validating."
+        );
+        expect(validateSurface.getAttribute("tabindex")).toBe("0");
     });
 
     it("should transition the stop action from enabled to loading and then settle disabled for a stopped row", () => {

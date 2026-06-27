@@ -165,14 +165,19 @@
             <img src="assets/icons/delete-remote.svg" alt="" aria-hidden="true" />
             <div class="text"><span>Delete Remote</span></div>
         </button>
-        <button type="button" class="button" appClickStopPropagation
-             [disabled]="!isValidatable()"
-             [class.disabled]="!isValidatable()"
-             (click)="onValidate(file)"
-             [class.loading]="activeAction == FileAction.VALIDATE">
-            <div class="loader"></div>
-            <img src="assets/icons/validate.svg" alt="" aria-hidden="true" />
-            <div class="text"><span>Validate</span></div>
-        </button>
+        <span class="validate-action-surface"
+              [attr.title]="getValidateTooltip()"
+              [attr.aria-label]="getValidateAriaLabel()"
+              [attr.tabindex]="getValidateTooltip() != null ? 0 : null">
+            <button type="button" class="button" appClickStopPropagation
+                 [disabled]="!isValidatable()"
+                 [class.disabled]="!isValidatable()"
+                 (click)="onValidate(file)"
+                 [class.loading]="activeAction == FileAction.VALIDATE">
+                <div class="loader"></div>
+                <img src="assets/icons/validate.svg" alt="" aria-hidden="true" />
+                <div class="text"><span>Validate</span></div>
+            </button>
+        </span>
     </div>
 </div>
