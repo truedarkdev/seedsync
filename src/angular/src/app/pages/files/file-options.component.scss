@@ -9,13 +9,27 @@
         color: white;
         height: 34px;
         width: 100%;
-        cursor: default;
+        cursor: pointer;
         user-select: none;
 
         display: flex;
         flex-direction: row;
         align-items: center;
         flex-wrap: nowrap;
+
+        &:hover,
+        &:focus,
+        &:focus-visible {
+            background-color: $primary-dark-color;
+            border-color: #245580;
+        }
+
+        &:disabled {
+            cursor: default;
+            opacity: .65;
+            background-color: $primary-color;
+            border-color: $primary-dark-color;
+        }
 
         .selection {
             margin-left: 5px;
@@ -55,25 +69,31 @@
             color: white;
             height: 32px;
             padding-right: 10px;
+            cursor: pointer;
 
             display: flex;
             flex-direction: row;
             align-items: center;
             flex-wrap: nowrap;
 
+            &:not(.active):not(.disabled):not(:disabled):hover,
+            &:not(.active):not(.disabled):not(:disabled):focus,
+            &:not(.active):not(.disabled):not(:disabled):focus-visible {
+                background-color: $primary-dark-color;
+            }
+
             &.active,
-            &.active:hover {
+            &.active:hover,
+            &.active:focus,
+            &.active:focus-visible {
                 background-color: $secondary-dark-color;
             }
 
-            &:hover,
-            &:active {
-                background-color: $primary-color;
-            }
-
-            &.disabled {
+            &.disabled,
+            &:disabled {
                 opacity: .65;
                 background-color: $primary-color;
+                cursor: default;
             }
 
             .icon {
@@ -127,7 +147,7 @@
     border: 1px solid $primary-dark-color;
     color: white;
     height: 34px;
-    cursor: default;
+    cursor: pointer;
     user-select: none;
 
     display: flex;
@@ -141,14 +161,17 @@
         border-color: $secondary-darker-color;
     }
 
-    &:hover,
-    &:active {
-        background-color: $primary-color;
+    &:not(.active):hover,
+    &:not(.active):focus,
+    &:not(.active):focus-visible {
+        background-color: $primary-dark-color;
+        border-color: #245580;
     }
 
     &.disabled {
         opacity: .65;
         background-color: $primary-color;
+        cursor: default;
     }
 
     .selection {
@@ -192,6 +215,7 @@
     #filter-search {
         flex-grow: 1;
         flex-basis: 100%;
+        min-width: 0;
 
         display: flex;
         flex-direction: row;
@@ -213,11 +237,39 @@
             border-radius: 5px;
             padding: 3px 15px 3px 30px;
             width: 100%;
+            min-width: 0;
         }
 
         .input-group{
             flex-grow: 1;
-            display: inline;
+            display: flex;
+            width: 100%;
+        }
+    }
+
+    #filter-controls {
+        flex: 0 0 auto;
+        margin-left: auto;
+        margin-top: 10px;
+
+        display: flex;
+        flex-direction: row;
+        flex-wrap: wrap;
+        justify-content: flex-end;
+        align-items: flex-start;
+        gap: 10px 5px;
+
+        #filter-status,
+        #sort-status,
+        #toggle-details,
+        #small-buttons {
+            flex: 0 0 auto;
+            margin: 0;
+        }
+
+        #small-buttons {
+            display: flex;
+            padding-top: 0;
         }
     }
 
@@ -288,8 +340,8 @@
     }
 
     #small-buttons {
-        flex-grow: 1;
-        padding-top: 5px;
+        flex: 0 0 auto;
+        padding-top: 0;
 
         display: flex;
         flex-direction: row;
@@ -309,18 +361,6 @@
         }
     }
 
-    // Margins for all the buttons
-    #filter-status,
-    #sort-status,
-    #toggle-details {
-        margin-top: 10px;
-    }
-
-    // Margins for the non-first buttons
-    #sort-status,
-    #toggle-details {
-        margin-left: 5px;
-    }
 }
 
 
@@ -338,12 +378,6 @@
             }
         }
     }
-
-    // Margins for the non-first buttons
-    #sort-status,
-    #toggle-details {
-        margin-left: 10px;
-    }
 }
 
 // Large screens
@@ -357,24 +391,17 @@
 
         #filter-search {
             flex: 1 1 24rem;
-            max-width: 44rem;
             min-width: 20rem;
+            max-width: none;
         }
 
-        #filter-status,
-        #sort-status,
-        #toggle-details {
+        #filter-controls {
             margin-top: 0;
-        }
-
-        #sort-status,
-        #toggle-details {
-            margin-left: 0;
         }
 
         #small-buttons {
             flex: 0 0 auto;
-            margin-left: 2px;
+            margin-left: 0;
             padding-top: 0;
             padding-right: 2px;
         }

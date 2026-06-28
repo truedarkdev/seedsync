@@ -35,6 +35,14 @@
         @extend %button;
         position: sticky;
         display: none;
+        cursor: pointer;
+
+        &:hover,
+        &:focus,
+        &:focus-visible {
+            background-color: $primary-dark-color;
+            border-color: #245580;
+        }
 
         &.visible {
             display: inherit;

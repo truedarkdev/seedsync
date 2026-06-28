@@ -92,6 +92,10 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
     }
 
     onFilterByStatus(status: ViewFile.Status) {
+        if (status !== null && this.isStatusDisabled(status)) {
+            return;
+        }
+
         this.viewFileOptionsService.setSelectedStatusFilter(status);
     }
 
