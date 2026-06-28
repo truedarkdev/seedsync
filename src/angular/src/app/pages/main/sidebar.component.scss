@@ -14,14 +14,23 @@
         outline: none;
         white-space: normal;
         float: none;
-        cursor: default;
+        cursor: pointer;
         user-select: none;
+
+        &:not(.selected):not([disabled]):hover,
+        &:not(.selected):not([disabled]):focus,
+        &:not(.selected):not([disabled]):focus-visible {
+            background-color: $primary-lighter-color;
+        }
 
         &:active {
             background-color: $primary-color;
         }
 
-        &.selected {
+        &.selected,
+        &.selected:hover,
+        &.selected:focus,
+        &.selected:focus-visible {
             background-color: $secondary-color;
             color: white;
             border-color: #6ac19e;
@@ -34,6 +43,7 @@
         &[disabled] {
             opacity: .65;
             background-color: inherit;
+            cursor: default;
         }
 
         img {

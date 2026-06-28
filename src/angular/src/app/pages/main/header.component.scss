@@ -9,20 +9,22 @@
         button.close {
             top: 5px;
             right: 5px;
-            cursor: default;
+            cursor: pointer;
             user-select: none;
             outline: none;
             opacity: .2;
             font-size: 160%;
             padding: 0;
 
-            &:active {
+            &:hover,
+            &:focus,
+            &:focus-visible {
                 color: red;
+                opacity: .7;
             }
 
-            &:hover {
-                color: inherit;
-                opacity: .2;
+            &:active {
+                color: red;
             }
         }
     }

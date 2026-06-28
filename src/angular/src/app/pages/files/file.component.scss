@@ -211,6 +211,24 @@
         filter: invert(1.0);
     }
 
+    &:not([disabled]) {
+        cursor: pointer;
+
+        &:hover,
+        &:focus,
+        &:focus-visible {
+            background-color: $primary-dark-color;
+            border-color: #245580;
+            color: #fff;
+        }
+
+        &:active {
+            background-color: #286090;
+            border-color: #204d74;
+            color: #fff;
+        }
+    }
+
     .loader {
         display: none;
         border: 5px solid white;
@@ -227,6 +245,7 @@
     }
 
     &[disabled] {
+        cursor: default;
         pointer-events: none;
     }
 

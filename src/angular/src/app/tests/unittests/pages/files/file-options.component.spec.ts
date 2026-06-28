@@ -112,6 +112,14 @@ describe("Testing file options component", () => {
         expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(true);
         expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(true);
 
+        const statusButtons = Array.from(
+            fixture.nativeElement.querySelectorAll("#filter-status .dropdown-menu .dropdown-item")
+        ) as HTMLButtonElement[];
+        const queuedButton = statusButtons.find(button => (button.textContent || "").includes("Queued"));
+
+        expect(queuedButton).toBeDefined();
+        expect(queuedButton!.disabled).toBe(true);
+
         viewFileService.emitFiles(Immutable.List([
             new ViewFile({status: ViewFile.Status.QUEUED}),
             new ViewFile({status: ViewFile.Status.QUEUED}),
@@ -153,6 +161,9 @@ describe("Testing file options component", () => {
         const setShowDetailsSpy = spyOn(viewFileOptionsService, "setShowDetails");
         const setPinFilterSpy = spyOn(viewFileOptionsService, "setPinFilter");
 
+        viewFileService.emitFiles(Immutable.List([
+            new ViewFile({status: ViewFile.Status.DOWNLOADED})
+        ]));
         viewFileOptionsService.emitOptions(new ViewFileOptions({
             showDetails: true,
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS,
@@ -172,6 +183,14 @@ describe("Testing file options component", () => {
         expect(setSortMethodSpy).toHaveBeenCalledWith(ViewFileOptions.SortMethod.NAME_DESC);
         expect(setShowDetailsSpy).toHaveBeenCalledWith(false);
         expect(setPinFilterSpy).toHaveBeenCalledWith(false);
+    });
+
+    it("should ignore disabled status filter selections", () => {
+        const setSelectedStatusFilterSpy = spyOn(viewFileOptionsService, "setSelectedStatusFilter");
+
+        component.onFilterByStatus(ViewFile.Status.QUEUED);
+
+        expect(setSelectedStatusFilterSpy).not.toHaveBeenCalled();
     });
 
     it("should stop reacting to file and option updates after destroy", () => {

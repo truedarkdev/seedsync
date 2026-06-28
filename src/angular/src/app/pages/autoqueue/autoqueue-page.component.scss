@@ -35,6 +35,7 @@
                 margin-right: 12px;
                 height: 35px;
                 width: 35px;
+                cursor: pointer;
 
                 span {
                     font-size: 220%;
@@ -58,6 +59,14 @@
             .button {
                 background-color: red;
                 border-color: darkred;
+                cursor: pointer;
+
+                &:hover:not(.disabled),
+                &:focus:not(.disabled),
+                &:focus-visible:not(.disabled) {
+                    background-color: darkred;
+                    border-color: #4d0000;
+                }
 
                 &:active {
                     background-color: darkred;
@@ -66,6 +75,7 @@
                 &.disabled {
                     opacity: .65;
                     background-color: red;
+                    cursor: default;
                 }
             }
         }
@@ -74,6 +84,14 @@
             .button {
                 background-color: green;
                 border-color: darkgreen;
+                cursor: pointer;
+
+                &:hover:not(.disabled),
+                &:focus:not(.disabled),
+                &:focus-visible:not(.disabled) {
+                    background-color: darkgreen;
+                    border-color: #004d00;
+                }
 
                 &:active {
                     background-color: darkgreen;
@@ -82,6 +100,7 @@
                 &.disabled {
                     opacity: .65;
                     background-color: green;
+                    cursor: default;
                 }
             }
 

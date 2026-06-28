@@ -142,10 +142,13 @@
     </div>
 
     <div id="commands">
-        <div class="button" appClickStopPropagation [attr.disabled]="commandsEnabled ? null : true"
-             (click)="!commandsEnabled || onCommandRestart()">
+        <button class="btn btn-primary btn-sm settings-restart-btn"
+                type="button"
+                appClickStopPropagation
+                [disabled]="!commandsEnabled"
+                (click)="!commandsEnabled || onCommandRestart()">
             <img src="assets/icons/refresh.svg" />
             <span class="text">Restart</span>
-        </div>
+        </button>
     </div>
 </div>
