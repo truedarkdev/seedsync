@@ -1,6 +1,6 @@
 # thejuran-arr Refresh - 2026-06-27
 
-Status: classification started; Batch 0 docs/tracker only; no code imported yet.
+Status: filtered-mining policy recorded; Batch 0 docs/tracker only; no code imported yet.
 
 ## Range Envelope
 
@@ -11,9 +11,10 @@ Status: classification started; Batch 0 docs/tracker only; no code imported yet.
 
 ## Batch 0 Classification
 
-- Absolute exclusions: ARR support; `seedsyncarr` identity, rebrand, theme, and terminal visual rewrites; Sonarr/Radarr-like integrations; webhook and completion ARR integration paths; and ARR-coupled product divergence are not to be imported from this fork.
-- Non-ARR deferrals: absent Playwright/e2e stack migrations, absent website-only changes, and dependency or lockfile churn remain separately evaluable only when they can be justified on their own merits.
-- Non-ARR candidate categories: compatibility, reliability, packaging, docs, and other SeedSync-preserving improvements that do not add ARR support or product rebranding.
+- Filtered mining only: do not treat this fork as a normal integration target. Hard-exclude ARR support; `seedsyncarr` identity, rebrand, theme, and terminal visual rewrites; Sonarr/Radarr-like integrations; webhook and completion ARR integration paths; ARR-coupled product divergence; and any similar product-divergent work.
+- Candidate pool: only scan for SeedSync-preserving, separable, non-ARR improvements such as bug fixes, Docker/runtime hardening, packaging fixes, docs corrections, compatibility fixes, small backend reliability improvements, and test fixes that reveal real local gaps.
+- High bar: prove a candidate is non-ARR, SeedSync-preserving, and separable before importing it. Skip ARR/product-divergent chunks quickly instead of spending equal effort on every row or chunk.
+- Retirement fallback: if the first scoring pass finds almost nothing beyond ARR, branding, or UI divergence, retire this fork from active integration and leave the tracker note explaining why.
 - Batching rule: treat upstream rows as audit labels, not commit units. Group selected changes into coherent local commits by subsystem or behavior, and split only when reviewability, risk, or coupling makes that necessary.
 - Batch 0 scope: documentation and tracker updates only; no code import yet.
 
