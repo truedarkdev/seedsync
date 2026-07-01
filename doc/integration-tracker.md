@@ -63,14 +63,16 @@ Refresh rule:
 - Last fully processed upstream commit: `unreviewed`
 - Fork tip at last full review: `unreviewed`
 - Last full review date: `pending`
-- Status: classification started; integration has not begun; ARR support is excluded by maintainer policy
+- Status: filtered mining only; integration has not begun; hard-exclude ARR/product divergence and retire the lane if scoring finds no worthwhile separable candidates
 - Integrated so far: none yet; Batch 0 is docs/tracker-only classification, not code import. This is the renamed `thejuran/seedsyncarr` history and remains the durable pending inventory, not a continuation of the old `thejuran/seedsync` checkpoint.
 - Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope and group accepted changes by subsystem/behavior instead of one commit per upstream row.
 - Notes:
-  - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, and ARR-coupled product divergence are hard exclusions from this fork.
-  - Non-ARR deferrals: absent Playwright/e2e migrations, absent website-only changes, and dependency/lockfile churn remain separately evaluable only when they can be justified on their own merits.
-  - Batching: treat upstream rows as audit labels, not commit units. Future accepted work should be grouped into a small number of coherent commits by subsystem/behavior, with split commits only when reviewability or coupling demands it.
-  - Future candidate pool: non-ARR compatibility, reliability, packaging, docs, and other SeedSync-preserving improvements only.
+  - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, ARR-coupled product divergence, and similar product-divergent work are hard exclusions from this fork.
+  - Filtered mining only: scan only for SeedSync-preserving, separable, non-ARR improvements such as bug fixes, Docker/runtime hardening, packaging fixes, docs corrections, compatibility fixes, small backend reliability improvements, and test fixes that reveal real local gaps.
+  - High bar: prove a candidate is non-ARR, SeedSync-preserving, and separable before importing it. Do not spend equal effort on every row/chunk; skip ARR/product-divergent chunks quickly.
+  - Retirement fallback: if the first scoring pass finds almost nothing beyond ARR, branding, or UI divergence, retire this fork from active integration and leave the tracker note explaining why.
+  - Batching: treat upstream rows as audit labels, not commit units. Preserve grouped commits by subsystem/behavior for accepted work, with split commits only when reviewability or coupling demands it.
+  - Future candidate pool: non-ARR compatibility, reliability, packaging, docs, and other SeedSync-preserving filtered-mining improvements only.
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
   - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
