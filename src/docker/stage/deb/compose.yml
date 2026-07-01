@@ -9,6 +9,16 @@ services:
     build:
       context: ../../../..
       dockerfile: src/docker/stage/deb/Dockerfile
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8800; printf \"GET /server/status HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\" >&3; IFS= read -r status <&3; case \"$$status\" in *\"200 OK\"*) exit 0 ;; *) exit 1 ;; esac'"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
     tty: true
     tmpfs:
       - /run
