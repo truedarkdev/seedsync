@@ -1,6 +1,6 @@
 # thejuran-arr Refresh - 2026-06-27
 
-Status: tracking only; no integration started.
+Status: classification started; Batch 0 docs/tracker only; no code imported yet.
 
 ## Range Envelope
 
@@ -8,6 +8,14 @@ Status: tracking only; no integration started.
 - Refresh span: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`
 - First commit in span: `d2985b1a` - `test(60): complete UAT - 4 passed, 0 issues`
 - Tip commit: `3db8b48b` - `chore: archive v1.4.1 milestone (Scanner Auto-Recovery -> tagged v1.5.0)`
+
+## Batch 0 Classification
+
+- Absolute exclusions: ARR support; `seedsyncarr` identity, rebrand, theme, and terminal visual rewrites; Sonarr/Radarr-like integrations; webhook and completion ARR integration paths; and ARR-coupled product divergence are not to be imported from this fork.
+- Non-ARR deferrals: absent Playwright/e2e stack migrations, absent website-only changes, and dependency or lockfile churn remain separately evaluable only when they can be justified on their own merits.
+- Non-ARR candidate categories: compatibility, reliability, packaging, docs, and other SeedSync-preserving improvements that do not add ARR support or product rebranding.
+- Batching rule: treat upstream rows as audit labels, not commit units. Group selected changes into coherent local commits by subsystem or behavior, and split only when reviewability, risk, or coupling makes that necessary.
+- Batch 0 scope: documentation and tracker updates only; no code import yet.
 
 ## Counts
 
@@ -26,8 +34,9 @@ Status: tracking only; no integration started.
 1. Start at `d2985b1a` and process oldest-to-newest.
 2. Use merge boundaries as natural checkpoints and finish one merge train before opening the next.
 3. Prefer chunks of roughly 25-50 non-merge commits, or one coherent milestone window if the history is especially dense.
-4. After each chunk, record the next resume commit and note any items that need `deferred`, `maintainer-decision`, or `new-task` treatment.
-5. Do not start integration on this branch in the current pass; this note is only the tracking envelope for future work.
+4. Group related accepted rows into coherent commits by subsystem or behavior rather than one local commit per upstream row.
+5. After each chunk, record the next resume commit and note any items that need `deferred`, `maintainer-decision`, or `new-task` treatment.
+6. Batch 0 is the documentation/tracker classification pass recorded above; code import starts only after rows are scored against the exclusion list.
 
 ## Resume Reminder
 

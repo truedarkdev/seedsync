@@ -63,14 +63,18 @@ Refresh rule:
 - Last fully processed upstream commit: `unreviewed`
 - Fork tip at last full review: `unreviewed`
 - Last full review date: `pending`
-- Status: tracking only; integration has not started by request
-- Integrated so far: none yet; this is the renamed `thejuran/seedsyncarr` history and remains the durable pending inventory, not a continuation of the old `thejuran/seedsync` checkpoint.
-- Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope.
+- Status: classification started; integration has not begun; ARR support is excluded by maintainer policy
+- Integrated so far: none yet; Batch 0 is docs/tracker-only classification, not code import. This is the renamed `thejuran/seedsyncarr` history and remains the durable pending inventory, not a continuation of the old `thejuran/seedsync` checkpoint.
+- Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope and group accepted changes by subsystem/behavior instead of one commit per upstream row.
 - Notes:
+  - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, and ARR-coupled product divergence are hard exclusions from this fork.
+  - Non-ARR deferrals: absent Playwright/e2e migrations, absent website-only changes, and dependency/lockfile churn remain separately evaluable only when they can be justified on their own merits.
+  - Batching: treat upstream rows as audit labels, not commit units. Future accepted work should be grouped into a small number of coherent commits by subsystem/behavior, with split commits only when reviewability or coupling demands it.
+  - Future candidate pool: non-ARR compatibility, reliability, packaging, docs, and other SeedSync-preserving improvements only.
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
   - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
-  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; integration has not started by request.
+  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; Batch 0 records the ARR-excluded classification and commit-grouping plan before any code import.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
