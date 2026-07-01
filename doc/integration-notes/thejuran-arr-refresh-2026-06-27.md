@@ -1,6 +1,6 @@
 # thejuran-arr Refresh - 2026-06-27
 
-Status: filtered-mining policy recorded; Batch 0 docs/tracker only; no code imported yet.
+Status: filtered mining completed; active import retired; no pending import unless future separable non-ARR work appears.
 
 ## Range Envelope
 
@@ -16,7 +16,7 @@ Status: filtered-mining policy recorded; Batch 0 docs/tracker only; no code impo
 - High bar: prove a candidate is non-ARR, SeedSync-preserving, and separable before importing it. Skip ARR/product-divergent chunks quickly instead of spending equal effort on every row or chunk.
 - Retirement fallback: if the first scoring pass finds almost nothing beyond ARR, branding, or UI divergence, retire this fork from active integration and leave the tracker note explaining why.
 - Batching rule: treat upstream rows as audit labels, not commit units. Group selected changes into coherent local commits by subsystem or behavior, and split only when reviewability, risk, or coupling makes that necessary.
-- Batch 0 scope: documentation and tracker updates only; no code import yet.
+- Batch 0 scope: documentation and tracker updates only; no code import was selected.
 
 ## Counts
 
@@ -24,24 +24,26 @@ Status: filtered-mining policy recorded; Batch 0 docs/tracker only; no code impo
 - Non-merge commits: `1226`
 - Merge commits: `93`
 
-## Category Summary
+## Results Summary
 
-- This history is too large to treat as one implementation pass, but the complete commit inventory below preserves every commit that needs future disposition.
-- Expect useful work to cluster around bootstrap/history, core runtime behavior, UI/service changes, release/docs, dependency updates, and milestone housekeeping.
-- Identity-shifting work, backend replacements, and broad product-shape changes should stay separate from routine refresh chunks.
+- The first contiguous 50 non-merge commits after `d2985b1a` (`3814eb88..ffeb52b7`) were non-importable, dominated by SeedSyncarr rebrand, UI/theme/interaction redesign, webhook/product-adjacent settings UI, and low-value planning/UAT records.
+- Full-range filtered mining did find non-ARR candidate groups, but mapping showed they are already present locally or intentionally superseded:
+  - Config/persistence: `15ef3490`, `932bf680`, and `6083cdac` were already active; `f4efff8e` was superseded by stronger local persist hardening.
+  - Controller lifecycle: `e622b914`, `d08be09a`, `4132bf80`, `d7d62c69`, `1df4fa86`, and `eeb16439` were already active locally; future maintenance grouping would be completion/scan targeting versus command throttling/process hardening, not per-row imports.
+  - Extract/scan: `1fe73b81` was a historical precursor superseded by `656b2efe`; `656b2efe`, `cb219608`, `ae841fb1`, `a47dfd2e`, and `1923357d` were present/active or superseded by the local current shape.
+  - Docker/runtime: `067664be`, `034832ed`, `46cd02fe`, `9d9c795a`, `89362f02`, and `c8513a4e` were already active; `c5d04201` was superseded by direct `scan_fs.py` execution; `12753242` was partially superseded by entrypoint bootstrap and the current compose helper.
+  - Security hardening: `a10d7d3e`, `a9d02db2`, `3e2485e5`, and `8dc4b400` were already covered; `86728492` was mostly superseded or moot because the old URL-style config setter route is not currently exposed.
+- No ARR support, rebrand, UI identity, Sonarr/Radarr/webhook ARR behavior, or other product-divergent change was imported.
+- Candidate handling was grouped by subsystem/behavior rather than one commit per upstream row; the accepted or rejected groups were evaluated as coherent batches, not row-by-row commits.
+- Active import lane retired: future refreshes should only reconsider newly discovered separable non-ARR work.
 
-## Suggested Chunking
+## Final State
 
-1. Start at `d2985b1a` and process oldest-to-newest.
-2. Use merge boundaries as natural checkpoints and finish one merge train before opening the next.
-3. Prefer chunks of roughly 25-50 non-merge commits, or one coherent milestone window if the history is especially dense.
-4. Group related accepted rows into coherent commits by subsystem or behavior rather than one local commit per upstream row.
-5. After each chunk, record the next resume commit and note any items that need `deferred`, `maintainer-decision`, or `new-task` treatment.
-6. Batch 0 is the documentation/tracker classification pass recorded above; code import starts only after rows are scored against the exclusion list.
+- No further chunking is scheduled for this fork unless new upstream commits land and expose new separable non-ARR work.
+- If that happens, resume from the next unprocessed commit and keep ARR/product divergence excluded.
 
 ## Resume Reminder
 
-- Resume from the next unprocessed commit after the current checkpoint when the branch is picked up again.
 - Keep this note current instead of rebuilding the whole span from chat history.
 
 ## Complete Commit Inventory
