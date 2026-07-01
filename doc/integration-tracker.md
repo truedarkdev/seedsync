@@ -60,23 +60,21 @@ Refresh rule:
 
 ## thejuran-arr
 - Source branch: `thejuran-arr/main`
-- Last fully processed upstream commit: `unreviewed`
-- Fork tip at last full review: `unreviewed`
-- Last full review date: `pending`
-- Status: filtered mining only; integration has not begun; hard-exclude ARR/product divergence and retire the lane if scoring finds no worthwhile separable candidates
-- Integrated so far: none yet; Batch 0 is docs/tracker-only classification, not code import. This is the renamed `thejuran/seedsyncarr` history and remains the durable pending inventory, not a continuation of the old `thejuran/seedsync` checkpoint.
-- Resume when this lane is picked up: use `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md`, then review the history strictly oldest-to-newest from the first commit in the tracked envelope and group accepted changes by subsystem/behavior instead of one commit per upstream row.
+- Last fully processed upstream commit: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`
+- Fork tip at last full review: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`
+- Last full review date: `2026-07-01`
+- Status: filtered mining completed; active import retired; no pending import unless future separable non-ARR work appears
+- Integrated so far: no code imported. The filtered-mining pass found only ARR/product-divergent noise or non-ARR groups that are already active locally or intentionally superseded; the first 50 non-merge commits after `d2985b1a` (`3814eb88..ffeb52b7`) were non-importable.
+- Resume when this lane is picked up: if new upstream commits appear, restart filtered mining from the next unprocessed commit after `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`, keep ARR/product divergence excluded, and only consider newly discovered separable SeedSync-preserving non-ARR work grouped by subsystem/behavior.
 - Notes:
   - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, ARR-coupled product divergence, and similar product-divergent work are hard exclusions from this fork.
-  - Filtered mining only: scan only for SeedSync-preserving, separable, non-ARR improvements such as bug fixes, Docker/runtime hardening, packaging fixes, docs corrections, compatibility fixes, small backend reliability improvements, and test fixes that reveal real local gaps.
-  - High bar: prove a candidate is non-ARR, SeedSync-preserving, and separable before importing it. Do not spend equal effort on every row/chunk; skip ARR/product-divergent chunks quickly.
-  - Retirement fallback: if the first scoring pass finds almost nothing beyond ARR, branding, or UI divergence, retire this fork from active integration and leave the tracker note explaining why.
+  - Filtered mining completed: the refresh note records the skipped first 50 non-merge commits after `d2985b1a`, the already-covered or superseded non-ARR candidate groups, and the final no-import recommendation.
   - Batching: treat upstream rows as audit labels, not commit units. Preserve grouped commits by subsystem/behavior for accepted work, with split commits only when reviewability or coupling demands it.
-  - Future candidate pool: non-ARR compatibility, reliability, packaging, docs, and other SeedSync-preserving filtered-mining improvements only.
+  - Future candidate pool: only newly discovered separable, SeedSync-preserving, non-ARR compatibility, reliability, packaging, docs, or backend-hardening work.
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
   - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
-  - Refresh planning note added at `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope; Batch 0 records the ARR-excluded classification and commit-grouping plan before any code import.
+  - Refresh note: `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` now records the completed filtered-mining disposition for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
