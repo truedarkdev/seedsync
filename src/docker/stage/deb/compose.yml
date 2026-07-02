@@ -10,28 +10,46 @@ services:
       context: ../../../..
       dockerfile: src/docker/stage/deb/Dockerfile
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "bash -ec 'exec 3<>/dev/tcp/127.0.0.1/8800; printf \"GET /server/status HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\n\\r\\n\" >&3; IFS= read -r status <&3; case \"$$status\" in *\"200 OK\"*) exit 0 ;; *) exit 1 ;; esac'"
-        ]
+      test: >
+        bash -ec 'header_file="$(mktemp)"; trap "rm -f \"$$header_file\"" EXIT; printf "Authorization: Bearer %s\n" "$${SEEDSYNC_E2E_API_TOKEN}" >"$$header_file"; curl -fsS --header @"$$header_file" http://127.0.0.1:8800/server/status >/dev/null'
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 10s
+    depends_on:
+      auth_seed:
+        condition: service_completed_successfully
     tty: true
     tmpfs:
       - /run
       - /run/lock
     security_opt:
       - seccomp:unconfined
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e auth seeding}
     volumes:
       - type: bind
         source: ${SEEDSYNC_DEB}
         target: /install/seedsync.deb
         read_only: true
+      - type: volume
+        source: seedsync_test_e2e_config
+        target: /home/user/.seedsync
 
       - type: bind
         source: /sys/fs/cgroup
         target: /sys/fs/cgroup
         read_only: false
+
+  auth_seed:
+    environment:
+      SEEDSYNC_API_KEY_DIR: /home/user/.seedsync
+      SEEDSYNC_API_KEY_OWNER: "${SEEDSYNC_API_KEY_OWNER:-1000:1000}"
+    volumes:
+      - type: volume
+        source: seedsync_test_e2e_config
+        target: /home/user/.seedsync
+
+  configure:
+    environment:
+      SEEDSYNC_API_KEY_OWNER: "${SEEDSYNC_API_KEY_OWNER:-1000:1000}"

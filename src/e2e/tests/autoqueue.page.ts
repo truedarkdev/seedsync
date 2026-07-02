@@ -1,23 +1,43 @@
 import {browser, by, element, ExpectedConditions} from 'protractor';
-import {promise} from "selenium-webdriver";
-import Promise = promise.Promise;
+import {promise as webdriverPromise} from "selenium-webdriver";
 
 import {Urls} from "../urls";
 import {App} from "./app";
+import {loadAngularRoute} from "./route-bootstrap";
+
+type WebdriverPromise<T> = webdriverPromise.Promise<T>;
 
 export class AutoQueuePage extends App {
-    navigateTo() {
-        return browser.get(Urls.APP_BASE_URL + "autoqueue").then(() => {
-            return browser.waitForAngular().then(() => {
-                return browser.wait(
-                    ExpectedConditions.presenceOf(element(by.css("#add-pattern input"))),
-                    10000
-                );
-            });
-        });
+    private getPatternInput() {
+        return element(by.css("#add-pattern input"));
     }
 
-    getPatterns(): Promise<Array<string>> {
+    private getAddPatternButton() {
+        return element(by.css("#add-pattern .button"));
+    }
+
+    private async waitForPatternInputReady(): Promise<void> {
+        const input = this.getPatternInput();
+        await browser.wait(ExpectedConditions.elementToBeClickable(input), 10000);
+    }
+
+    private async waitForPatternActionReady(button): Promise<void> {
+        await browser.wait(async () => {
+            try {
+                return await button.isDisplayed() &&
+                    (await button.getAttribute("aria-disabled")) !== "true";
+            } catch {
+                return false;
+            }
+        }, 10000);
+    }
+
+    async navigateTo(): Promise<void> {
+        await loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "autoqueue"), "#add-pattern input");
+        await this.waitForPatternInputReady();
+    }
+
+    getPatterns(): WebdriverPromise<Array<string>> {
         return element.all(by.css("#autoqueue .pattern span.text")).map(function (elm) {
             return browser.executeScript("return arguments[0].innerHTML;", elm).then((content: string) => {
                 return content.trim();
@@ -25,36 +45,39 @@ export class AutoQueuePage extends App {
         });
     }
 
-    addPattern(pattern: string) {
-        let input = element(by.css("#add-pattern input"));
+    async addPattern(pattern: string) {
+        const input = this.getPatternInput();
         let patterns = element.all(by.css("#autoqueue .pattern span.text"));
-        let button = element(by.css("#add-pattern .button"));
-        return patterns.count().then(count => {
-            return input.clear().then(() => {
-                return input.sendKeys(pattern);
-            }).then(() => {
-                return button.click().then(() => {
-                    return browser.waitForAngular().then(() => {
-                        return browser.wait(() => {
-                            return patterns.count().then(updatedCount => updatedCount === count + 1);
-                        }, 10000);
-                    });
-                });
-            });
-        });
+        const button = this.getAddPatternButton();
+
+        await this.waitForPatternInputReady();
+
+        const count = await patterns.count();
+        await input.click();
+        await input.clear();
+        await input.sendKeys(pattern);
+
+        await this.waitForPatternActionReady(button);
+        await browser.wait(ExpectedConditions.elementToBeClickable(button), 10000);
+        await button.click();
+
+        await browser.wait(async () => {
+            return (await patterns.count()) === count + 1;
+        }, 10000);
     }
 
-    removePattern(index: number) {
+    async removePattern(index: number) {
         let patterns = element.all(by.css("#autoqueue .pattern span.text"));
-        let button = element.all(by.css("#autoqueue .pattern")).get(index).element(by.css(".button"));
-        return patterns.count().then(count => {
-            return button.click().then(() => {
-                return browser.waitForAngular().then(() => {
-                    return browser.wait(() => {
-                        return patterns.count().then(updatedCount => updatedCount === count - 1);
-                    }, 10000);
-                });
-            });
-        });
+        const button = element.all(by.css("#autoqueue .pattern")).get(index).element(by.css(".button"));
+
+        await this.waitForPatternActionReady(button);
+        await browser.wait(ExpectedConditions.elementToBeClickable(button), 10000);
+
+        const count = await patterns.count();
+        await button.click();
+
+        await browser.wait(async () => {
+            return (await patterns.count()) === count - 1;
+        }, 10000);
     }
 }

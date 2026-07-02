@@ -3,16 +3,16 @@ import {AboutPage} from "./about.page";
 describe('Testing about page', () => {
     let page: AboutPage;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         page = new AboutPage();
-        page.navigateTo();
+        await page.navigateTo();
     });
 
-    it('should have right top title', () => {
-        expect(page.getTopTitle()).toEqual("About");
+    it('should have right top title', async () => {
+        expect(await page.getTopTitle()).toEqual("About");
     });
 
-    it('should have the right version', () => {
-        expect(page.getVersion()).toEqual("v0.8.6");
+    it('should have the right version', async () => {
+        expect(await page.getVersion()).toEqual("v0.8.6");
     });
 });

@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ubuntu:16.04
+ARG BASE_IMAGE=ubuntu-systemd:20.04
 
 FROM $BASE_IMAGE
 
@@ -9,7 +9,11 @@ RUN apt-get update && apt-get install -y \
     libexpat1 \
     expect \
     lftp \
-    openssh-client
+    openssh-client \
+    rclone \
+    curl && \
+    command -v rclone >/dev/null && \
+    command -v curl >/dev/null
 
 # Create non-root user
 RUN useradd --create-home -s /bin/bash user && \

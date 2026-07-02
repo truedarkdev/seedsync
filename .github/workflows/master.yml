@@ -152,6 +152,10 @@ jobs:
     name: End-to-end tests on Deb
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      SEEDSYNC_E2E_API_TOKEN: seedsync-e2e-api-token
+      SEEDSYNC_E2E_BROWSER_API_TOKEN: seedsync-e2e-browser-api-token
+      SEEDSYNC_E2E_BROWSER_SESSION_SECRET: seedsync-e2e-browser-session-secret
     needs: [ build-deb ]
     strategy:
       matrix:
@@ -180,6 +184,10 @@ jobs:
     name: End-to-end tests on Docker Image
     needs: [ build-docker-image ]
     timeout-minutes: 120
+    env:
+      SEEDSYNC_E2E_API_TOKEN: seedsync-e2e-api-token
+      SEEDSYNC_E2E_BROWSER_API_TOKEN: seedsync-e2e-browser-api-token
+      SEEDSYNC_E2E_BROWSER_SESSION_SECRET: seedsync-e2e-browser-session-secret
     strategy:
       matrix:
         include:

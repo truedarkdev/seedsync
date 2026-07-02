@@ -3,17 +3,17 @@ import {App} from "./app";
 describe('Testing top-level app', () => {
     let app: App;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         app = new App();
-        app.navigateTo();
+        await app.navigateTo();
     });
 
-    it('should have right title', () => {
-        expect(app.getTitle()).toEqual("SeedSync");
+    it('should have right title', async () => {
+        expect(await app.getTitle()).toEqual("SeedSync");
     });
 
-    it('should have all the sidebar items', () => {
-        expect(app.getSidebarItems()).toEqual(
+    it('should have all the sidebar items', async () => {
+        expect(await app.getSidebarItems()).toEqual(
             [
                 "Dashboard",
                 "Settings",
@@ -24,7 +24,7 @@ describe('Testing top-level app', () => {
         );
     });
 
-    it('should default to the dashboard page', () => {
-        expect(app.getTopTitle()).toEqual("Dashboard");
+    it('should default to the dashboard page', async () => {
+        expect(await app.getTopTitle()).toEqual("Dashboard");
     });
 });

@@ -3,69 +3,69 @@ import {AutoQueuePage} from "./autoqueue.page";
 describe('Testing autoqueue page', () => {
     let page: AutoQueuePage;
 
-    beforeEach(() => {
+    beforeEach(async () => {
         page = new AutoQueuePage();
-        page.navigateTo();
+        await page.navigateTo();
     });
 
-    it('should have right top title', () => {
-        expect(page.getTopTitle()).toEqual("Settings");
+    it('should have right top title', async () => {
+        expect(await page.getTopTitle()).toEqual("Settings");
     });
 
 
-    it('should add and remove patterns', () => {
+    it('should add and remove patterns', async () => {
         // start with an empty list
-        expect(page.getPatterns()).toEqual([]);
+        expect(await page.getPatterns()).toEqual([]);
 
         // add some patterns, and expect them in added order
-        page.addPattern("APattern");
-        page.addPattern("CPattern");
-        page.addPattern("DPattern");
-        page.addPattern("BPattern");
-        expect(page.getPatterns()).toEqual([
+        await page.addPattern("APattern");
+        await page.addPattern("CPattern");
+        await page.addPattern("DPattern");
+        await page.addPattern("BPattern");
+        expect(await page.getPatterns()).toEqual([
             "APattern", "CPattern", "DPattern", "BPattern"
         ]);
 
         // remove patterns one by one
-        page.removePattern(2);
-        expect(page.getPatterns()).toEqual([
+        await page.removePattern(2);
+        expect(await page.getPatterns()).toEqual([
             "APattern", "CPattern", "BPattern"
         ]);
-        page.removePattern(0);
-        expect(page.getPatterns()).toEqual([
+        await page.removePattern(0);
+        expect(await page.getPatterns()).toEqual([
             "CPattern", "BPattern"
         ]);
-        page.removePattern(1);
-        expect(page.getPatterns()).toEqual([
+        await page.removePattern(1);
+        expect(await page.getPatterns()).toEqual([
             "CPattern"
         ]);
-        page.removePattern(0);
-        expect(page.getPatterns()).toEqual([]);
+        await page.removePattern(0);
+        expect(await page.getPatterns()).toEqual([]);
     });
 
-    it('should list existing patterns in alphabetical order', () => {
+    it('should list existing patterns in alphabetical order', async () => {
         // start with an empty list
-        expect(page.getPatterns()).toEqual([]);
+        expect(await page.getPatterns()).toEqual([]);
 
         // add some patterns, and expect them in added order
-        page.addPattern("APattern");
-        page.addPattern("CPattern");
-        page.addPattern("DPattern");
-        page.addPattern("BPattern");
+        await page.addPattern("APattern");
+        await page.addPattern("CPattern");
+        await page.addPattern("DPattern");
+        await page.addPattern("BPattern");
 
         // reload the page
-        page.navigateTo();
+        await page.navigateTo();
 
         // patterns should be in alphabetical order
-        expect(page.getPatterns()).toEqual([
+        expect(await page.getPatterns()).toEqual([
             "APattern", "BPattern", "CPattern", "DPattern"
         ]);
 
         // remove all patterns
-        page.removePattern(0);
-        page.removePattern(0);
-        page.removePattern(0);
-        page.removePattern(0);
-        expect(page.getPatterns()).toEqual([]);
+        await page.removePattern(0);
+        await page.removePattern(0);
+        await page.removePattern(0);
+        await page.removePattern(0);
+        expect(await page.getPatterns()).toEqual([]);
     });
 });

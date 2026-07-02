@@ -20,7 +20,7 @@ Describe the tests you ran to verify your changes.
 
 - [ ] Python unit tests (`make run-tests-python`)
 - [ ] Angular unit tests (`make run-tests-angular`)
-- [ ] E2E tests (`make run-tests-e2e`)
+- [ ] E2E tests (`SEEDSYNC_E2E_*` fixture envs + `make run-tests-e2e`)
 - [ ] Manual testing
 - [ ] Not verified yet
 
