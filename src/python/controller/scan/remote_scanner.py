@@ -77,6 +77,55 @@ class RemoteScanner(IScanner):
             return "python3"
         return normalized
 
+    @staticmethod
+    def __is_python_shebang_helper(shebang: str) -> bool:
+        # Treat ambiguous or malformed shebangs as Python helpers so we stay on the configured
+        # interpreter path unless the script clearly signals a non-Python helper.
+        try:
+            shebang_tokens = shlex.split(shebang)
+        except ValueError:
+            return True
+
+        if not shebang_tokens:
+            return True
+
+        interpreter_tokens = shebang_tokens
+        if os.path.basename(shebang_tokens[0]).lower() == "env":
+            interpreter_tokens = [token for token in shebang_tokens[1:] if not token.startswith("-")]
+            if not interpreter_tokens:
+                return True
+
+        for token in interpreter_tokens:
+            interpreter = os.path.basename(token).lower()
+            if interpreter.startswith("python") or interpreter.startswith("pypy"):
+                return True
+
+        return False
+
+    @staticmethod
+    def __should_execute_scanfs_directly(local_path_to_scan_script: Optional[str]) -> bool:
+        if not isinstance(local_path_to_scan_script, str) or not local_path_to_scan_script:
+            return False
+
+        try:
+            with open(local_path_to_scan_script, "rb") as handle:
+                file_prefix = handle.read(256)
+        except (OSError, TypeError, ValueError):
+            return False
+
+        if file_prefix.startswith(b"\x7fELF"):
+            return True
+
+        if not file_prefix.startswith(b"#!"):
+            return False
+
+        first_line = file_prefix.splitlines()[0].decode("utf-8", errors="ignore").strip()
+        shebang = first_line[2:].strip()
+        if not shebang:
+            return False
+
+        return not RemoteScanner.__is_python_shebang_helper(shebang)
+
     def __init__(self,
                  remote_address: str,
                  remote_username: str,
@@ -136,12 +185,25 @@ class RemoteScanner(IScanner):
             self._install_scanfs()
 
         try:
-            remote_python_path = shlex.quote(self._normalize_remote_python_path(self.__remote_python_path))
-            out = self.__ssh.shell("{} {} {}".format(
-                remote_python_path,
-                escape_remote_path_for_shell(self.__remote_path_to_scan_script, allow_tilde_expansion=True),
-                escape_remote_path_for_shell(self.__remote_path_to_scan, allow_tilde_expansion=True)
-            ))
+            remote_scanfs_path = escape_remote_path_for_shell(
+                self.__remote_path_to_scan_script,
+                allow_tilde_expansion=True
+            )
+            remote_scan_path = escape_remote_path_for_shell(
+                self.__remote_path_to_scan,
+                allow_tilde_expansion=True
+            )
+            # Run packaged binaries or non-Python shebang helpers directly; Python shebang
+            # helpers keep the configured interpreter path.
+            if self.__should_execute_scanfs_directly(self.__local_path_to_scan_script):
+                out = self.__ssh.shell("{} {}".format(remote_scanfs_path, remote_scan_path))
+            else:
+                remote_python_path = shlex.quote(self._normalize_remote_python_path(self.__remote_python_path))
+                out = self.__ssh.shell("{} {} {}".format(
+                    remote_python_path,
+                    remote_scanfs_path,
+                    remote_scan_path
+                ))
         except SshcpError as e:
             self.logger.warning("Caught an SshcpError: {}".format(str(e)))
             recoverable = True
