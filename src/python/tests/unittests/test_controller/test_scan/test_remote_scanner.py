@@ -70,6 +70,13 @@ class TestRemoteScanner(unittest.TestCase):
             escape_remote_path_for_shell(remote_path, allow_tilde_expansion=True)
         )
 
+    @staticmethod
+    def _direct_scan_command(remote_script, remote_path):
+        return "{} {}".format(
+            escape_remote_path_for_shell(remote_script, allow_tilde_expansion=True),
+            escape_remote_path_for_shell(remote_path, allow_tilde_expansion=True)
+        )
+
     def test_correctly_initializes_ssh(self):
         self.ssh_args = {}
 
@@ -382,6 +389,82 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual(2, self.mock_ssh.shell.call_count)
         self.mock_ssh.shell.assert_called_with(
             self._scan_command("python3", "/remote/path/to/scan/script", "/remote/path/to/scan")
+        )
+
+    def test_uses_direct_scan_command_for_packaged_scanfs_helpers(self):
+        packaged_scanfs_path = os.path.join(TestRemoteScanner.temp_dir, "scanfs")
+        with open(packaged_scanfs_path, "wb") as handle:
+            handle.write(b"\x7fELF" + b"\x00" * 32)
+
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=packaged_scanfs_path,
+            remote_path_to_scan_script="/remote/path/to/scan/script"
+        )
+
+        self.ssh_run_command_count = 0
+
+        def ssh_shell(*args):
+            self.ssh_run_command_count += 1
+            if self.ssh_run_command_count == 1:
+                return "".encode()
+            return json.dumps([]).encode()
+
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        scanner.scan()
+
+        expected_remote_script = "/remote/path/to/scan/script/scanfs"
+        self.assertEqual(2, self.mock_ssh.shell.call_count)
+        self.mock_ssh.copy.assert_called_once_with(
+            local_path=packaged_scanfs_path,
+            remote_path=expected_remote_script
+        )
+        self.mock_ssh.shell.assert_called_with(
+            self._direct_scan_command(expected_remote_script, "/remote/path/to/scan")
+        )
+
+    def test_uses_configured_remote_python_path_for_shebang_python_scanfs_helpers(self):
+        shebang_scanfs_path = os.path.join(TestRemoteScanner.temp_dir, "scanfs.py")
+        with open(shebang_scanfs_path, "w", encoding="utf-8") as handle:
+            handle.write("#!/usr/bin/env python3\nprint('hello')\n")
+
+        remote_python_path = "/opt/custom python/bin/python3"
+        scanner = RemoteScanner(
+            remote_address="my remote address",
+            remote_username="my remote user",
+            remote_password="my password",
+            remote_port=1234,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=shebang_scanfs_path,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+            remote_python_path=remote_python_path
+        )
+
+        self.ssh_run_command_count = 0
+
+        def ssh_shell(*args):
+            self.ssh_run_command_count += 1
+            if self.ssh_run_command_count == 1:
+                return "".encode()
+            return json.dumps([]).encode()
+
+        self.mock_ssh.shell.side_effect = ssh_shell
+
+        scanner.scan()
+
+        expected_remote_script = "/remote/path/to/scan/script/scanfs.py"
+        self.assertEqual(2, self.mock_ssh.shell.call_count)
+        self.mock_ssh.copy.assert_called_once_with(
+            local_path=shebang_scanfs_path,
+            remote_path=expected_remote_script
+        )
+        self.mock_ssh.shell.assert_called_with(
+            self._scan_command(remote_python_path, expected_remote_script, "/remote/path/to/scan")
         )
 
     def test_uses_home_expansion_for_tilde_remote_paths(self):
