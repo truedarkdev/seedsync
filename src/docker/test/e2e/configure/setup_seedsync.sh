@@ -5,7 +5,22 @@ set -euo pipefail
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-90}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 CONFIGURE_CURL_TIMEOUT=${CONFIGURE_CURL_TIMEOUT:-15}
+readonly API_TOKEN="${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e auth seeding}"
+readonly AUTHORIZATION_HEADER_FILE="$(mktemp)"
+readonly api_key_dir="${SEEDSYNC_API_KEY_DIR:-/config}"
+readonly api_key_owner="${SEEDSYNC_API_KEY_OWNER:-}"
+readonly settings_path="${api_key_dir%/}/settings.cfg"
+readonly trusted_browser_bootstrap_sources_path="${api_key_dir%/}/trusted_browser_bootstrap_remote_addrs"
 readonly base_url="http://myapp:8800"
+
+if [[ -n "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}" ]]; then
+  echo "SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES is no longer supported; trusted browser sources are written by auth_seed.sh" >&2
+  exit 1
+fi
+
+trap 'rm -f -- "${AUTHORIZATION_HEADER_FILE}"' EXIT
+printf 'Authorization: Bearer %s\n' "${API_TOKEN}" > "${AUTHORIZATION_HEADER_FILE}"
+chmod 600 "${AUTHORIZATION_HEADER_FILE}"
 
 wait_for_app_ready() {
   local label="$1"
@@ -14,7 +29,9 @@ wait_for_app_ready() {
 
   while [ ${SECONDS} -lt ${end} ];
   do
-    if curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" "${base_url}/server/status" >/dev/null 2>&1; then
+    if curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" \
+      --header "@${AUTHORIZATION_HEADER_FILE}" \
+      "${base_url}/server/status" >/dev/null 2>&1; then
       app_ready='True'
       break
     fi
@@ -33,19 +50,159 @@ wait_for_app_ready() {
 call_api() {
   local url="$1"
   local method="${2:-GET}"
-  curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" --request "${method}" "${url}"
-  echo
+  local response_body
+  local response_stderr
+  local response_status
+  local curl_exit
+
+  response_body="$(mktemp)"
+  response_stderr="$(mktemp)"
+  if response_status=$(
+    curl --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" \
+      --request "${method}" \
+      --header "@${AUTHORIZATION_HEADER_FILE}" \
+      --output "${response_body}" \
+      --write-out '%{http_code}' \
+      "${url}" 2>"${response_stderr}"
+  ); then
+    if [[ "${response_status}" != 2* ]]; then
+      echo "E2E Configure request returned HTTP ${response_status}: ${method} ${url}"
+      if [[ -s "${response_body}" ]]; then
+        echo "Response body:"
+        cat "${response_body}"
+      else
+        echo "Response body: <empty>"
+      fi
+      if [[ -s "${response_stderr}" ]]; then
+        echo "Curl stderr:"
+        cat "${response_stderr}"
+      fi
+      rm -f "${response_body}" "${response_stderr}"
+      return 1
+    fi
+  else
+    curl_exit=$?
+    echo "E2E Configure request failed: ${method} ${url} (curl exit ${curl_exit})"
+    if [[ -s "${response_body}" ]]; then
+      echo "Response body:"
+      cat "${response_body}"
+    else
+      echo "Response body: <empty>"
+    fi
+    if [[ -s "${response_stderr}" ]]; then
+      echo "Curl stderr:"
+      cat "${response_stderr}"
+    fi
+    rm -f "${response_body}" "${response_stderr}"
+    return "${curl_exit}"
+  fi
+
+  if [[ -s "${response_body}" ]]; then
+    cat "${response_body}"
+    echo
+  fi
+
+  rm -f "${response_body}" "${response_stderr}"
 }
 
 call_api_json() {
   local url="$1"
   local json_body="$2"
-  curl --fail --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" \
-    --request POST \
-    --header "Content-Type: application/json" \
-    --data "${json_body}" \
-    "${url}"
-  echo
+  local response_body
+  local response_stderr
+  local response_status
+  local curl_exit
+
+  response_body="$(mktemp)"
+  response_stderr="$(mktemp)"
+  if response_status=$(
+    curl --silent --show-error --max-time "${CONFIGURE_CURL_TIMEOUT}" \
+      --request POST \
+      --header "@${AUTHORIZATION_HEADER_FILE}" \
+      --header "Content-Type: application/json" \
+      --data "${json_body}" \
+      --output "${response_body}" \
+      --write-out '%{http_code}' \
+      "${url}" 2>"${response_stderr}"
+  ); then
+    if [[ "${response_status}" != 2* ]]; then
+      echo "E2E Configure request returned HTTP ${response_status}: POST ${url}"
+      if [[ -s "${response_body}" ]]; then
+        echo "Response body:"
+        cat "${response_body}"
+      else
+        echo "Response body: <empty>"
+      fi
+      if [[ -s "${response_stderr}" ]]; then
+        echo "Curl stderr:"
+        cat "${response_stderr}"
+      fi
+      rm -f "${response_body}" "${response_stderr}"
+      return 1
+    fi
+  else
+    curl_exit=$?
+    echo "E2E Configure request failed: POST ${url} (curl exit ${curl_exit})"
+    if [[ -s "${response_body}" ]]; then
+      echo "Response body:"
+      cat "${response_body}"
+    else
+      echo "Response body: <empty>"
+    fi
+    if [[ -s "${response_stderr}" ]]; then
+      echo "Curl stderr:"
+      cat "${response_stderr}"
+    fi
+    rm -f "${response_body}" "${response_stderr}"
+    return "${curl_exit}"
+  fi
+
+  if [[ -s "${response_body}" ]]; then
+    cat "${response_body}"
+    echo
+  fi
+
+  rm -f "${response_body}" "${response_stderr}"
+}
+
+set_general_option() {
+  local key="$1"
+  local value="$2"
+
+  mkdir -p "${api_key_dir}"
+  if [[ ! -f "${settings_path}" ]]; then
+    printf "[General]\n%s = %s\n" "${key}" "${value}" > "${settings_path}"
+    return
+  fi
+
+  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${settings_path}"; then
+    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*$|${key} = ${value}|" "${settings_path}"
+  else
+    general_line="$(grep -n "^\[General\][[:space:]]*$" "${settings_path}" | head -n 1 | cut -d: -f1)"
+    if [[ -n "${general_line}" ]]; then
+      insert_line="$((general_line + 1))"
+      sed -i "${insert_line}i ${key} = ${value}" "${settings_path}"
+    else
+      printf "\n[General]\n%s = %s\n" "${key}" "${value}" >> "${settings_path}"
+    fi
+  fi
+}
+
+load_trusted_browser_bootstrap_sources() {
+  local trusted_browser_bootstrap_sources
+
+  if [[ ! -r "${trusted_browser_bootstrap_sources_path}" ]]; then
+    echo "Unable to read trusted browser bootstrap sources from ${trusted_browser_bootstrap_sources_path}" >&2
+    exit 1
+  fi
+
+  trusted_browser_bootstrap_sources="$(<"${trusted_browser_bootstrap_sources_path}")"
+  if [[ -z "${trusted_browser_bootstrap_sources//[[:space:]]/}" ]]; then
+    echo "Unable to determine trusted browser bootstrap sources for the Docker compose network" >&2
+    exit 1
+  fi
+
+  printf "%s" "${trusted_browser_bootstrap_sources}"
 }
 
 wait_for_app_ready "Seedsync app is up (before configuring)"
@@ -60,6 +217,12 @@ call_api_json "${base_url}/server/config/set/lftp/remote_path" '{"value":"/home/
 call_api_json "${base_url}/server/config/set/autoqueue/patterns_only" '{"value":true}'
 
 wait_for_app_ready "Seedsync app is up (before restart)"
+set_general_option trusted_browser_bootstrap_remote_addrs "$(load_trusted_browser_bootstrap_sources)"
+if [[ -n "${api_key_owner}" ]]; then
+  chown -R "${api_key_owner}" "${api_key_dir}"
+fi
+chmod 700 "${api_key_dir}"
+chmod 600 "${settings_path}"
 call_api "${base_url}/server/command/restart" POST
 
 wait_for_app_ready "Seedsync app is up (after configuring)"

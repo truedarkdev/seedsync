@@ -400,9 +400,18 @@ make run-tests-python
 make run-tests-angular
 
 # E2E Tests
+#
+# The e2e lane needs three non-secret fixture values. The examples below use
+# dummy local values so the documented entrypoints work as written.
 # Docker image (arch=amd64,arm64,arm/v7)
+SEEDSYNC_E2E_API_TOKEN=seedsync-e2e-api-token \
+SEEDSYNC_E2E_BROWSER_API_TOKEN=seedsync-e2e-browser-api-token \
+SEEDSYNC_E2E_BROWSER_SESSION_SECRET=seedsync-e2e-browser-session-secret \
 make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=<arch code>
 # Debian package (active DEB e2e lane: `ubu2004`, using the Ubuntu 20.04 lane)
+SEEDSYNC_E2E_API_TOKEN=seedsync-e2e-api-token \
+SEEDSYNC_E2E_BROWSER_API_TOKEN=seedsync-e2e-browser-api-token \
+SEEDSYNC_E2E_BROWSER_SESSION_SECRET=seedsync-e2e-browser-session-secret \
 make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=ubu2004
 ```
 
@@ -410,6 +419,9 @@ By default images are pulled from `localhost:5000`. To test image from a registr
 For example:
 
 ```bash
+SEEDSYNC_E2E_API_TOKEN=seedsync-e2e-api-token \
+SEEDSYNC_E2E_BROWSER_API_TOKEN=seedsync-e2e-browser-api-token \
+SEEDSYNC_E2E_BROWSER_SESSION_SECRET=seedsync-e2e-browser-session-secret \
 make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=arm64 STAGING_REGISTRY=ghcr.io/truedarkdev
 ```
 

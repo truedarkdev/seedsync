@@ -44,9 +44,21 @@ export class DashboardPage extends App {
         return row.element(by.css(".actions")).all(by.css(".button"));
     }
 
-    private waitForActionButtons(row) {
+    private async isActionContainerVisible(row): Promise<boolean> {
         const actions = row.element(by.css(".actions"));
-        return browser.wait(ExpectedConditions.presenceOf(actions), 10000);
+        try {
+            return await actions.isPresent();
+        } catch {
+            return false;
+        }
+    }
+
+    private waitForActionButtons(index: number) {
+        return browser.wait(async () => this.isActionContainerVisible(this.getFileRow(index)), 10000);
+    }
+
+    private waitForActionButtonsById(fileId: string) {
+        return browser.wait(async () => this.isActionContainerVisible(this.getFileRowById(this.requireFileId(fileId))), 10000);
     }
 
     private waitForFileRowCount(minimumCount: number) {
@@ -55,9 +67,9 @@ export class DashboardPage extends App {
         }, 10000);
     }
 
-    private async getActionButtonByTitle(row, title: string) {
-        await this.waitForActionButtons(row);
-        return this.getActionButtons(row)
+    private async getActionButtonByTitle(fileId: string, title: string) {
+        await this.waitForActionButtonsById(fileId);
+        return this.getActionButtons(this.getFileRowById(this.requireFileId(fileId)))
             .filter(buttonElm => {
                 return browser.executeScript(
                     "return arguments[0].innerHTML;",
@@ -105,30 +117,27 @@ export class DashboardPage extends App {
         return fileId;
     }
 
-    navigateTo() {
-        return loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "dashboard"), "#file-list .file")
-            .then(() => {
-                // Wait for the files list to show up
-                return browser.wait(ExpectedConditions.presenceOf(
-                    element.all(by.css("#file-list .file")).first()
-                ), 10000).then(() => {
-                    return browser.wait(ExpectedConditions.visibilityOf(
-                        element.all(by.css("#file-list .file")).first()
-                    ), 10000).then(() => this.waitForFileRowCount(1));
-                });
-            });
+    async navigateTo(): Promise<void> {
+        await loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "dashboard"), "#file-list .file");
+        // Wait for the files list to show up.
+        await browser.wait(ExpectedConditions.presenceOf(
+            element.all(by.css("#file-list .file")).first()
+        ), 10000);
+        await browser.wait(ExpectedConditions.visibilityOf(
+            element.all(by.css("#file-list .file")).first()
+        ), 10000);
+        await this.waitForFileRowCount(1);
     }
 
-    reload() {
-        return loadAngularRoute(() => browser.refresh(), "#file-list .file").then(() => {
-            return browser.wait(ExpectedConditions.presenceOf(
-                element.all(by.css("#file-list .file")).first()
-            ), 10000).then(() => {
-                return browser.wait(ExpectedConditions.visibilityOf(
-                    element.all(by.css("#file-list .file")).first()
-                ), 10000).then(() => this.waitForFileRowCount(1));
-            });
-        });
+    async reload(): Promise<void> {
+        await loadAngularRoute(() => browser.refresh(), "#file-list .file");
+        await browser.wait(ExpectedConditions.presenceOf(
+            element.all(by.css("#file-list .file")).first()
+        ), 10000);
+        await browser.wait(ExpectedConditions.visibilityOf(
+            element.all(by.css("#file-list .file")).first()
+        ), 10000);
+        await this.waitForFileRowCount(1);
     }
 
     getFiles(): WebdriverPromise<Array<File>> {
@@ -265,16 +274,24 @@ export class DashboardPage extends App {
         });
     }
 
-    selectFile(index: number) {
-        return this.getFileRow(index).click().then(() => {
-            return browser.waitForAngular();
-        });
+    async selectFile(index: number) {
+        const row = this.getFileRow(index);
+        const wasVisible = await this.isActionContainerVisible(row);
+        await browser.wait(ExpectedConditions.elementToBeClickable(row), 10000);
+        await row.click();
+        await browser.wait(async () => {
+            return (await this.isActionContainerVisible(this.getFileRow(index))) !== wasVisible;
+        }, 10000);
     }
 
-    selectFileById(fileId: string) {
-        return this.getFileRowById(this.requireFileId(fileId)).click().then(() => {
-            return browser.waitForAngular();
-        });
+    async selectFileById(fileId: string) {
+        const row = this.getFileRowById(this.requireFileId(fileId));
+        const wasVisible = await this.isActionContainerVisible(row);
+        await browser.wait(ExpectedConditions.elementToBeClickable(row), 10000);
+        await row.click();
+        await browser.wait(async () => {
+            return (await this.isActionContainerVisible(this.getFileRowById(this.requireFileId(fileId)))) !== wasVisible;
+        }, 10000);
     }
 
     selectFileByName(name: string) {
@@ -284,14 +301,7 @@ export class DashboardPage extends App {
     }
 
     isFileActionsVisible(index: number) {
-        const actions = this.getFileRow(index).element(by.css(".actions"));
-        return actions.isPresent().then(present => {
-            if (!present) {
-                return false;
-            }
-
-            return actions.isDisplayed();
-        });
+        return this.isActionContainerVisible(this.getFileRow(index));
     }
 
     isFileActionsVisibleByName(name: string) {
@@ -299,8 +309,8 @@ export class DashboardPage extends App {
     }
 
     async getFileActions(index: number): Promise<Array<FileActionButtonState>> {
+        await this.waitForActionButtons(index);
         const row = this.getFileRow(index);
-        await this.waitForActionButtons(row);
         return this.getActionButtons(row)
             .map(buttonElm => {
                 let title = browser.executeScript(
@@ -319,8 +329,7 @@ export class DashboardPage extends App {
     }
 
     stopFileById(fileId: string) {
-        const row = this.getFileRowById(this.requireFileId(fileId));
-        return this.getActionButtonByTitle(row, "Stop").then(button => {
+        return this.getActionButtonByTitle(fileId, "Stop").then(button => {
             return browser.wait(ExpectedConditions.elementToBeClickable(button), 10000).then(() => {
                 return button.click().then(() => {
                     return browser.waitForAngular();
@@ -330,8 +339,7 @@ export class DashboardPage extends App {
     }
 
     queueFileById(fileId: string) {
-        const row = this.getFileRowById(this.requireFileId(fileId));
-        return this.getActionButtonByTitle(row, "Queue").then(button => {
+        return this.getActionButtonByTitle(fileId, "Queue").then(button => {
             return browser.wait(ExpectedConditions.elementToBeClickable(button), 10000).then(() => {
                 return button.click().then(() => {
                     return browser.waitForAngular();
@@ -364,13 +372,13 @@ export class DashboardPage extends App {
         }, 20000);
     }
 
-    private async getActionStateByTitle(row, title: string) {
-        const button = await this.getActionButtonByTitle(row, title);
+    private async getActionStateByTitle(fileId: string, title: string) {
+        const button = await this.getActionButtonByTitle(fileId, title);
         const value = await button.getAttribute("disabled");
         return new FileActionButtonState(title, value == null);
     }
 
     getFileActionByTitle(fileId: string, title: string) {
-        return this.getActionStateByTitle(this.getFileRowById(this.requireFileId(fileId)), title);
+        return this.getActionStateByTitle(this.requireFileId(fileId), title);
     }
 }

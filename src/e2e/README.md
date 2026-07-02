@@ -57,16 +57,25 @@ canonical lane inventory and minimum-evidence ladder.
 
 2. Choose which dev image to run: deb install or docker image
 
+   The three `SEEDSYNC_E2E_*` fixture envs can be any non-empty non-secret
+   strings; the commands below use dummy local values.
+
     - deb install
 
         ```bash
-        make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=<arch code> DEV=1
+        SEEDSYNC_E2E_API_TOKEN=seedsync-e2e-api-token \
+        SEEDSYNC_E2E_BROWSER_API_TOKEN=seedsync-e2e-browser-api-token \
+        SEEDSYNC_E2E_BROWSER_SESSION_SECRET=seedsync-e2e-browser-session-secret \
+        make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=<os code> DEV=1
         ```
 
     - docker image
 
         ```bash
-        make run-tests-e2e SEEDSYNC_DEB=`readlink -f build/*.deb` SEEDSYNC_OS=<os code> DEV=1
+        SEEDSYNC_E2E_API_TOKEN=seedsync-e2e-api-token \
+        SEEDSYNC_E2E_BROWSER_API_TOKEN=seedsync-e2e-browser-api-token \
+        SEEDSYNC_E2E_BROWSER_SESSION_SECRET=seedsync-e2e-browser-session-secret \
+        make run-tests-e2e STAGING_VERSION=latest SEEDSYNC_ARCH=<arch code> DEV=1
         ```
 
 3. Compile and run the tests

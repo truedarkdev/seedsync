@@ -674,15 +674,10 @@ class WebApp(bottle.Bottle):
         if WebApp.__is_loopback_remote_addr():
             return WebApp.__is_loopback_host(WebApp.__request_host())
 
-        if not self.__is_trusted_browser_bootstrap_remote_addr():
-            return False
-
-        effective_origin = self.__effective_request_origin()
-        if effective_origin is None:
-            return False
-
-        _, host, _ = effective_origin
-        return WebApp.__is_loopback_host(host)
+        # Docker/browser bootstrap requests from the trusted CIDR are allowed
+        # by source address; the POST handlers that mutate state still enforce
+        # same-origin checks separately.
+        return self.__is_trusted_browser_bootstrap_remote_addr()
 
     def __authorize_server_route(
         self,

@@ -1422,30 +1422,25 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("console.log('hello');", response.text)
 
-    def test_trusted_bootstrap_remote_addr_rejects_forwarded_non_loopback_host(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+    def test_trusted_bootstrap_remote_addr_allows_root_route_despite_forwarded_non_loopback_host(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.26.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
         AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+        response = client.get(
+            "/",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "172.26.0.1",
+                "HTTP_X_FORWARDED_HOST": "seed.example:8800",
+                "HTTP_X_FORWARDED_PROTO": "https",
+            },
+            expect_errors=True,
+        )
 
-        with tempfile.TemporaryDirectory() as html_path:
-            with open(os.path.join(html_path, "index.html"), "w") as html_file:
-                html_file.write("<html></html>")
-            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
-            client = TestApp(self.web_app)
-            response = client.get(
-                "/",
-                extra_environ={
-                    "HTTP_HOST": "localhost:8800",
-                    "REMOTE_ADDR": "172.25.0.1",
-                    "HTTP_X_FORWARDED_HOST": "seed.example:8800",
-                    "HTTP_X_FORWARDED_PROTO": "https",
-                },
-                expect_errors=True,
-            )
-
-        self.assertEqual(403, response.status_int)
-        self.assertIn("trusted local runtime", response.text)
+        self.assertEqual(302, response.status_int)
+        self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
 
     def test_cross_origin_bootstrap_get_does_not_consume_first_admin_handover(self):
         empty_store = ApiKeyStore()
@@ -1494,18 +1489,38 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertTrue(empty_store.get_browser_handover_state(self.context.config)["open"])
         self.assertEqual("", response.headers.get("Set-Cookie", ""))
 
-    def test_trusted_bootstrap_remote_addr_still_rejects_non_loopback_host(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+    def test_trusted_bootstrap_remote_addr_allows_bootstrap_page_for_service_host(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.26.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
         AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
-        response = self._issue_trusted_browser_session(
-            client,
-            remote_addr="172.25.0.1",
-            host="seed.example:8800",
-            expect_errors=True
+        response = client.get(
+            "/bootstrap",
+            extra_environ={
+                "HTTP_HOST": "myapp:8800",
+                "REMOTE_ADDR": "172.26.0.1",
+            },
+        )
+
+        self.assertEqual(200, response.status_int)
+        self.assertIn("SeedSync browser access", response.text)
+
+    def test_trusted_bootstrap_remote_addr_rejects_sibling_bridge_peer_without_exact_match(self):
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.26.0.1/32"
+        self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        response = client.get(
+            "/bootstrap",
+            extra_environ={
+                "HTTP_HOST": "myapp:8800",
+                "REMOTE_ADDR": "172.26.0.2",
+            },
+            expect_errors=True,
         )
 
         self.assertEqual(403, response.status_int)
@@ -1572,7 +1587,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual("ok", response.text)
 
     def test_trusted_bootstrap_remote_addr_can_use_cookie_backed_ui_session(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.26.0.1/32"
         self.web_app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
         AdminHandler(self.context.config, self.auth_store).add_routes(self.web_app)
 
@@ -1582,14 +1597,14 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
 
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
-        self._remember_trusted_browser_session(client, remote_addr="172.25.0.1")
+        self._remember_trusted_browser_session(client, remote_addr="172.26.0.1", host="myapp:8800")
 
         response = client.post(
             "/server/ping",
             extra_environ={
-                "HTTP_HOST": "localhost:8800",
-                "REMOTE_ADDR": "172.25.0.1",
-                "HTTP_REFERER": "http://localhost:8800/dashboard",
+                "HTTP_HOST": "myapp:8800",
+                "REMOTE_ADDR": "172.26.0.1",
+                "HTTP_REFERER": "http://myapp:8800/dashboard",
             }
         )
 

@@ -14,6 +14,29 @@ services:
         condition: service_healthy
       remote:
         condition: service_started
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e test execution}
+      SEEDSYNC_E2E_BROWSER_SESSION_SECRET: ${SEEDSYNC_E2E_BROWSER_SESSION_SECRET:?SEEDSYNC_E2E_BROWSER_SESSION_SECRET is required for remembered-session bootstrap}
+
+  auth_seed:
+    image: seedsync/test/e2e
+    container_name: seedsync_test_e2e_auth_seed
+    build:
+      context: ../../../../
+      dockerfile: src/docker/test/e2e/Dockerfile
+      target: seedsync_test_e2e
+    restart: "no"
+    entrypoint: ["/bin/bash", "-lc"]
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e auth seeding}
+      SEEDSYNC_E2E_BROWSER_API_TOKEN: ${SEEDSYNC_E2E_BROWSER_API_TOKEN:?SEEDSYNC_E2E_BROWSER_API_TOKEN is required for e2e auth seeding}
+      SEEDSYNC_E2E_BROWSER_SESSION_SECRET: ${SEEDSYNC_E2E_BROWSER_SESSION_SECRET:?SEEDSYNC_E2E_BROWSER_SESSION_SECRET is required for remembered-session bootstrap}
+      SEEDSYNC_API_KEY_DIR: ${SEEDSYNC_API_KEY_DIR:-/config}
+    volumes:
+      - type: volume
+        source: seedsync_test_e2e_config
+        target: /config
+    command: /app/auth_seed.sh
 
   chrome:
     image: seedsync/test/e2e/chrome
@@ -48,3 +71,13 @@ services:
     depends_on:
       myapp:
         condition: service_healthy
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e auth seeding}
+      SEEDSYNC_API_KEY_DIR: ${SEEDSYNC_API_KEY_DIR:-/config}
+    volumes:
+      - type: volume
+        source: seedsync_test_e2e_config
+        target: /config
+
+volumes:
+  seedsync_test_e2e_config:

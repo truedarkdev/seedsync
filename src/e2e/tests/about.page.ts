@@ -4,10 +4,11 @@ import Promise = promise.Promise;
 
 import {Urls} from "../urls";
 import {App} from "./app";
+import {loadAngularRoute} from "./route-bootstrap";
 
 export class AboutPage extends App {
     navigateTo() {
-        return browser.get(Urls.APP_BASE_URL + "about");
+        return loadAngularRoute(() => browser.get(Urls.APP_BASE_URL + "about"), "#title");
     }
 
     getVersion(): Promise<string> {

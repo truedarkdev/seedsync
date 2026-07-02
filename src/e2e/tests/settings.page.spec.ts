@@ -8,7 +8,7 @@ describe('Testing settings page', () => {
         await page.navigateTo();
     });
 
-    it('should have right top title', () => {
-        expect(page.getTopTitle()).toEqual("Settings");
+    it('should have right top title', async () => {
+        expect(await page.getTopTitle()).toEqual("Settings");
     });
 });

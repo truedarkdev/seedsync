@@ -15,7 +15,16 @@ fi
 STARTUP_TIMEOUT=${STARTUP_TIMEOUT:-60}
 POLL_INTERVAL=${POLL_INTERVAL:-2}
 CURL_TIMEOUT=${CURL_TIMEOUT:-5}
+readonly API_TOKEN="${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e test execution}"
+readonly BROWSER_SESSION_SECRET="${SEEDSYNC_E2E_BROWSER_SESSION_SECRET:?SEEDSYNC_E2E_BROWSER_SESSION_SECRET is required for remembered-session bootstrap}"
+export SEEDSYNC_E2E_API_TOKEN="${API_TOKEN}"
+export SEEDSYNC_E2E_BROWSER_SESSION_SECRET="${BROWSER_SESSION_SECRET}"
+readonly AUTHORIZATION_HEADER_FILE="$(mktemp)"
 SERVER_UP='False'
+
+trap 'rm -f -- "${AUTHORIZATION_HEADER_FILE}"' EXIT
+printf 'Authorization: Bearer %s\n' "${API_TOKEN}" > "${AUTHORIZATION_HEADER_FILE}"
+chmod 600 "${AUTHORIZATION_HEADER_FILE}"
 
 wait_for_remote_ready() {
   local remote_up='False'
@@ -71,7 +80,9 @@ END=$((SECONDS+STARTUP_TIMEOUT))
 while [ ${SECONDS} -lt ${END} ];
 do
   SERVER_UP=$(
-      curl --fail --silent --show-error --max-time "${CURL_TIMEOUT}" myapp:8800/server/status 2>/dev/null | \
+      curl --fail --silent --show-error --max-time "${CURL_TIMEOUT}" \
+        --header "@${AUTHORIZATION_HEADER_FILE}" \
+        myapp:8800/server/status 2>/dev/null | \
         python ./parse_seedsync_status.py 2>/dev/null || echo 'False'
   )
   if [[ "${SERVER_UP}" == 'True' ]]; then

@@ -3,10 +3,11 @@ import {promise} from "selenium-webdriver";
 import Promise = promise.Promise;
 
 import {Urls} from "../urls";
+import {loadAngularRoute} from "./route-bootstrap";
 
 export class App {
     navigateTo() {
-        return browser.get(Urls.APP_BASE_URL);
+        return loadAngularRoute(() => browser.get(Urls.APP_BASE_URL), "#top-content");
     }
 
     getTitle(): Promise<string> {

@@ -3,9 +3,19 @@ services:
   myapp:
     image: ${STAGING_REGISTRY:-localhost:5000}/seedsync:${STAGING_VERSION:-latest}
     container_name: seedsync_test_e2e_myapp
+    depends_on:
+      auth_seed:
+        condition: service_completed_successfully
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${SEEDSYNC_E2E_API_TOKEN:?SEEDSYNC_E2E_API_TOKEN is required for e2e auth seeding}
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8800/server/status >/dev/null"]
+      test: >
+        bash -ec 'header_file="$(mktemp)"; trap "rm -f \"$$header_file\"" EXIT; printf "Authorization: Bearer %s\n" "$${SEEDSYNC_E2E_API_TOKEN}" >"$$header_file"; curl -fsS --header @"$$header_file" http://127.0.0.1:8800/server/status >/dev/null'
       interval: 5s
       timeout: 5s
       retries: 12
       start_period: 10s
+    volumes:
+      - type: volume
+        source: seedsync_test_e2e_config
+        target: /config
