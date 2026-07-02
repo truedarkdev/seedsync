@@ -25,6 +25,12 @@ Refresh rule:
 - if the tip moved, review only the new upstream commits after that commit
 - once the new work is processed, update this tracker to the new fully processed tip
 
+Temporary commit ledgers:
+- use detailed commit-by-commit ledgers only while an integration range is active
+- every row in an active ledger must have an explicit result and reason before the range can be considered caught up
+- before retiring a ledger, validate that the row count matches the reviewed range and that no row has a missing result or reason
+- after catch-up is complete, delete the temporary ledger and preserve only the durable summary, resume checkpoint, unresolved decisions, and follow-up tasks in this tracker
+
 ## Entry Template
 
 ```md
@@ -68,13 +74,13 @@ Refresh rule:
 - Resume when this lane is picked up: if new upstream commits appear, restart filtered mining from the next unprocessed commit after `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`, keep ARR/product divergence excluded, and only consider newly discovered separable SeedSync-preserving non-ARR work grouped by subsystem/behavior.
 - Notes:
   - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, ARR-coupled product divergence, and similar product-divergent work are hard exclusions from this fork.
-  - Filtered mining completed: the refresh note records the skipped first 50 non-merge commits after `d2985b1a`, the already-covered or superseded non-ARR candidate groups, and the final no-import recommendation.
+  - Filtered mining completed: the temporary row ledger was validated at `1319` rows with zero missing result/reason cells, then removed after catch-up. The durable outcome is that the first 50 non-merge commits after `d2985b1a` were skipped as rebrand/UI/theme/webhook-adjacent/planning noise, later non-ARR candidate groups were already covered or superseded locally, and no import batch remained.
   - Batching: treat upstream rows as audit labels, not commit units. Preserve grouped commits by subsystem/behavior for accepted work, with split commits only when reviewability or coupling demands it.
   - Future candidate pool: only newly discovered separable, SeedSync-preserving, non-ARR compatibility, reliability, packaging, docs, or backend-hardening work.
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
   - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
-  - Refresh note: `doc/integration-notes/thejuran-arr-refresh-2026-06-27.md` now records the completed filtered-mining disposition for the `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e` envelope.
+  - Retired ledger range: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
