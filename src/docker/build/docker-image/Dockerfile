@@ -42,6 +42,7 @@ RUN set -eux; \
         p7zip-rar \
         bzip2 \
         curl \
+        tini \
         libnss-wrapper \
         libxml2-dev libxslt-dev libffi-dev \
     && ln -s /usr/lib/p7zip/Codecs/Rar.so /usr/lib/p7zip/Codecs/Rar29.so \
@@ -122,8 +123,9 @@ USER root
 
 ENTRYPOINT [ "/scripts/entrypoint.sh" ]
 
-# Must run app inside shell
-# Otherwise the container crashes as soon as a child process exits
+# The entrypoint launches this command under tini so PID 1 reaps children
+# spawned by the application and forwards termination signals to its process
+# group.
 CMD [ \
     "/bin/bash", \
     "-lc", \

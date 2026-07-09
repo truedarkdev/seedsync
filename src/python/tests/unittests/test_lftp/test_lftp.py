@@ -1611,6 +1611,11 @@ class TestLftp(unittest.TestCase):
         self.assertIn("chown seedsync:seedsync /staging", contents)
         self.assertIn('VOLUME [ "/config", "/downloads" ]', contents)
         self.assertIn("RUN /scripts/entrypoint.sh --bootstrap-default-config", contents)
+        self.assertIn("        tini \\", contents)
+        self.assertIn(
+            'exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- tini -g -- bash -lc',
+            entrypoint_contents,
+        )
         self.assertNotIn("setup_default_config.sh", contents)
         self.assertNotIn("run_as_user", contents)
         self.assertNotIn("/usr/local/sbin/ssh", contents)
