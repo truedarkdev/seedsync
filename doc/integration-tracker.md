@@ -66,12 +66,12 @@ Temporary commit ledgers:
 
 ## thejuran-arr
 - Source branch: `thejuran-arr/main`
-- Last fully processed upstream commit: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`
-- Fork tip at last full review: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`
-- Last full review date: `2026-07-01`
-- Status: filtered mining completed; active import retired; no pending import unless future separable non-ARR work appears
-- Integrated so far: no code imported. The filtered-mining pass found only ARR/product-divergent noise or non-ARR groups that are already active locally or intentionally superseded; the first 50 non-merge commits after `d2985b1a` (`3814eb88..ffeb52b7`) were non-importable.
-- Resume when this lane is picked up: if new upstream commits appear, restart filtered mining from the next unprocessed commit after `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`, keep ARR/product divergence excluded, and only consider newly discovered separable SeedSync-preserving non-ARR work grouped by subsystem/behavior.
+- Last fully processed upstream commit: `4e3c50dff0721185d03790a0e7e190983d4f8ddb`
+- Fork tip at last full review: `4e3c50dff0721185d03790a0e7e190983d4f8ddb`
+- Last full review date: `2026-07-10`
+- Status: fully dispositioned through this tip; active import remains retired unless future separable non-ARR work appears
+- Integrated so far: the filtered-mining pass found only ARR/product-divergent noise or non-ARR groups already active locally or intentionally superseded until the `3db8b48b..4e3c50df` refresh; that refresh contributed the separable `ae482e1a` Docker reliability fix, adapted locally by installing `tini` and running the existing non-root bootstrap chain beneath `tini -g`, while `4e3c50df` was release metadata for the divergent fork layout and was intentionally skipped.
+- Resume when this lane is picked up: if new upstream commits appear, restart filtered mining from the next unprocessed commit after `4e3c50dff0721185d03790a0e7e190983d4f8ddb`, keep ARR/product divergence excluded, and only consider newly discovered separable SeedSync-preserving non-ARR work grouped by subsystem/behavior.
 - Notes:
   - Maintainer policy: ARR support, `seedsyncarr` identity/rebrand/theme/terminal visual rewrites, Sonarr/Radarr-like integrations, webhook/completion ARR integration paths, ARR-coupled product divergence, and similar product-divergent work are hard exclusions from this fork.
   - Filtered mining completed: the temporary row ledger was validated at `1319` rows with zero missing result/reason cells, then removed after catch-up. The durable outcome is that the first 50 non-merge commits after `d2985b1a` were skipped as rebrand/UI/theme/webhook-adjacent/planning noise, later non-ARR candidate groups were already covered or superseded locally, and no import batch remained.
@@ -79,20 +79,21 @@ Temporary commit ledgers:
   - Future candidate pool: only newly discovered separable, SeedSync-preserving, non-ARR compatibility, reliability, packaging, docs, or backend-hardening work.
   - The old `thejuran` checkpoint `bcebdf8eaec5d3abf5586aad2278f2c77667cd71` remains the processed base for the legacy fork only and does not appear in this lane's history.
   - Prior planning base for this lane: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db`.
-  - Local remote HEAD observed for this lane: `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
-  - Retired ledger range: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e`.
+  - Local remote HEAD observed for this lane: `4e3c50dff0721185d03790a0e7e190983d4f8ddb`.
+  - Refresh `3db8b48bfd20e7ed873343ddc45b7e47d27e3b0e..4e3c50dff0721185d03790a0e7e190983d4f8ddb` is fully dispositioned: `ae482e1a` is adapted locally with focused guardrails plus Docker PID 1, non-root, signal-forwarding, API, Playwright, and SSE evidence; `4e3c50df` is intentionally skipped as fork-specific release metadata.
+  - Retired ledger range: `e9d1e2627b7492f5025c6a9e55236dcd5b7d23db..4e3c50dff0721185d03790a0e7e190983d4f8ddb`.
 
 ### Active subject reopens
 - Subject 21 - Angular migration follow-up: `3767adafbc3893ad85643de7b2b7212d8dc7b2e9`
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
-- Last fully processed upstream commit: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
-- Fork tip at last full review: `b113ae7220d531c2bf200d2cc7c6857c43fb154c`
-- Last full review date: `2026-06-27`
+- Last fully processed upstream commit: `d82e0d2084e3a12b1cb871e04e2799e24d145170`
+- Fork tip at last full review: `d82e0d2084e3a12b1cb871e04e2799e24d145170`
+- Last full review date: `2026-07-10`
 - Status: fully dispositioned through this tip; no active conservative imports pending
 - Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, targeted reliability fixes, and a local optional `rclone` transfer backend that keeps `lftp` as the default engine, while branding, theme-system, and other identity-shifting changes remain intentionally out; the `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` refresh was fully dispositioned separately as backend-migration / rebrand noise rather than imported wholesale, and the RapidCopy rebrand remains deferred, product-decision, or out-of-scope rather than imported behavior.
-- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `b113ae7220d531c2bf200d2cc7c6857c43fb154c` in strict oldest-to-newest order.
+- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `d82e0d2084e3a12b1cb871e04e2799e24d145170`, preserving the current-master topology rather than assuming the legacy marker is a direct ancestor.
 - Notes:
   - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
   - Per-commit explorer re-audit finalized the disputed frozen-range dispositions as `cb20dc899ccabce453c2ae4d44e9e0153f7a74ea` `intentionally skipped` because the current workflow shape has moved past that exact `if:` guard pattern, plus `acf1a0c64eb4becb14ffec3104613238bd8cbbd5` and `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` as `needs new integration task` because both are stale failure-cleanup items that should only be revived on fresh repro.
@@ -102,6 +103,7 @@ Temporary commit ledgers:
   - `thejuran` is fully dispositioned through `90808e0ef3d2344e174974ef08d38e2db2b76a74`; no separate frozen ledger remains active for that legacy lane.
   - Refresh delta `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` is fully dispositioned as backend-migration / rebrand noise: the RapidCopy replacement-style `rclone` migration was not imported wholesale, while a later local `rclone-transfer-protocol-fit` integration added `rclone` as an optional SFTP-only backend with `lftp` preserved as the default/current backend; the README/docker-compose/docs and RapidCopy rebrand pieces remain deferred or wrapper-only.
   - Local `rclone-transfer-protocol-fit` follow-up added backend selection normalization, a shared transfer-backend factory, guarded rclone settings, Docker/deb runtime dependencies, focused Python/Angular tests, and live Docker/browser validation evidence while preserving the existing `lftp` SFTP/FTPS path.
+  - Current-master refresh through `d82e0d2084e3a12b1cb871e04e2799e24d145170` is fully dispositioned: `9d3c6726` is adapted locally for scanner/delete filesystem races and extraction-worker failure containment; applicable `73ef43a14` SSH child cleanup and WSGI socket-timeout protections are adapted, while its process sleep, bounded stream queue, and SSE heartbeat are already covered locally and its obsolete validation-process watchdog is inapplicable; `dac5de74`, `8226b22a`, and `d82e0d20` are covered or inapplicable in the evolved local architecture. Reviewer/security closure passed, focused final tests reported 145 passed and 56 skipped, and the fresh Docker/API/Playwright/SSE verifier path passed.
 
 ## nitrobass24
 - Source branch: `nitrobass24/develop`
