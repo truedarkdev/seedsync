@@ -7,6 +7,7 @@ import shutil
 import filecmp
 import logging
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pexpect
@@ -312,6 +313,52 @@ class TestSshcp(unittest.TestCase):
             sshcp._Sshcp__TIMEOUT_SECS,
             spawn.expect.call_args.kwargs["timeout"]
         )
+        spawn.close.assert_called_once_with()
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_run_command_preserves_timeout_when_cleanup_fails(self, mock_spawn_process):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=_PASSWORD)
+        sshcp.logger = MagicMock()
+        spawn = MagicMock()
+        spawn.expect.side_effect = pexpect.exceptions.TIMEOUT("timed out")
+        spawn.before = b"waiting for password"
+        spawn.close.side_effect = OSError("cleanup failed")
+        mock_spawn_process.return_value = (spawn, False)
+
+        with self.assertRaises(SshcpError) as ctx:
+            sshcp._Sshcp__run_command(
+                command="ssh",
+                flags=["-p", str(self.port)],
+                args=[sshcp._Sshcp__remote_address(), "echo hi"]
+            )
+
+        self.assertEqual("Timed out", str(ctx.exception))
+        spawn.close.assert_called_once_with()
+        sshcp.logger.warning.assert_called_once_with(
+            "Failed to clean up SSH child process",
+            exc_info=True
+        )
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_run_command_waits_when_spawn_has_no_close(self, mock_spawn_process):
+        wait = MagicMock(return_value=0)
+        spawn = SimpleNamespace(
+            expect=MagicMock(return_value=0),
+            before=b"",
+            after=b"",
+            wait=wait,
+        )
+        mock_spawn_process.return_value = (spawn, True)
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+
+        result = sshcp._Sshcp__run_command(
+            command="ssh",
+            flags=["-p", str(self.port)],
+            args=[sshcp._Sshcp__remote_address(), "echo hi"]
+        )
+
+        self.assertEqual(b"", result)
+        wait.assert_called_once_with()
 
     def test_spawn_fallback_forwards_argv_list(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
@@ -331,6 +378,7 @@ class TestSshcp(unittest.TestCase):
             )
 
         self.assertEqual(b"", result)
+        spawn.close.assert_called_once_with()
         popen_spawn.assert_called_once_with([
             "C:\\WINDOWS\\System32\\OpenSSH\\ssh.EXE",
             "-p",

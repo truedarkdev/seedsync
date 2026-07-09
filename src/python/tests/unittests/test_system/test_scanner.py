@@ -1,11 +1,13 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+import errno
 import os
 import shutil
 import tempfile
 import unittest
 from threading import Thread
 from datetime import datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -223,6 +225,38 @@ class TestSystemScanner(unittest.TestCase):
         with self.assertRaises(SystemScannerError) as ex:
             scanner.scan_single("nonexisting")
         self.assertTrue(str(ex.exception).startswith("Path does not exist"))
+
+    def test_scan_single_converts_stat_race_to_scanner_error(self):
+        self.setup_default_tree()
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+
+        with patch.object(scanner, "_SystemScanner__create_system_file", side_effect=FileNotFoundError("gone")):
+            with self.assertRaises(SystemScannerError) as ex:
+                scanner.scan_single("c")
+
+        self.assertIn("Failed to scan", str(ex.exception))
+
+    def test_scan_single_preserves_permission_error(self):
+        self.setup_default_tree()
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        error = PermissionError("denied")
+
+        with patch.object(scanner, "_SystemScanner__create_system_file", side_effect=error):
+            with self.assertRaises(PermissionError) as ex:
+                scanner.scan_single("c")
+
+        self.assertIs(error, ex.exception)
+
+    def test_scan_single_preserves_non_race_os_error(self):
+        self.setup_default_tree()
+        scanner = SystemScanner(TestSystemScanner.temp_dir)
+        error = OSError(errno.EIO, "I/O error")
+
+        with patch.object(scanner, "_SystemScanner__create_system_file", side_effect=error):
+            with self.assertRaises(OSError) as ex:
+                scanner.scan_single("c")
+
+        self.assertIs(error, ex.exception)
 
     def test_scan_tree_excluded_prefix(self):
         self.setup_default_tree()

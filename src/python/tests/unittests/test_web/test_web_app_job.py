@@ -34,6 +34,15 @@ class _FakeSocket:
 
 
 class TestRequestHandler(unittest.TestCase):
+    def test_setup_applies_socket_timeout_backstop(self):
+        handler = object.__new__(_RequestHandler)
+        handler.connection = _FakeSocket()
+
+        with patch("web.web_app_job.WSGIRequestHandler.setup"):
+            _RequestHandler.setup(handler)
+
+        self.assertEqual(_RequestHandler.socket_timeout, handler.connection.gettimeout())
+
     def test_get_environ_preserves_raw_path(self):
         handler = object.__new__(_RequestHandler)
         handler.server = SimpleNamespace(base_environ={})

@@ -169,6 +169,14 @@ class _BoundedWSGIServer(WSGIServer):
 
 
 class _RequestHandler(WSGIRequestHandler):
+    socket_timeout = 300
+
+    def setup(self):
+        super().setup()
+        # Bound blocking reads/writes for half-open clients so a worker cannot
+        # remain occupied forever when the peer stops responding.
+        self.connection.settimeout(self.socket_timeout)
+
     def address_string(self):
         return self.client_address[0]
 

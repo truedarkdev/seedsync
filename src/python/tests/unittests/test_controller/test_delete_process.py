@@ -194,6 +194,35 @@ class TestDeleteRemoteProcess(unittest.TestCase):
 
 
 class TestDeleteLocalProcess(unittest.TestCase):
+    @patch("controller.delete.delete_process.os.path.lexists", return_value=False)
+    @patch("controller.delete.delete_process.os.remove", side_effect=FileNotFoundError)
+    @patch("controller.delete.delete_process.os.path.isfile", return_value=True)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_tolerates_target_disappearing_during_delete(self, _, __, remove, lexists):
+        process = DeleteLocalProcess(local_path="/local", file_name="gone")
+        process.logger = MagicMock()
+
+        process.run_once()
+
+        remove.assert_called_once_with(os.path.join("/local", "gone"))
+        lexists.assert_called_once_with(os.path.join("/local", "gone"))
+        process.logger.warning.assert_called_once()
+
+    @patch("controller.delete.delete_process.os.path.lexists", return_value=True)
+    @patch("controller.delete.delete_process.shutil.rmtree", side_effect=FileNotFoundError("child vanished"))
+    @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
+    @patch("controller.delete.delete_process.os.path.exists", return_value=True)
+    def test_run_once_propagates_descendant_race_when_directory_remains(self, _, __, rmtree, lexists):
+        process = DeleteLocalProcess(local_path="/local", file_name="directory")
+        process.logger = MagicMock()
+
+        with self.assertRaises(FileNotFoundError):
+            process.run_once()
+
+        rmtree.assert_called_once_with(os.path.join("/local", "directory"))
+        lexists.assert_called_once_with(os.path.join("/local", "directory"))
+        process.logger.exception.assert_called_once()
+
     @patch("controller.delete.delete_process.shutil.rmtree")
     @patch("controller.delete.delete_process.os.path.isfile", return_value=False)
     @patch("controller.delete.delete_process.os.path.exists", return_value=True)
