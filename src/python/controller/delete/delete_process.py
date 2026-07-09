@@ -44,6 +44,15 @@ class DeleteLocalProcess(AppOneShotProcess):
                     os.remove(file_path)
                 else:
                     shutil.rmtree(file_path)
+            except FileNotFoundError:
+                # Another actor may remove the target between the existence
+                # check and the actual delete. Treat only a vanished top-level
+                # target as success; a missing descendant while a directory
+                # remains is a partial-delete failure.
+                if os.path.lexists(file_path):
+                    self.logger.exception("Failed to delete local file {}".format(file_path))
+                    raise
+                self.logger.warning("File already gone: {}".format(file_path))
             except OSError:
                 self.logger.exception("Failed to delete local file {}".format(file_path))
                 raise

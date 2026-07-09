@@ -101,14 +101,21 @@ class SystemScanner:
         else:
             raise SystemScannerError("Path does not exist: {}".format(path))
 
-        return self.__create_system_file(
-            PseudoDirEntry(
-                name=name,
-                path=path,
-                is_dir=os.path.isdir(path) and not os.path.islink(path),
-                stat=os.stat(path)
+        try:
+            return self.__create_system_file(
+                PseudoDirEntry(
+                    name=name,
+                    path=path,
+                    is_dir=os.path.isdir(path) and not os.path.islink(path),
+                    stat=os.stat(path)
+                )
             )
-        )
+        except FileNotFoundError as error:
+            # The target can disappear between the existence check and
+            # stat/scandir (a normal TOCTOU race for incomplete downloads).
+            # Report only that disappearance as a scan miss; permission and
+            # I/O failures must remain visible to the caller.
+            raise SystemScannerError("Failed to scan '{}': {}".format(path, error)) from error
 
     @staticmethod
     def __get_created_time(stat_result) -> datetime:

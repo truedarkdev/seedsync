@@ -397,6 +397,7 @@ class Sshcp:
         start_time = time.time()
         sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
         timeout_phase: str = "command execution"
+        cleanup_exitstatus = None
         try:
             if self.__password is not None:
                 timeout_phase = "password prompt"
@@ -450,16 +451,25 @@ class Sshcp:
         except pexpect.exceptions.TIMEOUT:
             self.__log_timeout(timeout_phase, command, sp, start_time)
             raise SshcpError("Timed out")
-        close = getattr(sp, "close", None)
-        if callable(close):
-            close()
-        else:
-            wait = getattr(sp, "wait", None)
-            if callable(wait):
-                wait()
+        finally:
+            # Always reap the child and release its pty, including timeout and
+            # expect/classification failures. Cleanup is best-effort so it
+            # cannot replace the primary command failure.
+            try:
+                close = getattr(sp, "close", None)
+                if callable(close):
+                    close()
+                else:
+                    wait = getattr(sp, "wait", None)
+                    if callable(wait):
+                        cleanup_exitstatus = wait()
+            except Exception:
+                self.logger.warning("Failed to clean up SSH child process", exc_info=True)
         end_time = time.time()
 
         exitstatus = getattr(sp, "exitstatus", None)
+        if exitstatus is None:
+            exitstatus = cleanup_exitstatus
         if exitstatus is None:
             wait = getattr(sp, "wait", None)
             if callable(wait):

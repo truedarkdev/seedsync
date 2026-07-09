@@ -999,3 +999,26 @@ class TestExtractDispatchThreadSafety(unittest.TestCase):
             os.path.join(self.local_path, "bbb")
         ], processed_archives)
         self.assertTrue(self.dispatch._ExtractDispatch__worker_thread.is_alive())
+
+    @pytest.mark.timeout(5)
+    def test_worker_survives_unexpected_extraction_error(self):
+        self.mock_is_archive.return_value = True
+        self.mock_extract_archive.side_effect = [RuntimeError("unexpected"), None]
+        self.dispatch.add_listener(self.listener)
+
+        first_file = ModelFile("first", False)
+        first_file.local_size = 100
+        second_file = ModelFile("second", False)
+        second_file.local_size = 100
+        self.dispatch.extract(first_file)
+
+        while self.listener.extract_failed.call_count < 1:
+            time.sleep(0.01)
+        self.assertTrue(self.dispatch._ExtractDispatch__worker_thread.is_alive())
+
+        self.dispatch.extract(second_file)
+        while self.listener.extract_completed.call_count < 1:
+            time.sleep(0.01)
+
+        self.assertEqual(1, self.listener.extract_failed.call_count)
+        self.assertEqual(1, self.listener.extract_completed.call_count)

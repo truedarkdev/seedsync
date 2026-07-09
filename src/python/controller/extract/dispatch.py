@@ -310,6 +310,11 @@ class ExtractDispatch:
                 except ExtractError:
                     self.logger.exception("Caught an extraction error")
                     completed = False
+                except Exception:
+                    # Unexpected filesystem/tool errors must not terminate the
+                    # worker thread or leave later tasks stuck as EXTRACTING.
+                    self.logger.exception("Unexpected error during extraction")
+                    completed = False
                 finally:
                     try:
                         self.__task_queue.get(block=False)
