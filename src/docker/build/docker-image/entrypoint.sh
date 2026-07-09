@@ -292,4 +292,7 @@ echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOM
 
 export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_local_path
 
-exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
+# Keep bootstrap and command/argument forwarding in the existing non-root
+# shell, but make tini the resulting PID 1 so it forwards signals and reaps
+# children spawned by the application.
+exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
