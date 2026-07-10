@@ -5,6 +5,29 @@ import {Config} from "../../../../services/settings/config";
 describe("Testing config record initialization", () => {
     let config: Config;
 
+    it("keeps notification secrets out of the typed record", () => {
+        const notificationsConfig = new Config({notifications: {
+            enabled: true,
+            provider: "apprise",
+            webhook_url: "**REDACTED**",
+            hmac_secret: "**REDACTED**",
+            apprise_url: "**REDACTED**",
+            webhook_url_configured: true,
+            hmac_secret_configured: true,
+            apprise_url_configured: true,
+            apprise_tag: "seedbox",
+        }});
+        expect(notificationsConfig.notifications.enabled).toBeTrue();
+        expect(notificationsConfig.notifications.webhook_url_configured).toBeTrue();
+        expect(notificationsConfig.notifications.hmac_secret_configured).toBeTrue();
+        expect(notificationsConfig.notifications.provider).toBe("apprise");
+        expect(notificationsConfig.notifications.apprise_url_configured).toBeTrue();
+        expect(notificationsConfig.notifications.apprise_tag).toBe("seedbox");
+        expect((notificationsConfig.notifications as any).webhook_url).toBeUndefined();
+        expect((notificationsConfig.notifications as any).hmac_secret).toBeUndefined();
+        expect((notificationsConfig.notifications as any).apprise_url).toBeUndefined();
+    });
+
     beforeEach(() => {
         const configJson = {
             general: {

@@ -190,9 +190,49 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.has_section("web"))
         self.assertTrue(config.has_section("autoqueue"))
         self.assertTrue(config.has_section("logging"))
+        self.assertTrue(config.has_section("notifications"))
         self.assertFalse(config.has_section("nope"))
         self.assertFalse(config.has_section("from_file"))
         self.assertFalse(config.has_section("__init__"))
+
+    def test_legacy_general_webhook_secret_migrates_without_loss(self):
+        source = Config().as_dict()
+        source["General"]["webhook_secret"] = "legacy-signing-secret"
+        source.pop("Notifications")
+
+        migrated = Config.from_dict(source)
+
+        self.assertEqual("legacy-signing-secret", migrated.notifications.hmac_secret)
+        self.assertNotIn("webhook_secret", migrated.general.as_dict())
+
+    def test_existing_notification_config_defaults_provider_to_webhook(self):
+        source = Config().as_dict()
+        source["Notifications"].pop("provider")
+        source["Notifications"].pop("apprise_url")
+        source["Notifications"].pop("apprise_tag")
+
+        migrated = Config.from_dict(source)
+
+        self.assertEqual("webhook", migrated.notifications.provider)
+        self.assertEqual("", migrated.notifications.apprise_url)
+        self.assertEqual("", migrated.notifications.apprise_tag)
+
+    def test_apprise_notification_config_round_trips(self):
+        config = Config()
+        config.notifications.provider = "apprise"
+        config.notifications.apprise_url = "https://apprise.example.test/notify/key"
+        config.notifications.apprise_tag = "seedbox"
+
+        restored = Config.from_dict(config.as_dict())
+
+        self.assertEqual("apprise", restored.notifications.provider)
+        self.assertEqual("https://apprise.example.test/notify/key", restored.notifications.apprise_url)
+        self.assertEqual("seedbox", restored.notifications.apprise_tag)
+
+    def test_notification_provider_rejects_unknown_values(self):
+        config = Config()
+        with self.assertRaises(ConfigError):
+            config.notifications.provider = "discord"
 
     def test_general(self):
         good_dict = {
@@ -1038,6 +1078,18 @@ class TestConfig(unittest.TestCase):
 
             [Logging]
             log_format = json
+
+            [Notifications]
+            enabled = False
+            provider = webhook
+            webhook_url =
+            hmac_secret =
+            apprise_url =
+            apprise_tag =
+            allow_private_networks = False
+            download_complete = True
+            extraction_complete = True
+            delete_complete = True
             """
 
             golden_lines = [s.strip() for s in golden_str.splitlines()]

@@ -16,6 +16,7 @@ from .handler.stream_heartbeat import HeartbeatStreamHandler
 from .handler.status import StatusHandler
 from .handler.path_pairs import PathPairsHandler
 from .handler.breadcrumb_trace import BreadcrumbTraceHandler
+from .handler.notifications import NotificationsAdminHandler
 
 
 class WebAppBuilder:
@@ -26,7 +27,8 @@ class WebAppBuilder:
                  context: Context,
                  controller: Controller,
                  auto_queue_persist: AutoQueuePersist,
-                 auth_store: ApiKeyStore = None):
+                 auth_store: ApiKeyStore = None,
+                 notifier=None):
         self.__context = context
         self.__controller = controller
         self.__auth_store = auth_store
@@ -46,8 +48,11 @@ class WebAppBuilder:
         self.status_handler = StatusHandler(context.status)
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
         self.admin_handler = None
+        self.notifications_admin_handler = None
         if self.__auth_store is not None:
             self.admin_handler = AdminHandler(context.config, self.__auth_store)
+            if notifier is not None:
+                self.notifications_admin_handler = NotificationsAdminHandler(context.config, notifier)
         self.path_pairs_handler = None
         if getattr(context, "path_pair_manager", None) is not None:
             self.path_pairs_handler = PathPairsHandler(context.path_pair_manager, controller=self.__controller)
@@ -76,6 +81,8 @@ class WebAppBuilder:
         self.breadcrumb_trace_handler.add_routes(web_app)
         if self.admin_handler is not None:
             self.admin_handler.add_routes(web_app)
+        if self.notifications_admin_handler is not None:
+            self.notifications_admin_handler.add_routes(web_app)
         if self.path_pairs_handler is not None:
             self.path_pairs_handler.add_routes(web_app)
 

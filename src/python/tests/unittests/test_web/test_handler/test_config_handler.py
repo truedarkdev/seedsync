@@ -281,6 +281,25 @@ class TestConfigHandlerSet(unittest.TestCase):
         )
         inner.set_property.assert_not_called()
 
+    def test_generic_config_route_cannot_update_notification_settings(self):
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.notifications = inner
+
+        for field, value in (
+            ("provider", "apprise"),
+            ("apprise_url", "https://apprise.example.test/notify/key"),
+            ("apprise_tag", "seedbox"),
+            ("allow_private_networks", True),
+        ):
+            with self.subTest(field=field):
+                response = self.handler._ConfigHandler__handle_set_config(
+                    "notifications", field, value
+                )
+                self.assertEqual(403, response.status_code)
+        inner.set_property.assert_not_called()
+
     def test_set_breadcrumb_trace_enabled_calls_sync_hook(self):
         sync_hook = MagicMock()
         handler = ConfigHandler(self.config, breadcrumb_trace_sync=sync_hook)

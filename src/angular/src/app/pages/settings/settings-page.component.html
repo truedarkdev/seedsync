@@ -69,6 +69,11 @@
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_DISCOVERY">
             </ng-container>
 
+            <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
+            <ng-container
+                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_TRANSFER_PROTOCOL">
+            </ng-container>
+
             <div class="card custom-section-card">
                 <h3 class="card-header" id="heading-api-access">
                     <button class="btn"
@@ -129,10 +134,14 @@
                 *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_CONNECTIONS">
             </ng-container>
 
-            <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
-            <ng-container
-                *ngTemplateOutlet="optionsList;context:OPTIONS_CONTEXT_TRANSFER_PROTOCOL">
-            </ng-container>
+            <div class="card custom-section-card">
+                <h3 class="card-header" id="heading-notifications">
+                    <button class="btn" type="button" data-toggle="collapse" attr.data-target="#collapse-notifications">Notifications</button>
+                </h3>
+                <div id="collapse-notifications" class="collapse" data-parent="#accordion">
+                    <div class="card-body"><app-notifications-settings></app-notifications-settings></div>
+                </div>
+            </div>
 
             <!--suppress HtmlUnknownAttribute, UnnecessaryLabelJS -->
             <ng-container

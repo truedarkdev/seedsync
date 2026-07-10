@@ -99,7 +99,8 @@ class Controller:
             process: AppOneShotProcess,
             post_callback: Callable,
             await_completion: bool,
-            started_at_monotonic: float | None = None
+            started_at_monotonic: float | None = None,
+            event_file: Optional[ModelFile] = None,
         ):
             self.command = command
             self.file_id = file_id
@@ -108,6 +109,7 @@ class Controller:
             self.post_callback = post_callback
             self.await_completion = await_completion
             self.started_at_monotonic = time.monotonic() if started_at_monotonic is None else started_at_monotonic
+            self.event_file = event_file
 
     _MAX_CONCURRENT_COMMAND_PROCESSES = 8
     _MAX_PENDING_DELETE_COMMANDS = _MAX_CONCURRENT_COMMAND_PROCESSES * 2
@@ -296,6 +298,8 @@ class Controller:
         # Lock for the model. Listeners may re-enter controller model access
         # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
+        self.__remote_delete_success_listeners = []
+        self.__remote_delete_success_listeners_lock = Lock()
         self.__path_pair_refresh_lock = Lock()
         self.__path_pair_refresh_requested = False
         self.__path_pair_refresh_generation = 0
@@ -1009,6 +1013,27 @@ class Controller:
         """
         with self.__model_lock:
             self.__model.remove_listener(listener)
+
+    def add_remote_delete_success_listener(self, listener: Callable[[ModelFile], None]):
+        with self.__remote_delete_success_listeners_lock:
+            if listener not in self.__remote_delete_success_listeners:
+                self.__remote_delete_success_listeners.append(listener)
+
+    def remove_remote_delete_success_listener(self, listener: Callable[[ModelFile], None]):
+        with self.__remote_delete_success_listeners_lock:
+            if listener in self.__remote_delete_success_listeners:
+                self.__remote_delete_success_listeners.remove(listener)
+
+    def __notify_remote_delete_success(self, file: Optional[ModelFile]):
+        if file is None:
+            return
+        with self.__remote_delete_success_listeners_lock:
+            listeners = list(self.__remote_delete_success_listeners)
+        for listener in listeners:
+            try:
+                listener(file)
+            except Exception:
+                self.logger.warning("Remote delete success listener failed", exc_info=True)
 
     def get_model_files_and_add_listener(self, listener: IModelListener):
         """
@@ -2411,7 +2436,8 @@ class Controller:
                         file_name=file.name,
                         process=process,
                         post_callback=post_callback,
-                        await_completion=False
+                        await_completion=False,
+                        event_file=copy.deepcopy(file),
                     )
                     with self.__command_state_lock():
                         self.__active_command_processes.append(command_wrapper)
@@ -2674,6 +2700,8 @@ class Controller:
                                     500
                                 )
                         else:
+                            if command_process.command.action == Controller.Command.Action.DELETE_REMOTE:
+                                self.__notify_remote_delete_success(command_process.event_file)
                             for callback in command_process.command.callbacks:
                                 callback.on_success()
                             self.__record_command_breadcrumb(

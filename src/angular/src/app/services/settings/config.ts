@@ -148,6 +148,32 @@ const DefaultLogging: ILogging = {
 };
 const LoggingRecord = Record(DefaultLogging);
 
+export interface INotifications {
+    enabled: boolean;
+    provider: "webhook" | "apprise";
+    webhook_url_configured: boolean;
+    hmac_secret_configured: boolean;
+    apprise_url_configured: boolean;
+    apprise_tag: string;
+    allow_private_networks: boolean;
+    download_complete: boolean;
+    extraction_complete: boolean;
+    delete_complete: boolean;
+}
+const DefaultNotifications: INotifications = {
+    enabled: false,
+    provider: "webhook",
+    webhook_url_configured: false,
+    hmac_secret_configured: false,
+    apprise_url_configured: false,
+    apprise_tag: "",
+    allow_private_networks: false,
+    download_complete: true,
+    extraction_complete: true,
+    delete_complete: true,
+};
+const NotificationsRecord = Record(DefaultNotifications);
+
 
 
 /*
@@ -161,6 +187,7 @@ export interface IConfig {
     web: IWeb;
     autoqueue: IAutoQueue;
     logging: ILogging;
+    notifications: INotifications;
 
 }
 const DefaultConfig: IConfig = {
@@ -171,6 +198,7 @@ const DefaultConfig: IConfig = {
     web: null,
     autoqueue: null,
     logging: null,
+    notifications: null,
 };
 const ConfigRecord = Record(DefaultConfig);
 
@@ -183,6 +211,7 @@ export class Config extends ConfigRecord implements IConfig {
     web: IWeb;
     autoqueue: IAutoQueue;
     logging: ILogging;
+    notifications: INotifications;
 
     constructor(props) {
         const general = Config.normalizeGeneral((props && props.general) || {});
@@ -195,7 +224,8 @@ export class Config extends ConfigRecord implements IConfig {
             controller: ControllerRecord((props && props.controller) || {}),
             web: WebRecord((props && props.web) || {}),
             autoqueue: AutoQueueRecord((props && props.autoqueue) || {}),
-            logging: LoggingRecord(logging)
+            logging: LoggingRecord(logging),
+            notifications: NotificationsRecord((props && props.notifications) || {})
         });
     }
 

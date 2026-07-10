@@ -21,6 +21,7 @@ from common import PathPairManager
 from common.json_formatter import JsonFormatter
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
 from web import WebAppJob, WebAppBuilder
+from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
 
 
@@ -158,8 +159,12 @@ class Seedsync:
         # Create auto queue
         auto_queue = AutoQueue(self.context, self.auto_queue_persist, controller)
 
+        notifier = NotificationService(self.context.config)
+
         # Create web app
-        web_app_builder = WebAppBuilder(self.context, controller, self.auto_queue_persist, self.api_key_store)
+        web_app_builder = WebAppBuilder(
+            self.context, controller, self.auto_queue_persist, self.api_key_store, notifier=notifier
+        )
         web_app = web_app_builder.build()
 
         # Define child threads
@@ -172,6 +177,10 @@ class Seedsync:
             context=self.context.create_child_context(WebAppJob.__name__),
             web_app=web_app
         )
+
+        controller.add_model_listener(notifier)
+        controller.add_remote_delete_success_listener(notifier.remote_delete_completed)
+        notifier.start()
 
         do_start_controller = True
 
@@ -230,6 +239,10 @@ class Seedsync:
 
         except Exception as e:
             self._log_shutdown_cause(e)
+
+            controller.remove_model_listener(notifier)
+            controller.remove_remote_delete_success_listener(notifier.remote_delete_completed)
+            notifier.stop()
 
             # This sleep is important to allow the jobs to finish setup before we terminate them
             # If we kill too early, the jobs may leave lingering threads around
