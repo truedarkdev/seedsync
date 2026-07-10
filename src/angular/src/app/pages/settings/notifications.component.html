@@ -1,0 +1,65 @@
+<div class="notifications-settings" *ngIf="state">
+    <p class="notifications-intro">Send selected completion events through a Generic Webhook or Apprise API. Saved endpoint and signing secret values are never shown.</p>
+
+    <label class="check-row"><input type="checkbox" [(ngModel)]="enabled"> Enable notifications</label>
+
+    <label class="field-row">
+        <span>Provider</span>
+        <select class="form-control" [(ngModel)]="provider">
+            <option value="webhook">Generic Webhook</option>
+            <option value="apprise">Apprise API</option>
+        </select>
+    </label>
+
+    <ng-container *ngIf="provider === 'webhook'">
+        <label class="field-row">
+            <span>Webhook URL</span>
+            <input class="form-control webhook-url-input" type="url" autocomplete="off" [(ngModel)]="webhookUrl"
+                   placeholder="https://hooks.example.net/seedsync">
+            <small>{{state.webhook_url_configured ? "A webhook URL is configured. Leave blank to keep it." : "No webhook URL is configured."}}</small>
+        </label>
+        <label class="check-row" *ngIf="state.webhook_url_configured"><input type="checkbox" [(ngModel)]="clearWebhookUrl"> Clear saved webhook URL</label>
+
+        <label class="field-row">
+            <span>HMAC signing secret (optional)</span>
+            <input class="form-control hmac-secret-input" type="password" autocomplete="new-password" [(ngModel)]="hmacSecret">
+            <small>{{state.hmac_secret_configured ? "A signing secret is configured. Leave blank to keep it." : "No signing secret is configured."}}</small>
+        </label>
+        <label class="check-row" *ngIf="state.hmac_secret_configured"><input type="checkbox" [(ngModel)]="clearHmacSecret"> Clear saved signing secret</label>
+    </ng-container>
+
+    <ng-container *ngIf="provider === 'apprise'">
+        <p class="notifications-intro">Apprise service destinations are configured in Apprise, not SeedSync. Public Apprise API instances should be placed behind authenticated HTTPS because Apprise API has no built-in authentication.</p>
+        <label class="field-row">
+            <span>Apprise API notification URL</span>
+            <input class="form-control apprise-url-input" type="url" autocomplete="off" [(ngModel)]="appriseUrl"
+                   placeholder="https://apprise.example.net/notify/seedsync">
+            <small>{{state.apprise_url_configured ? "An Apprise API URL is configured. Leave blank to keep it." : "Use the full /notify/ or /notify/{KEY} endpoint URL."}}</small>
+        </label>
+        <label class="check-row" *ngIf="state.apprise_url_configured"><input type="checkbox" [(ngModel)]="clearAppriseUrl"> Clear saved Apprise API URL</label>
+        <label class="field-row">
+            <span>Apprise tag (optional)</span>
+            <input class="form-control apprise-tag-input" type="text" [(ngModel)]="appriseTag">
+            <small>Send only to Apprise destinations matching this tag.</small>
+        </label>
+    </ng-container>
+
+    <div class="private-network-warning">
+        <label class="check-row"><input type="checkbox" [(ngModel)]="allowPrivateNetworks"> Allow private-network targets</label>
+        <small>This permits HTTP and private RFC1918/ULA addresses. Enable only for a notification service you control on your local network.</small>
+    </div>
+
+    <fieldset>
+        <legend>Events</legend>
+        <label class="check-row"><input type="checkbox" [(ngModel)]="downloadComplete"> Download complete</label>
+        <label class="check-row"><input type="checkbox" [(ngModel)]="extractionComplete"> Extraction complete</label>
+        <label class="check-row"><input type="checkbox" [(ngModel)]="deleteComplete"> Remote delete complete</label>
+    </fieldset>
+
+    <div class="notification-actions">
+        <button class="btn btn-primary" type="button" [disabled]="busy" (click)="save()">Save notifications</button>
+        <button class="btn btn-secondary" type="button" [disabled]="busy || !selectedProviderConfigured" (click)="test()">Test notification</button>
+    </div>
+    <p class="status-success" *ngIf="message">{{message}}</p>
+    <p class="status-error" *ngIf="error">{{error}}</p>
+</div>

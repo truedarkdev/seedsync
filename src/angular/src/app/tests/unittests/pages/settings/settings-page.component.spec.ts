@@ -230,7 +230,10 @@ describe("Testing settings page component", () => {
         }));
     });
 
-    it("should render other settings without a standalone validation section", () => {
+    it("should render settings cards in the approved column order", () => {
+        const leftHeaders = Array.from(
+            fixture.nativeElement.querySelectorAll("#left .card-header button")
+        ).map((button: HTMLButtonElement) => button.textContent.trim());
         const rightHeaders = Array.from(
             fixture.nativeElement.querySelectorAll("#right .card-header button")
         ).map((button: HTMLButtonElement) => button.textContent.trim());
@@ -238,9 +241,20 @@ describe("Testing settings page component", () => {
             fixture.nativeElement.querySelectorAll("#collapse-other-settings .settings-option-group-header")
         ).map((header: HTMLElement) => header.textContent.trim());
 
-        expect(rightHeaders).not.toContain("Logging");
-        expect(rightHeaders).not.toContain("Validation");
-        expect(rightHeaders).toContain("Other Settings");
+        expect(leftHeaders).toEqual([
+            "Server",
+            "File Discovery",
+            "Transfer Protocol",
+            "API Access",
+            "Archive Extraction",
+            "AutoQueue",
+        ]);
+        expect(rightHeaders).toEqual([
+            "Path Pairs",
+            "Connections",
+            "Notifications",
+            "Other Settings",
+        ]);
         expect(otherGroupHeaders).toEqual([
             "Diagnostics",
             "Validation",

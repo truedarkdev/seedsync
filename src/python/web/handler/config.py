@@ -26,12 +26,17 @@ class ConfigHandler(IHandler):
             "config_api_redact_remote_details",
             "trusted_browser_bootstrap_remote_addrs",
         },
+        "notifications": {
+            "enabled", "provider", "webhook_url", "hmac_secret", "apprise_url", "apprise_tag",
+            "allow_private_networks",
+            "download_complete", "extraction_complete", "delete_complete",
+        },
     }
     def __init__(self, config: Config, breadcrumb_trace_sync=None, lftp_reconfigure_request=None):
         self.__config = config
         self.__breadcrumb_trace_sync = breadcrumb_trace_sync
         self.__lftp_reconfigure_request = lftp_reconfigure_request
-        self.__write_lock = threading.Lock()
+        self.__write_lock = getattr(config, "write_lock", threading.Lock())
 
     @staticmethod
     def __is_blank_text(value) -> bool:

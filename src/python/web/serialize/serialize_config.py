@@ -33,6 +33,12 @@ class SerializeConfig:
                     if field in section_dict:
                         section_dict[field] = _REDACTED
 
+        if "notifications" in config_dict_lowercase:
+            section_dict = config_dict_lowercase["notifications"]
+            section_dict["webhook_url_configured"] = bool(config.notifications.webhook_url)
+            section_dict["hmac_secret_configured"] = bool(config.notifications.hmac_secret)
+            section_dict["apprise_url_configured"] = bool(config.notifications.apprise_url)
+
         if redact_remote_details and "lftp" in config_dict_lowercase:
             section_dict = config_dict_lowercase["lftp"]
             for field in _REMOTE_DETAIL_FIELDS:

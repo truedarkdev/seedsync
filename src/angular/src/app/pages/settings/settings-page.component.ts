@@ -26,11 +26,12 @@ import {AutoQueuePageComponent} from "../autoqueue/autoqueue-page.component";
 import {ApiAccessComponent} from "./api-access.component";
 import {PathPairsComponent} from "./path-pairs.component";
 import {ClickStopPropagationDirective} from "../../common/click-stop-propagation.directive";
+import {NotificationsComponent} from "./notifications.component";
 
 @Component({
     selector: "app-settings-page",
     standalone: true,
-    imports: [CommonModule, FormsModule, OptionComponent, AutoQueuePageComponent, ApiAccessComponent, PathPairsComponent, ClickStopPropagationDirective],
+    imports: [CommonModule, FormsModule, OptionComponent, AutoQueuePageComponent, ApiAccessComponent, PathPairsComponent, ClickStopPropagationDirective, NotificationsComponent],
     templateUrl: "./settings-page.component.html",
     styleUrls: ["./settings-page.component.scss"],
     providers: [],

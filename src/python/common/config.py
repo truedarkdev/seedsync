@@ -5,6 +5,8 @@ import re
 from typing import Dict
 from io import StringIO
 import collections
+import threading
+import weakref
 from abc import ABC
 from typing import Type, TypeVar, Callable, Any
 
@@ -36,6 +38,9 @@ OuterConfigType = Dict[str, InnerConfigType]
 
 # Source: https://stackoverflow.com/a/39205612/8571324
 T = TypeVar('T', bound='InnerConfig')
+
+_CONFIG_WRITE_LOCKS = weakref.WeakKeyDictionary()
+_CONFIG_WRITE_LOCKS_GUARD = threading.Lock()
 
 
 _BYTE_SIZE_VALUE_RE = re.compile(r"^(?P<size>\d+)(?P<suffix>[KMG])?$", re.IGNORECASE)
@@ -214,6 +219,14 @@ class Checkers:
                 config_cls.__name__, name
             ))
         return value
+
+    @staticmethod
+    def notification_provider(config_cls: Any, name: str, value: str) -> str:
+        if not isinstance(value, str) or value.strip().lower() not in {"webhook", "apprise"}:
+            raise ConfigError("Bad config: {}.{} must be webhook or apprise".format(
+                config_cls.__name__, name
+            ))
+        return value.strip().lower()
 
     @staticmethod
     def log_level(config_cls: Any, name: str, value: str) -> str:
@@ -420,6 +433,7 @@ class Config(Persist):
     SENSITIVE_FIELDS: Dict[str, tuple[str, ...]] = collections.OrderedDict([
         ("general", ("api_token", "webhook_secret")),
         ("lftp", ("remote_password",)),
+        ("notifications", ("webhook_url", "hmac_secret", "apprise_url")),
     ])
 
     @classmethod
@@ -688,6 +702,38 @@ class Config(Persist):
                 config_dict["log_format"] = "standard"
             return super().from_dict(config_dict)
 
+    class Notifications(IC):
+        enabled = PROP("enabled", Checkers.bool_value, Converters.bool)
+        provider = PROP("provider", Checkers.notification_provider, Converters.null)
+        webhook_url = PROP("webhook_url", Checkers.string_allow_empty, Converters.null)
+        hmac_secret = PROP("hmac_secret", Checkers.string_allow_empty, Converters.null)
+        apprise_url = PROP("apprise_url", Checkers.string_allow_empty, Converters.null)
+        apprise_tag = PROP("apprise_tag", Checkers.string_allow_empty, Converters.null)
+        allow_private_networks = PROP("allow_private_networks", Checkers.bool_value, Converters.bool)
+        download_complete = PROP("download_complete", Checkers.bool_value, Converters.bool)
+        extraction_complete = PROP("extraction_complete", Checkers.bool_value, Converters.bool)
+        delete_complete = PROP("delete_complete", Checkers.bool_value, Converters.bool)
+
+        def __init__(self):
+            super().__init__()
+            self.enabled = False
+            self.provider = "webhook"
+            self.webhook_url = ""
+            self.hmac_secret = ""
+            self.apprise_url = ""
+            self.apprise_tag = ""
+            self.allow_private_networks = False
+            self.download_complete = True
+            self.extraction_complete = True
+            self.delete_complete = True
+
+        @classmethod
+        def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            defaults = cls().as_dict()
+            merged = dict(defaults)
+            merged.update(config_dict)
+            return super().from_dict(merged)
+
     def __init__(self):
         self.file_path: str | None = None
         self.general = Config.General()
@@ -697,6 +743,17 @@ class Config(Persist):
         self.web = Config.Web()
         self.autoqueue = Config.AutoQueue()
         self.logging = Config.Logging()
+        self.notifications = Config.Notifications()
+
+    @property
+    def write_lock(self):
+        # Locks are deliberately external to persisted/copyable config state.
+        with _CONFIG_WRITE_LOCKS_GUARD:
+            lock = _CONFIG_WRITE_LOCKS.get(self)
+            if lock is None:
+                lock = threading.RLock()
+                _CONFIG_WRITE_LOCKS[self] = lock
+            return lock
 
     @staticmethod
     def _check_section(dct: OuterConfigType, name: str) -> InnerConfigType:
@@ -766,13 +823,23 @@ class Config(Persist):
         config_dict = dict(config_dict)  # copy that we can modify
         config = Config()
 
-        config.general = Config.General.from_dict(Config._check_section(config_dict, "General"))
+        # A short-lived hardening branch reserved General.webhook_secret without
+        # implementing notifications. If encountered, migrate it deliberately
+        # into the provider-generic section instead of rejecting or dropping it.
+        general_dict = dict(Config._check_section(config_dict, "General"))
+        legacy_webhook_secret = general_dict.pop("webhook_secret", "")
+
+        config.general = Config.General.from_dict(general_dict)
         config.lftp = Config.Lftp.from_dict(Config._check_section(config_dict, "Lftp"))
         config.validate = Config.Validate.from_dict(config_dict.pop("Validate", {}))
         config.controller = Config.Controller.from_dict(Config._check_section(config_dict, "Controller"))
         config.web = Config.Web.from_dict(Config._check_section(config_dict, "Web"))
         config.autoqueue = Config.AutoQueue.from_dict(Config._check_section(config_dict, "AutoQueue"))
         config.logging = Config.Logging.from_dict(config_dict.pop("Logging", {}))
+        notifications_dict = dict(config_dict.pop("Notifications", {}))
+        if legacy_webhook_secret and not notifications_dict.get("hmac_secret"):
+            notifications_dict["hmac_secret"] = legacy_webhook_secret
+        config.notifications = Config.Notifications.from_dict(notifications_dict)
 
         Config._check_empty_outer_dict(config_dict)
         return config
@@ -788,6 +855,7 @@ class Config(Persist):
         config_dict["Web"] = self.web.as_dict()
         config_dict["AutoQueue"] = self.autoqueue.as_dict()
         config_dict["Logging"] = self.logging.as_dict()
+        config_dict["Notifications"] = self.notifications.as_dict()
         return config_dict
 
     def has_section(self, name: str) -> bool:

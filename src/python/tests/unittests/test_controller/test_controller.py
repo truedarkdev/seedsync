@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+import copy
 import os
 import json
 import shutil
@@ -57,6 +58,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder = MagicMock()
         self.controller._Controller__model_builder.has_changes.return_value = False
         self.controller._Controller__model_lock = MagicMock()
+        self.controller._Controller__remote_delete_success_listeners = []
+        self.controller._Controller__remote_delete_success_listeners_lock = Lock()
         self.controller._Controller__path_pair_refresh_lock = Lock()
         self.controller._Controller__path_pair_refresh_requested = False
         self.controller._Controller__path_pair_refresh_generation = 0
@@ -2977,6 +2980,9 @@ class TestController(unittest.TestCase):
             Controller._MAX_CONCURRENT_COMMAND_PROCESSES,
             len(self.controller._Controller__active_command_processes)
         )
+        event_file = self.controller._Controller__active_command_processes[-1].event_file
+        self.assertEqual(file.file_id, event_file.file_id)
+        self.assertIsNot(file, event_file)
         self.assertEqual(0, self.controller._Controller__command_queue.qsize())
 
     def test_process_commands_delete_remote_defers_when_delete_cap_reached(self):
@@ -3204,6 +3210,8 @@ class TestController(unittest.TestCase):
         process.is_alive.return_value = False
         process.propagate_exception.side_effect = Exception("boom")
         post_callback = self.controller._Controller__remote_scan_process.force_scan
+        remote_delete_listener = MagicMock()
+        self.controller.add_remote_delete_success_listener(remote_delete_listener)
         self.controller._Controller__active_command_processes = [
             Controller.CommandProcessWrapper(
                 command=command,
@@ -3211,7 +3219,8 @@ class TestController(unittest.TestCase):
                 file_name=file.name,
                 process=process,
                 post_callback=post_callback,
-                await_completion=False
+                await_completion=False,
+                event_file=copy.deepcopy(file),
             )
         ]
 
@@ -3234,6 +3243,7 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
+        remote_delete_listener.assert_not_called()
 
     def test_cleanup_commands_delete_remote_records_success_breadcrumb_when_async_cleanup_completes(self):
         file = ModelFile("dup", False)
@@ -3247,6 +3257,8 @@ class TestController(unittest.TestCase):
         process.is_alive.return_value = False
         process.propagate_exception.return_value = None
         post_callback = self.controller._Controller__remote_scan_process.force_scan
+        remote_delete_listener = MagicMock()
+        self.controller.add_remote_delete_success_listener(remote_delete_listener)
         self.controller._Controller__active_command_processes = [
             Controller.CommandProcessWrapper(
                 command=command,
@@ -3254,7 +3266,8 @@ class TestController(unittest.TestCase):
                 file_name=file.name,
                 process=process,
                 post_callback=post_callback,
-                await_completion=False
+                await_completion=False,
+                event_file=copy.deepcopy(file),
             )
         ]
 
@@ -3272,6 +3285,9 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
+        remote_delete_listener.assert_called_once()
+        completed_file = remote_delete_listener.call_args.args[0]
+        self.assertEqual(file.file_id, completed_file.file_id)
 
     def test_cleanup_commands_delete_local_times_out_stale_processes(self):
         file = ModelFile("dup", False)

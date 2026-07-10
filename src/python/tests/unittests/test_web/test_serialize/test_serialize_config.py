@@ -9,6 +9,21 @@ from web.serialize import SerializeConfig
 
 
 class TestSerializeConfig(unittest.TestCase):
+    def test_notifications_are_redacted_with_explicit_configured_state(self):
+        config = Config()
+        config.notifications.webhook_url = "https://hooks.example.test/private?token=value"
+        config.notifications.hmac_secret = "signing-secret"
+        config.notifications.apprise_url = "https://apprise.example.test/notify/private-key"
+
+        payload = json.loads(SerializeConfig.config(config))
+
+        self.assertEqual(Config.REDACTED_SENTINEL, payload["notifications"]["webhook_url"])
+        self.assertEqual(Config.REDACTED_SENTINEL, payload["notifications"]["hmac_secret"])
+        self.assertTrue(payload["notifications"]["webhook_url_configured"])
+        self.assertTrue(payload["notifications"]["hmac_secret_configured"])
+        self.assertEqual(Config.REDACTED_SENTINEL, payload["notifications"]["apprise_url"])
+        self.assertTrue(payload["notifications"]["apprise_url_configured"])
+
     def test_restart_required_metadata_matches_config_shape_and_hot_fields(self):
         config = Config()
         config.general.verbose = False
