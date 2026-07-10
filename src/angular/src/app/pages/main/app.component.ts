@@ -1,4 +1,6 @@
 import {AfterViewInit, Component, ElementRef, OnDestroy, OnInit, ViewChild} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {RouterOutlet} from "@angular/router";
 import {NavigationEnd, Router} from "@angular/router";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
@@ -7,10 +9,13 @@ import {ROUTE_INFOS} from "../../routes";
 import {DomService} from "../../services/utils/dom.service";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
+import {HeaderComponent} from "./header.component";
+import {SidebarComponent} from "./sidebar.component";
 
 @Component({
     selector: "app-root",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, RouterOutlet, HeaderComponent, SidebarComponent],
     templateUrl: "./app.component.html",
     styleUrls: ["./app.component.scss"]
 })

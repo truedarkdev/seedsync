@@ -1,4 +1,5 @@
 import {Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
 import {ActivatedRoute} from "@angular/router";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
@@ -6,10 +7,14 @@ import {takeUntil} from "rxjs/operators";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
 import {ViewFileFilterService} from "../../services/files/view-file-filter.service";
+import {FileOptionsComponent} from "./file-options.component";
+import {FileListComponent} from "./file-list.component";
+import {PathPairStatsComponent} from "./path-pair-stats.component";
 
 @Component({
     selector: "app-files-page",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FileOptionsComponent, FileListComponent, PathPairStatsComponent],
     templateUrl: "./files-page.component.html"
 })
 

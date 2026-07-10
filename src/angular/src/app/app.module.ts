@@ -1,158 +1,72 @@
-import {BrowserModule} from "@angular/platform-browser";
-import {APP_INITIALIZER, NgModule} from "@angular/core";
-import {HttpClientModule} from "@angular/common/http";
-import {FormsModule} from "@angular/forms";
-import {RouteReuseStrategy, RouterModule} from "@angular/router";
+import {APP_INITIALIZER, Provider} from "@angular/core";
+import {RouteReuseStrategy} from "@angular/router";
 
-import {AppComponent} from "./pages/main/app.component";
 import {environment} from "../environments/environment";
 import {LoggerService} from "./services/utils/logger.service";
-import {FileListComponent} from "./pages/files/file-list.component";
-import {FileComponent} from "./pages/files/file.component";
-import {ModelFileService} from "./services/files/model-file.service";
 import {ViewFileService} from "./services/files/view-file.service";
-import {FileSizePipe} from "./common/file-size.pipe";
-import {EtaPipe} from "./common/eta.pipe";
-import {CapitalizePipe} from "./common/capitalize.pipe";
-import {ClickStopPropagationDirective} from "./common/click-stop-propagation.directive";
-import {FileOptionsComponent} from "./pages/files/file-options.component";
 import {ViewFileFilterService} from "./services/files/view-file-filter.service";
-import {FilesPageComponent} from "./pages/files/files-page.component";
-import {HeaderComponent} from "./pages/main/header.component";
-import {SidebarComponent} from "./pages/main/sidebar.component";
-import {SettingsPageComponent} from "./pages/settings/settings-page.component";
-import {ApiAccessComponent} from "./pages/settings/api-access.component";
-import {ServerStatusService} from "./services/server/server-status.service";
-import {ConfigService, ConfigServiceProvider} from "./services/settings/config.service";
-import {OptionComponent} from "./pages/settings/option.component";
-import {PathPairsComponent} from "./pages/settings/path-pairs.component";
-import {NotificationService} from "./services/utils/notification.service";
-import {ServerCommandServiceProvider} from "./services/server/server-command.service";
-import {AutoQueuePageComponent} from "./pages/autoqueue/autoqueue-page.component";
-import {AutoQueueService, AutoQueueServiceProvider} from "./services/autoqueue/autoqueue.service";
-import {CachedReuseStrategy} from "./common/cached-reuse-strategy";
-import {ConnectedService} from "./services/utils/connected.service";
-import {RestService} from "./services/utils/rest.service";
-import {StreamDispatchService, StreamServiceRegistryProvider} from "./services/base/stream-service.registry";
-import {LogsPageComponent} from "./pages/logs/logs-page.component";
-import {LogService} from "./services/logs/log.service";
-import {AboutPageComponent} from "./pages/about/about-page.component";
-import {ROUTES} from "./routes";
-import {ViewFileOptionsService} from "./services/files/view-file-options.service";
 import {ViewFileSortService} from "./services/files/view-file-sort.service";
+import {ViewFileOptionsService} from "./services/files/view-file-options.service";
+import {FileSelectionService} from "./services/files/file-selection.service";
+import {NotificationService} from "./services/utils/notification.service";
+import {RestService} from "./services/utils/rest.service";
 import {DomService} from "./services/utils/dom.service";
 import {VersionCheckService} from "./services/utils/version-check.service";
-import {BulkActionsBarComponent} from "./pages/files/bulk-actions-bar.component";
-import {PathPairStatsComponent} from "./pages/files/path-pair-stats.component";
-import {FileSelectionService} from "./services/files/file-selection.service";
-import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
+import {Modal} from "./services/utils/modal.service";
 import {ModalAccessibilityService} from "./services/utils/modal-accessibility.service";
+import {StreamDispatchService, StreamServiceRegistryProvider} from "./services/base/stream-service.registry";
+import {ServerStatusService} from "./services/server/server-status.service";
+import {ModelFileService} from "./services/files/model-file.service";
+import {ConnectedService} from "./services/utils/connected.service";
+import {LogService} from "./services/logs/log.service";
+import {AutoQueueService, AutoQueueServiceProvider} from "./services/autoqueue/autoqueue.service";
+import {ConfigService, ConfigServiceProvider} from "./services/settings/config.service";
 import {PathPairServiceProvider} from "./services/settings/path-pair.service";
 import {ApiAccessServiceProvider} from "./services/settings/api-access.service";
-import {Modal} from "./services/utils/modal.service";
-import {StorageServiceModule} from "./services/utils/storage.service";
+import {ServerCommandServiceProvider} from "./services/server/server-command.service";
+import {BulkCommandServiceProvider} from "./services/server/bulk-command.service";
+import {CachedReuseStrategy} from "./common/cached-reuse-strategy";
+import {STORAGE_SERVICE_PROVIDER} from "./services/utils/storage.service";
 
-@NgModule({
-    declarations: [
-        FileSizePipe,
-        EtaPipe,
-        CapitalizePipe,
-        ClickStopPropagationDirective,
-        AppComponent,
-        FileListComponent,
-        FileComponent,
-        BulkActionsBarComponent,
-        PathPairStatsComponent,
-        FileOptionsComponent,
-        FilesPageComponent,
-        HeaderComponent,
-        SidebarComponent,
-        SettingsPageComponent,
-        ApiAccessComponent,
-        OptionComponent,
-        PathPairsComponent,
-        AutoQueuePageComponent,
-        LogsPageComponent,
-        AboutPageComponent
-    ],
-    imports: [
-        BrowserModule,
-        HttpClientModule,
-        FormsModule,
-        RouterModule.forRoot(ROUTES),
-        StorageServiceModule
-    ],
-    providers: [
-        {provide: RouteReuseStrategy, useClass: CachedReuseStrategy},
-        LoggerService,
-        NotificationService,
-        RestService,
-        ViewFileService,
-        ViewFileFilterService,
-        ViewFileSortService,
-        ViewFileOptionsService,
-        FileSelectionService,
-        DomService,
-        VersionCheckService,
-        Modal,
-        ModalAccessibilityService,
-
-        // Stream services
-        StreamDispatchService,
-        StreamServiceRegistryProvider,
-        ServerStatusService,
-        ModelFileService,
-        ConnectedService,
-        LogService,
-
-        AutoQueueServiceProvider,
-        ConfigServiceProvider,
-        PathPairServiceProvider,
-        ApiAccessServiceProvider,
-        ServerCommandServiceProvider,
-        BulkCommandServiceProvider,
-
-        // Initialize services not tied to any components
-        {
-            provide: APP_INITIALIZER,
-            useFactory: dummyFactory,
-            deps: [ViewFileFilterService],
-            multi: true
-        },
-        {
-            provide: APP_INITIALIZER,
-            useFactory: dummyFactory,
-            deps: [ViewFileSortService],
-            multi: true
-        },
-        {
-            provide: APP_INITIALIZER,
-            useFactory: dummyFactory,
-            deps: [VersionCheckService],
-            multi: true
-        },
-        {
-            provide: APP_INITIALIZER,
-            useFactory: dummyFactory,
-            deps: [ConfigService],
-            multi: true
-        },
-        {
-            provide: APP_INITIALIZER,
-            useFactory: dummyFactory,
-            deps: [AutoQueueService],
-            multi: true
-        },
-    ],
-    bootstrap: [AppComponent]
-})
-export class AppModule {
-    constructor(private logger: LoggerService) {
-        this.logger.level = environment.logger.level;
-    }
-}
-
-// noinspection JSUnusedLocalSymbols
-export function dummyFactory(s) {
+export function dummyFactory(_service: unknown) {
     return () => null;
 }
+
+export function loggerInitializer(logger: LoggerService) {
+    return () => { logger.level = environment.logger.level; };
+}
+
+export const APP_PROVIDERS: Provider[] = [
+    {provide: RouteReuseStrategy, useClass: CachedReuseStrategy},
+    LoggerService,
+    NotificationService,
+    RestService,
+    ViewFileService,
+    ViewFileFilterService,
+    ViewFileSortService,
+    ViewFileOptionsService,
+    FileSelectionService,
+    DomService,
+    VersionCheckService,
+    Modal,
+    ModalAccessibilityService,
+    StreamDispatchService,
+    StreamServiceRegistryProvider,
+    ServerStatusService,
+    ModelFileService,
+    ConnectedService,
+    LogService,
+    AutoQueueServiceProvider,
+    ConfigServiceProvider,
+    PathPairServiceProvider,
+    ApiAccessServiceProvider,
+    ServerCommandServiceProvider,
+    BulkCommandServiceProvider,
+    STORAGE_SERVICE_PROVIDER,
+    {provide: APP_INITIALIZER, useFactory: loggerInitializer, deps: [LoggerService], multi: true},
+    {provide: APP_INITIALIZER, useFactory: dummyFactory, deps: [ViewFileFilterService], multi: true},
+    {provide: APP_INITIALIZER, useFactory: dummyFactory, deps: [ViewFileSortService], multi: true},
+    {provide: APP_INITIALIZER, useFactory: dummyFactory, deps: [VersionCheckService], multi: true},
+    {provide: APP_INITIALIZER, useFactory: dummyFactory, deps: [ConfigService], multi: true},
+    {provide: APP_INITIALIZER, useFactory: dummyFactory, deps: [AutoQueueService], multi: true},
+];

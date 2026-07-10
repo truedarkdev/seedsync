@@ -5,7 +5,7 @@ const { version: appVersion } = require('../../../../package.json');
 
 @Component({
     selector: "app-about-page",
-    standalone: false,
+    standalone: true,
     templateUrl: "./about-page.component.html",
     styleUrls: ["./about-page.component.scss"],
     providers: [],

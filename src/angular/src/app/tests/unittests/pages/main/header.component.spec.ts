@@ -22,8 +22,7 @@ describe("Testing header component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [HeaderComponent],
-            imports: [CommonModule],
+            imports: [HeaderComponent, CommonModule],
             providers: [
                 LoggerService,
                 NotificationService,

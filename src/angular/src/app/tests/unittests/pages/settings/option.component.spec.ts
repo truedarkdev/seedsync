@@ -13,9 +13,7 @@ describe("Testing option component", () => {
         TestBed.configureTestingModule({
             imports: [
                 CommonModule,
-                FormsModule
-            ],
-            declarations: [
+                FormsModule,
                 OptionComponent
             ]
         });

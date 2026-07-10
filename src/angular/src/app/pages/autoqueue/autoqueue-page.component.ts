@@ -1,4 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {Observable, Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
@@ -13,11 +15,13 @@ import {StreamServiceRegistry} from "../../services/base/stream-service.registry
 import {Config} from "../../services/settings/config";
 import {ConfigService} from "../../services/settings/config.service";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
+import {ClickStopPropagationDirective} from "../../common/click-stop-propagation.directive";
 
 
 @Component({
     selector: "app-autoqueue-page",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule, ClickStopPropagationDirective],
     templateUrl: "./autoqueue-page.component.html",
     styleUrls: ["./autoqueue-page.component.scss"],
     providers: [],

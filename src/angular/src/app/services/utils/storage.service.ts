@@ -1,4 +1,4 @@
-import { InjectionToken, NgModule } from "@angular/core";
+import { InjectionToken } from "@angular/core";
 
 export interface StorageService {
   get(key: string): any;
@@ -58,12 +58,7 @@ export function localStorageFactory(): StorageService {
   return new BrowserStorageService();
 }
 
-@NgModule({
-  providers: [
-    {
-      provide: LOCAL_STORAGE,
-      useFactory: localStorageFactory
-    }
-  ]
-})
-export class StorageServiceModule {}
+export const STORAGE_SERVICE_PROVIDER = {
+  provide: LOCAL_STORAGE,
+  useFactory: localStorageFactory
+};

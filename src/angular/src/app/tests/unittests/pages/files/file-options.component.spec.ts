@@ -65,8 +65,7 @@ describe("Testing file options component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [FileOptionsComponent],
-            imports: [
+            imports: [FileOptionsComponent,
                 CommonModule,
                 FormsModule
             ],

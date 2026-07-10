@@ -2,6 +2,7 @@ import {
     Component, Input, Output, ChangeDetectionStrategy,
     EventEmitter, OnChanges, SimpleChanges, ViewChild, ChangeDetectorRef
 } from "@angular/core";
+import {CommonModule} from "@angular/common";
 
 import {Modal} from "../../services/utils/modal.service";
 
@@ -9,10 +10,15 @@ import {ViewFile} from "../../services/files/view-file";
 import {Localization} from "../../common/localization";
 import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
+import {CapitalizePipe} from "../../common/capitalize.pipe";
+import {EtaPipe} from "../../common/eta.pipe";
+import {FileSizePipe} from "../../common/file-size.pipe";
+import {ClickStopPropagationDirective} from "../../common/click-stop-propagation.directive";
 
 @Component({
     selector: "app-file",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, CapitalizePipe, EtaPipe, FileSizePipe, ClickStopPropagationDirective],
     providers: [],
     templateUrl: "./file.component.html",
     styleUrls: ["./file.component.scss"],

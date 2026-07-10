@@ -1,4 +1,5 @@
 import {Component, Input, ChangeDetectionStrategy} from "@angular/core";
+import {CommonModule} from "@angular/common";
 
 import {List} from "immutable";
 import {Modal} from "../../services/utils/modal.service";
@@ -14,7 +15,8 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-bulk-actions-bar",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule],
     providers: [],
     templateUrl: "./bulk-actions-bar.component.html",
     styleUrls: ["./bulk-actions-bar.component.scss"],

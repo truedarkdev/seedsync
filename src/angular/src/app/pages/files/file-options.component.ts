@@ -1,4 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {Observable, Subscription} from "rxjs";
 
 import * as Immutable from "immutable";
@@ -11,7 +13,8 @@ import {DomService} from "../../services/utils/dom.service";
 
 @Component({
     selector: "app-file-options",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule],
     providers: [],
     templateUrl: "./file-options.component.html",
     styleUrls: ["./file-options.component.scss"],

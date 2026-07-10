@@ -1,4 +1,6 @@
 import {Component, Input, Output, ChangeDetectionStrategy, EventEmitter, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {Subject} from "rxjs";
 import {debounceTime, distinctUntilChanged} from "rxjs/operators";
 
@@ -6,7 +8,8 @@ export const DEBOUNCE_TIME_MS = 1000;
 
 @Component({
     selector: "app-option",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule],
     providers: [],
     templateUrl: "./option.component.html",
     styleUrls: ["./option.component.scss"],

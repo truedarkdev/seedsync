@@ -65,7 +65,7 @@ describe("Testing logs page component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [LogsPageComponent],
+            imports: [LogsPageComponent],
             providers: [
                 {provide: LogService, useClass: MockLogService},
                 {provide: ConnectedService, useClass: MockConnectedService},

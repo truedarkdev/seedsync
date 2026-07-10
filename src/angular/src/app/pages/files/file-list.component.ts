@@ -1,4 +1,6 @@
 import {ChangeDetectorRef, ChangeDetectionStrategy, Component, OnDestroy, OnInit, QueryList, ViewChildren} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {combineLatest, Observable, Subscription} from "rxjs";
 
 import {List} from "immutable";
@@ -11,10 +13,12 @@ import {ViewFileOptions} from "../../services/files/view-file-options";
 import {ViewFileOptionsService} from "../../services/files/view-file-options.service";
 import {FileSelectionService} from "../../services/files/file-selection.service";
 import {FileAction, FileComponent} from "./file.component";
+import {BulkActionsBarComponent} from "./bulk-actions-bar.component";
 
 @Component({
     selector: "app-file-list",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule, BulkActionsBarComponent, FileComponent],
     providers: [],
     templateUrl: "./file-list.component.html",
     styleUrls: ["./file-list.component.scss"],

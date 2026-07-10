@@ -78,13 +78,12 @@ describe("Testing file component", () => {
     beforeEach(() => {
         TestBed.configureTestingModule({
             declarations: [
-                FileComponent,
                 MockClickStopPropagationDirective,
                 MockCapitalizePipe,
                 MockFileSizePipe,
                 MockEtaPipe
             ],
-            imports: [CommonModule],
+            imports: [CommonModule, FileComponent],
             providers: [
                 {provide: Modal, useClass: MockModal},
                 {provide: ModalAccessibilityService, useClass: MockModalAccessibilityService},

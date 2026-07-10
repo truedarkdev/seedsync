@@ -3,6 +3,7 @@ import {
     ChangeDetectionStrategy, ChangeDetectorRef, Component, ElementRef, HostListener,
     OnDestroy, OnInit, ViewChild
 } from "@angular/core";
+import {CommonModule} from "@angular/common";
 import {Observable, Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
@@ -15,7 +16,8 @@ import {DomService} from "../../services/utils/dom.service";
 
 @Component({
     selector: "app-logs-page",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule],
     templateUrl: "./logs-page.component.html",
     styleUrls: ["./logs-page.component.scss"],
     providers: [],
