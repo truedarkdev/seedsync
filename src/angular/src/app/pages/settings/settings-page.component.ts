@@ -1,4 +1,5 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
 import {Observable, Subject} from "rxjs";
 import {distinctUntilChanged, map, takeUntil} from "rxjs/operators";
 import {Modal} from "../../services/utils/modal.service";
@@ -19,10 +20,17 @@ import {ConnectedService} from "../../services/utils/connected.service";
 import {StreamServiceRegistry} from "../../services/base/stream-service.registry";
 import {ModalAccessibilityService} from "../../services/utils/modal-accessibility.service";
 import {PathPairService} from "../../services/settings/path-pair.service";
+import {FormsModule} from "@angular/forms";
+import {OptionComponent} from "./option.component";
+import {AutoQueuePageComponent} from "../autoqueue/autoqueue-page.component";
+import {ApiAccessComponent} from "./api-access.component";
+import {PathPairsComponent} from "./path-pairs.component";
+import {ClickStopPropagationDirective} from "../../common/click-stop-propagation.directive";
 
 @Component({
     selector: "app-settings-page",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule, OptionComponent, AutoQueuePageComponent, ApiAccessComponent, PathPairsComponent, ClickStopPropagationDirective],
     templateUrl: "./settings-page.component.html",
     styleUrls: ["./settings-page.component.scss"],
     providers: [],

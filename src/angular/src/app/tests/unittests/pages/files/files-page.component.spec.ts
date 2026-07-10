@@ -11,21 +11,21 @@ import {ViewFileFilterService} from "../../../../services/files/view-file-filter
 
 @Component({
     selector: "app-path-pair-stats",
-    standalone: false,
+    standalone: true,
     template: ""
 })
 class StubPathPairStatsComponent {}
 
 @Component({
     selector: "app-file-options",
-    standalone: false,
+    standalone: true,
     template: ""
 })
 class StubFileOptionsComponent {}
 
 @Component({
     selector: "app-file-list",
-    standalone: false,
+    standalone: true,
     template: ""
 })
 class StubFileListComponent {}
@@ -78,18 +78,15 @@ describe("Testing files page component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [
-                FilesPageComponent,
-                StubPathPairStatsComponent,
-                StubFileOptionsComponent,
-                StubFileListComponent
-            ],
-            imports: [CommonModule],
+            imports: [CommonModule, FilesPageComponent],
             providers: [
                 {provide: ActivatedRoute, useClass: MockActivatedRoute},
                 {provide: PathPairService, useClass: MockPathPairService},
                 {provide: ViewFileFilterService, useClass: MockViewFileFilterService}
             ]
+        });
+        TestBed.overrideComponent(FilesPageComponent, {
+            set: {imports: [CommonModule, StubPathPairStatsComponent, StubFileOptionsComponent, StubFileListComponent]}
         });
 
         fixture = TestBed.createComponent(FilesPageComponent);

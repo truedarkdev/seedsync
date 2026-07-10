@@ -214,9 +214,9 @@ describe("Testing API access component", () => {
         TestBed.configureTestingModule({
             imports: [
                 CommonModule,
-                FormsModule
+                FormsModule,
+                ApiAccessComponent
             ],
-            declarations: [ApiAccessComponent],
             providers: [
                 {provide: ApiAccessService, useClass: MockApiAccessService},
                 {provide: NotificationService, useClass: MockNotificationService},

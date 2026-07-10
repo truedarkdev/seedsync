@@ -82,8 +82,7 @@ describe("Testing autoqueue page component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [AutoQueuePageComponent],
-            imports: [FormsModule],
+            imports: [AutoQueuePageComponent, FormsModule],
             providers: [
                 {provide: AutoQueueService, useClass: MockAutoQueueService},
                 {provide: NotificationService, useClass: MockNotificationService},

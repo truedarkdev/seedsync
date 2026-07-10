@@ -82,10 +82,7 @@ describe("Testing path-pair stats component", () => {
         pathPairService = new MockPathPairService();
 
         TestBed.configureTestingModule({
-            declarations: [
-                PathPairStatsComponent,
-                FileSizePipe
-            ],
+            imports: [PathPairStatsComponent, FileSizePipe],
             providers: [
                 {provide: ViewFileService, useValue: viewFileService},
                 {provide: PathPairService, useValue: pathPairService}

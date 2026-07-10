@@ -1,4 +1,5 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
+import {CommonModule} from "@angular/common";
 import {ComponentFixture, TestBed, fakeAsync, flushMicrotasks, tick} from "@angular/core/testing";
 import {BehaviorSubject, of} from "rxjs";
 import {Modal} from "../../../../services/utils/modal.service";
@@ -132,7 +133,7 @@ describe("Testing settings page component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [SettingsPageComponent],
+            imports: [SettingsPageComponent],
             schemas: [NO_ERRORS_SCHEMA],
             providers: [
                 {provide: LoggerService, useClass: MockLoggerService},
@@ -145,6 +146,9 @@ describe("Testing settings page component", () => {
                 {provide: ConnectedService, useClass: MockConnectedService},
                 {provide: StreamServiceRegistry, useClass: MockStreamServiceRegistry}
             ]
+        });
+        TestBed.overrideComponent(SettingsPageComponent, {
+            set: {imports: [CommonModule]}
         });
 
         fixture = TestBed.createComponent(SettingsPageComponent);

@@ -1,4 +1,5 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
 import * as Immutable from "immutable";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
@@ -6,6 +7,7 @@ import {takeUntil} from "rxjs/operators";
 import {ViewFileService} from "../../services/files/view-file.service";
 import {ViewFile} from "../../services/files/view-file";
 import {PathPairService, PathPair} from "../../services/settings/path-pair.service";
+import {FileSizePipe} from "../../common/file-size.pipe";
 
 export interface PathPairStat {
     pathPairId: string;
@@ -23,7 +25,8 @@ export interface PathPairStat {
 
 @Component({
     selector: "app-path-pair-stats",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FileSizePipe],
     templateUrl: "./path-pair-stats.component.html",
     styleUrls: ["./path-pair-stats.component.scss"],
     changeDetection: ChangeDetectionStrategy.OnPush

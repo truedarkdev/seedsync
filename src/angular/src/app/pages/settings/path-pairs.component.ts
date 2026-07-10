@@ -1,4 +1,6 @@
 import {ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 import {Modal} from "../../services/utils/modal.service";
@@ -17,7 +19,8 @@ import {ModalAccessibilityService} from "../../services/utils/modal-accessibilit
 
 @Component({
     selector: "app-path-pairs",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule],
     templateUrl: "./path-pairs.component.html",
     styleUrls: ["./path-pairs.component.scss"]
 })

@@ -1,4 +1,6 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {FormsModule} from "@angular/forms";
 import {from, Subject} from "rxjs";
 import {concatMap, finalize, takeUntil} from "rxjs/operators";
 
@@ -29,7 +31,8 @@ interface ScopeSelection {
 
 @Component({
     selector: "app-api-access",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule, FormsModule],
     templateUrl: "./api-access.component.html",
     styleUrls: ["./api-access.component.scss"],
     changeDetection: ChangeDetectionStrategy.OnPush

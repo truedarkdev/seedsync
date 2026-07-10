@@ -1,4 +1,5 @@
 import {Component, OnInit} from "@angular/core";
+import {CommonModule} from "@angular/common";
 import {Observable} from "rxjs";
 
 import * as Immutable from "immutable";
@@ -12,7 +13,8 @@ import {Localization} from "../../common/localization";
 
 @Component({
     selector: "app-header",
-    standalone: false,
+    standalone: true,
+    imports: [CommonModule],
     templateUrl: "./header.component.html",
     styleUrls: ["./header.component.scss"],
 })

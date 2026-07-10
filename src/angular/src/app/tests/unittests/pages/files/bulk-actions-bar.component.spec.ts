@@ -53,9 +53,7 @@ describe("Testing bulk actions bar component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [
-                BulkActionsBarComponent
-            ],
+            imports: [BulkActionsBarComponent],
             providers: [
                 LoggerService,
                 ModalAccessibilityService,

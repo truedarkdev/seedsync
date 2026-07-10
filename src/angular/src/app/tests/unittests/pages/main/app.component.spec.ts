@@ -1,4 +1,6 @@
 import {NO_ERRORS_SCHEMA} from "@angular/core";
+import {CommonModule} from "@angular/common";
+import {RouterOutlet} from "@angular/router";
 import {ComponentFixture, TestBed} from "@angular/core/testing";
 import {NavigationEnd, Router} from "@angular/router";
 import {BehaviorSubject, Subject} from "rxjs";
@@ -48,13 +50,16 @@ describe("Testing app component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [AppComponent],
+            imports: [AppComponent],
             schemas: [NO_ERRORS_SCHEMA],
             providers: [
                 {provide: Router, useClass: MockRouter},
                 {provide: PathPairService, useClass: MockPathPairService},
                 {provide: DomService, useClass: MockDomService}
             ]
+        });
+        TestBed.overrideComponent(AppComponent, {
+            set: {imports: [CommonModule, RouterOutlet]}
         });
 
         spyOn(window, "scrollTo").and.stub();

@@ -119,12 +119,10 @@ describe("Testing path pairs component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [
-                PathPairsHostComponent,
-                PathPairsComponent
-            ],
+            declarations: [PathPairsHostComponent],
             imports: [
-                FormsModule
+                FormsModule,
+                PathPairsComponent
             ],
             providers: [
                 {provide: PathPairService, useClass: MockPathPairService},

@@ -65,8 +65,7 @@ describe("Testing sidebar component", () => {
 
     beforeEach(() => {
         TestBed.configureTestingModule({
-            declarations: [SidebarComponent],
-            imports: [
+            imports: [SidebarComponent,
                 CommonModule,
                 RouterTestingModule.withRoutes([])
             ],
