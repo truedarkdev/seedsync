@@ -121,6 +121,11 @@ class ControllerHandler(IHandler):
             self.__handle_action_validate,
             required_scope="write"
         )
+        web_app.add_post_handler(
+            "/server/command/retry_move/<file_name>",
+            self.__handle_action_retry_move,
+            required_scope="write"
+        )
         web_app.add_delete_handler(
             "/server/command/delete_local/<file_name>",
             self.__handle_action_delete_local,
@@ -144,6 +149,7 @@ class ControllerHandler(IHandler):
             "stop": Controller.Command.Action.STOP,
             "extract": Controller.Command.Action.EXTRACT,
             "validate": Controller.Command.Action.VALIDATE,
+            "retry_move": Controller.Command.Action.RETRY_MOVE,
             "delete_local": Controller.Command.Action.DELETE_LOCAL,
             "delete_remote": Controller.Command.Action.DELETE_REMOTE
         }.get(action)
@@ -274,6 +280,25 @@ class ControllerHandler(IHandler):
             return HTTPResponse(body="Stopped file '{}'".format(file_name))
         else:
             return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+
+    def __handle_action_retry_move(self, file_name: str):
+        file_name = unquote(file_name)
+        file_id = self.__query_param("file_id")
+        if file_id is None:
+            return HTTPResponse(body="file_id is required", status=400)
+        file_identifier, _, error_response = self.__resolve_command_identifier(file_name, file_id)
+        if error_response:
+            return error_response
+        callback, completed = self.__execute_action(
+            Controller.Command.Action.RETRY_MOVE,
+            cast(str, file_identifier),
+            timeout=self._ACTION_TIMEOUT,
+        )
+        if not completed:
+            return HTTPResponse(body="Operation timed out", status=504)
+        if callback.success:
+            return HTTPResponse(body="Move retry completed")
+        return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
 
     def __handle_action_extract(self, file_name: str):
         """

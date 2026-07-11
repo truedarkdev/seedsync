@@ -299,6 +299,63 @@ class TestControllerHandler(BaseTestWebApp):
         self.assertEqual(Controller.Command.Action.VALIDATE, command.action)
         self.assertEqual("test1", command.filename)
 
+    def test_retry_move_requires_exact_encoded_file_id(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        file_id = '["movies","File One.mkv"]'
+        self.controller.get_model_files.return_value = [
+            self.__model_file("File One.mkv", file_id, "movies")
+        ]
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+        uri = quote(quote("File One.mkv", safe=""), safe="")
+
+        response = self.test_app.post(
+            "/server/command/retry_move/{}?file_id={}".format(uri, quote(file_id, safe=""))
+        )
+
+        self.assertEqual(200, response.status_code)
+        command = self.controller.queue_command.call_args.args[0]
+        self.assertEqual(Controller.Command.Action.RETRY_MOVE, command.action)
+        self.assertEqual(file_id, command.filename)
+
+    def test_retry_move_rejects_missing_ambiguous_and_control_identity(self):
+        self.controller.queue_command = MagicMock()
+        self.controller.get_model_files.return_value = [
+            self.__model_file("dup", '["movies","dup"]', "movies"),
+            self.__model_file("dup", '["tv","dup"]', "tv"),
+        ]
+
+        missing = self.test_app.post("/server/command/retry_move/dup", expect_errors=True)
+        ambiguous = self.test_app.post(
+            "/server/command/retry_move/dup?file_id={}".format(quote('["other","dup"]', safe="")),
+            expect_errors=True,
+        )
+        control = self.test_app.post(
+            "/server/command/retry_move/dup?file_id={}".format(quote("bad\x01id", safe="")),
+            expect_errors=True,
+        )
+
+        self.assertEqual(400, missing.status_code)
+        self.assertEqual(400, ambiguous.status_code)
+        self.assertEqual(400, control.status_code)
+        self.controller.queue_command.assert_not_called()
+
+    def test_retry_move_returns_generic_controller_failure(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_failure("Final move failed", 500)
+
+        self.controller.get_model_files.return_value = [self.__model_file("movie.mkv", "movie.mkv")]
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post(
+            "/server/command/retry_move/movie.mkv?file_id=movie.mkv",
+            expect_errors=True,
+        )
+
+        self.assertEqual(500, response.status_code)
+        self.assertEqual("Final move failed", response.text)
+
     def test_extract_rejects_path_traversal(self):
         self.controller.queue_command = MagicMock()
         uri = quote(quote("../../etc/passwd", safe=""), safe="")

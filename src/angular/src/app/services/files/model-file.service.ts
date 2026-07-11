@@ -121,6 +121,12 @@ export class ModelFileService extends BaseStreamService {
         return this._restService.post(url);
     }
 
+    public retryMove(file: ModelFile): Observable<WebReaction> {
+        this._logger.debug("Retry final move for model file: " + file.name);
+        const url: string = ModelFileService.buildCommandUrl("retry_move", file);
+        return this._restService.post(url);
+    }
+
     protected onEvent(eventName: string, data: string) {
         this.parseEvent(eventName, data);
     }

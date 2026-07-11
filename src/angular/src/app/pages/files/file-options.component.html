@@ -58,6 +58,16 @@
                         <div class="icon"><img src="assets/icons/stopped.svg" class="stopped" /></div>
                         <span class="text">Stopped</span>
                     </div>
+                    <div class="sel-item"
+                         *ngIf="(options | async)?.selectedStatusFilter == ViewFile.Status.MOVE_FAILED">
+                        <div class="icon"><img src="assets/icons/move-failed.png" class="move-failed" /></div>
+                        <span class="text">Final move failed</span>
+                    </div>
+                    <div class="sel-item"
+                         *ngIf="(options | async)?.selectedStatusFilter == ViewFile.Status.MOVE_SUCCEEDED">
+                        <div class="icon"><img src="assets/icons/move-succeeded.png" class="move-succeeded" /></div>
+                        <span class="text">Final move succeeded</span>
+                    </div>
                 </div>
             </button>
             <div class="dropdown-menu" data-bs-theme="dark">
@@ -66,6 +76,24 @@
                         (click)="onFilterByStatus(null)">
                     <div class="icon"></div>
                     <span class="text">All</span>
+                </button>
+                <button type="button" class="dropdown-item"
+                        [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.MOVE_FAILED"
+                        [class.disabled]="isStatusDisabled(ViewFile.Status.MOVE_FAILED) ? true : null"
+                        [disabled]="isStatusDisabled(ViewFile.Status.MOVE_FAILED)"
+                        (click)="onFilterByStatus(ViewFile.Status.MOVE_FAILED)">
+                    <div class="icon"><img src="assets/icons/move-failed.png" class="move-failed" /></div>
+                    <span class="text">Final move failed</span>
+                    <span class="count">{{ getStatusCount(ViewFile.Status.MOVE_FAILED) }}</span>
+                </button>
+                <button type="button" class="dropdown-item"
+                        [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.MOVE_SUCCEEDED"
+                        [class.disabled]="isStatusDisabled(ViewFile.Status.MOVE_SUCCEEDED) ? true : null"
+                        [disabled]="isStatusDisabled(ViewFile.Status.MOVE_SUCCEEDED)"
+                        (click)="onFilterByStatus(ViewFile.Status.MOVE_SUCCEEDED)">
+                    <div class="icon"><img src="assets/icons/move-succeeded.png" class="move-succeeded" /></div>
+                    <span class="text">Final move succeeded</span>
+                    <span class="count">{{ getStatusCount(ViewFile.Status.MOVE_SUCCEEDED) }}</span>
                 </button>
                 <button type="button" class="dropdown-item"
                         [class.active]="(options | async)?.selectedStatusFilter == ViewFile.Status.EXTRACTED"

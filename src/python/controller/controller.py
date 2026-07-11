@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 import copy
 import json
 import os
+import ntpath
+import stat
 import time
 import shutil
 from types import SimpleNamespace
@@ -56,6 +58,16 @@ class Controller:
     """
     Top-level class that controls the behaviour of the app
     """
+    class MoveFromStagingResult(Enum):
+        COMPLETED = 0
+        ALREADY_COMPLETED = 1
+        DEFERRED = 2
+        FAILED = 3
+        NO_MOVE_APPLICABLE = 4
+
+    __MAX_MOVE_FAILURES = 4
+    __MOVE_RETRY_DELAYS = (2, 10, 30)
+
     class Command:
         """
         Class by which clients of Controller can request Actions to be executed
@@ -70,6 +82,7 @@ class Controller:
             DELETE_LOCAL = 3
             DELETE_REMOTE = 4
             VALIDATE = 5
+            RETRY_MOVE = 6
 
         class ICallback(ABC):
             """Command callback interface"""
@@ -262,6 +275,10 @@ class Controller:
         self.__active_extracting_file_names = []
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
+        self.__move_retry_due = {}
+        self.__move_attempt_reservations = set()
+        self.__move_attempt_lock = Lock()
+        self.__deferred_move_file_ids = set()
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
         self.__exclude_patterns = ""
@@ -430,6 +447,10 @@ class Controller:
         # visible until the model reaches a terminal state.
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
+        self.__move_retry_due = {}
+        self.__move_attempt_reservations = set()
+        self.__move_attempt_lock = Lock()
+        self.__deferred_move_file_ids = set()
         self.__malformed_status_only_file_ids = set()
         self.__pending_auto_purge_file_ids = set()
         self.__last_lftp_statuses = []
@@ -1731,7 +1752,34 @@ class Controller:
         self.__persist.extracted_file_names.difference_update(stale_extracted_file_names)
         self.__model_builder.set_extracted_files(self.__persist.extracted_file_names)
 
-    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> bool:
+    @staticmethod
+    def __safe_final_move_candidate(root: str, name: str) -> Optional[str]:
+        normalized_name = name.replace("\\", "/")
+        if not normalized_name or os.path.isabs(name) or ntpath.isabs(name):
+            return None
+        parts = normalized_name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            return None
+        try:
+            canonical_root = os.path.realpath(root)
+            candidate = os.path.normpath(os.path.join(root, *parts))
+            resolved_candidate = os.path.realpath(candidate)
+            if os.path.normcase(os.path.commonpath([canonical_root, resolved_candidate])) != os.path.normcase(canonical_root):
+                return None
+            current = os.path.normpath(root)
+            for part in parts:
+                current = os.path.join(current, part)
+                try:
+                    if stat.S_ISLNK(os.lstat(current).st_mode):
+                        return None
+                except FileNotFoundError:
+                    continue
+            return candidate
+        except (OSError, ValueError):
+            return None
+
+    def __resolve_safe_final_move_paths(
+            self, name: str, path_pair_id: Optional[str] = None) -> Optional[Tuple[str, str, str, str]]:
         if path_pair_id:
             staging_path = self.__get_staging_path(path_pair_id)
             path_pair = self.__get_path_pair(path_pair_id)
@@ -1749,10 +1797,21 @@ class Controller:
                 staging_path,
                 final_path,
             )
-            return False
+            return None
 
-        src = os.path.join(staging_path, name)
-        dst = os.path.join(final_path, name)
+        src = Controller.__safe_final_move_candidate(staging_path, name)
+        dst = Controller.__safe_final_move_candidate(final_path, name)
+        if src is None or dst is None:
+            self.logger.warning("Rejected unsafe final move path")
+            return None
+        return staging_path, final_path, src, dst
+
+    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> MoveFromStagingResult:
+        resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
+        if resolved is None:
+            return Controller.MoveFromStagingResult.FAILED
+        staging_path, final_path, src, dst = resolved
+
         trace_file_id = ModelFile.build_file_id(name, path_pair_id)
         should_trace = self.__target_archive_trace_selector_matches_file(trace_file_id, name)
         if should_trace:
@@ -1783,7 +1842,8 @@ class Controller:
                     "result": "missing_source",
                     "destination_exists": destination_exists,
                 })
-            return destination_exists
+            return Controller.MoveFromStagingResult.ALREADY_COMPLETED if destination_exists \
+                else Controller.MoveFromStagingResult.FAILED
         if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
@@ -1791,7 +1851,7 @@ class Controller:
                     "file_name": name,
                     "result": "same_path",
                 })
-            return True
+            return Controller.MoveFromStagingResult.NO_MOVE_APPLICABLE
         if self.__source_has_lftp_temp_artifact(staging_path, src):
             self.logger.warning(
                 "Deferring move of '%s' from staging '%s' to '%s': staging source still has an lftp temp artifact",
@@ -1805,9 +1865,14 @@ class Controller:
                     "file_name": name,
                     "result": "deferred_temp_files",
                 })
-            return False
+            return Controller.MoveFromStagingResult.DEFERRED
 
         try:
+            # Re-resolve immediately before the mutation to narrow the window
+            # for a path component to be replaced with a symlink.
+            current = self.__resolve_safe_final_move_paths(name, path_pair_id)
+            if current is None or current[2:] != (src, dst):
+                return Controller.MoveFromStagingResult.FAILED
             shutil.move(src, dst)
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
             if should_trace:
@@ -1820,7 +1885,7 @@ class Controller:
                 self.__local_scan_process.force_scan()
             else:
                 self.__local_scan_process.force_scan(path_pair_id)
-            return True
+            return Controller.MoveFromStagingResult.COMPLETED
         except OSError as error:
             self.logger.warning(
                 "Failed to move '%s' from staging '%s' to '%s': %s",
@@ -1836,7 +1901,20 @@ class Controller:
                     "result": "failed",
                     "error": str(error),
                 })
-            return False
+            return Controller.MoveFromStagingResult.FAILED
+
+    def _reserve_move_attempt(self, file_id: str) -> bool:
+        # Lock order is model_lock -> move_attempt_lock. This helper never
+        # acquires model_lock, so callers must not invert that ordering.
+        with self.__move_attempt_lock:
+            if file_id in self.__move_attempt_reservations:
+                return False
+            self.__move_attempt_reservations.add(file_id)
+            return True
+
+    def _release_move_attempt(self, file_id: str) -> None:
+        with self.__move_attempt_lock:
+            self.__move_attempt_reservations.discard(file_id)
 
     @staticmethod
     def __source_has_lftp_temp_artifact(staging_path: str, src: str) -> bool:
@@ -2241,10 +2319,24 @@ class Controller:
                         local_base_dir_path=local_base_dir_path,
                         **queue_kwargs
                     )
-                    if file.state not in (
+                    is_new_transfer_lifecycle = file.state not in (
                         ModelFile.State.QUEUED,
                         ModelFile.State.DOWNLOADING,
-                    ):
+                    )
+                    if is_new_transfer_lifecycle:
+                        self.__persist.move_failure_counts.pop(file.file_id, None)
+                        self.__move_retry_due.pop(file.file_id, None)
+                        self.__deferred_move_file_ids.discard(file.file_id)
+                        self.__pending_completion_file_names = {
+                            entry for entry in self.__pending_completion_file_names
+                            if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
+                        }
+                        with self.__move_attempt_lock:
+                            self.__move_attempt_reservations.discard(file.file_id)
+                        self.__model_builder.set_move_failed_files({
+                            file_id for file_id, count in self.__persist.move_failure_counts.items()
+                            if count >= Controller.__MAX_MOVE_FAILURES
+                        })
                         self.__arm_download_start_lifecycle(
                             file.file_id,
                             file.name,
@@ -2256,6 +2348,13 @@ class Controller:
                         file.name,
                         file.path_pair_id
                     )
+                    if is_new_transfer_lifecycle:
+                        # A genuinely new queue invalidates all final-move
+                        # identity from the prior transfer lifecycle.
+                        self.__persist.final_move_succeeded_file_names.discard(file.file_id)
+                        self.__model_builder.set_final_move_succeeded_files(
+                            self.__persist.final_move_succeeded_file_names
+                        )
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",
@@ -2496,7 +2595,8 @@ class Controller:
                 if file.state not in (
                     ModelFile.State.DEFAULT,
                     ModelFile.State.DOWNLOADED,
-                    ModelFile.State.EXTRACTED
+                    ModelFile.State.EXTRACTED,
+                    ModelFile.State.MOVE_FAILED,
                 ):
                     _notify_failure(
                         command,
@@ -2537,6 +2637,53 @@ class Controller:
                         },
                         file=file,
                     )
+
+            elif command.action == Controller.Command.Action.RETRY_MOVE:
+                if file.state != ModelFile.State.MOVE_FAILED or \
+                        self.__persist.move_failure_counts.get(file.file_id, 0) < Controller.__MAX_MOVE_FAILURES:
+                    _notify_failure(command, "Final move is not failed for this file", 409, file)
+                    continue
+                if not self._reserve_move_attempt(file.file_id):
+                    _notify_failure(command, "Move retry is already active", 409, file)
+                    continue
+                try:
+                    result = self.__move_from_staging(file.name, file.path_pair_id)
+                    if result in (
+                        Controller.MoveFromStagingResult.COMPLETED,
+                        Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                    ):
+                        self.__persist.move_failure_counts.pop(file.file_id, None)
+                        self.__deferred_move_file_ids.discard(file.file_id)
+                        self.__move_retry_due.pop(file.file_id, None)
+                        self.__persist.downloaded_file_names.add(file.file_id)
+                        if result == Controller.MoveFromStagingResult.COMPLETED:
+                            self.__persist.final_move_succeeded_file_names.add(file.file_id)
+                        self._complete_download_start_lifecycle(file.file_id)
+                        self.clear_extracted_marker(file)
+                        self.__pending_completion_file_names = {
+                            entry for entry in self.__pending_completion_file_names
+                            if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
+                        }
+                        self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
+                        self.__model_builder.set_final_move_succeeded_files(
+                            self.__persist.final_move_succeeded_file_names
+                        )
+                        self.__model_builder.set_move_failed_files({
+                            file_id for file_id, count in self.__persist.move_failure_counts.items()
+                            if count >= Controller.__MAX_MOVE_FAILURES
+                        })
+                        if file.path_pair_id is None:
+                            self.__local_scan_process.force_scan()
+                        else:
+                            self.__local_scan_process.force_scan(file.path_pair_id)
+                    elif result == Controller.MoveFromStagingResult.DEFERRED:
+                        _notify_failure(command, "Move retry is temporarily unavailable", 409, file)
+                        continue
+                    else:
+                        _notify_failure(command, "Final move failed", 500, file)
+                        continue
+                finally:
+                    self._release_move_attempt(file.file_id)
 
             elif command.action == Controller.Command.Action.DELETE_REMOTE:
                 if file.state not in (
@@ -2809,6 +2956,17 @@ class Controller:
                         else:
                             command_process.post_callback()
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
+                                self.__persist.move_failure_counts.pop(command_process.file_id, None)
+                                self.__deferred_move_file_ids.discard(command_process.file_id)
+                                self.__move_retry_due.pop(command_process.file_id, None)
+                                self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
+                                self.__model_builder.set_final_move_succeeded_files(
+                                    self.__persist.final_move_succeeded_file_names
+                                )
+                                self.__model_builder.set_move_failed_files({
+                                    file_id for file_id, count in self.__persist.move_failure_counts.items()
+                                    if count >= Controller.__MAX_MOVE_FAILURES
+                                })
                                 self.__reset_download_start_after_local_delete(
                                     command_process.file_id,
                                     getattr(command_process.event_file, "path_pair_id", None),
@@ -2865,6 +3023,14 @@ class Controller:
                                     )
                                     self.__model_builder.set_downloaded_files(
                                         self.__persist.downloaded_file_names
+                                    )
+                                    # Remote deletion clears the existing
+                                    # completion identity, matching downloaded.
+                                    self.__persist.final_move_succeeded_file_names.discard(
+                                        command_process.file_id
+                                    )
+                                    self.__model_builder.set_final_move_succeeded_files(
+                                        self.__persist.final_move_succeeded_file_names
                                     )
                                 self.__notify_remote_delete_success(command_process.event_file)
                             for callback in command_process.command.callbacks:

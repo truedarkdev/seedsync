@@ -120,6 +120,19 @@
     img#downloading, img#downloaded {
         width: 45px;
     }
+    // The approved move-state bitmaps include transparent optical padding.
+    // Give their square canvases enough room for the visible folder silhouette
+    // to match the established status-icon family without scaling its geometry.
+    img#move-succeeded, img#move-failed {
+        flex: 0 0 72px;
+        width: 72px;
+        height: 72px;
+        // Preserve the established status/label flow while enlarging the
+        // heavily padded bitmap canvas. The transparent outer pixels occupy
+        // the overflow; the visible folder remains clear of the label.
+        margin-top: -16px;
+        margin-bottom: -12px;
+    }
     img#default-remote {
         width: 45px;
         height: 45px;
@@ -327,4 +340,9 @@
     /* Hide the inner eta, show outer eta */
     .content .eta {display: inline;}
     .content .speed .speed-eta {display: none;}
+}
+
+.move-failed-text {
+    color: #dc3545;
+    font-weight: 600;
 }

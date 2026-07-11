@@ -10,6 +10,7 @@ delegates the model refresh boundary.
 from __future__ import annotations
 
 import re
+from threading import Lock
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -46,6 +47,9 @@ class ModelUpdater:
 
     def sync_persist_to_all_builders(self):
         controller = self._controller
+        persist = controller._Controller__persist
+        move_failure_counts = getattr(persist, "move_failure_counts", {})
+        max_move_failures = getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4)
         path_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
         controller._Controller__model_builder.set_downloaded_files(  # type: ignore[attr-defined]
             self._filter_keys_for_model_builder(
@@ -65,6 +69,17 @@ class ModelUpdater:
                 path_pair_ids,
             )
         )
+        if hasattr(persist, "move_failure_counts"):
+            controller._Controller__model_builder.set_move_failed_files(  # type: ignore[attr-defined]
+                {
+                    file_id for file_id, count in move_failure_counts.items()
+                    if count >= max_move_failures
+                }
+            )
+        if hasattr(persist, "final_move_succeeded_file_names"):
+            controller._Controller__model_builder.set_final_move_succeeded_files(  # type: ignore[attr-defined]
+                persist.final_move_succeeded_file_names
+            )
 
     @staticmethod
     def _filter_keys_for_model_builder(keys: set[str], path_pair_ids: set[str]) -> set[str]:
@@ -124,6 +139,10 @@ class ModelUpdater:
         model_builder = controller._Controller__model_builder  # type: ignore[attr-defined]
         persist = controller._Controller__persist  # type: ignore[attr-defined]
         model = controller._Controller__model  # type: ignore[attr-defined]
+        if not isinstance(getattr(persist, "move_failure_counts", None), dict):
+            persist.move_failure_counts = {}
+        if not isinstance(getattr(persist, "final_move_succeeded_file_names", None), set):
+            persist.final_move_succeeded_file_names = set()
 
         if not hasattr(controller, "_Controller__malformed_status_only_file_ids"):
             controller._Controller__malformed_status_only_file_ids = set()
@@ -148,6 +167,14 @@ class ModelUpdater:
             controller._Controller__prev_downloading_file_names = set()
         if not hasattr(controller, "_Controller__pending_completion_file_names"):
             controller._Controller__pending_completion_file_names = set()
+        if not hasattr(controller, "_Controller__move_retry_due"):
+            controller._Controller__move_retry_due = {}
+        if not hasattr(controller, "_Controller__deferred_move_file_ids"):
+            controller._Controller__deferred_move_file_ids = set()
+        if not hasattr(controller, "_Controller__move_attempt_reservations"):
+            controller._Controller__move_attempt_reservations = set()
+        if not hasattr(controller, "_Controller__move_attempt_lock"):
+            controller._Controller__move_attempt_lock = Lock()
 
         # Grab the latest scan results.
         latest_remote_scan = controller._Controller__remote_scan_process.pop_latest_result()  # type: ignore[attr-defined]
@@ -245,7 +272,9 @@ class ModelUpdater:
                 if status.file_id not in controller._Controller__malformed_status_only_file_ids
             ]
             if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
-                controller._confirm_fresh_healthy_download_starts(lftp_statuses)
+                confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
+                if callable(confirm_download_starts):
+                    confirm_download_starts(lftp_statuses)
             current_downloading_file_names = [
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
@@ -442,11 +471,24 @@ class ModelUpdater:
                 )
         model_builder.set_stopped_files(persist.stopped_file_names)
 
+        retry_now = datetime.now()
+        if any(
+            0 < count < controller._Controller__MAX_MOVE_FAILURES
+            and (
+                file_id not in controller._Controller__move_retry_due
+                or controller._Controller__move_retry_due[file_id] <= retry_now
+            )
+            for file_id, count in persist.move_failure_counts.items()
+        ):
+            model_builder.request_rebuild()
+
         # Build the new model, if needed.
         auto_purge_candidate_ids = set()
         remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
         if remote_reconciliation_established:
-            enabled_path_pair_ids = set(controller._Controller__path_pairs_by_id.keys())
+            enabled_path_pair_ids = set(
+                getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
+            )
             scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
             remote_file_ids = {
                 ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None))
@@ -466,13 +508,17 @@ class ModelUpdater:
                     enabled_path_pair_ids,
                 )
             )
-            protected_file_ids.update(controller._snapshot_delete_command_file_ids())
-            controller._prune_download_start_lifecycles(
-                latest_remote_scan.timestamp,
-                scanned_path_pair_ids,
-                remote_file_ids,
-                protected_file_ids,
-            )
+            snapshot_delete_ids = getattr(controller, "_snapshot_delete_command_file_ids", None)
+            if callable(snapshot_delete_ids):
+                protected_file_ids.update(snapshot_delete_ids())
+            prune_lifecycles = getattr(controller, "_prune_download_start_lifecycles", None)
+            if callable(prune_lifecycles):
+                prune_lifecycles(
+                    latest_remote_scan.timestamp,
+                    scanned_path_pair_ids,
+                    remote_file_ids,
+                    protected_file_ids,
+                )
         if model_builder.has_changes():
             new_model = model_builder.build_model()
 
@@ -483,7 +529,9 @@ class ModelUpdater:
                         for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
                     }
 
-                def keep_completion_pending_after_failed_staging_move(file: ModelFile):
+                def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
+                    persist.final_move_succeeded_file_names.discard(file.file_id)
+                    model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
                     path_pair_name = file.path_pair_name
                     if path_pair_name is None:
                         path_pair = controller._Controller__get_path_pair(file.path_pair_id)  # type: ignore[attr-defined]
@@ -493,6 +541,24 @@ class ModelUpdater:
                         file.path_pair_id,
                         path_pair_name,
                     ))
+                    if consume_budget:
+                        controller._Controller__deferred_move_file_ids.discard(file.file_id)
+                        count = min(
+                            controller._Controller__MAX_MOVE_FAILURES,
+                            persist.move_failure_counts.get(file.file_id, 0) + 1,
+                        )
+                        persist.move_failure_counts[file.file_id] = count
+                        if count < controller._Controller__MAX_MOVE_FAILURES:
+                            delay = controller._Controller__MOVE_RETRY_DELAYS[count - 1]
+                            controller._Controller__move_retry_due[file.file_id] = datetime.now() + timedelta(seconds=delay)
+                        else:
+                            controller._Controller__move_retry_due.pop(file.file_id, None)
+                        model_builder.set_move_failed_files({
+                            file_id for file_id, failures in persist.move_failure_counts.items()
+                            if failures >= controller._Controller__MAX_MOVE_FAILURES
+                        })
+                    else:
+                        controller._Controller__deferred_move_file_ids.add(file.file_id)
                     controller.logger.warning(
                         "Keeping download completion pending after failed staging move: %s",
                         file.file_id,
@@ -502,7 +568,19 @@ class ModelUpdater:
                     else:
                         controller._Controller__local_scan_process.force_scan(file.path_pair_id)  # type: ignore[attr-defined]
 
-                def publish_completed_download(file: ModelFile):
+                def publish_completed_download(file: ModelFile, final_move_succeeded: bool):
+                    persist.move_failure_counts.pop(file.file_id, None)
+                    controller._Controller__deferred_move_file_ids.discard(file.file_id)
+                    controller._Controller__move_retry_due.pop(file.file_id, None)
+                    model_builder.set_move_failed_files({
+                        file_id for file_id, failures in persist.move_failure_counts.items()
+                        if failures >= controller._Controller__MAX_MOVE_FAILURES
+                    })
+                    if final_move_succeeded:
+                        persist.final_move_succeeded_file_names.add(file.file_id)
+                    else:
+                        persist.final_move_succeeded_file_names.discard(file.file_id)
+                    model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
                     if file.file_id not in persist.downloaded_file_names:
                         persist.downloaded_file_names.add(file.file_id)
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
@@ -521,8 +599,33 @@ class ModelUpdater:
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file.file_id
                     }
 
+                def run_reserved_automatic_move(file: ModelFile):
+                    if not controller._reserve_move_attempt(file.file_id):
+                        return None
+                    try:
+                        return controller._Controller__move_from_staging(  # type: ignore[attr-defined]
+                            file.name,
+                            file.path_pair_id,
+                        )
+                    finally:
+                        controller._release_move_attempt(file.file_id)
+
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
+                attempted_move_file_ids = set()
+
+                for file_id, count in persist.move_failure_counts.items():
+                    if count <= 0 or count >= controller._Controller__MAX_MOVE_FAILURES:
+                        continue
+                    try:
+                        restart_file = new_model.get_file(file_id)
+                    except ModelError:
+                        continue
+                    controller._Controller__pending_completion_file_names.add((
+                        restart_file.name,
+                        restart_file.path_pair_id,
+                        restart_file.path_pair_name,
+                    ))
 
                 # Apply changes to the new model.
                 for diff in model_diff:
@@ -581,14 +684,30 @@ class ModelUpdater:
                             completion_proved = True
 
                     if completion_proved and new_file is not None:
-                        staging_move_succeeded = controller._Controller__move_from_staging(  # type: ignore[attr-defined]
-                            new_file.name,
-                            new_file.path_pair_id,
-                        )
-                        if staging_move_succeeded is False:
-                            keep_completion_pending_after_failed_staging_move(new_file)
+                        failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
+                        retry_due = controller._Controller__move_retry_due.get(new_file.file_id)
+                        if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
+                            retry_due is not None and datetime.now() < retry_due
+                        ):
+                            continue
+                        move_result = run_reserved_automatic_move(new_file)
+                        if move_result is None:
+                            continue
+                        attempted_move_file_ids.add(new_file.file_id)
+                        if move_result in (
+                            controller.MoveFromStagingResult.FAILED,
+                            controller.MoveFromStagingResult.DEFERRED,
+                        ):
+                            keep_completion_pending_after_failed_staging_move(
+                                new_file,
+                                move_result == controller.MoveFromStagingResult.FAILED,
+                            )
                         else:
-                            publish_completed_download(new_file)
+                            publish_completed_download(
+                                new_file,
+                                move_result == controller.MoveFromStagingResult.COMPLETED or
+                                new_file.file_id in persist.final_move_succeeded_file_names,
+                            )
 
                     # Detect if a file was just downloaded through a direct state transition.
                     # Pending-completion files are handled above so disappearance does not
@@ -610,14 +729,63 @@ class ModelUpdater:
                             downloaded = True
                     if downloaded:
                         assert new_file is not None
-                        staging_move_succeeded = controller._Controller__move_from_staging(  # type: ignore[attr-defined]
-                            new_file.name,
-                            new_file.path_pair_id,
-                        )
-                        if staging_move_succeeded is False:
-                            keep_completion_pending_after_failed_staging_move(new_file)
+                        move_result = run_reserved_automatic_move(new_file)
+                        if move_result is None:
+                            continue
+                        attempted_move_file_ids.add(new_file.file_id)
+                        if move_result in (
+                            controller.MoveFromStagingResult.FAILED,
+                            controller.MoveFromStagingResult.DEFERRED,
+                        ):
+                            keep_completion_pending_after_failed_staging_move(
+                                new_file,
+                                move_result == controller.MoveFromStagingResult.FAILED,
+                            )
                         else:
-                            publish_completed_download(new_file)
+                            publish_completed_download(
+                                new_file,
+                                move_result == controller.MoveFromStagingResult.COMPLETED or
+                                new_file.file_id in persist.final_move_succeeded_file_names,
+                            )
+
+                # A pending file often has no subsequent model diff. Drive its
+                # retry budget from the durable pending identity instead of
+                # relying on incidental scan changes.
+                for file_name, path_pair_id, _ in list(controller._Controller__pending_completion_file_names):
+                    file_id = ModelFile.build_file_id(file_name, path_pair_id)
+                    if file_id in attempted_move_file_ids:
+                        continue
+                    failure_count = persist.move_failure_counts.get(file_id, 0)
+                    if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
+                        failure_count <= 0
+                        and file_id not in controller._Controller__deferred_move_file_ids
+                    ):
+                        continue
+                    retry_due = controller._Controller__move_retry_due.get(file_id)
+                    if retry_due is not None and datetime.now() < retry_due:
+                        continue
+                    try:
+                        pending_file = new_model.get_file(file_id)
+                    except ModelError:
+                        continue
+                    move_result = run_reserved_automatic_move(pending_file)
+                    if move_result is None:
+                        continue
+                    if move_result in (
+                        controller.MoveFromStagingResult.COMPLETED,
+                        controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                    ):
+                        publish_completed_download(
+                            pending_file,
+                            move_result == controller.MoveFromStagingResult.COMPLETED or
+                            pending_file.file_id in persist.final_move_succeeded_file_names,
+                        )
+                    elif move_result == controller.MoveFromStagingResult.NO_MOVE_APPLICABLE:
+                        publish_completed_download(pending_file, False)
+                    elif move_result == controller.MoveFromStagingResult.FAILED:
+                        keep_completion_pending_after_failed_staging_move(pending_file, True)
+                    else:
+                        keep_completion_pending_after_failed_staging_move(pending_file, False)
 
                 current_auto_purge_candidate_ids = set()
                 for diff in model_diff:
@@ -670,6 +838,24 @@ class ModelUpdater:
                 active_model_names = set(model.get_file_names())
                 active_model_ids = set(model.get_file_ids())
                 if remote_reconciliation_established:
+                    pending_ids = pending_completion_file_ids()
+                    stale_move_failure_ids = {
+                        file_id for file_id in persist.move_failure_counts
+                        if file_id not in active_model_ids and file_id not in pending_ids
+                    }
+                    if stale_move_failure_ids:
+                        for file_id in stale_move_failure_ids:
+                            persist.move_failure_counts.pop(file_id, None)
+                            controller._Controller__move_retry_due.pop(file_id, None)
+                            controller._Controller__deferred_move_file_ids.discard(file_id)
+                        with controller._Controller__move_attempt_lock:
+                            controller._Controller__move_attempt_reservations.difference_update(
+                                stale_move_failure_ids
+                            )
+                        model_builder.set_move_failed_files({
+                            file_id for file_id, failures in persist.move_failure_counts.items()
+                            if failures >= controller._Controller__MAX_MOVE_FAILURES
+                        })
                     remove_downloaded_file_names = {
                         downloaded_file_name
                         for downloaded_file_name in persist.downloaded_file_names
@@ -680,6 +866,10 @@ class ModelUpdater:
                     if remove_downloaded_file_names:
                         controller.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                         persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
+                        persist.final_move_succeeded_file_names.difference_update(remove_downloaded_file_names)
+                        model_builder.set_final_move_succeeded_files(
+                            persist.final_move_succeeded_file_names
+                        )
                         if controller._Controller__is_target_archive_trace_enabled():  # type: ignore[attr-defined]
                             for downloaded_file_name in remove_downloaded_file_names:
                                 if controller._Controller__target_archive_trace_selector_matches_file(  # type: ignore[attr-defined]

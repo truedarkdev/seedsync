@@ -28,6 +28,7 @@ interface IViewFile {
     isLocallyDeletable: boolean;
     isRemotelyDeletable: boolean;
     isValidatable: boolean;
+    isMoveRetryable: boolean;
     // timestamps
     localCreatedTimestamp: Date;
     localModifiedTimestamp: Date;
@@ -62,6 +63,7 @@ const DefaultViewFile: IViewFile = {
     isLocallyDeletable: null,
     isRemotelyDeletable: null,
     isValidatable: null,
+    isMoveRetryable: null,
     localCreatedTimestamp: null,
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
@@ -99,6 +101,7 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     isLocallyDeletable: boolean;
     isRemotelyDeletable: boolean;
     isValidatable: boolean;
+    isMoveRetryable: boolean;
     localCreatedTimestamp: Date;
     localModifiedTimestamp: Date;
     remoteCreatedTimestamp: Date;
@@ -124,6 +127,8 @@ export module ViewFile {
         EXTRACTED       = <any> "extracted",
         VALIDATING      = <any> "validating",
         VALIDATED       = <any> "validated",
-        CORRUPT         = <any> "corrupt"
+        CORRUPT         = <any> "corrupt",
+        MOVE_FAILED     = <any> "move_failed",
+        MOVE_SUCCEEDED  = <any> "move_succeeded"
     }
 }

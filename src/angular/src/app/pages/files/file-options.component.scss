@@ -137,6 +137,12 @@
             &.stopped {
                 width: 13px;
             }
+            &.move-succeeded,
+            &.move-failed {
+                flex: 0 0 40px;
+                width: 40px;
+                height: 40px;
+            }
         }
     }
 }

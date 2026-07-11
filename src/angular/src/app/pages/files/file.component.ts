@@ -49,6 +49,7 @@ export class FileComponent implements OnChanges {
     @Output() deleteLocalEvent = new EventEmitter<ViewFile>();
     @Output() deleteRemoteEvent = new EventEmitter<ViewFile>();
     @Output() validateEvent = new EventEmitter<ViewFile>();
+    @Output() retryMoveEvent = new EventEmitter<ViewFile>();
     @Output() toggleSelectionEvent = new EventEmitter<ViewFile>();
 
     // Indicates an active action on-going
@@ -134,6 +135,10 @@ export class FileComponent implements OnChanges {
 
     isValidatable() {
         return this.activeAction == null && this.file != null && this.file.isValidatable;
+    }
+
+    isMoveRetryable() {
+        return this.activeAction == null && this.file != null && this.file.isMoveRetryable;
     }
 
     getValidateTooltip() {
@@ -232,6 +237,14 @@ export class FileComponent implements OnChanges {
         this.validateEvent.emit(file);
     }
 
+    onRetryMove(file: ViewFile) {
+        if (!this.isMoveRetryable() || file == null) {
+            return;
+        }
+        this.activeAction = FileAction.RETRY_MOVE;
+        this.retryMoveEvent.emit(file);
+    }
+
     // Late async callbacks can arrive after this row has been rebound, so only
     // clear when the row still represents the same file and in-flight action.
     resetActiveAction(forFile?: ViewFile, forAction?: FileAction): void {
@@ -272,5 +285,6 @@ export enum FileAction {
     EXTRACT,
     DELETE_LOCAL,
     DELETE_REMOTE,
-    VALIDATE
+    VALIDATE,
+    RETRY_MOVE
 }

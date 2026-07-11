@@ -31,7 +31,9 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
         [ViewFile.Status.DOWNLOADED]: 0,
         [ViewFile.Status.DOWNLOADING]: 0,
         [ViewFile.Status.QUEUED]: 0,
-        [ViewFile.Status.STOPPED]: 0
+        [ViewFile.Status.STOPPED]: 0,
+        [ViewFile.Status.MOVE_FAILED]: 0,
+        [ViewFile.Status.MOVE_SUCCEEDED]: 0
     };
 
     public options: Observable<ViewFileOptions>;
@@ -70,6 +72,12 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
             );
             this.statusCounts[ViewFile.Status.STOPPED] = FileOptionsComponent.getStatusCount(
                 files, ViewFile.Status.STOPPED
+            );
+            this.statusCounts[ViewFile.Status.MOVE_FAILED] = FileOptionsComponent.getStatusCount(
+                files, ViewFile.Status.MOVE_FAILED
+            );
+            this.statusCounts[ViewFile.Status.MOVE_SUCCEEDED] = FileOptionsComponent.getStatusCount(
+                files, ViewFile.Status.MOVE_SUCCEEDED
             );
             this._changeDetector.detectChanges();
         });

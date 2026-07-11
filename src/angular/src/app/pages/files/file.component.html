@@ -23,6 +23,9 @@
             <img src="assets/icons/downloaded.svg" id="downloaded"
                  *ngIf="file.status === ViewFile.Status.DOWNLOADED"
                  alt="" aria-hidden="true" />
+            <img src="assets/icons/move-succeeded.png" id="move-succeeded"
+                 *ngIf="file.status === ViewFile.Status.MOVE_SUCCEEDED"
+                 alt="" aria-hidden="true" />
             <img src="assets/icons/stopped.svg" id="stopped"
                  *ngIf="file.status === ViewFile.Status.STOPPED"
                  alt="" aria-hidden="true" />
@@ -44,9 +47,18 @@
             <img src="assets/icons/corrupt.svg" id="corrupt"
                  *ngIf="file.status === ViewFile.Status.CORRUPT"
                  alt="" aria-hidden="true" />
+            <img src="assets/icons/move-failed.png" id="move-failed"
+                 *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
+                 alt="" aria-hidden="true" />
             <!-- don't show text for default status unless the file is local-only -->
-            <span *ngIf="file.status != ViewFile.Status.DEFAULT"
+            <span *ngIf="file.status != ViewFile.Status.DEFAULT &&
+                         file.status != ViewFile.Status.MOVE_FAILED &&
+                         file.status != ViewFile.Status.MOVE_SUCCEEDED"
                   class="text">{{file.status | capitalize}}</span>
+            <span *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
+                  class="text move-failed-text">Final move failed</span>
+            <span *ngIf="file.status === ViewFile.Status.MOVE_SUCCEEDED"
+                  class="text">Move succeeded</span>
             <span *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize === 0 && file.localSize > 0"
                   class="text">Local Only</span>
         </div>
@@ -119,6 +131,17 @@
 
     <!-- actions div, visible on selection -->
     <div class="actions" *ngIf="showActions">
+        <button *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
+             type="button" class="button" appClickStopPropagation
+             title="Retry the final move to the local destination"
+             [disabled]="!isMoveRetryable()"
+             [class.disabled]="!isMoveRetryable()"
+             (click)="onRetryMove(file)"
+             [class.loading]="activeAction == FileAction.RETRY_MOVE">
+            <div class="loader"></div>
+            <img src="assets/icons/refresh.svg" alt="" aria-hidden="true" />
+            <div class="text"><span>Retry Move</span></div>
+        </button>
         <button type="button" class="button" appClickStopPropagation
              [disabled]="!isQueueable()"
              [class.disabled]="!isQueueable()"

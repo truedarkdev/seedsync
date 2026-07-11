@@ -26,6 +26,9 @@ class MockViewFileService {
     deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
         of(new WebReaction(true, "ok", null))
     );
+    retryMove = jasmine.createSpy("retryMove").and.returnValue(
+        of(new WebReaction(true, "ok", null))
+    );
     setPageSize = jasmine.createSpy("setPageSize");
     prevPage = jasmine.createSpy("prevPage");
     nextPage = jasmine.createSpy("nextPage");
@@ -194,6 +197,19 @@ describe("Testing file list component", () => {
 
         expect(mockViewFileService.deleteLocal).toHaveBeenCalled();
         expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.DELETE_LOCAL);
+    });
+
+    it("should clear retry move loading on success and error", () => {
+        const file = createViewFile();
+
+        component.onRetryMove(file);
+        expect(mockViewFileService.retryMove).toHaveBeenCalledWith(file);
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.RETRY_MOVE);
+
+        (mockFileComponent.resetActiveAction as jasmine.Spy).calls.reset();
+        mockViewFileService.retryMove.and.returnValue(throwError("boom"));
+        component.onRetryMove(file);
+        expect(mockFileComponent.resetActiveAction).toHaveBeenCalledWith(file, FileAction.RETRY_MOVE);
     });
 
     it("should switch Smart Status to Status Reverse when the status header is clicked", () => {

@@ -172,6 +172,55 @@ describe("Testing view file service", () => {
         expect(count).toBe(1);
     }));
 
+    it("should expose only retry move and reliable local delete for move failed", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("movie", new ModelFile({
+            file_id: "movie",
+            name: "movie",
+            state: ModelFile.State.MOVE_FAILED,
+            local_size: 100,
+            remote_size: 100,
+            is_stoppable: true,
+            is_extractable: true
+        })));
+        tick();
+
+        let file: ViewFile = null;
+        viewService.files.subscribe(files => file = files.get(0));
+        tick();
+
+        expect(file.status).toBe(ViewFile.Status.MOVE_FAILED);
+        expect(file.isMoveRetryable).toBe(true);
+        expect(file.isLocallyDeletable).toBe(true);
+        expect(file.isQueueable).toBe(false);
+        expect(file.isStoppable).toBe(false);
+        expect(file.isExtractable).toBe(false);
+        expect(file.isRemotelyDeletable).toBe(false);
+        expect(file.isValidatable).toBe(false);
+    }));
+
+    it("should refine only ordinary downloaded state to final move succeeded", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>()
+            .set("downloaded", new ModelFile({
+                file_id: "downloaded", name: "downloaded", state: ModelFile.State.DOWNLOADED,
+                final_move_succeeded: true, local_size: 100, remote_size: 100
+            }))
+            .set("validated", new ModelFile({
+                file_id: "validated", name: "validated", state: ModelFile.State.VALIDATED,
+                final_move_succeeded: true, local_size: 100, remote_size: 100
+            })));
+        tick();
+
+        let files: Immutable.List<ViewFile> = null;
+        viewService.files.subscribe(value => files = value);
+        tick();
+
+        expect(files.find(file => file.fileId === "downloaded").status)
+            .toBe(ViewFile.Status.MOVE_SUCCEEDED);
+        expect(files.find(file => file.fileId === "validated").status)
+            .toBe(ViewFile.Status.VALIDATED);
+        expect(files.find(file => file.fileId === "downloaded").isMoveRetryable).toBe(false);
+    }));
+
     it("should prefer transferred size for active downloads", fakeAsync(() => {
         const testVectors = [
             {

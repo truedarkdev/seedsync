@@ -68,6 +68,35 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(original_real_propagate, real_model_builder_propagate)
         self.assertFalse(any(record.name.startswith("dummy.Model") for record in captured_records))
 
+    def test_move_failed_overlay_is_canonical_pair_scoped_and_last(self):
+        movies = SystemFile("same.mkv", 100, False)
+        movies.path_pair_id = "movies"
+        tv = SystemFile("same.mkv", 100, False)
+        tv.path_pair_id = "tv"
+        movies_id = ModelFile.build_file_id("same.mkv", "movies")
+        tv_id = ModelFile.build_file_id("same.mkv", "tv")
+        self.model_builder.set_local_files([movies, tv])
+        self.model_builder.set_downloaded_files({movies_id, tv_id})
+        self.model_builder.set_extracted_files({movies_id, tv_id})
+        self.model_builder.set_move_failed_files({movies_id})
+
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.MOVE_FAILED, model.get_file(movies_id).state)
+        self.assertEqual(ModelFile.State.EXTRACTED, model.get_file(tv_id).state)
+
+    def test_move_failed_overlay_survives_remote_absence_and_rebuild(self):
+        local = SystemFile("movie.mkv", 100, False)
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_move_failed_files({"movie.mkv"})
+
+        first = self.model_builder.build_model()
+        self.model_builder.request_rebuild()
+        second = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.MOVE_FAILED, first.get_file("movie.mkv").state)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, second.get_file("movie.mkv").state)
+
     def __build_test_model_children_tree_1(self) -> Model:
         """Build a test model for children testing"""
         self.model_builder.clear()

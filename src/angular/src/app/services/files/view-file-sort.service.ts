@@ -259,6 +259,8 @@ const getRemoteCreatedTimestampValue = (file: ViewFile): number => {
 const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
     if (a.status !== b.status) {
         const statusPriorities = {
+            [ViewFile.Status.MOVE_FAILED]: -1,
+            [ViewFile.Status.MOVE_SUCCEEDED]: 7,
             [ViewFile.Status.CORRUPT]: 0,
             [ViewFile.Status.EXTRACTING]: 1,
             [ViewFile.Status.VALIDATING]: 2,
@@ -281,6 +283,8 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
 const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
     if (a.status !== b.status) {
         const statusPriorities = {
+            [ViewFile.Status.MOVE_FAILED]: -1,
+            [ViewFile.Status.MOVE_SUCCEEDED]: 7,
             [ViewFile.Status.CORRUPT]: 0,
             [ViewFile.Status.EXTRACTING]: 1,
             [ViewFile.Status.VALIDATING]: 2,
