@@ -80,6 +80,23 @@ class TestNotificationService(unittest.TestCase):
         self.assertEqual("release/file.mkv", event.file_name)
         self.assertTrue(self.service._queue.empty())
 
+    @patch("controller.notifier.validate_webhook_url")
+    def test_download_started_uses_dedicated_provider_neutral_event(self, _validate):
+        file = ModelFile("release/file.mkv", False)
+        self.config.notifications.download_start = True
+        self.service.reconfigure(self.config)
+
+        self.service.download_started(file)
+
+        event = self.service._queue.get_nowait()
+        self.assertEqual("download_start", event.event_type)
+        self.assertEqual("release/file.mkv", event.payload()["file"]["name"])
+
+    def test_download_started_is_disabled_by_default(self):
+        self.service.download_started(ModelFile("release/file.mkv", False))
+
+        self.assertTrue(self.service._queue.empty())
+
     def test_queue_drops_newest_when_full(self):
         event = NotificationEvent.create("download_complete", ModelFile("a", False))
         self.assertTrue(self.service.enqueue(event))
@@ -165,7 +182,7 @@ class TestWebhookProvider(unittest.TestCase):
         response = Mock(status=204)
         connection_cls.return_value.getresponse.return_value = response
         event = NotificationEvent("download_complete", "movie.mkv", None, None, "event-id", "2026-01-01T00:00:00.000Z")
-        settings = WebhookSettings(True, "https://hooks.example.test/hook?q=opaque", "secret", False, True, True, True)
+        settings = WebhookSettings(True, "https://hooks.example.test/hook?q=opaque", "secret", False, False, True, True, True)
 
         WebhookProvider().deliver(event, settings)
 
@@ -182,7 +199,7 @@ class TestWebhookProvider(unittest.TestCase):
         validate.return_value = ("https", "hooks.example.test", 443, "/hook", "93.184.216.34")
         connection_cls.return_value.getresponse.return_value = Mock(status=302)
         event = NotificationEvent("download_complete", "movie.mkv", None, None, "event-id", "2026-01-01T00:00:00.000Z")
-        settings = WebhookSettings(True, "https://hooks.example.test/hook", "", False, True, True, True)
+        settings = WebhookSettings(True, "https://hooks.example.test/hook", "", False, False, True, True, True)
 
         with self.assertRaises(NotificationError):
             WebhookProvider().deliver(event, settings)
@@ -196,7 +213,7 @@ class TestWebhookProvider(unittest.TestCase):
         validate.return_value = ("https", "hooks.example.test", 443, "/hook", "93.184.216.34")
         connection_cls.return_value.getresponse.side_effect = [Mock(status=503), Mock(status=204)]
         event = NotificationEvent("download_complete", "movie.mkv", None, None, "event-id", "2026-01-01T00:00:00.000Z")
-        settings = WebhookSettings(True, "https://hooks.example.test/hook", "", False, True, True, True)
+        settings = WebhookSettings(True, "https://hooks.example.test/hook", "", False, False, True, True, True)
 
         WebhookProvider().deliver(event, settings)
 
@@ -208,7 +225,7 @@ class TestWebhookProvider(unittest.TestCase):
 class TestAppriseProvider(unittest.TestCase):
     def settings(self, tag=""):
         return WebhookSettings(
-            True, "", "", False, True, True, True,
+            True, "", "", False, True, True, True, True,
             provider="apprise",
             apprise_url="https://apprise.example.test/notify/private-key",
             apprise_tag=tag,
@@ -217,6 +234,7 @@ class TestAppriseProvider(unittest.TestCase):
     def test_payload_maps_all_supported_events_without_seed_sync_paths(self):
         expected = {
             "test": ("info", "Test notification"),
+            "download_start": ("info", "Download started"),
             "download_complete": ("success", "Download complete"),
             "extraction_complete": ("success", "Extraction complete"),
             "delete_complete": ("success", "Remote delete complete"),

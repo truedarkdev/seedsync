@@ -21,6 +21,7 @@ class TestNotificationsAdminHandler(unittest.TestCase):
             "enabled": True, "provider": "webhook", "webhook_url_configured": True,
             "hmac_secret_configured": True, "allow_private_networks": False,
             "apprise_url_configured": False, "apprise_tag": "",
+            "download_start": False,
             "download_complete": True, "extraction_complete": True, "delete_complete": True,
         }
         self.context = Mock()
@@ -56,7 +57,7 @@ class TestNotificationsAdminHandler(unittest.TestCase):
         response = self.app.post_json(
             "/server/admin/notifications/v1/config",
             {"enabled": True, "webhook_url": "https://hooks.example.test/x", "hmac_secret": "secret",
-             "allow_private_networks": False, "download_complete": True,
+             "allow_private_networks": False, "download_start": True, "download_complete": True,
              "extraction_complete": True, "delete_complete": True},
             extra_environ=self.headers(self.admin),
         )
@@ -64,6 +65,7 @@ class TestNotificationsAdminHandler(unittest.TestCase):
         self.assertNotIn("hooks.example", response.text)
         self.assertNotIn('"hmac_secret":', response.text)
         self.assertEqual("secret", self.config.notifications.hmac_secret)
+        self.assertTrue(self.config.notifications.download_start)
         self.notifier.reconfigure.assert_called_once_with(self.config)
 
     def test_write_scope_and_cross_origin_are_rejected(self):
@@ -103,7 +105,8 @@ class TestNotificationsAdminHandler(unittest.TestCase):
             {"enabled": True, "provider": "apprise",
              "apprise_url": "https://apprise.example.test/notify/private-key",
              "apprise_tag": "seedbox", "allow_private_networks": False,
-             "download_complete": True, "extraction_complete": True, "delete_complete": True},
+             "download_start": False, "download_complete": True,
+             "extraction_complete": True, "delete_complete": True},
             extra_environ=self.headers(self.admin),
         )
         self.assertEqual(200, response.status_int)

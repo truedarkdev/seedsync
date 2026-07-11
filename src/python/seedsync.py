@@ -179,6 +179,7 @@ class Seedsync:
         )
 
         controller.add_model_listener(notifier)
+        controller.add_download_start_listener(notifier.download_started)
         controller.add_remote_delete_success_listener(notifier.remote_delete_completed)
         notifier.start()
 
@@ -241,6 +242,7 @@ class Seedsync:
             self._log_shutdown_cause(e)
 
             controller.remove_model_listener(notifier)
+            controller.remove_download_start_listener(notifier.download_started)
             controller.remove_remote_delete_success_listener(notifier.remote_delete_completed)
             notifier.stop()
 

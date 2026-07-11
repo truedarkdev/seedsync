@@ -23,6 +23,7 @@ describe("Testing config record initialization", () => {
         expect(notificationsConfig.notifications.provider).toBe("apprise");
         expect(notificationsConfig.notifications.apprise_url_configured).toBeTrue();
         expect(notificationsConfig.notifications.apprise_tag).toBe("seedbox");
+        expect(notificationsConfig.notifications.download_start).toBeFalse();
         expect((notificationsConfig.notifications as any).webhook_url).toBeUndefined();
         expect((notificationsConfig.notifications as any).hmac_secret).toBeUndefined();
         expect((notificationsConfig.notifications as any).apprise_url).toBeUndefined();
@@ -151,6 +152,7 @@ describe("Testing config record initialization", () => {
         expect(partialConfig.general.exclude_patterns).toBe("");
         expect(partialConfig.autoqueue.auto_delete_remote).toBe(false);
         expect(partialConfig.logging.log_format).toBe("standard");
+        expect(partialConfig.notifications.download_start).toBeFalse();
         expect(partialConfig.getValue("general", "log_level")).toBe("DEBUG");
         expect(partialConfig.getValue("general", "debug")).toBe(true);
         expect(partialConfig.getValue("general", "breadcrumb_trace_enabled")).toBe(null);

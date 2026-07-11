@@ -156,6 +156,7 @@ export interface INotifications {
     apprise_url_configured: boolean;
     apprise_tag: string;
     allow_private_networks: boolean;
+    download_start: boolean;
     download_complete: boolean;
     extraction_complete: boolean;
     delete_complete: boolean;
@@ -168,6 +169,7 @@ const DefaultNotifications: INotifications = {
     apprise_url_configured: false,
     apprise_tag: "",
     allow_private_networks: false,
+    download_start: false,
     download_complete: true,
     extraction_complete: true,
     delete_complete: true,

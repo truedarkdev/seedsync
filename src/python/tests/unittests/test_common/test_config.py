@@ -1087,6 +1087,7 @@ class TestConfig(unittest.TestCase):
             apprise_url =
             apprise_tag =
             allow_private_networks = False
+            download_start = False
             download_complete = True
             extraction_complete = True
             delete_complete = True

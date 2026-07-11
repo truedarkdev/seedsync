@@ -14,6 +14,7 @@ class MockConfigService {
         apprise_url_configured: true,
         apprise_tag: "seedbox",
         allow_private_networks: false,
+        download_start: true,
         download_complete: true,
         extraction_complete: true,
         delete_complete: true,
@@ -53,9 +54,11 @@ describe("Testing notification settings component", () => {
 
         const update = service.update.calls.mostRecent().args[0];
         expect(update.provider).toBe("webhook");
+        expect(update.download_start).toBeTrue();
         expect(update.webhook_url).toBeUndefined();
         expect(update.hmac_secret).toBeUndefined();
         expect(update.apprise_url).toBeUndefined();
+        expect(fixture.nativeElement.textContent).toContain("Download started");
     });
 
     it("sends explicit replacements and invokes the test action", () => {
