@@ -535,4 +535,21 @@ describe("Testing view file sort service", () => {
             new ViewFile({name: "present", eta: 100})
         )).toBeGreaterThan(0);
     }));
+
+    it("puts move failed first in smart status without disturbing ordinary ties", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
+        }));
+        tick();
+
+        const failed = new ViewFile({name: "failed", status: ViewFile.Status.MOVE_FAILED});
+        const corrupt = new ViewFile({name: "corrupt", status: ViewFile.Status.CORRUPT});
+        const downloadedA = new ViewFile({name: "a", status: ViewFile.Status.DOWNLOADED});
+        const downloadedB = new ViewFile({name: "b", status: ViewFile.Status.DOWNLOADED});
+        const moved = new ViewFile({name: "moved", status: ViewFile.Status.MOVE_SUCCEEDED});
+
+        expect(sortComparator(failed, corrupt)).toBeLessThan(0);
+        expect(sortComparator(downloadedA, downloadedB)).toBeLessThan(0);
+        expect(sortComparator(moved, downloadedA)).toBeGreaterThan(0);
+    }));
 });

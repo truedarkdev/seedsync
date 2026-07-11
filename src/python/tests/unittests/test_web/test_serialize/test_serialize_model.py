@@ -10,6 +10,23 @@ from model import ModelFile
 
 
 class TestSerializeModel(unittest.TestCase):
+    def test_move_failed_state(self):
+        file = ModelFile("movie.mkv", False)
+        file.state = ModelFile.State.MOVE_FAILED
+
+        data = json.loads(parse_stream(SerializeModel().model([file]))["data"])
+
+        self.assertEqual("move_failed", data[0]["state"])
+
+    def test_final_move_succeeded_is_additive_metadata(self):
+        file = ModelFile("movie.mkv", False)
+        file.state = ModelFile.State.DOWNLOADED
+        file.final_move_succeeded = True
+
+        data = json.loads(parse_stream(SerializeModel().model([file]))["data"])
+
+        self.assertEqual("downloaded", data[0]["state"])
+        self.assertIs(True, data[0]["final_move_succeeded"])
     def test_event_names(self):
         serialize = SerializeModel()
         out = parse_stream(serialize.model([]))

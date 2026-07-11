@@ -176,6 +176,13 @@ export class FileListComponent implements OnInit, OnDestroy {
         });
     }
 
+    onRetryMove(file: ViewFile) {
+        this.viewFileService.retryMove(file).subscribe({
+            next: () => this.resetFileLoading(file, FileAction.RETRY_MOVE),
+            error: () => this.resetFileLoading(file, FileAction.RETRY_MOVE),
+        });
+    }
+
     onPageSizeChange(newSize: number | string): void {
         const pageSize = +newSize;
         if (Number.isNaN(pageSize)) {

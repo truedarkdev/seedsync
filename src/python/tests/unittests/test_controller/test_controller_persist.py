@@ -10,6 +10,35 @@ from controller.persist_keys import KEY_SEP, persist_key, strip_persist_key
 
 
 class TestControllerPersist(unittest.TestCase):
+    def test_move_failure_counts_round_trip_and_missing_key_is_backward_compatible(self):
+        file_id = '["movies","movie.mkv"]'
+        persist = ControllerPersist()
+        persist.move_failure_counts[file_id] = 4
+
+        restored = ControllerPersist.from_str(persist.to_str())
+        legacy = ControllerPersist.from_str('{"downloaded": [], "extracted": []}')
+
+        self.assertEqual({file_id: 4}, restored.move_failure_counts)
+        self.assertEqual({}, legacy.move_failure_counts)
+
+    def test_final_move_succeeded_round_trip_and_missing_key_is_backward_compatible(self):
+        file_id = '["movies","movie.mkv"]'
+        persist = ControllerPersist()
+        persist.final_move_succeeded_file_names.add(file_id)
+
+        restored = ControllerPersist.from_str(persist.to_str())
+        legacy = ControllerPersist.from_str('{"downloaded": [], "extracted": []}')
+
+        self.assertEqual({file_id}, restored.final_move_succeeded_file_names)
+        self.assertEqual(set(), legacy.final_move_succeeded_file_names)
+
+    def test_move_failure_counts_drops_invalid_entries(self):
+        restored = ControllerPersist.from_str(
+            '{"downloaded": [], "extracted": [], "move_failure_counts": '
+            '{"valid": 3, "negative": -1, "too_large": 5, "boolean": true, "text": "4"}}'
+        )
+
+        self.assertEqual({"valid": 3}, restored.move_failure_counts)
     def test_from_str(self):
         content = """
         {

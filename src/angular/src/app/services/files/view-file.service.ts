@@ -115,6 +115,7 @@ export class ViewFileService {
             // For layout/style testing
             this.buildViewFromModelFiles(MOCK_MODEL_FILES);
         }
+
     }
 
     private static getViewFileKey(file: ViewFile): string {
@@ -411,6 +412,10 @@ export class ViewFileService {
         return this.createAction(file, (f) => this.modelFileService.validate(f));
     }
 
+    public retryMove(file: ViewFile): Observable<WebReaction> {
+        return this.createAction(file, (f) => this.modelFileService.retryMove(f));
+    }
+
     /**
      * Set a new filter criteria
      * @param {ViewFileFilterCriteria} criteria
@@ -529,6 +534,16 @@ export class ViewFileService {
                 status = ViewFile.Status.CORRUPT;
                 break;
             }
+            case ModelFile.State.MOVE_FAILED: {
+                status = ViewFile.Status.MOVE_FAILED;
+                break;
+            }
+        }
+
+        // Final-move success is a presentation refinement of ordinary
+        // downloaded state. More-specific terminal states keep precedence.
+        if (status === ViewFile.Status.DOWNLOADED && modelFile.final_move_succeeded === true) {
+            status = ViewFile.Status.MOVE_SUCCEEDED;
         }
 
         const isQueueable: boolean = [ViewFile.Status.DEFAULT,
@@ -542,29 +557,35 @@ export class ViewFileService {
         const isExtractable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
+                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED].includes(status)
                                     && localSize > 0;
         const isLocallyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
+                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED,
-                                    ViewFile.Status.CORRUPT].includes(status)
+                                    ViewFile.Status.CORRUPT,
+                                    ViewFile.Status.MOVE_FAILED].includes(status)
                                     && localSize > 0;
         const isRemotelyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
+                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.DELETED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)
                                     && remoteSize > 0;
         const isValidatable: boolean = [ViewFile.Status.DOWNLOADED,
+                                    ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)
                                     && localSize > 0 && remoteSize > 0;
+        const isMoveRetryable = status === ViewFile.Status.MOVE_FAILED;
 
         return new ViewFile({
             fileId: modelFile.file_id,
@@ -589,6 +610,7 @@ export class ViewFileService {
             isLocallyDeletable: isLocallyDeletable,
             isRemotelyDeletable: isRemotelyDeletable,
             isValidatable: isValidatable,
+            isMoveRetryable: isMoveRetryable,
             localCreatedTimestamp: modelFile.local_created_timestamp,
             localModifiedTimestamp: modelFile.local_modified_timestamp,
             remoteCreatedTimestamp: modelFile.remote_created_timestamp,

@@ -57,6 +57,23 @@ describe("Testing model file service", () => {
         httpMock.verify();
     });
 
+    it("should send retry move with an encoded canonical file_id", () => {
+        const file = new ModelFile({
+            file_id: "[\"movies\",\"File One & Two.mkv\"]",
+            name: "File One & Two.mkv"
+        });
+
+        modelFileService.retryMove(file).subscribe(DoNothing);
+
+        const request = httpMock.expectOne(
+            "/server/command/retry_move/File%2520One%2520%2526%2520Two.mkv" +
+            "?file_id=%5B%22movies%22%2C%22File%20One%20%26%20Two.mkv%22%5D"
+        );
+        expect(request.request.method).toBe("POST");
+        request.flush("ok");
+        httpMock.verify();
+    });
+
     it("should send correct model on an init event", fakeAsync(() => {
         let count = 0;
         let latestModel: Immutable.Map<string, ModelFile> = null;

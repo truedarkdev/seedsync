@@ -29,6 +29,7 @@ class ModelFile:
         VALIDATING = 7
         VALIDATED = 8
         CORRUPT = 9
+        MOVE_FAILED = 10
 
     def __init__(self, name: str, is_dir: bool):
         self.__name = name  # file or folder name
@@ -49,6 +50,7 @@ class ModelFile:
         self.__validation_progress = None
         self.__validation_error = None
         self.__corrupt_chunks = None
+        self.__final_move_succeeded = False
         # timestamp of the latest update
         # Note: timestamp is not part of equality operator
         self.__update_timestamp = datetime.now()
@@ -289,6 +291,16 @@ class ModelFile:
         if type(corrupt_chunks) != list or not all(type(chunk) == int and chunk >= 0 for chunk in corrupt_chunks):
             raise TypeError
         self.__corrupt_chunks = copy.copy(corrupt_chunks)
+
+    @property
+    def final_move_succeeded(self) -> bool:
+        return self.__final_move_succeeded
+
+    @final_move_succeeded.setter
+    def final_move_succeeded(self, value: bool):
+        if type(value) is not bool:
+            raise TypeError
+        self.__final_move_succeeded = value
 
     @property
     def full_path(self) -> str:

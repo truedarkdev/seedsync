@@ -57,7 +57,8 @@ function createViewFile(props: any = {}): ViewFile {
         isExtractable: props.isExtractable || false,
         isLocallyDeletable: props.isLocallyDeletable || false,
         isRemotelyDeletable: props.isRemotelyDeletable || false,
-        isValidatable: props.isValidatable || false
+        isValidatable: props.isValidatable || false,
+        isMoveRetryable: props.isMoveRetryable || false
     });
 }
 
@@ -243,6 +244,60 @@ describe("Testing file component", () => {
 
         expect(component.activeAction).toBe(FileAction.VALIDATE);
         expect(validateSpy).toHaveBeenCalledWith(component.file);
+    });
+
+    it("should suppress duplicate retry move clicks while loading", () => {
+        const retrySpy = spyOn(component.retryMoveEvent, "emit");
+        component.file = createViewFile({
+            status: ViewFile.Status.MOVE_FAILED,
+            isMoveRetryable: true
+        });
+
+        component.onRetryMove(component.file);
+        component.onRetryMove(component.file);
+
+        expect(component.activeAction).toBe(FileAction.RETRY_MOVE);
+        expect(retrySpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("should render Retry Move with the existing refresh action icon", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.MOVE_FAILED,
+            isMoveRetryable: true
+        });
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const icon = fixture.debugElement.query(
+            By.css('button[title="Retry the final move to the local destination"] img')
+        ).nativeElement as HTMLImageElement;
+        expect(icon.getAttribute("src")).toBe("assets/icons/refresh.svg");
+        expect(fixture.debugElement.query(By.css("img#move-failed")).attributes["src"])
+            .toBe("assets/icons/move-failed.png");
+    });
+
+    it("should render approved final move status icons", () => {
+        fixture.componentInstance.file = createViewFile({status: ViewFile.Status.MOVE_SUCCEEDED});
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+        expect(fixture.debugElement.query(By.css("img#move-succeeded")).attributes["src"])
+            .toBe("assets/icons/move-succeeded.png");
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.nativeElement.textContent).toContain("Move succeeded");
+        expect(status.nativeElement.textContent).not.toContain("Final move succeeded");
+        const style = getComputedStyle(
+            fixture.debugElement.query(By.css("img#move-succeeded")).nativeElement
+        );
+        expect(style.width).toBe("72px");
+        expect(style.height).toBe("72px");
+        expect(style.flexShrink).toBe("0");
+        expect(
+            fixture.debugElement.query(By.css("img#move-succeeded")).nativeElement.getBoundingClientRect().width
+        ).toBe(72);
+        expect(style.marginTop).toBe("-16px");
+        expect(style.marginBottom).toBe("-12px");
     });
 
     it("should clear the active action when resetActiveAction is called", () => {

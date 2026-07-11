@@ -61,6 +61,8 @@ class ModelBuilder:
         self.__extracted_files = set()
         self.__stopped_files = set()
         self.__validation_statuses = dict()
+        self.__move_failed_files = set()
+        self.__final_move_succeeded_files = set()
         self.__local_root_paths = dict()
         self.__local_staging_paths = dict()
         self.__suppressed_ambiguous_extracted_file_names = set()
@@ -1063,6 +1065,18 @@ class ModelBuilder:
         if self.__stopped_files != prev_stopped_files:
             self.__cached_model = None
 
+    def set_move_failed_files(self, move_failed_files: Set[str]):
+        previous = self.__move_failed_files
+        self.__move_failed_files = set(move_failed_files)
+        if self.__move_failed_files != previous:
+            self.__cached_model = None
+
+    def set_final_move_succeeded_files(self, file_ids: Set[str]):
+        previous = self.__final_move_succeeded_files
+        self.__final_move_succeeded_files = set(file_ids)
+        if self.__final_move_succeeded_files != previous:
+            self.__cached_model = None
+
     def set_validation_statuses(self, validation_statuses: List[ValidateStatus]):
         prev_validation_statuses = self.__validation_statuses
         self.__validation_statuses = {status.file_id: status for status in validation_statuses}
@@ -1082,6 +1096,8 @@ class ModelBuilder:
         self.__extracted_files.clear()
         self.__stopped_files.clear()
         self.__validation_statuses.clear()
+        self.__move_failed_files.clear()
+        self.__final_move_succeeded_files.clear()
         self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__cached_model = None
 
@@ -1091,6 +1107,9 @@ class ModelBuilder:
         :return:
         """
         return self.__cached_model is None or self.__has_pending_recent_live_transfer_snapshots()
+
+    def request_rebuild(self):
+        self.__cached_model = None
 
     def build_model(self) -> Model:
         if self.__cached_model is not None and not self.__has_pending_recent_live_transfer_snapshots():
@@ -1759,6 +1778,7 @@ class ModelBuilder:
         return incomplete_children, arbitration_source
 
     def __determine_state(self, model_file: ModelFile, local: Optional[SystemFile], incomplete_children: bool):
+        model_file.final_move_succeeded = model_file.file_id in self.__final_move_succeeded_files
         self.__check_persist_authority(model_file, incomplete_children)
         self.__check_extracting(model_file)
 
@@ -1776,6 +1796,10 @@ class ModelBuilder:
                 model_file.state = ModelFile.State.EXTRACTED
 
         self.__check_validating(model_file)
+        # Terminal move failures are authoritative until an explicit local
+        # cleanup or a successful retry clears their canonical identity.
+        if model_file.file_id in self.__move_failed_files:
+            model_file.state = ModelFile.State.MOVE_FAILED
 
     def __check_persist_authority(self, model_file: ModelFile, _incomplete_children: bool):
         # next we check persisted markers for previously downloaded files

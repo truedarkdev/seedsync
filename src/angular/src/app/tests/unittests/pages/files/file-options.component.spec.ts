@@ -122,11 +122,22 @@ describe("Testing file options component", () => {
         viewFileService.emitFiles(Immutable.List([
             new ViewFile({status: ViewFile.Status.QUEUED}),
             new ViewFile({status: ViewFile.Status.QUEUED}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADING})
+            new ViewFile({status: ViewFile.Status.DOWNLOADING}),
+            new ViewFile({status: ViewFile.Status.MOVE_FAILED}),
+            new ViewFile({status: ViewFile.Status.MOVE_SUCCEEDED})
         ]));
 
         expect(component.getStatusCount(ViewFile.Status.QUEUED)).toBe(2);
         expect(component.getStatusCount(ViewFile.Status.DOWNLOADING)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.MOVE_FAILED)).toBe(1);
+        expect(component.getStatusCount(ViewFile.Status.MOVE_SUCCEEDED)).toBe(1);
+        const moveIcons = fixture.nativeElement.querySelectorAll(
+            '#filter-status img.move-succeeded, #filter-status img.move-failed'
+        );
+        expect(moveIcons.length).toBe(2);
+        expect(getComputedStyle(moveIcons[0]).width).toBe("40px");
+        expect(getComputedStyle(moveIcons[0]).height).toBe("40px");
+        expect(getComputedStyle(moveIcons[0]).flexShrink).toBe("0");
         expect(component.isStatusAvailable(ViewFile.Status.QUEUED)).toBe(true);
         expect(component.isStatusDisabled(ViewFile.Status.QUEUED)).toBe(false);
         expect(component.isStatusDisabled(ViewFile.Status.STOPPED)).toBe(true);
