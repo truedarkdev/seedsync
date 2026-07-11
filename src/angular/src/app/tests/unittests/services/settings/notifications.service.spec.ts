@@ -25,7 +25,7 @@ describe("Testing notifications service", () => {
             enabled: true, provider: "webhook" as const,
             webhook_url: "https://hooks.example.test/seed", hmac_secret: "new-secret",
             apprise_tag: "",
-            allow_private_networks: false, download_complete: true,
+            allow_private_networks: false, download_start: false, download_complete: true,
             extraction_complete: true, delete_complete: true,
         };
         service.update(update).subscribe();

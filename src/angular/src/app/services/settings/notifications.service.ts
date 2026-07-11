@@ -9,6 +9,7 @@ export interface NotificationConfigUpdate {
     enabled: boolean;
     provider: "webhook" | "apprise";
     allow_private_networks: boolean;
+    download_start: boolean;
     download_complete: boolean;
     extraction_complete: boolean;
     delete_complete: boolean;

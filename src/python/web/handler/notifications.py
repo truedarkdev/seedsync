@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 class NotificationsAdminHandler(IHandler):
     _BOOLEAN_FIELDS = (
-        "enabled", "allow_private_networks", "download_complete",
+        "enabled", "allow_private_networks", "download_start", "download_complete",
         "extraction_complete", "delete_complete",
     )
     _TEXT_FIELDS = ("provider", "apprise_tag")

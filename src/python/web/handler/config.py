@@ -29,7 +29,7 @@ class ConfigHandler(IHandler):
         "notifications": {
             "enabled", "provider", "webhook_url", "hmac_secret", "apprise_url", "apprise_tag",
             "allow_private_networks",
-            "download_complete", "extraction_complete", "delete_complete",
+            "download_start", "download_complete", "extraction_complete", "delete_complete",
         },
     }
     def __init__(self, config: Config, breadcrumb_trace_sync=None, lftp_reconfigure_request=None):

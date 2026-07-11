@@ -1,5 +1,5 @@
 <div class="notifications-settings" *ngIf="state">
-    <p class="notifications-intro">Send selected completion events through a Generic Webhook or Apprise API. Saved endpoint and signing secret values are never shown.</p>
+    <p class="notifications-intro">Send selected lifecycle events through a Generic Webhook or Apprise API. Saved endpoint and signing secret values are never shown.</p>
 
     <label class="check-row"><input type="checkbox" [(ngModel)]="enabled"> Enable notifications</label>
 
@@ -51,6 +51,7 @@
 
     <fieldset>
         <legend>Events</legend>
+        <label class="check-row"><input type="checkbox" [(ngModel)]="downloadStart"> Download started</label>
         <label class="check-row"><input type="checkbox" [(ngModel)]="downloadComplete"> Download complete</label>
         <label class="check-row"><input type="checkbox" [(ngModel)]="extractionComplete"> Extraction complete</label>
         <label class="check-row"><input type="checkbox" [(ngModel)]="deleteComplete"> Remote delete complete</label>

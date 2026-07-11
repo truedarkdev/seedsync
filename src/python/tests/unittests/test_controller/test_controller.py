@@ -16,7 +16,7 @@ from controller import Controller, ControllerPersist, ModelBuilder
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner
-from controller.controller import ControllerError
+from controller.controller import ControllerError, DownloadStartLifecycleEntry
 from controller.persist_keys import KEY_SEP
 from common import AppError, PathPairManager
 from common.path_pair import PathPair
@@ -60,6 +60,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_lock = MagicMock()
         self.controller._Controller__remote_delete_success_listeners = []
         self.controller._Controller__remote_delete_success_listeners_lock = Lock()
+        self.controller._Controller__download_start_listeners = []
+        self.controller._Controller__download_start_state = {}
+        self.controller._Controller__download_start_lock = Lock()
         self.controller._Controller__path_pair_refresh_lock = Lock()
         self.controller._Controller__path_pair_refresh_requested = False
         self.controller._Controller__path_pair_refresh_generation = 0
@@ -106,6 +109,172 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def test_download_start_lifecycle_confirms_running_once(self):
+        file = ModelFile("release", True)
+        listener = MagicMock()
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        queued = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file.name, "")
+        running = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "")
+
+        self.controller._confirm_fresh_healthy_download_starts([queued])
+        self.controller._confirm_fresh_healthy_download_starts([running])
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        listener.assert_called_once()
+        self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
+
+    def test_download_start_lifecycle_stop_suppresses_resume(self):
+        file = ModelFile("release", False)
+        listener = MagicMock()
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__suppress_download_start_lifecycle(file.file_id)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        running = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "")
+
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        listener.assert_not_called()
+        self.assertEqual("suppressed", self.controller._Controller__download_start_state[file.file_id].state)
+
+    def test_download_start_lifecycle_clear_allows_new_lifecycle(self):
+        file = ModelFile("release", False)
+        listener = MagicMock()
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        running = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "")
+
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._confirm_fresh_healthy_download_starts([running])
+        self.controller._clear_download_start_lifecycle(file.file_id)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        self.assertEqual(2, listener.call_count)
+
+    def test_download_start_lifecycle_keeps_path_pairs_independent(self):
+        movies = ModelFile("release", True)
+        movies.path_pair_id = "movies"
+        tv = ModelFile("release", True)
+        tv.path_pair_id = "tv"
+        listener = MagicMock()
+        self.controller._Controller__model.get_file.side_effect = lambda file_id: {
+            movies.file_id: movies,
+            tv.file_id: tv,
+        }[file_id]
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(movies.file_id)
+        self.controller._Controller__arm_download_start_lifecycle(tv.file_id)
+        movies_status = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, movies.name, ""
+        )
+        movies_status.path_pair_id = movies.path_pair_id
+
+        self.controller._confirm_fresh_healthy_download_starts([movies_status])
+
+        listener.assert_called_once()
+        self.assertEqual("notified", self.controller._Controller__download_start_state[movies.file_id].state)
+        self.assertEqual("eligible", self.controller._Controller__download_start_state[tv.file_id].state)
+
+    def test_download_start_completion_clears_terminal_states_without_retaining_completed_entries(self):
+        for index in range(250):
+            file_id = "completed-{}".format(index)
+            self.controller._Controller__download_start_state[file_id] = DownloadStartLifecycleEntry(
+                "notified" if index % 2 == 0 else "suppressed", None, datetime.now()
+            )
+            self.controller._complete_download_start_lifecycle(file_id)
+
+        self.assertEqual({}, self.controller._Controller__download_start_state)
+
+    def test_authoritative_scan_prunes_absent_legacy_entries_but_preserves_remote_present(self):
+        transitioned_at = datetime.now()
+        self.controller._Controller__download_start_state = {
+            "absent": DownloadStartLifecycleEntry("eligible", None, transitioned_at),
+            "stopped-absent": DownloadStartLifecycleEntry("suppressed", None, transitioned_at),
+            "present": DownloadStartLifecycleEntry("eligible", None, transitioned_at),
+        }
+
+        self.controller._prune_download_start_lifecycles(
+            transitioned_at + timedelta(seconds=1),
+            {None},
+            {"present"},
+            set(),
+        )
+
+        self.assertEqual({"present"}, set(self.controller._Controller__download_start_state))
+
+    def test_authoritative_scan_respects_timestamp_scope_and_protected_ids(self):
+        transitioned_at = datetime.now()
+        self.controller._Controller__download_start_state = {
+            "legacy-old-scan": DownloadStartLifecycleEntry("eligible", None, transitioned_at),
+            ModelFile.build_file_id("live", "movies"): DownloadStartLifecycleEntry(
+                "eligible", "movies", transitioned_at
+            ),
+            ModelFile.build_file_id("disabled", "disabled"): DownloadStartLifecycleEntry(
+                "eligible", "disabled", transitioned_at
+            ),
+            ModelFile.build_file_id("protected", "movies"): DownloadStartLifecycleEntry(
+                "suppressed", "movies", transitioned_at
+            ),
+        }
+
+        self.controller._prune_download_start_lifecycles(
+            transitioned_at - timedelta(seconds=1),
+            {None, "movies"},
+            set(),
+            set(),
+        )
+        self.controller._prune_download_start_lifecycles(
+            transitioned_at + timedelta(seconds=1),
+            {"movies"},
+            set(),
+            {ModelFile.build_file_id("protected", "movies")},
+        )
+
+        self.assertEqual(
+            {
+                "legacy-old-scan",
+                ModelFile.build_file_id("disabled", "disabled"),
+                ModelFile.build_file_id("protected", "movies"),
+            },
+            set(self.controller._Controller__download_start_state),
+        )
+
+    def test_authoritative_scan_bulk_prunes_absent_and_keeps_live_or_protected(self):
+        transitioned_at = datetime.now()
+        absent = {"absent-{}".format(index) for index in range(200)}
+        live = {"live-{}".format(index) for index in range(25)}
+        protected = {"protected-{}".format(index) for index in range(25)}
+        self.controller._Controller__download_start_state = {
+            file_id: DownloadStartLifecycleEntry("eligible", None, transitioned_at)
+            for file_id in absent | live | protected
+        }
+
+        self.controller._prune_download_start_lifecycles(
+            transitioned_at + timedelta(seconds=1), {None}, live, protected
+        )
+
+        self.assertEqual(live | protected, set(self.controller._Controller__download_start_state))
+
+    def test_delete_command_snapshot_protects_active_queued_and_deferred_identities(self):
+        active_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "active")
+        queued_command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, "queued")
+        deferred_command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, "deferred")
+        self.controller._Controller__active_command_processes = [
+            Controller.CommandProcessWrapper(
+                active_command, "active", "active", MagicMock(), MagicMock(), True
+            )
+        ]
+        self.controller._Controller__command_queue.put(queued_command)
+        self.controller._Controller__deferred_delete_command_refs = [deferred_command]
+
+        protected = self.controller._snapshot_delete_command_file_ids()
+
+        self.assertEqual({"active", "queued", "deferred"}, protected)
 
     def _set_exit_worker_processes_not_alive(self):
         for process in (
@@ -628,6 +797,136 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status])
         self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
+
+    def test_update_model_confirms_download_start_only_from_fresh_healthy_running_status(self):
+        file = ModelFile("a", False)
+        listener = MagicMock()
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__lftp.status.return_value = [status]
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+
+        self.controller._Controller__update_model()
+
+        listener.assert_called_once()
+
+    def test_update_model_does_not_confirm_download_start_from_unhealthy_status(self):
+        file = ModelFile("a", False)
+        listener = MagicMock()
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__lftp.status.return_value = [status]
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+
+        self.controller._Controller__update_model()
+
+        listener.assert_not_called()
+
+    def test_update_model_does_not_confirm_download_start_from_cached_status(self):
+        file = ModelFile("a", False)
+        listener = MagicMock()
+        status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__last_lftp_statuses = [status]
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+
+        self.controller._Controller__update_model()
+
+        listener.assert_not_called()
+
+    def test_update_model_prunes_only_from_successful_authoritative_remote_scan(self):
+        transitioned_at = datetime.now()
+        file_id = "absent"
+        self.controller._Controller__download_start_state[file_id] = DownloadStartLifecycleEntry(
+            "eligible", None, transitioned_at
+        )
+        self.controller._Controller__startup_recovery_done = True
+        failed_scan = SimpleNamespace(
+            timestamp=transitioned_at + timedelta(seconds=1),
+            files=[],
+            failed=True,
+            error_message="scan failed",
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = failed_scan
+
+        self.controller._Controller__update_model()
+
+        self.assertIn(file_id, self.controller._Controller__download_start_state)
+        healthy_scan = SimpleNamespace(
+            timestamp=transitioned_at + timedelta(seconds=2),
+            files=[],
+            failed=False,
+            error_message=None,
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = healthy_scan
+
+        self.controller._Controller__update_model()
+
+        self.assertNotIn(file_id, self.controller._Controller__download_start_state)
+
+    def test_update_model_authoritative_prune_protects_runtime_and_persisted_identities(self):
+        transitioned_at = datetime.now()
+        protected_ids = {"queued", "pending", "stopped", "deleting"}
+        self.controller._Controller__download_start_state = {
+            file_id: DownloadStartLifecycleEntry("eligible", None, transitioned_at)
+            for file_id in protected_ids
+        }
+        status = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "queued", ""
+        )
+        self.controller._Controller__lftp.status.return_value = [status]
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__pending_completion_file_names = {("pending", None, None)}
+        self.controller._Controller__persist.stopped_file_names = {"stopped"}
+        self.controller._Controller__command_queue.put(
+            Controller.Command(Controller.Command.Action.DELETE_REMOTE, "deleting")
+        )
+        self.controller._Controller__startup_recovery_done = True
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=transitioned_at + timedelta(seconds=1),
+            files=[],
+            failed=False,
+            error_message=None,
+        )
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(protected_ids, set(self.controller._Controller__download_start_state))
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_update_model_transient_removal_preserves_notified_download_start_lifecycle(self, diff_models):
+        file = ModelFile("a", False)
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        diff_models.return_value = [SimpleNamespace(
+            change=ModelDiff.Change.REMOVED,
+            old_file=file,
+            new_file=None,
+        )]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__model.get_file.return_value = file
+        listener = MagicMock()
+        self.controller.add_download_start_listener(listener)
+        running = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "")
+
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        listener.assert_not_called()
 
     def test_update_model_uses_unhealthy_returned_statuses_during_cooldown_without_prior_healthy_cache(self):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -2075,6 +2374,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__persist.downloaded_file_names = {stale_a, stale_b}
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__move_from_staging = MagicMock(return_value=True)
         self.controller._Controller__model.get_file_ids.return_value = {
             stale_a,
             stale_b,
@@ -2107,12 +2407,23 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
         self.controller._Controller__move_from_staging = MagicMock(return_value=True)
+        self.controller._Controller__download_start_state[added_file.file_id] = DownloadStartLifecycleEntry(
+            "notified", added_file.path_pair_id, datetime.now()
+        )
+        complete_lifecycle = self.controller._complete_download_start_lifecycle
+        self.controller._complete_download_start_lifecycle = MagicMock(
+            side_effect=lambda file_id: (
+                self.assertIn(file_id, self.controller._Controller__persist.downloaded_file_names),
+                complete_lifecycle(file_id),
+            )
+        )
         diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=added_file)]
 
         self.controller._Controller__update_model()
 
         self.assertEqual({added_file.file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.assertNotIn(added_file.file_id, self.controller._Controller__download_start_state)
         self.controller._Controller__model_builder.set_extracted_files.assert_called_with(set())
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
@@ -2196,6 +2507,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__active_scanner = MultiPathActiveScanner({})
         self.controller._Controller__active_scanner.set_active_files = MagicMock()
+        self.controller._Controller__move_from_staging = MagicMock(return_value=True)
         self.controller._Controller__prev_downloading_file_names = {completion_entry}
         diff_models.side_effect = [
             [
@@ -2695,6 +3007,7 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/movies/incomplete",
             exclude_patterns="*.nfo,Sample/"
         )
+        self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
 
     def test_process_commands_stop_uses_path_pair_identity(self):
         file = ModelFile("dup", False)
@@ -2722,6 +3035,54 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
 
+    def test_process_commands_failed_queue_does_not_arm_download_start(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.side_effect = LftpError("queue failed")
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
+    def test_process_commands_failed_queue_preserves_local_delete_fresh_token(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "fresh_after_delete", file.path_pair_id, datetime.now()
+        )
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.side_effect = LftpError("queue failed")
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual("fresh_after_delete", self.controller._Controller__download_start_state[file.file_id].state)
+
+    def test_process_commands_existing_queued_file_does_not_backfill_download_start(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.QUEUED
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
+    def test_process_commands_completed_file_does_not_arm_without_delete_reset(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
     def test_process_commands_queue_clears_stopped_file_identity(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
@@ -2738,6 +3099,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
 
     def test_process_commands_queue_clears_legacy_stopped_name_identity(self):
         file = ModelFile("dup", False)
@@ -2838,6 +3200,7 @@ class TestController(unittest.TestCase):
             self.controller._Controller__process_commands()
 
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
 
     def test_process_commands_delete_local_defers_when_delete_cap_reached(self):
         file = ModelFile("dup", False)
@@ -3136,6 +3499,9 @@ class TestController(unittest.TestCase):
         file.local_size = 10
         file.state = ModelFile.State.DEFAULT
         self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
 
         command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
         callback = MagicMock()
@@ -3163,6 +3529,12 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual("fresh_after_delete", self.controller._Controller__download_start_state[file.file_id].state)
+        self.controller._Controller__model.get_file.return_value = file
+        file.remote_size = 10
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
 
     def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
         file = ModelFile("dup", False)
@@ -3170,6 +3542,9 @@ class TestController(unittest.TestCase):
         file.local_size = 10
         file.state = ModelFile.State.DEFAULT
         self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
 
         command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
         callback = MagicMock()
@@ -3197,6 +3572,7 @@ class TestController(unittest.TestCase):
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
         process.close_queues.assert_called_once_with()
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
 
     def test_cleanup_commands_delete_remote_logs_failed_async_cleanup_without_crashing(self):
         file = ModelFile("dup", False)
@@ -3212,6 +3588,10 @@ class TestController(unittest.TestCase):
         post_callback = self.controller._Controller__remote_scan_process.force_scan
         remote_delete_listener = MagicMock()
         self.controller.add_remote_delete_success_listener(remote_delete_listener)
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
         self.controller._Controller__active_command_processes = [
             Controller.CommandProcessWrapper(
                 command=command,
@@ -3244,6 +3624,8 @@ class TestController(unittest.TestCase):
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
         remote_delete_listener.assert_not_called()
+        self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.downloaded_file_names)
 
     def test_cleanup_commands_delete_remote_records_success_breadcrumb_when_async_cleanup_completes(self):
         file = ModelFile("dup", False)
@@ -3259,6 +3641,10 @@ class TestController(unittest.TestCase):
         post_callback = self.controller._Controller__remote_scan_process.force_scan
         remote_delete_listener = MagicMock()
         self.controller.add_remote_delete_success_listener(remote_delete_listener)
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
         self.controller._Controller__active_command_processes = [
             Controller.CommandProcessWrapper(
                 command=command,
@@ -3286,6 +3672,13 @@ class TestController(unittest.TestCase):
         process.close_queues.assert_called_once_with()
         self.assertEqual([], self.controller._Controller__active_command_processes)
         remote_delete_listener.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.controller._Controller__model.get_file.return_value = file
+        file.state = ModelFile.State.DEFAULT
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
         completed_file = remote_delete_listener.call_args.args[0]
         self.assertEqual(file.file_id, completed_file.file_id)
 
@@ -4037,6 +4430,7 @@ class TestController(unittest.TestCase):
             remote_base_dir_path=None,
             local_base_dir_path="/local/incomplete"
         )
+        self.assertEqual({}, self.controller._Controller__download_start_state)
 
     def test_recover_interrupted_downloads_skips_previously_downloaded_path_pair_file(self):
         file_id = ModelFile.build_file_id("dup.mkv", "movies")

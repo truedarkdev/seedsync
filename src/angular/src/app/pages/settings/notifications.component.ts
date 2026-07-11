@@ -24,6 +24,7 @@ export class NotificationsComponent implements OnInit, OnDestroy {
     public provider: "webhook" | "apprise" = "webhook";
     public enabled = false;
     public allowPrivateNetworks = false;
+    public downloadStart = false;
     public downloadComplete = true;
     public extractionComplete = true;
     public deleteComplete = true;
@@ -47,6 +48,7 @@ export class NotificationsComponent implements OnInit, OnDestroy {
                 this.provider = this.state.provider;
                 this.appriseTag = this.state.apprise_tag || "";
                 this.allowPrivateNetworks = this.state.allow_private_networks;
+                this.downloadStart = this.state.download_start;
                 this.downloadComplete = this.state.download_complete;
                 this.extractionComplete = this.state.extraction_complete;
                 this.deleteComplete = this.state.delete_complete;
@@ -66,6 +68,7 @@ export class NotificationsComponent implements OnInit, OnDestroy {
             enabled: this.enabled,
             provider: this.provider,
             allow_private_networks: this.allowPrivateNetworks,
+            download_start: this.downloadStart,
             download_complete: this.downloadComplete,
             extraction_complete: this.extractionComplete,
             delete_complete: this.deleteComplete,

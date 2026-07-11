@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Tuple, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
 from threading import Lock, RLock
 from queue import Queue
 from enum import Enum
@@ -12,6 +12,7 @@ import os
 import time
 import shutil
 from types import SimpleNamespace
+from dataclasses import dataclass
 
 # my libs
 from .scan import (
@@ -42,6 +43,15 @@ class ControllerError(AppError):
     Exception indicating a controller error
     """
     pass
+
+
+@dataclass(frozen=True)
+class DownloadStartLifecycleEntry:
+    state: str
+    path_pair_id: Optional[str]
+    transitioned_at: datetime
+
+
 class Controller:
     """
     Top-level class that controls the behaviour of the app
@@ -300,6 +310,9 @@ class Controller:
         self.__model_lock = RLock()
         self.__remote_delete_success_listeners = []
         self.__remote_delete_success_listeners_lock = Lock()
+        self.__download_start_listeners = []
+        self.__download_start_state = {}
+        self.__download_start_lock = Lock()
         self.__path_pair_refresh_lock = Lock()
         self.__path_pair_refresh_requested = False
         self.__path_pair_refresh_generation = 0
@@ -1018,6 +1031,130 @@ class Controller:
         with self.__remote_delete_success_listeners_lock:
             if listener not in self.__remote_delete_success_listeners:
                 self.__remote_delete_success_listeners.append(listener)
+
+    def add_download_start_listener(self, listener: Callable[[ModelFile], None]):
+        with self.__download_start_lock:
+            if listener not in self.__download_start_listeners:
+                self.__download_start_listeners.append(listener)
+
+    def remove_download_start_listener(self, listener: Callable[[ModelFile], None]):
+        with self.__download_start_lock:
+            if listener in self.__download_start_listeners:
+                self.__download_start_listeners.remove(listener)
+
+    def __arm_download_start_lifecycle(
+        self,
+        file_id: str,
+        file_name: Optional[str] = None,
+        path_pair_id: Optional[str] = None,
+        is_resume: bool = False,
+    ) -> None:
+        with self.__download_start_lock:
+            entry = self.__download_start_state.get(file_id)
+            if entry is not None and entry.state == "fresh_after_delete":
+                self.__download_start_state[file_id] = DownloadStartLifecycleEntry(
+                    "eligible", path_pair_id, datetime.now()
+                )
+                return
+            if entry is not None or is_resume:
+                return
+            if file_name is not None and self.__is_previously_downloaded(file_name, path_pair_id):
+                return
+            self.__download_start_state[file_id] = DownloadStartLifecycleEntry(
+                "eligible", path_pair_id, datetime.now()
+            )
+
+    def __suppress_download_start_lifecycle(self, file_id: str) -> None:
+        with self.__download_start_lock:
+            entry = self.__download_start_state.get(file_id)
+            if entry is not None and entry.state == "eligible":
+                self.__download_start_state[file_id] = DownloadStartLifecycleEntry(
+                    "suppressed", entry.path_pair_id, datetime.now()
+                )
+
+    def _clear_download_start_lifecycle(self, file_id: str) -> None:
+        with self.__download_start_lock:
+            self.__download_start_state.pop(file_id, None)
+
+    def _complete_download_start_lifecycle(self, file_id: str) -> None:
+        with self.__download_start_lock:
+            entry = self.__download_start_state.get(file_id)
+            if entry is not None and entry.state in ("notified", "suppressed"):
+                self.__download_start_state.pop(file_id, None)
+
+    def __reset_download_start_after_local_delete(
+        self, file_id: str, path_pair_id: Optional[str]
+    ) -> None:
+        with self.__download_start_lock:
+            self.__download_start_state[file_id] = DownloadStartLifecycleEntry(
+                "fresh_after_delete", path_pair_id, datetime.now()
+            )
+
+    def _snapshot_delete_command_file_ids(self) -> Set[str]:
+        with self.__command_state_lock():
+            protected = {
+                command_process.file_id
+                for command_process in self.__active_command_processes
+                if self.__is_delete_command_action(command_process.command.action)
+            }
+            with self.__command_queue.mutex:
+                protected.update(
+                    self.__delete_command_identity(command)
+                    for command in self.__command_queue.queue
+                    if self.__is_delete_command_action(command.action)
+                )
+            protected.update(
+                self.__delete_command_identity(command)
+                for command in self.__deferred_delete_commands()
+                if self.__is_delete_command_action(command.action)
+            )
+        return protected
+
+    def _prune_download_start_lifecycles(
+        self,
+        scan_timestamp: datetime,
+        scanned_path_pair_ids: Set[Optional[str]],
+        remote_file_ids: Set[str],
+        protected_file_ids: Set[str],
+    ) -> None:
+        with self.__download_start_lock:
+            stale_ids = [
+                file_id
+                for file_id, entry in self.__download_start_state.items()
+                if entry.path_pair_id in scanned_path_pair_ids
+                and file_id not in remote_file_ids
+                and file_id not in protected_file_ids
+                and scan_timestamp >= entry.transitioned_at
+            ]
+            for file_id in stale_ids:
+                self.__download_start_state.pop(file_id, None)
+
+    def _confirm_fresh_healthy_download_starts(self, statuses: List[LftpJobStatus]) -> None:
+        notifications = []
+        with self.__download_start_lock:
+            listeners = list(self.__download_start_listeners)
+            for status in statuses:
+                if status.state != LftpJobStatus.State.RUNNING:
+                    continue
+                entry = self.__download_start_state.get(status.file_id)
+                if entry is None or entry.state != "eligible":
+                    continue
+                try:
+                    file = copy.deepcopy(self.__model.get_file(status.file_id))
+                except ModelError:
+                    continue
+                # Commit the once-per-lifecycle decision before any listener
+                # can re-enter controller or notification code.
+                self.__download_start_state[status.file_id] = DownloadStartLifecycleEntry(
+                    "notified", entry.path_pair_id, datetime.now()
+                )
+                notifications.append(file)
+        for file in notifications:
+            for listener in listeners:
+                try:
+                    listener(file)
+                except Exception:
+                    self.logger.warning("Download start listener failed", exc_info=True)
 
     def remove_remote_delete_success_listener(self, listener: Callable[[ModelFile], None]):
         with self.__remote_delete_success_listeners_lock:
@@ -1917,7 +2054,8 @@ class Controller:
             file_name=file.name,
             process=process,
             post_callback=post_callback,
-            await_completion=True
+            await_completion=True,
+            event_file=copy.deepcopy(file),
         )
         with self.__command_state_lock():
             self.__active_command_processes.append(command_wrapper)
@@ -2103,6 +2241,16 @@ class Controller:
                         local_base_dir_path=local_base_dir_path,
                         **queue_kwargs
                     )
+                    if file.state not in (
+                        ModelFile.State.QUEUED,
+                        ModelFile.State.DOWNLOADING,
+                    ):
+                        self.__arm_download_start_lifecycle(
+                            file.file_id,
+                            file.name,
+                            file.path_pair_id,
+                            is_resume=stopped_marked,
+                        )
                     Controller.__clear_persist_key(
                         self.__persist.stopped_file_names,
                         file.name,
@@ -2176,6 +2324,7 @@ class Controller:
                         )
                         continue
                     self.__persist.stopped_file_names.add(file.file_id)
+                    self.__suppress_download_start_lifecycle(file.file_id)
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None
@@ -2659,6 +2808,11 @@ class Controller:
                                 )
                         else:
                             command_process.post_callback()
+                            if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
+                                self.__reset_download_start_after_local_delete(
+                                    command_process.file_id,
+                                    getattr(command_process.event_file, "path_pair_id", None),
+                                )
                             for callback in command_process.command.callbacks:
                                 callback.on_success()
                             self.__record_command_breadcrumb(
@@ -2701,6 +2855,17 @@ class Controller:
                                 )
                         else:
                             if command_process.command.action == Controller.Command.Action.DELETE_REMOTE:
+                                self._clear_download_start_lifecycle(command_process.file_id)
+                                event_file = command_process.event_file
+                                if event_file is not None:
+                                    Controller.__clear_persist_key(
+                                        self.__persist.downloaded_file_names,
+                                        event_file.name,
+                                        event_file.path_pair_id,
+                                    )
+                                    self.__model_builder.set_downloaded_files(
+                                        self.__persist.downloaded_file_names
+                                    )
                                 self.__notify_remote_delete_success(command_process.event_file)
                             for callback in command_process.command.callbacks:
                                 callback.on_success()

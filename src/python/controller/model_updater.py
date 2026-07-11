@@ -244,6 +244,8 @@ class ModelUpdater:
                 status for status in lftp_statuses
                 if status.file_id not in controller._Controller__malformed_status_only_file_ids
             ]
+            if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
+                controller._confirm_fresh_healthy_download_starts(lftp_statuses)
             current_downloading_file_names = [
                 (s.name, s.path_pair_id, s.path_pair_name)
                 for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
@@ -443,6 +445,34 @@ class ModelUpdater:
         # Build the new model, if needed.
         auto_purge_candidate_ids = set()
         remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
+        if remote_reconciliation_established:
+            enabled_path_pair_ids = set(controller._Controller__path_pairs_by_id.keys())
+            scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
+            remote_file_ids = {
+                ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None))
+                for file in latest_remote_scan.files
+            }
+            protected_file_ids = {
+                status.file_id for status in (lftp_statuses or [])
+                if status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
+            }
+            protected_file_ids.update(
+                ModelFile.build_file_id(file_name, path_pair_id)
+                for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
+            )
+            protected_file_ids.update(
+                self._filter_keys_for_model_builder(
+                    persist.stopped_file_names,
+                    enabled_path_pair_ids,
+                )
+            )
+            protected_file_ids.update(controller._snapshot_delete_command_file_ids())
+            controller._prune_download_start_lifecycles(
+                latest_remote_scan.timestamp,
+                scanned_path_pair_ids,
+                remote_file_ids,
+                protected_file_ids,
+            )
         if model_builder.has_changes():
             new_model = model_builder.build_model()
 
@@ -476,6 +506,7 @@ class ModelUpdater:
                     if file.file_id not in persist.downloaded_file_names:
                         persist.downloaded_file_names.add(file.file_id)
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
+                    controller._complete_download_start_lifecycle(file.file_id)
                     controller.clear_extracted_marker(file)
                     if controller._Controller__target_archive_trace_selector_matches_file(  # type: ignore[attr-defined]
                         file.file_id,

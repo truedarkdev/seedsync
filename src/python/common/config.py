@@ -710,6 +710,7 @@ class Config(Persist):
         apprise_url = PROP("apprise_url", Checkers.string_allow_empty, Converters.null)
         apprise_tag = PROP("apprise_tag", Checkers.string_allow_empty, Converters.null)
         allow_private_networks = PROP("allow_private_networks", Checkers.bool_value, Converters.bool)
+        download_start = PROP("download_start", Checkers.bool_value, Converters.bool)
         download_complete = PROP("download_complete", Checkers.bool_value, Converters.bool)
         extraction_complete = PROP("extraction_complete", Checkers.bool_value, Converters.bool)
         delete_complete = PROP("delete_complete", Checkers.bool_value, Converters.bool)
@@ -723,6 +724,7 @@ class Config(Persist):
             self.apprise_url = ""
             self.apprise_tag = ""
             self.allow_private_networks = False
+            self.download_start = False
             self.download_complete = True
             self.extraction_complete = True
             self.delete_complete = True

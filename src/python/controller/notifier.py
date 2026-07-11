@@ -43,6 +43,7 @@ class NotificationSettings:
     webhook_url: str
     hmac_secret: str
     allow_private_networks: bool
+    download_start: bool
     download_complete: bool
     extraction_complete: bool
     delete_complete: bool
@@ -283,6 +284,7 @@ def validate_apprise_url(url: str, allow_private_networks: bool) -> Tuple[str, s
 class AppriseProvider(NotificationProvider):
     _LABELS = {
         "test": "Test notification",
+        "download_start": "Download started",
         "download_complete": "Download complete",
         "extraction_complete": "Extraction complete",
         "delete_complete": "Remote delete complete",
@@ -294,7 +296,7 @@ class AppriseProvider(NotificationProvider):
         payload = {
             "body": "{}: {}".format(label, event.file_name),
             "title": "SeedSync - {}".format(label),
-            "type": "info" if event.event_type == "test" else "success",
+            "type": "info" if event.event_type in ("test", "download_start") else "success",
             "format": "text",
         }
         if tag:
@@ -364,6 +366,7 @@ class NotificationService(IModelListener):
             "apprise_url_configured": bool(settings.apprise_url),
             "apprise_tag": settings.apprise_tag,
             "allow_private_networks": settings.allow_private_networks,
+            "download_start": settings.download_start,
             "download_complete": settings.download_complete,
             "extraction_complete": settings.extraction_complete,
             "delete_complete": settings.delete_complete,
@@ -443,6 +446,12 @@ class NotificationService(IModelListener):
             settings = self._settings
         if settings.enabled and settings.delete_complete:
             self.enqueue(NotificationEvent.create("delete_complete", file))
+
+    def download_started(self, file: ModelFile):
+        with self._settings_lock:
+            settings = self._settings
+        if settings.enabled and settings.download_start:
+            self.enqueue(NotificationEvent.create("download_start", file))
 
     def enqueue(self, event: NotificationEvent) -> bool:
         try:
