@@ -1,0 +1,17 @@
+version: 2
+
+# Use this repository's default branch; the upstream develop target is absent.
+# This config intentionally covers selected current dependency surfaces; /src/e2e is excluded from this source-row slice.
+updates:
+  # This surface tracks direct package.json updates; the generated lockfile is intentionally untracked.
+  - package-ecosystem: npm
+    directory: /src/angular
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: pip
+    directory: /src/python
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
