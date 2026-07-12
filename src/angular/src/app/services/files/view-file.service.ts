@@ -1,6 +1,6 @@
-import {Inject, Injectable} from "@angular/core";
+import {Inject, Injectable, InjectionToken} from "@angular/core";
 import {BehaviorSubject, Observable, of} from "rxjs";
-import {catchError, tap} from "rxjs/operators";
+import {auditTime, catchError, tap} from "rxjs/operators";
 
 import * as Immutable from "immutable";
 
@@ -31,6 +31,16 @@ export interface ViewFileComparator {
     // noinspection TsLint
     (a: ViewFile, b: ViewFile): number;
 }
+
+/**
+ * Coalescing window for batching bursts of model-file updates before rebuilding
+ * the view. Tests use the zero default for deterministic synchronous behavior;
+ * the application provider sets a small production window for SSE bursts.
+ */
+export const VIEW_FILE_COALESCE_MS = new InjectionToken<number>("VIEW_FILE_COALESCE_MS", {
+    providedIn: "root",
+    factory: () => 0
+});
 
 
 /**
@@ -93,17 +103,22 @@ export class ViewFileService {
 
     private _filterCriteria: ViewFileFilterCriteria = null;
     private _sortComparator: ViewFileComparator = null;
+    private _forceFilteredEmission = false;
 
     constructor(private _logger: LoggerService,
                 private _streamServiceRegistry: StreamServiceRegistry,
                 private _fileSelectionService: FileSelectionService,
-                @Inject(LOCAL_STORAGE) private _storage: StorageService) {
+                @Inject(LOCAL_STORAGE) private _storage: StorageService,
+                @Inject(VIEW_FILE_COALESCE_MS) private _coalesceMs: number = 0) {
         this.modelFileService = _streamServiceRegistry.modelFileService;
         this._restorePageSizeFromStorage();
         const _viewFileService = this;
 
         if (!this.USE_MOCK_MODEL) {
-            this.modelFileService.files.subscribe({
+            const modelFiles = this._coalesceMs > 0
+                ? this.modelFileService.files.pipe(auditTime(this._coalesceMs))
+                : this.modelFileService.files;
+            modelFiles.subscribe({
                 next: modelFiles => {
                     let t0 = performance.now();
                     _viewFileService.buildViewFromModelFiles(modelFiles);
@@ -423,6 +438,7 @@ export class ViewFileService {
     public setFilterCriteria(criteria: ViewFileFilterCriteria) {
         this._filterCriteria = criteria;
         this._fileSelectionService.clear();
+        this._forceFilteredEmission = true;
         this.pushViewFiles();
     }
 
@@ -686,6 +702,31 @@ export class ViewFileService {
         const start = this._currentPage * this._pageSize;
         const end = start + this._pageSize;
         const pagedFiles = this._pageSize > 0 ? filteredFiles.slice(start, end).toList() : filteredFiles;
+
+        // Immutable.List may allocate a fresh list even when every row reference
+        // is unchanged. Suppress only that redundant emission; a changed row,
+        // identity/order, page, or filter criteria still emits normally.
+        const previousPagedFiles = this._filteredFilesSubject.getValue();
+        const forceEmission = this._forceFilteredEmission;
+        this._forceFilteredEmission = false;
+        if (!forceEmission && immutableListsReferenceEqual(pagedFiles, previousPagedFiles)) {
+            return;
+        }
         this._filteredFilesSubject.next(pagedFiles);
     }
+}
+
+function immutableListsReferenceEqual(a: Immutable.List<ViewFile>, b: Immutable.List<ViewFile>): boolean {
+    if (a === b) {
+        return true;
+    }
+    if (a.size !== b.size) {
+        return false;
+    }
+    for (let index = 0; index < a.size; index++) {
+        if (a.get(index) !== b.get(index)) {
+            return false;
+        }
+    }
+    return true;
 }

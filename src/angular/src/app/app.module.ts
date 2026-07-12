@@ -3,7 +3,7 @@ import {RouteReuseStrategy} from "@angular/router";
 
 import {environment} from "../environments/environment";
 import {LoggerService} from "./services/utils/logger.service";
-import {ViewFileService} from "./services/files/view-file.service";
+import {VIEW_FILE_COALESCE_MS, ViewFileService} from "./services/files/view-file.service";
 import {ViewFileFilterService} from "./services/files/view-file-filter.service";
 import {ViewFileSortService} from "./services/files/view-file-sort.service";
 import {ViewFileOptionsService} from "./services/files/view-file-options.service";
@@ -42,6 +42,7 @@ export const APP_PROVIDERS: Provider[] = [
     NotificationService,
     RestService,
     ViewFileService,
+    {provide: VIEW_FILE_COALESCE_MS, useValue: 100},
     ViewFileFilterService,
     ViewFileSortService,
     ViewFileOptionsService,
