@@ -1,12 +1,41 @@
 <div id="logs">
     <div class="logs-filter">
+        <label class="search-field" for="logs-filter-input">
+            <span>Search logs</span>
         <input id="logs-filter-input"
                type="search"
                class="form-control"
                [value]="searchQuery"
-               placeholder="Search logs"
+               placeholder="Logger, message, or exception"
                (input)="onSearchQueryChange($event.target.value)">
+        </label>
+        <div class="history-filter-row">
+        <label class="compact-field" for="logs-level-filter"><span>Severity</span>
+        <select id="logs-level-filter" class="form-control" aria-label="Log severity"
+                [value]="levelFilter" (change)="onLevelFilterChange($event.target.value)">
+            <option value="">All</option>
+            <option *ngFor="let level of ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']" [value]="level">{{level}}</option>
+        </select>
+        </label>
+        <label class="compact-field logger-field" for="logs-logger-filter"><span>Logger</span>
+        <input id="logs-logger-filter" class="form-control" aria-label="Logger name"
+               placeholder="Exact name" [value]="loggerFilter"
+               (input)="onLoggerFilterChange($event.target.value)">
+        </label>
+        <label class="compact-field time-field" for="logs-start-filter"><span>From</span>
+        <input id="logs-start-filter" type="datetime-local" class="form-control" aria-label="Logs from"
+               [value]="startFilter" (change)="onTimeFilterChange($event.target.value, endFilter)">
+        </label>
+        <label class="compact-field time-field" for="logs-end-filter"><span>Until</span>
+        <input id="logs-end-filter" type="datetime-local" class="form-control" aria-label="Logs until"
+               [value]="endFilter" (change)="onTimeFilterChange(startFilter, $event.target.value)">
+        </label>
+        <button type="button" class="btn btn-secondary history-search-button" (click)="loadHistoricalLogs()"
+                [disabled]="historyLoading">{{historyLoading ? 'Loading history…' : 'Search history'}}</button>
+        </div>
     </div>
+
+    <div class="alert alert-danger" role="alert" aria-live="assertive" *ngIf="historyError">{{historyError}}</div>
 
     <div class="logs-summary"
          *ngIf="hasReceivedLogs && (hiddenRecordCount > 0 || searchQuery)">

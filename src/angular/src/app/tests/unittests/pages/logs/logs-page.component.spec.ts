@@ -1,5 +1,5 @@
 import {ComponentFixture, TestBed, fakeAsync, tick} from "@angular/core/testing";
-import {BehaviorSubject, Subject, of} from "rxjs";
+import {BehaviorSubject, Subject, of, throwError} from "rxjs";
 
 import {LogsPageComponent} from "../../../../pages/logs/logs-page.component";
 import {LogService} from "../../../../services/logs/log.service";
@@ -10,6 +10,7 @@ import {LogRecord} from "../../../../services/logs/log-record";
 
 
 class MockLogService {
+    public failHistory = false;
     private _history: LogRecord[] = [];
     private _logs = new Subject<LogRecord>();
 
@@ -23,6 +24,10 @@ class MockLogService {
 
     getHistorySnapshot(): LogRecord[] {
         return this._history.slice();
+    }
+
+    loadHistory(_filters = {}) {
+        return this.failHistory ? throwError(() => new Error("history unavailable")) : of(this.getHistorySnapshot());
     }
 
     push(record: LogRecord) {
@@ -101,6 +106,23 @@ describe("Testing logs page component", () => {
         expect(records[0].textContent).toContain("Downloader");
         expect(records[1].textContent).toContain("Scanner");
     });
+
+    it("should show an accessible history error while keeping live logs usable", fakeAsync(() => {
+        fixture.destroy();
+        logService.failHistory = true;
+        fixture = TestBed.createComponent(LogsPageComponent);
+        component = fixture.componentInstance;
+        fixture.detectChanges();
+
+        const alert = fixture.nativeElement.querySelector('[role="alert"]');
+        expect(alert).not.toBeNull();
+        expect(alert.textContent).toContain("Historical logs could not be loaded");
+
+        logService.push(createRecord("LiveLogger", "live event still works"));
+        tick(100);
+        fixture.detectChanges();
+        expect(fixture.nativeElement.textContent).toContain("live event still works");
+    }));
 
     it("should filter logs case-insensitively by logger and message text", fakeAsync(() => {
         logService.push(createRecord("Downloader", "queued first item"));

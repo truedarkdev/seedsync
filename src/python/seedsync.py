@@ -24,6 +24,7 @@ from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, 
 from web import WebAppJob, WebAppBuilder
 from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
+from web.handler.historical_log import create_historical_log_handler
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
@@ -102,6 +103,11 @@ class Seedsync:
                                      log_level=effective_log_level,
                                      logdir=args.logdir,
                                      log_format=log_format)
+        history_log_path = os.path.join(args.config_dir, "logs", "history.jsonl")
+        logger.addHandler(create_historical_log_handler(
+            history_log_path, Constants.MAX_LOG_SIZE_IN_BYTES, Constants.LOG_BACKUP_COUNT
+        ))
+        ctx_args.history_log_path = history_log_path
         Seedsync.logger = logger
         web_access_logger = self._create_logger(name=Constants.WEB_ACCESS_LOG_NAME,
                                                 log_level=effective_log_level,
