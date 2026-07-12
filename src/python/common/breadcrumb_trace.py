@@ -1,5 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
+from __future__ import annotations
+
 import copy
 import json
 import multiprocessing
@@ -7,7 +9,7 @@ import queue
 import time
 from collections import deque
 from threading import Lock
-from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
+from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, cast
 
 from .redaction import redact_sensitive_text
 
@@ -19,13 +21,13 @@ class _EnabledGate(Protocol):
 class BreadcrumbTraceEmitter:
     def __init__(
         self,
-        record_queue: multiprocessing.Queue,
+        record_queue: multiprocessing.Queue[object],
         enabled_gate: _EnabledGate,
     ):
         self.__record_queue = record_queue
         self.__enabled_gate = enabled_gate
 
-    def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
         try:
             enabled = bool(self.__enabled_gate.value)
         except Exception:
@@ -48,7 +50,7 @@ class BreadcrumbTraceEmitter:
 
 
 class BreadcrumbTraceNoopEmitter:
-    def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
         pass
 
 
@@ -95,21 +97,21 @@ class BreadcrumbTraceCollector:
         self.__enabled_getter = enabled_getter
         self.__max_entries = max_entries
         self.__entries: Deque[Dict[str, Any]] = deque(maxlen=max_entries)
-        self.__external_records = None
+        self.__external_records: Optional[multiprocessing.Queue[object]] = None
         self.__external_records_lock = Lock()
         self.__enabled_gate = multiprocessing.Value("b", 0)
         self.__lock = Lock()
         self.__version = 0
         self.__last_reset_version = 0
-        self.__last_reset_reason = None
+        self.__last_reset_reason: Optional[str] = None
         self.__window_reset_pending = False
         self.__window_truncated_pending = False
         self.__external_queue_last_drain_count = 0
         self.__external_queue_last_drain_limit = self.__max_entries
         self.__external_queue_drain_limited = False
-        self.__last_signature = None
-        self.__last_failure_entry = None
-        self.__last_failure_version = None
+        self.__last_signature: Optional[str] = None
+        self.__last_failure_entry: Optional[Dict[str, Any]] = None
+        self.__last_failure_version: Optional[int] = None
         self.sync_enabled_state()
 
     def create_emitter(self) -> BreadcrumbTraceEmitter:
@@ -145,14 +147,14 @@ class BreadcrumbTraceCollector:
         except Exception:
             return False
 
-    def __set_enabled_gate(self, enabled: bool):
+    def __set_enabled_gate(self, enabled: bool) -> None:
         try:
             with self.__enabled_gate.get_lock():
                 self.__enabled_gate.value = 1 if enabled else 0
         except Exception:
             pass
 
-    def clear(self):
+    def clear(self) -> None:
         self.__drain_external_records(limit=None)
         with self.__lock:
             self.__entries.clear()
@@ -164,7 +166,7 @@ class BreadcrumbTraceCollector:
             self.__window_reset_pending = True
             self.__window_truncated_pending = False
 
-    def reset(self):
+    def reset(self) -> None:
         self.__drain_external_records(limit=None)
         with self.__lock:
             self.__entries.clear()
@@ -176,7 +178,7 @@ class BreadcrumbTraceCollector:
             self.__window_reset_pending = True
             self.__window_truncated_pending = False
 
-    def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
         if self.is_enabled():
             self.__drain_external_records(limit=self.__max_entries)
         self.__record_entry(source, message, details, **metadata)
@@ -185,10 +187,10 @@ class BreadcrumbTraceCollector:
         self,
         source: str,
         message: str,
-        details: Optional[Dict[str, Any]] = None,
+        details: object = None,
         allow_when_disabled: bool = False,
-        **metadata,
-    ):
+        **metadata: Any,
+    ) -> None:
         if not allow_when_disabled and not self.is_enabled():
             return
 
@@ -212,18 +214,16 @@ class BreadcrumbTraceCollector:
             if details is None:
                 details = extra_details
             elif isinstance(details, dict):
-                details = {**details, **extra_details}
+                detail_mapping = cast(Dict[str, Any], details)
+                details = {**detail_mapping, **extra_details}
             else:
-                details = {
-                    "value": details,
-                    **extra_details,
-                }
+                details = {"value": details, **extra_details}
 
         sanitized_details = self.__sanitize_value(details, key=None, depth=0)
         if sanitized_details is None:
             sanitized_details = {}
 
-        entry = {
+        entry: Dict[str, Any] = {
             "created_ms": created_ms,
             "created_ns": created_ns,
             "source": self.__truncate_string(source),
@@ -277,7 +277,7 @@ class BreadcrumbTraceCollector:
         event_type: Optional[str] = None,
         path_pair_id: Optional[str] = None,
         file_id: Optional[str] = None,
-        order: str = "asc",
+        order: str | None = "asc",
     ) -> Dict[str, Any]:
         if limit is not None and limit < 1:
             raise ValueError("limit must be greater than 0")
@@ -431,7 +431,7 @@ class BreadcrumbTraceCollector:
         corr_id = failure_entry.get("corr_id")
         trace_scope = failure_entry.get("trace_scope") or "flow"
 
-        recent_entries = []
+        recent_entries: List[Dict[str, Any]] = []
         for entry in entries:
             if failure_version is not None and entry["version"] > failure_version:
                 continue
@@ -457,7 +457,7 @@ class BreadcrumbTraceCollector:
         if not recent_entries:
             recent_entries = [failure_entry]
 
-        recent_stage_trail = []
+        recent_stage_trail: List[Dict[str, Any]] = []
         for entry in recent_entries[-5:]:
             recent_stage_trail.append({
                 "version": entry["version"],
@@ -520,8 +520,9 @@ class BreadcrumbTraceCollector:
                 return "<redacted>"
             return self.__truncate_string(self.__sanitize_string_content(value))
         if isinstance(value, dict):
-            sanitized = {}
-            for item_key, item_value in value.items():
+            sanitized: Dict[str, Any] = {}
+            mapping = cast(Dict[object, object], value)
+            for item_key, item_value in mapping.items():
                 item_key_str = str(item_key)
                 if self.__is_sensitive_key(item_key_str):
                     sanitized[item_key_str] = "<redacted>"
@@ -535,8 +536,9 @@ class BreadcrumbTraceCollector:
         if isinstance(value, (list, tuple, set)):
             if key is not None and self.__is_command_key(key):
                 return "<redacted>"
-            sanitized_list = []
-            for index, item in enumerate(list(value)):
+            sanitized_list: List[Any] = []
+            items = list(cast(Iterable[object], value))
+            for index, item in enumerate(items):
                 if index >= self.__MAX_LIST_ITEMS:
                     sanitized_list.append("<truncated>")
                     break
@@ -563,7 +565,7 @@ class BreadcrumbTraceCollector:
     def __sanitize_string_content(self, value: str) -> str:
         return redact_sensitive_text(value) or ""
 
-    def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False):
+    def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False) -> None:
         if self.__external_records is None:
             self.__external_queue_last_drain_count = 0
             self.__external_queue_last_drain_limit = limit if limit is not None else self.__max_entries
@@ -585,17 +587,19 @@ class BreadcrumbTraceCollector:
             drained_count += 1
             if not isinstance(external_record, dict):
                 continue
-            source = external_record.get("source")
-            message = external_record.get("message")
+            record_mapping = cast(Dict[str, Any], external_record)
+            source = record_mapping.get("source")
+            message = record_mapping.get("message")
             if not isinstance(source, str) or not isinstance(message, str):
                 continue
-            metadata = external_record.get("metadata", {})
-            if not isinstance(metadata, dict):
-                metadata = {}
+            metadata_value = record_mapping.get("metadata", {})
+            metadata: Dict[str, Any] = (
+                cast(Dict[str, Any], metadata_value) if isinstance(metadata_value, dict) else {}
+            )
             self.__record_entry(
                 source,
                 message,
-                external_record.get("details"),
+                record_mapping.get("details"),
                 allow_when_disabled=True,
                 stage=metadata.get("stage"),
                 event_type=metadata.get("event_type", "breadcrumb"),
@@ -604,8 +608,8 @@ class BreadcrumbTraceCollector:
                 file_id=metadata.get("file_id"),
                 path_pair_id=metadata.get("path_pair_id"),
                 path_pair_name=metadata.get("path_pair_name"),
-                created_ns=external_record.get("created_ns"),
-                created_ms=external_record.get("created_ms"),
+                created_ns=record_mapping.get("created_ns"),
+                created_ms=record_mapping.get("created_ms"),
             )
         if limit is not None and drained_count >= limit:
             try:
@@ -616,12 +620,13 @@ class BreadcrumbTraceCollector:
         self.__external_queue_last_drain_limit = drain_limit
         self.__external_queue_drain_limited = drain_limited
 
-    def __get_external_record(self, wait_timeout: Optional[float]):
+    def __get_external_record(self, wait_timeout: Optional[float]) -> object:
         external_records = self.__external_records
         if external_records is None:
             raise queue.Empty
         if wait_timeout is not None:
             get_method = getattr(external_records, "get", None)
             if callable(get_method):
-                return get_method(timeout=wait_timeout)
+                record = get_method(timeout=wait_timeout)
+                return record
         return external_records.get_nowait()

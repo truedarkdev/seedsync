@@ -45,14 +45,14 @@ class StatusComponent(BaseStatus):
     """
 
     def __init__(self):
-        self.__listeners = []
-        self.__properties = []  # names of properties created
+        self.__listeners: list[IStatusComponentListener] = []
+        self.__properties: list[str] = []  # names of properties created
 
-    def add_listener(self, listener: IStatusComponentListener):
+    def add_listener(self, listener: IStatusComponentListener) -> None:
         if listener not in self.__listeners:
             self.__listeners.append(listener)
 
-    def remove_listener(self, listener: IStatusComponentListener):
+    def remove_listener(self, listener: IStatusComponentListener) -> None:
         if listener in self.__listeners:
             self.__listeners.remove(listener)
 
@@ -96,7 +96,7 @@ class Status(BaseStatus):
         def __init__(self, status: "Status"):
             self.status = status
 
-        def notify(self, name: str):
+        def notify(self, name: str) -> None:
             with self.status._listeners_lock:
                 for listener in self.status._listeners:
                     listener.notify()
@@ -131,7 +131,7 @@ class Status(BaseStatus):
     controller = BaseStatus._create_property("controller")
 
     def __init__(self):
-        self._listeners = []
+        self._listeners: list[IStatusListener] = []
         self._listeners_lock = Lock()
         self.__comp_listener = Status.CompListener(self)
 
@@ -149,12 +149,12 @@ class Status(BaseStatus):
             src_comp.__class__.copy(src_comp, dst_comp)
         return copy
 
-    def add_listener(self, listener: IStatusListener):
+    def add_listener(self, listener: IStatusListener) -> None:
         with self._listeners_lock:
             if listener not in self._listeners:
                 self._listeners.append(listener)
 
-    def remove_listener(self, listener: IStatusListener):
+    def remove_listener(self, listener: IStatusListener) -> None:
         with self._listeners_lock:
             if listener in self._listeners:
                 self._listeners.remove(listener)

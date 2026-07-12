@@ -3,7 +3,7 @@
 import logging
 import copy
 import collections
-from typing import Optional
+from typing import Any, Optional
 
 # my libs
 from .config import Config
@@ -27,8 +27,8 @@ class Args:
         self.logdir: str | None = None
         self.history_log_path: str | None = None
 
-    def as_dict(self) -> dict:
-        dct = collections.OrderedDict()
+    def as_dict(self) -> dict[str, str]:
+        dct: collections.OrderedDict[str, str] = collections.OrderedDict()
         dct["local_path_to_scanfs"] = str(self.local_path_to_scanfs)
         dct["html_path"] = str(self.html_path)
         dct["debug"] = str(self.debug)
@@ -83,7 +83,7 @@ class Context:
         retention_depth = getattr(general_config, "breadcrumb_trace_retention_depth", 128)
         return retention_depth if type(retention_depth) is int and retention_depth > 0 else 128
 
-    def __redact_config_log_value(self, section, option, value):
+    def __redact_config_log_value(self, section: str, option: str, value: Any) -> Any:
         section_name = str(section).lower()
         option_name = str(option).lower()
         if Config.is_sensitive_field(section_name, option_name):
@@ -98,7 +98,7 @@ class Context:
             return "{} [{}]".format(path_pair.name, path_pair.id[:8])
         return path_pair.name
 
-    def print_to_log(self):
+    def print_to_log(self) -> None:
         # Print the config
         self.logger.debug("Config:")
         config_dict = self.config.as_dict()
@@ -108,7 +108,7 @@ class Context:
                 value = self.__redact_config_log_value(section, option, value)
                 self.logger.debug("  {}.{}: {}".format(section, option, value))
 
-        path_pairs = []
+        path_pairs: list[PathPair] = []
         if self.path_pair_manager is not None:
             path_pairs = list(self.path_pair_manager.get_all_pairs() or [])
         if path_pairs:

@@ -7,6 +7,9 @@ from system import SystemFile
 
 
 class TestExcludePatterns(unittest.TestCase):
+    def test_parse_skips_none_elements(self):
+        self.assertEqual(["*.nfo"], parse_exclude_patterns([None, "*.nfo"]))
+
     def test_parse_trims_and_deduplicates_exact_patterns(self):
         self.assertEqual(
             ["*.nfo", "Sample/", "Sample"],

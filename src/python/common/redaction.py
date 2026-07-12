@@ -36,7 +36,7 @@ _USER_AT_HOST_REGEX = re.compile(
 )
 
 
-def _redact_credential_url(match: re.Match) -> str:
+def _redact_credential_url(match: re.Match[str]) -> str:
     scheme = match.group("scheme")
     port = match.group("port") or ""
     return "{}://**REDACTED**@**REDACTED**{}".format(scheme, port)
