@@ -11,7 +11,7 @@ import uuid
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, TypedDict
 
 from common import Persist, PersistError
 
@@ -24,6 +24,11 @@ _UI_SESSION_TTL = timedelta(hours=12)
 _REMEMBERED_UI_SESSION_COOKIE_MAX_AGE = timedelta(days=3650)
 _BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
 _BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
+
+
+class CreatedApiKey(TypedDict):
+    record: "ApiKeyRecord"
+    secret: str
 
 
 def _utc_now_iso() -> str:
@@ -39,10 +44,10 @@ def _history_file_path(file_path: Optional[str]) -> Optional[str]:
 
 def append_api_key_store_history(file_path: Optional[str], event: str, reason: str, **details) -> None:
     history_path = _history_file_path(file_path)
-    if history_path is None:
+    if history_path is None or file_path is None:
         return
 
-    payload = {
+    payload: Dict[str, object] = {
         "timestamp": _utc_now_iso(),
         "event": event,
         "reason": reason,
@@ -300,7 +305,7 @@ class ApiKeyStore(Persist):
         )
         return record
 
-    def __create_api_key_record(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
+    def __create_api_key_record(self, name: str, scopes: Sequence[str]) -> CreatedApiKey:
         scopes = _normalize_scopes(scopes)
         if not isinstance(name, str) or not name.strip():
             raise ValueError("API key name cannot be blank")
@@ -435,7 +440,7 @@ class ApiKeyStore(Persist):
         self,
         browser_handover_version: str,
         name: str,
-    ) -> Optional[Dict[str, object]]:
+    ) -> Optional[CreatedApiKey]:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
         with self.__state_lock:
             if not self.can_claim_initial_admin(version):
@@ -564,7 +569,7 @@ class ApiKeyStore(Persist):
         self.__bootstrap_exchange = None
         self.__record_history_event("bootstrap_exchange_cleared", reason)
 
-    def create_api_key(self, name: str, scopes: Sequence[str]) -> Dict[str, object]:
+    def create_api_key(self, name: str, scopes: Sequence[str]) -> CreatedApiKey:
         with self.__state_lock:
             result = self.__create_api_key_record(name, scopes)
             if "admin" in result["record"].scopes:
@@ -666,7 +671,7 @@ class ApiKeyStore(Persist):
         )
         return record
 
-    def rotate_api_key(self, key_id: str) -> Dict[str, object]:
+    def rotate_api_key(self, key_id: str) -> CreatedApiKey:
         record = self.get_api_key(key_id)
         if record is None:
             raise KeyError("API key '{}' not found".format(key_id))

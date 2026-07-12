@@ -118,7 +118,7 @@ class SystemScanner:
             raise SystemScannerError("Failed to scan '{}': {}".format(path, error)) from error
 
     @staticmethod
-    def __get_created_time(stat_result) -> datetime:
+    def __get_created_time(stat_result) -> Optional[datetime]:
         try:
             return datetime.fromtimestamp(stat_result.st_birthtime)
         except (AttributeError, OSError, OverflowError, TypeError, ValueError):

@@ -181,7 +181,10 @@ class PathPairManager:
         with self._lock:
             if self._collection is None:
                 self.load()
-            return self._collection
+            collection = self._collection
+            if collection is None:
+                raise RuntimeError("Path pair collection failed to load")
+            return collection
 
     def load(self) -> PathPairCollection:
         with self._lock:

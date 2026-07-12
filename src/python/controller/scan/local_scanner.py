@@ -23,15 +23,16 @@ class LocalScanner(IScanner):
                  use_temp_file: bool,
                  staging_path: Optional[str] = None,
                  managed_extract_folders_enabled: bool = True,
-                 path_pair_id: str = None,
-                 path_pair_name: str = None):
+                 path_pair_id: Optional[str] = None,
+                 path_pair_name: Optional[str] = None):
         self.__local_path = local_path
         self.__staging_path = staging_path
         self.__scanner = SystemScanner(local_path)
         if use_temp_file:
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__staging_scanner = None
-        if self.__is_valid_scan_path(local_path) and self.__is_valid_scan_path(staging_path) and \
+        if self.__is_valid_scan_path(local_path) and isinstance(staging_path, str) and \
+                self.__is_valid_scan_path(staging_path) and \
                 self.__normalize_path(staging_path) != self.__normalize_path(local_path):
             self.__staging_scanner = SystemScanner(staging_path)
             if use_temp_file:
@@ -43,11 +44,11 @@ class LocalScanner(IScanner):
         self.__path_pair_name = path_pair_name
 
     @property
-    def path_pair_id(self) -> str:
+    def path_pair_id(self) -> Optional[str]:
         return self.__path_pair_id
 
     @property
-    def path_pair_name(self) -> str:
+    def path_pair_name(self) -> Optional[str]:
         return self.__path_pair_name
 
     @overrides(IScanner)
@@ -79,7 +80,7 @@ class LocalScanner(IScanner):
                 self.logger.exception("Caught SystemScannerError")
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
 
-            if self.__managed_extract_folders_enabled:
+            if self.__managed_extract_folders_enabled and self.__staging_path is not None:
                 staging_result = self.__prune_managed_extract_entries(staging_result, self.__staging_path)
 
             local_names = {system_file.name: index for index, system_file in enumerate(result)}
@@ -107,7 +108,7 @@ class LocalScanner(IScanner):
 
     @staticmethod
     def __is_valid_scan_path(path) -> bool:
-        return isinstance(path, str) and path.strip() and os.path.isabs(path)
+        return bool(isinstance(path, str) and path.strip() and os.path.isabs(path))
 
     def __get_nested_staging_name(self) -> Optional[str]:
         if not self.__staging_path:

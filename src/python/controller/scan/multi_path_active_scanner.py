@@ -28,6 +28,7 @@ class MultiPathActiveScanner(IScanner):
             for scanner in self.__scanners.values():
                 scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__active_files_queue = multiprocessing.Queue()
+        self.__active_files_queue_closed = False
         self.__active_files: List[Tuple[str, Optional[str], Optional[str]]] = []
         self.__malformed_status_only_file_ids = []
 
@@ -52,7 +53,7 @@ class MultiPathActiveScanner(IScanner):
 
         results = []
         for file_name, path_pair_id, path_pair_name in self.__active_files:
-            scanner = self.__scanners.get(path_pair_id)
+            scanner = self.__scanners.get(path_pair_id) if path_pair_id is not None else None
             if scanner is None and path_pair_id is None and len(self.__scanners) == 1:
                 scanner = next(iter(self.__scanners.values()))
             if scanner is None:
@@ -84,11 +85,11 @@ class MultiPathActiveScanner(IScanner):
         return malformed_status_only_file_ids
 
     def close(self):
-        if self.__active_files_queue is None:
+        if self.__active_files_queue_closed:
             return
         self.__active_files_queue.close()
         self.__active_files_queue.join_thread()
-        self.__active_files_queue = None
+        self.__active_files_queue_closed = True
 
     def __is_status_only_partial(
             self,

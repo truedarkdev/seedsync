@@ -249,6 +249,8 @@ class ExtractProcess(AppProcess):
                 else:
                     file = queue_item
                     flow_id = None
+                if not isinstance(file, (ExtractRequest, ModelFile)):
+                    raise TypeError("Unexpected extract queue item")
                 model_file = getattr(file, "model_file", file)
                 assert isinstance(model_file, ModelFile)
                 self.__record_breadcrumb(

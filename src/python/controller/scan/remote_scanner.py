@@ -135,8 +135,8 @@ class RemoteScanner(IScanner):
                  local_path_to_scan_script: str,
                  remote_path_to_scan_script: str,
                  remote_python_path: Optional[str] = "python3",
-                 path_pair_id: str = None,
-                 path_pair_name: str = None):
+                 path_pair_id: Optional[str] = None,
+                 path_pair_name: Optional[str] = None):
         self.logger = logging.getLogger("RemoteScanner")
         self.__remote_path_to_scan = remote_path_to_scan
         self.__local_path_to_scan_script = local_path_to_scan_script
@@ -158,11 +158,11 @@ class RemoteScanner(IScanner):
                 self.__remote_path_to_scan_script = posixpath.join(self.__remote_path_to_scan_script, script_name)
 
     @property
-    def path_pair_id(self) -> str:
+    def path_pair_id(self) -> Optional[str]:
         return self.__path_pair_id
 
     @property
-    def path_pair_name(self) -> str:
+    def path_pair_name(self) -> Optional[str]:
         return self.__path_pair_name
 
     @overrides(IScanner)
@@ -374,10 +374,10 @@ class RemoteScanner(IScanner):
 
     @staticmethod
     def __is_valid_remote_script_path(path) -> bool:
-        return isinstance(path, str) and path.strip() and (
+        return bool(isinstance(path, str) and path.strip() and (
             posixpath.isabs(path) or RemoteScanner._SAFE_TILDE_PREFIX.match(path) is not None
-        )
+        ))
 
     @staticmethod
     def __is_valid_local_script_path(path) -> bool:
-        return isinstance(path, str) and path.strip()
+        return bool(isinstance(path, str) and path.strip())
