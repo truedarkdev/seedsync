@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from threading import RLock
@@ -217,12 +218,41 @@ class PathPairManager:
             if self._collection is None:
                 raise PathPairError("No path pair collection loaded")
 
+            temp_path = None
             try:
                 os.makedirs(self._config_dir, exist_ok=True)
-                with open(self._file_path, "w", encoding="utf-8") as handle:
+                descriptor, temp_path = tempfile.mkstemp(
+                    dir=self._config_dir,
+                    prefix=".{}-".format(self.FILENAME),
+                    suffix=".tmp",
+                )
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                     handle.write(self.to_str())
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_path, self._file_path)
+                temp_path = None
             except OSError as exc:
                 raise PersistError("Failed to save path pairs: {}".format(exc)) from exc
+            finally:
+                if temp_path is not None:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+
+    def __mutate_and_save(self, mutation):
+        collection = self.collection
+        original_pairs = list(collection.path_pairs)
+        original_version = collection.version
+        try:
+            result = mutation(collection)
+            self.save()
+            return result
+        except Exception:
+            collection.path_pairs = original_pairs
+            collection.version = original_version
+            raise
 
     def get_all_pairs(self) -> List[PathPair]:
         with self._lock:
@@ -238,25 +268,19 @@ class PathPairManager:
 
     def add_pair(self, pair: PathPair):
         with self._lock:
-            warnings = self.collection.add_pair(pair)
-            self.save()
-            return warnings
+            return self.__mutate_and_save(lambda collection: collection.add_pair(pair))
 
     def update_pair(self, pair: PathPair):
         with self._lock:
-            warnings = self.collection.update_pair(pair)
-            self.save()
-            return warnings
+            return self.__mutate_and_save(lambda collection: collection.update_pair(pair))
 
     def remove_pair(self, pair_id: str):
         with self._lock:
-            self.collection.remove_pair(pair_id)
-            self.save()
+            self.__mutate_and_save(lambda collection: collection.remove_pair(pair_id))
 
     def reorder_pairs(self, pair_ids: List[str]):
         with self._lock:
-            self.collection.reorder_pairs(pair_ids)
-            self.save()
+            self.__mutate_and_save(lambda collection: collection.reorder_pairs(pair_ids))
 
     def from_str(self, content: str) -> PathPairCollection:
         try:
@@ -317,14 +341,12 @@ class PathPairManager:
             if remote_path.startswith("<") or local_path.startswith("<"):
                 return False
 
-            self.collection.add_pair(
-                PathPair(
-                    name="Default",
-                    remote_path=remote_path,
-                    local_path=local_path,
-                    enabled=True,
-                    auto_queue=True,
-                )
+            pair = PathPair(
+                name="Default",
+                remote_path=remote_path,
+                local_path=local_path,
+                enabled=True,
+                auto_queue=True,
             )
-            self.save()
+            self.__mutate_and_save(lambda collection: collection.add_pair(pair))
             return True

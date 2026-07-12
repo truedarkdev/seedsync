@@ -3,6 +3,7 @@
 import json
 from unittest.mock import patch
 
+from common import PersistError
 from tests.integration.test_web.test_web_app import BaseTestWebApp
 
 
@@ -183,6 +184,22 @@ class TestPathPairsHandler(BaseTestWebApp):
         self.assertEqual(200, response.status_int)
         data = json.loads(response.text)["data"]
         self.assertEqual([second["id"], first["id"]], [pair["id"] for pair in data])
+
+    def test_failed_create_save_returns_500_without_mutating_collection(self):
+        with patch.object(
+            self.context.path_pair_manager,
+            "save",
+            side_effect=PersistError("write failed"),
+        ):
+            response = self.test_app.post_json("/server/path-pairs", {
+                "name": "Movies",
+                "remote_path": "/remote/movies",
+                "local_path": "/local/movies",
+            }, expect_errors=True)
+
+        self.assertEqual(500, response.status_int)
+        self.assertIn("Failed to save", json.loads(response.text)["error"])
+        self.assertEqual([], self.context.path_pair_manager.get_all_pairs())
 
     def test_get_missing_pair_returns_404(self):
         response = self.test_app.get("/server/path-pairs/missing", expect_errors=True)
