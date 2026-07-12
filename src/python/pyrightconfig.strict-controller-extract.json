@@ -1,0 +1,19 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "controller/extract/__init__.py",
+    "controller/extract/dispatch.py",
+    "controller/extract/extract.py",
+    "controller/extract/extract_process.py",
+    "controller/extract/extract_request.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}

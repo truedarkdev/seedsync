@@ -314,6 +314,32 @@ class TestExtractProcess(unittest.TestCase):
         self.assertEqual("archive.zip", failed_result.file_id)
         self.assertEqual("pair-1", failed_result.path_pair_id)
 
+    def test_parse_extract_command_rejects_malformed_shapes(self):
+        file = ModelFile("archive.zip", False)
+
+        for malformed_command in ((file,), (file, "flow-id", "extra"), [file, "flow-id"]):
+            with self.subTest(command=malformed_command):
+                with self.assertRaises(TypeError):
+                    ExtractProcess._ExtractProcess__parse_extract_command(malformed_command)
+
+    def test_parse_extract_command_rejects_non_string_flow_id(self):
+        file = ModelFile("archive.zip", False)
+
+        with self.assertRaises(TypeError):
+            ExtractProcess._ExtractProcess__parse_extract_command((file, 123))
+
+    def test_parse_extract_command_preserves_valid_commands(self):
+        file = ModelFile("archive.zip", False)
+
+        self.assertEqual(
+            (file, None),
+            ExtractProcess._ExtractProcess__parse_extract_command(file),
+        )
+        self.assertEqual(
+            (file, "flow-id"),
+            ExtractProcess._ExtractProcess__parse_extract_command((file, "flow-id")),
+        )
+
     @pytest.mark.timeout(5)
     def test_forwards_extract_commands(self):
         a = ModelFile("a", True)
