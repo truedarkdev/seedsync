@@ -345,6 +345,25 @@ If you need junit XML on the native Windows lane, create the repo-root
 `tmp\pytest\` tree first and write the file there so the artifacts stay in
 the gitignored temp tree.
 
+## Annual Major-Version/Platform Upgrade Readiness
+
+SeedSync uses an annual readiness push for major platform, framework, and
+toolchain upgrades, beginning with the 2027 review tracked as
+`platform-upgrade-readiness-2027`. The 2026 baseline remains the Debian-based
+topology and Python `>=3.11,<3.13` support range described above.
+
+Each readiness push inventories Python, Angular and other frameworks, Docker
+base images, packaging/build tools, GitHub Actions, and material library
+families. Candidates are assessed for upstream support and EOL dates, security
+exposure, and ecosystem compatibility, then handled as separate scoped
+migrations with their own validation. This is a readiness and planning cycle,
+not an automatic mass upgrade; support claims must not change until the
+corresponding migration is completed and validated.
+
+Routine safe direct dependency updates continue weekly through Dependabot.
+Urgent security, EOL, or compatibility blockers may trigger an earlier,
+dedicated upgrade outside the annual push.
+
 If you already have GNU Make available on the Windows host, the repository
 also provides a convenience wrapper:
 
