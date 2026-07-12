@@ -1,4 +1,5 @@
 import {fakeAsync, TestBed, tick} from "@angular/core/testing";
+import {HttpClientTestingModule, HttpTestingController} from "@angular/common/http/testing";
 
 import * as Immutable from "immutable";
 
@@ -9,9 +10,11 @@ import {LogRecord} from "../../../../services/logs/log-record";
 
 describe("Testing log service", () => {
     let logService: LogService;
+    let http: HttpTestingController;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
+            imports: [HttpClientTestingModule],
             providers: [
                 LoggerService,
                 LogService
@@ -19,6 +22,7 @@ describe("Testing log service", () => {
         });
 
         logService = TestBed.get(LogService);
+        http = TestBed.get(HttpTestingController);
     });
 
     it("should create an instance", () => {
@@ -169,5 +173,31 @@ describe("Testing log service", () => {
 
         expect(count).toBe(0);
         expect(console.error).toHaveBeenCalled();
+    }));
+
+    it("should load historical records and deduplicate the live handoff by id", fakeAsync(() => {
+        let loaded: LogRecord[] = [];
+        logService.loadHistory({level: "ERROR", text: "failed", logger: "seed.Controller",
+            start: "10", end: "20"}).subscribe(records => loaded = records);
+        const request = http.expectOne(req => req.url === "/server/logs/history/v1");
+        expect(request.request.params.get("level")).toBe("ERROR");
+        expect(request.request.params.get("text")).toBe("failed");
+        expect(request.request.params.get("logger")).toBe("seed.Controller");
+        expect(request.request.params.get("start")).toBe("10");
+        expect(request.request.params.get("end")).toBe("20");
+        request.flush({
+            schema: "seedsync.log-history.v1",
+            records: [{id: "stable", epoch: 10, level: "ERROR", logger: "seed", message: "failed", exception: null}],
+            page: {limit: 500, direction: "asc", next_cursor: null, has_more: false},
+            evidence: {scanned_bytes: 10, malformed_records_skipped: 0, scan_truncated: false}
+        });
+        tick();
+        expect(loaded.length).toBe(1);
+
+        logService.notifyEvent("log-record", JSON.stringify({
+            id: "stable", time: "10", level_name: "ERROR", logger_name: "seed", message: "failed", exc_tb: null
+        }));
+        tick();
+        expect(logService.getHistorySnapshot().length).toBe(1);
     }));
 });

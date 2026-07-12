@@ -17,6 +17,7 @@ from .handler.status import StatusHandler
 from .handler.path_pairs import PathPairsHandler
 from .handler.breadcrumb_trace import BreadcrumbTraceHandler
 from .handler.notifications import NotificationsAdminHandler
+from .handler.historical_log import HistoricalLogHandler, HistoricalLogStore
 
 
 class WebAppBuilder:
@@ -47,6 +48,10 @@ class WebAppBuilder:
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
+        history_path = getattr(context.args, "history_log_path", None)
+        self.historical_log_handler = HistoricalLogHandler(
+            HistoricalLogStore(history_path, 10), context.logger
+        ) if history_path else None
         self.admin_handler = None
         self.notifications_admin_handler = None
         if self.__auth_store is not None:
@@ -79,6 +84,8 @@ class WebAppBuilder:
         self.auto_queue_handler.add_routes(web_app)
         self.status_handler.add_routes(web_app)
         self.breadcrumb_trace_handler.add_routes(web_app)
+        if self.historical_log_handler is not None:
+            self.historical_log_handler.add_routes(web_app)
         if self.admin_handler is not None:
             self.admin_handler.add_routes(web_app)
         if self.notifications_admin_handler is not None:

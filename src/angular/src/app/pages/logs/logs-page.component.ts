@@ -32,6 +32,12 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     public headerHeight: Observable<number>;
     public searchQuery = "";
+    public levelFilter = "";
+    public loggerFilter = "";
+    public startFilter = "";
+    public endFilter = "";
+    public historyLoading = false;
+    public historyError = "";
     public visibleRecords: LogRecord[] = [];
     public filteredRecordCount = 0;
     public hiddenRecordCount = 0;
@@ -65,6 +71,7 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
         this._records = this._logService.getHistorySnapshot();
         this.hasReceivedLogs = this._records.length > 0;
         this.updateVisibleRecords(false);
+        this.loadHistoricalLogs();
 
         this._connectedService.connected.pipe(takeUntil(this._destroy$)).subscribe({
             next: connected => {
@@ -114,6 +121,42 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     onSearchQueryChange(value: string) {
         this.searchQuery = value || "";
+        this.updateVisibleRecords(false);
+    }
+
+    loadHistoricalLogs() {
+        this.historyLoading = true;
+        this.historyError = "";
+        this._logService.loadHistory({text: this.searchQuery.trim(), level: this.levelFilter,
+            logger: this.loggerFilter.trim(), start: this.toEpoch(this.startFilter),
+            end: this.toEpoch(this.endFilter)}).pipe(takeUntil(this._destroy$)).subscribe({
+            next: () => {
+                this._records = this._logService.getHistorySnapshot();
+                this.hasReceivedLogs = this._records.length > 0;
+                this.historyLoading = false;
+                this.updateVisibleRecords(false);
+            },
+            error: () => {
+                this.historyLoading = false;
+                this.historyError = "Historical logs could not be loaded. Live logs remain available.";
+                this._changeDetector.detectChanges();
+            }
+        });
+    }
+
+    onLevelFilterChange(value: string) {
+        this.levelFilter = value || "";
+        this.updateVisibleRecords(false);
+    }
+
+    onLoggerFilterChange(value: string) {
+        this.loggerFilter = value || "";
+        this.updateVisibleRecords(false);
+    }
+
+    onTimeFilterChange(start: string, end: string) {
+        this.startFilter = start || "";
+        this.endFilter = end || "";
         this.updateVisibleRecords(false);
     }
 
@@ -168,17 +211,21 @@ export class LogsPageComponent implements OnInit, AfterViewInit, AfterContentChe
 
     private getFilteredRecords(): LogRecord[] {
         const query = this.searchQuery.trim().toLowerCase();
-        if (!query) {
-            return this._records;
-        }
-
         return this._records.filter(record => {
-            return [
+            const textMatches = !query || [
                 record.loggerName,
                 record.message,
                 record.exceptionTraceback
             ].some(value => (value || "").toLowerCase().indexOf(query) !== -1);
+            return textMatches && (!this.levelFilter || String(record.level) === this.levelFilter) &&
+                (!this.loggerFilter.trim() || record.loggerName === this.loggerFilter.trim()) &&
+                (!this.startFilter || record.time.getTime() >= new Date(this.startFilter).getTime()) &&
+                (!this.endFilter || record.time.getTime() <= new Date(this.endFilter).getTime());
         });
+    }
+
+    private toEpoch(value: string): string {
+        return value ? String(new Date(value).getTime() / 1000) : "";
     }
 
     private clearPendingFlush() {

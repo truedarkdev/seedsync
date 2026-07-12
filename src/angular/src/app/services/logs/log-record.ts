@@ -5,6 +5,7 @@ import {Record} from "immutable";
  * LogRecord immutable
  */
 interface ILogRecord {
+    id: string;
     time: Date;
     level: LogRecord.Level;
     loggerName: string;
@@ -12,6 +13,7 @@ interface ILogRecord {
     exceptionTraceback: string;
 }
 const DefaultLogRecord: ILogRecord = {
+    id: null,
     time: null,
     level: null,
     loggerName: null,
@@ -20,6 +22,7 @@ const DefaultLogRecord: ILogRecord = {
 };
 const LogRecordRecord = Record(DefaultLogRecord);
 export class LogRecord extends LogRecordRecord implements ILogRecord {
+    id: string;
     time: Date;
     level: LogRecord.Level;
     loggerName: string;
@@ -35,6 +38,7 @@ export class LogRecord extends LogRecordRecord implements ILogRecord {
 export module LogRecord {
     export function fromJson(json: LogRecordJson): LogRecord {
         return new LogRecord({
+            id: json.id || null,
             // str -> number, then sec -> ms
             time: new Date(1000 * +json.time),
             level: LogRecord.Level[json.level_name],
@@ -59,9 +63,26 @@ export module LogRecord {
  * Note: naming convention matches that used in JSON
  */
 export interface LogRecordJson {
+    id?: string;
     time: number;
     level_name: string;
     logger_name: string;
     message: string;
     exc_tb: string;
+}
+
+export interface HistoricalLogRecordJson {
+    id: string;
+    epoch: number;
+    level: string;
+    logger: string;
+    message: string;
+    exception: string;
+}
+
+export interface HistoricalLogResponse {
+    schema: string;
+    records: HistoricalLogRecordJson[];
+    page: {limit: number; direction: string; next_cursor: string; has_more: boolean};
+    evidence: {scanned_bytes: number; malformed_records_skipped: number; scan_truncated: boolean};
 }

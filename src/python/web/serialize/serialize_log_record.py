@@ -22,6 +22,7 @@ class SerializeLogRecord(Serialize):
     __KEY_LOGGER_NAME = "logger_name"
     __KEY_MESSAGE = "message"
     __KEY_EXCEPTION_TRACEBACK = "exc_tb"
+    __KEY_ID = "id"
 
     def __init__(self):
         super().__init__()
@@ -34,6 +35,7 @@ class SerializeLogRecord(Serialize):
 
     def record(self, record: logging.LogRecord) -> str:
         json_dict = dict()
+        json_dict[SerializeLogRecord.__KEY_ID] = getattr(record, "seedsync_record_id", None)
         json_dict[SerializeLogRecord.__KEY_TIME] = str(record.created)
         json_dict[SerializeLogRecord.__KEY_LEVEL_NAME] = record.levelname
         json_dict[SerializeLogRecord.__KEY_LOGGER_NAME] = record.name
