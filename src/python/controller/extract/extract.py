@@ -221,35 +221,6 @@ class Extract:
         return os.path.join(wrapped_root, output_name)
 
     @staticmethod
-    def __resolve_single_wrapped_archive(wrapped_root: str) -> str:
-        extracted_files = []
-        real_wrapped_root = os.path.realpath(wrapped_root)
-        for dirpath, dirnames, filenames in os.walk(wrapped_root):
-            for name in dirnames + filenames:
-                candidate_path = os.path.join(dirpath, name)
-                candidate_real_path = os.path.realpath(candidate_path)
-                try:
-                    common_path = os.path.commonpath([real_wrapped_root, candidate_real_path])
-                except ValueError:
-                    common_path = ""
-                if os.path.normcase(common_path) != os.path.normcase(real_wrapped_root):
-                    raise ExtractError(
-                        "Extracted path '{}' escapes staged extraction directory".format(candidate_path)
-                    )
-                if os.path.islink(candidate_path):
-                    raise ExtractError("Link rejected in extracted archive: '{}'".format(candidate_path))
-                if os.path.isfile(candidate_path):
-                    extracted_files.append(candidate_path)
-        if len(extracted_files) != 1:
-            raise ExtractError(
-                "Expected a single wrapped archive member from '{}', found {}".format(
-                    wrapped_root,
-                    len(extracted_files),
-                )
-            )
-        return extracted_files[0]
-
-    @staticmethod
     def __validate_staged_paths(temp_root: str, allowed_roots: list[str]) -> None:
         real_allowed_roots = [os.path.realpath(root) for root in allowed_roots]
         for dirpath, dirnames, filenames in os.walk(temp_root):
@@ -332,7 +303,7 @@ class Extract:
             Extract.__merge_staged_payload(payload_root, out_dir_path)
 
     @staticmethod
-    def extract_archive(archive_path: str, out_dir_path: str):
+    def extract_archive(archive_path: str, out_dir_path: str) -> None:
         archive_kind = Extract.__detect_archive_kind(archive_path)
         if archive_kind is None:
             raise ExtractError("Path is not a valid archive: {}".format(archive_path))

@@ -5,11 +5,13 @@ import time
 import queue
 import threading
 from datetime import datetime
-from typing import Any, Optional, List, cast
+from typing import Optional, Protocol, cast
 import logging
 import os
 import json
 from collections import defaultdict, deque
+from _thread import LockType
+from multiprocessing.queues import Queue as MPQueue
 
 from .dispatch import ExtractDispatch, ExtractStatus, ExtractListener, ExtractDispatchError
 from .extract_request import ExtractRequest
@@ -17,8 +19,16 @@ from common import overrides, AppProcess
 from model import ModelFile
 
 
+class _BreadcrumbEmitter(Protocol):
+    def record(self, source: str, message: str, details: object = None, **metadata: object) -> None: ...
+
+
+ExtractItem = ExtractRequest | ModelFile
+ExtractCommand = tuple[ExtractItem, Optional[str]]
+
+
 class ExtractStatusResult:
-    def __init__(self, timestamp: datetime, statuses: List[ExtractStatus]):
+    def __init__(self, timestamp: datetime, statuses: list[ExtractStatus]):
         self.timestamp = timestamp
         self.statuses = statuses
 
@@ -57,9 +67,9 @@ class ExtractProcess(AppProcess):
     class __ExtractListener(ExtractListener):
         def __init__(self,
                      logger: logging.Logger,
-                     completed_queue: multiprocessing.Queue,
+                     completed_queue: MPQueue[ExtractCompletedResult],
                      trace_owner: "ExtractProcess",
-                     failed_queue: Optional[multiprocessing.Queue] = None):
+                     failed_queue: Optional[MPQueue[ExtractFailedResult]] = None):
             self.logger = logger
             self.completed_queue = completed_queue
             self.trace_owner = trace_owner
@@ -69,11 +79,10 @@ class ExtractProcess(AppProcess):
                               name: str,
                               is_dir: bool,
                               file_id: Optional[str] = None,
-                              path_pair_id: Optional[str] = None):
+                              path_pair_id: Optional[str] = None) -> None:
             self.logger.info("Extraction completed for {}".format(name))
-            trace_owner: Any = self.trace_owner
-            flow_id = trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
-            trace_owner._ExtractProcess__record_breadcrumb(
+            flow_id = self.trace_owner._listener_pop_inflight_flow_id(file_id=file_id, file_name=name)
+            self.trace_owner._listener_record_breadcrumb(
                 "extract_completed",
                 {
                     "file_name": name,
@@ -81,12 +90,12 @@ class ExtractProcess(AppProcess):
                     "file_id": file_id,
                     "path_pair_id": path_pair_id,
                 },
-                corr_id=trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                corr_id=self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            trace_owner._ExtractProcess__trace_target_archive_event("extract_completed", {
+            self.trace_owner._listener_trace_target_archive_event("extract_completed", {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
@@ -103,11 +112,10 @@ class ExtractProcess(AppProcess):
                            name: str,
                            is_dir: bool,
                            file_id: Optional[str] = None,
-                           path_pair_id: Optional[str] = None):
+                           path_pair_id: Optional[str] = None) -> None:
             self.logger.error("Extraction failed for {}".format(name))
-            trace_owner: Any = self.trace_owner
-            flow_id = trace_owner._ExtractProcess__pop_inflight_flow_id(file_id=file_id, file_name=name)
-            trace_owner._ExtractProcess__record_breadcrumb(
+            flow_id = self.trace_owner._listener_pop_inflight_flow_id(file_id=file_id, file_name=name)
+            self.trace_owner._listener_record_breadcrumb(
                 "extract_failed",
                 {
                     "file_name": name,
@@ -116,12 +124,12 @@ class ExtractProcess(AppProcess):
                     "path_pair_id": path_pair_id,
                 },
                 event_type="failure",
-                corr_id=trace_owner._ExtractProcess__trace_corr_id(file_id, path_pair_id, name),
+                corr_id=self.trace_owner._listener_trace_corr_id(file_id, path_pair_id, name),
                 flow_id=flow_id,
                 file_id=file_id,
                 path_pair_id=path_pair_id,
             )
-            trace_owner._ExtractProcess__trace_target_archive_event("extract_failed", {
+            self.trace_owner._listener_trace_target_archive_event("extract_failed", {
                 "file_name": name,
                 "is_dir": is_dir,
                 "file_id": file_id,
@@ -140,27 +148,27 @@ class ExtractProcess(AppProcess):
                  local_path: str,
                  local_path_fallback: Optional[str] = None,
                  managed_extract_folders_enabled: bool = True,
-                 breadcrumb_trace=None):
+                 breadcrumb_trace: Optional[_BreadcrumbEmitter] = None):
         super().__init__(name=self.__class__.__name__)
         self.__out_dir_path = out_dir_path
         self.__local_path = local_path
         self.__local_path_fallback = local_path_fallback
         self.__managed_extract_folders_enabled = managed_extract_folders_enabled
-        self.__command_queue = multiprocessing.Queue()
-        self.__status_result_queue = multiprocessing.Queue()
-        self.__completed_result_queue = multiprocessing.Queue()
-        self.__failed_result_queue = multiprocessing.Queue()
+        self.__command_queue: Optional[MPQueue[ExtractCommand | ExtractItem]] = multiprocessing.Queue()
+        self.__status_result_queue: Optional[MPQueue[ExtractStatusResult]] = multiprocessing.Queue()
+        self.__completed_result_queue: Optional[MPQueue[ExtractCompletedResult]] = multiprocessing.Queue()
+        self.__failed_result_queue: Optional[MPQueue[ExtractFailedResult]] = multiprocessing.Queue()
         self.__dispatch: Optional[ExtractDispatch] = None
         self.__breadcrumb_trace = breadcrumb_trace
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
-        self.__target_archive_trace_last_signature = None
-        self.__inflight_flow_ids_by_file_id = defaultdict(deque)
-        self.__inflight_flow_ids_by_name = defaultdict(deque)
+        self.__target_archive_trace_last_signature: Optional[str] = None
+        self.__inflight_flow_ids_by_file_id: defaultdict[str, deque[str]] = defaultdict(deque)
+        self.__inflight_flow_ids_by_name: defaultdict[str, deque[str]] = defaultdict(deque)
         # Child-only synchronization must not cross the spawn pickle boundary.
-        self.__inflight_flow_ids_lock = None
+        self.__inflight_flow_ids_lock: Optional[LockType] = None
 
     @staticmethod
     def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
@@ -170,8 +178,14 @@ class ExtractProcess(AppProcess):
             parsed_identifier = json.loads(identifier)
         except (TypeError, ValueError, json.JSONDecodeError):
             return identifier
-        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
-            return parsed_identifier[1]
+        if isinstance(parsed_identifier, list):
+            parsed_items = cast(list[object], parsed_identifier)
+            try:
+                _, selector_name = parsed_items
+            except ValueError:
+                return identifier
+            if isinstance(selector_name, str):
+                return selector_name
         return identifier
 
     def __is_target_archive_trace_enabled(self) -> bool:
@@ -185,10 +199,10 @@ class ExtractProcess(AppProcess):
         selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
         return selector_name == file_name
 
-    def __trace_target_archive_event(self, event: str, payload: dict):
+    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
-        trace_payload = {
+        trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
         }
@@ -200,21 +214,23 @@ class ExtractProcess(AppProcess):
         self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
 
     @overrides(AppProcess)
-    def run_init(self):
+    def run_init(self) -> None:
         self.__inflight_flow_ids_lock = threading.Lock()
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         # Create dispatch inside the process
         self.__dispatch = ExtractDispatch(out_dir_path=self.__out_dir_path,
                                           local_path=self.__local_path,
-                                          local_path_fallback=cast(Any, self.__local_path_fallback),
+                                          local_path_fallback=self.__local_path_fallback,
                                           managed_extract_folders_enabled=self.__managed_extract_folders_enabled)
 
         # Add extract listener
+        assert self.__completed_result_queue is not None
+        assert self.__failed_result_queue is not None
         listener = ExtractProcess.__ExtractListener(
             logger=self.logger,
-            completed_queue=cast(Any, self.__completed_result_queue),
+            completed_queue=self.__completed_result_queue,
             trace_owner=self,
-            failed_queue=cast(Any, self.__failed_result_queue)
+            failed_queue=self.__failed_result_queue
         )
         self.__dispatch.add_listener(listener)
 
@@ -222,12 +238,28 @@ class ExtractProcess(AppProcess):
         self.__dispatch.start()
 
     @overrides(AppProcess)
-    def run_cleanup(self):
+    def run_cleanup(self) -> None:
         assert self.__dispatch is not None
         self.__dispatch.stop()
 
+    @staticmethod
+    def __parse_extract_command(queue_item: object) -> ExtractCommand:
+        if isinstance(queue_item, tuple):
+            queue_items = cast(tuple[object, ...], queue_item)
+            if len(queue_items) != 2:
+                raise TypeError("Unexpected extract queue item")
+            file, flow_id = queue_items
+        else:
+            file = queue_item
+            flow_id = None
+        if not isinstance(file, (ExtractRequest, ModelFile)):
+            raise TypeError("Unexpected extract queue item")
+        if flow_id is not None and not isinstance(flow_id, str):
+            raise TypeError("Unexpected extract flow id")
+        return file, flow_id
+
     @overrides(AppProcess)
-    def run_loop(self):
+    def run_loop(self) -> None:
         assert self.__dispatch is not None
         assert self.__command_queue is not None
         assert self.__status_result_queue is not None
@@ -244,13 +276,7 @@ class ExtractProcess(AppProcess):
                     first_queue_read = False
                 else:
                     queue_item = self.__command_queue.get(block=False)
-                if isinstance(queue_item, tuple) and len(queue_item) == 2:
-                    file, flow_id = queue_item
-                else:
-                    file = queue_item
-                    flow_id = None
-                if not isinstance(file, (ExtractRequest, ModelFile)):
-                    raise TypeError("Unexpected extract queue item")
+                file, flow_id = self.__parse_extract_command(queue_item)
                 model_file = getattr(file, "model_file", file)
                 assert isinstance(model_file, ModelFile)
                 self.__record_breadcrumb(
@@ -323,7 +349,7 @@ class ExtractProcess(AppProcess):
         time.sleep(ExtractProcess.__DEFAULT_SLEEP_INTERVAL_IN_SECS)
 
     @overrides(AppProcess)
-    def close_queues(self):
+    def close_queues(self) -> None:
         self.__command_queue = self._close_multiprocessing_queue(self.__command_queue)
         self.__status_result_queue = self._close_multiprocessing_queue(self.__status_result_queue)
         self.__completed_result_queue = self._close_multiprocessing_queue(self.__completed_result_queue)
@@ -333,17 +359,25 @@ class ExtractProcess(AppProcess):
     def __trace_corr_id(self,
                         file_id: Optional[str] = None,
                         path_pair_id: Optional[str] = None,
-                        file_name: Optional[str] = None):
+                        file_name: Optional[str] = None) -> Optional[str]:
         return path_pair_id or file_id or file_name
+
+    def _listener_trace_corr_id(
+            self,
+            file_id: Optional[str] = None,
+            path_pair_id: Optional[str] = None,
+            file_name: Optional[str] = None
+    ) -> Optional[str]:
+        return self.__trace_corr_id(file_id, path_pair_id, file_name)
 
     def __record_breadcrumb(self,
                             message: str,
-                            details: dict,
+                            details: dict[str, object],
                             event_type: str = "state_transition",
                             corr_id: Optional[str] = None,
                             flow_id: Optional[str] = None,
                             file_id: Optional[str] = None,
-                            path_pair_id: Optional[str] = None):
+                            path_pair_id: Optional[str] = None) -> None:
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -358,22 +392,44 @@ class ExtractProcess(AppProcess):
             path_pair_id=path_pair_id,
         )
 
-    def __track_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
+    def _listener_record_breadcrumb(
+            self,
+            message: str,
+            details: dict[str, object],
+            event_type: str = "state_transition",
+            corr_id: Optional[str] = None,
+            flow_id: Optional[str] = None,
+            file_id: Optional[str] = None,
+            path_pair_id: Optional[str] = None
+    ) -> None:
+        self.__record_breadcrumb(
+            message,
+            details,
+            event_type=event_type,
+            corr_id=corr_id,
+            flow_id=flow_id,
+            file_id=file_id,
+            path_pair_id=path_pair_id,
+        )
+
+    def _listener_trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
+        self.__trace_target_archive_event(event, payload)
+
+    def __track_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None) -> None:
         if flow_id is None:
             return
         with self.__inflight_flow_ids_lock_or_create():
-            if file.file_id is not None:
-                self.__inflight_flow_ids_by_file_id[file.file_id].append(flow_id)
+            self.__inflight_flow_ids_by_file_id[file.file_id].append(flow_id)
             self.__inflight_flow_ids_by_name[file.name].append(flow_id)
 
-    def __inflight_flow_ids_lock_or_create(self):
+    def __inflight_flow_ids_lock_or_create(self) -> LockType:
         # Direct run_loop unit tests do not call run_init; keep those local
         # execution paths synchronized without serializing a parent thread lock.
         if self.__inflight_flow_ids_lock is None:
             self.__inflight_flow_ids_lock = threading.Lock()
         return self.__inflight_flow_ids_lock
 
-    def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
+    def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None) -> None:
         if flow_id is None:
             return
         with self.__inflight_flow_ids_lock_or_create():
@@ -389,7 +445,11 @@ class ExtractProcess(AppProcess):
             )
 
     @staticmethod
-    def __remove_flow_id(flow_ids_by_key, key, flow_id: str):
+    def __remove_flow_id(
+            flow_ids_by_key: defaultdict[str, deque[str]],
+            key: Optional[str],
+            flow_id: str
+    ) -> None:
         if key is None:
             return
         flow_ids = flow_ids_by_key.get(key)
@@ -404,7 +464,7 @@ class ExtractProcess(AppProcess):
 
     def __pop_inflight_flow_id(self,
                                file_id: Optional[str] = None,
-                               file_name: Optional[str] = None):
+                               file_name: Optional[str] = None) -> Optional[str]:
         with self.__inflight_flow_ids_lock_or_create():
             if file_id is not None:
                 by_id = self.__inflight_flow_ids_by_file_id.get(file_id)
@@ -424,7 +484,14 @@ class ExtractProcess(AppProcess):
                     return flow_id
         return None
 
-    def extract(self, file: ExtractRequest | ModelFile, flow_id: Optional[str] = None):
+    def _listener_pop_inflight_flow_id(
+            self,
+            file_id: Optional[str] = None,
+            file_name: Optional[str] = None
+    ) -> Optional[str]:
+        return self.__pop_inflight_flow_id(file_id=file_id, file_name=file_name)
+
+    def extract(self, file: ExtractItem, flow_id: Optional[str] = None) -> None:
         """
         Process-safe method to queue an extraction
         :param file:
@@ -453,7 +520,7 @@ class ExtractProcess(AppProcess):
         this method was called
         :return:
         """
-        latest_result = None
+        latest_result: Optional[ExtractStatusResult] = None
         try:
             assert self.__status_result_queue is not None
             while True:
@@ -462,14 +529,14 @@ class ExtractProcess(AppProcess):
             pass
         return latest_result
 
-    def pop_completed(self) -> List[ExtractCompletedResult]:
+    def pop_completed(self) -> list[ExtractCompletedResult]:
         """
         Process-safe method to retrieve list of newly completed extractions
         Returns an empty list if no new extractions were completed since the
         last time this method was called.
         :return:
         """
-        completed = []
+        completed: list[ExtractCompletedResult] = []
         try:
             assert self.__completed_result_queue is not None
             while True:
@@ -479,14 +546,14 @@ class ExtractProcess(AppProcess):
             pass
         return completed
 
-    def pop_failed(self) -> List[ExtractFailedResult]:
+    def pop_failed(self) -> list[ExtractFailedResult]:
         """
         Process-safe method to retrieve list of newly failed extractions
         Returns an empty list if no new extractions failed since the last time
         this method was called.
         :return:
         """
-        failed = []
+        failed: list[ExtractFailedResult] = []
         try:
             assert self.__failed_result_queue is not None
             while True:

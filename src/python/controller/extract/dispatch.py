@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from enum import Enum
-from typing import List, Optional
+from typing import List
 import queue
 import logging
 import os
@@ -31,7 +31,7 @@ class ExtractListener(ABC):
                           name: str,
                           is_dir: bool,
                           file_id: str | None = None,
-                          path_pair_id: str | None = None):
+                          path_pair_id: str | None = None) -> None:
         pass
 
     @abstractmethod
@@ -39,7 +39,7 @@ class ExtractListener(ABC):
                        name: str,
                        is_dir: bool,
                        file_id: str | None = None,
-                       path_pair_id: str | None = None):
+                       path_pair_id: str | None = None) -> None:
         pass
 
 
@@ -78,8 +78,8 @@ class ExtractStatus:
     @property
     def path_pair_id(self) -> str | None: return self.__path_pair_id
 
-    def __eq__(self, other):
-        return self.__dict__ == other.__dict__
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, ExtractStatus) and self.__dict__ == other.__dict__
 
 
 class ExtractDispatch:
@@ -87,6 +87,8 @@ class ExtractDispatch:
     __WORKER_SLEEP_INTERVAL_IN_SECS = 0.5
 
     class _Task:
+        ArchivePath = tuple[str, str, str, str | None, str | None]
+
         def __init__(self,
                      root_name: str,
                      root_is_dir: bool,
@@ -96,14 +98,14 @@ class ExtractDispatch:
             self.root_is_dir = root_is_dir
             self.root_file_id = root_file_id
             self.path_pair_id = path_pair_id
-            self.archive_paths = []  # list of (archive path, out path, archive name, archive file_id, path_pair_id) tuples
+            self.archive_paths: list[ExtractDispatch._Task.ArchivePath] = []
 
         def add_archive(self,
                         archive_path: str,
                         out_dir_path: str,
                         archive_name: str,
                         archive_file_id: str | None = None,
-                        path_pair_id: str | None = None):
+                        path_pair_id: str | None = None) -> None:
             self.archive_paths.append((archive_path, out_dir_path, archive_name, archive_file_id, path_pair_id))
 
     def __init__(self,
@@ -116,33 +118,33 @@ class ExtractDispatch:
         self.__local_path_fallback = local_path_fallback
         self.__managed_extract_folders_enabled = managed_extract_folders_enabled
 
-        self.__task_queue = queue.Queue()
+        self.__task_queue: queue.Queue[ExtractDispatch._Task] = queue.Queue()
         self.__worker_thread: threading.Thread = threading.Thread(name="ExtractWorker", target=self.__worker)
         self.__worker_shutdown = threading.Event()
 
-        self.__listeners = []
+        self.__listeners: list[ExtractListener] = []
         self.__listeners_lock = threading.Lock()
 
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild(self.__class__.__name__)
 
-    def start(self):
+    def start(self) -> None:
         self.__worker_thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         self.__worker_shutdown.set()
         self.__worker_thread.join()
 
-    def add_listener(self, listener: ExtractListener):
+    def add_listener(self, listener: ExtractListener) -> None:
         with self.__listeners_lock:
             self.__listeners.append(listener)
 
     def status(self) -> List[ExtractStatus]:
         with self.__task_queue.mutex:
             tasks = list(self.__task_queue.queue)
-        statuses = []
+        statuses: list[ExtractStatus] = []
         for task in tasks:
             status = ExtractStatus(name=task.root_name,
                                    is_dir=task.root_is_dir,
@@ -176,7 +178,7 @@ class ExtractDispatch:
             local_path_fallback=self.__local_path_fallback,
         )
 
-    def extract(self, extract_item: ExtractRequest | ModelFile):
+    def extract(self, extract_item: ExtractRequest | ModelFile) -> None:
         req = self.__normalize_extract_request(extract_item)
         model_file = req.model_file
         self.logger.debug("Received extract for {}".format(model_file.name))
@@ -210,7 +212,7 @@ class ExtractDispatch:
                             and archive_full_path is not None:
                         resolved_out_dir_path = out_dir_path
                         if archive_uses_fallback and \
-                                req.out_dir_path_fallback is not None and req.out_dir_path_fallback != req.out_dir_path:
+                                req.out_dir_path_fallback != req.out_dir_path:
                             resolved_out_dir_path = os.path.join(req.out_dir_path_fallback, os.path.dirname(curr_file.full_path))
                         task.add_archive(
                             archive_path=archive_full_path,
@@ -240,7 +242,7 @@ class ExtractDispatch:
                 raise ExtractDispatchError("File is not an archive: {}".format(model_file.name))
             base_out = req.out_dir_path
             if archive_uses_fallback and \
-                    req.out_dir_path_fallback is not None and req.out_dir_path_fallback != req.out_dir_path:
+                    req.out_dir_path_fallback != req.out_dir_path:
                 base_out = req.out_dir_path_fallback
             task.add_archive(
                 archive_path=archive_full_path,
@@ -258,7 +260,7 @@ class ExtractDispatch:
             self.__task_queue.queue.append(task)
             self.__task_queue.not_empty.notify()
 
-    def __worker(self):
+    def __worker(self) -> None:
         self.logger.debug("Started worker thread")
 
         while not self.__worker_shutdown.is_set():
@@ -347,14 +349,14 @@ class ExtractDispatch:
         self.logger.debug("Stopped worker thread")
 
     @staticmethod
-    def __coalesce_extractions(task: _Task):
+    def __coalesce_extractions(task: _Task) -> None:
         """
         Remove duplicate extractions due to split files
         :param task:
         :return:
         """
         # Filter out any rxx files for a split rar
-        filtered_paths = []
+        filtered_paths: list[ExtractDispatch._Task.ArchivePath] = []
         for archive_path, out_path, archive_name, archive_file_id, path_pair_id in task.archive_paths:
             file_ext = os.path.splitext(os.path.basename(archive_path))[1]
             if not re.match(r"^\.r\d{2,}$", file_ext):
