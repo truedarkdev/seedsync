@@ -39,7 +39,7 @@ class LocalScanner(IScanner):
                 self.__staging_scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.logger = logging.getLogger("LocalScanner")
         self.__managed_extract_folders_enabled = managed_extract_folders_enabled
-        self.__managed_extract_file_ids = set()
+        self.__managed_extract_file_ids: set[str] = set()
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
 
@@ -52,7 +52,7 @@ class LocalScanner(IScanner):
         return self.__path_pair_name
 
     @overrides(IScanner)
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("LocalScanner")
 
     @overrides(IScanner)
@@ -107,7 +107,7 @@ class LocalScanner(IScanner):
         return os.path.normcase(os.path.abspath(path))
 
     @staticmethod
-    def __is_valid_scan_path(path) -> bool:
+    def __is_valid_scan_path(path: object) -> bool:
         return bool(isinstance(path, str) and path.strip() and os.path.isabs(path))
 
     def __get_nested_staging_name(self) -> Optional[str]:
@@ -119,13 +119,13 @@ class LocalScanner(IScanner):
         return os.path.basename(self.__staging_path.rstrip(os.sep))
 
     @staticmethod
-    def __mark_staging_file_tree(system_file: SystemFile):
+    def __mark_staging_file_tree(system_file: SystemFile) -> None:
         system_file.is_staging = True
         for child in system_file.children:
             LocalScanner.__mark_staging_file_tree(child)
 
     def __prune_managed_extract_entries(self, system_files: List[SystemFile], root_path: str) -> List[SystemFile]:
-        pruned_files = []
+        pruned_files: List[SystemFile] = []
         for system_file in system_files:
             pruned_file = self.__prune_managed_extract_tree(
                 system_file,
@@ -159,7 +159,7 @@ class LocalScanner(IScanner):
                 self.__managed_extract_file_ids.add(managed_extract_file_id)
                 return None
 
-        pruned_children = []
+        pruned_children: List[SystemFile] = []
         for child in system_file.children:
             if marker_child is not None and child.name == marker_child.name:
                 continue
@@ -197,9 +197,9 @@ class LocalScanner(IScanner):
 
     @staticmethod
     def __build_merged_directory(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
-        merged_children = []
+        merged_children: List[SystemFile] = []
         staging_children_by_name = {child.name: child for child in staging_file.children}
-        consumed_staging_names = set()
+        consumed_staging_names: set[str] = set()
 
         for existing_child in existing_file.children:
             staging_child = staging_children_by_name.get(existing_child.name)

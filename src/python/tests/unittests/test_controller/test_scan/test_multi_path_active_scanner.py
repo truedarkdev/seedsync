@@ -42,6 +42,45 @@ class TestMultiPathActiveScanner(unittest.TestCase):
             {(file.name, file.path_pair_id, file.path_pair_name, file.size) for file in files}
         )
 
+    def test_scan_observes_immediately_set_active_files(self):
+        scanner = MultiPathActiveScanner({
+            "movies": self.movies_dir,
+            "tv": self.tv_dir,
+        })
+        self.addCleanup(scanner.close)
+
+        scanner.set_active_files([
+            ("dup", "movies", "Movies"),
+            ("dup", "tv", "TV"),
+        ])
+
+        files = scanner.scan()
+
+        self.assertEqual(
+            {("dup", "movies", "Movies", 6), ("dup", "tv", "TV", 2)},
+            {(file.name, file.path_pair_id, file.path_pair_name, file.size) for file in files}
+        )
+
+    def test_scan_uses_newest_queued_active_files(self):
+        scanner = MultiPathActiveScanner({
+            "movies": self.movies_dir,
+            "tv": self.tv_dir,
+        })
+        self.addCleanup(scanner.close)
+
+        scanner.set_active_files([("dup", "movies", "Movies")])
+        scanner.set_active_files([("dup", "tv", "TV")])
+
+        files = scanner.scan()
+
+        self.assertEqual(1, len(files))
+        self.assertEqual(("dup", "tv", "TV", 2), (
+            files[0].name,
+            files[0].path_pair_id,
+            files[0].path_pair_name,
+            files[0].size,
+        ))
+
     def test_scan_uses_single_scanner_fallback_for_missing_path_pair(self):
         scanner = MultiPathActiveScanner({"movies": self.movies_dir})
         self.addCleanup(scanner.close)

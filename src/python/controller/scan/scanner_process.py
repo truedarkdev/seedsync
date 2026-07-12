@@ -4,11 +4,17 @@ import logging
 from abc import ABC, abstractmethod
 import multiprocessing
 from datetime import datetime
-from typing import Any, List, Optional, cast
+from typing import List, Optional, Protocol
 import queue
+from multiprocessing.queues import Queue as MPQueue
+from multiprocessing.synchronize import Event as EventType
 
 from common import overrides, AppProcess, AppError
 from system import SystemFile
+
+
+class _BreadcrumbEmitter(Protocol):
+    def record(self, source: str, message: str, details: object = None, **metadata: object) -> None: ...
 
 
 class ScannerError(AppError):
@@ -38,7 +44,7 @@ class IScanner(ABC):
         pass
 
     @abstractmethod
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         pass
 
     def pop_malformed_status_only_file_ids(self) -> List[str]:
@@ -74,33 +80,33 @@ class ScannerProcess(AppProcess):
     def __init__(self,
                  scanner: IScanner, interval_in_ms: int,
                  verbose: bool = True,
-                 breadcrumb_trace=None):
+                 breadcrumb_trace: Optional[_BreadcrumbEmitter] = None):
         """
         Create a scanner process
         :param scanner: IScanner implementation
         :param interval_in_ms: Minimum interval (in ms) between results
         """
         super().__init__(name=scanner.__class__.__name__)
-        self.__queue: Any | None = multiprocessing.Queue()
-        self.__scan_target_queue: Any | None = multiprocessing.Queue()
-        self.__wake_event: Any | None = multiprocessing.Event()
+        self.__queue: Optional[MPQueue[ScannerResult]] = multiprocessing.Queue()
+        self.__scan_target_queue: Optional[MPQueue[Optional[str]]] = multiprocessing.Queue()
+        self.__wake_event: Optional[EventType] = multiprocessing.Event()
         self.__scanner = scanner
         self.__interval_in_ms = interval_in_ms
-        self.__last_recoverable_error_message = None
+        self.__last_recoverable_error_message: Optional[str] = None
         self.verbose = verbose
         self.__breadcrumb_trace = breadcrumb_trace
 
     @overrides(AppProcess)
-    def run_init(self):
+    def run_init(self) -> None:
         # Set the base logger for scanner
         self.__scanner.set_base_logger(self.logger)
 
     @overrides(AppProcess)
-    def run_cleanup(self):
+    def run_cleanup(self) -> None:
         pass
 
     @overrides(AppProcess)
-    def run_loop(self):
+    def run_loop(self) -> None:
         timestamp_start = datetime.now()
         if self.verbose:
             self.logger.debug("Running a scan")
@@ -205,25 +211,27 @@ class ScannerProcess(AppProcess):
             self.__wake_event.clear()
 
     @overrides(AppProcess)
-    def close_queues(self):
+    def close_queues(self) -> None:
         self.__queue = self._close_multiprocessing_queue(self.__queue)
         self.__scan_target_queue = self._close_multiprocessing_queue(self.__scan_target_queue)
         if self.__wake_event is not None:
             self.__wake_event = None
         super().close_queues()
 
-    def __trace_corr_id(self):
+    def __trace_corr_id(self) -> str:
         return self.__trace_path_pair_id() or self.__scanner.__class__.__name__
 
-    def __trace_path_pair_id(self):
-        return cast(Optional[str], getattr(self.__scanner, "path_pair_id", None))
+    def __trace_path_pair_id(self) -> Optional[str]:
+        path_pair_id = getattr(self.__scanner, "path_pair_id", None)
+        return path_pair_id if isinstance(path_pair_id, str) else None
 
-    def __trace_path_pair_name(self):
-        return cast(Optional[str], getattr(self.__scanner, "path_pair_name", None))
+    def __trace_path_pair_name(self) -> Optional[str]:
+        path_pair_name = getattr(self.__scanner, "path_pair_name", None)
+        return path_pair_name if isinstance(path_pair_name, str) else None
 
-    def __record_breadcrumb(self, message: str, details: dict, event_type: str = "state_transition",
+    def __record_breadcrumb(self, message: str, details: dict[str, object], event_type: str = "state_transition",
                             corr_id: str | None = None, flow_id: str | None = None,
-                            path_pair_id: str | None = None, path_pair_name: str | None = None):
+                            path_pair_id: str | None = None, path_pair_name: str | None = None) -> None:
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -257,7 +265,7 @@ class ScannerProcess(AppProcess):
                 return latest_scan
         return latest_scan
 
-    def force_scan(self, path_pair_id: Optional[str] = None):
+    def force_scan(self, path_pair_id: Optional[str] = None) -> None:
         """Force process to wake and do an immediate scan"""
         assert self.__scan_target_queue is not None
         self.__scan_target_queue.put(path_pair_id)
@@ -265,7 +273,7 @@ class ScannerProcess(AppProcess):
         self.__wake_event.set()
 
     def __drain_scan_target_path_pair_ids(self) -> Optional[set[str]]:
-        scan_target_path_pair_ids = set()
+        scan_target_path_pair_ids: set[str] = set()
         full_scan_requested = False
         while True:
             try:
