@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, ServiceRestart, AppError
 from controller import AutoQueuePattern, AutoQueuePersist
-from seedsync import Seedsync
+from seedsync import Seedsync, _configure_multiprocessing_start_method
 from web.auth_store import ApiKeyStore
 
 
@@ -28,6 +28,31 @@ def _read_history_entries(file_path):
 
 
 class TestSeedsync(unittest.TestCase):
+    def test_configure_multiprocessing_selects_spawn(self):
+        with patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_called_once_with("spawn")
+
+    def test_configure_multiprocessing_accepts_existing_spawn(self):
+        with patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=RuntimeError("context already set"),
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value="spawn",
+        ):
+            _configure_multiprocessing_start_method()
+
+    def test_configure_multiprocessing_rejects_incompatible_method(self):
+        with patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=RuntimeError("context already set"),
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value="fork",
+        ), self.assertRaisesRegex(RuntimeError, "requires multiprocessing start method 'spawn'"):
+            _configure_multiprocessing_start_method()
+
     def test_args_config(self):
         argv = []
         argv.append("-c")
@@ -330,6 +355,7 @@ class TestSeedsync(unittest.TestCase):
                 interval_ms_remote_scan=1000,
                 interval_ms_local_scan=1000,
                 interval_ms_downloading_scan=1000,
+                use_local_path_as_extract_path=True,
             ),
             general=SimpleNamespace(verbose=False),
             autoqueue=SimpleNamespace(auto_delete_remote=False),

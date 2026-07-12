@@ -15,7 +15,7 @@ from typing import Any
 
 import tblib.pickling_support
 
-from common import overrides, ServiceExit, MultiprocessingLogger
+from common import overrides, ServiceExit
 
 
 tblib.pickling_support.install()
@@ -51,17 +51,16 @@ class AppProcess(Process):
         self.__name = name
         super().__init__(name=self.__name)
 
-        self.mp_logger = None
         self._mp_log_queue: Any | None = None
         self._mp_log_level: int | None = None
         self.logger = logging.getLogger(self.__name)
         self.__exception_queue: Any | None = multiprocessing.Queue()
         self._terminate: Any | None = multiprocessing.Event()
 
-    def set_multiprocessing_logger(self, mp_logger: MultiprocessingLogger):
-        self.mp_logger = mp_logger
-        self._mp_log_queue = mp_logger.queue
-        self._mp_log_level = mp_logger.log_level
+    def set_mp_log_queue(self, log_queue: MPQueue, log_level: int):
+        """Configure child logging with spawn-safe transport data."""
+        self._mp_log_queue = log_queue
+        self._mp_log_level = log_level
 
     @overrides(Process)
     def run(self):
@@ -88,7 +87,9 @@ class AppProcess(Process):
             from logging.handlers import QueueHandler
 
             root_logger = logging.getLogger()
-            root_logger.handlers.clear()
+            for handler in root_logger.handlers[:]:
+                handler.close()
+                root_logger.removeHandler(handler)
             root_logger.addHandler(QueueHandler(self._mp_log_queue))
             if self._mp_log_level is not None:
                 root_logger.setLevel(self._mp_log_level)
@@ -139,7 +140,6 @@ class AppProcess(Process):
         Release multiprocessing resources after the process has been joined.
         """
         self.__exception_queue = self._close_multiprocessing_queue(self.__exception_queue)
-        self.mp_logger = None
         self._terminate = None
         self._mp_log_queue = None
         self._mp_log_level = None

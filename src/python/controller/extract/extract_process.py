@@ -159,7 +159,8 @@ class ExtractProcess(AppProcess):
         self.__target_archive_trace_last_signature = None
         self.__inflight_flow_ids_by_file_id = defaultdict(deque)
         self.__inflight_flow_ids_by_name = defaultdict(deque)
-        self.__inflight_flow_ids_lock = threading.Lock()
+        # Child-only synchronization must not cross the spawn pickle boundary.
+        self.__inflight_flow_ids_lock = None
 
     @staticmethod
     def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
@@ -200,6 +201,7 @@ class ExtractProcess(AppProcess):
 
     @overrides(AppProcess)
     def run_init(self):
+        self.__inflight_flow_ids_lock = threading.Lock()
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         # Create dispatch inside the process
         self.__dispatch = ExtractDispatch(out_dir_path=self.__out_dir_path,
@@ -357,15 +359,22 @@ class ExtractProcess(AppProcess):
     def __track_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
         if flow_id is None:
             return
-        with self.__inflight_flow_ids_lock:
+        with self.__inflight_flow_ids_lock_or_create():
             if file.file_id is not None:
                 self.__inflight_flow_ids_by_file_id[file.file_id].append(flow_id)
             self.__inflight_flow_ids_by_name[file.name].append(flow_id)
 
+    def __inflight_flow_ids_lock_or_create(self):
+        # Direct run_loop unit tests do not call run_init; keep those local
+        # execution paths synchronized without serializing a parent thread lock.
+        if self.__inflight_flow_ids_lock is None:
+            self.__inflight_flow_ids_lock = threading.Lock()
+        return self.__inflight_flow_ids_lock
+
     def __untrack_inflight_flow_id(self, file: ModelFile, flow_id: Optional[str] = None):
         if flow_id is None:
             return
-        with self.__inflight_flow_ids_lock:
+        with self.__inflight_flow_ids_lock_or_create():
             self.__remove_flow_id(
                 self.__inflight_flow_ids_by_file_id,
                 file.file_id,
@@ -394,7 +403,7 @@ class ExtractProcess(AppProcess):
     def __pop_inflight_flow_id(self,
                                file_id: Optional[str] = None,
                                file_name: Optional[str] = None):
-        with self.__inflight_flow_ids_lock:
+        with self.__inflight_flow_ids_lock_or_create():
             if file_id is not None:
                 by_id = self.__inflight_flow_ids_by_file_id.get(file_id)
                 if by_id:

@@ -16,11 +16,9 @@ class BreadcrumbTraceEmitter:
     def __init__(
         self,
         record_queue: multiprocessing.Queue,
-        enabled_getter: Callable[[], bool],
         enabled_gate: multiprocessing.Value,
     ):
         self.__record_queue = record_queue
-        self.__enabled_getter = enabled_getter
         self.__enabled_gate = enabled_gate
 
     def record(self, source: str, message: str, details: Optional[Dict[str, Any]] = None, **metadata):
@@ -114,7 +112,10 @@ class BreadcrumbTraceCollector:
         with self.__external_records_lock:
             if self.__external_records is None:
                 self.__external_records = multiprocessing.Queue(maxsize=self.__max_entries)
-            return BreadcrumbTraceEmitter(self.__external_records, self.__enabled_getter, self.__enabled_gate)
+            # The emitter crosses the spawn boundary. Keep the collector callback,
+            # locks, and owning Context in the parent; the shared gate preserves
+            # runtime enable/disable updates.
+            return BreadcrumbTraceEmitter(self.__external_records, self.__enabled_gate)
 
     def is_enabled(self) -> bool:
         enabled = self.__read_enabled_state()

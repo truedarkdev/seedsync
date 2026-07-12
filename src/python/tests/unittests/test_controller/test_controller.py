@@ -1117,6 +1117,16 @@ class TestController(unittest.TestCase):
             Controller._Controller__JOIN_TIMEOUT_IN_SECS
         )
 
+    def test_teardown_process_only_closes_queues_when_start_never_succeeded(self):
+        process = MagicMock()
+        process.pid = None
+
+        self.assertTrue(self.controller._Controller__teardown_process("unstarted worker", process))
+
+        process.terminate.assert_not_called()
+        process.join.assert_not_called()
+        process.close_queues.assert_called_once_with()
+
     @patch("controller.controller.os.makedirs")
     def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
         self.controller._Controller__context.breadcrumb_trace = MagicMock()

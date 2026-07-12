@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch, call
 
 import pytest
 
+from common import MultiprocessingLogger
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller import IScanner, ScannerProcess, ScannerError
 from controller.extract import ExtractProcess
@@ -42,6 +43,39 @@ class TestScannerProcess(unittest.TestCase):
     def tearDown(self):
         if self.process:
             self.process.terminate()
+
+    def test_real_spawn_with_production_breadcrumb_and_log_transport(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        mp_logger = MultiprocessingLogger(logging.getLogger("scanner-spawn-boundary"))
+        self.process = ScannerProcess(
+            scanner=DummyScanner(),
+            interval_in_ms=1000,
+            verbose=False,
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        self.process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+
+        mp_logger.start()
+        try:
+            self.process.start()
+            deadline = time.time() + 5
+            result = None
+            while result is None and time.time() < deadline:
+                result = self.process.pop_latest_result()
+                time.sleep(0.02)
+            self.assertIsNotNone(result)
+            self.process.terminate()
+            self.process.join(timeout=5)
+            self.assertFalse(self.process.is_alive())
+            entries = collector.snapshot()["entries"]
+            self.assertTrue(any(entry["message"] == "scan_started" for entry in entries))
+        finally:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join()
+            self.process.close_queues()
+            self.process = None
+            mp_logger.stop()
 
     def test_retrieves_scan_results(self):
         # Use this as a signal to mock to control which result to send
@@ -252,6 +286,7 @@ class TestScannerProcess(unittest.TestCase):
         self.addCleanup(process.close_queues)
 
         process.force_scan("movies")
+        time.sleep(0.05)
         process.run_loop()
 
         self.assertEqual(
@@ -272,6 +307,7 @@ class TestScannerProcess(unittest.TestCase):
 
         process.force_scan("movies")
         process.force_scan("tv")
+        time.sleep(0.05)
         process.run_loop()
 
         self.assertEqual(
@@ -292,6 +328,7 @@ class TestScannerProcess(unittest.TestCase):
 
         process.force_scan()
         process.force_scan("movies")
+        time.sleep(0.05)
         process.run_loop()
 
         self.assertEqual(
@@ -312,6 +349,7 @@ class TestScannerProcess(unittest.TestCase):
 
         process.force_scan("movies")
         process.force_scan()
+        time.sleep(0.05)
         process.run_loop()
 
         self.assertEqual(
@@ -331,8 +369,10 @@ class TestScannerProcess(unittest.TestCase):
         self.addCleanup(process.close_queues)
 
         process.force_scan("movies")
+        time.sleep(0.05)
         process.run_loop()
 
+        time.sleep(0.05)
         result = process.pop_latest_result()
         self.assertIsNotNone(result)
         self.assertTrue(result.failed)
@@ -352,6 +392,7 @@ class TestScannerProcess(unittest.TestCase):
         self.addCleanup(process.close_queues)
 
         process.force_scan("movies")
+        time.sleep(0.05)
         with self.assertRaises(ScannerError):
             process.run_loop()
 
@@ -374,7 +415,6 @@ class TestScannerProcess(unittest.TestCase):
                 patch("controller.scan.scanner_process.multiprocessing.Event", return_value=wake_event):
             process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False)
 
-        process.mp_logger = MagicMock()
         self.assertIs(process._AppProcess__exception_queue, exception_queue)
         self.assertIs(process._ScannerProcess__queue, result_queue)
         self.assertIs(process._ScannerProcess__scan_target_queue, target_queue)
@@ -393,7 +433,8 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIsNone(process._ScannerProcess__wake_event)
         self.assertIsNone(process._AppProcess__exception_queue)
         self.assertIsNone(process._terminate)
-        self.assertIsNone(process.mp_logger)
+        self.assertIsNone(process._mp_log_queue)
+        self.assertIsNone(process._mp_log_level)
 
     def test_recoverable_error_warning_resets_after_success(self):
         mock_scanner = DummyScanner()

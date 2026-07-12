@@ -2,11 +2,36 @@ import os
 import posixpath
 import tempfile
 import unittest
+import logging
 from unittest.mock import MagicMock, patch
 
 from controller.delete.delete_process import DeleteLocalProcess, DeleteRemoteProcess
-from common import escape_remote_path_for_shell
+from common import escape_remote_path_for_shell, MultiprocessingLogger
 from ssh import SshcpError
+
+
+class TestDeleteProcessSpawn(unittest.TestCase):
+    def test_real_local_delete_spawn_with_log_transport(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target = os.path.join(temp_dir, "delete-me")
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write("test")
+            mp_logger = MultiprocessingLogger(logging.getLogger("delete-spawn-boundary"))
+            process = DeleteLocalProcess(temp_dir, "delete-me")
+            process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+            mp_logger.start()
+            try:
+                process.start()
+                process.join(timeout=5)
+                self.assertFalse(process.is_alive())
+                self.assertEqual(0, process.exitcode)
+                self.assertFalse(os.path.exists(target))
+            finally:
+                if process.is_alive():
+                    process.terminate()
+                    process.join()
+                process.close_queues()
+                mp_logger.stop()
 
 
 class TestDeleteRemoteProcess(unittest.TestCase):

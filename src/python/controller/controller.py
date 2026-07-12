@@ -434,11 +434,11 @@ class Controller:
 
         # Setup multiprocess logging
         self.__mp_logger = MultiprocessingLogger(self.logger)
-        self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__extract_process.set_multiprocessing_logger(self.__mp_logger)
-        self.__validate_process.set_multiprocessing_logger(self.__mp_logger)
+        self.__active_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+        self.__local_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+        self.__remote_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+        self.__extract_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+        self.__validate_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
 
         # Keep track of active files
         self.__active_downloading_file_names = []
@@ -803,9 +803,9 @@ class Controller:
             self.__refresh_path_pair_runtime_state()
             new_state_applied = True
             if was_started:
-                self.__active_scan_process.set_multiprocessing_logger(self.__mp_logger)
-                self.__local_scan_process.set_multiprocessing_logger(self.__mp_logger)
-                self.__remote_scan_process.set_multiprocessing_logger(self.__mp_logger)
+                self.__active_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+                self.__local_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+                self.__remote_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                 self.__validate_process.set_path_pairs_by_id(cast(Dict[str, object], self.__path_pairs_by_id))
 
             if was_started:
@@ -953,6 +953,11 @@ class Controller:
                            *,
                            terminate: bool = True) -> bool:
         if process is None:
+            return True
+        if process.pid is None:
+            # start() never succeeded; there is no child to terminate or join,
+            # but parent-owned queues still need deterministic cleanup.
+            self.__best_effort_teardown("{} close_queues".format(label), process.close_queues)
             return True
         if terminate:
             self.__best_effort_teardown("{} terminate".format(label), process.terminate)
@@ -2125,7 +2130,7 @@ class Controller:
             local_path=delete_local_path,
             file_name=delete_local_name
         )
-        process.set_multiprocessing_logger(self.__mp_logger)
+        process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
         command_wrapper = Controller.CommandProcessWrapper(
             command=command or Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id),
             file_id=file.file_id,
@@ -2724,7 +2729,7 @@ class Controller:
                         else self.__legacy_remote_path,
                         file_name=file.name
                     )
-                    process.set_multiprocessing_logger(self.__mp_logger)
+                    process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                     post_callback = self.__remote_scan_process.force_scan
                     command_wrapper = Controller.CommandProcessWrapper(
                         command=command,
