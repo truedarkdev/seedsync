@@ -21,17 +21,17 @@ class MultiPathLocalScanner(IScanner):
         self.__scan_target_path_pair_ids: Optional[set[str]] = None
 
     @overrides(IScanner)
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("MultiPathLocalScanner")
         for scanner in self.__scanners:
             scanner.set_base_logger(self.logger)
 
-    def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]):
+    def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]) -> None:
         self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
-        all_files = []
+        all_files: List[SystemFile] = []
         for scanner in self.__scanners:
             if (
                 self.__scan_target_path_pair_ids is not None
@@ -53,7 +53,7 @@ class MultiPathLocalScanner(IScanner):
         return all_files
 
     def pop_managed_extract_file_ids(self) -> List[str]:
-        managed_extract_file_ids = []
+        managed_extract_file_ids: List[str] = []
         for scanner in self.__scanners:
             managed_extract_file_ids.extend(scanner.pop_managed_extract_file_ids())
         return sorted(set(managed_extract_file_ids))
@@ -69,15 +69,15 @@ class MultiPathRemoteScanner(IScanner):
         self.__scanners = scanners
 
     @overrides(IScanner)
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("MultiPathRemoteScanner")
         for scanner in self.__scanners:
             scanner.set_base_logger(self.logger)
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
-        all_files = []
-        recoverable_errors = []
+        all_files: List[SystemFile] = []
+        recoverable_errors: List[str] = []
         for scanner in self.__scanners:
             try:
                 files = scanner.scan()

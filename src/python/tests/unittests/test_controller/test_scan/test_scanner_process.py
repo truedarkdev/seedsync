@@ -521,7 +521,11 @@ class TestScannerProcess(unittest.TestCase):
             path_pair_id="movies"
         )
 
+        deadline = time.monotonic() + 1
         snapshot = collector.snapshot()
+        while len(snapshot["entries"]) < 3 and time.monotonic() < deadline:
+            time.sleep(0.001)
+            snapshot = collector.snapshot()
         self.assertEqual(3, len(snapshot["entries"]))
         self.assertEqual(["movies", "movies", "movies"], [entry["corr_id"] for entry in snapshot["entries"]])
         self.assertEqual([1, 2, 3], [entry["version"] for entry in snapshot["entries"]])

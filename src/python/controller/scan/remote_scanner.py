@@ -3,7 +3,8 @@
 import logging
 import json
 import re
-from typing import List
+from collections.abc import Callable
+from typing import List, cast
 import os
 import posixpath
 import shlex
@@ -67,7 +68,7 @@ class RemoteScanner(IScanner):
         return False
 
     @staticmethod
-    def _normalize_remote_python_path(remote_python_path: Optional[str]) -> str:
+    def _normalize_remote_python_path(remote_python_path: object) -> str:
         if remote_python_path is None:
             return "python3"
         if not isinstance(remote_python_path, str):
@@ -166,7 +167,7 @@ class RemoteScanner(IScanner):
         return self.__path_pair_name
 
     @overrides(IScanner)
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("RemoteScanner")
         self.__ssh.set_base_logger(self.logger)
 
@@ -220,9 +221,19 @@ class RemoteScanner(IScanner):
             )
 
         try:
-            out_str = out.decode("utf-8") if isinstance(out, bytes) else out
-            file_dicts = json.loads(out_str)
-            remote_files = [SystemFile.from_dict(file_dict) for file_dict in file_dicts]
+            out_str = out.decode("utf-8")
+            decoded: object = json.loads(out_str)
+            if not isinstance(decoded, list):
+                raise TypeError("scan data must be a list")
+            remote_files: List[SystemFile] = []
+            for item in cast(List[object], decoded):
+                if not isinstance(item, dict):
+                    raise TypeError("scan entries must be objects")
+                decode_system_file = cast(
+                    Callable[[dict[str, object]], SystemFile],
+                    getattr(SystemFile, "from_dict"),
+                )
+                remote_files.append(decode_system_file(cast(dict[str, object], item)))
         except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as err:
             self.logger.error("JSON decode error: {}\n{}".format(str(err), out))
             raise ScannerError(
@@ -373,11 +384,11 @@ class RemoteScanner(IScanner):
         self.__remote_path_to_scan_script = fallback_path
 
     @staticmethod
-    def __is_valid_remote_script_path(path) -> bool:
+    def __is_valid_remote_script_path(path: object) -> bool:
         return bool(isinstance(path, str) and path.strip() and (
             posixpath.isabs(path) or RemoteScanner._SAFE_TILDE_PREFIX.match(path) is not None
         ))
 
     @staticmethod
-    def __is_valid_local_script_path(path) -> bool:
+    def __is_valid_local_script_path(path: object) -> bool:
         return bool(isinstance(path, str) and path.strip())

@@ -1,0 +1,21 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "controller/scan/__init__.py",
+    "controller/scan/active_scanner.py",
+    "controller/scan/local_scanner.py",
+    "controller/scan/multi_path_active_scanner.py",
+    "controller/scan/multi_path_scanner.py",
+    "controller/scan/remote_scanner.py",
+    "controller/scan/scanner_process.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}
