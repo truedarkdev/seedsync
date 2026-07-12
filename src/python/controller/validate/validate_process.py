@@ -42,8 +42,8 @@ class ValidateProcess(AppProcess):
                  remote_path: str,
         path_pairs_by_id: Dict[str, object]):
         super().__init__(name=self.__class__.__name__)
-        self.__command_queue: multiprocessing.Queue | None = multiprocessing.Queue()
-        self.__status_result_queue: multiprocessing.Queue | None = multiprocessing.Queue()
+        self.__command_queue: multiprocessing.Queue[Tuple[str, object]] | None = multiprocessing.Queue()
+        self.__status_result_queue: multiprocessing.Queue[ValidateStatusResult] | None = multiprocessing.Queue()
         self.__ssh = Sshcp(
             host=remote_address,
             port=remote_port,
@@ -58,17 +58,17 @@ class ValidateProcess(AppProcess):
                 "remote_path": getattr(pair, "remote_path", None)
             } for pair_id, pair in path_pairs_by_id.items()
         }
-        self.__statuses = {}
+        self.__statuses: Dict[str, ValidateStatus] = {}
 
-    def validate(self, file: ModelFile):
+    def validate(self, file: ModelFile) -> None:
         assert self.__command_queue is not None
         self.__command_queue.put(("validate", file))
 
-    def clear(self, file_id: str):
+    def clear(self, file_id: str) -> None:
         assert self.__command_queue is not None
         self.__command_queue.put(("clear", file_id))
 
-    def set_path_pairs_by_id(self, path_pairs_by_id: Dict[str, object]):
+    def set_path_pairs_by_id(self, path_pairs_by_id: Dict[str, object]) -> None:
         self.__path_pairs_by_id = {
             pair_id: {
                 "local_path": getattr(pair, "local_path", None),
@@ -79,7 +79,7 @@ class ValidateProcess(AppProcess):
         self.__command_queue.put(("set_path_pairs_by_id", self.__path_pairs_by_id))
 
     def pop_latest_statuses(self) -> Optional[ValidateStatusResult]:
-        latest_result = None
+        latest_result: Optional[ValidateStatusResult] = None
         try:
             while True:
                 assert self.__status_result_queue is not None
@@ -88,13 +88,13 @@ class ValidateProcess(AppProcess):
             pass
         return latest_result
 
-    def run_init(self):
+    def run_init(self) -> None:
         self.__ssh.set_base_logger(self.logger)
 
-    def run_cleanup(self):
+    def run_cleanup(self) -> None:
         pass
 
-    def run_loop(self):
+    def run_loop(self) -> None:
         try:
             assert self.__command_queue is not None
             command, payload = self.__command_queue.get(timeout=self.__DEFAULT_SLEEP_INTERVAL_IN_SECS)
@@ -102,17 +102,21 @@ class ValidateProcess(AppProcess):
             return
 
         if command == "clear":
-            self.__statuses.pop(payload, None)
+            if isinstance(payload, str):
+                self.__statuses.pop(payload, None)
             self.__publish_statuses()
             return
 
         if command == "set_path_pairs_by_id":
-            self.__path_pairs_by_id = payload
+            if isinstance(payload, dict):
+                self.__path_pairs_by_id = cast(dict[str, dict[str, str | None]], payload)
             return
 
         if command != "validate":
             return
 
+        if not isinstance(payload, ModelFile):
+            return
         file = payload
         self.__set_status(file.file_id, ModelFile.State.VALIDATING, 0)
         try:
@@ -128,12 +132,12 @@ class ValidateProcess(AppProcess):
             self.__set_status(file.file_id, ModelFile.State.CORRUPT, 100, str(error))
 
     @overrides(AppProcess)
-    def close_queues(self):
+    def close_queues(self) -> None:
         self.__command_queue = self._close_multiprocessing_queue(self.__command_queue)
         self.__status_result_queue = self._close_multiprocessing_queue(self.__status_result_queue)
         super().close_queues()
 
-    def __publish_statuses(self):
+    def __publish_statuses(self) -> None:
         assert self.__status_result_queue is not None
         self.__status_result_queue.put(
             ValidateStatusResult(
@@ -147,7 +151,7 @@ class ValidateProcess(AppProcess):
                      state: ModelFile.State,
                      progress: Optional[int],
                      error: Optional[str] = None,
-                     corrupt_chunks: Optional[List[int]] = None):
+                     corrupt_chunks: Optional[List[int]] = None) -> None:
         self.__statuses[file_id] = ValidateStatus(
             file_id=file_id,
             state=state,
@@ -194,9 +198,9 @@ class ValidateProcess(AppProcess):
     def __build_local_directory_manifest(self,
                                          local_path: str,
                                          file_id: str) -> Tuple[Set[str], Dict[str, str]]:
-        dirs = set()
-        hashes = {}
-        file_paths = []
+        dirs: Set[str] = set()
+        hashes: Dict[str, str] = {}
+        file_paths: List[str] = []
         local_parent = os.path.dirname(local_path)
         for current_root, dir_names, file_names in os.walk(local_path):
             dir_names.sort()
@@ -261,7 +265,7 @@ class ValidateProcess(AppProcess):
                 self.HASH_COMMAND,
             )
         )
-        hashes = {}
+        hashes: Dict[str, str] = {}
         for line in filter(None, files_output.splitlines()):
             digest, relative_path = line.split(None, 1)
             hashes[relative_path] = digest
