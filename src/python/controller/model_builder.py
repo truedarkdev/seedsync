@@ -4,7 +4,8 @@ import os
 import logging
 from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from enum import Enum
+from typing import Dict, List, NamedTuple, Optional, Set, Tuple, cast
 import math
 import json
 
@@ -25,12 +26,20 @@ class _RecentLiveTransferSnapshot:
     eta: Optional[int]
 
 
+class _TransferState(NamedTuple):
+    size_local: Optional[int]
+    size_remote: Optional[int]
+    percent_local: Optional[int | float]
+    speed: Optional[int]
+    eta: Optional[int]
+
+
 @dataclass
 class _BuiltRootFile:
     model_file: ModelFile
     normalized_local_root_path: Optional[str]
     is_local_only: bool
-    seen_file_ids: Set[str]
+    seen_file_ids: set[str]
 
 
 class ModelBuilder:
@@ -49,31 +58,31 @@ class ModelBuilder:
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
-        self.__local_files = dict()
-        self.__active_files = dict()
-        self.__remote_files = dict()
-        self.__active_file_ids = set()
-        self.__lftp_statuses = dict()
-        self.__recent_live_transfer_snapshots = dict()
-        self.__retained_stopped_transfer_snapshots = dict()
-        self.__downloaded_files = None
-        self.__extract_statuses = dict()
-        self.__extracted_files = set()
-        self.__stopped_files = set()
-        self.__validation_statuses = dict()
-        self.__move_failed_files = set()
-        self.__final_move_succeeded_files = set()
-        self.__local_root_paths = dict()
-        self.__local_staging_paths = dict()
-        self.__suppressed_ambiguous_extracted_file_names = set()
-        self.__cached_model = None
-        self.__stop_resume_trace_file_id = None
-        self.__stop_resume_trace_cycle_id = None
+        self.__local_files: dict[str, SystemFile] = {}
+        self.__active_files: dict[str, SystemFile] = {}
+        self.__remote_files: dict[str, SystemFile] = {}
+        self.__active_file_ids: set[str] = set()
+        self.__lftp_statuses: dict[str, LftpJobStatus] = {}
+        self.__recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
+        self.__retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
+        self.__downloaded_files: Optional[set[str]] = None
+        self.__extract_statuses: dict[str, ExtractStatus] = {}
+        self.__extracted_files: set[str] = set()
+        self.__stopped_files: set[str] = set()
+        self.__validation_statuses: dict[str, ValidateStatus] = {}
+        self.__move_failed_files: set[str] = set()
+        self.__final_move_succeeded_files: set[str] = set()
+        self.__local_root_paths: dict[Optional[str], str] = {}
+        self.__local_staging_paths: dict[Optional[str], str] = {}
+        self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
+        self.__cached_model: Optional[Model] = None
+        self.__stop_resume_trace_file_id: Optional[str] = None
+        self.__stop_resume_trace_cycle_id: Optional[int] = None
         self.__stop_resume_trace_emitted = False
-        self.__stop_resume_trace_last_idle_signature = None
-        self.__target_archive_trace_last_signature = None
+        self.__stop_resume_trace_last_idle_signature: Optional[str] = None
+        self.__target_archive_trace_last_signature: Optional[str] = None
 
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("ModelBuilder")
         self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
@@ -85,7 +94,7 @@ class ModelBuilder:
         logger.propagate = False
         return logger
 
-    def set_stop_resume_trace_file_id(self, file_id: Optional[str]):
+    def set_stop_resume_trace_file_id(self, file_id: Optional[str]) -> None:
         self.__stop_resume_trace_file_id = file_id.strip() if file_id is not None and file_id.strip() else None
         self.__stop_resume_trace_last_idle_signature = None
 
@@ -100,8 +109,10 @@ class ModelBuilder:
             parsed_identifier = json.loads(identifier)
         except (TypeError, ValueError, json.JSONDecodeError):
             return identifier
-        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
-            return parsed_identifier[1]
+        if isinstance(parsed_identifier, list):
+            parsed_items = cast(list[object], parsed_identifier)
+            if len(parsed_items) == 2 and isinstance(parsed_items[1], str):
+                return parsed_items[1]
         return identifier
 
     def __is_target_archive_trace_enabled(self) -> bool:
@@ -131,7 +142,7 @@ class ModelBuilder:
     def __summarize_target_archive_source(arbitration_source: str,
                                           model_file: ModelFile,
                                           local: Optional[SystemFile],
-                                          transfer_state: Optional[LftpJobStatus.TransferState]) -> str:
+                                          transfer_state: Optional[_TransferState]) -> str:
         if arbitration_source in (
             "recent_live_snapshot",
             "live_status",
@@ -159,10 +170,10 @@ class ModelBuilder:
             return "live_transfer"
         return "scan_only"
 
-    def __trace_target_archive_event(self, event: str, payload: dict):
+    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
-        trace_payload = {
+        trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
         }
@@ -183,8 +194,8 @@ class ModelBuilder:
                                            active_present: bool,
                                            local_freshness: str,
                                            status: Optional[LftpJobStatus],
-                                           transfer_state: Optional[LftpJobStatus.TransferState],
-                                           arbitration_source: str):
+                                           transfer_state: Optional[_TransferState],
+                                           arbitration_source: str) -> None:
         if not self.__trace_target_archive_selector_matches_model_file(model_file, root_file_id):
             return
 
@@ -236,11 +247,11 @@ class ModelBuilder:
             "final_model": ModelBuilder.__summarize_rendered_model(model_file),
         })
 
-    def begin_stop_resume_trace_cycle(self, cycle_id: int):
+    def begin_stop_resume_trace_cycle(self, cycle_id: int) -> None:
         self.__stop_resume_trace_cycle_id = cycle_id
         self.__stop_resume_trace_emitted = False
 
-    def finish_stop_resume_trace_cycle(self, model: Model, build_triggered: bool):
+    def finish_stop_resume_trace_cycle(self, model: Model, build_triggered: bool) -> None:
         if not self.__is_stop_resume_trace_enabled() or self.__stop_resume_trace_emitted:
             return
         target_file = None
@@ -255,7 +266,7 @@ class ModelBuilder:
                     break
 
         event = "target_not_rendered" if build_triggered else "no_rebuild"
-        payload = {
+        payload: dict[str, object] = {
             "model_source": "rebuilt" if build_triggered else "cached",
             "target_file_id": self.__stop_resume_trace_file_id,
             "final_model": self.__summarize_rendered_model(target_file),
@@ -274,7 +285,7 @@ class ModelBuilder:
         return ModelFile.build_file_id(name, path_pair_id)
 
     @staticmethod
-    def __model_file_matches_persisted_name(model_file: ModelFile, persisted_names: Optional[Set[str]]) -> bool:
+    def __model_file_matches_persisted_name(model_file: ModelFile, persisted_names: Optional[set[str]]) -> bool:
         if persisted_names is None:
             return False
         return model_file.file_id in persisted_names or model_file.name in persisted_names
@@ -289,8 +300,8 @@ class ModelBuilder:
     def __candidate_stopped_file_ids(file_id: Optional[str],
                                      remote: Optional[SystemFile] = None,
                                      local: Optional[SystemFile] = None,
-                                     status: Optional[LftpJobStatus] = None) -> Set[str]:
-        candidate_ids = set()
+                                     status: Optional[LftpJobStatus] = None) -> set[str]:
+        candidate_ids: set[str] = set()
         if file_id is not None:
             candidate_ids.add(file_id)
 
@@ -329,19 +340,21 @@ class ModelBuilder:
                (local is not None and local.name in self.__stopped_files)
 
     @staticmethod
-    def __apply_path_pair_metadata(model_file: ModelFile, path_pair_id: Optional[str], path_pair_name: Optional[str]):
+    def __apply_path_pair_metadata(
+        model_file: ModelFile, path_pair_id: Optional[str], path_pair_name: Optional[str]
+    ) -> None:
         model_file.path_pair_id = path_pair_id
         model_file.path_pair_name = path_pair_name
 
     @staticmethod
-    def __enum_name(value):
-        return value.name if value is not None and hasattr(value, "name") else value
+    def __enum_name(value: Optional[Enum]) -> Optional[str]:
+        return value.name if value is not None else None
 
     @staticmethod
     def __collect_active_file_ids(system_file: SystemFile,
-                                  file_ids: Set[str],
+                                  file_ids: set[str],
                                   parent_path: Optional[str] = None,
-                                  path_pair_id: Optional[str] = None):
+                                  path_pair_id: Optional[str] = None) -> None:
         current_path = system_file.name if parent_path is None else os.path.join(parent_path, system_file.name)
         effective_path_pair_id = system_file.path_pair_id if system_file.path_pair_id is not None else path_pair_id
         file_ids.add(ModelFile.build_file_id(current_path, effective_path_pair_id))
@@ -349,7 +362,9 @@ class ModelBuilder:
             ModelBuilder.__collect_active_file_ids(child, file_ids, current_path, effective_path_pair_id)
 
     @staticmethod
-    def __summarize_transfer_state(transfer_state: Optional[LftpJobStatus.TransferState]):
+    def __summarize_transfer_state(
+        transfer_state: Optional[_TransferState]
+    ) -> Optional[dict[str, object]]:
         if transfer_state is None:
             return None
         return {
@@ -361,7 +376,7 @@ class ModelBuilder:
         }
 
     @staticmethod
-    def __summarize_rendered_model(model_file: Optional[ModelFile]):
+    def __summarize_rendered_model(model_file: Optional[ModelFile]) -> Optional[dict[str, object]]:
         if model_file is None:
             return None
         return {
@@ -381,7 +396,7 @@ class ModelBuilder:
     @staticmethod
     def __summarize_local_data_role(model_file: Optional[ModelFile],
                                     local_file: Optional[SystemFile],
-                                    transfer_state: Optional[LftpJobStatus.TransferState],
+                                    transfer_state: Optional[_TransferState],
                                     arbitration_source: str) -> Optional[str]:
         if local_file is None or model_file is None:
             return None
@@ -393,7 +408,6 @@ class ModelBuilder:
             return "completion"
         if ModelBuilder.__is_authoritative_local_file(local_file) and \
                 transfer_state is None and \
-                local_file.size is not None and \
                 model_file.transferred_size is not None and \
                 model_file.transferred_size == local_file.size and \
                 model_file.state != ModelFile.State.DOWNLOADED:
@@ -403,7 +417,7 @@ class ModelBuilder:
     @staticmethod
     def __is_stoppable_model_file(model_file: ModelFile,
                                   local_file: Optional[SystemFile],
-                                  current_transfer_state: Optional[LftpJobStatus.TransferState]) -> bool:
+                                  current_transfer_state: Optional[_TransferState]) -> bool:
         if model_file.state == ModelFile.State.QUEUED:
             return True
         if model_file.state != ModelFile.State.DOWNLOADING:
@@ -417,7 +431,7 @@ class ModelBuilder:
 
     def set_local_root_paths(self,
                              local_root_paths: Dict[Optional[str], str],
-                             local_staging_paths: Optional[Dict[Optional[str], str]] = None):
+                             local_staging_paths: Optional[Dict[Optional[str], str]] = None) -> None:
         next_local_root_paths = {path_pair_id: path for path_pair_id, path in local_root_paths.items() if path}
         next_local_staging_paths = {
             path_pair_id: path for path_pair_id, path in (local_staging_paths or {}).items() if path
@@ -479,10 +493,10 @@ class ModelBuilder:
             return "retained_stopped_snapshot"
         return "none"
 
-    def __trace_cycle_event(self, event: str, payload: dict):
+    def __trace_cycle_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_stop_resume_trace_enabled():
             return
-        trace_payload = {
+        trace_payload: dict[str, object] = {
             "cycle": self.__stop_resume_trace_cycle_id,
             "event": event,
         }
@@ -499,8 +513,8 @@ class ModelBuilder:
                                    active_present: bool,
                                    local_freshness: str,
                                    status: Optional[LftpJobStatus],
-                                   transfer_state: Optional[LftpJobStatus.TransferState],
-                                   arbitration_source: str):
+                                   transfer_state: Optional[_TransferState],
+                                   arbitration_source: str) -> None:
         if not self.__is_stop_resume_trace_enabled():
             return
         if not self.__trace_selector_matches_model_file(model_file, root_file_id):
@@ -561,19 +575,19 @@ class ModelBuilder:
     def __local_size_is_authoritative_progress(local_file: Optional[SystemFile],
                                                remote_file: Optional[SystemFile],
                                                retained_size_local: Optional[int]) -> bool:
-        if not ModelBuilder.__is_authoritative_local_file(local_file):
+        if local_file is None or not ModelBuilder.__is_authoritative_local_file(local_file):
             return False
-        if local_file is None or local_file.size is None or retained_size_local is None:
+        if retained_size_local is None:
             return False
         return local_file.size >= retained_size_local or \
-            (remote_file is not None and remote_file.size is not None and local_file.size >= remote_file.size)
+            (remote_file is not None and local_file.size >= remote_file.size)
 
     @staticmethod
     def __local_file_proves_download_completion(local_file: Optional[SystemFile],
                                                 remote_file: Optional[SystemFile]) -> bool:
-        if not ModelBuilder.__is_authoritative_local_file(local_file):
+        if local_file is None or not ModelBuilder.__is_authoritative_local_file(local_file):
             return False
-        if local_file is None or local_file.size is None or remote_file is None or remote_file.size is None:
+        if remote_file is None:
             return False
         return local_file.size >= remote_file.size
 
@@ -590,7 +604,7 @@ class ModelBuilder:
         return False
 
     @staticmethod
-    def __normalize_download_progress(percent_local):
+    def __normalize_download_progress(percent_local: Optional[int | float]) -> Optional[int]:
         if percent_local is None:
             return None
         if type(percent_local) == float:
@@ -599,7 +613,27 @@ class ModelBuilder:
             if percent_local < 1:
                 return int(round(percent_local * 100))
             return int(round(percent_local))
-        return percent_local
+        return int(percent_local)
+
+    @staticmethod
+    def __transfer_state(value: object) -> _TransferState:
+        if not isinstance(value, tuple):
+            raise ModelError("Invalid transfer state")
+        transfer_tuple = cast(tuple[object, ...], value)
+        if len(transfer_tuple) != 5:
+            raise ModelError("Invalid transfer state")
+        size_local, size_remote, percent_local, speed, eta = transfer_tuple
+        if size_local is not None and not isinstance(size_local, int):
+            raise ModelError("Invalid local transfer size")
+        if size_remote is not None and not isinstance(size_remote, int):
+            raise ModelError("Invalid remote transfer size")
+        if percent_local is not None and not isinstance(percent_local, (int, float)):
+            raise ModelError("Invalid transfer progress")
+        if speed is not None and not isinstance(speed, int):
+            raise ModelError("Invalid transfer speed")
+        if eta is not None and not isinstance(eta, int):
+            raise ModelError("Invalid transfer ETA")
+        return _TransferState(size_local, size_remote, percent_local, speed, eta)
 
     @staticmethod
     def __remote_indicates_newer_content(local_file: Optional[SystemFile],
@@ -615,7 +649,7 @@ class ModelBuilder:
     def __store_recent_live_transfer_snapshot(self,
                                               file_id: str,
                                               root_file_id: str,
-                                              transfer_state: LftpJobStatus.TransferState):
+                                              transfer_state: _TransferState) -> None:
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -630,7 +664,7 @@ class ModelBuilder:
     def __store_retained_stopped_transfer_snapshot(self,
                                                    file_id: str,
                                                    root_file_id: str,
-                                                   transfer_state: LftpJobStatus.TransferState):
+                                                   transfer_state: _TransferState) -> None:
         snapshot = _RecentLiveTransferSnapshot(
             root_file_id=root_file_id,
             size_local=transfer_state.size_local,
@@ -646,24 +680,26 @@ class ModelBuilder:
     def __candidate_snapshot_root_aliases(root_file_id: Optional[str]) -> List[str]:
         if root_file_id is None:
             return []
-        alias_candidates = [root_file_id]
+        alias_candidates: list[str] = [root_file_id]
         try:
             parsed_root = json.loads(root_file_id)
         except (TypeError, ValueError, json.JSONDecodeError):
             parsed_root = None
-        if isinstance(parsed_root, list) and len(parsed_root) == 2 and isinstance(parsed_root[1], str):
-            alias_candidates.append(parsed_root[1])
+        if isinstance(parsed_root, list):
+            parsed_items = cast(list[object], parsed_root)
+            if len(parsed_items) == 2 and isinstance(parsed_items[1], str):
+                alias_candidates.append(parsed_items[1])
         return list(dict.fromkeys(alias_candidates))
 
     @staticmethod
-    def __get_transfer_snapshot_alias_keys(snapshot_store: dict,
+    def __get_transfer_snapshot_alias_keys(snapshot_store: dict[str, _RecentLiveTransferSnapshot],
                                            root_file_id: Optional[str],
                                            excluded_keys: Optional[Set[str]] = None) -> List[str]:
         root_aliases = ModelBuilder.__candidate_snapshot_root_aliases(root_file_id)
         if not root_aliases:
             return []
         excluded_keys = excluded_keys if excluded_keys is not None else set()
-        alias_keys = []
+        alias_keys: list[str] = []
         for root_alias in root_aliases:
             if root_alias not in excluded_keys and root_alias in snapshot_store:
                 alias_keys.append(root_alias)
@@ -675,7 +711,7 @@ class ModelBuilder:
         return list(dict.fromkeys(alias_keys))
 
     def __resolve_transfer_snapshot(self,
-                                    snapshot_store: dict,
+                                    snapshot_store: dict[str, _RecentLiveTransferSnapshot],
                                     file_id: str,
                                     root_file_id: Optional[str] = None
                                     ) -> Tuple[Optional[str], Optional[_RecentLiveTransferSnapshot]]:
@@ -691,7 +727,7 @@ class ModelBuilder:
         return None, None
 
     @staticmethod
-    def __promote_transfer_snapshot(snapshot_store: dict,
+    def __promote_transfer_snapshot(snapshot_store: dict[str, _RecentLiveTransferSnapshot],
                                     resolved_file_id: Optional[str],
                                     canonical_file_id: str,
                                     canonical_root_file_id: Optional[str]
@@ -748,12 +784,12 @@ class ModelBuilder:
 
     def __evict_retained_stopped_transfer_snapshots(self,
                                                     resolved_file_id: str,
-                                                    root_file_id: Optional[str] = None):
+                                                    root_file_id: Optional[str] = None) -> None:
         self.__retained_stopped_transfer_snapshots.pop(resolved_file_id, None)
 
     def __evict_transfer_completion_snapshots(self,
                                               file_id: str,
-                                              root_file_id: Optional[str] = None):
+                                              root_file_id: Optional[str] = None) -> None:
         recent_snapshot_key, _ = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if recent_snapshot_key is not None:
             self.__recent_live_transfer_snapshots.pop(recent_snapshot_key, None)
@@ -775,10 +811,10 @@ class ModelBuilder:
     @staticmethod
     def __build_retained_transfer_state(size_local: Optional[int],
                                         size_remote: Optional[int],
-                                        percent_local: Optional[int]) -> Optional[LftpJobStatus.TransferState]:
+                                        percent_local: Optional[int | float]) -> Optional[_TransferState]:
         if size_local is None:
             return None
-        return LftpJobStatus.TransferState(
+        return _TransferState(
             size_local,
             size_remote,
             ModelBuilder.__normalize_download_progress(percent_local),
@@ -786,7 +822,7 @@ class ModelBuilder:
             None
         )
 
-    def __sweep_recent_live_transfer_snapshots(self, seen_file_ids: Optional[Set[str]] = None):
+    def __sweep_recent_live_transfer_snapshots(self, seen_file_ids: Optional[Set[str]] = None) -> None:
         for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
             root_status = self.__lftp_statuses.get(snapshot.root_file_id)
             if self.__is_stopped_file(file_id) or self.__is_stopped_file(snapshot.root_file_id, status=root_status):
@@ -798,7 +834,7 @@ class ModelBuilder:
             if seen_file_ids is not None and file_id not in seen_file_ids:
                 self.__recent_live_transfer_snapshots.pop(file_id, None)
 
-    def __evict_recent_live_transfer_snapshots(self, root_file_id: str):
+    def __evict_recent_live_transfer_snapshots(self, root_file_id: str) -> None:
         for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
             if snapshot.root_file_id == root_file_id:
                 self.__recent_live_transfer_snapshots.pop(file_id, None)
@@ -817,7 +853,7 @@ class ModelBuilder:
                                          remote: Optional[SystemFile],
                                          local: Optional[SystemFile],
                                          root_remote: Optional[SystemFile] = None,
-                                         root_local: Optional[SystemFile] = None) -> Optional[LftpJobStatus.TransferState]:
+                                         root_local: Optional[SystemFile] = None) -> Optional[_TransferState]:
         root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
         resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
@@ -833,7 +869,7 @@ class ModelBuilder:
             return None
         if self.__lftp_statuses.get(snapshot.root_file_id) is not None:
             return None
-        if remote is None or local is None or local.size is None or snapshot.size_local is None:
+        if remote is None or local is None or snapshot.size_local is None:
             self.__recent_live_transfer_snapshots.pop(
                 resolved_file_id if resolved_file_id is not None else file_id,
                 None
@@ -846,7 +882,7 @@ class ModelBuilder:
             )
             return None
 
-        return LftpJobStatus.TransferState(
+        return _TransferState(
             snapshot.size_local,
             remote.size,
             snapshot.percent_local,
@@ -856,7 +892,7 @@ class ModelBuilder:
 
     @staticmethod
     def __has_clear_transfer_reset_signal(local: Optional[SystemFile],
-                                          current_transfer_state: LftpJobStatus.TransferState,
+                                          current_transfer_state: _TransferState,
                                           retained_snapshot: _RecentLiveTransferSnapshot) -> bool:
         if current_transfer_state.size_local == 0 or current_transfer_state.percent_local == 0:
             return True
@@ -867,8 +903,8 @@ class ModelBuilder:
                                                    root_file_id: Optional[str],
                                                    remote: Optional[SystemFile],
                                                    local: Optional[SystemFile],
-                                                   current_transfer_state: LftpJobStatus.TransferState
-                                                   ) -> LftpJobStatus.TransferState:
+                                                   current_transfer_state: _TransferState
+                                                   ) -> _TransferState:
         retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
             file_id,
             root_file_id
@@ -899,7 +935,7 @@ class ModelBuilder:
         coalesced_percent_local = retained_percent
         if percent_has_caught_up:
             coalesced_percent_local = current_percent
-        return LftpJobStatus.TransferState(
+        return _TransferState(
             coalesced_size_local,
             remote.size if remote is not None else current_transfer_state.size_remote,
             coalesced_percent_local,
@@ -913,7 +949,7 @@ class ModelBuilder:
             root_file_id: Optional[str],
             remote: Optional[SystemFile],
             local: Optional[SystemFile],
-            preserve_when_local_growth_only: bool = False) -> Optional[LftpJobStatus.TransferState]:
+            preserve_when_local_growth_only: bool = False) -> Optional[_TransferState]:
         retained_snapshot_key, retained_snapshot = self.__resolve_retained_stopped_transfer_snapshot(
             file_id,
             root_file_id
@@ -926,7 +962,7 @@ class ModelBuilder:
                 root_file_id
             )
             return None
-        if ModelBuilder.__is_authoritative_local_file(local) and local is not None and local.size is not None:
+        if local is not None and ModelBuilder.__is_authoritative_local_file(local):
             if local.size == 0:
                 self.__evict_retained_stopped_transfer_snapshots(
                     retained_snapshot_key if retained_snapshot_key is not None else file_id,
@@ -946,7 +982,7 @@ class ModelBuilder:
                                              remote: Optional[SystemFile],
                                              local: Optional[SystemFile],
                                              root_remote: Optional[SystemFile] = None,
-                                             root_local: Optional[SystemFile] = None) -> Optional[LftpJobStatus.TransferState]:
+                                             root_local: Optional[SystemFile] = None) -> Optional[_TransferState]:
         root_file_id = self.__resolve_root_file_id(file_id, root_remote, root_local)
         resolved_file_id, snapshot = self.__resolve_recent_live_transfer_snapshot(file_id, root_file_id)
         if snapshot is None:
@@ -964,7 +1000,7 @@ class ModelBuilder:
             return self.__build_retained_transfer_state(snapshot.size_local, None, snapshot.percent_local)
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
 
-    def set_active_files(self, active_files: List[SystemFile]):
+    def set_active_files(self, active_files: List[SystemFile]) -> None:
         had_active_files = bool(self.__active_files)
         self.__active_file_ids = set()
         self.__active_files = {}
@@ -988,15 +1024,13 @@ class ModelBuilder:
             if existing_file is not None and \
                     self.__is_authoritative_local_file(existing_file) and \
                     getattr(active_file, "is_staging", False) and \
-                    existing_file.size is not None and \
-                    active_file.size is not None and \
                     existing_file.size >= active_file.size and \
                     not self.__remote_indicates_newer_content(existing_file, remote_file):
                 continue
             effective_local_files[file_id] = active_file
         return effective_local_files
 
-    def set_local_files(self, local_files: List[SystemFile]):
+    def set_local_files(self, local_files: List[SystemFile]) -> None:
         prev_local_files = self.__local_files
         self.__local_files = {
             self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
@@ -1005,7 +1039,7 @@ class ModelBuilder:
         if self.__local_files != prev_local_files:
             self.__cached_model = None
 
-    def set_remote_files(self, remote_files: List[SystemFile]):
+    def set_remote_files(self, remote_files: List[SystemFile]) -> None:
         prev_remote_files = self.__remote_files
         self.__remote_files = {
             self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
@@ -1014,14 +1048,14 @@ class ModelBuilder:
         if self.__remote_files != prev_remote_files:
             self.__cached_model = None
 
-    def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]):
+    def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]) -> None:
         prev_lftp_statuses = self.__lftp_statuses
         self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
         # Invalidate the cache
         if self.__lftp_statuses != prev_lftp_statuses:
             self.__cached_model = None
 
-    def evict_recent_live_transfer_snapshots_missing_roots(self, active_root_file_ids: Set[str]):
+    def evict_recent_live_transfer_snapshots_missing_roots(self, active_root_file_ids: Set[str]) -> None:
         removed = False
         for file_id, snapshot in list(self.__recent_live_transfer_snapshots.items()):
             if snapshot.root_file_id in active_root_file_ids:
@@ -1034,14 +1068,14 @@ class ModelBuilder:
         if removed:
             self.__cached_model = None
 
-    def set_downloaded_files(self, downloaded_files: Set[str]):
+    def set_downloaded_files(self, downloaded_files: Set[str]) -> None:
         prev_downloaded_files = self.__downloaded_files
         self.__downloaded_files = set(downloaded_files)
         # Invalidate the cache
         if self.__downloaded_files != prev_downloaded_files:
             self.__cached_model = None
 
-    def set_extract_statuses(self, extract_statuses: List[ExtractStatus]):
+    def set_extract_statuses(self, extract_statuses: List[ExtractStatus]) -> None:
         prev_extract_statuses = self.__extract_statuses
         self.__extract_statuses = {
             self.__extract_status_key(status): status for status in extract_statuses
@@ -1050,14 +1084,14 @@ class ModelBuilder:
         if self.__extract_statuses != prev_extract_statuses:
             self.__cached_model = None
 
-    def set_extracted_files(self, extracted_files: Set[str]):
+    def set_extracted_files(self, extracted_files: Set[str]) -> None:
         prev_extracted_files = self.__extracted_files
         self.__extracted_files = extracted_files
         # Invalidate the cache
         if self.__extracted_files != prev_extracted_files:
             self.__cached_model = None
 
-    def set_stopped_files(self, stopped_files: Set[str]):
+    def set_stopped_files(self, stopped_files: Set[str]) -> None:
         prev_stopped_files = self.__stopped_files
         self.__stopped_files = set(stopped_files)
         self.__sweep_recent_live_transfer_snapshots()
@@ -1065,25 +1099,25 @@ class ModelBuilder:
         if self.__stopped_files != prev_stopped_files:
             self.__cached_model = None
 
-    def set_move_failed_files(self, move_failed_files: Set[str]):
+    def set_move_failed_files(self, move_failed_files: Set[str]) -> None:
         previous = self.__move_failed_files
         self.__move_failed_files = set(move_failed_files)
         if self.__move_failed_files != previous:
             self.__cached_model = None
 
-    def set_final_move_succeeded_files(self, file_ids: Set[str]):
+    def set_final_move_succeeded_files(self, file_ids: Set[str]) -> None:
         previous = self.__final_move_succeeded_files
         self.__final_move_succeeded_files = set(file_ids)
         if self.__final_move_succeeded_files != previous:
             self.__cached_model = None
 
-    def set_validation_statuses(self, validation_statuses: List[ValidateStatus]):
+    def set_validation_statuses(self, validation_statuses: List[ValidateStatus]) -> None:
         prev_validation_statuses = self.__validation_statuses
         self.__validation_statuses = {status.file_id: status for status in validation_statuses}
         if self.__validation_statuses != prev_validation_statuses:
             self.__cached_model = None
 
-    def clear(self):
+    def clear(self) -> None:
         self.__local_files.clear()
         self.__active_files.clear()
         self.__remote_files.clear()
@@ -1108,7 +1142,7 @@ class ModelBuilder:
         """
         return self.__cached_model is None or self.__has_pending_recent_live_transfer_snapshots()
 
-    def request_rebuild(self):
+    def request_rebuild(self) -> None:
         self.__cached_model = None
 
     def build_model(self) -> Model:
@@ -1117,10 +1151,10 @@ class ModelBuilder:
 
         model = Model()
         model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
-        live_transferred_file_ids = set()
+        live_transferred_file_ids: set[str] = set()
         effective_local_files = self.__build_effective_local_files()
-        all_file_ids = set().union(effective_local_files.keys(), self.__remote_files.keys())
-        source_file_ids = set(effective_local_files.keys()).union(self.__remote_files.keys())
+        all_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
+        source_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
         for status_file_id in self.__lftp_statuses.keys():
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
@@ -1174,7 +1208,7 @@ class ModelBuilder:
             path_pair_name = remote.path_pair_name if remote and remote.path_pair_name is not None else \
                 local.path_pair_name if local else status.path_pair_name if status else None
             self.__apply_path_pair_metadata(model_file, path_pair_id, path_pair_name)
-            root_seen_file_ids = set()
+            root_seen_file_ids: set[str] = set()
             (
                 current_transfer_state,
                 recent_transfer_state,
@@ -1310,7 +1344,7 @@ class ModelBuilder:
             if normalized_local_root_path is not None:
                 seen_names_by_path[normalized_local_root_path].add(built_root_file.model_file.name)
 
-        seen_file_ids = set()
+        seen_file_ids: set[str] = set()
         for built_root_file in visible_root_files:
             seen_file_ids.add(built_root_file.model_file.file_id)
             seen_file_ids.update(built_root_file.seen_file_ids)
@@ -1329,10 +1363,10 @@ class ModelBuilder:
         status: Optional[LftpJobStatus],
         is_stopped: bool,
     ) -> Tuple[
-        Optional[LftpJobStatus.TransferState],
-        Optional[LftpJobStatus.TransferState],
-        Optional[LftpJobStatus.TransferState],
-        Optional[LftpJobStatus.TransferState],
+        Optional[_TransferState],
+        Optional[_TransferState],
+        Optional[_TransferState],
+        Optional[_TransferState],
         str
     ]:
         # set the file state
@@ -1341,7 +1375,7 @@ class ModelBuilder:
         recent_transfer_state = None
         retained_transfer_state = None
         arbitration_source = "scan_only"
-        raw_current_transfer_state = status.total_transfer_state if status and \
+        raw_current_transfer_state = self.__transfer_state(status.total_transfer_state) if status and \
             status.state == LftpJobStatus.State.RUNNING else None
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
         if is_stopped and raw_current_transfer_state is not None:
@@ -1375,7 +1409,7 @@ class ModelBuilder:
         elif status is not None:
             retained_transfer_state = self.__get_retained_stopped_transfer_state_without_live_progress(
                 file_id,
-                status.file_id if status is not None else model_file.file_id,
+                status.file_id,
                 remote,
                 local,
                 preserve_when_local_growth_only=is_stopped
@@ -1426,7 +1460,7 @@ class ModelBuilder:
         status: Optional[LftpJobStatus],
         seen_file_ids: Set[str],
         live_transferred_file_ids: Set[str],
-    ):
+    ) -> None:
         # Traverse SystemFile children tree in BFS order
         # Store (remote, local, status, model_file) tuple in traversal frontier where remote and local
         # correspond to the same node in both remote and local SystemFile trees, status corresponds
@@ -1434,14 +1468,17 @@ class ModelBuilder:
         # for the pair
         # Note: in this case the frontier contains nodes that have already been process, it is
         #       merely used for traversing children
-        frontier = deque()
+        frontier: deque[tuple[
+            Optional[SystemFile], Optional[SystemFile], Optional[LftpJobStatus],
+            ModelFile, Optional[SystemFile], Optional[SystemFile]
+        ]] = deque()
         if remote or local:
             frontier.append((remote, local, status, root_model_file, remote, local))
         while frontier:
             _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.popleft()
-            _remote_children = {sf.name: sf for sf in _remote.children} if _remote else {}
-            _local_children = {sf.name: sf for sf in _local.children} if _local else {}
-            _all_children_names = set().union(_remote_children.keys(), _local_children.keys())
+            _remote_children: dict[str, SystemFile] = {sf.name: sf for sf in _remote.children} if _remote else {}
+            _local_children: dict[str, SystemFile] = {sf.name: sf for sf in _local.children} if _local else {}
+            _all_children_names: set[str] = set(_remote_children).union(_local_children)
             for _child_name in _all_children_names:
                 _remote_child = _remote_children.get(_child_name, None)
                 _local_child = _local_children.get(_child_name, None)
@@ -1478,16 +1515,18 @@ class ModelBuilder:
                 #   finished files are Downloaded
                 #   Queued and Downloading root's unfinished files are Queued
                 #   Local-only files are Default
-                _child_current_transfer_state = None
-                _child_recent_transfer_state = None
+                _child_current_transfer_state: Optional[_TransferState] = None
+                _child_recent_transfer_state: Optional[_TransferState] = None
                 _child_arbitration_source = "scan_only"
                 if _status and _status.state == LftpJobStatus.State.RUNNING and \
                         not self.__is_stopped_file(_status.file_id, _root_remote, _root_local, _status) and \
                         not _child_is_stopped:
                     # Transfer states are in root-relative paths.
                     _child_status_path = "/".join(_child_model_file.full_path.split(os.sep)[1:])
-                    _child_current_transfer_state = next((ts for n, ts in _status.get_active_file_transfer_states()
-                                                         if n == _child_status_path), None)
+                    for active_name, active_state in _status.get_active_file_transfer_states():
+                        if active_name == _child_status_path:
+                            _child_current_transfer_state = self.__transfer_state(active_state)
+                            break
                     if _child_current_transfer_state is not None:
                         _child_arbitration_source = "live_status"
                 if _child_current_transfer_state is None and _status is None:
@@ -1557,11 +1596,11 @@ class ModelBuilder:
         model_file: ModelFile,
         remote: Optional[SystemFile],
         local: Optional[SystemFile],
-        transfer_state: Optional[LftpJobStatus.TransferState],
+        transfer_state: Optional[_TransferState],
         store_recent_snapshot: bool,
         recent_snapshot_root_file_id: Optional[str],
         live_transferred_file_ids: Set[str],
-    ):
+    ) -> None:
         # set local and remote sizes
         if remote:
             model_file.remote_size = remote.size
@@ -1604,7 +1643,7 @@ class ModelBuilder:
         remote: SystemFile,
         local: SystemFile,
         live_transferred_file_ids: Set[str],
-    ):
+    ) -> None:
         if model_file.is_dir:
             if model_file.transferred_size is None:
                 # dir transferred size is updated by child files
@@ -1626,7 +1665,7 @@ class ModelBuilder:
                     _parent_file = _parent_file.parent
 
     @staticmethod
-    def __update_extractable_flag(model_file: ModelFile):
+    def __update_extractable_flag(model_file: ModelFile) -> None:
         if not model_file.is_dir and Extract.is_archive_fast(model_file.name):
             model_file.is_extractable = True
             # Also set the flag for all of its parents
@@ -1640,7 +1679,7 @@ class ModelBuilder:
         model_file: ModelFile,
         remote: Optional[SystemFile],
         local: Optional[SystemFile],
-    ):
+    ) -> None:
         if local:
             if local.timestamp_created:
                 model_file.local_created_timestamp = local.timestamp_created
@@ -1653,7 +1692,7 @@ class ModelBuilder:
                 model_file.remote_modified_timestamp = remote.timestamp_modified
 
     @staticmethod
-    def __estimate_eta(model_file: ModelFile):
+    def __estimate_eta(model_file: ModelFile) -> None:
         # estimate the ETA for the root if it's not available
         if model_file.state == ModelFile.State.DOWNLOADING and \
                 model_file.eta is None and \
@@ -1673,7 +1712,7 @@ class ModelBuilder:
         local: Optional[SystemFile],
         status: Optional[LftpJobStatus],
         is_stopped: bool,
-        retained_transfer_state: Optional[LftpJobStatus.TransferState],
+        retained_transfer_state: Optional[_TransferState],
         arbitration_source: str,
     ) -> Tuple[bool, str]:
         incomplete_children = False
@@ -1696,8 +1735,6 @@ class ModelBuilder:
                 remote is not None and \
                 local is not None and \
                 getattr(local, "is_staging", False) and \
-                local.size is not None and \
-                remote.size is not None and \
                 local.size >= remote.size and \
                 not self.__has_incomplete_remote_file_children(model_file) and \
                 self.__resolve_recent_live_transfer_snapshot(
@@ -1751,7 +1788,6 @@ class ModelBuilder:
                         not is_stopped and \
                         local is not None and \
                         getattr(local, "is_staging", False) and \
-                        local.size is not None and \
                         local.size >= model_file.remote_size:
                     # A fully staged directory copy should be treated as complete even
                     # if live transfer state has already disappeared.
