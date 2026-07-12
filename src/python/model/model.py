@@ -22,7 +22,7 @@ class IModelListener(ABC):
     Interface to listen to model events
     """
     @abstractmethod
-    def file_added(self, file: ModelFile):
+    def file_added(self, file: ModelFile) -> None:
         """
         Event indicating a file was added to the model
         :param file:
@@ -31,7 +31,7 @@ class IModelListener(ABC):
         pass
 
     @abstractmethod
-    def file_removed(self, file: ModelFile):
+    def file_removed(self, file: ModelFile) -> None:
         """
         Event indicating that the given file was removed from the model
         :param file:
@@ -40,7 +40,7 @@ class IModelListener(ABC):
         pass
 
     @abstractmethod
-    def file_updated(self, old_file: ModelFile, new_file: ModelFile):
+    def file_updated(self, old_file: ModelFile, new_file: ModelFile) -> None:
         """
         Event indicating that the given file was updated
         :param old_file:
@@ -58,10 +58,10 @@ class Model:
         self.logger = logging.getLogger("Model")
         self.__files_by_id: Dict[str, ModelFile] = {}
         self.__file_ids_by_name: Dict[str, Set[str]] = {}
-        self.__listeners = []
+        self.__listeners: list[IModelListener] = []
         self.__listeners_lock = Lock()
 
-    def set_base_logger(self, base_logger: logging.Logger):
+    def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("Model")
 
     @staticmethod
@@ -71,7 +71,7 @@ class Model:
             return "{} [{}]".format(file.name, path_pair_id[:8])
         return file.name
 
-    def add_listener(self, listener: IModelListener):
+    def add_listener(self, listener: IModelListener) -> None:
         """
         Add a model listener
         :param listener:
@@ -82,7 +82,7 @@ class Model:
             if listener not in self.__listeners:
                 self.__listeners.append(listener)
 
-    def remove_listener(self, listener: IModelListener):
+    def remove_listener(self, listener: IModelListener) -> None:
         """
         Add a model listener
         :param listener:
@@ -95,7 +95,7 @@ class Model:
             else:
                 self.__listeners.remove(listener)
 
-    def add_file(self, file: ModelFile):
+    def add_file(self, file: ModelFile) -> None:
         """
         Add a file to the model
         :param file:
@@ -124,7 +124,7 @@ class Model:
             raise ModelError("File lookup is ambiguous in the model")
         return next(iter(matching_ids))
 
-    def remove_file(self, filename: str):
+    def remove_file(self, filename: str) -> None:
         """
         Remove the file from the model
         :param filename:
@@ -142,7 +142,7 @@ class Model:
         for listener in listeners:
             listener.file_removed(file)
 
-    def update_file(self, file: ModelFile):
+    def update_file(self, file: ModelFile) -> None:
         """
         Update an already existing file
         :param file:

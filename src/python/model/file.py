@@ -35,31 +35,33 @@ class ModelFile:
         self.__name = name  # file or folder name
         self.__is_dir = is_dir  # True if this is a dir, False if file
         self.__state = ModelFile.State.DEFAULT  # status
-        self.__remote_size = None  # remote size in bytes, None if file does not exist
-        self.__local_size = None  # local size in bytes, None if file does not exist
-        self.__transferred_size = None  # transferred size in bytes, None if file does not exist
-        self.__download_progress = None  # active download progress percent, None if unavailable
-        self.__downloading_speed = None  # in bytes / sec, None if not downloading
-        self.__eta = None  # est. time remaining in seconds, None if not available
+        self.__remote_size: Optional[int] = None  # remote size in bytes, None if file does not exist
+        self.__local_size: Optional[int] = None  # local size in bytes, None if file does not exist
+        self.__transferred_size: Optional[int] = None  # transferred size in bytes, None if file does not exist
+        self.__download_progress: Optional[int] = None  # active download progress percent, None if unavailable
+        self.__downloading_speed: Optional[int] = None  # in bytes / sec, None if not downloading
+        self.__eta: Optional[int] = None  # est. time remaining in seconds, None if not available
         self.__is_extractable = False  # whether file is an archive or dir contains archives
         self.__is_stoppable = False  # whether stop is currently safe and enabled
-        self.__local_created_timestamp = None
-        self.__local_modified_timestamp = None
-        self.__remote_created_timestamp = None
-        self.__remote_modified_timestamp = None
-        self.__validation_progress = None
-        self.__validation_error = None
-        self.__corrupt_chunks = None
+        self.__local_created_timestamp: Optional[datetime] = None
+        self.__local_modified_timestamp: Optional[datetime] = None
+        self.__remote_created_timestamp: Optional[datetime] = None
+        self.__remote_modified_timestamp: Optional[datetime] = None
+        self.__validation_progress: Optional[int] = None
+        self.__validation_error: Optional[str] = None
+        self.__corrupt_chunks: Optional[List[int]] = None
         self.__final_move_succeeded = False
         # timestamp of the latest update
         # Note: timestamp is not part of equality operator
         self.__update_timestamp = datetime.now()
-        self.__children = []  # children files
-        self.__parent = None  # direct predecessor
-        self.__path_pair_id = None
-        self.__path_pair_name = None
+        self.__children: List[ModelFile] = []  # children files
+        self.__parent: Optional[ModelFile] = None  # direct predecessor
+        self.__path_pair_id: Optional[str] = None
+        self.__path_pair_name: Optional[str] = None
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelFile):
+            return NotImplemented
         # disregard in comparisons:
         #   timestamp: we don't care about it
         #   parent: semantics are to check self and children only
@@ -93,7 +95,7 @@ class ModelFile:
 
         return True
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self.__dict__)
 
     @property
@@ -319,7 +321,7 @@ class ModelFile:
     def file_id(self) -> str:
         return ModelFile.build_file_id(self.full_path, self.path_pair_id)
 
-    def add_child(self, child_file: "ModelFile"):
+    def add_child(self, child_file: "ModelFile") -> None:
         if not self.is_dir:
             raise TypeError("Cannot add child to a non-directory")
         if child_file is self:
