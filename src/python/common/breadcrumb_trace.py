@@ -7,16 +7,20 @@ import queue
 import time
 from collections import deque
 from threading import Lock
-from typing import Any, Callable, Deque, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Protocol
 
 from .redaction import redact_sensitive_text
+
+
+class _EnabledGate(Protocol):
+    value: object
 
 
 class BreadcrumbTraceEmitter:
     def __init__(
         self,
         record_queue: multiprocessing.Queue,
-        enabled_gate: multiprocessing.Value,
+        enabled_gate: _EnabledGate,
     ):
         self.__record_queue = record_queue
         self.__enabled_gate = enabled_gate
@@ -557,9 +561,7 @@ class BreadcrumbTraceCollector:
         return value[:BreadcrumbTraceCollector.__MAX_DETAIL_STRING_LENGTH] + "...<truncated>"
 
     def __sanitize_string_content(self, value: str) -> str:
-        if value is None:
-            return None
-        return redact_sensitive_text(value)
+        return redact_sensitive_text(value) or ""
 
     def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False):
         if self.__external_records is None:
@@ -581,10 +583,18 @@ class BreadcrumbTraceCollector:
             except queue.Empty:
                 break
             drained_count += 1
+            if not isinstance(external_record, dict):
+                continue
+            source = external_record.get("source")
+            message = external_record.get("message")
+            if not isinstance(source, str) or not isinstance(message, str):
+                continue
             metadata = external_record.get("metadata", {})
+            if not isinstance(metadata, dict):
+                metadata = {}
             self.__record_entry(
-                external_record.get("source"),
-                external_record.get("message"),
+                source,
+                message,
                 external_record.get("details"),
                 allow_when_disabled=True,
                 stage=metadata.get("stage"),
@@ -607,8 +617,11 @@ class BreadcrumbTraceCollector:
         self.__external_queue_drain_limited = drain_limited
 
     def __get_external_record(self, wait_timeout: Optional[float]):
+        external_records = self.__external_records
+        if external_records is None:
+            raise queue.Empty
         if wait_timeout is not None:
-            get_method = getattr(self.__external_records, "get", None)
+            get_method = getattr(external_records, "get", None)
             if callable(get_method):
                 return get_method(timeout=wait_timeout)
-        return self.__external_records.get_nowait()
+        return external_records.get_nowait()

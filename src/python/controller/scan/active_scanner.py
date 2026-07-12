@@ -24,6 +24,7 @@ class ActiveScanner(IScanner):
         if use_temp_file:
             self.__scanner.set_lftp_temp_suffix(Constants.LFTP_TEMP_FILE_SUFFIX)
         self.__active_files_queue = multiprocessing.Queue()
+        self.__active_files_queue_closed = False
         self.__active_files = []  # latest state
         self.__malformed_status_only_file_ids = []
         self.logger = logging.getLogger(self.__class__.__name__)
@@ -45,6 +46,9 @@ class ActiveScanner(IScanner):
         self.__malformed_status_only_file_ids = []
         # Grab the latest list of active files, if any
         try:
+            # A freshly enqueued multiprocessing item can lag briefly behind
+            # put() while the feeder thread publishes it to the pipe.
+            self.__active_files = self.__active_files_queue.get(block=True, timeout=0.01)
             while True:
                 self.__active_files = self.__active_files_queue.get(block=False)
         except queue.Empty:
@@ -72,11 +76,11 @@ class ActiveScanner(IScanner):
         return malformed_status_only_file_ids
 
     def close(self):
-        if self.__active_files_queue is None:
+        if self.__active_files_queue_closed:
             return
         self.__active_files_queue.close()
         self.__active_files_queue.join_thread()
-        self.__active_files_queue = None
+        self.__active_files_queue_closed = True
 
     def __is_status_only_partial(self, file_name: str) -> Optional[bool]:
         if not self.__use_temp_file:

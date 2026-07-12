@@ -27,6 +27,7 @@ class MultiprocessingLogger:
     def __init__(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("MPLogger")
         self.__queue = multiprocessing.Queue(-1)
+        self.__queue_closed = False
         self.__logger_level = base_logger.getEffectiveLevel()
         self.__listener_thread: threading.Thread | None = threading.Thread(
             name="MPLoggerListener", target=self.__listener
@@ -55,10 +56,10 @@ class MultiprocessingLogger:
             self.__listener_shutdown.set()
         if self.__listener_thread is not None and self.__listener_thread.ident is not None:
             self.__listener_thread.join()
-        if self.__queue is not None:
+        if not self.__queue_closed:
             self.__queue.close()
             self.__queue.join_thread()
-            self.__queue = None
+            self.__queue_closed = True
 
     def propagate_exception(self):
         """

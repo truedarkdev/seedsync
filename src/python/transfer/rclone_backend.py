@@ -472,11 +472,11 @@ class RcloneTransferBackend:
         return value
 
     def __sanitize_error_output(self, message: str) -> str:
-        sanitized_message = redact_sensitive_text(message)
+        sanitized_message = redact_sensitive_text(message) or ""
         if self.__config_path:
             sanitized_message = sanitized_message.replace(self.__config_path, "<rclone-config>")
         temp_dir_path = getattr(self.__temp_dir_obj, "name", None)
-        if temp_dir_path:
+        if isinstance(temp_dir_path, str) and temp_dir_path:
             sanitized_message = sanitized_message.replace(temp_dir_path, "<rclone-tempdir>")
         return sanitized_message
 

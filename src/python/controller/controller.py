@@ -110,7 +110,9 @@ class Controller:
             self.filename = filename
             self.flow_id = flow_id
             self.origin = origin
-            self.callbacks = []
+            self.callbacks: List[Controller.Command.ICallback] = []
+            self.duplicate_waiter_count = 0
+            self.delete_identity = filename
 
         def add_callback(self, callback: ICallback):
             self.callbacks.append(callback)
@@ -158,6 +160,12 @@ class Controller:
         return value is None or (
             isinstance(value, str) and (value.strip() == "" or value == "<replace me>")
         )
+
+    @staticmethod
+    def __require_runtime_path(value: object, field_name: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ControllerError("Missing validated runtime path: {}".format(field_name))
+        return value
 
     @staticmethod
     def __get_exclude_patterns(config: Any) -> str:
@@ -263,19 +271,26 @@ class Controller:
         self.__password = None
         self.__ssh_password = None
         self.__transfer_password = None
-        self.__legacy_local_path = None
-        self.__legacy_remote_path = None
         self.__staging_path = ""
-        self.__lftp = None
-        self.__active_scanner = None
-        self.__local_scanner = None
-        self.__remote_scanner = None
-        self.__active_scan_process = None
-        self.__local_scan_process = None
-        self.__remote_scan_process = None
-        self.__extract_process = None
-        self.__validate_process = None
-        self.__mp_logger = None
+        # These attributes are unavailable only in the explicit failed-startup
+        # state. Keep that exceptional runtime representation out of their
+        # normal operational types; public lifecycle methods gate this state.
+        failed_startup_attributes = (
+            "__lftp",
+            "__legacy_local_path",
+            "__legacy_remote_path",
+            "__active_scanner",
+            "__local_scanner",
+            "__remote_scanner",
+            "__active_scan_process",
+            "__local_scan_process",
+            "__remote_scan_process",
+            "__extract_process",
+            "__validate_process",
+            "__mp_logger",
+        )
+        for attribute_name in failed_startup_attributes:
+            object.__setattr__(self, "_Controller{}".format(attribute_name), None)
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
         self.__prev_downloading_file_names = set()
@@ -379,12 +394,14 @@ class Controller:
 
         enabled_path_pairs = self.__get_enabled_path_pairs()
         first_path_pair = enabled_path_pairs[0] if enabled_path_pairs else None
-        self.__legacy_local_path = lftp_cfg.local_path
-        if Controller._is_missing_startup_value(self.__legacy_local_path) and first_path_pair is not None:
-            self.__legacy_local_path = first_path_pair.local_path
-        self.__legacy_remote_path = lftp_cfg.remote_path
-        if Controller._is_missing_startup_value(self.__legacy_remote_path) and first_path_pair is not None:
-            self.__legacy_remote_path = first_path_pair.remote_path
+        legacy_local_path = lftp_cfg.local_path
+        if Controller._is_missing_startup_value(legacy_local_path) and first_path_pair is not None:
+            legacy_local_path = first_path_pair.local_path
+        legacy_remote_path = lftp_cfg.remote_path
+        if Controller._is_missing_startup_value(legacy_remote_path) and first_path_pair is not None:
+            legacy_remote_path = first_path_pair.remote_path
+        self.__legacy_local_path = Controller.__require_runtime_path(legacy_local_path, "Lftp.local_path")
+        self.__legacy_remote_path = Controller.__require_runtime_path(legacy_remote_path, "Lftp.remote_path")
 
         self.__staging_path = self.__build_staging_path(
             self.__legacy_local_path,
@@ -928,7 +945,7 @@ class Controller:
         updater.update()
         self.__log_memory_usage()
 
-    def __best_effort_teardown(self, label: str, teardown: Callable[[], None]):
+    def __best_effort_teardown(self, label: str, teardown: Callable[[], object]):
         try:
             teardown()
         except Exception:
@@ -1433,6 +1450,7 @@ class Controller:
             "extract_path",
             final_local_path,
         )
+        extract_out_dir = Controller.__require_runtime_path(extract_out_dir, "Controller.extract_path")
         local_path_fallback = final_local_path if os.path.normcase(os.path.abspath(final_local_path)) != os.path.normcase(os.path.abspath(staging_path)) else None
         out_dir_path_fallback = extract_out_dir if os.path.normcase(os.path.abspath(extract_out_dir)) != os.path.normcase(os.path.abspath(staging_path)) else None
         return ExtractRequest(

@@ -106,6 +106,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
     def __init__(self, host: str, pinned_address: str, port: int, timeout: float):
         super().__init__(host, port=port, timeout=timeout)
         self._pinned_address = pinned_address
+        self.source_address = None
 
     def connect(self):
         self.sock = socket.create_connection(
@@ -115,15 +116,18 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
 
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host: str, pinned_address: str, port: int, timeout: float):
-        super().__init__(host, port=port, timeout=timeout, context=ssl.create_default_context())
+        ssl_context = ssl.create_default_context()
+        super().__init__(host, port=port, timeout=timeout, context=ssl_context)
         self._pinned_address = pinned_address
+        self.source_address = None
+        self._ssl_context = ssl_context
 
     def connect(self):
         raw_socket = socket.create_connection(
             (self._pinned_address, self.port), self.timeout, self.source_address
         )
         # The logical hostname (not the pinned IP) preserves SNI and hostname verification.
-        self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
+        self.sock = self._ssl_context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
 _PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (

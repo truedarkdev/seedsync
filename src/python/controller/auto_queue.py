@@ -576,6 +576,8 @@ class AutoQueue:
 
     def _is_auto_queue_enabled_for_file(self, file: ModelFile) -> bool:
         if self.__pair_auto_queue:
+            if file.path_pair_id is None:
+                return False
             return self.__pair_auto_queue.get(file.path_pair_id, False)
         return True
 

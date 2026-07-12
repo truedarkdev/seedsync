@@ -491,13 +491,16 @@ class ModelUpdater:
         auto_purge_candidate_ids = set()
         remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
         if remote_reconciliation_established:
+            remote_scan = latest_remote_scan
+            if remote_scan is None:
+                raise RuntimeError("Remote reconciliation requires a scan result")
             enabled_path_pair_ids = set(
                 getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
             )
             scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
             remote_file_ids = {
                 ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None))
-                for file in latest_remote_scan.files
+                for file in remote_scan.files
             }
             protected_file_ids = {
                 status.file_id for status in (lftp_statuses or [])
@@ -515,11 +518,13 @@ class ModelUpdater:
             )
             snapshot_delete_ids = getattr(controller, "_snapshot_delete_command_file_ids", None)
             if callable(snapshot_delete_ids):
-                protected_file_ids.update(snapshot_delete_ids())
+                delete_ids = snapshot_delete_ids()
+                if isinstance(delete_ids, set):
+                    protected_file_ids.update(delete_ids)
             prune_lifecycles = getattr(controller, "_prune_download_start_lifecycles", None)
             if callable(prune_lifecycles):
                 prune_lifecycles(
-                    latest_remote_scan.timestamp,
+                    remote_scan.timestamp,
                     scanned_path_pair_ids,
                     remote_file_ids,
                     protected_file_ids,

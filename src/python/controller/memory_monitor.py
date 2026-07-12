@@ -1,14 +1,14 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import time
-from typing import Callable
+from typing import Callable, Optional
 
 
 class ControllerMemoryMonitor:
     DEFAULT_LOG_INTERVAL_IN_SECS = 300
 
     def __init__(self, logger, log_interval_in_secs: int = DEFAULT_LOG_INTERVAL_IN_SECS,
-                 time_fn: Callable[[], float] = None):
+                 time_fn: Optional[Callable[[], float]] = None):
         self.__logger = logger
         self.__log_interval_in_secs = log_interval_in_secs
         self.__time_fn = time_fn or time.monotonic

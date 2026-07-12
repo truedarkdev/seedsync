@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from common import Context
+from typing import Optional
 from controller import Controller, AutoQueuePersist
 from .auth_store import ApiKeyStore
 from .web_app import WebApp
@@ -28,7 +29,7 @@ class WebAppBuilder:
                  context: Context,
                  controller: Controller,
                  auto_queue_persist: AutoQueuePersist,
-                 auth_store: ApiKeyStore = None,
+                 auth_store: Optional[ApiKeyStore] = None,
                  notifier=None):
         self.__context = context
         self.__controller = controller
@@ -59,8 +60,9 @@ class WebAppBuilder:
             if notifier is not None:
                 self.notifications_admin_handler = NotificationsAdminHandler(context.config, notifier)
         self.path_pairs_handler = None
-        if getattr(context, "path_pair_manager", None) is not None:
-            self.path_pairs_handler = PathPairsHandler(context.path_pair_manager, controller=self.__controller)
+        path_pair_manager = getattr(context, "path_pair_manager", None)
+        if path_pair_manager is not None:
+            self.path_pairs_handler = PathPairsHandler(path_pair_manager, controller=self.__controller)
 
     def build(self) -> WebApp:
         web_app = WebApp(context=self.__context,

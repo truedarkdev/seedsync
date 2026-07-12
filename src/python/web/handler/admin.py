@@ -25,7 +25,7 @@ class AdminHandler(IHandler):
 
     @staticmethod
     def __load_request_json():
-        raw_body = bottle.request.body.read().decode("utf-8")
+        raw_body = getattr(bottle.request.body, "read")().decode("utf-8")
         if not raw_body.strip():
             return {}
         return json.loads(raw_body)
@@ -244,7 +244,7 @@ class AdminHandler(IHandler):
 
     @staticmethod
     def __query_flag(name: str) -> bool:
-        value = bottle.request.query.get(name)
+        value = getattr(bottle.request.query, "get")(name)
         if value is None:
             return False
         return value.strip().lower() in {"1", "true", "yes", "on"}

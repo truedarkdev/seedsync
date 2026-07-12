@@ -34,7 +34,7 @@ class NotificationsAdminHandler(IHandler):
 
     @staticmethod
     def _load_json():
-        raw = bottle.request.body.read().decode("utf-8")
+        raw = getattr(bottle.request.body, "read")().decode("utf-8")
         value = json.loads(raw) if raw.strip() else {}
         if not isinstance(value, dict):
             raise ValueError("Request body must be a JSON object")

@@ -506,7 +506,28 @@ class TestModelBuilder(unittest.TestCase):
             model.get_file(ModelFile.build_file_id("archive.zip", "tv")).state
         )
 
-    def test_build_state_keeps_duplicate_root_name_stale_extracted_marker_from_reviving_after_collapse(self):
+    def test_build_state_promotes_legacy_extracted_marker_after_root_name_becomes_unique(self):
+        local_movies = SystemFile("archive.zip", 100, False)
+        local_movies.path_pair_id = "movies"
+        local_tv = SystemFile("archive.zip", 100, False)
+        local_tv.path_pair_id = "tv"
+        movies_id = ModelFile.build_file_id("archive.zip", "movies")
+        tv_id = ModelFile.build_file_id("archive.zip", "tv")
+
+        self.model_builder.set_local_files([local_movies, local_tv])
+        self.model_builder.set_downloaded_files({movies_id, tv_id})
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        ambiguous_model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.DOWNLOADED, ambiguous_model.get_file(movies_id).state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, ambiguous_model.get_file(tv_id).state)
+
+        self.model_builder.set_local_files([local_movies])
+        unique_model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.EXTRACTED, unique_model.get_file(movies_id).state)
+
+    def test_build_state_does_not_promote_after_ambiguous_extracted_marker_is_removed(self):
         local_movies = SystemFile("archive.zip", 100, False)
         local_movies.path_pair_id = "movies"
         local_tv = SystemFile("archive.zip", 100, False)
@@ -532,6 +553,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.set_local_files([local_movies])
         self.model_builder.set_downloaded_files({ModelFile.build_file_id("archive.zip", "movies")})
+        self.model_builder.set_extracted_files(set())
 
         collapsed_model = self.model_builder.build_model()
 

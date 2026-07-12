@@ -1125,6 +1125,25 @@ class ModelBuilder:
             if status_file_id not in source_file_ids:
                 all_file_ids.add(status_file_id)
 
+        # A legacy name-only extraction marker cannot identify one of two
+        # path-pair-scoped roots. Establish that ambiguity before root states
+        # are rendered; the later visibility pass retains the suppression only
+        # while the ambiguity still exists.
+        source_name_counts: Dict[str, int] = {}
+        for file_id in all_file_ids:
+            source = effective_local_files.get(file_id) or self.__remote_files.get(file_id)
+            if source is None:
+                status = self.__lftp_statuses.get(file_id)
+                source_name = status.name if status is not None else file_id
+            else:
+                source_name = source.name
+            source_name_counts[source_name] = source_name_counts.get(source_name, 0) + 1
+        self.__suppressed_ambiguous_extracted_file_names = {
+            file_name
+            for file_name, count in source_name_counts.items()
+            if count > 1 and file_name in self.__extracted_files
+        }
+
         built_root_files: List[_BuiltRootFile] = []
         for file_id in all_file_ids:
             remote = self.__remote_files.get(file_id, None)
@@ -1290,22 +1309,6 @@ class ModelBuilder:
             visible_root_files.append(built_root_file)
             if normalized_local_root_path is not None:
                 seen_names_by_path[normalized_local_root_path].add(built_root_file.model_file.name)
-
-        file_name_counts = dict()
-        for built_root_file in visible_root_files:
-            file_name_counts[built_root_file.model_file.name] = \
-                file_name_counts.get(built_root_file.model_file.name, 0) + 1
-        ambiguous_file_names = {
-            file_name
-            for file_name, file_name_count in file_name_counts.items()
-            if file_name_count > 1
-        }
-        self.__suppressed_ambiguous_extracted_file_names.intersection_update(self.__extracted_files)
-        self.__suppressed_ambiguous_extracted_file_names.update(
-            file_name
-            for file_name in ambiguous_file_names
-            if file_name in self.__extracted_files
-        )
 
         seen_file_ids = set()
         for built_root_file in visible_root_files:

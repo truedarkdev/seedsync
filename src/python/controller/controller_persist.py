@@ -31,7 +31,7 @@ class ControllerPersist(Persist):
     def __init__(self):
         self.downloaded_file_names = set()
         self.extracted_file_names = set()
-        self.stopped_file_names = set()
+        self.stopped_file_names: set[str] = set()
         self.move_failure_counts = {}
         self.final_move_succeeded_file_names = set()
 

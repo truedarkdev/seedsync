@@ -16,6 +16,11 @@ from common.redaction import redact_sensitive_text
 from ..web_app import IHandler, WebApp
 
 
+def _query_value(name: str, default: str | None = None) -> str | None:
+    value = getattr(bottle.request.query, "get")(name, default)
+    return value if isinstance(value, str) else default
+
+
 HISTORY_SCHEMA = "seedsync.log-history.v1"
 DEFAULT_PAGE_SIZE = 200
 MAX_PAGE_SIZE = 500
@@ -76,6 +81,8 @@ def _redact_history_text(value):
     redacted = _CREDENTIAL_URL_REGEX.sub(r"\g<scheme>**REDACTED**@**REDACTED**", redacted)
     redacted = _COLON_PATH_REGEX.sub(r"\g<prefix>**REDACTED_PATH**", redacted)
     redacted = redact_sensitive_text(redacted)
+    if redacted is None:
+        return None
     return _ABSOLUTE_PATH_REGEX.sub("**REDACTED_PATH**", redacted)
 
 
@@ -130,7 +137,8 @@ def _validate_owned_object(path, expected_mode):
     expected_type = stat.S_IFDIR if expected_mode == 0o700 else stat.S_IFREG
     if stat.S_IFMT(details.st_mode) != expected_type:
         raise OSError("Unsafe historical log path type")
-    if hasattr(os, "getuid") and details.st_uid != os.getuid():
+    getuid = getattr(os, "getuid", None)
+    if callable(getuid) and details.st_uid != getuid():
         raise OSError("Historical log path is not owned by the current user")
     os.chmod(path, expected_mode)
 
@@ -158,17 +166,18 @@ class SecureRotatingFileHandler(RotatingFileHandler):
     def _open(self):
         _prepare_history_path(self.baseFilename, self._history_backup_count)
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
+        flags |= getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(self.baseFilename, flags, 0o600)
         try:
             details = os.fstat(descriptor)
             if not stat.S_ISREG(details.st_mode):
                 raise OSError("Historical log target is not a regular file")
-            if hasattr(os, "getuid") and details.st_uid != os.getuid():
+            getuid = getattr(os, "getuid", None)
+            if callable(getuid) and details.st_uid != getuid():
                 raise OSError("Historical log target is not owned by the current user")
-            if hasattr(os, "fchmod"):
-                os.fchmod(descriptor, 0o600)
+            fchmod = getattr(os, "fchmod", None)
+            if callable(fchmod):
+                fchmod(descriptor, 0o600)
             return os.fdopen(descriptor, "a", encoding=self.encoding, errors=self.errors)
         except Exception:
             os.close(descriptor)
@@ -255,11 +264,11 @@ class HistoricalLogStore:
                 details = os.lstat(path)
                 if not stat.S_ISREG(details.st_mode):
                     raise OSError("Unsafe historical log read path")
-                if hasattr(os, "getuid") and details.st_uid != os.getuid():
+                getuid = getattr(os, "getuid", None)
+                if callable(getuid) and details.st_uid != getuid():
                     raise OSError("Historical log read path is not owned by the current user")
                 flags = os.O_RDONLY
-                if hasattr(os, "O_NOFOLLOW"):
-                    flags |= os.O_NOFOLLOW
+                flags |= getattr(os, "O_NOFOLLOW", 0)
                 descriptor = os.open(path, flags)
                 with os.fdopen(descriptor, "rb") as source:
                     remaining = MAX_SCAN_BYTES - scanned
@@ -330,10 +339,10 @@ class HistoricalLogHandler(IHandler):
             end = self._timestamp("end")
             if start is not None and end is not None and (end < start or end - start > MAX_RANGE_SECONDS):
                 raise ValueError("invalid time range")
-            direction = bottle.request.query.get("direction", "desc").lower()
+            direction = (_query_value("direction", "desc") or "desc").lower()
             if direction not in {"asc", "desc"}:
                 raise ValueError("invalid direction")
-            raw_levels = bottle.request.query.get("level")
+            raw_levels = _query_value("level")
             levels = {value.strip().upper() for value in raw_levels.split(",")} if raw_levels else None
             if levels and not levels.issubset(self._LEVELS):
                 raise ValueError("invalid level")
@@ -341,7 +350,7 @@ class HistoricalLogHandler(IHandler):
             text = self._bounded("text", 500)
             payload = self.store.query(start=start, end=end, levels=levels, logger=logger, text=text,
                                        direction=direction, limit=limit,
-                                       cursor=bottle.request.query.get("cursor"))
+                                       cursor=_query_value("cursor"))
             return HTTPResponse(body=json.dumps(payload), content_type="application/json")
         except ValueError as exc:
             self.logger.warning("Rejected historical log query: %s", exc)
@@ -350,9 +359,9 @@ class HistoricalLogHandler(IHandler):
 
     @staticmethod
     def _integer(name, default, minimum, maximum):
-        raw = bottle.request.query.get(name)
+        raw = _query_value(name)
         try:
-            value = default if raw in {None, ""} else int(raw)
+            value = default if not raw else int(raw)
         except ValueError:
             raise ValueError("invalid {}".format(name))
         if value < minimum or value > maximum:
@@ -361,7 +370,7 @@ class HistoricalLogHandler(IHandler):
 
     @staticmethod
     def _timestamp(name):
-        raw = bottle.request.query.get(name)
+        raw = _query_value(name)
         if not raw:
             return None
         try:
@@ -374,7 +383,7 @@ class HistoricalLogHandler(IHandler):
 
     @staticmethod
     def _bounded(name, maximum):
-        value = bottle.request.query.get(name)
+        value = _query_value(name)
         if value is not None and len(value) > maximum:
             raise ValueError("invalid {}".format(name))
         return value or None

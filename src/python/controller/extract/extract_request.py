@@ -1,5 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from typing import Optional
+
 from model import ModelFile
 
 
@@ -10,9 +12,9 @@ class ExtractRequest:
                  model_file: ModelFile,
                  local_path: str,
                  out_dir_path: str,
-                 pair_id: str = None,
-                 local_path_fallback: str = None,
-                 out_dir_path_fallback: str = None):
+                 pair_id: Optional[str] = None,
+                 local_path_fallback: Optional[str] = None,
+                 out_dir_path_fallback: Optional[str] = None):
         self.model_file = model_file
         self.pair_id = pair_id
         self.local_path = local_path

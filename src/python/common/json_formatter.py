@@ -1,6 +1,7 @@
 import json
 import logging
 import traceback
+from typing import Optional
 
 
 class JsonFormatter(logging.Formatter):
@@ -28,7 +29,7 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(log_entry)
 
     @classmethod
-    def _get_traceback_text(cls, record: logging.LogRecord, message: str) -> str:
+    def _get_traceback_text(cls, record: logging.LogRecord, message: str) -> Optional[str]:
         if record.exc_info and record.exc_info[2]:
             return "".join(traceback.format_exception(*record.exc_info))
         if record.exc_text:

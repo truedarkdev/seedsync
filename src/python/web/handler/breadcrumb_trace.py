@@ -64,14 +64,14 @@ class BreadcrumbTraceHandler(IHandler):
 
     @staticmethod
     def __parse_optional_string(name: str):
-        value = bottle.request.query.get(name)
+        value = getattr(bottle.request.query, "get")(name)
         if value is None or value == "":
             return None
         return value
 
     @staticmethod
     def __parse_optional_int(name: str):
-        value = bottle.request.query.get(name)
+        value = getattr(bottle.request.query, "get")(name)
         if value is None or value == "":
             return None
         try:

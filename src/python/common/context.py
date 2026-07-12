@@ -25,6 +25,7 @@ class Args:
         self.exit: bool | None = None
         self.web_bind_host: str | None = None
         self.logdir: str | None = None
+        self.history_log_path: str | None = None
 
     def as_dict(self) -> dict:
         dct = collections.OrderedDict()
