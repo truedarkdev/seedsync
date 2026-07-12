@@ -2,7 +2,7 @@
 
 import json
 from abc import ABC, abstractmethod
-from typing import Set, List, Callable, Tuple, Optional, Dict
+from typing import Callable, Optional, Protocol, cast
 import fnmatch
 from threading import Lock
 import os
@@ -10,6 +10,30 @@ import os
 from common import overrides, Constants, Context, Persist, PersistError, Serializable
 from model import IModelListener, ModelFile
 from .controller import Controller
+
+
+CandidateMatch = tuple[ModelFile, Optional["AutoQueuePattern"]]
+
+
+class _AutoQueueController(Protocol):
+    def get_model_files(self) -> list[ModelFile]: ...
+    def get_model_files_and_add_listener(self, listener: IModelListener) -> list[ModelFile]: ...
+    def is_file_stopped(self, filename: str) -> bool: ...
+    def clear_extracted_marker(self, file: ModelFile) -> None: ...
+    def queue_command(self, command: Controller.Command) -> None: ...
+
+
+def _config_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise TypeError("Auto-queue setting '{}' must be a boolean".format(name))
+    return value
+
+
+def _json_object(content: str) -> dict[str, object]:
+    value = json.loads(content)
+    if not isinstance(value, dict):
+        raise TypeError("Expected a JSON object")
+    return cast(dict[str, object], value)
 
 
 class AutoQueuePattern(Serializable):
@@ -32,25 +56,28 @@ class AutoQueuePattern(Serializable):
         return hash(self.__pattern)
 
     def to_str(self) -> str:
-        dct = dict()
+        dct: dict[str, str] = {}
         dct[AutoQueuePattern.__KEY_PATTERN] = self.__pattern
         return json.dumps(dct)
 
     @classmethod
     def from_str(cls, content: str) -> "AutoQueuePattern":
-        dct = json.loads(content)
-        return AutoQueuePattern(pattern=dct[AutoQueuePattern.__KEY_PATTERN])
+        dct = _json_object(content)
+        pattern = dct[AutoQueuePattern.__KEY_PATTERN]
+        if not isinstance(pattern, str):
+            raise TypeError("Auto-queue pattern must be a string")
+        return AutoQueuePattern(pattern=pattern)
 
 
 class IAutoQueuePersistListener(ABC):
     """Listener for receiving AutoQueuePersist events"""
 
     @abstractmethod
-    def pattern_added(self, pattern: AutoQueuePattern):
+    def pattern_added(self, pattern: AutoQueuePattern) -> None:
         pass
 
     @abstractmethod
-    def pattern_removed(self, pattern: AutoQueuePattern):
+    def pattern_removed(self, pattern: AutoQueuePattern) -> None:
         pass
 
 
@@ -63,15 +90,15 @@ class AutoQueuePersist(Persist):
     __KEY_PATTERNS = "patterns"
 
     def __init__(self):
-        self.__patterns = []
-        self.__listeners = []
+        self.__patterns: list[AutoQueuePattern] = []
+        self.__listeners: list[IAutoQueuePersistListener] = []
         self.__listeners_lock = Lock()
 
     @property
-    def patterns(self) -> Set[AutoQueuePattern]:
+    def patterns(self) -> set[AutoQueuePattern]:
         return set(self.__patterns)
 
-    def add_pattern(self, pattern: AutoQueuePattern):
+    def add_pattern(self, pattern: AutoQueuePattern) -> None:
         # Check values
         if not pattern.pattern.strip():
             raise ValueError("Cannot add blank pattern")
@@ -83,7 +110,7 @@ class AutoQueuePersist(Persist):
             for listener in listeners:
                 listener.pattern_added(pattern)
 
-    def remove_pattern(self, pattern: AutoQueuePattern):
+    def remove_pattern(self, pattern: AutoQueuePattern) -> None:
         if pattern in self.__patterns:
             self.__patterns.remove(pattern)
             with self.__listeners_lock:
@@ -91,7 +118,7 @@ class AutoQueuePersist(Persist):
             for listener in listeners:
                 listener.pattern_removed(pattern)
 
-    def add_listener(self, listener: IAutoQueuePersistListener):
+    def add_listener(self, listener: IAutoQueuePersistListener) -> None:
         with self.__listeners_lock:
             self.__listeners.append(listener)
 
@@ -100,9 +127,13 @@ class AutoQueuePersist(Persist):
     def from_str(cls: type["AutoQueuePersist"], content: str) -> "AutoQueuePersist":
         persist = cls()
         try:
-            dct = json.loads(content)
+            dct = _json_object(content)
             pattern_list = dct[AutoQueuePersist.__KEY_PATTERNS]
-            for pattern in pattern_list:
+            if not isinstance(pattern_list, list):
+                raise TypeError("Auto-queue patterns must be a list")
+            for pattern in cast(list[object], pattern_list):
+                if not isinstance(pattern, str):
+                    raise TypeError("Serialized auto-queue pattern must be a string")
                 persist.add_pattern(AutoQueuePattern.from_str(pattern))
             return persist
         except (ValueError, TypeError, KeyError) as e:
@@ -112,7 +143,7 @@ class AutoQueuePersist(Persist):
 
     @overrides(Persist)
     def to_str(self) -> str:
-        dct = dict()
+        dct: dict[str, list[str]] = {}
         dct[AutoQueuePersist.__KEY_PATTERNS] = list(p.to_str() for p in self.__patterns)
         return json.dumps(dct, indent=Constants.JSON_PRETTY_PRINT_INDENT)
 
@@ -120,45 +151,45 @@ class AutoQueuePersist(Persist):
 class AutoQueueModelListener(IModelListener):
     """Keeps track of added and modified files"""
     def __init__(self):
-        self.new_files = []  # list of new files
-        self.modified_files = []  # list of pairs (old_file, new_file)
+        self.new_files: list[ModelFile] = []
+        self.modified_files: list[tuple[ModelFile, ModelFile]] = []
 
     @overrides(IModelListener)
-    def file_added(self, file: ModelFile):
+    def file_added(self, file: ModelFile) -> None:
         self.new_files.append(file)
 
     @overrides(IModelListener)
-    def file_updated(self, old_file: ModelFile, new_file: ModelFile):
+    def file_updated(self, old_file: ModelFile, new_file: ModelFile) -> None:
         self.modified_files.append((old_file, new_file))
 
     @overrides(IModelListener)
-    def file_removed(self, file: ModelFile):
+    def file_removed(self, file: ModelFile) -> None:
         pass
 
 
 class AutoQueuePersistListener(IAutoQueuePersistListener):
     """Keeps track of newly added patterns"""
     def __init__(self):
-        self.new_patterns = set()
+        self.new_patterns: set[AutoQueuePattern] = set()
         self.__lock = Lock()
 
     @overrides(IAutoQueuePersistListener)
-    def pattern_added(self, pattern: AutoQueuePattern):
+    def pattern_added(self, pattern: AutoQueuePattern) -> None:
         with self.__lock:
             self.new_patterns.add(pattern)
 
     @overrides(IAutoQueuePersistListener)
-    def pattern_removed(self, pattern: AutoQueuePattern):
+    def pattern_removed(self, pattern: AutoQueuePattern) -> None:
         with self.__lock:
             self.new_patterns.discard(pattern)
 
-    def drain_new_patterns(self) -> Set[AutoQueuePattern]:
+    def drain_new_patterns(self) -> set[AutoQueuePattern]:
         with self.__lock:
             drained = set(self.new_patterns)
             self.new_patterns.clear()
             return drained
 
-    def restore_new_patterns(self, patterns: Set[AutoQueuePattern]):
+    def restore_new_patterns(self, patterns: set[AutoQueuePattern]) -> None:
         with self.__lock:
             self.new_patterns.update(patterns)
 
@@ -173,24 +204,26 @@ class AutoQueue:
     def __init__(self,
                  context: Context,
                  persist: AutoQueuePersist,
-                 controller: Controller):
+                 controller: _AutoQueueController):
         self.logger = context.logger.getChild("AutoQueue")
         self.__breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
             self.__target_archive_trace_file_id = None
-        self.__target_archive_trace_last_signature = None
+        self.__target_archive_trace_last_signature: Optional[str] = None
         self.__persist = persist
         self.__controller = controller
         self.__model_listener = AutoQueueModelListener()
         self.__persist_listener = AutoQueuePersistListener()
-        self.__enabled = context.config.autoqueue.enabled
-        self.__patterns_only = context.config.autoqueue.patterns_only
-        self.__auto_extract_enabled = context.config.autoqueue.auto_extract
-        self.__auto_delete_remote_enabled = context.config.autoqueue.auto_delete_remote
-        self.__path_pair_manager = getattr(context, "path_pair_manager", None)
-        self.__pair_auto_queue: Dict[str, bool] = {}
+        self.__enabled = _config_bool(context.config.autoqueue.enabled, "enabled")
+        self.__patterns_only = _config_bool(context.config.autoqueue.patterns_only, "patterns_only")
+        self.__auto_extract_enabled = _config_bool(context.config.autoqueue.auto_extract, "auto_extract")
+        self.__auto_delete_remote_enabled = _config_bool(
+            context.config.autoqueue.auto_delete_remote, "auto_delete_remote"
+        )
+        self.__path_pair_manager = context.path_pair_manager
+        self.__pair_auto_queue: dict[str, bool] = {}
         self.__queue_enabled = self.__enabled
         self.__cycle_sequence = 0
 
@@ -220,8 +253,10 @@ class AutoQueue:
             parsed_identifier = json.loads(identifier)
         except (TypeError, ValueError, json.JSONDecodeError):
             return identifier
-        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
-            return parsed_identifier[1]
+        if isinstance(parsed_identifier, list):
+            parsed_items = cast(list[object], parsed_identifier)
+            if len(parsed_items) == 2 and isinstance(parsed_items[1], str):
+                return parsed_items[1]
         return identifier
 
     def __is_target_archive_trace_enabled(self) -> bool:
@@ -235,10 +270,10 @@ class AutoQueue:
         selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
         return selector_name == file.name
 
-    def __trace_target_archive_event(self, event: str, payload: dict):
+    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
-        trace_payload = {
+        trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
         }
@@ -249,7 +284,7 @@ class AutoQueue:
         self.__target_archive_trace_last_signature = signature
         self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
 
-    def process(self):
+    def process(self) -> None:
         """
         Advance the auto queue state
         :return:
@@ -265,12 +300,13 @@ class AutoQueue:
             ###
             # Queue
             ###
-            queue_candidates = {}
-            new_files_to_queue = []
-            modified_files_actual_update = []
-            modified_files_remote_discovery = []
-            files_to_queue = []
-            queue_blocked_reason_counts, queue_blocked_samples = {}, []
+            queue_candidates: dict[str, ModelFile] = {}
+            new_files_to_queue: list[CandidateMatch] = []
+            modified_files_actual_update: list[CandidateMatch] = []
+            modified_files_remote_discovery: list[CandidateMatch] = []
+            files_to_queue: list[CandidateMatch] = []
+            queue_blocked_reason_counts: dict[str, int] = {}
+            queue_blocked_samples: list[dict[str, str]] = []
             if self.__queue_enabled:
                 new_files_to_queue = self.__filter_candidates(
                     candidates=self.__model_listener.new_files,
@@ -284,8 +320,8 @@ class AutoQueue:
                 )
                 queue_candidates.update({file.file_id: file for file in self.__model_listener.new_files})
 
-                modified_candidates_actual_update = []
-                modified_candidates_remote_discovery = []
+                modified_candidates_actual_update: list[ModelFile] = []
+                modified_candidates_remote_discovery: list[ModelFile] = []
                 for old_file, new_file in self.__model_listener.modified_files:
                     if old_file.remote_size != new_file.remote_size:
                         if old_file.remote_size is not None:
@@ -314,7 +350,7 @@ class AutoQueue:
                     )
                 )
 
-                files_to_queue_dict = {
+                files_to_queue_dict: dict[str, CandidateMatch] = {
                     file.file_id: (file, pattern) for file, pattern in new_files_to_queue
                 }
                 for file, pattern in modified_files_actual_update + modified_files_remote_discovery:
@@ -334,8 +370,8 @@ class AutoQueue:
             ###
             # Extract
             ###
-            files_to_extract = []
-            extract_candidate_files = []
+            files_to_extract: list[CandidateMatch] = []
+            extract_candidate_files: list[ModelFile] = []
 
             if self.__enabled and self.__auto_extract_enabled:
                 # Candidate all new files
@@ -543,7 +579,7 @@ class AutoQueue:
             })
             raise
 
-    def __record_breadcrumb(self, message: str, details: dict):
+    def __record_breadcrumb(self, message: str, details: dict[str, object]) -> None:
         if self.__breadcrumb_trace is None:
             return
         self.__breadcrumb_trace.record(
@@ -555,7 +591,7 @@ class AutoQueue:
             corr_id="auto_queue",
         )
 
-    def __refresh_queue_state(self):
+    def __refresh_queue_state(self) -> None:
         self.__queue_enabled = self.__enabled
         self.__pair_auto_queue = {}
         if self.__path_pair_manager is None:
@@ -569,7 +605,7 @@ class AutoQueue:
         self.__pair_auto_queue = {pair.id: pair.auto_queue for pair in enabled_pairs}
         self.__queue_enabled = any(self.__pair_auto_queue.values())
 
-    def __discard_inactive_buffers(self):
+    def __discard_inactive_buffers(self) -> None:
         self.__model_listener.new_files.clear()
         self.__model_listener.modified_files.clear()
         self.__persist_listener.drain_new_patterns()
@@ -582,9 +618,9 @@ class AutoQueue:
         return True
 
     def __filter_candidates(self,
-                            candidates: List[ModelFile],
-                            new_patterns: Set[AutoQueuePattern],
-                            accept: Callable[[ModelFile], bool]) -> List[Tuple[ModelFile, Optional[AutoQueuePattern]]]:
+                            candidates: list[ModelFile],
+                            new_patterns: set[AutoQueuePattern],
+                            accept: Callable[[ModelFile], bool]) -> list[CandidateMatch]:
         """
         Given a list of candidate files, filter out those that match the accept criteria
         Also takes into consideration new patterns that were added
@@ -596,7 +632,7 @@ class AutoQueue:
         """
         # Files accepted and matched, filename -> pattern map
         # Filename key prevents a file from being accepted twice
-        files_matched = dict()
+        files_matched: dict[str, CandidateMatch] = {}
 
         # Step 1: run candidates through all the patterns if they are enabled
         #         otherwise accept all files
@@ -621,11 +657,12 @@ class AutoQueue:
 
     def __summarize_auto_queue_decisions(self,
                                          lane: str,
-                                         candidate_files: List[ModelFile],
-                                         selected_by_id: Dict[str, ModelFile]):
-        reason_counts = {}
-        samples = []
-        seen_ids = set()
+                                         candidate_files: list[ModelFile],
+                                         selected_by_id: dict[str, ModelFile]
+                                         ) -> tuple[dict[str, int], list[dict[str, str]]]:
+        reason_counts: dict[str, int] = {}
+        samples: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
 
         for file in candidate_files:
             if file.file_id in seen_ids:
@@ -650,7 +687,7 @@ class AutoQueue:
 
         return reason_counts, samples
 
-    def __filter_delete_remote_candidates(self) -> List[Tuple[ModelFile, Optional[AutoQueuePattern]]]:
+    def __filter_delete_remote_candidates(self) -> list[CandidateMatch]:
         """
         Select remote-delete candidates from true completion transitions only.
         This intentionally avoids startup seeding and new-pattern backfill.
@@ -658,7 +695,7 @@ class AutoQueue:
         if not self.__auto_delete_remote_enabled:
             return []
 
-        files_matched = dict()
+        files_matched: dict[str, CandidateMatch] = {}
         for old_file, new_file in self.__model_listener.modified_files:
             if not self.__is_remote_delete_transition(old_file, new_file):
                 continue
