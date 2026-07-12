@@ -2,7 +2,6 @@
 
 from enum import Enum
 from typing import List, Optional
-import copy
 
 # my libs
 from .file import ModelFile
@@ -23,10 +22,12 @@ class ModelDiff:
         self.__old_file = old_file
         self.__new_file = new_file
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, ModelDiff):
+            return NotImplemented
         return self.__dict__ == other.__dict__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self.__dict__)
 
     @property
@@ -51,7 +52,7 @@ class ModelDiffUtil:
         :param model_after:
         :return:
         """
-        diffs = []
+        diffs: List[ModelDiff] = []
         file_ids_before = model_before.get_file_ids()
         file_ids_after = model_after.get_file_ids()
 
