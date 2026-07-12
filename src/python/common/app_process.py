@@ -1,5 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from __future__ import annotations
+
 import logging
 import queue
 import signal
@@ -9,9 +11,10 @@ import time
 from abc import abstractmethod
 from datetime import datetime
 import multiprocessing
-from multiprocessing import Event, Process
+from multiprocessing import Process
 from multiprocessing.queues import Queue as MPQueue
-from typing import Any
+from multiprocessing.synchronize import Event as EventType
+from typing import Protocol
 
 import tblib.pickling_support
 
@@ -21,16 +24,21 @@ from common import overrides, ServiceExit
 tblib.pickling_support.install()
 
 
+class _CloseableQueue(Protocol):
+    def close(self) -> None: ...
+    def join_thread(self) -> None: ...
+
+
 class ExceptionWrapper:
     """
     An exception wrapper that works across processes
     Source: https://stackoverflow.com/a/26096355/8571324
     """
-    def __init__(self, ee):
+    def __init__(self, ee: BaseException):
         self.ee = ee
         __,  __, self.tb = sys.exc_info()
 
-    def re_raise(self):
+    def re_raise(self) -> None:
         raise self.ee.with_traceback(self.tb)
 
 
@@ -51,13 +59,13 @@ class AppProcess(Process):
         self.__name = name
         super().__init__(name=self.__name)
 
-        self._mp_log_queue: Any | None = None
+        self._mp_log_queue: MPQueue[logging.LogRecord] | None = None
         self._mp_log_level: int | None = None
         self.logger = logging.getLogger(self.__name)
-        self.__exception_queue: Any | None = multiprocessing.Queue()
-        self._terminate: Any | None = multiprocessing.Event()
+        self.__exception_queue: MPQueue[ExceptionWrapper] | None = multiprocessing.Queue()
+        self._terminate: EventType | None = multiprocessing.Event()
 
-    def set_mp_log_queue(self, log_queue: MPQueue, log_level: int):
+    def set_mp_log_queue(self, log_queue: MPQueue[logging.LogRecord], log_level: int) -> None:
         """Configure child logging with spawn-safe transport data."""
         self._mp_log_queue = log_queue
         self._mp_log_level = log_level
@@ -123,7 +131,7 @@ class AppProcess(Process):
             return
         self._terminate.set()
 
-        def elapsed_ms(start):
+        def elapsed_ms(start: datetime) -> int:
             delta_in_s = (datetime.now() - start).total_seconds()
             delta_in_ms = int(delta_in_s * 1000)
             return delta_in_ms
@@ -145,7 +153,7 @@ class AppProcess(Process):
         self._mp_log_level = None
 
     @staticmethod
-    def _close_multiprocessing_queue(mp_queue):
+    def _close_multiprocessing_queue(mp_queue: _CloseableQueue | None) -> None:
         if mp_queue is None:
             return None
         mp_queue.close()
@@ -161,7 +169,7 @@ class AppProcess(Process):
             return
         try:
             exc = self.__exception_queue.get(block=False)
-            raise exc.re_raise()
+            exc.re_raise()
         except queue.Empty:
             pass
 

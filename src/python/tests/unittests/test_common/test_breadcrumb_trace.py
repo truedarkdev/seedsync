@@ -137,6 +137,63 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1, snapshot["entry_count"])
         self.assertEqual("delayed", snapshot["entries"][0]["details"]["phase"])
 
+    def test_snapshot_skips_malformed_timed_record_and_non_mapping_metadata(self):
+        class MixedRecordQueue:
+            def __init__(self):
+                self.records = [
+                    "malformed",
+                    {"source": "controller", "message": "valid", "details": {}, "metadata": "bad"},
+                ]
+
+            def get(self, timeout=None):
+                return self.records.pop(0)
+
+            def get_nowait(self):
+                if not self.records:
+                    raise queue.Empty()
+                return self.records.pop(0)
+
+            def empty(self):
+                return not self.records
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector._BreadcrumbTraceCollector__external_records = MixedRecordQueue()
+
+        snapshot = collector.snapshot()
+
+        self.assertEqual(1, snapshot["entry_count"])
+        self.assertEqual("valid", snapshot["entries"][0]["message"])
+        self.assertEqual("valid", snapshot["entries"][0]["stage"])
+
+    def test_snapshot_skips_malformed_nonblocking_record(self):
+        class NonblockingRecordQueue:
+            def __init__(self):
+                self.records = [42]
+
+            def get_nowait(self):
+                if not self.records:
+                    raise queue.Empty()
+                return self.records.pop(0)
+
+            def empty(self):
+                return not self.records
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector._BreadcrumbTraceCollector__external_records = NonblockingRecordQueue()
+
+        snapshot = collector.snapshot()
+
+        self.assertEqual(0, snapshot["entry_count"])
+
+    def test_record_wraps_scalar_details_when_metadata_is_present(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+
+        collector.record("controller", "scalar", "detail-value", stage="scan", attempt=2)
+
+        entry = collector.snapshot()["entries"][0]
+        self.assertEqual("detail-value", entry["details"]["value"])
+        self.assertEqual(2, entry["details"]["attempt"])
+
     def test_record_redacts_risky_strings_inside_generic_detail_values(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
 
@@ -475,6 +532,15 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertEqual(1, len(snapshot["entries"]))
         self.assertEqual("refresh", snapshot["entries"][0]["message"])
         self.assertEqual(False, snapshot["window_reset"])
+
+    def test_snapshot_none_order_defaults_to_ascending(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector.record("controller", "first", {"position": 1})
+        collector.record("controller", "second", {"position": 2})
+
+        snapshot = collector.snapshot(order=None)
+
+        self.assertEqual(["first", "second"], [entry["message"] for entry in snapshot["entries"]])
 
     def test_record_failure_marks_latest_failure_window(self):
         collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)

@@ -165,6 +165,22 @@ class TestPathPairManager(unittest.TestCase):
         self.assertEqual([], recovered.get_all_pairs())
         self.assertTrue(os.path.isfile(self.manager.file_path + ".1.bak"))
 
+    def test_from_str_rejects_non_object_top_level_json(self):
+        for content in ("[]", "null", "42", '"value"'):
+            with self.subTest(content=content):
+                with self.assertRaises(PersistError):
+                    self.manager.from_str(content)
+
+    def test_load_backs_up_and_recovers_from_non_object_top_level_json(self):
+        with open(self.manager.file_path, "w", encoding="utf-8") as handle:
+            handle.write("[]")
+
+        recovered = PathPairManager(self.temp_dir)
+        recovered.load()
+
+        self.assertEqual([], recovered.get_all_pairs())
+        self.assertTrue(os.path.isfile(self.manager.file_path + ".1.bak"))
+
     def test_validate_rejects_non_string_paths(self):
         with self.assertRaises(PathPairError):
             PathPair(name="Invalid", remote_path=123, local_path="/local").validate()

@@ -39,7 +39,7 @@ OuterConfigType = Dict[str, InnerConfigType]
 # Source: https://stackoverflow.com/a/39205612/8571324
 T = TypeVar('T', bound='InnerConfig')
 
-_CONFIG_WRITE_LOCKS = weakref.WeakKeyDictionary()
+_CONFIG_WRITE_LOCKS: weakref.WeakKeyDictionary["Config", threading.RLock] = weakref.WeakKeyDictionary()
 _CONFIG_WRITE_LOCKS_GUARD = threading.Lock()
 
 
@@ -221,7 +221,7 @@ class Checkers:
         return value
 
     @staticmethod
-    def notification_provider(config_cls: Any, name: str, value: str) -> str:
+    def notification_provider(config_cls: Any, name: str, value: object) -> str:
         if not isinstance(value, str) or value.strip().lower() not in {"webhook", "apprise"}:
             raise ConfigError("Bad config: {}.{} must be webhook or apprise".format(
                 config_cls.__name__, name
@@ -257,7 +257,7 @@ class Checkers:
         return value
 
     @staticmethod
-    def int_non_negative_max(max_val: int) -> Callable:
+    def int_non_negative_max(max_val: int) -> Callable[[Any, str, int], int]:
         def _checker(config_cls: Any, name: str, value: int) -> int:
             if value < 1:
                 raise ConfigError("Bad config: {}.{} ({}) must be greater than 0".format(
@@ -317,16 +317,16 @@ class InnerConfig(ABC):
     """
     class PropMetadata:
         """Tracks property metadata"""
-        def __init__(self, checker: Callable, converter: Callable):
+        def __init__(self, checker: Callable[..., Any], converter: Callable[..., Any]):
             self.checker = checker
             self.converter = converter
 
     # Global map to map a property to its metadata
     # Is there a way for each concrete class to do this separately?
-    __prop_addon_map = collections.OrderedDict()
+    __prop_addon_map: collections.OrderedDict[property, "InnerConfig.PropMetadata"] = collections.OrderedDict()
 
     @classmethod
-    def _create_property(cls, name: str, checker: Callable, converter: Callable) -> property:
+    def create_property(cls, name: str, checker: Callable[..., Any], converter: Callable[..., Any]) -> property:
         # noinspection PyProtectedMember
         prop = property(fget=lambda s: s._get_property(name),
                         fset=lambda s, v: s._set_property(name, v, checker))
@@ -334,10 +334,15 @@ class InnerConfig(ABC):
         InnerConfig.__prop_addon_map[prop] = prop_addon
         return prop
 
+    @classmethod
+    def _create_property(cls, name: str, checker: Callable[..., Any], converter: Callable[..., Any]) -> property:
+        """Compatibility alias for existing extensions and tests."""
+        return cls.create_property(name, checker, converter)
+
     def _get_property(self, name: str) -> Any:
         return getattr(self, "__" + name, None)
 
-    def _set_property(self, name: str, value: Any, checker: Callable):
+    def _set_property(self, name: str, value: Any, checker: Callable[..., Any]) -> None:
         # Allow setting to None for the first time
         if value is None and self._get_property(name) is None:
             setattr(self, "__" + name, None)
@@ -359,7 +364,7 @@ class InnerConfig(ABC):
         # noinspection PyCallingNonCallable
         inner_config = cls()
         property_map = {p: getattr(cls, p) for p in dir(cls) if isinstance(getattr(cls, p), property)}
-        for name, prop in property_map.items():
+        for name in property_map:
             if name not in config_dict:
                 raise ConfigError("Missing config: {}.{}".format(cls.__name__, name))
             inner_config.set_property(name, config_dict[name])
@@ -377,7 +382,7 @@ class InnerConfig(ABC):
         Return the dict representation of the inner config
         :return:
         """
-        config_dict = collections.OrderedDict()
+        config_dict: collections.OrderedDict[str, Any] = collections.OrderedDict()
         cls = self.__class__
         my_property_to_name_map = {getattr(cls, p): p for p in dir(cls) if isinstance(getattr(cls, p), property)}
         # Arrange prop names in order of creation. Use the prop map to get the order
@@ -420,7 +425,7 @@ class InnerConfig(ABC):
 # Useful aliases
 IC = InnerConfig
 # noinspection PyProtectedMember
-PROP = InnerConfig._create_property
+PROP = InnerConfig.create_property
 
 
 class Config(Persist):
@@ -437,7 +442,7 @@ class Config(Persist):
     ])
 
     @classmethod
-    def is_sensitive_field(cls, section: str, key: str) -> bool:
+    def is_sensitive_field(cls, section: object, key: object) -> bool:
         if not isinstance(section, str) or not isinstance(key, str):
             return False
         return key in cls.SENSITIVE_FIELDS.get(section.lower(), ())
@@ -615,7 +620,7 @@ class Config(Persist):
                 config_dict["protocol"] = "sftp"
             return super().from_dict(config_dict)
 
-        def _set_property(self, name: str, value: Any, checker: Callable):
+        def _set_property(self, name: str, value: Any, checker: Callable[..., Any]) -> None:
             super()._set_property(name, value, checker)
             if name in ("transfer_backend", "protocol") and self.transfer_backend == "rclone" and self.protocol != "sftp":
                 super()._set_property("protocol", "sftp", Checkers.transfer_protocol)
@@ -748,7 +753,7 @@ class Config(Persist):
         self.notifications = Config.Notifications()
 
     @property
-    def write_lock(self):
+    def write_lock(self) -> threading.RLock:
         # Locks are deliberately external to persisted/copyable config state.
         with _CONFIG_WRITE_LOCKS_GUARD:
             lock = _CONFIG_WRITE_LOCKS.get(self)
@@ -785,7 +790,7 @@ class Config(Persist):
             raise PersistError("Error parsing Config - {}: {}".format(
                 type(e).__name__, str(e))
             )
-        config_dict = {}
+        config_dict: OuterConfigType = {}
         for section in config_parser.sections():
             config_dict[section] = {}
             for option in config_parser.options(section):
@@ -849,7 +854,7 @@ class Config(Persist):
     def as_dict(self) -> OuterConfigType:
         # We convert all values back to strings
         # Use an ordered dict to main section order
-        config_dict = collections.OrderedDict()
+        config_dict: collections.OrderedDict[str, InnerConfigType] = collections.OrderedDict()
         config_dict["General"] = self.general.as_dict()
         config_dict["Lftp"] = self.lftp.as_dict()
         config_dict["Validate"] = self.validate.as_dict()

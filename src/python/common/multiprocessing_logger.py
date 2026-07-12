@@ -1,5 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from __future__ import annotations
+
 import logging
 import multiprocessing
 import queue
@@ -26,7 +28,7 @@ class MultiprocessingLogger:
 
     def __init__(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("MPLogger")
-        self.__queue = multiprocessing.Queue(-1)
+        self.__queue: multiprocessing.Queue[logging.LogRecord] = multiprocessing.Queue(-1)
         self.__queue_closed = False
         self.__logger_level = base_logger.getEffectiveLevel()
         self.__listener_thread: threading.Thread | None = threading.Thread(
@@ -40,7 +42,7 @@ class MultiprocessingLogger:
         ] | None = None
 
     @property
-    def queue(self) -> multiprocessing.Queue:
+    def queue(self) -> multiprocessing.Queue[logging.LogRecord]:
         return self.__queue
 
     @property

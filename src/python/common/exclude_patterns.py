@@ -9,7 +9,7 @@ from system import SystemFile
 ExcludePattern = Tuple[str, bool]
 
 
-def parse_exclude_patterns(exclude_patterns: str | Iterable[str] | None) -> List[str]:
+def parse_exclude_patterns(exclude_patterns: str | Iterable[str | None] | None) -> List[str]:
     if exclude_patterns is None:
         return []
 
@@ -18,8 +18,8 @@ def parse_exclude_patterns(exclude_patterns: str | Iterable[str] | None) -> List
     else:
         raw_patterns = exclude_patterns
 
-    parsed_patterns = []
-    seen_patterns = set()
+    parsed_patterns: List[str] = []
+    seen_patterns: set[str] = set()
     for pattern in raw_patterns:
         if pattern is None:
             continue
@@ -31,7 +31,7 @@ def parse_exclude_patterns(exclude_patterns: str | Iterable[str] | None) -> List
     return parsed_patterns
 
 
-def compile_exclude_patterns(exclude_patterns: str | Iterable[str] | None) -> List[ExcludePattern]:
+def compile_exclude_patterns(exclude_patterns: str | Iterable[str | None] | None) -> List[ExcludePattern]:
     return [
         (pattern.rstrip("/"), pattern.endswith("/"))
         for pattern in parse_exclude_patterns(exclude_patterns)
@@ -79,7 +79,7 @@ def _filter_excluded_tree(
     if not system_file.is_dir:
         return _clone_system_file(system_file)
 
-    filtered_children = []
+    filtered_children: List[SystemFile] = []
     for child in system_file.children:
         filtered_child = _filter_excluded_tree(
             child,
@@ -93,7 +93,7 @@ def _filter_excluded_tree(
 
 def filter_excluded_files(
     files: Sequence[SystemFile] | None,
-    exclude_patterns: str | Iterable[str] | None,
+    exclude_patterns: str | Iterable[str | None] | None,
 ) -> List[SystemFile]:
     if files is None:
         return []
@@ -102,7 +102,7 @@ def filter_excluded_files(
     if not patterns:
         return list(files)
 
-    filtered_files = []
+    filtered_files: List[SystemFile] = []
     for system_file in files:
         if _matches_exclude(system_file.name, system_file.is_dir, patterns):
             continue

@@ -7,7 +7,8 @@ import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
 from threading import RLock
-from typing import List, Optional
+from collections.abc import Callable
+from typing import List, Optional, TypeVar, cast
 
 from .error import AppError
 from .persist import PersistError
@@ -29,6 +30,11 @@ class PathPairConflictError(PathPairError):
 
 DOCKER_DOWNLOADS_BASE = "/downloads"
 DOCKER_MOUNTS_BASE = "/mounts"
+_MutationResult = TypeVar("_MutationResult")
+
+
+def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    return dict(pairs)
 
 
 def is_running_in_docker() -> bool:
@@ -53,7 +59,7 @@ class PathPair:
     enabled: bool = True
     auto_queue: bool = True
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if type(self.name) != str:
             raise PathPairError("Path pair '{}': name must be a string".format(self.name))
         if not self.name and type(self.remote_path) == str:
@@ -78,7 +84,7 @@ class PathPair:
             raise PathPairError("Path pair '{}': enabled must be a boolean".format(self.name))
         if type(self.auto_queue) != bool:
             raise PathPairError("Path pair '{}': auto_queue must be a boolean".format(self.name))
-        warnings = []
+        warnings: List[str] = []
         if is_running_in_docker():
             local_path = os.path.normpath(self.local_path)
             downloads_base = os.path.normpath(DOCKER_DOWNLOADS_BASE)
@@ -106,7 +112,7 @@ class PathPairCollection:
     """
     Collection of path pairs with light schema metadata.
     """
-    path_pairs: List[PathPair] = field(default_factory=list)
+    path_pairs: List[PathPair] = field(default_factory=lambda: list[PathPair]())
     version: int = 1
 
     def get_enabled_pairs(self) -> List[PathPair]:
@@ -124,7 +130,7 @@ class PathPairCollection:
                 return pair
         return None
 
-    def add_pair(self, pair: PathPair):
+    def add_pair(self, pair: PathPair) -> List[str]:
         warnings = pair.validate()
         if self.get_pair_by_id(pair.id):
             raise PathPairError("Path pair with id '{}' already exists".format(pair.id))
@@ -133,7 +139,7 @@ class PathPairCollection:
         self.path_pairs.append(pair)
         return warnings
 
-    def update_pair(self, pair: PathPair):
+    def update_pair(self, pair: PathPair) -> List[str]:
         warnings = pair.validate()
         for index, existing in enumerate(self.path_pairs):
             if existing.id == pair.id:
@@ -143,14 +149,14 @@ class PathPairCollection:
                 return warnings
         raise PathPairError("Path pair with id '{}' not found".format(pair.id))
 
-    def remove_pair(self, pair_id: str):
+    def remove_pair(self, pair_id: str) -> None:
         for index, pair in enumerate(self.path_pairs):
             if pair.id == pair_id:
                 del self.path_pairs[index]
                 return
         raise PathPairError("Path pair with id '{}' not found".format(pair_id))
 
-    def reorder_pairs(self, pair_ids: List[str]):
+    def reorder_pairs(self, pair_ids: List[str]) -> None:
         existing_ids = [pair.id for pair in self.path_pairs]
         if sorted(pair_ids) != sorted(existing_ids):
             raise PathPairError("Reorder list must contain all existing path pair IDs")
@@ -202,7 +208,7 @@ class PathPairManager:
 
             return self._collection
 
-    def __backup_file(self):
+    def __backup_file(self) -> None:
         file_name = os.path.basename(self._file_path)
         file_dir = os.path.dirname(self._file_path)
         i = 1
@@ -216,7 +222,7 @@ class PathPairManager:
         except OSError:
             pass
 
-    def save(self):
+    def save(self) -> None:
         with self._lock:
             if self._collection is None:
                 raise PathPairError("No path pair collection loaded")
@@ -244,7 +250,10 @@ class PathPairManager:
                     except OSError:
                         pass
 
-    def __mutate_and_save(self, mutation):
+    def __mutate_and_save(
+        self,
+        mutation: Callable[[PathPairCollection], _MutationResult],
+    ) -> _MutationResult:
         collection = self.collection
         original_pairs = list(collection.path_pairs)
         original_version = collection.version
@@ -269,50 +278,64 @@ class PathPairManager:
         with self._lock:
             return self.collection.get_pair_by_id(pair_id)
 
-    def add_pair(self, pair: PathPair):
+    def add_pair(self, pair: PathPair) -> List[str]:
         with self._lock:
             return self.__mutate_and_save(lambda collection: collection.add_pair(pair))
 
-    def update_pair(self, pair: PathPair):
+    def update_pair(self, pair: PathPair) -> List[str]:
         with self._lock:
             return self.__mutate_and_save(lambda collection: collection.update_pair(pair))
 
-    def remove_pair(self, pair_id: str):
+    def remove_pair(self, pair_id: str) -> None:
         with self._lock:
             self.__mutate_and_save(lambda collection: collection.remove_pair(pair_id))
 
-    def reorder_pairs(self, pair_ids: List[str]):
+    def reorder_pairs(self, pair_ids: List[str]) -> None:
         with self._lock:
             self.__mutate_and_save(lambda collection: collection.reorder_pairs(pair_ids))
 
     def from_str(self, content: str) -> PathPairCollection:
         try:
-            data = json.loads(content)
-            if not isinstance(data, dict):
+            decoded_value: object = json.loads(content, object_pairs_hook=_json_object)
+            if not isinstance(decoded_value, dict):
                 raise TypeError("top-level path pair data must be a JSON object")
-
-            raw_path_pairs = data.get("path_pairs", [])
+            decoded = cast(dict[str, object], decoded_value)
+            raw_path_pairs: object = decoded.get("path_pairs", [])
             if raw_path_pairs is None:
                 raw_path_pairs = []
             if not isinstance(raw_path_pairs, list):
                 raise TypeError("path_pairs must be a list")
 
-            path_pairs = []
-            for pair_data in raw_path_pairs:
-                if not isinstance(pair_data, dict):
+            path_pairs: List[PathPair] = []
+            decoded_pairs = cast(List[object], raw_path_pairs)
+            for decoded_pair in decoded_pairs:
+                if not isinstance(decoded_pair, dict):
                     raise TypeError("path pair entries must be JSON objects")
+                pair_data = cast(dict[str, object], decoded_pair)
+                pair_id: object = pair_data.get("id", str(uuid.uuid4()))
+                name: object = pair_data.get("name", "")
+                remote_path: object = pair_data.get("remote_path")
+                local_path: object = pair_data.get("local_path")
+                enabled: object = pair_data.get("enabled", True)
+                auto_queue: object = pair_data.get("auto_queue", True)
+                if not isinstance(pair_id, str) or not isinstance(name, str):
+                    raise TypeError("path pair id and name must be strings")
+                if not isinstance(remote_path, str) or not isinstance(local_path, str):
+                    raise TypeError("path pair paths must be strings")
+                if not isinstance(enabled, bool) or not isinstance(auto_queue, bool):
+                    raise TypeError("path pair flags must be booleans")
                 pair = PathPair(
-                    id=pair_data.get("id", str(uuid.uuid4())),
-                    name=pair_data.get("name", ""),
-                    remote_path=pair_data["remote_path"],
-                    local_path=pair_data["local_path"],
-                    enabled=pair_data.get("enabled", True),
-                    auto_queue=pair_data.get("auto_queue", True),
+                    id=pair_id,
+                    name=name,
+                    remote_path=remote_path,
+                    local_path=local_path,
+                    enabled=enabled,
+                    auto_queue=auto_queue,
                 )
                 pair.validate()
                 path_pairs.append(pair)
 
-            version = data.get("version", 1)
+            version: object = decoded.get("version", 1)
             if not isinstance(version, int):
                 raise TypeError("version must be an integer")
 
