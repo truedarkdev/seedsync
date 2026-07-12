@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from common import PathPair, PathPairConflictError, PathPairError, PathPairManager
+from common import PathPair, PathPairConflictError, PathPairError, PathPairManager, PersistError
 
 
 class TestPathPairManager(unittest.TestCase):
@@ -100,6 +100,60 @@ class TestPathPairManager(unittest.TestCase):
 
         with self.assertRaises(PathPairError):
             self.manager.reorder_pairs([first.id])
+
+    def test_failed_saves_roll_back_each_mutation(self):
+        first = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        second = PathPair(name="TV", remote_path="/remote/tv", local_path="/local/tv")
+        self.manager.add_pair(first)
+        self.manager.add_pair(second)
+        original_pairs = list(self.manager.get_all_pairs())
+
+        mutations = (
+            lambda: self.manager.add_pair(
+                PathPair(name="Music", remote_path="/remote/music", local_path="/local/music")
+            ),
+            lambda: self.manager.update_pair(PathPair(
+                id=first.id,
+                name="Films",
+                remote_path="/remote/films",
+                local_path="/local/films",
+            )),
+            lambda: self.manager.remove_pair(first.id),
+            lambda: self.manager.reorder_pairs([second.id, first.id]),
+        )
+
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                with patch.object(self.manager, "save", side_effect=PersistError("write failed")):
+                    with self.assertRaisesRegex(PersistError, "write failed"):
+                        mutation()
+                self.assertEqual(original_pairs, self.manager.get_all_pairs())
+
+    def test_failed_atomic_replace_preserves_existing_file_and_memory(self):
+        pair = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        self.manager.add_pair(pair)
+        with open(self.manager.file_path, "r", encoding="utf-8") as handle:
+            original_content = handle.read()
+
+        with patch("common.path_pair.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(PersistError, "replace failed"):
+                self.manager.remove_pair(pair.id)
+
+        with open(self.manager.file_path, "r", encoding="utf-8") as handle:
+            self.assertEqual(original_content, handle.read())
+        self.assertEqual([pair], self.manager.get_all_pairs())
+        self.assertEqual([], [name for name in os.listdir(self.temp_dir) if name.endswith(".tmp")])
+
+    def test_reorder_persists_and_reloads_in_order(self):
+        first = PathPair(name="Movies", remote_path="/remote/movies", local_path="/local/movies")
+        second = PathPair(name="TV", remote_path="/remote/tv", local_path="/local/tv")
+        self.manager.add_pair(first)
+        self.manager.add_pair(second)
+
+        self.manager.reorder_pairs([second.id, first.id])
+        reloaded = PathPairManager(self.temp_dir)
+
+        self.assertEqual([second.id, first.id], [pair.id for pair in reloaded.load().path_pairs])
 
     def test_load_backs_up_and_recovers_from_malformed_file(self):
         with open(self.manager.file_path, "w", encoding="utf-8") as handle:
