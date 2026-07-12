@@ -272,6 +272,11 @@ class ModelUpdater:
                 if status.file_id not in controller._Controller__malformed_status_only_file_ids
             ]
             if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
+                reconcile_pending_queues = getattr(
+                    controller, "_reconcile_pending_queue_dispatches_from_fresh_status", None
+                )
+                if callable(reconcile_pending_queues):
+                    reconcile_pending_queues({status.file_id for status in lftp_statuses})
                 confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
                 if callable(confirm_download_starts):
                     confirm_download_starts(lftp_statuses)
