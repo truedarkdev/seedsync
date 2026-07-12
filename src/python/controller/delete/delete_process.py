@@ -13,14 +13,15 @@ class DeleteLocalProcess(AppOneShotProcess):
     def __init__(self, local_path: str, file_name: str):
         super().__init__(name=self.__class__.__name__)
         self.__local_path = local_path
-        self.__file_name = file_name
+        self.__file_name: object = file_name
 
     def run_once(self):
-        if not isinstance(self.__file_name, str) or self.__file_name == "" or "\x00" in self.__file_name:
+        file_name = self.__file_name
+        if not isinstance(file_name, str) or file_name == "" or "\x00" in file_name:
             self.logger.error("Invalid local delete filename: {}".format(self.__file_name))
             return
 
-        file_path = os.path.join(self.__local_path, self.__file_name)
+        file_path = os.path.join(self.__local_path, file_name)
         real_base = os.path.realpath(self.__local_path)
         real_target = os.path.realpath(file_path)
         try:
@@ -34,7 +35,7 @@ class DeleteLocalProcess(AppOneShotProcess):
             self.logger.error("Path traversal blocked: {} escapes {}".format(real_target, real_base))
             return
 
-        self.logger.debug("Deleting local file {}".format(self.__file_name))
+        self.logger.debug("Deleting local file {}".format(file_name))
         if not os.path.exists(file_path):
             self.logger.error("Failed to delete non-existing file: {}".format(file_path))
             raise FileNotFoundError(file_path)
@@ -68,7 +69,7 @@ class DeleteRemoteProcess(AppOneShotProcess):
                  file_name: str):
         super().__init__(name=self.__class__.__name__)
         self.__remote_path = remote_path
-        self.__file_name = file_name
+        self.__file_name: object = file_name
         self.__ssh = Sshcp(host=remote_address,
                            port=remote_port,
                            user=remote_username,
@@ -76,11 +77,12 @@ class DeleteRemoteProcess(AppOneShotProcess):
 
     def run_once(self):
         self.__ssh.set_base_logger(self.logger)
-        if not isinstance(self.__file_name, str) or "\x00" in self.__file_name:
+        file_name = self.__file_name
+        if not isinstance(file_name, str) or "\x00" in file_name:
             self.logger.error("Invalid remote delete filename: {}".format(self.__file_name))
             return
 
-        normalized_name = posixpath.normpath(self.__file_name.replace("\\", "/"))
+        normalized_name = posixpath.normpath(file_name.replace("\\", "/"))
         if (
             normalized_name in {"", ".", ".."} or
             normalized_name.startswith("../") or
@@ -89,8 +91,8 @@ class DeleteRemoteProcess(AppOneShotProcess):
             self.logger.error("Path traversal blocked in remote delete: {}".format(self.__file_name))
             return
 
-        file_path = posixpath.join(self.__remote_path, self.__file_name)
-        self.logger.debug("Deleting remote file: {}".format(self.__file_name))
+        file_path = posixpath.join(self.__remote_path, file_name)
+        self.logger.debug("Deleting remote file: {}".format(file_name))
         out = self.__ssh.shell(
             "rm -rf {}".format(escape_remote_path_for_shell(file_path, allow_tilde_expansion=True))
         )

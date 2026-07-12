@@ -1,0 +1,16 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "controller/delete/delete_process.py",
+    "controller/validate/validate_process.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}
