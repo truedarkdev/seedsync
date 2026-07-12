@@ -6,7 +6,6 @@ import queue
 import sys
 import threading
 import time
-from logging.handlers import QueueHandler
 from types import TracebackType
 
 
@@ -22,6 +21,8 @@ class MultiprocessingLogger:
     """
 
     __LISTENER_SLEEP_INTERVAL_IN_SECS = 0.1
+    __SHUTDOWN_DRAIN_TIMEOUT_IN_SECS = 1.0
+    __SHUTDOWN_DRAIN_MAX_RECORDS = 10000
 
     def __init__(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild("MPLogger")
@@ -45,22 +46,6 @@ class MultiprocessingLogger:
     def log_level(self) -> int:
         return self.__logger_level
 
-    def __getstate__(self):
-        return {
-            "logger_name": self.logger.name,
-            "queue": self.__queue,
-            "logger_level": self.__logger_level,
-        }
-
-    def __setstate__(self, state):
-        self.logger = logging.getLogger(state["logger_name"])
-        self.__queue = state["queue"]
-        self.__logger_level = state["logger_level"]
-        # Listener lifecycle stays parent-owned; unpickled children only carry the queue.
-        self.__listener_thread = None
-        self.__listener_shutdown = None
-        self.__listener_exc_info = None
-
     def start(self):
         assert self.__listener_thread is not None
         self.__listener_thread.start()
@@ -68,10 +53,12 @@ class MultiprocessingLogger:
     def stop(self):
         if self.__listener_shutdown is not None:
             self.__listener_shutdown.set()
-        if self.__listener_thread is not None:
+        if self.__listener_thread is not None and self.__listener_thread.ident is not None:
             self.__listener_thread.join()
-        self.__queue.close()
-        self.__queue.join_thread()
+        if self.__queue is not None:
+            self.__queue.close()
+            self.__queue.join_thread()
+            self.__queue = None
 
     def propagate_exception(self):
         """
@@ -97,40 +84,31 @@ class MultiprocessingLogger:
 
             current_logger = current_logger.parent
 
-    def get_process_safe_logger(self) -> logging.Logger:
-        """
-        Returns a process-safe logger
-        This logger sends all records to the main process
-        :return:
-        """
-        queue_handler = QueueHandler(self.__queue)
-        root_logger = logging.getLogger()
-
-        # The fork may have happened after the root logger was setup by the main process
-        # Remove all handlers from the root logger for this process
-        handlers = root_logger.handlers[:]
-        for handler in handlers:
-            handler.close()
-            root_logger.removeHandler(handler)
-
-        root_logger.addHandler(queue_handler)
-        root_logger.setLevel(self.__logger_level)
-        return root_logger
-
     def __listener(self):
         assert self.__listener_shutdown is not None
         self.__remove_closed_stream_handlers(self.logger)
         self.logger.debug("Started listener thread")
 
-        while not self.__listener_shutdown.is_set():
+        shutdown_started_at = None
+        shutdown_record_count = 0
+        while True:
+            if self.__listener_shutdown.is_set() and shutdown_started_at is None:
+                shutdown_started_at = time.monotonic()
             # noinspection PyBroadException
             try:
                 while True:
                     try:
                         record = self.__queue.get(block=False)
+                        if shutdown_started_at is not None:
+                            shutdown_record_count += 1
                         record_logger = self.logger.getChild(record.name)
                         self.__remove_closed_stream_handlers(record_logger)
                         record_logger.handle(record)
+                        if shutdown_started_at is not None and (
+                            shutdown_record_count >= self.__SHUTDOWN_DRAIN_MAX_RECORDS
+                            or time.monotonic() - shutdown_started_at >= self.__SHUTDOWN_DRAIN_TIMEOUT_IN_SECS
+                        ):
+                            break
                     except queue.Empty:
                         break
             except Exception:
@@ -140,6 +118,17 @@ class MultiprocessingLogger:
                 self.__listener_shutdown.set()
                 break
 
+            if self.__listener_shutdown.is_set():
+                if shutdown_started_at is None:
+                    shutdown_started_at = time.monotonic()
+                if (
+                    shutdown_record_count >= self.__SHUTDOWN_DRAIN_MAX_RECORDS
+                    or time.monotonic() - shutdown_started_at >= self.__SHUTDOWN_DRAIN_TIMEOUT_IN_SECS
+                ):
+                    break
+                # Reaching here means the non-blocking drain observed the queue
+                # empty, so all records currently available have been handled.
+                break
             time.sleep(MultiprocessingLogger.__LISTENER_SLEEP_INTERVAL_IN_SECS)
 
         self.__remove_closed_stream_handlers(self.logger)

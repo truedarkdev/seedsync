@@ -1,10 +1,12 @@
 import os
 import tempfile
 import unittest
+import logging
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from common import escape_remote_path_for_shell
+from common import escape_remote_path_for_shell, MultiprocessingLogger
 from controller.validate import ValidateProcess
 from model import ModelFile
 
@@ -24,6 +26,24 @@ class TestValidateProcess(unittest.TestCase):
                 "movies": SimpleNamespace(local_path="/local/movies", remote_path="/remote/movies")
             }
         )
+
+    def test_real_spawn_with_log_transport(self):
+        mp_logger = MultiprocessingLogger(logging.getLogger("validate-spawn-boundary"))
+        self.process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+        mp_logger.start()
+        try:
+            self.process.start()
+            time.sleep(0.2)
+            self.assertTrue(self.process.is_alive())
+            self.process.terminate()
+            self.process.join(timeout=5)
+            self.assertFalse(self.process.is_alive())
+        finally:
+            if self.process.is_alive():
+                self.process.terminate()
+                self.process.join()
+            self.process.close_queues()
+            mp_logger.stop()
 
     def test_validate_file_marks_validated_for_matching_checksum(self):
         file = ModelFile("movie.mkv", False)
@@ -167,7 +187,6 @@ class TestValidateProcess(unittest.TestCase):
             user="user",
             password=None
         )
-        process.mp_logger = MagicMock()
         process._AppProcess__exception_queue = MagicMock()
 
         process.close_queues()
@@ -181,4 +200,5 @@ class TestValidateProcess(unittest.TestCase):
         self.assertIsNone(process._ValidateProcess__status_result_queue)
         self.assertIsNone(process._AppProcess__exception_queue)
         self.assertIsNone(process._terminate)
-        self.assertIsNone(process.mp_logger)
+        self.assertIsNone(process._mp_log_queue)
+        self.assertIsNone(process._mp_log_level)

@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import signal
+import multiprocessing
 import sys
 import time
 import argparse
@@ -26,6 +27,19 @@ from web.auth_store import ApiKeyStore, append_api_key_store_history
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
+
+
+def _configure_multiprocessing_start_method() -> None:
+    """Select spawn once, accepting an already-compatible configuration."""
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError as exc:
+        current_method = multiprocessing.get_start_method(allow_none=True)
+        if current_method != "spawn":
+            raise RuntimeError(
+                "SeedSync requires multiprocessing start method 'spawn'; "
+                f"current method is {current_method!r}"
+            ) from exc
 
 
 class Seedsync:
@@ -654,6 +668,8 @@ class Seedsync:
 
 
 if __name__ == "__main__":
+    _configure_multiprocessing_start_method()
+
     if sys.hexversion < 0x030B0000 or sys.hexversion >= 0x030D0000:
         sys.exit("Python 3.11 or 3.12 is required to run this program.")
 

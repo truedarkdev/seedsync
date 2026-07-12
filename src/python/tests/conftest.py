@@ -9,12 +9,25 @@ name.
 """
 
 import logging
+import multiprocessing
 import sys
 from unittest.mock import MagicMock
 
 import pytest
 
 from common import Config, BreadcrumbTraceCollector
+
+
+def pytest_configure(config):
+    try:
+        multiprocessing.set_start_method("spawn")
+    except RuntimeError:
+        current_method = multiprocessing.get_start_method()
+        if current_method != "spawn":
+            raise RuntimeError(
+                "Tests require multiprocessing start method 'spawn'; "
+                f"current method is {current_method!r}"
+            )
 
 
 @pytest.fixture

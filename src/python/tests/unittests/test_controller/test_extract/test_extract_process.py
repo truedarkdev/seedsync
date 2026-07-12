@@ -14,6 +14,7 @@ import pytest
 
 from model import ModelFile
 from controller.extract import ExtractDispatchError, ExtractFailedResult, ExtractProcess, ExtractListener, ExtractRequest, ExtractStatus
+from common import MultiprocessingLogger
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 
 
@@ -40,6 +41,31 @@ class TestExtractProcess(unittest.TestCase):
         # Assign process to this variable so that it can be cleaned up
         # even after an error
         self.process = None
+
+    @pytest.mark.timeout(10)
+    def test_real_spawn_with_production_breadcrumb_and_log_transport(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        mp_logger = MultiprocessingLogger(logging.getLogger("extract-spawn-boundary"))
+        process = ExtractProcess(
+            out_dir_path="/tmp",
+            local_path="/tmp",
+            breadcrumb_trace=collector.create_emitter(),
+        )
+        process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+        mp_logger.start()
+        try:
+            process.start()
+            time.sleep(0.5)
+            self.assertTrue(process.is_alive())
+            process.terminate()
+            process.join(timeout=5)
+            self.assertFalse(process.is_alive())
+        finally:
+            if process.is_alive():
+                process.terminate()
+                process.join()
+            process.close_queues()
+            mp_logger.stop()
 
     def tearDown(self):
         if self.process:
@@ -125,8 +151,6 @@ class TestExtractProcess(unittest.TestCase):
         ):
             process = ExtractProcess(out_dir_path="/test/out/path", local_path="/test/local/path")
 
-        process.mp_logger = MagicMock()
-
         process.close_queues()
         process.close_queues()
 
@@ -139,7 +163,8 @@ class TestExtractProcess(unittest.TestCase):
         self.assertIsNone(process._ExtractProcess__failed_result_queue)
         self.assertIsNone(process._AppProcess__exception_queue)
         self.assertIsNone(process._terminate)
-        self.assertIsNone(process.mp_logger)
+        self.assertIsNone(process._mp_log_queue)
+        self.assertIsNone(process._mp_log_level)
 
     @pytest.mark.timeout(10)
     def test_retrieves_status(self):

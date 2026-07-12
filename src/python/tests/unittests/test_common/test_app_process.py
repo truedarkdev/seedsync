@@ -10,10 +10,19 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from common import AppProcess, AppOneShotProcess
+from common import AppProcess, AppOneShotProcess, BreadcrumbTraceCollector, MultiprocessingLogger
 
 
-pytestmark = pytest.mark.timeout(2)
+pytestmark = pytest.mark.timeout(5)
+
+
+def wait_until(predicate, timeout=3):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
 
 class DummyException(Exception):
     pass
@@ -61,9 +70,10 @@ class LongRunningProcess(AppProcess):
 class LongRunningThreadProcess(AppProcess):
     def __init__(self):
         super().__init__(name=self.__class__.__name__)
-        self.thread = threading.Thread(target=self.long_task)
+        self.thread = None
 
     def run_init(self):
+        self.thread = threading.Thread(target=self.long_task)
         self.thread.start()
 
     def run_loop(self):
@@ -86,6 +96,16 @@ class DummyOneShotProcess(AppOneShotProcess):
 
     def run_once(self):
         self.time.value += 1
+
+
+class BreadcrumbOneShotProcess(AppOneShotProcess):
+    def __init__(self, breadcrumb_trace):
+        super().__init__(name=self.__class__.__name__)
+        self.breadcrumb_trace = breadcrumb_trace
+
+    def run_once(self):
+        self.logger.info("spawned breadcrumb process")
+        self.breadcrumb_trace.record("spawn-test", "child-started")
 
 
 class OneShotLongRunningProcess(AppOneShotProcess):
@@ -118,9 +138,15 @@ class TestAppProcess(unittest.TestCase):
     def test_exception_propagates(self):
         self.process = DummyProcess(fail=True)
         self.process.start()
-        time.sleep(0.2)
-        with self.assertRaises(DummyException):
-            self.process.propagate_exception()
+        deadline = time.time() + 3
+        while True:
+            try:
+                self.process.propagate_exception()
+            except DummyException:
+                break
+            if time.time() >= deadline:
+                self.fail("spawned child exception was not propagated")
+            time.sleep(0.02)
 
     def test_process_terminates(self):
         self.process = DummyProcess(fail=False)
@@ -132,7 +158,7 @@ class TestAppProcess(unittest.TestCase):
     def test_init_called_before_loop(self):
         self.process = DummyProcess(fail=False)
         self.process.start()
-        time.sleep(0.2)
+        self.assertTrue(wait_until(lambda: self.process.last_loop_time.value > -1))
         self.assertGreater(self.process.last_init_time.value, -1)
         self.assertGreater(self.process.last_loop_time.value, -1)
         self.assertGreater(self.process.last_loop_time.value, self.process.last_init_time.value)
@@ -140,7 +166,7 @@ class TestAppProcess(unittest.TestCase):
     def test_cleanup_called_after_loop(self):
         self.process = DummyProcess(fail=False)
         self.process.start()
-        time.sleep(0.2)
+        self.assertTrue(wait_until(lambda: self.process.last_loop_time.value > -1))
         self.process.terminate()
         self.process.join()
         self.assertGreater(self.process.last_cleanup_time.value, -1)
@@ -161,7 +187,7 @@ class TestAppProcess(unittest.TestCase):
     def test_process_with_long_running_thread_terminates_properly(self):
         self.process = LongRunningThreadProcess()
         self.process.start()
-        time.sleep(0.2)
+        time.sleep(0.5)
         self.process.terminate()
         self.process.join()
         self.process = None
@@ -179,7 +205,6 @@ class TestAppProcess(unittest.TestCase):
 
     def test_close_queues_releases_resources_and_makes_terminate_a_noop(self):
         self.process = DummyProcess(fail=False)
-        self.process.mp_logger = MagicMock()
         exception_queue = MagicMock()
         self.process._AppProcess__exception_queue = exception_queue
 
@@ -190,7 +215,8 @@ class TestAppProcess(unittest.TestCase):
         exception_queue.join_thread.assert_called_once_with()
         self.assertIsNone(self.process._AppProcess__exception_queue)
         self.assertIsNone(self.process._terminate)
-        self.assertIsNone(self.process.mp_logger)
+        self.assertIsNone(self.process._mp_log_queue)
+        self.assertIsNone(self.process._mp_log_level)
 
         with patch("common.app_process.Process.terminate") as mock_terminate:
             self.process.terminate()
@@ -219,14 +245,31 @@ class TestAppOneShotProcess(unittest.TestCase):
     def test_run_once_called_once(self):
         self.process = DummyOneShotProcess()
         self.process.start()
-        time.sleep(0.2)
+        self.assertTrue(wait_until(lambda: self.process.time.value == 1))
         self.assertEqual(self.process.time.value, 1)
+
+    def test_spawn_serializes_production_breadcrumb_and_log_transport(self):
+        collector = BreadcrumbTraceCollector(lambda: True)
+        mp_logger = MultiprocessingLogger(logging.getLogger("spawn-boundary"))
+        self.process = BreadcrumbOneShotProcess(collector.create_emitter())
+        self.process.set_mp_log_queue(mp_logger.queue, mp_logger.log_level)
+
+        mp_logger.start()
+        try:
+            self.process.start()
+            self.process.join(timeout=5)
+            self.assertFalse(self.process.is_alive())
+            self.assertEqual(0, self.process.exitcode)
+            entries = collector.snapshot()["entries"]
+            self.assertTrue(any(entry["message"] == "child-started" for entry in entries))
+        finally:
+            mp_logger.stop()
 
     @pytest.mark.timeout(5)
     def test_long_running_process_is_force_terminated(self):
         self.process = OneShotLongRunningProcess()
         self.process.start()
-        time.sleep(0.2)
+        time.sleep(0.5)
         self.process.terminate()
         self.process.join()
         self.process = None
