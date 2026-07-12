@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from common import Config
 from controller.notifier import (
     AppriseProvider, NotificationError, NotificationEvent, NotificationProvider, NotificationService,
+    NotificationSettings,
     ProviderRegistry, WebhookProvider, WebhookSettings, validate_apprise_url, validate_webhook_url,
 )
 from controller.notifier import _PinnedHTTPSConnection
@@ -103,6 +104,12 @@ class TestNotificationService(unittest.TestCase):
         self.assertTrue(self.service.enqueue(event))
         self.assertFalse(self.service.enqueue(event))
 
+    def test_notification_settings_reject_malformed_dynamic_value(self):
+        self.config.notifications.__dict__["__enabled"] = "yes"
+
+        with self.assertRaises(NotificationError):
+            NotificationSettings.from_config(self.config)
+
     def test_owned_worker_delivers_and_stops(self):
         self.service.start()
         self.service.enqueue(NotificationEvent.create("delete_complete", ModelFile("a", False)))
@@ -129,6 +136,12 @@ class TestNotificationService(unittest.TestCase):
 
 
 class TestWebhookProvider(unittest.TestCase):
+    def test_webhook_validator_rejects_non_string_urls(self):
+        for url in (None, 123):
+            with self.subTest(url=url):
+                with self.assertRaises(NotificationError):
+                    validate_webhook_url(url, False)
+
     @patch("controller.notifier.ssl.create_default_context")
     @patch("controller.notifier.socket.create_connection")
     def test_tls_connection_pins_address_but_verifies_logical_hostname(self, create_connection, create_context):
@@ -149,6 +162,13 @@ class TestWebhookProvider(unittest.TestCase):
             (2, 1, 6, "", ("93.184.216.34", 443)),
             (2, 1, 6, "", ("127.0.0.1", 443)),
         ]
+        with self.assertRaises(NotificationError):
+            validate_webhook_url("https://example.test/hook", False)
+
+    @patch("controller.notifier.socket.getaddrinfo")
+    def test_rejects_non_string_dns_address(self, getaddrinfo):
+        getaddrinfo.return_value = [(2, 1, 6, "", (123, 443))]
+
         with self.assertRaises(NotificationError):
             validate_webhook_url("https://example.test/hook", False)
 
@@ -223,6 +243,12 @@ class TestWebhookProvider(unittest.TestCase):
 
 
 class TestAppriseProvider(unittest.TestCase):
+    def test_apprise_validator_rejects_non_string_urls(self):
+        for url in (None, 123):
+            with self.subTest(url=url):
+                with self.assertRaises(NotificationError):
+                    validate_apprise_url(url, False)
+
     def settings(self, tag=""):
         return WebhookSettings(
             True, "", "", False, True, True, True, True,

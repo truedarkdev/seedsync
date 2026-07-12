@@ -20,7 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Collection, Mapping, NotRequired, Optional, TypedDict
 from urllib.parse import urlsplit
 
 from common import Config, overrides
@@ -32,9 +32,47 @@ _MAX_RESPONSE_BYTES = 4096
 _DELIVERY_TIMEOUT_SECONDS = 5.0
 _RETRY_BACKOFF_SECONDS = 0.2
 
+IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+ValidatedTarget = tuple[str, str, int, str, str]
+
+
+class NotificationFilePayload(TypedDict):
+    name: str
+    path_pair_id: NotRequired[str]
+    path_pair_name: NotRequired[str]
+
+
+class NotificationPayload(TypedDict):
+    schema_version: int
+    event_id: str
+    timestamp: str
+    event_type: str
+    file: NotificationFilePayload
+
+
+class ApprisePayload(TypedDict):
+    body: str
+    title: str
+    type: str
+    format: str
+    tag: NotRequired[str]
+
 
 class NotificationError(ValueError):
     """A safe, user-displayable notification configuration/delivery error."""
+
+
+def _config_bool(value: object, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise NotificationError("Notification setting '{}' must be a boolean".format(name))
+    return value
+
+
+def _config_string(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise NotificationError("Notification setting '{}' must be a string".format(name))
+    return value
 
 
 @dataclass(frozen=True)
@@ -53,8 +91,28 @@ class NotificationSettings:
 
     @classmethod
     def from_config(cls, config: Config) -> "NotificationSettings":
-        section = getattr(config, "notifications", None) or Config.Notifications()
-        return cls(**{name: getattr(section, name) for name in cls.__dataclass_fields__})
+        section = config.notifications
+        return cls(
+            enabled=_config_bool(section.enabled, "enabled"),
+            provider=_config_string(section.provider, "provider"),
+            webhook_url=_config_string(section.webhook_url, "webhook_url"),
+            hmac_secret=_config_string(section.hmac_secret, "hmac_secret"),
+            apprise_url=_config_string(section.apprise_url, "apprise_url"),
+            apprise_tag=_config_string(section.apprise_tag, "apprise_tag"),
+            allow_private_networks=_config_bool(section.allow_private_networks, "allow_private_networks"),
+            download_start=_config_bool(section.download_start, "download_start"),
+            download_complete=_config_bool(section.download_complete, "download_complete"),
+            extraction_complete=_config_bool(section.extraction_complete, "extraction_complete"),
+            delete_complete=_config_bool(section.delete_complete, "delete_complete"),
+        )
+
+    def event_enabled(self, event_type: str) -> bool:
+        return {
+            "download_start": self.download_start,
+            "download_complete": self.download_complete,
+            "extraction_complete": self.extraction_complete,
+            "delete_complete": self.delete_complete,
+        }.get(event_type, False)
 
 
 # Compatibility name retained for the initial webhook-only test/import surface.
@@ -81,13 +139,14 @@ class NotificationEvent:
             occurred_at=datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
         )
 
-    def payload(self) -> dict:
-        payload = {
+    def payload(self) -> NotificationPayload:
+        file_payload: NotificationFilePayload = {"name": self.file_name}
+        payload: NotificationPayload = {
             "schema_version": 1,
             "event_id": self.event_id,
             "timestamp": self.occurred_at,
             "event_type": self.event_type,
-            "file": {"name": self.file_name},
+            "file": file_payload,
         }
         if self.path_pair_id:
             payload["file"]["path_pair_id"] = self.path_pair_id
@@ -108,7 +167,7 @@ class _PinnedHTTPConnection(http.client.HTTPConnection):
         self._pinned_address = pinned_address
         self.source_address = None
 
-    def connect(self):
+    def connect(self) -> None:
         self.sock = socket.create_connection(
             (self._pinned_address, self.port), self.timeout, self.source_address
         )
@@ -122,7 +181,7 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.source_address = None
         self._ssl_context = ssl_context
 
-    def connect(self):
+    def connect(self) -> None:
         raw_socket = socket.create_connection(
             (self._pinned_address, self.port), self.timeout, self.source_address
         )
@@ -130,16 +189,16 @@ class _PinnedHTTPSConnection(http.client.HTTPSConnection):
         self.sock = self._ssl_context.wrap_socket(raw_socket, server_hostname=self.host)
 
 
-_PRIVATE_NETWORKS = tuple(ipaddress.ip_network(value) for value in (
+_PRIVATE_NETWORKS: tuple[IPNetwork, ...] = tuple(ipaddress.ip_network(value) for value in (
     "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7",
 ))
 
 
-def _is_explicit_private_address(address) -> bool:
+def _is_explicit_private_address(address: IPAddress) -> bool:
     return any(address.version == network.version and address in network for network in _PRIVATE_NETWORKS)
 
 
-def _address_is_allowed(address, allow_private_networks: bool) -> bool:
+def _address_is_allowed(address: IPAddress, allow_private_networks: bool) -> bool:
     if address.is_loopback or address.is_link_local or address.is_multicast or address.is_unspecified:
         return False
     if address.is_global:
@@ -148,7 +207,7 @@ def _address_is_allowed(address, allow_private_networks: bool) -> bool:
     return allow_private_networks and _is_explicit_private_address(address)
 
 
-def validate_webhook_url(url: str, allow_private_networks: bool) -> Tuple[str, str, int, str, str]:
+def validate_webhook_url(url: object, allow_private_networks: bool) -> ValidatedTarget:
     """Return (scheme, hostname, port, request target, pinned address)."""
     if not isinstance(url, str) or not url.strip():
         raise NotificationError("Webhook URL is required")
@@ -178,9 +237,11 @@ def validate_webhook_url(url: str, allow_private_networks: bool) -> Tuple[str, s
         resolved = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
         raise NotificationError("Webhook host could not be resolved") from exc
-    addresses = []
+    addresses: list[str] = []
     for info in resolved:
         address_text = info[4][0]
+        if not isinstance(address_text, str):
+            raise NotificationError("Webhook host resolved ambiguously")
         try:
             address = ipaddress.ip_address(address_text)
         except ValueError as exc:
@@ -203,14 +264,13 @@ class WebhookProvider(NotificationProvider):
     USER_AGENT = "SeedSync-Notifications/1"
 
     @staticmethod
-    def canonical_json(payload: dict) -> bytes:
+    def canonical_json(payload: Mapping[str, object]) -> bytes:
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
     @overrides(NotificationProvider)
     def deliver(self, event: NotificationEvent, settings: NotificationSettings) -> None:
         body = self.canonical_json(event.payload())
-        headers = {
-        }
+        headers: dict[str, str] = {}
         if settings.hmac_secret:
             digest = hmac.new(settings.hmac_secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
             headers["X-SeedSync-Signature"] = "sha256=" + digest
@@ -228,10 +288,10 @@ class WebhookProvider(NotificationProvider):
 def _deliver_json(url: str,
                   allow_private_networks: bool,
                   body: bytes,
-                  extra_headers: dict,
-                  success_statuses,
+                  extra_headers: Mapping[str, str],
+                  success_statuses: Collection[int],
                   service_name: str,
-                  validated_target=None) -> None:
+                  validated_target: Optional[ValidatedTarget] = None) -> None:
     scheme, hostname, port, target, pinned_address = validated_target or validate_webhook_url(
         url, allow_private_networks
     )
@@ -239,7 +299,7 @@ def _deliver_json(url: str,
     host_value = "[{}]".format(hostname) if ":" in hostname else hostname
     if port != default_port:
         host_value += ":{}".format(port)
-    headers = {
+    headers: dict[str, str] = {
         "Content-Type": "application/json",
         "Content-Length": str(len(body)),
         "User-Agent": WebhookProvider.USER_AGENT,
@@ -247,9 +307,9 @@ def _deliver_json(url: str,
     }
     headers.update(extra_headers)
 
-    last_error = None
+    last_error: Optional[BaseException] = None
     for attempt in range(2):
-        connection = None
+        connection: Optional[http.client.HTTPConnection] = None
         try:
             connection_cls = _PinnedHTTPSConnection if scheme == "https" else _PinnedHTTPConnection
             connection = connection_cls(hostname, pinned_address, port, _DELIVERY_TIMEOUT_SECONDS)
@@ -274,7 +334,7 @@ def _deliver_json(url: str,
     raise NotificationError("{} delivery failed".format(service_name)) from last_error
 
 
-def validate_apprise_url(url: str, allow_private_networks: bool) -> Tuple[str, str, int, str, str]:
+def validate_apprise_url(url: object, allow_private_networks: bool) -> ValidatedTarget:
     try:
         parsed = urlsplit(url.strip()) if isinstance(url, str) else None
     except ValueError as exc:
@@ -295,9 +355,9 @@ class AppriseProvider(NotificationProvider):
     }
 
     @staticmethod
-    def payload(event: NotificationEvent, tag: str = "") -> dict:
+    def payload(event: NotificationEvent, tag: str = "") -> ApprisePayload:
         label = AppriseProvider._LABELS[event.event_type]
-        payload = {
+        payload: ApprisePayload = {
             "body": "{}: {}".format(label, event.file_name),
             "title": "SeedSync - {}".format(label),
             "type": "info" if event.event_type in ("test", "download_start") else "success",
@@ -323,7 +383,7 @@ class AppriseProvider(NotificationProvider):
 
 
 class ProviderRegistry:
-    def __init__(self, providers: Optional[Dict[str, NotificationProvider]] = None):
+    def __init__(self, providers: Optional[dict[str, NotificationProvider]] = None):
         self._providers = providers or {
             "webhook": WebhookProvider(),
             "apprise": AppriseProvider(),
@@ -331,6 +391,10 @@ class ProviderRegistry:
 
     def get(self, name: str) -> NotificationProvider:
         return self._providers[name]
+
+
+class _StopSignal:
+    pass
 
 
 class NotificationService(IModelListener):
@@ -343,10 +407,10 @@ class NotificationService(IModelListener):
         self._registry = registry or ProviderRegistry()
         self._settings_lock = threading.Lock()
         self._settings = NotificationSettings.from_config(config)
-        self._queue = queue.Queue(maxsize=max_queue_size)
+        self._queue: queue.Queue[NotificationEvent | _StopSignal] = queue.Queue(maxsize=max_queue_size)
         self._stop_event = threading.Event()
-        self._sentinel = object()
-        self._thread = None
+        self._sentinel = _StopSignal()
+        self._thread: Optional[threading.Thread] = None
         self._last_drop_warning = 0.0
 
     def reconfigure(self, config: Config) -> None:
@@ -359,7 +423,7 @@ class NotificationService(IModelListener):
         with self._settings_lock:
             self._settings = settings
 
-    def public_config(self) -> dict:
+    def public_config(self) -> dict[str, object]:
         with self._settings_lock:
             settings = self._settings
         return {
@@ -421,17 +485,17 @@ class NotificationService(IModelListener):
         self.test_delivery()
 
     @overrides(IModelListener)
-    def file_added(self, file: ModelFile):
+    def file_added(self, file: ModelFile) -> None:
         # Completion is defined as a state transition, not discovery of an
         # already-terminal model entry.
         return
 
     @overrides(IModelListener)
-    def file_removed(self, file: ModelFile):
+    def file_removed(self, file: ModelFile) -> None:
         return
 
     @overrides(IModelListener)
-    def file_updated(self, old_file: ModelFile, new_file: ModelFile):
+    def file_updated(self, old_file: ModelFile, new_file: ModelFile) -> None:
         if old_file.state == new_file.state:
             return
         if old_file.state == ModelFile.State.EXTRACTING and new_file.state == ModelFile.State.DOWNLOADED:
@@ -441,17 +505,17 @@ class NotificationService(IModelListener):
             return
         with self._settings_lock:
             settings = self._settings
-        if not settings.enabled or not getattr(settings, event_type):
+        if not settings.enabled or not settings.event_enabled(event_type):
             return
         self.enqueue(NotificationEvent.create(event_type, new_file))
 
-    def remote_delete_completed(self, file: ModelFile):
+    def remote_delete_completed(self, file: ModelFile) -> None:
         with self._settings_lock:
             settings = self._settings
         if settings.enabled and settings.delete_complete:
             self.enqueue(NotificationEvent.create("delete_complete", file))
 
-    def download_started(self, file: ModelFile):
+    def download_started(self, file: ModelFile) -> None:
         with self._settings_lock:
             settings = self._settings
         if settings.enabled and settings.download_start:
@@ -477,11 +541,11 @@ class NotificationService(IModelListener):
                     return
                 continue
             try:
-                if item is self._sentinel:
+                if isinstance(item, _StopSignal):
                     return
                 with self._settings_lock:
                     settings = self._settings
-                if not settings.enabled or not getattr(settings, item.event_type, False):
+                if not settings.enabled or not settings.event_enabled(item.event_type):
                     continue
                 self._registry.get(settings.provider).deliver(item, settings)
             except Exception:
