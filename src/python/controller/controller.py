@@ -54,6 +54,11 @@ class DownloadStartLifecycleEntry:
     transitioned_at: datetime
 
 
+@dataclass
+class PendingQueueDispatch:
+    accepted_at_monotonic: float
+
+
 class Controller:
     """
     Top-level class that controls the behaviour of the app
@@ -318,6 +323,7 @@ class Controller:
         self.__command_queue = Queue()
         self.__command_flow_sequence = 0
         self.__command_flow_lock = Lock()
+        self.__pending_queue_dispatches: Dict[str, PendingQueueDispatch] = {}
 
         # The model
         self.__model = Model()
@@ -2219,6 +2225,31 @@ class Controller:
                         error
                     )
 
+    def __queue_dispatch_pending(self) -> Dict[str, PendingQueueDispatch]:
+        pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+        if not isinstance(pending, dict):
+            pending = {}
+            self.__pending_queue_dispatches = pending
+        return pending
+
+    def __reconcile_queue_dispatch_pending(self) -> None:
+        pending = self.__queue_dispatch_pending()
+        for file_id, dispatch in list(pending.items()):
+            try:
+                file = self.__model.get_file(file_id)
+            except ModelError:
+                del pending[file_id]
+                continue
+
+    def _reconcile_pending_queue_dispatches_from_fresh_status(self, active_file_ids: Set[str]) -> None:
+        pending = self.__queue_dispatch_pending()
+        for file_id in list(pending):
+            if file_id in active_file_ids:
+                # A fresh healthy transport snapshot has made the accepted
+                # lifecycle authoritative. The model's active-state guard now
+                # owns duplicate suppression.
+                del pending[file_id]
+
     def __set_active_scanner_files(self, active_files):
         if isinstance(self.__active_scanner, MultiPathActiveScanner):
             self.__active_scanner.set_active_files(active_files)
@@ -2255,6 +2286,12 @@ class Controller:
                 _callback.on_failure(_msg, _error_code)
 
         deferred_commands = []
+        # Queue commands are drained before the next model refresh. Retain
+        # accepted identities until their authoritative lifecycle is observed
+        # (or bounded reconciliation expires an unobserved acknowledgement).
+        self.__reconcile_queue_dispatch_pending()
+        pending_queue_dispatches = self.__queue_dispatch_pending()
+        stopped_queue_lifecycle_ids = set()
         while not self.__command_queue.empty():
             command = self.__command_queue.get()
             self.logger.info("Received command {} for file {}".format(str(command.action), command.filename))
@@ -2295,87 +2332,148 @@ class Controller:
             )
 
             if command.action == Controller.Command.Action.QUEUE:
-                if file.remote_size is None:
-                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
-                    continue
+                # Re-resolve immediately before any transport side effect. A
+                # model refresh may have advanced this exact file since the
+                # command was dequeued (for example, to QUEUED or
+                # DOWNLOADING), and identity must remain file-id/path-pair
+                # aware rather than falling back to a name match.
                 try:
-                    path_pair = self.__get_path_pair(file.path_pair_id)
-                    local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
-                    stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
-                    self.__log_stop_resume_trace(
-                        "queue_after_stop" if stopped_marked else "queue_fresh",
-                        file.file_id,
-                        file.name,
-                        file.path_pair_id,
-                        file.is_dir,
-                        getattr(file.state, "name", file.state),
-                        path_pair.remote_path if path_pair else None,
-                        local_base_dir_path,
-                        stopped_marked
-                    )
-                    queue_kwargs = {}
-                    exclude_patterns = Controller.__get_exclude_patterns(self)
-                    if exclude_patterns.strip():
-                        queue_kwargs["exclude_patterns"] = exclude_patterns
-                    self.__lftp.queue(
-                        file.name,
-                        file.is_dir,
-                        remote_base_dir_path=path_pair.remote_path if path_pair else None,
-                        local_base_dir_path=local_base_dir_path,
-                        **queue_kwargs
-                    )
-                    is_new_transfer_lifecycle = file.state not in (
-                        ModelFile.State.QUEUED,
-                        ModelFile.State.DOWNLOADING,
-                    )
-                    if is_new_transfer_lifecycle:
-                        self.__persist.move_failure_counts.pop(file.file_id, None)
-                        self.__move_retry_due.pop(file.file_id, None)
-                        self.__deferred_move_file_ids.discard(file.file_id)
-                        self.__pending_completion_file_names = {
-                            entry for entry in self.__pending_completion_file_names
-                            if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
-                        }
-                        with self.__move_attempt_lock:
-                            self.__move_attempt_reservations.discard(file.file_id)
-                        self.__model_builder.set_move_failed_files({
-                            file_id for file_id, count in self.__persist.move_failure_counts.items()
-                            if count >= Controller.__MAX_MOVE_FAILURES
-                        })
-                        self.__arm_download_start_lifecycle(
-                            file.file_id,
-                            file.name,
-                            file.path_pair_id,
-                            is_resume=stopped_marked,
-                        )
+                    file = self.__model.get_file(command.filename)
+                except ModelError:
+                    _notify_failure(command, "File '{}' not found".format(command.filename), 404)
+                    continue
+
+                already_active = file.state in (
+                    ModelFile.State.QUEUED,
+                    ModelFile.State.DOWNLOADING,
+                )
+                stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                stop_boundary = file.file_id in stopped_queue_lifecycle_ids or stopped_marked
+                if stop_boundary:
+                    pending_queue_dispatches.pop(file.file_id, None)
+                pending_dispatch = pending_queue_dispatches.get(file.file_id)
+                pending_timeout = max(
+                    1, getattr(self, "_Controller__lftp_status_cache_max_age_seconds", 3)
+                )
+                retry_after_ambiguity = pending_dispatch is not None and (
+                    time.monotonic() - pending_dispatch.accepted_at_monotonic >= pending_timeout
+                )
+                already_dispatched = pending_dispatch is not None and not retry_after_ambiguity
+                if (already_active and not stop_boundary and not retry_after_ambiguity) or already_dispatched:
                     Controller.__clear_persist_key(
                         self.__persist.stopped_file_names,
                         file.name,
                         file.path_pair_id
                     )
-                    if is_new_transfer_lifecycle:
-                        # A genuinely new queue invalidates all final-move
-                        # identity from the prior transfer lifecycle.
-                        self.__persist.final_move_succeeded_file_names.discard(file.file_id)
-                        self.__model_builder.set_final_move_succeeded_files(
-                            self.__persist.final_move_succeeded_file_names
-                        )
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",
                         details={
                             "command": "QUEUE",
-                            "mode": "lftp_queue",
+                            "mode": "idempotent_noop",
+                            "already_active": already_active,
+                            "already_dispatched": already_dispatched,
                             "stopped_marked": stopped_marked,
                         },
                         file=file,
                     )
-                except (LftpError, RcloneTransferError) as e:
-                    _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
+                elif file.remote_size is None:
+                    _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
                     continue
+                else:
+                    try:
+                        path_pair = self.__get_path_pair(file.path_pair_id)
+                        local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
+                        stopped_marked = self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                        self.__log_stop_resume_trace(
+                            "queue_after_stop" if stopped_marked else "queue_fresh",
+                            file.file_id,
+                            file.name,
+                            file.path_pair_id,
+                            file.is_dir,
+                            getattr(file.state, "name", file.state),
+                            path_pair.remote_path if path_pair else None,
+                            local_base_dir_path,
+                            stopped_marked
+                        )
+                        queue_kwargs = {}
+                        exclude_patterns = Controller.__get_exclude_patterns(self)
+                        if exclude_patterns.strip():
+                            queue_kwargs["exclude_patterns"] = exclude_patterns
+                        self.__lftp.queue(
+                            file.name,
+                            file.is_dir,
+                            remote_base_dir_path=path_pair.remote_path if path_pair else None,
+                            local_base_dir_path=local_base_dir_path,
+                            **queue_kwargs
+                        )
+                        pending_queue_dispatches[file.file_id] = PendingQueueDispatch(time.monotonic())
+                        # If the prior acknowledgement was never observable,
+                        # this successful explicit retry resets the bounded
+                        # ambiguity window. Beyond that window Queue is
+                        # intentionally at-least-once: LFTP acknowledgement is
+                        # not transactional with controller model observation.
+                        # Ensure this acceptance is reconciled against a fresh
+                        # transport snapshot in the updater that follows this
+                        # command drain.
+                        self.__next_lftp_status_poll_at = None
+                        is_new_transfer_lifecycle = stop_boundary or file.state not in (
+                            ModelFile.State.QUEUED,
+                            ModelFile.State.DOWNLOADING,
+                        )
+                        stopped_queue_lifecycle_ids.discard(file.file_id)
+                        if is_new_transfer_lifecycle:
+                            self.__persist.move_failure_counts.pop(file.file_id, None)
+                            self.__move_retry_due.pop(file.file_id, None)
+                            self.__deferred_move_file_ids.discard(file.file_id)
+                            self.__pending_completion_file_names = {
+                                entry for entry in self.__pending_completion_file_names
+                                if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
+                            }
+                            with self.__move_attempt_lock:
+                                self.__move_attempt_reservations.discard(file.file_id)
+                            self.__model_builder.set_move_failed_files({
+                                file_id for file_id, count in self.__persist.move_failure_counts.items()
+                                if count >= Controller.__MAX_MOVE_FAILURES
+                            })
+                            self.__arm_download_start_lifecycle(
+                                file.file_id,
+                                file.name,
+                                file.path_pair_id,
+                                is_resume=stopped_marked,
+                            )
+                        Controller.__clear_persist_key(
+                            self.__persist.stopped_file_names,
+                            file.name,
+                            file.path_pair_id
+                        )
+                        if is_new_transfer_lifecycle:
+                            # A genuinely new queue invalidates all final-move
+                            # identity from the prior transfer lifecycle.
+                            self.__persist.final_move_succeeded_file_names.discard(file.file_id)
+                            self.__model_builder.set_final_move_succeeded_files(
+                                self.__persist.final_move_succeeded_file_names
+                            )
+                        self.__record_command_breadcrumb(
+                            command=command,
+                            message="command_dispatched",
+                            details={
+                                "command": "QUEUE",
+                                "mode": "lftp_queue",
+                                "stopped_marked": stopped_marked,
+                            },
+                            file=file,
+                        )
+                    except (LftpError, RcloneTransferError) as e:
+                        _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
+                        continue
 
             elif command.action == Controller.Command.Action.STOP:
-                if file.state not in (ModelFile.State.DOWNLOADING, ModelFile.State.QUEUED):
+                pending_stop = file.file_id in pending_queue_dispatches
+                if not pending_stop and file.state not in (
+                    ModelFile.State.DOWNLOADING,
+                    ModelFile.State.QUEUED,
+                ):
                     _notify_failure(
                         command,
                         "File '{}' is not Queued or Downloading".format(command.filename),
@@ -2383,7 +2481,7 @@ class Controller:
                         file
                     )
                     continue
-                if not file.is_stoppable:
+                if not pending_stop and not file.is_stoppable:
                     _notify_failure(
                         command,
                         "File '{}' could not be stopped".format(command.filename),
@@ -2428,6 +2526,8 @@ class Controller:
                         )
                         continue
                     self.__persist.stopped_file_names.add(file.file_id)
+                    pending_queue_dispatches.pop(file.file_id, None)
+                    stopped_queue_lifecycle_ids.add(file.file_id)
                     self.__suppress_download_start_lifecycle(file.file_id)
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.

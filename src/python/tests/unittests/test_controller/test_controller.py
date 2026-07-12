@@ -3057,6 +3057,418 @@ class TestController(unittest.TestCase):
         )
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
 
+    def test_process_commands_queue_is_idempotent_for_queued_file(self):
+        file = ModelFile("queued", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.QUEUED
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_called_once_with()
+
+    def test_process_commands_queue_is_idempotent_for_downloading_file(self):
+        file = ModelFile("downloading", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_success.assert_called_once_with()
+
+    def test_process_commands_queue_rechecks_authoritative_state_before_transport(self):
+        stale_file = ModelFile("stale", False)
+        stale_file.remote_size = 10
+        current_file = ModelFile("stale", False)
+        current_file.remote_size = 10
+        current_file.state = ModelFile.State.QUEUED
+        self.controller._Controller__model.get_file.side_effect = [stale_file, current_file]
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, stale_file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_process_commands_queue_deduplicates_pending_commands_by_file_id(self):
+        file = ModelFile("duplicate", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        first_callback = MagicMock()
+        second_callback = MagicMock()
+        first_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        second_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        first_command.add_callback(first_callback)
+        second_command.add_callback(second_callback)
+
+        self.controller.queue_command(first_command)
+        self.controller.queue_command(second_command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "duplicate",
+            False,
+            remote_base_dir_path=None,
+            local_base_dir_path="/local/incomplete",
+        )
+        first_callback.on_success.assert_called_once_with()
+        second_callback.on_success.assert_called_once_with()
+
+    def test_process_commands_queue_pending_guard_persists_across_stale_model_ticks(self):
+        file = ModelFile("cross-tick", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+
+    def test_process_commands_queue_failed_dispatch_does_not_fence_retry(self):
+        file = ModelFile("retry", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.side_effect = [LftpError("queue failed"), None]
+        failed_callback = MagicMock()
+        retried_callback = MagicMock()
+        failed = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        retried = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        failed.add_callback(failed_callback)
+        retried.add_callback(retried_callback)
+
+        self.controller.queue_command(failed)
+        self.controller._Controller__process_commands()
+        self.controller.queue_command(retried)
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
+        failed_callback.on_failure.assert_called_once_with("Transfer backend error: queue failed", 500)
+        failed_callback.on_success.assert_not_called()
+        retried_callback.on_success.assert_called_once_with()
+
+    def test_process_commands_queue_pending_guard_clears_after_authoritative_lifecycle_exit(self):
+        file = ModelFile("lifecycle", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        file.state = ModelFile.State.QUEUED
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status({file.file_id})
+        self.controller._Controller__process_commands()
+        file.state = ModelFile.State.DEFAULT
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
+
+    def test_process_commands_queue_pending_guard_clears_when_file_is_missing(self):
+        file = ModelFile("removed", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__model.get_file.side_effect = ModelError("removed")
+        self.controller._Controller__process_commands()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_process_commands_queue_unobserved_acceptance_expires_for_explicit_retry(self):
+        file = ModelFile("ambiguous", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        pending = self.controller._Controller__pending_queue_dispatches[file.file_id]
+        pending.accepted_at_monotonic -= (
+            self.controller._Controller__lftp_status_cache_max_age_seconds + 1
+        )
+        # Even a stale active model cannot deny retry forever when no fresh
+        # transport status ever reconciled the accepted command.
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
+
+    def test_process_commands_queue_fresh_empty_before_deadline_keeps_pending_guard(self):
+        file = ModelFile("fresh-empty", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(set())
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+
+    def test_process_commands_queue_fresh_empty_then_active_clears_retry_eligibility(self):
+        file = ModelFile("eventually-active", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status(set())
+        self.controller._reconcile_pending_queue_dispatches_from_fresh_status({file.file_id})
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_process_commands_queue_successful_ambiguous_retry_resets_deadline(self):
+        file = ModelFile("retry-once", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__pending_queue_dispatches[file.file_id].accepted_at_monotonic -= 4
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
+
+    def test_process_commands_queue_failed_ambiguous_retry_remains_retryable(self):
+        file = ModelFile("retry-failure", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.queue.side_effect = [None, LftpError("late failure"), None]
+        failed_callback = MagicMock()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__pending_queue_dispatches[file.file_id].accepted_at_monotonic -= 4
+        failed = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        failed.add_callback(failed_callback)
+        self.controller.queue_command(failed)
+        self.controller._Controller__process_commands()
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(3, self.controller._Controller__lftp.queue.call_count)
+        failed_callback.on_failure.assert_called_once_with("Transfer backend error: late failure", 500)
+
+    def test_process_commands_queue_removed_identity_cannot_reuse_expired_permission(self):
+        file = ModelFile("reappears", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller._Controller__pending_queue_dispatches[file.file_id].accepted_at_monotonic -= 4
+
+        self.controller._Controller__model.get_file.side_effect = ModelError("removed")
+        self.controller._Controller__process_commands()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.controller._Controller__model.get_file.side_effect = None
+        file.state = ModelFile.State.DOWNLOADING
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+
+    def test_process_commands_queue_many_removed_identities_leave_no_pending_growth(self):
+        files = [ModelFile("removed-{}".format(index), False) for index in range(100)]
+        for file in files:
+            file.remote_size = 10
+        files_by_id = {file.file_id: file for file in files}
+        self.controller._Controller__model.get_file.side_effect = files_by_id.__getitem__
+        for file in files:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__model.get_file.side_effect = ModelError("removed")
+        self.controller._Controller__process_commands()
+
+        self.assertEqual({}, self.controller._Controller__pending_queue_dispatches)
+
+    def test_process_commands_stop_then_queue_redispatches_despite_stale_active_model(self):
+        file = ModelFile("resume", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = True
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.kill.return_value = True
+        stop_callback = MagicMock()
+        queue_callback = MagicMock()
+        duplicate_callback = MagicMock()
+        stop = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        queue = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        duplicate = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        stop.add_callback(stop_callback)
+        queue.add_callback(queue_callback)
+        duplicate.add_callback(duplicate_callback)
+
+        self.controller.queue_command(stop)
+        self.controller.queue_command(queue)
+        self.controller.queue_command(duplicate)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.kill.assert_called_once()
+        self.controller._Controller__lftp.queue.assert_called_once()
+        stop_callback.on_success.assert_called_once_with()
+        queue_callback.on_success.assert_called_once_with()
+        duplicate_callback.on_success.assert_called_once_with()
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        # Resume preserves the existing download-start listener contract: it
+        # must not create a second fresh-download notification lifecycle.
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
+    def test_process_commands_queue_then_stop_same_drain_uses_pending_identity(self):
+        file = ModelFile("cancel-pending", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.kill.return_value = True
+        queue_callback = MagicMock()
+        stop_callback = MagicMock()
+        queue = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        stop = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        queue.add_callback(queue_callback)
+        stop.add_callback(stop_callback)
+
+        self.controller.queue_command(queue)
+        self.controller.queue_command(stop)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.controller._Controller__lftp.kill.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        queue_callback.on_success.assert_called_once_with()
+        stop_callback.on_success.assert_called_once_with()
+
+    def test_process_commands_queue_then_stop_separate_drain_before_poll_uses_pending_identity(self):
+        file = ModelFile("cancel-cross-tick", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.kill.return_value = True
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.controller._Controller__lftp.kill.assert_called_once()
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+
+    def test_process_commands_queue_then_failed_stop_preserves_pending_identity(self):
+        file = ModelFile("failed-cancel", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__lftp.kill.return_value = False
+        stop_callback = MagicMock()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        stop = Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        stop.add_callback(stop_callback)
+        self.controller.queue_command(stop)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.kill.assert_called_once()
+        self.assertIn(file.file_id, self.controller._Controller__pending_queue_dispatches)
+        self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+        stop_callback.on_failure.assert_called_once_with(
+            "File '{}' could not be stopped".format(file.file_id), 409
+        )
+        stop_callback.on_success.assert_not_called()
+
+    def test_process_commands_stop_cannot_borrow_same_name_pending_from_other_path_pair(self):
+        movies = ModelFile("shared", False)
+        movies.path_pair_id = "movies"
+        movies.remote_size = 10
+        tv = ModelFile("shared", False)
+        tv.path_pair_id = "tv"
+        tv.remote_size = 10
+        files = {movies.file_id: movies, tv.file_id: tv}
+        self.controller._Controller__model.get_file.side_effect = files.__getitem__
+        callback = MagicMock()
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, movies.file_id))
+        self.controller._Controller__process_commands()
+        stop = Controller.Command(Controller.Command.Action.STOP, tv.file_id)
+        stop.add_callback(callback)
+        self.controller.queue_command(stop)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.kill.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "File '{}' is not Queued or Downloading".format(tv.file_id), 409
+        )
+        self.assertIn(movies.file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_process_commands_queue_pending_guard_has_no_lossy_capacity_eviction(self):
+        files = []
+        for index in range(1025):
+            file = ModelFile("capacity-{}".format(index), False)
+            file.remote_size = 10
+            files.append(file)
+        files_by_id = {file.file_id: file for file in files}
+        self.controller._Controller__model.get_file.side_effect = files_by_id.__getitem__
+
+        for file in files:
+            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(1025, self.controller._Controller__lftp.queue.call_count)
+        self.assertEqual(set(files_by_id), set(self.controller._Controller__pending_queue_dispatches))
+
+    def test_process_commands_queue_keeps_same_name_path_pairs_independent(self):
+        movies_file = ModelFile("duplicate", False)
+        movies_file.path_pair_id = "movies"
+        movies_file.remote_size = 10
+        tv_file = ModelFile("duplicate", False)
+        tv_file.path_pair_id = "tv"
+        tv_file.remote_size = 10
+        self.controller._Controller__model.get_file.side_effect = {
+            movies_file.file_id: movies_file,
+            tv_file.file_id: tv_file,
+        }.__getitem__
+        self.controller._Controller__path_pairs_by_id = {
+            "movies": SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies"),
+            "tv": SimpleNamespace(remote_path="/remote/tv", local_path="/local/tv"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "movies": "/local/movies/incomplete",
+            "tv": "/local/tv/incomplete",
+        }
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, movies_file.file_id))
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, tv_file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.assertEqual(2, self.controller._Controller__lftp.queue.call_count)
+        self.assertEqual(
+            ["duplicate", "duplicate"],
+            [call.args[0] for call in self.controller._Controller__lftp.queue.call_args_list],
+        )
+        self.assertEqual(
+            {"/remote/movies", "/remote/tv"},
+            {call.kwargs["remote_base_dir_path"] for call in self.controller._Controller__lftp.queue.call_args_list},
+        )
+
     def test_process_commands_stop_uses_path_pair_identity(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
