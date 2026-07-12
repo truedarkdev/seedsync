@@ -360,6 +360,11 @@ migrations with their own validation. This is a readiness and planning cycle,
 not an automatic mass upgrade; support claims must not change until the
 corresponding migration is completed and validated.
 
+Stable releases and long-term support take priority over adopting the newest
+available version. The target is selected from versions available at review
+time using local support, ecosystem, migration-risk, and maintenance evidence;
+source-fork target choices are not inherited.
+
 Routine safe direct dependency updates continue weekly through Dependabot.
 Urgent security, EOL, or compatibility blockers may trigger an earlier,
 dedicated upgrade outside the annual push.
