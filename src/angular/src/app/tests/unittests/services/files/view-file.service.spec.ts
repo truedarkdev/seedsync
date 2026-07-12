@@ -1448,6 +1448,74 @@ describe("Testing view file service", () => {
         expect(viewFilesMap.has("blueman")).toBe(true);
     }));
 
+    it("should suppress unchanged filtered lists but emit a real row update", fakeAsync(() => {
+        class MatchAllCriteria implements ViewFileFilterCriteria {
+            meetsCriteria(_viewFile: ViewFile): boolean {
+                return true;
+            }
+        }
+
+        viewService.setFilterCriteria(new MatchAllCriteria());
+        let emissionCount = 0;
+        let latestFile: ViewFile = null;
+        viewService.filteredFiles.subscribe(files => {
+            emissionCount++;
+            latestFile = files.get(0) || null;
+        });
+
+        const initialFile = new ModelFile({name: "movie", state: ModelFile.State.DEFAULT});
+        const initialModel = Immutable.Map<string, ModelFile>().set("movie", initialFile);
+        mockModelService._files.next(initialModel);
+        tick();
+        expect(emissionCount).toBe(2);
+        expect(latestFile.status).toBe(ViewFile.Status.DEFAULT);
+
+        // Replaying the same row references does not require another filtered
+        // list emission.
+        mockModelService._files.next(initialModel);
+        tick();
+        expect(emissionCount).toBe(2);
+
+        const updatedModel = initialModel.set("movie", new ModelFile(initialFile.set(
+            "state", ModelFile.State.QUEUED
+        )));
+        mockModelService._files.next(updatedModel);
+        tick();
+        expect(emissionCount).toBe(3);
+        expect(latestFile.status).toBe(ViewFile.Status.QUEUED);
+    }));
+
+    it("should coalesce rapid model emissions to the latest batch", fakeAsync(() => {
+        const coalescedService = new ViewFileService(
+            TestBed.get(LoggerService),
+            TestBed.get(StreamServiceRegistry),
+            TestBed.get(FileSelectionService),
+            TestBed.get(LOCAL_STORAGE),
+            100
+        );
+        let emissionCount = 0;
+        let latestFile: ViewFile = null;
+        coalescedService.files.subscribe(files => {
+            emissionCount++;
+            latestFile = files.get(0) || null;
+        });
+
+        const firstModel = Immutable.Map<string, ModelFile>().set("movie", new ModelFile({
+            name: "movie", state: ModelFile.State.DEFAULT
+        }));
+        const latestModel = firstModel.set("movie", new ModelFile({
+            name: "movie", state: ModelFile.State.QUEUED
+        }));
+        mockModelService._files.next(firstModel);
+        mockModelService._files.next(latestModel);
+
+        tick(99);
+        expect(emissionCount).toBe(1);
+        tick(1);
+        expect(emissionCount).toBe(2);
+        expect(latestFile.status).toBe(ViewFile.Status.QUEUED);
+    }));
+
     it("should not sort files by default", fakeAsync(() => {
         const model = Immutable.Map({
             "aaaa": new ModelFile({name: "aaaa", state: ModelFile.State.DEFAULT}),
