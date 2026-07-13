@@ -10,17 +10,118 @@ delegates the model refresh boundary.
 from __future__ import annotations
 
 import re
-from threading import Lock
+import logging
+from types import SimpleNamespace
+from threading import Lock, RLock
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
-from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
+from common import Context, PathPair
+from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
+from system import SystemFile
+from transfer import RcloneTransferBackend
 
 from common.exclude_patterns import filter_excluded_files
 
-from .extract import ExtractStatus
+from .controller_persist import ControllerPersist
+from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus
+from .model_builder import ModelBuilder
 from .persist_keys import KEY_SEP
+from .scan import ScannerProcess
+from .validate import ValidateProcess
+
+if TYPE_CHECKING:
+    from .controller import Controller
+
+
+class _ControllerCoreAccess:
+    logger: logging.Logger
+    MoveFromStagingResult: type["Controller.MoveFromStagingResult"]
+    _Controller__context: Context
+    _Controller__persist: ControllerPersist
+    _Controller__model: Model
+    _Controller__model_builder: ModelBuilder
+    _Controller__path_pairs_by_id: dict[str, PathPair]
+    _Controller__active_scan_process: ScannerProcess
+    _Controller__local_scan_process: ScannerProcess
+    _Controller__remote_scan_process: ScannerProcess
+    _Controller__extract_process: ExtractProcess
+    _Controller__validate_process: ValidateProcess
+    _Controller__lftp: Lftp | RcloneTransferBackend
+    _Controller__active_downloading_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    _Controller__active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__move_retry_due: dict[str, datetime]
+    _Controller__move_attempt_lock: Lock
+    _Controller__move_attempt_reservations: set[str]
+    _Controller__deferred_move_file_ids: set[str]
+    _Controller__malformed_status_only_file_ids: set[str]
+    _Controller__pending_auto_purge_file_ids: set[str]
+    _Controller__last_lftp_statuses: Optional[list[LftpJobStatus]]
+    _Controller__next_lftp_status_poll_at: Optional[datetime]
+    _Controller__lftp_status_poll_retry_seconds: int
+    _Controller__lftp_status_cache_expires_at: Optional[datetime]
+    _Controller__lftp_status_cache_max_age_seconds: int
+    _Controller__lftp_status_poll_retry_active: bool
+    _Controller__startup_recovery_done: bool
+    _Controller__exclude_patterns: str
+    _Controller__model_lock: RLock
+    _Controller__MAX_MOVE_FAILURES: int
+    _Controller__MOVE_RETRY_DELAYS: tuple[int, ...]
+
+    def _reconcile_pending_queue_dispatches_from_fresh_status(self, active_file_ids: set[str]) -> None: ...
+    def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
+    def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
+    def clear_extracted_marker(self, file: ModelFile) -> None: ...
+    def _reserve_move_attempt(self, file_id: str) -> bool: ...
+    def _release_move_attempt(self, file_id: str) -> None: ...
+    def _Controller__active_extracting_file_tuple(
+        self, status: ExtractStatus
+    ) -> tuple[str, Optional[str], Optional[str]]: ...
+    def _Controller__extract_status_matches_failed_result(
+        self, status: ExtractStatus, failed_results: list[ExtractFailedResult]
+    ) -> bool: ...
+    def _Controller__find_target_archive_model_file(
+        self, file_name: str, file_id: Optional[str] = None
+    ) -> Optional[ModelFile]: ...
+    def _Controller__get_path_pair(self, path_pair_id: Optional[str]) -> Optional[PathPair]: ...
+    def _Controller__is_explicitly_stopped(
+        self, name: str, path_pair_id: Optional[str] = None
+    ) -> bool: ...
+    def _Controller__is_target_archive_trace_enabled(self) -> bool: ...
+    def _Controller__move_from_staging(
+        self, name: str, path_pair_id: Optional[str] = None
+    ) -> "Controller.MoveFromStagingResult": ...
+    def _Controller__queue_delete_local_process(
+        self, file: ModelFile, post_callback: Callable[[], None], command: object = None
+    ) -> None: ...
+    def _Controller__record_breadcrumb(
+        self, stage: str, message: str, details: Optional[dict[str, object]] = None,
+        event_type: str = "diagnostic", file_id: Optional[str] = None,
+        path_pair_id: Optional[str] = None, path_pair_name: Optional[str] = None,
+        corr_id: Optional[str] = None, flow_id: Optional[str] = None,
+        trace_scope: str = "flow"
+    ) -> None: ...
+    def _Controller__recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None: ...
+    def _Controller__set_active_scanner_files(
+        self, active_files: list[tuple[str, Optional[str], Optional[str]]]
+    ) -> None: ...
+    def _Controller__should_auto_purge_local_file(self, file: ModelFile) -> bool: ...
+    def _Controller__summarize_target_archive_file(self, file: ModelFile) -> dict[str, object]: ...
+    def _Controller__target_archive_trace_selector_matches_file(
+        self, file_id: str, file_name: str
+    ) -> bool: ...
+    def _Controller__temp_diag(
+        self, stage: str, file_id: Optional[str] = None, **payload: object
+    ) -> None: ...
+    def _Controller__trace_corr_id_from_files(
+        self, files: Optional[Sequence[object]], fallback: str
+    ) -> str: ...
+    def _Controller__trace_target_archive_event(
+        self, event: str, payload: dict[str, object]
+    ) -> None: ...
 
 
 _LEGACY_PAIR_ID_RE = re.compile(
@@ -29,14 +130,17 @@ _LEGACY_PAIR_ID_RE = re.compile(
 )
 
 
-class ModelUpdater:
+class ModelUpdater(_ControllerCoreAccess):
     """Runs the per-tick model update loop for a controller instance."""
 
-    def __init__(self, controller: Any):
-        self._controller = controller
+    def __init__(self, controller: object) -> None:
+        from .controller import Controller as ControllerType
+        if not isinstance(controller, (ControllerType, SimpleNamespace)):
+            raise TypeError("ModelUpdater requires the controller core runtime boundary")
+        self._controller = cast(_ControllerCoreAccess, controller)
 
     @staticmethod
-    def _get_exclude_patterns(controller: Any) -> str:
+    def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
         exclude_patterns = getattr(controller, "_Controller__exclude_patterns", None)
         if isinstance(exclude_patterns, str):
             return exclude_patterns
@@ -51,33 +155,33 @@ class ModelUpdater:
         move_failure_counts = getattr(persist, "move_failure_counts", {})
         max_move_failures = getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4)
         path_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
-        controller._Controller__model_builder.set_downloaded_files(  # type: ignore[attr-defined]
+        controller._Controller__model_builder.set_downloaded_files(
             self._filter_keys_for_model_builder(
                 controller._Controller__persist.downloaded_file_names,
                 path_pair_ids,
             )
         )
-        controller._Controller__model_builder.set_extracted_files(  # type: ignore[attr-defined]
+        controller._Controller__model_builder.set_extracted_files(
             self._filter_keys_for_model_builder(
                 controller._Controller__persist.extracted_file_names,
                 path_pair_ids,
             )
         )
-        controller._Controller__model_builder.set_stopped_files(  # type: ignore[attr-defined]
+        controller._Controller__model_builder.set_stopped_files(
             self._filter_keys_for_model_builder(
                 controller._Controller__persist.stopped_file_names,
                 path_pair_ids,
             )
         )
         if hasattr(persist, "move_failure_counts"):
-            controller._Controller__model_builder.set_move_failed_files(  # type: ignore[attr-defined]
+            controller._Controller__model_builder.set_move_failed_files(
                 {
                     file_id for file_id, count in move_failure_counts.items()
                     if count >= max_move_failures
                 }
             )
         if hasattr(persist, "final_move_succeeded_file_names"):
-            controller._Controller__model_builder.set_final_move_succeeded_files(  # type: ignore[attr-defined]
+            controller._Controller__model_builder.set_final_move_succeeded_files(
                 persist.final_move_succeeded_file_names
             )
 
@@ -86,7 +190,7 @@ class ModelUpdater:
         if not path_pair_ids:
             return set(keys)
 
-        filtered = set()
+        filtered: set[str] = set()
         for key in keys:
             normalized_key = key
             for path_pair_id in path_pair_ids:
@@ -121,7 +225,7 @@ class ModelUpdater:
         )
         just_completed_file_names = {
             file_name for file_name in just_completed_file_names
-            if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])  # type: ignore[attr-defined]
+            if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])
         }
         if just_completed_file_names:
             for name, path_pair_id, _ in just_completed_file_names:
@@ -131,14 +235,14 @@ class ModelUpdater:
                     )
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
-            controller._Controller__local_scan_process.force_scan()  # type: ignore[attr-defined]
+            controller._Controller__local_scan_process.force_scan()
         controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
 
-    def update(self):  # noqa: C901 - extracted controller refresh loop
+    def update(self) -> None:
         controller = self._controller
-        model_builder = controller._Controller__model_builder  # type: ignore[attr-defined]
-        persist = controller._Controller__persist  # type: ignore[attr-defined]
-        model = controller._Controller__model  # type: ignore[attr-defined]
+        model_builder = controller._Controller__model_builder
+        persist = controller._Controller__persist
+        model = controller._Controller__model
         if not isinstance(getattr(persist, "move_failure_counts", None), dict):
             persist.move_failure_counts = {}
         if not isinstance(getattr(persist, "final_move_succeeded_file_names", None), set):
@@ -177,17 +281,17 @@ class ModelUpdater:
             controller._Controller__move_attempt_lock = Lock()
 
         # Grab the latest scan results.
-        latest_remote_scan = controller._Controller__remote_scan_process.pop_latest_result()  # type: ignore[attr-defined]
-        latest_local_scan = controller._Controller__local_scan_process.pop_latest_result()  # type: ignore[attr-defined]
-        latest_active_scan = controller._Controller__active_scan_process.pop_latest_result()  # type: ignore[attr-defined]
+        latest_remote_scan = controller._Controller__remote_scan_process.pop_latest_result()
+        latest_local_scan = controller._Controller__local_scan_process.pop_latest_result()
+        latest_active_scan = controller._Controller__active_scan_process.pop_latest_result()
 
         # Grab the Lftp status.
-        lftp_statuses = []
+        lftp_statuses: Optional[list[LftpJobStatus]] = []
         lftp_status_poll_healthy = True
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
         now = datetime.now()
-        current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)  # type: ignore[attr-defined]
+        current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
         lftp_status_poll_due = (
             controller._Controller__next_lftp_status_poll_at is None
             or now >= controller._Controller__next_lftp_status_poll_at
@@ -207,8 +311,8 @@ class ModelUpdater:
                 lftp_status_source = "retry_empty"
         else:
             try:
-                lftp_statuses = controller._Controller__lftp.status()  # type: ignore[attr-defined]
-                lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)  # type: ignore[attr-defined]
+                lftp_statuses = controller._Controller__lftp.status()
+                lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
                 poll_finished_at = datetime.now()
                 if lftp_status_poll_healthy:
                     controller._Controller__lftp_status_poll_retry_active = False
@@ -253,12 +357,12 @@ class ModelUpdater:
                     lftp_status_source = "error_empty"
 
         # Grab the latest extract results.
-        latest_extract_statuses = controller._Controller__extract_process.pop_latest_statuses()  # type: ignore[attr-defined]
-        latest_validation_statuses = controller._Controller__validate_process.pop_latest_statuses()  # type: ignore[attr-defined]
+        latest_extract_statuses = controller._Controller__extract_process.pop_latest_statuses()
+        latest_validation_statuses = controller._Controller__validate_process.pop_latest_statuses()
 
         # Grab the latest extracted file names.
-        latest_extracted_results = controller._Controller__extract_process.pop_completed()  # type: ignore[attr-defined]
-        latest_failed_results = controller._Controller__extract_process.pop_failed()  # type: ignore[attr-defined]
+        latest_extracted_results = controller._Controller__extract_process.pop_completed()
+        latest_failed_results = controller._Controller__extract_process.pop_failed()
         previous_malformed_status_only_file_ids = set(controller._Controller__malformed_status_only_file_ids)
         if latest_active_scan is not None:
             controller._Controller__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
@@ -293,10 +397,10 @@ class ModelUpdater:
             controller._Controller__next_lftp_status_poll_at = None
         if latest_extract_statuses is not None:
             controller._Controller__active_extracting_file_names = [
-                controller._Controller__active_extracting_file_tuple(s)  # type: ignore[attr-defined]
+                controller._Controller__active_extracting_file_tuple(s)
                 for s in latest_extract_statuses.statuses
                 if s.state == ExtractStatus.State.EXTRACTING
-                and not controller._Controller__extract_status_matches_failed_result(s, latest_failed_results)  # type: ignore[attr-defined]
+                and not controller._Controller__extract_status_matches_failed_result(s, latest_failed_results)
             ]
         controller._Controller__temp_diag(
             "update_model",
@@ -316,13 +420,14 @@ class ModelUpdater:
         )
 
         # Update the active scanner's state.
-        controller._Controller__set_active_scanner_files(  # type: ignore[attr-defined]
+        controller._Controller__set_active_scanner_files(
             controller._Controller__active_downloading_file_names
             + controller._Controller__active_extracting_file_names
             + list(controller._Controller__pending_completion_file_names)
         )
 
         # Update model builder state.
+        remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             remote_files = filter_excluded_files(
                 latest_remote_scan.files,
@@ -338,24 +443,28 @@ class ModelUpdater:
                     "error_message": latest_remote_scan.error_message,
                 },
                 event_type="failure" if latest_remote_scan.failed else "state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),  # type: ignore[attr-defined]
+                corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
             )
         if latest_local_scan is not None:
             model_builder.set_local_files(latest_local_scan.files)
-            recovered_extracted_file_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
-            if isinstance(recovered_extracted_file_ids, (list, tuple, set)):
-                persist.extracted_file_names.update(recovered_extracted_file_ids)
+            raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
+            if isinstance(raw_recovered_ids, (list, tuple, set)):
+                recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
+                recovered_extracted_file_ids = [
+                    file_id for file_id in recovered_items if isinstance(file_id, str)
+                ]
+            else:
+                recovered_extracted_file_ids = []
+            persist.extracted_file_names.update(recovered_extracted_file_ids)
             controller._Controller__record_breadcrumb(
                 stage="scan",
                 message="local_scan_result",
                 details={
                     "file_count": len(latest_local_scan.files),
-                    "managed_extract_file_count": len(recovered_extracted_file_ids)
-                    if isinstance(recovered_extracted_file_ids, (list, tuple, set))
-                    else None,
+                    "managed_extract_file_count": len(recovered_extracted_file_ids),
                 },
                 event_type="state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),  # type: ignore[attr-defined]
+                corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
             )
         if latest_active_scan is not None:
             model_builder.set_active_files(latest_active_scan.files)
@@ -367,7 +476,7 @@ class ModelUpdater:
                     "malformed_status_only_file_count": len(latest_active_scan.malformed_status_only_file_ids),
                 },
                 event_type="state_transition",
-                corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),  # type: ignore[attr-defined]
+                corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
             )
         if lftp_statuses is not None:
             model_builder.set_lftp_statuses(lftp_statuses)
@@ -390,22 +499,24 @@ class ModelUpdater:
                 corr_id="extract:aggregate",
                 trace_scope="aggregate",
             )
-            if controller._Controller__is_target_archive_trace_enabled():  # type: ignore[attr-defined]
+            if controller._Controller__is_target_archive_trace_enabled():
                 for status in latest_extract_statuses.statuses:
-                    trace_target_file = controller._Controller__find_target_archive_model_file(status.name)  # type: ignore[attr-defined]
+                    trace_target_file = controller._Controller__find_target_archive_model_file(status.name)
                     if trace_target_file is not None:
-                        controller._Controller__trace_target_archive_event("extract_status", {  # type: ignore[attr-defined]
-                            "file": controller._Controller__summarize_target_archive_file(trace_target_file),  # type: ignore[attr-defined]
+                        controller._Controller__trace_target_archive_event("extract_status", {
+                            "file": controller._Controller__summarize_target_archive_file(trace_target_file),
                             "is_dir": status.is_dir,
                             "state": getattr(status.state, "name", status.state),
                         })
         if latest_validation_statuses is not None:
             model_builder.set_validation_statuses(latest_validation_statuses.statuses)
-        def _is_known_extract_result_pair(result, result_kind: str) -> bool:
+        def _is_known_extract_result_pair(
+            result: ExtractCompletedResult | ExtractFailedResult, result_kind: str
+        ) -> bool:
             path_pair_id = getattr(result, "path_pair_id", None)
             if path_pair_id is None:
                 return True
-            if controller._Controller__get_path_pair(path_pair_id) is not None:  # type: ignore[attr-defined]
+            if controller._Controller__get_path_pair(path_pair_id) is not None:
                 return True
             controller.logger.warning(
                 "Ignoring extract %s for '%s': pair '%s' no longer exists",
@@ -416,8 +527,8 @@ class ModelUpdater:
             return False
 
         if latest_extracted_results:
-            known_extracted_results = []
-            extracted_result_summaries = []
+            known_extracted_results: list[ExtractCompletedResult] = []
+            extracted_result_summaries: list[dict[str, object]] = []
             for result in latest_extracted_results:
                 if not _is_known_extract_result_pair(result, "completion"):
                     continue
@@ -432,10 +543,10 @@ class ModelUpdater:
                     "is_dir": result.is_dir,
                     "path_pair_id": result.path_pair_id,
                 })
-                trace_target_file = controller._Controller__find_target_archive_model_file(result.name, result.file_id)  # type: ignore[attr-defined]
+                trace_target_file = controller._Controller__find_target_archive_model_file(result.name, result.file_id)
                 if trace_target_file is not None:
-                    controller._Controller__trace_target_archive_event("extracted_marker_added", {  # type: ignore[attr-defined]
-                        "file": controller._Controller__summarize_target_archive_file(trace_target_file),  # type: ignore[attr-defined]
+                    controller._Controller__trace_target_archive_event("extracted_marker_added", {
+                        "file": controller._Controller__summarize_target_archive_file(trace_target_file),
                         "is_dir": result.is_dir,
                     })
             model_builder.set_extracted_files(persist.extracted_file_names)
@@ -448,11 +559,11 @@ class ModelUpdater:
                         "results": extracted_result_summaries,
                     },
                     event_type="state_transition",
-                    corr_id=controller._Controller__trace_corr_id_from_files(known_extracted_results, "extract"),  # type: ignore[attr-defined]
+                    corr_id=controller._Controller__trace_corr_id_from_files(known_extracted_results, "extract"),
                 )
         if latest_failed_results:
-            known_failed_results = []
-            failed_result_summaries = []
+            known_failed_results: list[ExtractFailedResult] = []
+            failed_result_summaries: list[dict[str, object]] = []
             for result in latest_failed_results:
                 if not _is_known_extract_result_pair(result, "failure"):
                     continue
@@ -472,7 +583,7 @@ class ModelUpdater:
                         "results": failed_result_summaries,
                     },
                     event_type="failure",
-                    corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),  # type: ignore[attr-defined]
+                    corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),
                 )
         model_builder.set_stopped_files(persist.stopped_file_names)
 
@@ -488,7 +599,7 @@ class ModelUpdater:
             model_builder.request_rebuild()
 
         # Build the new model, if needed.
-        auto_purge_candidate_ids = set()
+        auto_purge_candidate_ids: set[str] = set()
         remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
         if remote_reconciliation_established:
             remote_scan = latest_remote_scan
@@ -520,7 +631,10 @@ class ModelUpdater:
             if callable(snapshot_delete_ids):
                 delete_ids = snapshot_delete_ids()
                 if isinstance(delete_ids, set):
-                    protected_file_ids.update(delete_ids)
+                    delete_items = cast(set[object], delete_ids)
+                    protected_file_ids.update(
+                        file_id for file_id in delete_items if isinstance(file_id, str)
+                    )
             prune_lifecycles = getattr(controller, "_prune_download_start_lifecycles", None)
             if callable(prune_lifecycles):
                 prune_lifecycles(
@@ -532,7 +646,7 @@ class ModelUpdater:
         if model_builder.has_changes():
             new_model = model_builder.build_model()
 
-            with controller._Controller__model_lock:  # type: ignore[attr-defined]
+            with controller._Controller__model_lock:
                 def pending_completion_file_ids():
                     return {
                         ModelFile.build_file_id(file_name, path_pair_id)
@@ -544,7 +658,7 @@ class ModelUpdater:
                     model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
                     path_pair_name = file.path_pair_name
                     if path_pair_name is None:
-                        path_pair = controller._Controller__get_path_pair(file.path_pair_id)  # type: ignore[attr-defined]
+                        path_pair = controller._Controller__get_path_pair(file.path_pair_id)
                         path_pair_name = getattr(path_pair, "name", None)
                     controller._Controller__pending_completion_file_names.add((
                         file.name,
@@ -574,9 +688,9 @@ class ModelUpdater:
                         file.file_id,
                     )
                     if file.path_pair_id is None:
-                        controller._Controller__local_scan_process.force_scan()  # type: ignore[attr-defined]
+                        controller._Controller__local_scan_process.force_scan()
                     else:
-                        controller._Controller__local_scan_process.force_scan(file.path_pair_id)  # type: ignore[attr-defined]
+                        controller._Controller__local_scan_process.force_scan(file.path_pair_id)
 
                 def publish_completed_download(file: ModelFile, final_move_succeeded: bool):
                     persist.move_failure_counts.pop(file.file_id, None)
@@ -596,12 +710,12 @@ class ModelUpdater:
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
                     controller._complete_download_start_lifecycle(file.file_id)
                     controller.clear_extracted_marker(file)
-                    if controller._Controller__target_archive_trace_selector_matches_file(  # type: ignore[attr-defined]
+                    if controller._Controller__target_archive_trace_selector_matches_file(
                         file.file_id,
                         file.name,
                     ):
-                        controller._Controller__trace_target_archive_event("downloaded_marker_added", {  # type: ignore[attr-defined]
-                            "file": controller._Controller__summarize_target_archive_file(file),  # type: ignore[attr-defined]
+                        controller._Controller__trace_target_archive_event("downloaded_marker_added", {
+                            "file": controller._Controller__summarize_target_archive_file(file),
                         })
                     controller._Controller__pending_completion_file_names = {
                         file_name
@@ -613,7 +727,7 @@ class ModelUpdater:
                     if not controller._reserve_move_attempt(file.file_id):
                         return None
                     try:
-                        return controller._Controller__move_from_staging(  # type: ignore[attr-defined]
+                        return controller._Controller__move_from_staging(
                             file.name,
                             file.path_pair_id,
                         )
@@ -622,7 +736,7 @@ class ModelUpdater:
 
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
-                attempted_move_file_ids = set()
+                attempted_move_file_ids: set[str] = set()
 
                 for file_id, count in persist.move_failure_counts.items():
                     if count <= 0 or count >= controller._Controller__MAX_MOVE_FAILURES:
@@ -669,7 +783,7 @@ class ModelUpdater:
                         new_file is not None
                         and old_file is not None
                         and new_file.file_id in pending_completion_file_ids()
-                        and not controller._Controller__is_explicitly_stopped(  # type: ignore[attr-defined]
+                        and not controller._Controller__is_explicitly_stopped(
                             new_file.name,
                             new_file.path_pair_id,
                         )
@@ -797,13 +911,13 @@ class ModelUpdater:
                     else:
                         keep_completion_pending_after_failed_staging_move(pending_file, False)
 
-                current_auto_purge_candidate_ids = set()
+                current_auto_purge_candidate_ids: set[str] = set()
                 for diff in model_diff:
                     new_file = getattr(diff, "new_file", None)
                     if (
                         diff.change in (ModelDiff.Change.ADDED, ModelDiff.Change.UPDATED)
                         and new_file is not None
-                        and controller._Controller__should_auto_purge_local_file(new_file)  # type: ignore[attr-defined]
+                        and controller._Controller__should_auto_purge_local_file(new_file)
                     ):
                         current_auto_purge_candidate_ids.add(new_file.file_id)
                 if remote_reconciliation_established:
@@ -813,7 +927,7 @@ class ModelUpdater:
 
                 # Prune the extracted files list of any files that were deleted locally.
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded.
-                remove_extracted_file_names = set()
+                remove_extracted_file_names: set[str] = set()
                 existing_file_ids = model.get_file_ids()
                 for extracted_file_name in persist.extracted_file_names:
                     if extracted_file_name in existing_file_ids:
@@ -833,13 +947,13 @@ class ModelUpdater:
                 if remove_extracted_file_names:
                     controller.logger.info("Removing from extracted list: {}".format(remove_extracted_file_names))
                     persist.extracted_file_names.difference_update(remove_extracted_file_names)
-                    if controller._Controller__is_target_archive_trace_enabled():  # type: ignore[attr-defined]
+                    if controller._Controller__is_target_archive_trace_enabled():
                         for extracted_file_name in remove_extracted_file_names:
-                            if controller._Controller__target_archive_trace_selector_matches_file(  # type: ignore[attr-defined]
+                            if controller._Controller__target_archive_trace_selector_matches_file(
                                 extracted_file_name,
                                 extracted_file_name,
                             ):
-                                controller._Controller__trace_target_archive_event("extracted_marker_removed", {  # type: ignore[attr-defined]
+                                controller._Controller__trace_target_archive_event("extracted_marker_removed", {
                                     "file_name": extracted_file_name,
                                     "file_id": ModelFile.build_file_id(extracted_file_name, None),
                                 })
@@ -880,27 +994,27 @@ class ModelUpdater:
                         model_builder.set_final_move_succeeded_files(
                             persist.final_move_succeeded_file_names
                         )
-                        if controller._Controller__is_target_archive_trace_enabled():  # type: ignore[attr-defined]
+                        if controller._Controller__is_target_archive_trace_enabled():
                             for downloaded_file_name in remove_downloaded_file_names:
-                                if controller._Controller__target_archive_trace_selector_matches_file(  # type: ignore[attr-defined]
+                                if controller._Controller__target_archive_trace_selector_matches_file(
                                     downloaded_file_name,
                                     downloaded_file_name,
                                 ):
-                                    controller._Controller__trace_target_archive_event("downloaded_marker_removed", {  # type: ignore[attr-defined]
+                                    controller._Controller__trace_target_archive_event("downloaded_marker_removed", {
                                         "file_name": downloaded_file_name,
                                         "file_id": ModelFile.build_file_id(downloaded_file_name, None),
                                     })
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
 
-        if remote_reconciliation_established and controller._Controller__pending_auto_purge_file_ids:  # type: ignore[attr-defined]
-            pending_auto_purge_candidates = set()
+        if remote_reconciliation_established and controller._Controller__pending_auto_purge_file_ids:
+            pending_auto_purge_candidates: set[str] = set()
             for file_id in list(controller._Controller__pending_auto_purge_file_ids):
                 try:
                     file = model.get_file(file_id)
                 except ModelError:
                     controller._Controller__pending_auto_purge_file_ids.discard(file_id)
                     continue
-                if controller._Controller__should_auto_purge_local_file(file):  # type: ignore[attr-defined]
+                if controller._Controller__should_auto_purge_local_file(file):
                     pending_auto_purge_candidates.add(file_id)
                 else:
                     controller._Controller__pending_auto_purge_file_ids.discard(file_id)
@@ -909,14 +1023,14 @@ class ModelUpdater:
 
         for file_id in auto_purge_candidate_ids:
             file = model.get_file(file_id)
-            controller._Controller__queue_delete_local_process(file, controller._Controller__local_scan_process.force_scan)  # type: ignore[attr-defined]
+            controller._Controller__queue_delete_local_process(file, controller._Controller__local_scan_process.force_scan)
 
         # Update the controller status.
         if latest_remote_scan is not None:
-            controller._Controller__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp  # type: ignore[attr-defined]
-            controller._Controller__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed  # type: ignore[attr-defined]
-            controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message  # type: ignore[attr-defined]
-            if not latest_remote_scan.failed and not controller._Controller__startup_recovery_done:  # type: ignore[attr-defined]
-                controller._Controller__recover_interrupted_downloads(remote_files)  # type: ignore[attr-defined]
+            controller._Controller__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
+            controller._Controller__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed
+            controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
+            if not latest_remote_scan.failed and not controller._Controller__startup_recovery_done:
+                controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
-            controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp  # type: ignore[attr-defined]
+            controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp

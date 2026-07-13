@@ -1,0 +1,20 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "controller/controller.py",
+    "controller/model_updater.py",
+    "controller/controller_persist.py",
+    "controller/memory_monitor.py",
+    "controller/controller_job.py",
+    "controller/persist_keys.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}

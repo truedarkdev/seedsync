@@ -2,6 +2,7 @@
 
 import json
 import re
+from typing import cast
 
 from common import overrides, Constants, Persist, PersistError
 
@@ -29,11 +30,20 @@ class ControllerPersist(Persist):
     __KEY_FINAL_MOVE_SUCCEEDED = "final_move_succeeded"
 
     def __init__(self):
-        self.downloaded_file_names = set()
-        self.extracted_file_names = set()
+        self.downloaded_file_names: set[str] = set()
+        self.extracted_file_names: set[str] = set()
         self.stopped_file_names: set[str] = set()
-        self.move_failure_counts = {}
-        self.final_move_succeeded_file_names = set()
+        self.move_failure_counts: dict[str, int] = {}
+        self.final_move_succeeded_file_names: set[str] = set()
+
+    @staticmethod
+    def _read_string_set(value: object, field_name: str) -> set[str]:
+        if not isinstance(value, list):
+            raise TypeError("{} must be an array of strings".format(field_name))
+        items = cast(list[object], value)
+        if not all(isinstance(item, str) for item in items):
+            raise TypeError("{} must be an array of strings".format(field_name))
+        return set(cast(list[str], items))
 
     @staticmethod
     def _migrate_legacy_keys(keys: set[str]) -> set[str]:
@@ -56,16 +66,26 @@ class ControllerPersist(Persist):
     def from_str(cls: type["ControllerPersist"], content: str) -> "ControllerPersist":
         persist = cls()
         try:
-            dct = json.loads(content)
-            persist.downloaded_file_names = set(dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES])
-            persist.extracted_file_names = set(dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES])
-            persist.stopped_file_names = set(dct.get(ControllerPersist.__KEY_STOPPED_FILE_NAMES, []))
+            raw_persist = json.loads(content)
+            if not isinstance(raw_persist, dict):
+                raise TypeError("controller persist must be an object")
+            dct = cast(dict[str, object], raw_persist)
+            persist.downloaded_file_names = cls._read_string_set(
+                dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES], "downloaded"
+            )
+            persist.extracted_file_names = cls._read_string_set(
+                dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES], "extracted"
+            )
+            persist.stopped_file_names = cls._read_string_set(
+                dct.get(ControllerPersist.__KEY_STOPPED_FILE_NAMES, []), "stopped"
+            )
             raw_move_failure_counts = dct.get(ControllerPersist.__KEY_MOVE_FAILURE_COUNTS, {})
             if not isinstance(raw_move_failure_counts, dict):
                 raise TypeError("move_failure_counts must be an object")
+            move_failure_items = cast(dict[object, object], raw_move_failure_counts)
             persist.move_failure_counts = {
                 file_id: count
-                for file_id, count in raw_move_failure_counts.items()
+                for file_id, count in move_failure_items.items()
                 if isinstance(file_id, str)
                 and file_id != ""
                 and type(count) is int
@@ -74,8 +94,9 @@ class ControllerPersist(Persist):
             raw_final_move_succeeded = dct.get(ControllerPersist.__KEY_FINAL_MOVE_SUCCEEDED, [])
             if not isinstance(raw_final_move_succeeded, list):
                 raise TypeError("final_move_succeeded must be an array")
+            final_move_items = cast(list[object], raw_final_move_succeeded)
             persist.final_move_succeeded_file_names = {
-                file_id for file_id in raw_final_move_succeeded
+                file_id for file_id in final_move_items
                 if isinstance(file_id, str) and file_id != ""
             }
             persist.downloaded_file_names = ControllerPersist._migrate_legacy_keys(persist.downloaded_file_names)
@@ -92,7 +113,7 @@ class ControllerPersist(Persist):
 
     @overrides(Persist)
     def to_str(self) -> str:
-        dct = dict()
+        dct: dict[str, object] = {}
         dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES] = list(self.downloaded_file_names)
         dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES] = list(self.extracted_file_names)
         dct[ControllerPersist.__KEY_STOPPED_FILE_NAMES] = list(self.stopped_file_names)
