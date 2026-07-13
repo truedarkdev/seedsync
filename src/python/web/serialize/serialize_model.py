@@ -20,7 +20,7 @@ class SerializeModel(Serialize):
             REMOVED = 1
             UPDATED = 2
 
-        def __init__(self, change: Change, old_file: Optional[ModelFile], new_file: Optional[ModelFile]):
+        def __init__(self, change: Change, old_file: Optional[ModelFile], new_file: Optional[ModelFile]) -> None:
             self.change = change
             self.old_file = old_file
             self.new_file = new_file
@@ -75,8 +75,8 @@ class SerializeModel(Serialize):
     __KEY_FILE_CHILDREN = "children"
 
     @staticmethod
-    def __model_file_to_json_dict(model_file: ModelFile) -> dict:
-        json_dict = dict()
+    def __model_file_to_json_dict(model_file: ModelFile) -> dict[str, object]:
+        json_dict: dict[str, object] = {}
         json_dict[SerializeModel.__KEY_FILE_NAME] = model_file.name
         json_dict[SerializeModel.__KEY_FILE_IS_DIR] = model_file.is_dir
         json_dict[SerializeModel.__KEY_FILE_STATE] = SerializeModel.__VALUES_FILE_STATE[model_file.state]
@@ -104,9 +104,10 @@ class SerializeModel(Serialize):
         json_dict[SerializeModel.__KEY_FILE_VALIDATION_ERROR] = model_file.validation_error
         json_dict[SerializeModel.__KEY_FILE_CORRUPT_CHUNKS] = model_file.corrupt_chunks
         json_dict[SerializeModel.__KEY_FILE_FINAL_MOVE_SUCCEEDED] = model_file.final_move_succeeded
-        json_dict[SerializeModel.__KEY_FILE_CHILDREN] = list()
-        for child in model_file.get_children():
-            json_dict[SerializeModel.__KEY_FILE_CHILDREN].append(SerializeModel.__model_file_to_json_dict(child))
+        json_dict[SerializeModel.__KEY_FILE_CHILDREN] = [
+            SerializeModel.__model_file_to_json_dict(child)
+            for child in model_file.get_children()
+        ]
         return json_dict
 
     def model(self, model_files: List[ModelFile]) -> str:
@@ -119,7 +120,7 @@ class SerializeModel(Serialize):
         return self._sse_pack(event=SerializeModel.__EVENT_INIT,
                               data=model_json)
 
-    def update_event(self, event: UpdateEvent):
+    def update_event(self, event: UpdateEvent) -> str:
         model_file_json_dict = {
             SerializeModel.__KEY_UPDATE_OLD_FILE:
                 SerializeModel.__model_file_to_json_dict(event.old_file) if event.old_file else None,

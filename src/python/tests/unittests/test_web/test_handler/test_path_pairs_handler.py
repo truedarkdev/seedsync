@@ -287,6 +287,13 @@ class TestPathPairsHandlerCreateUpdate(unittest.TestCase):
         self.manager.update_pair.assert_not_called()
         self.controller.refresh_path_pairs.assert_not_called()
 
+    def test_reorder_rejects_non_string_id_without_mutating_order(self):
+        with self.__mock_request({"order": ["movies", 7]}):
+            response = self.handler._PathPairsHandler__handle_reorder()
+
+        self.__assert_bad_request(response, "order field must be a list of path pair IDs")
+        self.manager.reorder_pairs.assert_not_called()
+
     def test_delete_refresh_failure_returns_generic_message(self):
         existing = PathPair(
             id="movies",

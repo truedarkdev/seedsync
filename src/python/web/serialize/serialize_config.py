@@ -2,6 +2,7 @@
 
 import json
 import collections
+from typing import TypeGuard
 
 from common import Config
 from ..config_restart import requires_restart
@@ -14,15 +15,22 @@ _REMOTE_DETAIL_FIELDS = ("remote_address", "remote_username", "remote_path", "re
 _REDACTED = Config.REDACTED_SENTINEL
 
 
+def _is_config_dict(value: object) -> TypeGuard[dict[str, dict[str, object]]]:
+    return isinstance(value, dict)
+
+
 class SerializeConfig:
     @staticmethod
     def config(config: Config) -> str:
-        config_dict = config.as_dict()
+        config_value: object = config.as_dict()
+        if not _is_config_dict(config_value):
+            raise TypeError("Config serialization requires a section mapping")
+        config_dict = config_value
         redact_remote_details = getattr(config.general, "config_api_redact_remote_details", True)
 
         # Make the section names lower case
         keys = list(config_dict.keys())
-        config_dict_lowercase = collections.OrderedDict()
+        config_dict_lowercase: collections.OrderedDict[str, dict[str, object]] = collections.OrderedDict()
         for key in keys:
             config_dict_lowercase[key.lower()] = config_dict[key]
 
@@ -45,13 +53,13 @@ class SerializeConfig:
                 if field in section_dict:
                     section_dict[field] = _REDACTED
 
-        restart_required = collections.OrderedDict()
+        restart_required: collections.OrderedDict[str, collections.OrderedDict[str, bool]] = collections.OrderedDict()
         for section, section_dict in config_dict_lowercase.items():
             restart_required[section] = collections.OrderedDict(
                 (field, requires_restart(section, field))
                 for field in section_dict.keys()
             )
 
-        out_dict = collections.OrderedDict(config_dict_lowercase)
+        out_dict: collections.OrderedDict[str, object] = collections.OrderedDict(config_dict_lowercase)
         out_dict["restart_required"] = restart_required
         return json.dumps(out_dict)
