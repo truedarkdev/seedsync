@@ -150,7 +150,7 @@ class TestWebApp(BaseTestWebApp):
         self.assertIn("Save this browser for next time", response.text)
         self.assertEqual({}, browser_app.cookies)
 
-    def test_trusted_docker_gateway_requires_bootstrap_limited_session_before_first_admin_exists(self):
+    def test_trusted_docker_gateway_redirects_to_open_first_run_handover_without_granting_session(self):
         self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         self.auth_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "empty-api-keys.json"))
         self.web_app = WebAppBuilder(
@@ -167,13 +167,19 @@ class TestWebApp(BaseTestWebApp):
             }
         )
 
-        response = browser_app.get("/", expect_errors=True)
+        response = browser_app.get("/")
 
-        self.assertEqual(403, response.status_int)
-        self.assertIn(
-            "First-admin browser bootstrap requires direct loopback access or an approved local browser request.",
-            response.text
-        )
+        self.assertEqual(302, response.status_int)
+        self.assertEqual("http://seedsync.local:8800/bootstrap", response.headers["Location"])
+        self.assertEqual("", response.headers.get("Set-Cookie", ""))
+
+        bootstrap_response = response.follow()
+
+        self.assertEqual(200, bootstrap_response.status_int)
+        self.assertIn("First-run browser access", bootstrap_response.text)
+        self.assertIn("Claim the first local session", bootstrap_response.text)
+        self.assertIn("Claim session", bootstrap_response.text)
+        self.assertEqual({}, browser_app.cookies)
 
     def test_stream_interleaves_one_event_per_handler(self):
         class SequenceHandler(IStreamHandler):

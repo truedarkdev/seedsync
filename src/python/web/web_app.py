@@ -1,7 +1,9 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import ipaddress
-from typing import Any, Type, Callable, Optional, Tuple
+import logging
+from collections.abc import Callable, Iterator, Sequence
+from typing import Type, Optional, Tuple, overload
 from abc import ABC, abstractmethod
 from functools import wraps
 import time
@@ -10,8 +12,9 @@ from urllib.parse import urlparse
 import bottle
 from bottle import static_file
 
-from common import Context
+from common import Context, Status
 from controller import Controller
+from web.auth_store import ApiKeyRecord, ApiKeyStore, UiSessionRecord
 
 
 class IHandler(ABC):
@@ -19,7 +22,7 @@ class IHandler(ABC):
     Abstract class that defines a web handler
     """
     @abstractmethod
-    def add_routes(self, web_app: "WebApp"):
+    def add_routes(self, web_app: "WebApp") -> None:
         """
         Add all the handled routes to the given web app
         :param web_app:
@@ -32,8 +35,11 @@ class IStreamHandler(ABC):
     """
     Abstract class that defines a streaming data provider
     """
+    def __init__(self, **kwargs: object) -> None:
+        del kwargs
+
     @abstractmethod
-    def setup(self):
+    def setup(self) -> None:
         pass
 
     @abstractmethod
@@ -41,11 +47,27 @@ class IStreamHandler(ABC):
         pass
 
     @abstractmethod
-    def cleanup(self):
+    def cleanup(self) -> None:
         pass
 
     @classmethod
-    def register(cls, web_app: "WebApp", **kwargs):
+    @overload
+    def register(cls, web_app: "WebApp", *, logger: logging.Logger) -> None: ...
+
+    @classmethod
+    @overload
+    def register(cls, web_app: "WebApp", *, status: Status) -> None: ...
+
+    @classmethod
+    @overload
+    def register(cls, web_app: "WebApp", *, controller: Controller) -> None: ...
+
+    @classmethod
+    @overload
+    def register(cls, web_app: "WebApp") -> None: ...
+
+    @classmethod
+    def register(cls, web_app: "WebApp", **kwargs: object) -> None:
         """
         Register this streaming handler with the web app
         :param web_app: web_app instance
@@ -73,7 +95,12 @@ class WebApp(bottle.Bottle):
         "/assets/logo.png",
     }
 
-    def __init__(self, context: Context, controller: Controller, auth_store: Optional[object] = None):
+    def __init__(
+        self,
+        context: Context,
+        controller: Controller,
+        auth_store: Optional[ApiKeyStore] = None,
+    ) -> None:
         super().__init__()
         self.logger = context.logger.getChild("WebApp")
         self.__controller = controller
@@ -84,23 +111,23 @@ class WebApp(bottle.Bottle):
         self.__trusted_browser_bootstrap_networks = self.__load_trusted_browser_bootstrap_networks()
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
-        self.__streaming_handlers = []  # list of (handler, kwargs) pairs
+        self.__streaming_handlers: list[tuple[Type[IStreamHandler], dict[str, object]]] = []
 
-        @self.hook("before_request")
-        def __gate_server_request():
+        def gate_server_request_hook() -> None:
             try:
                 return self.__gate_server_request()
             except bottle.HTTPResponse as response:
                 WebApp.__apply_security_headers(response)
                 raise
+        self.hook("before_request")(gate_server_request_hook)
 
-        @self.hook("after_request")
-        def __apply_security_headers():
+        def apply_security_headers_hook() -> None:
             # Keep the browser-facing security headers attached to HTML, JSON,
             # redirect, and error responses without spreading policy across handlers.
             self.__apply_security_headers(bottle.response)
+        self.hook("after_request")(apply_security_headers_hook)
 
-    def add_default_routes(self):
+    def add_default_routes(self) -> None:
         """
         Add the default routes. This must be called after all the handlers have
         been added.
@@ -109,42 +136,42 @@ class WebApp(bottle.Bottle):
         # Bootstrap landing page. It is intentionally tiny and same-origin so the
         # browser can claim first-run admin access or remember an API key without
         # exposing credentials to the helper process.
-        self.route("/bootstrap")(self.__bootstrap)  # type: ignore[operator]
+        self.route("/bootstrap")(self.__bootstrap)
 
         # Streaming route
         self.get(
             "/server/stream",
             required_scope="stream",
             allow_sessionless_ui=True,
-        )(self.__web_stream)  # type: ignore[operator]
+        )(self.__web_stream)
 
         # Front-end routes
-        self.route("/")(self.__index)  # type: ignore[operator]
-        self.route("/dashboard")(self.__index)  # type: ignore[operator]
-        self.route("/dashboard/<pathPairId>")(self.__dashboard_index)  # type: ignore[operator]
-        self.route("/settings")(self.__index)  # type: ignore[operator]
-        self.route("/autoqueue")(self.__index)  # type: ignore[operator]
-        self.route("/logs")(self.__index)  # type: ignore[operator]
-        self.route("/about")(self.__index)  # type: ignore[operator]
+        self.route("/")(self.__index)
+        self.route("/dashboard")(self.__index)
+        self.route("/dashboard/<pathPairId>")(self.__dashboard_index)
+        self.route("/settings")(self.__index)
+        self.route("/autoqueue")(self.__index)
+        self.route("/logs")(self.__index)
+        self.route("/about")(self.__index)
         # For static files
-        self.route("/<file_path:path>")(self.__static)  # type: ignore[operator]
+        self.route("/<file_path:path>")(self.__static)
 
-    def add_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.get(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
+    def add_handler(self, path: str, handler: Callable[..., object], required_scope: Optional[str] = None, **config: object) -> None:
+        self.get(path, required_scope=required_scope, **config)(handler)
 
-    def add_post_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.post(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
+    def add_post_handler(self, path: str, handler: Callable[..., object], required_scope: Optional[str] = None, **config: object) -> None:
+        self.post(path, required_scope=required_scope, **config)(handler)
 
-    def add_put_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.put(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
+    def add_put_handler(self, path: str, handler: Callable[..., object], required_scope: Optional[str] = None, **config: object) -> None:
+        self.put(path, required_scope=required_scope, **config)(handler)
 
-    def add_delete_handler(self, path: str, handler: Callable, required_scope: Optional[str] = None, **config):
-        self.delete(path, required_scope=required_scope, **config)(handler)  # type: ignore[operator]
+    def add_delete_handler(self, path: str, handler: Callable[..., object], required_scope: Optional[str] = None, **config: object) -> None:
+        self.delete(path, required_scope=required_scope, **config)(handler)
 
-    def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs):
+    def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs: object) -> None:
         self.__streaming_handlers.append((handler, kwargs))
 
-    def __gate_server_request(self):
+    def __gate_server_request(self) -> None:
         if not WebApp.__is_server_path(bottle.request.path):
             return
 
@@ -161,13 +188,11 @@ class WebApp(bottle.Bottle):
             if host not in {"localhost", "127.0.0.1", "[::1]", allowed_hostname}:
                 bottle.abort(400)
 
-        route: Any = None
         try:
             route, _ = self.match(bottle.request.environ)
         except bottle.HTTPError:
             bottle.abort(404)
 
-        assert route is not None
         if not WebApp.__is_server_path(route.rule):
             bottle.abort(404)
 
@@ -187,27 +212,29 @@ class WebApp(bottle.Bottle):
             bool(route.config.get("allow_browser_api_key_entry", False)),
         )
 
-    def process(self):
+    def process(self) -> None:
         """
         Advance the web app state
         :return:
         """
         pass
 
-    def stop(self):
+    def stop(self) -> None:
         """
         Exit gracefully, kill any connections and clean up any state
         :return:
         """
         object.__setattr__(self, "_stop", True)
 
-    def route(self, path=None, method="GET", callback=None, name=None, apply=None, skip=None,
+    def route(self, path: Optional[str] = None, method: str = "GET",
+              callback: Optional[Callable[..., object]] = None,
+              name: Optional[str] = None, apply: object = None, skip: object = None,
               required_scope: Optional[str] = None,
               allow_sessionless_ui: bool = False,
               allow_first_admin_bootstrap: bool = False,
               allow_bootstrap_proof_exchange: bool = False,
               allow_browser_api_key_entry: bool = False,
-              **config):
+              **config: object) -> Callable[..., object]:
         if path is not None and WebApp.__is_server_path(path):
             if required_scope is None:
                 raise ValueError("required_scope is required for /server routes")
@@ -237,7 +264,7 @@ class WebApp(bottle.Bottle):
                 **config
             )
 
-        def _route_decorator(route_callback):
+        def _route_decorator(route_callback: Callable[..., object]) -> Callable[..., object]:
             return super(WebApp, self).route(
                 path=path,
                 method=method,
@@ -251,15 +278,17 @@ class WebApp(bottle.Bottle):
         return _route_decorator
 
     @staticmethod
-    def __apply_security_headers(response):
+    def __apply_security_headers(response: bottle.BaseResponse) -> None:
         response.set_header("Content-Security-Policy", WebApp._CONTENT_SECURITY_POLICY)
         response.set_header("X-Content-Type-Options", WebApp._X_CONTENT_TYPE_OPTIONS)
         response.set_header("X-Frame-Options", WebApp._X_FRAME_OPTIONS)
         response.set_header("Referrer-Policy", WebApp._REFERRER_POLICY)
 
-    def __with_security_headers(self, callback):
+    def __with_security_headers(
+        self, callback: Callable[..., object]
+    ) -> Callable[..., object]:
         @wraps(callback)
-        def _wrapped_callback(*args, **kwargs):
+        def _wrapped_callback(*args: object, **kwargs: object) -> object:
             try:
                 result = callback(*args, **kwargs)
             except bottle.HTTPResponse as response:
@@ -272,7 +301,7 @@ class WebApp(bottle.Bottle):
         return _wrapped_callback
 
     @staticmethod
-    def __get_allowed_hostname(config) -> str:
+    def __get_allowed_hostname(config: object) -> str:
         general_config = getattr(config, "general", None)
         if general_config is None:
             return ""
@@ -280,7 +309,7 @@ class WebApp(bottle.Bottle):
         return allowed_hostname if isinstance(allowed_hostname, str) else ""
 
     @staticmethod
-    def __get_trusted_browser_bootstrap_remote_addrs(config) -> str:
+    def __get_trusted_browser_bootstrap_remote_addrs(config: object) -> str:
         general_config = getattr(config, "general", None)
         if general_config is None:
             return ""
@@ -298,8 +327,7 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None:
             return False
 
-        auth_store: Any = self.__auth_store
-        browser_handover_state = auth_store.get_browser_handover_state(self.__config)
+        browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
         return bool(browser_handover_state.get("open", False))
 
     @staticmethod
@@ -326,14 +354,8 @@ class WebApp(bottle.Bottle):
         return normalized
 
     @staticmethod
-    def __is_blank_value(value) -> bool:
-        return not isinstance(value, str) or value.strip() == ""
-
-    @staticmethod
     def __extract_bearer_token() -> Optional[str]:
         auth_header = bottle.request.get_header("Authorization", "")
-        if not isinstance(auth_header, str):
-            return None
         auth_header = auth_header.strip()
         if not auth_header.startswith("Bearer "):
             return None
@@ -343,8 +365,6 @@ class WebApp(bottle.Bottle):
     @staticmethod
     def __has_bearer_authorization_header() -> bool:
         auth_header = bottle.request.get_header("Authorization", "")
-        if not isinstance(auth_header, str):
-            return False
         auth_header = auth_header.strip()
         return auth_header == "Bearer" or auth_header.startswith("Bearer ")
 
@@ -360,25 +380,8 @@ class WebApp(bottle.Bottle):
         return remote_addr.strip() if isinstance(remote_addr, str) else ""
 
     @staticmethod
-    def __request_header_hostname(header_name: str) -> Optional[str]:
-        raw_value = bottle.request.get_header(header_name, "")
-        if not isinstance(raw_value, str) or raw_value.strip() == "":
-            return None
-
-        parsed = urlparse(raw_value.strip())
-        if parsed.hostname:
-            return WebApp.__normalize_hostname(parsed.hostname)
-
-        return WebApp.__normalize_hostname(
-            WebApp.__strip_host_port(raw_value.strip())
-        )
-
-    @staticmethod
     def __request_forwarded_proto() -> Optional[str]:
         raw_value = bottle.request.get_header("X-Forwarded-Proto", "")
-        if not isinstance(raw_value, str):
-            return None
-
         raw_value = raw_value.strip().lower()
         if not raw_value or "," in raw_value:
             return None
@@ -391,9 +394,6 @@ class WebApp(bottle.Bottle):
     @staticmethod
     def __request_forwarded_host() -> Optional[str]:
         raw_value = bottle.request.get_header("X-Forwarded-Host", "")
-        if not isinstance(raw_value, str):
-            return None
-
         raw_value = raw_value.strip()
         if not raw_value or "," in raw_value or "://" in raw_value:
             return None
@@ -416,7 +416,7 @@ class WebApp(bottle.Bottle):
     def __has_proxy_forwarding_headers() -> bool:
         for header_name in ("Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto"):
             raw_value = bottle.request.get_header(header_name, "")
-            if isinstance(raw_value, str) and raw_value.strip():
+            if raw_value.strip():
                 return True
         return False
 
@@ -475,7 +475,7 @@ class WebApp(bottle.Bottle):
             return None
 
         host = bottle.request.get_header("Host", "")
-        if not isinstance(host, str) or host.strip() == "":
+        if host.strip() == "":
             return None
 
         return WebApp.__parse_origin("{}://{}".format(scheme, host.strip()))
@@ -508,7 +508,7 @@ class WebApp(bottle.Bottle):
             return False
 
         sec_fetch_site = bottle.request.get_header("Sec-Fetch-Site", "")
-        if isinstance(sec_fetch_site, str) and sec_fetch_site.strip():
+        if sec_fetch_site.strip():
             sec_fetch_site = sec_fetch_site.strip().lower()
             if sec_fetch_site not in {"same-origin", "none"}:
                 return False
@@ -526,12 +526,12 @@ class WebApp(bottle.Bottle):
     @staticmethod
     def __request_origin() -> Optional[Tuple[str, str, int]]:
         raw_url = bottle.request.url
-        if not isinstance(raw_url, str) or raw_url.strip() == "":
+        if raw_url.strip() == "":
             return None
         return WebApp.__parse_origin(raw_url)
 
     @staticmethod
-    def __parse_origin(raw_value: str) -> Optional[Tuple[str, str, int]]:
+    def __parse_origin(raw_value: object) -> Optional[Tuple[str, str, int]]:
         if not isinstance(raw_value, str) or raw_value.strip() == "":
             return None
 
@@ -574,9 +574,14 @@ class WebApp(bottle.Bottle):
             return False
 
     @staticmethod
-    def __parse_trusted_browser_bootstrap_networks(raw_value: str):
-        networks = []
-        invalid_entries = []
+    def __parse_trusted_browser_bootstrap_networks(
+        raw_value: str,
+    ) -> tuple[
+        tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...],
+        tuple[str, ...],
+    ]:
+        networks: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        invalid_entries: list[str] = []
 
         for candidate in raw_value.split(","):
             candidate = candidate.strip()
@@ -594,10 +599,7 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None:
             return False
 
-        can_claim = getattr(self.__auth_store, "can_claim_initial_admin", None)
-        if can_claim is None:
-            return False
-        if not can_claim(self.__get_browser_handover_version()):
+        if not self.__auth_store.can_claim_initial_admin(self.__get_browser_handover_version()):
             return False
 
         return (
@@ -614,7 +616,7 @@ class WebApp(bottle.Bottle):
     def __allow_sessionless_ui_route(self) -> bool:
         return (
             self.__auth_store is not None and
-            getattr(self.__auth_store, "active_admin_key_count", 0) == 0 and
+            self.__auth_store.active_admin_key_count == 0 and
             self.__is_loopback_remote_addr() and
             not WebApp.__has_proxy_forwarding_headers() and
             WebApp.__is_loopback_host(WebApp.__request_host()) and
@@ -628,7 +630,7 @@ class WebApp(bottle.Bottle):
     def __allow_bootstrap_proof_exchange(self) -> bool:
         if (
             self.__auth_store is None or
-            getattr(self.__auth_store, "active_admin_key_count", 0) != 0 or
+            self.__auth_store.active_admin_key_count != 0 or
             not WebApp.__is_loopback_host(WebApp.__request_host()) or
             not self.__is_same_origin_browser_request() or
             not self.__is_trusted_browser_bootstrap_request()
@@ -639,13 +641,11 @@ class WebApp(bottle.Bottle):
         if not isinstance(exchange_secret, str) or not exchange_secret.strip():
             return False
 
-        peek_exchange = getattr(self.__auth_store, "peek_bootstrap_exchange", None)
-        if peek_exchange is None:
-            return False
+        return self.__auth_store.peek_bootstrap_exchange(exchange_secret.strip())
 
-        return bool(peek_exchange(exchange_secret.strip()))
-
-    def __load_trusted_browser_bootstrap_networks(self):
+    def __load_trusted_browser_bootstrap_networks(
+        self,
+    ) -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
         configured_value = WebApp.__get_trusted_browser_bootstrap_remote_addrs(self.__config)
         networks, invalid_entries = WebApp.__parse_trusted_browser_bootstrap_networks(configured_value)
         for invalid_entry in invalid_entries:
@@ -711,10 +711,9 @@ class WebApp(bottle.Bottle):
                     return
             bottle.abort(401, "Missing API token")
 
-        auth_record = None
+        auth_record: Optional[ApiKeyRecord] = None
         if self.__auth_store is not None:
-            auth_store: Any = self.__auth_store
-            auth_record = auth_store.find_api_key_by_secret(token)
+            auth_record = self.__auth_store.find_api_key_by_secret(token)
 
         if auth_record is not None:
             if getattr(auth_record, "revoked_at", None) is not None:
@@ -729,28 +728,26 @@ class WebApp(bottle.Bottle):
 
         bottle.abort(401, "Invalid API token")
 
-    def __get_ui_session_scopes(self):
+    def __get_ui_session_scopes(self) -> Optional[list[str]]:
         session = self.__get_ui_session()
         if session is None:
             return None
 
         if getattr(session, "api_key_id", None):
-            resolved_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
-            if resolved_api_key is None:
+            if self.__auth_store is None:
                 return None
-
-            auth_record = resolved_api_key(session)
+            auth_record = self.__auth_store.resolve_ui_session_api_key(session)
             if auth_record is None:
                 return None
 
-            return list(getattr(auth_record, "scopes", []) or [])
+            return list(auth_record.scopes)
 
         if getattr(session, "bootstrap", False):
-            return getattr(session, "scopes", None)
+            return session.scopes
 
         return None
 
-    def __get_ui_session(self):
+    def __get_ui_session(self) -> Optional[UiSessionRecord]:
         if self.__auth_store is None:
             return None
 
@@ -758,42 +755,36 @@ class WebApp(bottle.Bottle):
         if not isinstance(ui_session_secret, str) or ui_session_secret.strip() == "":
             return None
 
-        find_session = getattr(self.__auth_store, "find_ui_session_by_secret", None)
-        if find_session is None:
-            return None
-
-        session = find_session(ui_session_secret)
+        session = self.__auth_store.find_ui_session_by_secret(ui_session_secret)
         if session is None:
             return None
 
         if getattr(session, "api_key_id", None):
-            resolve_api_key = getattr(self.__auth_store, "resolve_ui_session_api_key", None)
-            if resolve_api_key is None:
-                return None
-            if resolve_api_key(session) is None:
-                invalidate_session = getattr(self.__auth_store, "invalidate_ui_session", None)
-                if invalidate_session is not None:
-                    invalidate_session(ui_session_secret)
+            if self.__auth_store.resolve_ui_session_api_key(session) is None:
+                self.__auth_store.invalidate_ui_session(ui_session_secret)
                 return None
             return session
 
         if getattr(session, "bootstrap", False):
             return session
 
-        invalidate_session = getattr(self.__auth_store, "invalidate_ui_session", None)
-        if invalidate_session is not None:
-            invalidate_session(ui_session_secret)
+        self.__auth_store.invalidate_ui_session(ui_session_secret)
 
         return None
 
-    def __authorize_scopes(self, required_scope: str, scopes, forbidden_message: Optional[str] = None) -> None:
+    def __authorize_scopes(
+        self,
+        required_scope: str,
+        scopes: Sequence[str],
+        forbidden_message: Optional[str] = None,
+    ) -> None:
         allowed_scopes = set(scopes or [])
         if "admin" in allowed_scopes:
             allowed_scopes.update(WebApp._AUTH_SCOPES)
         if required_scope not in allowed_scopes:
             bottle.abort(403, forbidden_message or "Session lacks scope '{}'".format(required_scope))
 
-    def __bootstrap(self):
+    def __bootstrap(self) -> str:
         if self.__auth_store is not None:
             if not self.__is_trusted_browser_bootstrap_request():
                 bottle.abort(
@@ -811,8 +802,7 @@ class WebApp(bottle.Bottle):
             "open": False,
         }
         if self.__auth_store is not None:
-            auth_store: Any = self.__auth_store
-            browser_handover_state = auth_store.get_browser_handover_state(self.__config)
+            browser_handover_state = self.__auth_store.get_browser_handover_state(self.__config)
 
         page_title = "SeedSync browser access"
         can_claim_initial_admin = bool(browser_handover_state.get("open", False))
@@ -853,7 +843,7 @@ class WebApp(bottle.Bottle):
             form_variant_class = "form-panel"
 
         bottle.response.content_type = "text/html; charset=utf-8"
-        bottle.response.cache_control = "no-store"  # type: ignore[assignment]
+        bottle.response.cache_control = "no-store"
         return """<!doctype html>
 <html lang="en">
 <head>
@@ -1258,7 +1248,7 @@ class WebApp(bottle.Bottle):
         if self.__is_trusted_browser_bootstrap_request():
             return
 
-        if getattr(self.__auth_store, "active_admin_key_count", 0) == 0:
+        if self.__auth_store.active_admin_key_count == 0:
             bottle.abort(
                 403,
                 "First-admin browser bootstrap requires direct loopback access or an approved local browser request."
@@ -1266,7 +1256,7 @@ class WebApp(bottle.Bottle):
 
         bottle.abort(403, "Browser shell and static asset access is limited to loopback or explicit trusted local runtime sources")
 
-    def __index(self):
+    def __index(self) -> bottle.HTTPResponse:
         """
         Serves the index.html static file
         :return:
@@ -1284,7 +1274,7 @@ class WebApp(bottle.Bottle):
 
         return self.__static("index.html")
 
-    def __dashboard_index(self, pathPairId: str):
+    def __dashboard_index(self, pathPairId: str) -> bottle.HTTPResponse:
         """
         Serves the index.html static file for dashboard deep links.
         :param pathPairId:
@@ -1293,25 +1283,27 @@ class WebApp(bottle.Bottle):
         return self.__index()
 
     # noinspection PyMethodMayBeStatic
-    def __static(self, file_path: str):
+    def __static(self, file_path: str) -> bottle.HTTPResponse:
         """
         Serves all the static files
         :param file_path:
         :return:
         """
         self.__authorize_browser_bootstrap()
+        if self.__html_path is None:
+            bottle.abort(500, "Static content path is not configured")
         response = static_file(file_path, root=self.__html_path)
         response.set_header("Content-Security-Policy", self._CONTENT_SECURITY_POLICY)
         return response
 
-    def __web_stream(self):
+    def __web_stream(self) -> Iterator[str]:
         # Initialize all the handlers
         handlers = [cls(**kwargs) for (cls, kwargs) in self.__streaming_handlers]
 
         try:
             # Setup the response header
             bottle.response.content_type = "text/event-stream"
-            bottle.response.cache_control = "no-cache"  # type: ignore[assignment]
+            bottle.response.cache_control = "no-cache"
 
             # Call setup on all handlers
             for handler in handlers:

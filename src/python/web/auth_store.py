@@ -11,7 +11,7 @@ import uuid
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Sequence, TypedDict
+from typing import Dict, List, Optional, Sequence, TypeGuard, TypedDict
 
 from common import Persist, PersistError
 
@@ -31,6 +31,27 @@ class CreatedApiKey(TypedDict):
     secret: str
 
 
+def _is_string_object_dict(value: object) -> TypeGuard[Dict[str, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[List[object]]:
+    return isinstance(value, list)
+
+
+def _is_scope_collection(
+    value: object,
+) -> TypeGuard[List[object] | tuple[object, ...] | set[object]]:
+    return isinstance(value, (list, tuple, set))
+
+
+def _required_string_field(record: Dict[str, object], field_name: str) -> str:
+    value = record[field_name]
+    if not isinstance(value, str):
+        raise ValueError("{} must be a string".format(field_name))
+    return value
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -42,7 +63,9 @@ def _history_file_path(file_path: Optional[str]) -> Optional[str]:
     return "{}.history.jsonl".format(history_root)
 
 
-def append_api_key_store_history(file_path: Optional[str], event: str, reason: str, **details) -> None:
+def append_api_key_store_history(
+    file_path: Optional[str], event: str, reason: str, **details: object
+) -> None:
     history_path = _history_file_path(file_path)
     if history_path is None or file_path is None:
         return
@@ -67,11 +90,11 @@ def append_api_key_store_history(file_path: Optional[str], event: str, reason: s
         return
 
 
-def _normalize_scopes(scopes: Sequence[str]) -> List[str]:
-    if not isinstance(scopes, (list, tuple, set)):
+def _normalize_scopes(scopes: object) -> List[str]:
+    if not _is_scope_collection(scopes):
         raise ValueError("API key scopes must be a list of scope names")
 
-    normalized = []
+    normalized: List[str] = []
     for scope in scopes:
         if not isinstance(scope, str):
             raise ValueError("API key scopes must be strings")
@@ -89,7 +112,7 @@ def _normalize_scopes(scopes: Sequence[str]) -> List[str]:
     return normalized
 
 
-def _hash_secret(secret: str, salt: Optional[bytes] = None) -> str:
+def _hash_secret(secret: object, salt: object = None) -> str:
     if not isinstance(secret, str) or not secret:
         raise ValueError("API key secret cannot be blank")
 
@@ -133,7 +156,7 @@ def _verify_secret(secret: str, stored_hash: str) -> bool:
 class ApiKeyRecord:
     id: str
     name: str
-    scopes: List[str] = field(default_factory=list)
+    scopes: List[str] = field(default_factory=lambda: list[str]())
     secret_hash: str = ""
     created_at: str = ""
     updated_at: str = ""
@@ -153,7 +176,7 @@ class ApiKeyRecord:
 @dataclass
 class UiSessionRecord:
     secret: str
-    scopes: List[str] = field(default_factory=list)
+    scopes: List[str] = field(default_factory=lambda: list[str]())
     created_at: str = ""
     expires_at: str = ""
     bootstrap: bool = False
@@ -210,7 +233,7 @@ class ApiKeyStore(Persist):
         self.__bootstrap_proof_path = file_path
         self.__sync_bootstrap_proof_artifact()
 
-    def __record_history_event(self, event: str, reason: str, **details) -> None:
+    def __record_history_event(self, event: str, reason: str, **details: object) -> None:
         append_api_key_store_history(self.__file_path, event, reason, **details)
 
     def __history_snapshot(self) -> Dict[str, object]:
@@ -258,11 +281,11 @@ class ApiKeyStore(Persist):
 
     def create_ui_session(
         self,
-        scopes: Sequence[str],
-        bootstrap: bool = False,
-        api_key_id: Optional[str] = None,
-        api_key_secret_hash: Optional[str] = None,
-        remembered: bool = False
+        scopes: object,
+        bootstrap: object = False,
+        api_key_id: object = None,
+        api_key_secret_hash: object = None,
+        remembered: object = False
     ) -> UiSessionRecord:
         normalized_scopes = _normalize_scopes(scopes)
         if type(bootstrap) is not bool:
@@ -305,7 +328,7 @@ class ApiKeyStore(Persist):
         )
         return record
 
-    def __create_api_key_record(self, name: str, scopes: Sequence[str]) -> CreatedApiKey:
+    def __create_api_key_record(self, name: object, scopes: object) -> CreatedApiKey:
         scopes = _normalize_scopes(scopes)
         if not isinstance(name, str) or not name.strip():
             raise ValueError("API key name cannot be blank")
@@ -323,7 +346,7 @@ class ApiKeyStore(Persist):
         self.__api_keys.append(record)
         return {"record": record, "secret": secret}
 
-    def create_browser_session_for_api_key(self, key_id: str) -> UiSessionRecord:
+    def create_browser_session_for_api_key(self, key_id: object) -> UiSessionRecord:
         if not isinstance(key_id, str) or not key_id.strip():
             raise ValueError("API key id cannot be blank")
 
@@ -339,7 +362,7 @@ class ApiKeyStore(Persist):
             api_key_secret_hash=record.secret_hash
         )
 
-    def create_remembered_browser_session_for_api_key(self, key_id: str) -> UiSessionRecord:
+    def create_remembered_browser_session_for_api_key(self, key_id: object) -> UiSessionRecord:
         if not isinstance(key_id, str) or not key_id.strip():
             raise ValueError("API key id cannot be blank")
 
@@ -393,7 +416,7 @@ class ApiKeyStore(Persist):
             return None
         return record
 
-    def invalidate_ui_session(self, secret: str) -> None:
+    def invalidate_ui_session(self, secret: object) -> None:
         if not isinstance(secret, str) or not secret.strip():
             return
         if self.__ui_sessions.pop(secret, None) is not None:
@@ -416,13 +439,13 @@ class ApiKeyStore(Persist):
 
         return record
 
-    def can_claim_initial_admin(self, browser_handover_version: str) -> bool:
+    def can_claim_initial_admin(self, browser_handover_version: object) -> bool:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
         if self.active_admin_key_count == 0:
             return True
         return self.__browser_handover_claimed_version != version
 
-    def claim_initial_admin_if_available(self, browser_handover_version: str) -> bool:
+    def claim_initial_admin_if_available(self, browser_handover_version: object) -> bool:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
         with self.__state_lock:
             if not self.can_claim_initial_admin(version):
@@ -438,7 +461,7 @@ class ApiKeyStore(Persist):
 
     def create_initial_admin_api_key_if_available(
         self,
-        browser_handover_version: str,
+        browser_handover_version: object,
         name: str,
     ) -> Optional[CreatedApiKey]:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
@@ -464,7 +487,7 @@ class ApiKeyStore(Persist):
     def claim_initial_admin(self, browser_handover_version: str) -> None:
         self.claim_initial_admin_if_available(browser_handover_version)
 
-    def get_browser_handover_state(self, config) -> Dict[str, object]:
+    def get_browser_handover_state(self, config: object) -> Dict[str, object]:
         version = self.__get_browser_handover_version(config)
         return {
             "configured_version": version,
@@ -496,7 +519,7 @@ class ApiKeyStore(Persist):
 
         return self.__bootstrap_proof
 
-    def peek_bootstrap_proof(self, secret: str) -> bool:
+    def peek_bootstrap_proof(self, secret: object) -> bool:
         if not isinstance(secret, str) or not secret.strip():
             return False
 
@@ -544,7 +567,7 @@ class ApiKeyStore(Persist):
 
         return self.__bootstrap_exchange
 
-    def peek_bootstrap_exchange(self, secret: str) -> bool:
+    def peek_bootstrap_exchange(self, secret: object) -> bool:
         if not isinstance(secret, str) or not secret.strip():
             return False
 
@@ -588,7 +611,7 @@ class ApiKeyStore(Persist):
     def update_api_key(
         self,
         key_id: str,
-        name: Optional[str] = None,
+        name: object = None,
         scopes: Optional[Sequence[str]] = None
     ) -> ApiKeyRecord:
         record = self.get_api_key(key_id)
@@ -711,11 +734,11 @@ class ApiKeyStore(Persist):
     def from_str(cls, content: str) -> "ApiKeyStore":
         store = ApiKeyStore()
         try:
-            payload = json.loads(content)
+            payload: object = json.loads(content)
         except ValueError as exc:
             raise PersistError("Invalid API key store JSON: {}".format(exc)) from exc
 
-        if not isinstance(payload, dict):
+        if not _is_string_object_dict(payload):
             raise PersistError("Invalid API key store JSON: expected an object")
 
         version = payload.get(cls.__KEY_VERSION, 1)
@@ -734,22 +757,26 @@ class ApiKeyStore(Persist):
         store.__browser_handover_claimed_version = claimed_version
 
         records = payload.get(cls.__KEY_API_KEYS, [])
-        if not isinstance(records, list):
+        if not _is_object_list(records):
             raise PersistError("Invalid API key store JSON: api_keys must be a list")
 
         for raw_record in records:
-            if not isinstance(raw_record, dict):
+            if not _is_string_object_dict(raw_record):
                 raise PersistError("Invalid API key store JSON: api key record must be an object")
             try:
                 store.__api_keys.append(
                     ApiKeyRecord(
-                        id=raw_record["id"],
-                        name=raw_record["name"],
+                        id=_required_string_field(raw_record, "id"),
+                        name=_required_string_field(raw_record, "name"),
                         scopes=_normalize_scopes(raw_record.get("scopes", [])),
-                        secret_hash=raw_record["secret_hash"],
-                        created_at=raw_record["created_at"],
-                        updated_at=raw_record["updated_at"],
-                        revoked_at=raw_record.get("revoked_at"),
+                        secret_hash=_required_string_field(raw_record, "secret_hash"),
+                        created_at=_required_string_field(raw_record, "created_at"),
+                        updated_at=_required_string_field(raw_record, "updated_at"),
+                        revoked_at=(
+                            _required_string_field(raw_record, "revoked_at")
+                            if raw_record.get("revoked_at") is not None
+                            else None
+                        ),
                     )
                 )
             except KeyError as exc:
@@ -758,11 +785,11 @@ class ApiKeyStore(Persist):
                 raise PersistError("Invalid API key store JSON: {}".format(exc)) from exc
 
         ui_sessions = payload.get(cls.__KEY_UI_SESSIONS, [])
-        if not isinstance(ui_sessions, list):
+        if not _is_object_list(ui_sessions):
             raise PersistError("Invalid API key store JSON: ui_sessions must be a list")
 
         for raw_session in ui_sessions:
-            if not isinstance(raw_session, dict):
+            if not _is_string_object_dict(raw_session):
                 raise PersistError("Invalid API key store JSON: ui session record must be an object")
             try:
                 api_key_id = raw_session.get("api_key_id")
@@ -774,12 +801,16 @@ class ApiKeyStore(Persist):
                     raise ValueError("API key session api_key_secret_hash must be a string")
                 if type(remembered) is not bool:
                     raise ValueError("API key session remembered flag must be a boolean")
-                store.__ui_sessions[raw_session["secret"]] = UiSessionRecord(
-                    secret=raw_session["secret"],
+                secret = _required_string_field(raw_session, "secret")
+                bootstrap = raw_session.get("bootstrap", False)
+                if type(bootstrap) is not bool:
+                    raise ValueError("API key session bootstrap flag must be a boolean")
+                store.__ui_sessions[secret] = UiSessionRecord(
+                    secret=secret,
                     scopes=_normalize_scopes(raw_session.get("scopes", [])),
-                    created_at=raw_session["created_at"],
-                    expires_at=raw_session["expires_at"],
-                    bootstrap=raw_session.get("bootstrap", False),
+                    created_at=_required_string_field(raw_session, "created_at"),
+                    expires_at=_required_string_field(raw_session, "expires_at"),
+                    bootstrap=bootstrap,
                     remembered=remembered,
                     api_key_id=api_key_id,
                     api_key_secret_hash=api_key_secret_hash,
@@ -811,7 +842,7 @@ class ApiKeyStore(Persist):
         return json.dumps(payload, indent=2)
 
     def __prune_expired_ui_sessions(self, now: datetime) -> None:
-        expired_session_ids = []
+        expired_session_ids: List[str] = []
         for secret, record in self.__ui_sessions.items():
             if getattr(record, "remembered", False):
                 continue
@@ -869,7 +900,7 @@ class ApiKeyStore(Persist):
             json.dump(payload, handle, indent=2)
 
     @staticmethod
-    def __get_browser_handover_version(config) -> str:
+    def __get_browser_handover_version(config: object) -> str:
         general_config = getattr(config, "general", None)
         if general_config is None:
             return ""
