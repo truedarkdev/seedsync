@@ -10,7 +10,34 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import List, Optional, Protocol, TypedDict
+
+
+class SystemFileDataRequired(TypedDict):
+    name: str
+    size: int
+    is_dir: bool
+
+
+class SystemFileData(SystemFileDataRequired, total=False):
+    time_created: Optional[str]
+    time_modified: Optional[str]
+    path_pair_id: Optional[str]
+    path_pair_name: Optional[str]
+    is_staging: bool
+    children: List["SystemFileData"]
+
+
+class ScanEntry(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def path(self) -> str: ...
+
+    def is_dir(self) -> bool: ...
+
+    def stat(self) -> os.stat_result: ...
 
 
 class SystemFile:
@@ -31,16 +58,18 @@ class SystemFile:
         self.__is_dir = is_dir
         self.__timestamp_created = time_created
         self.__timestamp_modified = time_modified
-        self.__children = []
-        self.__path_pair_id = None
-        self.__path_pair_name = None
+        self.__children: List[SystemFile] = []
+        self.__path_pair_id: Optional[str] = None
+        self.__path_pair_name: Optional[str] = None
         self.__is_staging = is_staging
         self.__status_sidecar_ready = False
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SystemFile):
+            return NotImplemented
         return self.__dict__ == other.__dict__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self.__dict__)
 
     @property
@@ -112,8 +141,8 @@ class SystemFile:
             raise TypeError("Cannot add children to a file")
         self.__children.append(file)
 
-    def to_dict(self) -> Dict[str, Any]:
-        d = {
+    def to_dict(self) -> SystemFileData:
+        d: SystemFileData = {
             "name": self.__name,
             "size": self.__size,
             "is_dir": self.__is_dir,
@@ -133,7 +162,7 @@ class SystemFile:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SystemFile":
+    def from_dict(cls, data: SystemFileData) -> "SystemFile":
         time_created = None
         time_modified = None
         if "time_created" in data and data["time_created"] is not None:
@@ -163,16 +192,16 @@ class SystemScannerError(Exception):
 
 
 class PseudoDirEntry:
-    def __init__(self, name: str, path: str, is_dir: bool, stat_result):
+    def __init__(self, name: str, path: str, is_dir: bool, stat_result: os.stat_result):
         self.name = name
         self.path = path
         self._is_dir = is_dir
         self._stat = stat_result
 
-    def is_dir(self):
+    def is_dir(self) -> bool:
         return self._is_dir
 
-    def stat(self):
+    def stat(self) -> os.stat_result:
         return self._stat
 
 
@@ -188,9 +217,9 @@ class SystemScanner:
         :param path_to_scan: path to file or directory to scan
         """
         self.path_to_scan = path_to_scan
-        self.exclude_prefixes = []
-        self.exclude_suffixes = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
-        self.__lftp_temp_file_suffix = None
+        self.exclude_prefixes: List[str] = []
+        self.exclude_suffixes: List[str] = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
+        self.__lftp_temp_file_suffix: Optional[str] = None
 
     def add_exclude_prefix(self, prefix: str):
         """
@@ -244,16 +273,19 @@ class SystemScanner:
         )
 
     @staticmethod
-    def __get_created_time(stat_result) -> Optional[datetime]:
+    def __get_created_time(stat_result: os.stat_result) -> Optional[datetime]:
         try:
-            return datetime.fromtimestamp(stat_result.st_birthtime)
+            birthtime = getattr(stat_result, "st_birthtime")
+            if isinstance(birthtime, (int, float)):
+                return datetime.fromtimestamp(birthtime)
         except (AttributeError, OSError, OverflowError, TypeError, ValueError):
-            try:
-                return datetime.fromtimestamp(stat_result.st_ctime)
-            except (AttributeError, OSError, OverflowError, TypeError, ValueError):
-                return None
+            pass
+        try:
+            return datetime.fromtimestamp(stat_result.st_ctime)
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            return None
 
-    def __create_system_file(self, entry) -> SystemFile:
+    def __create_system_file(self, entry: ScanEntry) -> SystemFile:
         """
         Creates a system file from a DirEntry.
         """
@@ -303,7 +335,7 @@ class SystemScanner:
         return sys_file
 
     def __create_children(self, path: str) -> List[SystemFile]:
-        children = []
+        children: List[SystemFile] = []
         # Files may get deleted while scanning, ignore the error.
         for entry in os.scandir(path):
             if entry.is_symlink() and entry.is_dir():

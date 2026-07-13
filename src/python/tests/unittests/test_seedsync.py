@@ -762,6 +762,7 @@ class TestSeedsync(unittest.TestCase):
             "Bootstrap mode requested; persisting defaults and exiting before startup"
         )
 
+    @patch("seedsync.NotificationService", new=MagicMock())
     def test_run_skips_controller_join_when_setup_times_out(self):
         seedsync = Seedsync.__new__(Seedsync)
         seedsync.context = SimpleNamespace(
@@ -830,6 +831,7 @@ class TestSeedsync(unittest.TestCase):
         webapp_job.terminate.assert_called_once_with()
         webapp_job.join.assert_called_once_with()
 
+    @patch("seedsync.NotificationService", new=MagicMock())
     def test_run_propagates_controller_app_error_after_startup(self):
         seedsync = Seedsync.__new__(Seedsync)
         seedsync.context = SimpleNamespace(
@@ -905,6 +907,7 @@ class TestSeedsync(unittest.TestCase):
         webapp_job.join.assert_called_once_with()
         seedsync.persist.assert_called_once_with()
 
+    @patch("seedsync.NotificationService", new=MagicMock())
     def test_run_redirects_restart_request_while_controller_setup_is_degraded(self):
         seedsync = Seedsync.__new__(Seedsync)
         seedsync.context = SimpleNamespace(

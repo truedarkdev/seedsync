@@ -13,6 +13,8 @@ from typing import Optional, Type, TypeVar, cast
 import shutil
 import platform
 import tempfile
+from types import FrameType
+from typing import NoReturn, Sequence
 
 # my libs
 from common import ServiceExit, Context, Constants, Config, Args
@@ -56,7 +58,7 @@ class Seedsync:
     __CONFIG_DUMMY_VALUE = "<replace me>"
 
     # This logger is used to print any exceptions caught at top module
-    logger = None
+    logger: Optional[logging.Logger] = None
 
     def __init__(self):
         Seedsync._apply_umask_from_env()
@@ -333,14 +335,19 @@ class Seedsync:
         except Exception:
             self.context.logger.exception("Final persist during shutdown failed")
 
-    def signal(self, signum: int, _):
+    def signal(self, signum: int, _: Optional[FrameType]) -> NoReturn:
         # noinspection PyUnresolvedReferences
         # Signals is a generated enum
         self.context.logger.info("Caught signal {}".format(signal.Signals(signum).name))
         raise ServiceExit()
 
     @staticmethod
-    def __start_jobs(context, do_start_controller, controller_job, webapp_job):
+    def __start_jobs(
+        context: Context,
+        do_start_controller: bool,
+        controller_job: ControllerJob,
+        webapp_job: WebAppJob,
+    ) -> tuple[bool, bool]:
         """
         Start the controller before the web server thread so controller subprocess startup
         does not race against the threaded web app.
@@ -363,19 +370,29 @@ class Seedsync:
                 )
                 context.logger.error(context.status.server.error_msg)
             elif isinstance(controller_job.exc_info, tuple):
+                controller_exc_info = controller_job.exc_info
                 controller_start_failed = True
                 context.status.server.up = False
-                context.status.server.error_msg = str(controller_job.exc_info[1])
+                context.status.server.error_msg = str(controller_exc_info[1])
+                logging_exc_info = (
+                    (controller_exc_info[0], controller_exc_info[1], controller_exc_info[2])
+                    if controller_exc_info[0] is not None and controller_exc_info[1] is not None
+                    else False
+                )
                 context.logger.error(
                     "Controller failed to start; keeping the web UI available",
-                    exc_info=controller_job.exc_info
+                    exc_info=logging_exc_info
                 )
 
         webapp_job.start()
         return controller_start_failed, controller_start_isolated
 
     @staticmethod
-    def __handle_controller_startup_timeout(context, controller_job, controller_start_isolated):
+    def __handle_controller_startup_timeout(
+        context: Context,
+        controller_job: ControllerJob,
+        controller_start_isolated: bool,
+    ) -> bool:
         """
         Keep monitoring a controller that timed out during startup without crashing the web service.
         """
@@ -387,13 +404,19 @@ class Seedsync:
         )
 
         if isinstance(controller_job.exc_info, tuple):
-            error_msg = str(controller_job.exc_info[1])
+            controller_exc_info = controller_job.exc_info
+            error_msg = str(controller_exc_info[1])
             if context.status.server.error_msg != error_msg:
                 context.status.server.up = False
                 context.status.server.error_msg = error_msg
+                logging_exc_info = (
+                    (controller_exc_info[0], controller_exc_info[1], controller_exc_info[2])
+                    if controller_exc_info[0] is not None and controller_exc_info[1] is not None
+                    else False
+                )
                 context.logger.error(
                     "Controller failed after startup timeout; keeping the web UI available",
-                    exc_info=controller_job.exc_info
+                    exc_info=logging_exc_info
                 )
             return True
 
@@ -408,7 +431,7 @@ class Seedsync:
         return False
 
     @staticmethod
-    def _parse_args(args):
+    def _parse_args(args: Sequence[str]) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Seedsync daemon")
         parser.add_argument("-c", "--config_dir", required=True, help="Path to config directory")
         parser.add_argument("--logdir", help="Directory for log files")
@@ -552,11 +575,11 @@ class Seedsync:
         config: Config,
         path_pair_manager: PathPairManager | None = None,
         args: Args | None = None
-    ) -> list:
+    ) -> list[str]:
         return Controller.collect_missing_startup_fields(config, args=args, path_pair_manager=path_pair_manager)
 
     @staticmethod
-    def _is_blank_config_value(value) -> bool:
+    def _is_blank_config_value(value: object) -> bool:
         return value is None or (isinstance(value, str) and value.strip() == "")
 
     @staticmethod
