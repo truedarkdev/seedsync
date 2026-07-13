@@ -74,7 +74,7 @@ class IStreamHandler(ABC):
         :param kwargs: args for stream handler ctor
         :return:
         """
-        web_app.add_streaming_handler(cls, **kwargs)
+        web_app.add_streaming_handler(cls, required_scope="stream", **kwargs)
 
 
 class WebApp(bottle.Bottle):
@@ -111,7 +111,9 @@ class WebApp(bottle.Bottle):
         self.__trusted_browser_bootstrap_networks = self.__load_trusted_browser_bootstrap_networks()
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
-        self.__streaming_handlers: list[tuple[Type[IStreamHandler], dict[str, object]]] = []
+        self.__streaming_handlers: list[
+            tuple[Type[IStreamHandler], dict[str, object], str]
+        ] = []
 
         def gate_server_request_hook() -> None:
             try:
@@ -168,8 +170,15 @@ class WebApp(bottle.Bottle):
     def add_delete_handler(self, path: str, handler: Callable[..., object], required_scope: Optional[str] = None, **config: object) -> None:
         self.delete(path, required_scope=required_scope, **config)(handler)
 
-    def add_streaming_handler(self, handler: Type[IStreamHandler], **kwargs: object) -> None:
-        self.__streaming_handlers.append((handler, kwargs))
+    def add_streaming_handler(
+        self,
+        handler: Type[IStreamHandler],
+        required_scope: str = "stream",
+        **kwargs: object,
+    ) -> None:
+        if required_scope not in self._AUTH_SCOPES:
+            raise ValueError("Unknown streaming handler scope '{}'".format(required_scope))
+        self.__streaming_handlers.append((handler, kwargs, required_scope))
 
     def __gate_server_request(self) -> None:
         if not WebApp.__is_server_path(bottle.request.path):
@@ -747,6 +756,22 @@ class WebApp(bottle.Bottle):
 
         return None
 
+    def __request_auth_scopes(self) -> set[str]:
+        token = WebApp.__extract_bearer_token()
+        if token is not None and self.__auth_store is not None:
+            auth_record = self.__auth_store.find_api_key_by_secret(token)
+            if auth_record is not None and not auth_record.is_revoked:
+                scopes = set(auth_record.scopes)
+                if "admin" in scopes:
+                    scopes.update(self._AUTH_SCOPES)
+                return scopes
+
+        session_scopes = self.__get_ui_session_scopes()
+        scopes = set(session_scopes or [])
+        if "admin" in scopes:
+            scopes.update(self._AUTH_SCOPES)
+        return scopes
+
     def __get_ui_session(self) -> Optional[UiSessionRecord]:
         if self.__auth_store is None:
             return None
@@ -1298,7 +1323,12 @@ class WebApp(bottle.Bottle):
 
     def __web_stream(self) -> Iterator[str]:
         # Initialize all the handlers
-        handlers = [cls(**kwargs) for (cls, kwargs) in self.__streaming_handlers]
+        request_scopes = self.__request_auth_scopes()
+        handlers = [
+            cls(**kwargs)
+            for (cls, kwargs, required_scope) in self.__streaming_handlers
+            if required_scope == "stream" or required_scope in request_scopes
+        ]
 
         try:
             # Setup the response header

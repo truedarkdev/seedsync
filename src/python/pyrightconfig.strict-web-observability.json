@@ -1,0 +1,19 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "web/handler/historical_log.py",
+    "web/handler/stream_log.py",
+    "web/handler/notifications.py",
+    "web/serialize/serialize_log_record.py",
+    "web/utils.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}

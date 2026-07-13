@@ -3,9 +3,8 @@
 import json
 import logging
 
-from common.redaction import redact_sensitive_text
-
 from .serialize import Serialize
+from ..handler.historical_log import sanitize_log_text
 
 
 class SerializeLogRecord(Serialize):
@@ -24,21 +23,21 @@ class SerializeLogRecord(Serialize):
     __KEY_EXCEPTION_TRACEBACK = "exc_tb"
     __KEY_ID = "id"
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         # logging formatter to generate exception traceback
         self.__log_formatter = logging.Formatter()
 
     @staticmethod
-    def _redact_sensitive(message):
-        return redact_sensitive_text(message)
+    def _redact_sensitive(message: str | None) -> str | None:
+        return sanitize_log_text(message)
 
     def record(self, record: logging.LogRecord) -> str:
-        json_dict = dict()
+        json_dict: dict[str, object] = {}
         json_dict[SerializeLogRecord.__KEY_ID] = getattr(record, "seedsync_record_id", None)
         json_dict[SerializeLogRecord.__KEY_TIME] = str(record.created)
         json_dict[SerializeLogRecord.__KEY_LEVEL_NAME] = record.levelname
-        json_dict[SerializeLogRecord.__KEY_LOGGER_NAME] = record.name
+        json_dict[SerializeLogRecord.__KEY_LOGGER_NAME] = sanitize_log_text(record.name)
         message = record.getMessage() if record.msg is not None else None
         json_dict[SerializeLogRecord.__KEY_MESSAGE] = SerializeLogRecord._redact_sensitive(
             message

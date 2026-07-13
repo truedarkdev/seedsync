@@ -52,6 +52,31 @@ class TestHistoricalLogStore(unittest.TestCase):
         self.assertEqual(["valid"], [item["id"] for item in result["records"]])
         self.assertEqual(1, result["evidence"]["malformed_records_skipped"])
 
+    def test_missing_or_invalid_required_record_fields_are_skipped(self):
+        malformed_records = []
+        for field_name in ("timestamp", "level_number"):
+            missing = self.record("missing-{}".format(field_name), 1)
+            missing.pop(field_name)
+            malformed_records.append(missing)
+        invalid_timestamp = self.record("invalid-timestamp", 2)
+        invalid_timestamp["timestamp"] = 7
+        malformed_records.append(invalid_timestamp)
+        for invalid_level_number in ("INFO", True):
+            invalid = self.record("invalid-level-{}".format(invalid_level_number), 3)
+            invalid["level_number"] = invalid_level_number
+            malformed_records.append(invalid)
+        nonfinite = self.record("nonfinite-epoch", float("inf"))
+        malformed_records.append(nonfinite)
+        enormous_epoch = self.record("enormous-epoch", 10 ** 1000)
+        malformed_records.append(enormous_epoch)
+        valid = self.record("valid", 4)
+        self.write(self.path, malformed_records + [valid])
+
+        result = self.store.query()
+
+        self.assertEqual(["valid"], [item["id"] for item in result["records"]])
+        self.assertEqual(len(malformed_records), result["evidence"]["malformed_records_skipped"])
+
     def test_missing_files_return_empty_page(self):
         result = self.store.query()
         self.assertEqual([], result["records"])
