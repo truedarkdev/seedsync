@@ -2,7 +2,7 @@
 
 import os
 from threading import BoundedSemaphore, Event
-from typing import Any, Optional, cast
+from typing import Optional, TypeGuard
 from urllib.parse import unquote
 
 import bottle
@@ -13,6 +13,14 @@ from controller.controller import Controller
 from ..web_app import IHandler, WebApp
 
 
+def _is_string_object_dict(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
 class WebResponseActionCallback(Controller.Command.ICallback):
     """
     Controller action callback used by model streams to wait for action
@@ -21,25 +29,25 @@ class WebResponseActionCallback(Controller.Command.ICallback):
     then query the status from 'success' and 'error'
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.__event = Event()
-        self.success = None
-        self.error = None
+        self.success: bool | None = None
+        self.error: str | None = None
         self.error_code = 400
 
     @overrides(Controller.Command.ICallback)
-    def on_failure(self, error: str, error_code: int = 400):
+    def on_failure(self, error: str, error_code: int = 400) -> None:
         self.success = False
         self.error = error
         self.error_code = error_code
         self.__event.set()
 
     @overrides(Controller.Command.ICallback)
-    def on_success(self):
+    def on_success(self) -> None:
         self.success = True
         self.__event.set()
 
-    def wait(self, timeout: float | None = None):
+    def wait(self, timeout: float | None = None) -> bool:
         return self.__event.wait(timeout=timeout)
 
 
@@ -53,21 +61,20 @@ class ControllerHandler(IHandler):
         Controller.Command.Action.DELETE_REMOTE
     }
 
-    def __init__(self, controller: Controller, local_path: str | None = None):
+    def __init__(self, controller: Controller, local_path: str | None = None) -> None:
         self.__controller = controller
         self.__local_path_root = self.__normalize_local_path(local_path)
         self.__bulk_request_limiter = BoundedSemaphore(self._MAX_CONCURRENT_BULK_REQUESTS)
 
     @staticmethod
     def __normalize_local_path(local_path: str | None) -> Optional[str]:
-        if not isinstance(local_path, str) or local_path.strip() == "":
+        if local_path is None or local_path.strip() == "":
             return None
         return os.path.realpath(local_path)
 
     @staticmethod
     def __check_file_name_safe(file_name: str) -> Optional[HTTPResponse]:
         if (
-            not isinstance(file_name, str) or
             file_name == "" or
             any(ord(char) < 32 or ord(char) == 127 for char in file_name)
         ):
@@ -97,10 +104,10 @@ class ControllerHandler(IHandler):
 
     @staticmethod
     def __query_param(name: str) -> str | None:
-        return cast(str | None, bottle.request.query.get(name))  # type: ignore[attr-defined]
+        return bottle.request.query.get(name)
 
     @overrides(IHandler)
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_post_handler(
             "/server/command/queue/<file_name>",
             self.__handle_action_queue,
@@ -143,7 +150,7 @@ class ControllerHandler(IHandler):
         )
 
     @staticmethod
-    def __get_action(action: str):
+    def __get_action(action: str) -> Controller.Command.Action | None:
         return {
             "queue": Controller.Command.Action.QUEUE,
             "stop": Controller.Command.Action.STOP,
@@ -154,7 +161,12 @@ class ControllerHandler(IHandler):
             "delete_remote": Controller.Command.Action.DELETE_REMOTE
         }.get(action)
 
-    def __execute_action(self, action, file_name: str, timeout: float | None = None):
+    def __execute_action(
+        self,
+        action: Controller.Command.Action,
+        file_name: str,
+        timeout: float | None = None,
+    ) -> tuple[WebResponseActionCallback, bool]:
         command = Controller.Command(action, file_name)
         callback = WebResponseActionCallback()
         command.add_callback(callback)
@@ -166,20 +178,20 @@ class ControllerHandler(IHandler):
         file_name: str,
         file_id: str | None = None,
         path_pair_id: str | None = None,
-    ):
+    ) -> tuple[str | None, str | None, HTTPResponse | None]:
         guard_response = self.__check_file_name_safe(file_name)
         if guard_response:
             return None, None, guard_response
 
         if file_id is not None:
-            if not isinstance(file_id, str) or file_id == "":
+            if file_id == "":
                 return None, None, HTTPResponse(body="Invalid file_id query parameter", status=400)
             guard_response = self.__check_file_name_safe(file_id)
             if guard_response:
                 return None, None, guard_response
 
         if path_pair_id is not None:
-            if not isinstance(path_pair_id, str) or path_pair_id == "":
+            if path_pair_id == "":
                 return None, None, HTTPResponse(body="Invalid path_pair_id query parameter", status=400)
             guard_response = self.__check_file_name_safe(path_pair_id)
             if guard_response:
@@ -221,7 +233,7 @@ class ControllerHandler(IHandler):
             return file_name, matches[0].name, None
         return file_name, file_name, None
 
-    def __handle_action_queue(self, file_name: str):
+    def __handle_action_queue(self, file_name: str) -> HTTPResponse:
         """
         Request a QUEUE action
         :param file_name:
@@ -249,9 +261,9 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Queued file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_stop(self, file_name: str):
+    def __handle_action_stop(self, file_name: str) -> HTTPResponse:
         """
         Request a STOP action
         :param file_name:
@@ -279,9 +291,9 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Stopped file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_retry_move(self, file_name: str):
+    def __handle_action_retry_move(self, file_name: str) -> HTTPResponse:
         file_name = unquote(file_name)
         file_id = self.__query_param("file_id")
         if file_id is None:
@@ -289,18 +301,19 @@ class ControllerHandler(IHandler):
         file_identifier, _, error_response = self.__resolve_command_identifier(file_name, file_id)
         if error_response:
             return error_response
+        assert file_identifier is not None
         callback, completed = self.__execute_action(
             Controller.Command.Action.RETRY_MOVE,
-            cast(str, file_identifier),
+            file_identifier,
             timeout=self._ACTION_TIMEOUT,
         )
         if not completed:
             return HTTPResponse(body="Operation timed out", status=504)
         if callback.success:
             return HTTPResponse(body="Move retry completed")
-        return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+        return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_extract(self, file_name: str):
+    def __handle_action_extract(self, file_name: str) -> HTTPResponse:
         """
         Request a EXTRACT action
         :param file_name:
@@ -333,9 +346,9 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested extraction for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_delete_local(self, file_name: str):
+    def __handle_action_delete_local(self, file_name: str) -> HTTPResponse:
         """
         Request a DELETE LOCAL action
         :param file_name:
@@ -368,9 +381,9 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested local delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_validate(self, file_name: str):
+    def __handle_action_validate(self, file_name: str) -> HTTPResponse:
         """
         Request a VALIDATE action
         :param file_name:
@@ -398,9 +411,9 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested validation for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_delete_remote(self, file_name: str):
+    def __handle_action_delete_remote(self, file_name: str) -> HTTPResponse:
         """
         Request a DELETE REMOTE action
         :param file_name:
@@ -433,27 +446,28 @@ class ControllerHandler(IHandler):
         if callback.success:
             return HTTPResponse(body="Requested remote delete for file '{}'".format(file_name))
         else:
-            return HTTPResponse(body=cast(Any, callback.error), status=callback.error_code)
+            return HTTPResponse(body=callback.error, status=callback.error_code)
 
-    def __handle_action_bulk(self, action: str):
+    def __handle_action_bulk(self, action: str) -> HTTPResponse:
         command_action = self.__get_action(action)
         if command_action is None:
             return HTTPResponse(body="Unsupported bulk action '{}'".format(action), status=404)
 
-        payload = cast(dict[str, Any], bottle.request.json or {})
+        payload_value = bottle.request.json
+        payload = payload_value if _is_string_object_dict(payload_value) else {}
         file_entries = payload.get("files")
         filenames = payload.get("filenames")
 
-        ordered_commands = []
-        seen_identifiers = set()
-        if isinstance(file_entries, list) and len(file_entries) > 0:
+        ordered_commands: list[tuple[str, str, str | None]] = []
+        seen_identifiers: set[str] = set()
+        if _is_object_list(file_entries) and len(file_entries) > 0:
             if len(file_entries) > self._MAX_BULK_ITEMS:
                 return HTTPResponse(
                     body="Bulk command exceeds maximum of {} items".format(self._MAX_BULK_ITEMS),
                     status=413
                 )
             for file_entry in file_entries:
-                if not isinstance(file_entry, dict):
+                if not _is_string_object_dict(file_entry):
                     return HTTPResponse(body="Bulk command files must be objects", status=400)
                 file_name = file_entry.get("name")
                 file_id = file_entry.get("file_id")
@@ -472,10 +486,11 @@ class ControllerHandler(IHandler):
                 )
                 if error_response:
                     return error_response
+                assert identifier is not None
                 if identifier not in seen_identifiers:
                     ordered_commands.append((file_name, identifier, guard_name))
                     seen_identifiers.add(identifier)
-        elif isinstance(filenames, list) and len(filenames) > 0:
+        elif _is_object_list(filenames) and len(filenames) > 0:
             if len(filenames) > self._MAX_BULK_ITEMS:
                 return HTTPResponse(
                     body="Bulk command exceeds maximum of {} items".format(self._MAX_BULK_ITEMS),
@@ -487,6 +502,7 @@ class ControllerHandler(IHandler):
                 identifier, guard_name, error_response = self.__resolve_command_identifier(file_name)
                 if error_response:
                     return error_response
+                assert identifier is not None
                 if identifier not in seen_identifiers:
                     ordered_commands.append((file_name, identifier, guard_name))
                     seen_identifiers.add(identifier)
@@ -500,10 +516,13 @@ class ControllerHandler(IHandler):
             return HTTPResponse(body="Bulk request already in progress", status=429)
 
         try:
-            failures = []
+            failures: list[str] = []
             success_count = 0
             for display_name, identifier, guard_name in ordered_commands:
                 if command_action in self._GUARDED_ACTIONS:
+                    if guard_name is None:
+                        failures.append("'{}': Invalid file path".format(display_name))
+                        continue
                     guard_response = self.__check_path_safe(guard_name)
                     if guard_response:
                         failures.append("'{}': Invalid file path".format(display_name))

@@ -1,8 +1,9 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 from common import Context
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 from controller import Controller, AutoQueuePersist
+from controller.notifier import NotificationService
 from .auth_store import ApiKeyStore
 from .web_app import WebApp
 from .handler.stream_model import ModelStreamHandler
@@ -21,6 +22,27 @@ from .handler.notifications import NotificationsAdminHandler
 from .handler.historical_log import HistoricalLogHandler, HistoricalLogStore
 
 
+@runtime_checkable
+class _LoggerStreamRegistrar(Protocol):
+    def register(self, *, web_app: WebApp, logger: object) -> None: ...
+
+
+@runtime_checkable
+class _ControllerStreamRegistrar(Protocol):
+    def register(self, *, web_app: WebApp, controller: Controller) -> None: ...
+
+
+@runtime_checkable
+class _EmptyStreamRegistrar(Protocol):
+    def register(self, *, web_app: WebApp) -> None: ...
+
+
+def _register_log_stream(
+    registrar: _LoggerStreamRegistrar, web_app: WebApp, logger: object
+) -> None:
+    registrar.register(web_app=web_app, logger=logger)
+
+
 class WebAppBuilder:
     """
     Helper class to build WebApp with all the extensions
@@ -30,14 +52,15 @@ class WebAppBuilder:
                  controller: Controller,
                  auto_queue_persist: AutoQueuePersist,
                  auth_store: Optional[ApiKeyStore] = None,
-                 notifier=None):
+                 notifier: Optional[NotificationService] = None) -> None:
         self.__context = context
         self.__controller = controller
         self.__auth_store = auth_store
 
-        local_path = None
+        local_path: Optional[str] = None
         if getattr(context, "config", None) is not None and getattr(context.config, "lftp", None) is not None:
-            local_path = getattr(context.config.lftp, "local_path", None)
+            local_path_value: object = getattr(context.config.lftp, "local_path", None)
+            local_path = local_path_value if isinstance(local_path_value, str) else None
 
         self.controller_handler = ControllerHandler(controller, local_path=local_path)
         self.server_handler = ServerHandler(context)
@@ -72,13 +95,21 @@ class WebAppBuilder:
         StatusStreamHandler.register(web_app=web_app,
                                      status=self.__context.status)
 
-        LogStreamHandler.register(web_app=web_app,
-                                  logger=self.__context.logger)
+        log_stream_registrar: object = LogStreamHandler
+        if not isinstance(log_stream_registrar, _LoggerStreamRegistrar):
+            raise TypeError("Log stream handler does not support registration")
+        _register_log_stream(log_stream_registrar, web_app, self.__context.logger)
 
-        ModelStreamHandler.register(web_app=web_app,
-                                    controller=self.__controller)
+        model_stream_registrar: object = ModelStreamHandler
+        if not isinstance(model_stream_registrar, _ControllerStreamRegistrar):
+            raise TypeError("Model stream handler does not support registration")
+        model_stream_registrar.register(web_app=web_app,
+                                        controller=self.__controller)
 
-        HeartbeatStreamHandler.register(web_app=web_app)
+        heartbeat_stream_registrar: object = HeartbeatStreamHandler
+        if not isinstance(heartbeat_stream_registrar, _EmptyStreamRegistrar):
+            raise TypeError("Heartbeat stream handler does not support registration")
+        heartbeat_stream_registrar.register(web_app=web_app)
 
         self.controller_handler.add_routes(web_app)
         self.server_handler.add_routes(web_app)
