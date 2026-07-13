@@ -38,7 +38,7 @@ class Sshcp:
     )
 
     def __init__(self,
-                 host: str,
+                 host: Optional[str],
                  port: int,
                  user: Optional[str] = None,
                  password: Optional[str] = None):
@@ -244,7 +244,7 @@ class Sshcp:
         return self.__detected_shell
 
     def __check_remote_shells_via_sftp(self) -> List[str]:
-        available_shells = []
+        available_shells: List[str] = []
         for shell_path in self.SHELL_CANDIDATES:
             try:
                 self.__sftp_stat(shell_path)
@@ -355,11 +355,9 @@ class Sshcp:
                     else:
                         os.environ["RES_OPTIONS"] = resolver_options
         else:
-            from pexpect.popen_spawn import PopenSpawn
-
             resolved_command = shutil.which(command) or command
             try:
-                return PopenSpawn([resolved_command] + command_args), True
+                return pexpect.popen_spawn.PopenSpawn([resolved_command] + command_args), True
             finally:
                 if resolver_modified:
                     if resolver_options is None:
@@ -369,8 +367,8 @@ class Sshcp:
 
     def __run_command(self,
                       command: str,
-                      flags: list,
-                      args: list) -> bytes:
+                      flags: List[str],
+                      args: List[str]) -> bytes:
 
         command_args = [command]
         command_args += flags

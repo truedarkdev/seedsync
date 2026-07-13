@@ -3,3 +3,5 @@
 from .lftp import Lftp, LftpError
 from .job_status import LftpJobStatus
 from .job_status_parser import LftpJobStatusParser, LftpJobStatusParserError
+
+__all__ = ["Lftp", "LftpError", "LftpJobStatus", "LftpJobStatusParser", "LftpJobStatusParserError"]

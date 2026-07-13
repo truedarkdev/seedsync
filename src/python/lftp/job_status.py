@@ -1,8 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from collections import namedtuple
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from model import ModelFile
 
@@ -19,12 +18,7 @@ class LftpJobStatus:
         QUEUED = 0
         RUNNING = 1
 
-    class TransferState(namedtuple("TransferState",
-                                   ["size_local",
-                                    "size_remote",
-                                    "percent_local",
-                                    "speed",
-                                    "eta"])):
+    class TransferState(NamedTuple):
         """
         State of transfer for a file or entire download
           size_local: size in bytes that have been downloaded
@@ -33,7 +27,11 @@ class LftpJobStatus:
           speed: transfer speed in bytes per second
           eta: est. remaining transfer time in seconds
         """
-        pass
+        size_local: int | None
+        size_remote: int | None
+        percent_local: int | None
+        speed: int | None
+        eta: int | None
 
     def __init__(self,
                  job_id: int,
@@ -50,12 +48,12 @@ class LftpJobStatus:
         self.__flags = flags
         self.__remote_path = remote_path.strip() if remote_path is not None else None
         self.__local_path = local_path.strip() if local_path is not None else None
-        self.__path_pair_id = None
-        self.__path_pair_name = None
+        self.__path_pair_id: str | None = None
+        self.__path_pair_name: str | None = None
         self.__total_transfer_state = LftpJobStatus.TransferState(None, None, None, None, None)
         # dict of active file transfer states, maps filename to their transfer state
         # there's no hierarchical info for now
-        self.__active_files_state = {}
+        self.__active_files_state: dict[str, LftpJobStatus.TransferState] = {}
 
     @property
     def id(self) -> int: return self.__id
@@ -119,7 +117,9 @@ class LftpJobStatus:
         """
         return list(zip(self.__active_files_state.keys(), self.__active_files_state.values()))
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, LftpJobStatus):
+            return NotImplemented
         ignored = {
             "_LftpJobStatus__remote_path",
             "_LftpJobStatus__local_path",
@@ -130,8 +130,8 @@ class LftpJobStatus:
         other_dict = {k: v for k, v in other.__dict__.items() if k not in ignored}
         return self_dict == other_dict
 
-    def __str__(self):
+    def __str__(self) -> str:
         return str(self.__dict__)
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self.__dict__)

@@ -5,7 +5,7 @@ import re
 import os
 import time
 from functools import wraps
-from typing import Any, Callable, Union, List, Optional, Dict, Iterable
+from typing import Any, Callable, Union, List, Optional, Dict, Iterable, Concatenate, ParamSpec, Protocol, TypeVar
 
 # 3rd party libs
 import pexpect
@@ -23,6 +23,19 @@ MAX_CONSECUTIVE_STATUS_ERRORS = 10
 MAX_KILL_MATCH_ATTEMPTS = 20
 STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS = 1.0
 redact_credentials = redact_sensitive_text
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+
+
+class _PathPair(Protocol):
+    @property
+    def id(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def remote_path(self) -> str: ...
+    @property
+    def local_path(self) -> str: ...
 
 
 class LftpError(AppError):
@@ -183,7 +196,10 @@ class Lftp:
                 "refusing to transfer over cleartext FTP"
             )
 
-    def with_check_process(method: Callable):  # type: ignore[override]
+    @staticmethod
+    def with_check_process(
+        method: Callable[Concatenate["Lftp", _P], _R]
+    ) -> Callable[Concatenate["Lftp", _P], _R]:
         """
         Decorator that checks for a valid process before executing
         the decorated method
@@ -191,8 +207,8 @@ class Lftp:
         :return:
         """
         @wraps(method)
-        def wrapper(inst: "Lftp", *args, **kwargs):
-            if inst.__process is None or not inst.__process.isalive():
+        def wrapper(inst: "Lftp", *args: _P.args, **kwargs: _P.kwargs) -> _R:
+            if not inst.__process.isalive():
                 raise LftpError("lftp process is not running")
             return method(inst, *args, **kwargs)
         return wrapper
@@ -207,7 +223,7 @@ class Lftp:
     def set_base_local_dir_path(self, base_local_dir_path: str):
         self.__base_local_dir_path = base_local_dir_path
 
-    def set_path_pairs(self, path_pairs):
+    def set_path_pairs(self, path_pairs: Iterable[_PathPair]):
         self.__path_pairs_by_id = {
             pair.id: {
                 "name": pair.name,
@@ -280,7 +296,7 @@ class Lftp:
             raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
     @with_check_process
-    def __run_command(self, command: str, timeout_seconds: Optional[int] = None, require_prompt_ready: bool = True, status_poll: bool = False):
+    def __run_command(self, command: str, timeout_seconds: Optional[int] = None, require_prompt_ready: bool = True, status_poll: bool = False) -> str:
         self.__last_command_timed_out = False
         restore_delaybeforesend = None
         restore_delayafterread = None
@@ -462,7 +478,7 @@ class Lftp:
         """
         out = self.__run_command("set -a | grep {}".format(setting))  # type: ignore[arg-type]
         m = re.search(r"^set {} (.*)$".format(re.escape(setting)), out, re.MULTILINE)
-        if not m or not m.group or not m.group(1):
+        if not m or not m.group(1):
             raise LftpError("Failed to get setting '{}'. Output: '{}'".format(setting, out))
         return m.group(1).strip()
 
@@ -766,7 +782,7 @@ class Lftp:
                 "-o",
                 Lftp.__quote_command_argument("{local_dir}/".format(local_dir=local_dir)),
             ])
-        command = " ".join(part for part in parts if part is not None)
+        command = " ".join(parts)
         self.logger.debug("queue command: %s", command)
         self.__run_command(command, require_prompt_ready=False)  # type: ignore[arg-type]
 
@@ -780,14 +796,14 @@ class Lftp:
         :param name:
         :return: True if job of given name was found, False otherwise
         """
-        def find_matching_jobs():
+        def find_matching_jobs() -> tuple[List[LftpJobStatus], List[LftpJobStatus], bool]:
             statuses = self.status()
             if statuses is None:
                 # Parser failures come back as None; treat them as an empty
                 # snapshot so the retry loop can keep probing safely.
                 statuses = []
             status_poll_healthy = self.last_status_poll_healthy
-            matching_jobs = []
+            matching_jobs: List[LftpJobStatus] = []
             for status in statuses:
                 if status.name != name:
                     continue
@@ -817,7 +833,7 @@ class Lftp:
             return statuses, matching_jobs, status_poll_healthy
 
         killed_any = False
-        previous_match_signature = None
+        previous_match_signature: Optional[tuple[tuple[int, LftpJobStatus.State], ...]] = None
         attempts = 0
         while attempts < MAX_KILL_MATCH_ATTEMPTS:
             statuses, matching_jobs, status_poll_healthy = find_matching_jobs()

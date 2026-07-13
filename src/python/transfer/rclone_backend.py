@@ -12,7 +12,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Dict, Iterable, List, Optional
+from typing import Deque, Dict, Iterable, List, Optional, Protocol
 
 from common import AppError, Constants
 from common.exclude_patterns import parse_exclude_patterns
@@ -21,8 +21,19 @@ from lftp import LftpJobStatus
 
 
 class RcloneTransferError(AppError):
-    def __init__(self, message: str = ""):
+    def __init__(self, message: Optional[str] = ""):
         super().__init__(redact_sensitive_text("" if message is None else message))
+
+
+class _PathPair(Protocol):
+    @property
+    def id(self) -> str: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def remote_path(self) -> str: ...
+    @property
+    def local_path(self) -> str: ...
 
 
 @dataclass
@@ -99,7 +110,7 @@ class RcloneTransferBackend:
     def set_base_local_dir_path(self, base_local_dir_path: str):
         self.__base_local_dir_path = base_local_dir_path
 
-    def set_path_pairs(self, path_pairs):
+    def set_path_pairs(self, path_pairs: Iterable[_PathPair]):
         self.__path_pairs_by_id = {
             pair.id: {
                 "name": pair.name,
@@ -172,7 +183,7 @@ class RcloneTransferBackend:
         return self.__rate_limit
 
     @rate_limit.setter
-    def rate_limit(self, value):
+    def rate_limit(self, value: object):
         self.__rate_limit = "0" if value in (None, "") else str(value)
 
     @property
@@ -180,7 +191,7 @@ class RcloneTransferBackend:
         return self.__net_socket_buffer
 
     @net_socket_buffer.setter
-    def net_socket_buffer(self, value):
+    def net_socket_buffer(self, value: object):
         self.__net_socket_buffer = "" if value is None else str(value)
 
     @property
@@ -369,7 +380,7 @@ class RcloneTransferBackend:
                 self.__running_jobs[job.job_id] = job
 
     def __reap_finished_jobs(self, force: bool = False):
-        finished_job_ids = []
+        finished_job_ids: List[int] = []
         for job_id, job in list(self.__running_jobs.items()):
             process = job.process
             if process is None:
@@ -462,7 +473,7 @@ class RcloneTransferBackend:
         return rclone_executable
 
     @staticmethod
-    def __validate_config_field(field_name: str, value: str) -> str:
+    def __validate_config_field(field_name: str, value: object) -> str:
         if not isinstance(value, str):
             raise RcloneTransferError("Invalid rclone {} value.".format(field_name))
         if any(ord(char) < 32 or ord(char) == 127 for char in value):
