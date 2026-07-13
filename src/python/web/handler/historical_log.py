@@ -1,12 +1,15 @@
 import base64
+import io
 import json
 import logging
+import math
 import os
 import re
 import stat
 import uuid
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import NotRequired, TypeGuard, TypedDict
 
 import bottle
 from bottle import HTTPResponse
@@ -16,8 +19,36 @@ from common.redaction import redact_sensitive_text
 from ..web_app import IHandler, WebApp
 
 
+class HistoryRecord(TypedDict):
+    id: str
+    timestamp: str
+    epoch: int | float
+    level: str
+    level_number: int
+    logger: str
+    message: str | None
+    exception: str | None
+    truncated: NotRequired[bool]
+
+
+def _is_object_dict(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
+def _is_valid_epoch(value: object) -> TypeGuard[int | float]:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        try:
+            datetime.fromtimestamp(value, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return False
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
 def _query_value(name: str, default: str | None = None) -> str | None:
-    value = getattr(bottle.request.query, "get")(name, default)
+    value = bottle.request.query.get(name, default)
     return value if isinstance(value, str) else default
 
 
@@ -70,7 +101,7 @@ _CREDENTIAL_URL_REGEX = re.compile(
 )
 
 
-def _redact_history_text(value):
+def sanitize_log_text(value: object) -> str | None:
     if value is None:
         return None
     redacted = value if isinstance(value, str) else str(value)
@@ -86,7 +117,7 @@ def _redact_history_text(value):
     return _ABSOLUTE_PATH_REGEX.sub("**REDACTED_PATH**", redacted)
 
 
-def _truncate_text(value, maximum=MAX_RECORD_TEXT_BYTES):
+def _truncate_text(value: str | None, maximum: int = MAX_RECORD_TEXT_BYTES) -> tuple[str | None, bool]:
     if value is None:
         return None, False
     encoded = value.encode("utf-8")
@@ -95,10 +126,13 @@ def _truncate_text(value, maximum=MAX_RECORD_TEXT_BYTES):
     return encoded[:maximum].decode("utf-8", errors="ignore") + "...[TRUNCATED]", True
 
 
-def _sanitize_record_text(item):
+def _sanitize_record_text(item: HistoryRecord) -> HistoryRecord:
     truncated = bool(item.get("truncated", False))
-    for key in ("logger", "message", "exception"):
-        value, field_truncated = _truncate_text(_redact_history_text(item.get(key)))
+    logger_value, logger_truncated = _truncate_text(sanitize_log_text(item.get("logger")))
+    item["logger"] = logger_value or ""
+    truncated = truncated or logger_truncated
+    for key in ("message", "exception"):
+        value, field_truncated = _truncate_text(sanitize_log_text(item.get(key)))
         item[key] = value
         truncated = truncated or field_truncated
     item["truncated"] = truncated
@@ -120,7 +154,7 @@ class HistoricalJsonFormatter(logging.Formatter):
             exception = self.formatException(record.exc_info)
         elif record.exc_text:
             exception = record.exc_text
-        return json.dumps(_sanitize_record_text({
+        item: HistoryRecord = {
             "id": _record_id(record),
             "timestamp": datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
             "epoch": record.created,
@@ -129,10 +163,12 @@ class HistoricalJsonFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
             "exception": exception,
-        }), separators=(",", ":"))
+            "truncated": False,
+        }
+        return json.dumps(_sanitize_record_text(item), separators=(",", ":"))
 
 
-def _validate_owned_object(path, expected_mode):
+def _validate_owned_object(path: str, expected_mode: int) -> None:
     details = os.lstat(path)
     expected_type = stat.S_IFDIR if expected_mode == 0o700 else stat.S_IFREG
     if stat.S_IFMT(details.st_mode) != expected_type:
@@ -143,7 +179,7 @@ def _validate_owned_object(path, expected_mode):
     os.chmod(path, expected_mode)
 
 
-def _prepare_history_path(path, backup_count):
+def _prepare_history_path(path: str, backup_count: int) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     if os.path.lexists(directory):
         _validate_owned_object(directory, 0o700)
@@ -156,14 +192,14 @@ def _prepare_history_path(path, backup_count):
 
 
 class SecureRotatingFileHandler(RotatingFileHandler):
-    def __init__(self, filename, maxBytes, backupCount):
+    def __init__(self, filename: str, maxBytes: int, backupCount: int) -> None:
         self._history_backup_count = backupCount
         _prepare_history_path(filename, backupCount)
         super().__init__(filename, maxBytes=maxBytes, backupCount=backupCount,
                          encoding="utf-8", delay=True)
         self.stream = self._open()
 
-    def _open(self):
+    def _open(self) -> io.TextIOWrapper:
         _prepare_history_path(self.baseFilename, self._history_backup_count)
         flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -183,7 +219,7 @@ class SecureRotatingFileHandler(RotatingFileHandler):
             os.close(descriptor)
             raise
 
-    def doRollover(self):
+    def doRollover(self) -> None:
         super().doRollover()
         _prepare_history_path(self.baseFilename, self._history_backup_count)
 
@@ -195,12 +231,22 @@ def create_historical_log_handler(path: str, max_bytes: int, backup_count: int) 
 
 
 class HistoricalLogStore:
-    def __init__(self, path: str, backup_count: int):
+    def __init__(self, path: str, backup_count: int) -> None:
         self.path = path
         self.backup_count = backup_count
 
-    def query(self, *, start=None, end=None, levels=None, logger=None, text=None,
-              direction="desc", limit=DEFAULT_PAGE_SIZE, cursor=None):
+    def query(
+        self,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+        levels: set[str] | None = None,
+        logger: str | None = None,
+        text: str | None = None,
+        direction: str = "desc",
+        limit: int = DEFAULT_PAGE_SIZE,
+        cursor: str | None = None,
+    ) -> dict[str, object]:
         records, scanned, malformed, truncated = self._read_records()
         records.sort(key=lambda item: (item["epoch"], item["id"]), reverse=direction == "desc")
         if start is not None:
@@ -225,7 +271,7 @@ class HistoricalLogStore:
                 raise ValueError("invalid cursor")
             offset = indexes[0] + 1
         candidates = records[offset:offset + limit]
-        page = []
+        page: list[HistoryRecord] = []
         output_bytes = 0
         output_truncated = False
         for item in candidates:
@@ -250,8 +296,8 @@ class HistoricalLogStore:
                          "output_truncated": output_truncated},
         }
 
-    def _read_records(self):
-        records = []
+    def _read_records(self) -> tuple[list[HistoryRecord], int, int, bool]:
+        records: list[HistoryRecord] = []
         scanned = 0
         malformed = 0
         truncated = False
@@ -283,7 +329,7 @@ class HistoricalLogStore:
                         truncated = True
                     for raw_line in lines:
                         try:
-                            item = json.loads(raw_line.decode("utf-8"))
+                            item: object = json.loads(raw_line.decode("utf-8"))
                             if not self._valid_record(item):
                                 raise ValueError()
                             records.append(_sanitize_record_text(item))
@@ -297,27 +343,39 @@ class HistoricalLogStore:
         return records, scanned, malformed, truncated
 
     @staticmethod
-    def _valid_record(item):
-        return (isinstance(item, dict) and isinstance(item.get("id"), str) and
-                0 < len(item["id"]) <= 128 and re.fullmatch(r"[A-Za-z0-9._-]+", item["id"]) is not None and
-                isinstance(item.get("epoch"), (int, float)) and isinstance(item.get("level"), str) and
+    def _valid_record(item: object) -> TypeGuard[HistoryRecord]:
+        if not _is_object_dict(item):
+            return False
+        record_id = item.get("id")
+        epoch = item.get("epoch")
+        level_number = item.get("level_number")
+        truncated = item.get("truncated", False)
+        return (isinstance(record_id, str) and
+                0 < len(record_id) <= 128 and re.fullmatch(r"[A-Za-z0-9._-]+", record_id) is not None and
+                isinstance(item.get("timestamp"), str) and
+                _is_valid_epoch(epoch) and
+                isinstance(item.get("level"), str) and
+                isinstance(level_number, int) and not isinstance(level_number, bool) and
                 isinstance(item.get("logger"), str) and isinstance(item.get("message"), (str, type(None))) and
-                isinstance(item.get("exception"), (str, type(None))))
+                isinstance(item.get("exception"), (str, type(None))) and type(truncated) is bool)
 
     @staticmethod
-    def _encode_cursor(record_id):
+    def _encode_cursor(record_id: str) -> str:
         payload = json.dumps({"v": 1, "id": record_id}, separators=(",", ":")).encode()
         return base64.urlsafe_b64encode(payload).decode().rstrip("=")
 
     @staticmethod
-    def _decode_cursor(cursor):
+    def _decode_cursor(cursor: object) -> str:
         if not isinstance(cursor, str) or len(cursor) > 256 or not re.fullmatch(r"[A-Za-z0-9_-]+", cursor):
             raise ValueError("invalid cursor")
         try:
-            payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
-            if payload.get("v") != 1 or not isinstance(payload.get("id"), str):
+            payload: object = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+            if not _is_object_dict(payload) or payload.get("v") != 1 or not isinstance(payload.get("id"), str):
                 raise ValueError()
-            return payload["id"]
+            record_id = payload["id"]
+            if not isinstance(record_id, str):
+                raise ValueError()
+            return record_id
         except (ValueError, TypeError, json.JSONDecodeError):
             raise ValueError("invalid cursor")
 
@@ -325,14 +383,14 @@ class HistoricalLogStore:
 class HistoricalLogHandler(IHandler):
     _LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
-    def __init__(self, store: HistoricalLogStore, logger: logging.Logger):
+    def __init__(self, store: HistoricalLogStore, logger: logging.Logger) -> None:
         self.store = store
         self.logger = logger
 
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_handler("/server/logs/history/v1", self._get, required_scope="admin")
 
-    def _get(self):
+    def _get(self) -> HTTPResponse:
         try:
             limit = self._integer("limit", DEFAULT_PAGE_SIZE, 1, MAX_PAGE_SIZE)
             start = self._timestamp("start")
@@ -358,7 +416,7 @@ class HistoricalLogHandler(IHandler):
                                 content_type="application/json")
 
     @staticmethod
-    def _integer(name, default, minimum, maximum):
+    def _integer(name: str, default: int, minimum: int, maximum: int) -> int:
         raw = _query_value(name)
         try:
             value = default if not raw else int(raw)
@@ -369,7 +427,7 @@ class HistoricalLogHandler(IHandler):
         return value
 
     @staticmethod
-    def _timestamp(name):
+    def _timestamp(name: str) -> float | None:
         raw = _query_value(name)
         if not raw:
             return None
@@ -382,7 +440,7 @@ class HistoricalLogHandler(IHandler):
         return value
 
     @staticmethod
-    def _bounded(name, maximum):
+    def _bounded(name: str, maximum: int) -> str | None:
         value = _query_value(name)
         if value is not None and len(value) > maximum:
             raise ValueError("invalid {}".format(name))

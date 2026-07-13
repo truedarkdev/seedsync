@@ -19,11 +19,11 @@ class StreamQueue(Generic[T]):
 
     def __init__(self, maxsize: int = DEFAULT_MAXSIZE):
         self.__maxsize = maxsize
-        self.__queue = Queue(maxsize=maxsize)
+        self.__queue: Queue[T] = Queue(maxsize=maxsize)
         self.__dropped_count = 0
         self.__put_lock = Lock()
 
-    def put(self, event: T):
+    def put(self, event: T) -> None:
         if self.__maxsize == 0:
             self.__queue.put(event)
             return

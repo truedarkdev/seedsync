@@ -273,6 +273,27 @@ class TestSerializeLogRecord(unittest.TestCase):
             data["exc_tb"]
         )
 
+    def test_live_record_uses_history_path_and_credential_sanitizer(self):
+        record = logging.LogRecord(
+            "/srv/private/logger",
+            logging.ERROR,
+            __file__,
+            1,
+            "failed sftp://alice:secret@example.test at /home/alice/private/file",
+            (),
+            None,
+        )
+        record.exc_text = "Authorization: Bearer secret-token path=/etc/seedsync/config"
+
+        data = json.loads(parse_stream(SerializeLogRecord().record(record))["data"])
+
+        serialized = json.dumps(data)
+        for secret_value in (
+            "/srv/private/logger", "alice", "secret", "example.test",
+            "/home/alice/private/file", "secret-token", "/etc/seedsync/config",
+        ):
+            self.assertNotIn(secret_value, serialized)
+
 
 class TestRedactSensitive(unittest.TestCase):
     def test_redact_sftp_url(self):
@@ -294,7 +315,7 @@ class TestRedactSensitive(unittest.TestCase):
         self.assertNotIn("pa/ss", result)
         self.assertNotIn("seedbox.example.com", result)
         self.assertNotIn("mirror.example.net", result)
-        self.assertIn("ftp://**REDACTED**@**REDACTED**/downloads", result)
+        self.assertIn("ftp://**REDACTED**@**REDACTED****REDACTED_PATH**", result)
         self.assertIn("ftps://**REDACTED**@**REDACTED**:21/files", result)
 
     def test_redact_ssh_command_args_user_at_host(self):
@@ -372,10 +393,10 @@ class TestRedactSensitive(unittest.TestCase):
         result = SerializeLogRecord._redact_sensitive(msg)
         self.assertEqual(msg, result)
 
-    def test_no_redact_embedded_at_in_path(self):
+    def test_redact_absolute_path_even_when_filename_contains_at(self):
         msg = "/downloads/show@720p/file.mkv"
         result = SerializeLogRecord._redact_sensitive(msg)
-        self.assertEqual(msg, result)
+        self.assertEqual("**REDACTED_PATH**", result)
 
     def test_no_redact_filename_like_token_with_letter_suffix(self):
         msg = "Now playing episode@final.mkv"

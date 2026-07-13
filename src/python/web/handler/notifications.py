@@ -1,5 +1,6 @@
 import json
 import logging
+from typing import TypeGuard
 
 import bottle
 from bottle import HTTPResponse
@@ -14,6 +15,10 @@ from ..web_app import IHandler, WebApp
 logger = logging.getLogger(__name__)
 
 
+def _is_object_dict(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
 class NotificationsAdminHandler(IHandler):
     _BOOLEAN_FIELDS = (
         "enabled", "allow_private_networks", "download_start", "download_complete",
@@ -23,31 +28,31 @@ class NotificationsAdminHandler(IHandler):
     _WRITE_ONLY_FIELDS = ("webhook_url", "hmac_secret", "apprise_url")
     _ALLOWED_FIELDS = frozenset(_BOOLEAN_FIELDS + _TEXT_FIELDS + _WRITE_ONLY_FIELDS)
 
-    def __init__(self, config: Config, notifier: NotificationService):
+    def __init__(self, config: Config, notifier: NotificationService) -> None:
         self._config = config
         self._notifier = notifier
 
     @staticmethod
-    def _json_response(payload, status=200):
+    def _json_response(payload: object, status: int = 200) -> HTTPResponse:
         return HTTPResponse(body=json.dumps(payload), status=status,
                             headers={"Content-Type": "application/json"})
 
     @staticmethod
-    def _load_json():
-        raw = getattr(bottle.request.body, "read")().decode("utf-8")
-        value = json.loads(raw) if raw.strip() else {}
-        if not isinstance(value, dict):
+    def _load_json() -> dict[str, object]:
+        raw = bottle.request.body.read().decode("utf-8")
+        value: object = json.loads(raw) if raw.strip() else {}
+        if not _is_object_dict(value):
             raise ValueError("Request body must be a JSON object")
         return value
 
     @overrides(IHandler)
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_post_handler("/server/admin/notifications/v1/config", self._handle_update,
                                  required_scope="admin")
         web_app.add_post_handler("/server/admin/notifications/v1/test", self._handle_test,
                                  required_scope="admin")
 
-    def _handle_update(self):
+    def _handle_update(self) -> HTTPResponse:
         try:
             data = self._load_json()
             if set(data).difference(self._ALLOWED_FIELDS):
@@ -97,7 +102,7 @@ class NotificationsAdminHandler(IHandler):
             logger.exception("Failed to update notification configuration")
             return self._json_response({"error": "Failed to update notification configuration"}, status=500)
 
-    def _handle_test(self):
+    def _handle_test(self) -> HTTPResponse:
         try:
             self._notifier.test_delivery()
             return self._json_response({"delivered": True})

@@ -459,6 +459,119 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, response.status_int)
         self.assertIn("text/event-stream", response.headers["Content-Type"])
 
+    def test_stream_only_key_cannot_receive_admin_log_handlers(self):
+        construction_log: list[str] = []
+        cleanup_log: list[str] = []
+
+        class ScopedStreamHandler(IStreamHandler):
+            def __init__(self, label: str, event: str, stop_callback):
+                self.label = label
+                self.event = event
+                self.stop_callback = stop_callback
+                self.emitted = False
+                construction_log.append(label)
+
+            def setup(self):
+                pass
+
+            def get_value(self):
+                if self.emitted:
+                    return None
+                self.emitted = True
+                self.stop_callback()
+                return self.event
+
+            def cleanup(self):
+                cleanup_log.append(self.label)
+
+        store = ApiKeyStore()
+        stream_secret = store.create_api_key("streamer", ["stream"])["secret"]
+        read_secret = store.create_api_key("reader", ["stream", "read"])["secret"]
+        write_secret = store.create_api_key("writer", ["stream", "write"])["secret"]
+        admin_secret = store.create_api_key("admin", ["admin"])["secret"]
+        web_app = WebApp(self.context, MagicMock(), auth_store=store)
+        web_app.add_streaming_handler(
+            ScopedStreamHandler,
+            label="stream",
+            event="model-event\n",
+            stop_callback=web_app.stop,
+        )
+        web_app.add_streaming_handler(
+            ScopedStreamHandler,
+            required_scope="admin",
+            label="admin",
+            event="log-event\n",
+            stop_callback=web_app.stop,
+        )
+        web_app.add_streaming_handler(
+            ScopedStreamHandler,
+            required_scope="read",
+            label="read",
+            event="read-event\n",
+            stop_callback=web_app.stop,
+        )
+        web_app.add_streaming_handler(
+            ScopedStreamHandler,
+            required_scope="write",
+            label="write",
+            event="write-event\n",
+            stop_callback=web_app.stop,
+        )
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        stream_response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(stream_secret)},
+        )
+
+        self.assertIn("model-event", stream_response.text)
+        self.assertNotIn("log-event", stream_response.text)
+        self.assertNotIn("read-event", stream_response.text)
+        self.assertNotIn("write-event", stream_response.text)
+        self.assertEqual(["stream"], construction_log)
+        self.assertEqual(["stream"], cleanup_log)
+
+        object.__setattr__(web_app, "_stop", False)
+        construction_log.clear()
+        cleanup_log.clear()
+        read_response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(read_secret)},
+        )
+        self.assertIn("read-event", read_response.text)
+        self.assertNotIn("write-event", read_response.text)
+        self.assertNotIn("log-event", read_response.text)
+        self.assertEqual(["stream", "read"], construction_log)
+        self.assertEqual(["stream", "read"], cleanup_log)
+
+        object.__setattr__(web_app, "_stop", False)
+        construction_log.clear()
+        cleanup_log.clear()
+        write_response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(write_secret)},
+        )
+        self.assertIn("write-event", write_response.text)
+        self.assertNotIn("read-event", write_response.text)
+        self.assertNotIn("log-event", write_response.text)
+        self.assertEqual(["stream", "write"], construction_log)
+        self.assertEqual(["stream", "write"], cleanup_log)
+
+        object.__setattr__(web_app, "_stop", False)
+        construction_log.clear()
+        cleanup_log.clear()
+        admin_response = client.get(
+            "/server/stream",
+            extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(admin_secret)},
+        )
+
+        self.assertIn("log-event", admin_response.text)
+        self.assertIn("read-event", admin_response.text)
+        self.assertIn("write-event", admin_response.text)
+        self.assertEqual(["stream", "admin", "read", "write"], construction_log)
+        self.assertEqual(["stream", "admin", "read", "write"], cleanup_log)
+
     def test_stream_rejects_legacy_token(self):
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
