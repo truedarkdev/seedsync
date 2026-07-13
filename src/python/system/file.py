@@ -1,7 +1,19 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
-from typing import Any, List
+from typing import List, NotRequired, TypedDict
 from datetime import datetime
+
+
+class SystemFileData(TypedDict):
+    name: str
+    size: int
+    is_dir: bool
+    time_created: NotRequired[str | None]
+    time_modified: NotRequired[str | None]
+    path_pair_id: NotRequired[str]
+    path_pair_name: NotRequired[str]
+    is_staging: NotRequired[bool]
+    children: NotRequired[list["SystemFileData"]]
 
 
 class SystemFile:
@@ -22,16 +34,18 @@ class SystemFile:
         self.__is_dir = is_dir
         self.__timestamp_created = time_created
         self.__timestamp_modified = time_modified
-        self.__children = []
-        self.__path_pair_id = None
-        self.__path_pair_name = None
+        self.__children: list[SystemFile] = []
+        self.__path_pair_id: str | None = None
+        self.__path_pair_name: str | None = None
         self.__is_staging = is_staging
         self.__status_sidecar_ready = False
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SystemFile):
+            return NotImplemented
         return self.__dict__ == other.__dict__
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return str(self.__dict__)
 
     @property
@@ -93,8 +107,8 @@ class SystemFile:
             raise TypeError("Cannot add children to a file")
         self.__children.append(file)
 
-    def to_dict(self) -> dict[str, Any]:
-        d = {
+    def to_dict(self) -> SystemFileData:
+        d: SystemFileData = {
             "name": self.__name,
             "size": self.__size,
             "is_dir": self.__is_dir,
@@ -114,7 +128,7 @@ class SystemFile:
         return d
 
     @classmethod
-    def from_dict(cls, data: dict) -> "SystemFile":
+    def from_dict(cls, data: SystemFileData) -> "SystemFile":
         time_created = None
         time_modified = None
         if "time_created" in data and data["time_created"] is not None:

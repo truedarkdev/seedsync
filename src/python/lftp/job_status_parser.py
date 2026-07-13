@@ -84,7 +84,7 @@ class LftpJobStatusParser:
         return eta_d*24*3600 + eta_h*3600 + eta_m*60 + eta_s
 
     def parse(self, output: str) -> List[LftpJobStatus]:
-        statuses = list()
+        statuses: list[LftpJobStatus] = []
         lines = [s.strip() for s in output.splitlines()]
         lines = list(filter(None, lines))  # remove blank lines
         # lftp in a PTY can leak bracketed-paste toggle lines into the status output.
@@ -128,7 +128,7 @@ class LftpJobStatusParser:
 
     @staticmethod
     def __parse_jobs(lines: List[str]) -> List[LftpJobStatus]:
-        jobs = []
+        jobs: list[LftpJobStatus] = []
         logger = logging.getLogger("LftpJobStatusParser")
 
         # Header patterns
@@ -570,7 +570,7 @@ class LftpJobStatusParser:
 
     @staticmethod
     def __parse_queue(lines: List[str]) -> List[LftpJobStatus]:
-        queue = []
+        queue: list[LftpJobStatus] = []
 
         queue_done_m = re.compile(LftpJobStatusParser.__QUEUE_DONE_REGEX)
         if len(lines) == 1:
