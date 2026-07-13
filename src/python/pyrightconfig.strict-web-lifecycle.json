@@ -1,0 +1,22 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "web/web_app_job.py",
+    "web/web_app_builder.py",
+    "web/handler/controller.py",
+    "web/handler/server.py",
+    "web/handler/status.py",
+    "web/__init__.py",
+    "web/serialize/__init__.py",
+    "web/serialize/serialize.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}

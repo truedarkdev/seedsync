@@ -8,11 +8,11 @@ from ..serialize import SerializeStatusJson
 
 
 class StatusHandler(IHandler):
-    def __init__(self, status: Status):
+    def __init__(self, status: Status) -> None:
         self.__status = status
 
     @overrides(IHandler)
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_handler(
             "/server/status",
             self.__handle_get_status,
@@ -20,6 +20,6 @@ class StatusHandler(IHandler):
             allow_sessionless_ui=True
         )
 
-    def __handle_get_status(self):
+    def __handle_get_status(self) -> HTTPResponse:
         out_json = SerializeStatusJson.status(self.__status)
         return HTTPResponse(body=out_json)

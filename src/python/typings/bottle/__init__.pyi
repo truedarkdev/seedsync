@@ -1,5 +1,6 @@
 from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from typing import Never, ParamSpec, Protocol, TypeVar, overload
+from wsgiref.types import WSGIApplication
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -110,7 +111,7 @@ class ServerAdapter:
     port: int
     quiet: bool
     def __init__(self, host: str = "127.0.0.1", port: int = 8080, **options: object) -> None: ...
-    def run(self, handler: Callable[[MutableMapping[str, object], Callable[[str, list[tuple[str, str]]], object]], Iterable[bytes]]) -> None: ...
+    def run(self, handler: WSGIApplication) -> None: ...
 
 def run(
     app: Bottle | None = None,

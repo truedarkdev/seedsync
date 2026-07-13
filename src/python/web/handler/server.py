@@ -7,26 +7,26 @@ from ..web_app import IHandler, WebApp
 
 
 class ServerHandler(IHandler):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context) -> None:
         self.logger = context.logger.getChild("ServerActionHandler")
         self.__request_restart = False
 
     @overrides(IHandler)
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_post_handler(
             "/server/command/restart",
             self.__handle_action_restart,
             required_scope="write"
         )
 
-    def is_restart_requested(self):
+    def is_restart_requested(self) -> bool:
         """
         Returns true is a restart is requested
         :return:
         """
         return self.__request_restart
 
-    def __handle_action_restart(self):
+    def __handle_action_restart(self) -> HTTPResponse:
         """
         Request a server restart
         :return:
