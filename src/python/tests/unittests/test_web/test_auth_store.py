@@ -4,6 +4,7 @@ import unittest
 import json
 import threading
 
+from common import PersistError
 from web.auth_store import ApiKeyStore
 
 
@@ -96,6 +97,53 @@ class TestApiKeyStore(unittest.TestCase):
 
         self.assertEqual(0, len(store.list_api_keys()))
         self.assertEqual(0, store.active_admin_key_count)
+
+    def test_malformed_persisted_record_scalar_types_are_rejected(self):
+        api_key_record = {
+            "id": "key-id",
+            "name": "admin",
+            "scopes": ["admin"],
+            "secret_hash": "hash",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "updated_at": "2026-01-01T00:00:00+00:00",
+            "revoked_at": None,
+        }
+        ui_session_record = {
+            "secret": "session",
+            "scopes": ["read"],
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "expires_at": "2026-01-01T01:00:00+00:00",
+            "bootstrap": False,
+            "remembered": False,
+            "api_key_id": None,
+            "api_key_secret_hash": None,
+        }
+        malformed_fields = [
+            ("api_key", field_name, 7)
+            for field_name in ("id", "name", "secret_hash", "created_at", "updated_at", "revoked_at")
+        ] + [
+            ("ui_session", field_name, 7)
+            for field_name in (
+                "secret", "created_at", "expires_at", "api_key_id", "api_key_secret_hash"
+            )
+        ] + [
+            ("ui_session", field_name, "yes")
+            for field_name in ("bootstrap", "remembered")
+        ]
+
+        for record_type, field_name, invalid_value in malformed_fields:
+            payload = {"version": 3, "api_keys": [], "ui_sessions": []}
+            if record_type == "api_key":
+                record = dict(api_key_record)
+                payload["api_keys"] = [record]
+            else:
+                record = dict(ui_session_record)
+                payload["ui_sessions"] = [record]
+            record[field_name] = invalid_value
+
+            with self.subTest(record_type=record_type, field_name=field_name):
+                with self.assertRaises(PersistError):
+                    ApiKeyStore.from_str(json.dumps(payload))
 
     def test_bootstrap_proof_is_created_published_consumed_and_not_replayed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
