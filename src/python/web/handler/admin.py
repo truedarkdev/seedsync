@@ -1,6 +1,7 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
 import json
+from typing import TypeGuard
 
 import bottle
 from bottle import HTTPResponse
@@ -10,13 +11,28 @@ from ..auth_store import ApiKeyStore
 from ..web_app import IHandler, WebApp
 
 
+def _is_object_dict(value: object) -> TypeGuard[dict[str, object]]:
+    return isinstance(value, dict)
+
+
+def _is_object_list(value: object) -> TypeGuard[list[object]]:
+    return isinstance(value, list)
+
+
+def _is_string_list(value: object) -> TypeGuard[list[str]]:
+    return _is_object_list(value) and all(isinstance(item, str) for item in value)
+
+
 class AdminHandler(IHandler):
-    def __init__(self, config: Config, auth_store: ApiKeyStore):
+    _UI_SESSION_COOKIE_NAME = "seedsync_ui_session"
+    _BOOTSTRAP_EXCHANGE_COOKIE_NAME = "seedsync_bootstrap_exchange"
+
+    def __init__(self, config: Config, auth_store: ApiKeyStore) -> None:
         self.__config = config
         self.__auth_store = auth_store
 
     @staticmethod
-    def __json_response(payload, status: int = 200):
+    def __json_response(payload: object, status: int = 200) -> HTTPResponse:
         return HTTPResponse(
             body=json.dumps(payload),
             status=status,
@@ -24,14 +40,17 @@ class AdminHandler(IHandler):
         )
 
     @staticmethod
-    def __load_request_json():
-        raw_body = getattr(bottle.request.body, "read")().decode("utf-8")
+    def __load_request_json() -> dict[str, object]:
+        raw_body = bottle.request.body.read().decode("utf-8")
         if not raw_body.strip():
             return {}
-        return json.loads(raw_body)
+        value: object = json.loads(raw_body)
+        if not _is_object_dict(value):
+            raise ValueError("Request body must be a JSON object")
+        return value
 
     @overrides(IHandler)
-    def add_routes(self, web_app: WebApp):
+    def add_routes(self, web_app: WebApp) -> None:
         web_app.add_post_handler(
             "/server/admin/bootstrap/v1/exchange",
             self.__handle_exchange_bootstrap_proof,
@@ -66,7 +85,7 @@ class AdminHandler(IHandler):
             required_scope="admin"
         )
 
-    def __handle_exchange_bootstrap_proof(self):
+    def __handle_exchange_bootstrap_proof(self) -> HTTPResponse:
         if self.__auth_store.active_admin_key_count > 0:
             return self.__json_response({"error": "Bootstrap proof exchange is only available before the first admin API key exists"}, status=409)
 
@@ -77,7 +96,7 @@ class AdminHandler(IHandler):
                 return self.__json_response({"error": "Bootstrap proof is required"}, status=400)
 
             proof = proof.strip()
-            exchange_secret = bottle.request.get_cookie(WebApp._BOOTSTRAP_EXCHANGE_COOKIE_NAME)
+            exchange_secret = bottle.request.get_cookie(self._BOOTSTRAP_EXCHANGE_COOKIE_NAME)
             peek_exchange = getattr(self.__auth_store, "peek_bootstrap_exchange", None)
             consume_exchange = getattr(self.__auth_store, "consume_bootstrap_exchange", None)
             if peek_exchange is None or consume_exchange is None or not peek_exchange(exchange_secret):
@@ -95,9 +114,9 @@ class AdminHandler(IHandler):
             response = self.__json_response({
                 "expires_at": ui_session.expires_at,
             })
-            response.delete_cookie(WebApp._BOOTSTRAP_EXCHANGE_COOKIE_NAME, path="/")
+            response.delete_cookie(self._BOOTSTRAP_EXCHANGE_COOKIE_NAME, path="/")
             response.set_cookie(
-                WebApp._UI_SESSION_COOKIE_NAME,
+                self._UI_SESSION_COOKIE_NAME,
                 ui_session.secret,
                 path="/",
                 httponly=True,
@@ -108,13 +127,16 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_bootstrap_first_api_key(self):
+    def __handle_bootstrap_first_api_key(self) -> HTTPResponse:
         try:
             handover_version = self.__browser_handover_version()
             data = self.__load_request_json()
+            name = data.get("name", "bootstrap-admin")
+            if not isinstance(name, str):
+                raise ValueError("API key name must be a string")
             result = self.__auth_store.create_initial_admin_api_key_if_available(
                 browser_handover_version=handover_version,
-                name=data.get("name", "bootstrap-admin"),
+                name=name,
             )
             if result is None:
                 return self.__json_response({
@@ -128,7 +150,7 @@ class AdminHandler(IHandler):
                 "browser_handover": self.__auth_store.get_browser_handover_state(self.__config),
             }, status=201)
             response.set_cookie(
-                WebApp._UI_SESSION_COOKIE_NAME,
+                self._UI_SESSION_COOKIE_NAME,
                 ui_session.secret,
                 path="/",
                 httponly=True,
@@ -139,7 +161,7 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_remember_browser_session(self):
+    def __handle_remember_browser_session(self) -> HTTPResponse:
         try:
             data = self.__load_request_json()
             api_key_secret = data.get("secret", "")
@@ -161,7 +183,7 @@ class AdminHandler(IHandler):
                 "cookie_max_age_seconds": ui_session.cookie_max_age_seconds(),
             }, status=201)
             response.set_cookie(
-                WebApp._UI_SESSION_COOKIE_NAME,
+                self._UI_SESSION_COOKIE_NAME,
                 ui_session.secret,
                 path="/",
                 httponly=True,
@@ -172,16 +194,22 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError, KeyError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_list_api_keys(self):
+    def __handle_list_api_keys(self) -> HTTPResponse:
         include_revoked = AdminHandler.__query_flag("include_revoked")
         return self.__json_response({"keys": self.__auth_store.list_api_keys(include_revoked=include_revoked)})
 
-    def __handle_create_api_key(self):
+    def __handle_create_api_key(self) -> HTTPResponse:
         try:
             data = self.__load_request_json()
+            name = data.get("name", "")
+            scopes = data.get("scopes", [])
+            if not isinstance(name, str):
+                raise ValueError("API key name must be a string")
+            if not _is_string_list(scopes):
+                raise ValueError("API key scopes must be a list of strings")
             result = self.__auth_store.create_api_key(
-                name=data.get("name", ""),
-                scopes=data.get("scopes", [])
+                name=name,
+                scopes=scopes,
             )
             payload = {
                 "key": result["record"].to_public_dict(),
@@ -191,13 +219,16 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_update_api_key(self, key_id: str):
+    def __handle_update_api_key(self, key_id: str) -> HTTPResponse:
         try:
             data = self.__load_request_json()
+            scopes = data.get("scopes")
+            if scopes is not None and not _is_string_list(scopes):
+                raise ValueError("API key scopes must be a list of strings")
             record = self.__auth_store.update_api_key(
                 key_id=key_id,
                 name=data.get("name"),
-                scopes=data.get("scopes")
+                scopes=scopes,
             )
             return self.__json_response({"key": record.to_public_dict()})
         except KeyError as exc:
@@ -205,7 +236,7 @@ class AdminHandler(IHandler):
         except (TypeError, ValueError) as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_delete_api_key(self, key_id: str):
+    def __handle_delete_api_key(self, key_id: str) -> HTTPResponse:
         try:
             self.__auth_store.delete_api_key(key_id)
             return HTTPResponse(status=204)
@@ -214,7 +245,7 @@ class AdminHandler(IHandler):
         except ValueError as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_revoke_api_key(self, key_id: str):
+    def __handle_revoke_api_key(self, key_id: str) -> HTTPResponse:
         try:
             record = self.__auth_store.revoke_api_key(key_id)
             return self.__json_response({"key": record.to_public_dict()})
@@ -223,7 +254,7 @@ class AdminHandler(IHandler):
         except ValueError as exc:
             return self.__json_response({"error": str(exc)}, status=400)
 
-    def __handle_rotate_api_key(self, key_id: str):
+    def __handle_rotate_api_key(self, key_id: str) -> HTTPResponse:
         try:
             result = self.__auth_store.rotate_api_key(key_id)
             return self.__json_response({
@@ -244,7 +275,7 @@ class AdminHandler(IHandler):
 
     @staticmethod
     def __query_flag(name: str) -> bool:
-        value = getattr(bottle.request.query, "get")(name)
+        value = bottle.request.query.get(name)
         if value is None:
             return False
         return value.strip().lower() in {"1", "true", "yes", "on"}

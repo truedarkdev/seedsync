@@ -566,6 +566,21 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(400, delete_active_resp.status_int)
         self.assertIn("Cannot delete an active API key", delete_active_resp.text)
 
+    def test_create_key_rejects_non_string_scope_without_creating_key(self):
+        create_api_key = self.auth_store.create_api_key
+        self.auth_store.create_api_key = MagicMock(wraps=create_api_key)
+
+        response = self.test_app.post_json(
+            "/server/admin/api-keys/v1",
+            {"name": "invalid", "scopes": ["read", 7]},
+            extra_environ=self._auth_headers(self.admin_secret),
+            expect_errors=True,
+        )
+
+        self.assertEqual(400, response.status_int)
+        self.assertIn("API key scopes must be a list of strings", response.text)
+        self.auth_store.create_api_key.assert_not_called()
+
     def test_legacy_migration_routes_are_removed(self):
         get_resp = self.test_app.get("/server/admin/migration/v1", expect_errors=True)
         self.assertEqual(404, get_resp.status_int)

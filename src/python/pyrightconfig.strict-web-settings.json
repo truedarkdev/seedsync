@@ -1,0 +1,21 @@
+{
+  "typeCheckingMode": "strict",
+  "pythonVersion": "3.11",
+  "pythonPlatform": "Linux",
+  "stubPath": "typings",
+  "include": [
+    "web/handler/admin.py",
+    "web/handler/config.py",
+    "web/handler/path_pairs.py",
+    "web/serialize/serialize_auto_queue.py",
+    "web/serialize/serialize_config.py",
+    "web/serialize/serialize_model.py",
+    "web/serialize/serialize_status.py"
+  ],
+  "exclude": [
+    "tests",
+    "tmp",
+    "artifacts",
+    "__pycache__"
+  ]
+}
