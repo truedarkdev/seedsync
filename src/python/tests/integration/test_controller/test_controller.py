@@ -444,6 +444,13 @@ class TestController(unittest.TestCase):
         self.__process_until(_predicate, message, max_iterations=max_iterations)
         return match["file"]
 
+    def __wait_for_command_callback(self, callback, message, max_iterations=2000):
+        self.__process_until(
+            lambda: callback.on_success.called or callback.on_failure.called,
+            message,
+            max_iterations=max_iterations,
+        )
+
     def test_bad_config_doesnot_raise_ctor_exception(self):
         self.context.config.lftp.remote_address = "<bad>"
         self.context.config.lftp.remote_username = "<bad>"
@@ -2096,6 +2103,14 @@ class TestController(unittest.TestCase):
                 file = call[0][0]
                 self.assertEqual("lb", file.name)
                 break
+
+        # File removal and one-shot process cleanup are observed on adjacent
+        # controller ticks. Do not assume which tick wins the race.
+        self.__wait_for_command_callback(
+            callback,
+            "Timed out waiting for delete-local file callback completion",
+        )
+
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
@@ -2135,6 +2150,10 @@ class TestController(unittest.TestCase):
                 file = call[0][0]
                 self.assertEqual("la", file.name)
                 break
+        self.__wait_for_command_callback(
+            callback,
+            "Timed out waiting for delete-local directory callback completion",
+        )
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
@@ -2174,6 +2193,10 @@ class TestController(unittest.TestCase):
                 file = call[0][0]
                 self.assertEqual("ra", file.name)
                 break
+        self.__wait_for_command_callback(
+            callback,
+            "Timed out waiting for delete-remote directory callback completion",
+        )
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
@@ -2300,6 +2323,10 @@ class TestController(unittest.TestCase):
                 file = call[0][0]
                 self.assertEqual("ra", file.name)
                 break
+        self.__wait_for_command_callback(
+            callback,
+            "Timed out waiting for forced remote-delete callback completion",
+        )
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 
@@ -2344,6 +2371,10 @@ class TestController(unittest.TestCase):
                 file = call[0][0]
                 self.assertEqual("la", file.name)
                 break
+        self.__wait_for_command_callback(
+            callback,
+            "Timed out waiting for forced local-delete callback completion",
+        )
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
 

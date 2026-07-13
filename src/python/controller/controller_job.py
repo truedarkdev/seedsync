@@ -23,18 +23,18 @@ class ControllerJob(Job):
         self.__auto_queue = auto_queue
 
     @overrides(Job)
-    def setup(self):
+    def setup(self) -> None:
         self.__controller.start()
 
     @overrides(Job)
-    def execute(self):
+    def execute(self) -> None:
         self.__controller.process()
         self.__auto_queue.process()
 
     @overrides(Job)
-    def _get_sleep_interval_in_secs(self):
+    def _get_sleep_interval_in_secs(self) -> float:
         return ControllerJob._SLEEP_INTERVAL_IN_SECS
 
     @overrides(Job)
-    def cleanup(self):
+    def cleanup(self) -> None:
         self.__controller.exit()

@@ -1,11 +1,13 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, cast
+from typing import Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple, cast
 from threading import Lock, RLock
 from queue import Queue
 from enum import Enum
-from datetime import datetime, timedelta
+from datetime import datetime
 import copy
 import json
 import os
@@ -13,7 +15,6 @@ import ntpath
 import stat
 import time
 import shutil
-from types import SimpleNamespace
 from dataclasses import dataclass
 
 # my libs
@@ -26,18 +27,30 @@ from .scan import (
     MultiPathLocalScanner,
     MultiPathRemoteScanner,
 )
-from .extract import ExtractProcess, ExtractRequest, ExtractStatus
+from .extract import ExtractFailedResult, ExtractProcess, ExtractRequest, ExtractStatus
 from .validate import ValidateProcess
 from .model_updater import ModelUpdater
 from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
-from common import Context, AppError, MultiprocessingLogger, AppOneShotProcess, AppProcess, Constants, PathPair, Localization
-from model import ModelError, ModelFile, Model, ModelDiff, ModelDiffUtil, IModelListener
-from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
-from transfer import create_transfer_backend, RcloneTransferError
+from common import (
+    AppError, AppOneShotProcess, AppProcess, Args, Config, Constants, Context,
+    Localization, MultiprocessingLogger, PathPair, PathPairManager,
+)
+from model import ModelError, ModelFile, Model, IModelListener
+from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
+from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
 from .controller_persist import ControllerPersist
 from .persist_keys import persist_key, strip_persist_key
 from .delete import DeleteLocalProcess, DeleteRemoteProcess
+from system import SystemFile
+
+ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
+LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
+RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
+
+
+class _PathPairTransferBackend(Protocol):
+    def set_path_pairs(self, path_pairs: list[PathPair]) -> None: ...
 
 
 class ControllerError(AppError):
@@ -73,6 +86,86 @@ class Controller:
     __MAX_MOVE_FAILURES = 4
     __MOVE_RETRY_DELAYS = (2, 10, 30)
 
+    __context: Context
+    __persist: ControllerPersist
+    __command_queue: Queue[Controller.Command]
+    __model: Model
+    __model_builder: ModelBuilder
+    __updater: ModelUpdater
+    __path_pairs_by_id: dict[str, PathPair]
+    __path_pair_staging_paths: dict[str, str]
+    __active_scanner: ActiveScannerRuntime
+    __local_scanner: LocalScannerRuntime
+    __remote_scanner: RemoteScannerRuntime
+    __active_scan_process: ScannerProcess
+    __local_scan_process: ScannerProcess
+    __remote_scan_process: ScannerProcess
+    __extract_process: ExtractProcess
+    __validate_process: ValidateProcess
+    __lftp: Lftp | RcloneTransferBackend
+    __mp_logger: MultiprocessingLogger
+    __active_downloading_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    __active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    __prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    __pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    __move_retry_due: dict[str, datetime]
+    __move_attempt_reservations: set[str]
+    __deferred_move_file_ids: set[str]
+    __malformed_status_only_file_ids: set[str]
+    __pending_auto_purge_file_ids: set[str]
+    __last_lftp_statuses: Optional[list[LftpJobStatus]]
+    __next_lftp_status_poll_at: Optional[datetime]
+    __lftp_status_cache_expires_at: Optional[datetime]
+    __active_command_processes: list[Controller.CommandProcessWrapper]
+    __reported_dead_workers: set[int]
+    __remote_delete_success_listeners: list[Callable[[ModelFile], None]]
+    __download_start_listeners: list[Callable[[ModelFile], None]]
+    __download_start_state: dict[str, DownloadStartLifecycleEntry]
+    __deferred_delete_command_refs: list[Controller.Command]
+    __startup_validation_error: Optional[str]
+    __path_pair_runtime_error: Optional[str]
+    __stop_resume_trace_file_id: Optional[str]
+    __target_archive_trace_file_id: Optional[str]
+    __target_archive_trace_last_signature: Optional[str]
+    __temp_diag_file_id: Optional[str]
+    __temp_diag_last_signature: Optional[str]
+
+    # ModelUpdater intentionally shares this controller-owned runtime state.
+    # The explicit mangled aliases describe that combined strict boundary
+    # without adding a public façade or changing the runtime representation.
+    _Controller__context: Context
+    _Controller__persist: ControllerPersist
+    _Controller__model: Model
+    _Controller__model_builder: ModelBuilder
+    _Controller__path_pairs_by_id: dict[str, PathPair]
+    _Controller__active_scan_process: ScannerProcess
+    _Controller__local_scan_process: ScannerProcess
+    _Controller__remote_scan_process: ScannerProcess
+    _Controller__extract_process: ExtractProcess
+    _Controller__validate_process: ValidateProcess
+    _Controller__lftp: Lftp | RcloneTransferBackend
+    _Controller__active_downloading_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    _Controller__active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__move_retry_due: dict[str, datetime]
+    _Controller__move_attempt_lock: Lock
+    _Controller__move_attempt_reservations: set[str]
+    _Controller__deferred_move_file_ids: set[str]
+    _Controller__malformed_status_only_file_ids: set[str]
+    _Controller__pending_auto_purge_file_ids: set[str]
+    _Controller__last_lftp_statuses: Optional[list[LftpJobStatus]]
+    _Controller__next_lftp_status_poll_at: Optional[datetime]
+    _Controller__lftp_status_poll_retry_seconds: int
+    _Controller__lftp_status_cache_expires_at: Optional[datetime]
+    _Controller__lftp_status_cache_max_age_seconds: int
+    _Controller__lftp_status_poll_retry_active: bool
+    _Controller__startup_recovery_done: bool
+    _Controller__exclude_patterns: str
+    _Controller__model_lock: RLock
+    _Controller__MAX_MOVE_FAILURES: int
+    _Controller__MOVE_RETRY_DELAYS: tuple[int, ...]
+
     class Command:
         """
         Class by which clients of Controller can request Actions to be executed
@@ -92,12 +185,12 @@ class Controller:
         class ICallback(ABC):
             """Command callback interface"""
             @abstractmethod
-            def on_success(self):
+            def on_success(self) -> None:
                 """Called on successful completion of action"""
                 pass
 
             @abstractmethod
-            def on_failure(self, error: str, error_code: int = 400):
+            def on_failure(self, error: str, error_code: int = 400) -> None:
                 """Called on action failure"""
                 pass
 
@@ -114,7 +207,7 @@ class Controller:
             self.duplicate_waiter_count = 0
             self.delete_identity = filename
 
-        def add_callback(self, callback: ICallback):
+        def add_callback(self, callback: ICallback) -> None:
             self.callbacks.append(callback)
 
     class CommandProcessWrapper:
@@ -127,7 +220,7 @@ class Controller:
             file_id: str,
             file_name: str,
             process: AppOneShotProcess,
-            post_callback: Callable,
+            post_callback: Callable[[], None],
             await_completion: bool,
             started_at_monotonic: float | None = None,
             event_file: Optional[ModelFile] = None,
@@ -147,7 +240,7 @@ class Controller:
     _DELETE_COMMAND_STALE_TIMEOUT_IN_SECS = 10 * 60
 
     @staticmethod
-    def __lftp_status_refresh_timing(interval_ms_downloading_scan: int):
+    def __lftp_status_refresh_timing(interval_ms_downloading_scan: int) -> tuple[int, int]:
         # Keep the unhealthy retry window close to the downloading scan
         # cadence so a brief lftp hiccup does not pin a finished transfer in
         # a stale state.
@@ -156,7 +249,7 @@ class Controller:
         return lftp_status_poll_retry_seconds, lftp_status_cache_max_age_seconds
 
     @staticmethod
-    def _is_missing_startup_value(value: Any) -> bool:
+    def _is_missing_startup_value(value: object) -> bool:
         return value is None or (
             isinstance(value, str) and (value.strip() == "" or value == "<replace me>")
         )
@@ -168,7 +261,35 @@ class Controller:
         return value
 
     @staticmethod
-    def __get_exclude_patterns(config: Any) -> str:
+    def __require_runtime_int(value: object, field_name: str) -> int:
+        if type(value) is not int:
+            raise ControllerError("Missing validated runtime integer: {}".format(field_name))
+        return value
+
+    @staticmethod
+    def __require_runtime_bool(value: object, field_name: str) -> bool:
+        if type(value) is not bool:
+            raise ControllerError("Missing validated runtime boolean: {}".format(field_name))
+        return value
+
+    @staticmethod
+    def __runtime_int_or_default(value: object, default: int) -> int:
+        return value if type(value) is int else default
+
+    @staticmethod
+    def __runtime_bool_or_default(value: object, default: bool) -> bool:
+        return value if type(value) is bool else default
+
+    @staticmethod
+    def __runtime_str_or_default(value: object, default: str) -> str:
+        return value if isinstance(value, str) else default
+
+    def __set_transfer_path_pairs(self, path_pairs: list[PathPair]) -> None:
+        backend = cast(_PathPairTransferBackend, self.__lftp)
+        backend.set_path_pairs(path_pairs)
+
+    @staticmethod
+    def __get_exclude_patterns(config: object) -> str:
         controller_exclude_patterns = getattr(config, "_Controller__exclude_patterns", None)
         if isinstance(controller_exclude_patterns, str):
             return controller_exclude_patterns
@@ -179,11 +300,11 @@ class Controller:
 
     @staticmethod
     def collect_missing_startup_fields(
-        config: Any,
-        args: Any | None = None,
-        path_pair_manager: Any | None = None,
+        config: Config,
+        args: Optional[Args] = None,
+        path_pair_manager: Optional[PathPairManager] = None,
     ) -> List[str]:
-        def _append_missing(section_name: str, field_name: str, value: Any) -> None:
+        def _append_missing(section_name: str, field_name: str, value: object) -> None:
             if Controller._is_missing_startup_value(value):
                 missing_fields.append("{}.{}".format(section_name, field_name))
 
@@ -366,11 +487,11 @@ class Controller:
         self.__path_pairs_by_id: Dict[str, PathPair] = {}
         self.__path_pair_staging_paths: Dict[str, str] = {}
 
-        config = cast(Any, self.__context.config)
+        config = self.__context.config
         self.__exclude_patterns = Controller.__get_exclude_patterns(config)
         startup_args = getattr(self.__context, "args", None)
         if startup_args is None:
-            startup_args = SimpleNamespace(local_path_to_scanfs=None)
+            startup_args = Args()
         missing_startup_fields = Controller.collect_missing_startup_fields(
             config,
             startup_args,
@@ -384,7 +505,6 @@ class Controller:
         # Decide the password here
         lftp_cfg = config.lftp
         controller_cfg = config.controller
-        general_cfg = config.general
         self.__ssh_password = lftp_cfg.remote_password if not lftp_cfg.use_ssh_key else None
         self.__transfer_password = (
             lftp_cfg.remote_password if lftp_cfg.transfer_backend == "lftp" and lftp_cfg.protocol == "ftps"
@@ -435,7 +555,9 @@ class Controller:
         if controller_cfg.use_local_path_as_extract_path:
             out_dir_path = self.__legacy_local_path
         else:
-            out_dir_path = controller_cfg.extract_path
+            out_dir_path = Controller.__require_runtime_path(
+                controller_cfg.extract_path, "Controller.extract_path"
+            )
         # Keep the final local root primary, but allow archive lookup to fall
         # back to staging so extraction can survive the move boundary.
         self.__extract_process = ExtractProcess(
@@ -445,14 +567,15 @@ class Controller:
             managed_extract_folders_enabled=controller_cfg.managed_extract_folders_enabled,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
+        path_pairs_for_validation: dict[str, object] = dict(self.__path_pairs_by_id)
         self.__validate_process = ValidateProcess(
-            remote_address=lftp_cfg.remote_address,
-            remote_username=lftp_cfg.remote_username,
+            remote_address=Controller.__require_runtime_path(lftp_cfg.remote_address, "Lftp.remote_address"),
+            remote_username=Controller.__require_runtime_path(lftp_cfg.remote_username, "Lftp.remote_username"),
             remote_password=self.__ssh_password,
-            remote_port=lftp_cfg.remote_port,
+            remote_port=Controller.__require_runtime_int(lftp_cfg.remote_port, "Lftp.remote_port"),
             local_path=self.__legacy_local_path,
             remote_path=self.__legacy_remote_path,
-            path_pairs_by_id=cast(Dict[str, object], self.__path_pairs_by_id)
+            path_pairs_by_id=path_pairs_for_validation
         )
 
         # Setup multiprocess logging
@@ -481,7 +604,9 @@ class Controller:
         (
             self.__lftp_status_poll_retry_seconds,
             self.__lftp_status_cache_max_age_seconds
-        ) = Controller.__lftp_status_refresh_timing(controller_cfg.interval_ms_downloading_scan)
+        ) = Controller.__lftp_status_refresh_timing(Controller.__require_runtime_int(
+            controller_cfg.interval_ms_downloading_scan, "Controller.interval_ms_downloading_scan"
+        ))
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
 
@@ -499,16 +624,26 @@ class Controller:
     def __configure_lftp(self):
         # Configure the active transfer backend while preserving the legacy lftp
         # runtime path unchanged when lftp remains selected.
-        config = cast(Any, self.__context.config)
+        config = self.__context.config
         lftp_cfg = config.lftp
         validate_cfg = getattr(config, "validate", None)
         general_cfg = config.general
-        self.__lftp.num_parallel_jobs = lftp_cfg.num_max_parallel_downloads
-        self.__lftp.num_parallel_files = lftp_cfg.num_max_parallel_files_per_download
-        self.__lftp.num_connections_per_root_file = lftp_cfg.num_max_connections_per_root_file
-        self.__lftp.num_connections_per_dir_file = lftp_cfg.num_max_connections_per_dir_file
-        self.__lftp.num_max_total_connections = lftp_cfg.num_max_total_connections
-        self.__lftp.use_temp_file = lftp_cfg.use_temp_file
+        self.__lftp.num_parallel_jobs = Controller.__runtime_int_or_default(
+            lftp_cfg.num_max_parallel_downloads, 1
+        )
+        self.__lftp.num_parallel_files = Controller.__runtime_int_or_default(
+            lftp_cfg.num_max_parallel_files_per_download, 1
+        )
+        self.__lftp.num_connections_per_root_file = Controller.__runtime_int_or_default(
+            lftp_cfg.num_max_connections_per_root_file, 1
+        )
+        self.__lftp.num_connections_per_dir_file = Controller.__runtime_int_or_default(
+            lftp_cfg.num_max_connections_per_dir_file, 1
+        )
+        self.__lftp.num_max_total_connections = Controller.__runtime_int_or_default(
+            lftp_cfg.num_max_total_connections, 0
+        )
+        self.__lftp.use_temp_file = Controller.__runtime_bool_or_default(lftp_cfg.use_temp_file, False)
         rate_limit = lftp_cfg.rate_limit
         self.__lftp.rate_limit = 0 if rate_limit in (None, "") else rate_limit
         net_socket_buffer = lftp_cfg.net_socket_buffer
@@ -520,7 +655,7 @@ class Controller:
                 self.__lftp.xfer_verify_command = ValidateProcess.HASH_COMMAND
             else:
                 self.__lftp.xfer_verify = False
-        self.__lftp.set_verbose_logging(general_cfg.verbose)
+        self.__lftp.set_verbose_logging(Controller.__runtime_bool_or_default(general_cfg.verbose, False))
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:
         if self.__context.path_pair_manager is None:
@@ -531,7 +666,7 @@ class Controller:
         if enabled_path_pairs is None:
             enabled_path_pairs = self.__get_enabled_path_pairs()
 
-        config = cast(Any, self.__context.config)
+        config = self.__context.config
         controller_cfg = config.controller
         path_pairs_by_id: Dict[str, PathPair] = {pair.id: pair for pair in enabled_path_pairs}
         path_pair_staging_paths: Dict[str, str] = {
@@ -554,22 +689,28 @@ class Controller:
         remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
         active_scan_process = ScannerProcess(
             scanner=active_scanner,
-            interval_in_ms=controller_cfg.interval_ms_downloading_scan,
+            interval_in_ms=Controller.__require_runtime_int(
+                controller_cfg.interval_ms_downloading_scan, "Controller.interval_ms_downloading_scan"
+            ),
             verbose=False,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         local_scan_process = ScannerProcess(
             scanner=local_scanner,
-            interval_in_ms=controller_cfg.interval_ms_local_scan,
+            interval_in_ms=Controller.__require_runtime_int(
+                controller_cfg.interval_ms_local_scan, "Controller.interval_ms_local_scan"
+            ),
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
         remote_scan_process = ScannerProcess(
             scanner=remote_scanner,
-            interval_in_ms=controller_cfg.interval_ms_remote_scan,
+            interval_in_ms=Controller.__require_runtime_int(
+                controller_cfg.interval_ms_remote_scan, "Controller.interval_ms_remote_scan"
+            ),
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
 
-        self.__lftp.set_path_pairs(lftp_path_pairs)
+        self.__set_transfer_path_pairs(lftp_path_pairs)
         self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
         self.__path_pairs_by_id = path_pairs_by_id
         self.__path_pair_staging_paths = path_pair_staging_paths
@@ -633,65 +774,83 @@ class Controller:
             self.__context.status.server.error_msg = None
         self.__path_pair_runtime_error = None
 
-    def __build_active_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
-        config = cast(Any, self.__context.config)
+    def __build_active_scanner(
+        self, enabled_path_pairs: List[PathPair], path_pair_staging_paths: dict[str, str]
+    ) -> ActiveScannerRuntime:
+        config = self.__context.config
         if enabled_path_pairs:
             return MultiPathActiveScanner({
                 pair.id: path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
-            }, use_temp_file=config.lftp.use_temp_file)
+            }, use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"))
         return ActiveScanner(
             self.__staging_path,
-            use_temp_file=config.lftp.use_temp_file
+            use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file")
         )
 
-    def __build_local_scanner(self, enabled_path_pairs: List[PathPair], path_pair_staging_paths):
-        config = cast(Any, self.__context.config)
+    def __build_local_scanner(
+        self, enabled_path_pairs: List[PathPair], path_pair_staging_paths: dict[str, str]
+    ) -> LocalScannerRuntime:
+        config = self.__context.config
         if enabled_path_pairs:
             return MultiPathLocalScanner([
                 LocalScanner(
                     local_path=pair.local_path,
-                    use_temp_file=config.lftp.use_temp_file,
+                    use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"),
                     staging_path=path_pair_staging_paths[pair.id],
-                    managed_extract_folders_enabled=config.controller.managed_extract_folders_enabled,
+                    managed_extract_folders_enabled=Controller.__require_runtime_bool(
+                        config.controller.managed_extract_folders_enabled,
+                        "Controller.managed_extract_folders_enabled",
+                    ),
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
             ])
         return LocalScanner(
             local_path=self.__legacy_local_path,
-            use_temp_file=config.lftp.use_temp_file,
+            use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"),
             staging_path=self.__staging_path,
-            managed_extract_folders_enabled=config.controller.managed_extract_folders_enabled
+            managed_extract_folders_enabled=Controller.__require_runtime_bool(
+                config.controller.managed_extract_folders_enabled,
+                "Controller.managed_extract_folders_enabled",
+            )
         )
 
-    def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]):
-        config = cast(Any, self.__context.config)
+    def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]) -> RemoteScannerRuntime:
+        config = self.__context.config
         remote_python_path = getattr(config.lftp, "remote_python_path", None)
         if not isinstance(remote_python_path, str):
             remote_python_path = None
         if enabled_path_pairs:
             return MultiPathRemoteScanner([
                 RemoteScanner(
-                    remote_address=config.lftp.remote_address,
-                    remote_username=config.lftp.remote_username,
+                    remote_address=Controller.__require_runtime_path(config.lftp.remote_address, "Lftp.remote_address"),
+                    remote_username=Controller.__require_runtime_path(config.lftp.remote_username, "Lftp.remote_username"),
                     remote_password=self.__ssh_password,
-                    remote_port=config.lftp.remote_port,
+                    remote_port=Controller.__require_runtime_int(config.lftp.remote_port, "Lftp.remote_port"),
                     remote_path_to_scan=pair.remote_path,
-                    local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
-                    remote_path_to_scan_script=config.lftp.remote_path_to_scan_script,
+                    local_path_to_scan_script=Controller.__require_runtime_path(
+                        self.__context.args.local_path_to_scanfs, "Args.local_path_to_scanfs"
+                    ),
+                    remote_path_to_scan_script=Controller.__require_runtime_path(
+                        config.lftp.remote_path_to_scan_script, "Lftp.remote_path_to_scan_script"
+                    ),
                     remote_python_path=remote_python_path,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name
                 ) for pair in enabled_path_pairs
             ])
         return RemoteScanner(
-            remote_address=config.lftp.remote_address,
-            remote_username=config.lftp.remote_username,
+            remote_address=Controller.__require_runtime_path(config.lftp.remote_address, "Lftp.remote_address"),
+            remote_username=Controller.__require_runtime_path(config.lftp.remote_username, "Lftp.remote_username"),
             remote_password=self.__ssh_password,
-            remote_port=config.lftp.remote_port,
+            remote_port=Controller.__require_runtime_int(config.lftp.remote_port, "Lftp.remote_port"),
             remote_path_to_scan=self.__legacy_remote_path,
-            local_path_to_scan_script=cast(Any, self.__context.args).local_path_to_scanfs,
-            remote_path_to_scan_script=config.lftp.remote_path_to_scan_script,
+            local_path_to_scan_script=Controller.__require_runtime_path(
+                self.__context.args.local_path_to_scanfs, "Args.local_path_to_scanfs"
+            ),
+            remote_path_to_scan_script=Controller.__require_runtime_path(
+                config.lftp.remote_path_to_scan_script, "Lftp.remote_path_to_scan_script"
+            ),
             remote_python_path=remote_python_path
         )
 
@@ -764,15 +923,16 @@ class Controller:
             self,
             path_pairs_by_id: Dict[str, PathPair],
             path_pair_staging_paths: Dict[str, str],
-            active_scanner,
-            local_scanner,
-            remote_scanner,
-            active_scan_process,
-            local_scan_process,
-            remote_scan_process):
-        self.__lftp.set_path_pairs(self.__build_lftp_path_pairs(path_pairs_by_id, path_pair_staging_paths))
+            active_scanner: ActiveScannerRuntime,
+            local_scanner: LocalScannerRuntime,
+            remote_scanner: RemoteScannerRuntime,
+            active_scan_process: ScannerProcess,
+            local_scan_process: ScannerProcess,
+            remote_scan_process: ScannerProcess) -> None:
+        self.__set_transfer_path_pairs(self.__build_lftp_path_pairs(path_pairs_by_id, path_pair_staging_paths))
         self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
-        self.__validate_process.set_path_pairs_by_id(cast(Dict[str, object], path_pairs_by_id))
+        validation_path_pairs: dict[str, object] = dict(path_pairs_by_id)
+        self.__validate_process.set_path_pairs_by_id(validation_path_pairs)
         self.__path_pairs_by_id = path_pairs_by_id
         self.__path_pair_staging_paths = path_pair_staging_paths
         self.__active_scanner = active_scanner
@@ -809,15 +969,13 @@ class Controller:
         old_remote_scanner = self.__remote_scanner
         new_state_applied = False
 
-        def stop_process(process) -> bool:
+        def stop_process(process: AppProcess) -> bool:
             return self.__teardown_process(
-                "refresh process {}".format(getattr(process, "name", "?")) if process is not None else "refresh process",
+                "refresh process {}".format(getattr(process, "name", "?")),
                 process,
             )
 
-        def close_active_scanner(label: str, scanner) -> None:
-            if scanner is None:
-                return
+        def close_active_scanner(label: str, scanner: ActiveScannerRuntime) -> None:
             close = getattr(scanner, "close", None)
             if callable(close):
                 self.__best_effort_teardown(label, close)
@@ -829,7 +987,8 @@ class Controller:
                 self.__active_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                 self.__local_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                 self.__remote_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
-                self.__validate_process.set_path_pairs_by_id(cast(Dict[str, object], self.__path_pairs_by_id))
+                refreshed_validation_pairs: dict[str, object] = dict(self.__path_pairs_by_id)
+                self.__validate_process.set_path_pairs_by_id(refreshed_validation_pairs)
 
             if was_started:
                 for staging_path in self.__path_pair_staging_paths.values():
@@ -938,11 +1097,7 @@ class Controller:
             except Exception:
                 self.__restore_lftp_reconfigure_request()
                 self.logger.exception("Ignoring lftp reconfigure failure")
-        updater = getattr(self, "_Controller__updater", None)
-        if updater is None:
-            updater = ModelUpdater(self)
-            self.__updater = updater
-        updater.update()
+        self.__updater.update()
         self.__log_memory_usage()
 
     def __best_effort_teardown(self, label: str, teardown: Callable[[], object]):
@@ -1179,7 +1334,7 @@ class Controller:
                 self.__download_start_state.pop(file_id, None)
 
     def _confirm_fresh_healthy_download_starts(self, statuses: List[LftpJobStatus]) -> None:
-        notifications = []
+        notifications: list[ModelFile] = []
         with self.__download_start_lock:
             listeners = list(self.__download_start_listeners)
             for status in statuses:
@@ -1378,9 +1533,8 @@ class Controller:
         )
 
     def __get_model_files(self) -> List[ModelFile]:
-        model_files = []
-        get_ids = getattr(self.__model, "get_file_ids", None)
-        identifiers = cast(List[str], get_ids()) if callable(get_ids) else self.__model.get_file_names()
+        model_files: list[ModelFile] = []
+        identifiers = self.__model.get_file_ids()
         for identifier in identifiers:
             model_files.append(copy.deepcopy(self.__model.get_file(identifier)))
         return model_files
@@ -1439,7 +1593,7 @@ class Controller:
         if file.path_pair_id is not None and path_pair is None:
             return None
 
-        controller_cfg = cast(Any, self.__context.config).controller
+        controller_cfg = self.__context.config.controller
         staging_path = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
         if staging_path is None:
             return None
@@ -1462,7 +1616,9 @@ class Controller:
             out_dir_path_fallback=out_dir_path_fallback,
         )
 
-    def __get_stop_resume_trace_file_details(self, path: Optional[str], include_allocated_size: bool = False) -> dict:
+    def __get_stop_resume_trace_file_details(
+        self, path: Optional[str], include_allocated_size: bool = False
+    ) -> dict[str, object]:
         if path is None:
             return {
                 "exists": False,
@@ -1481,7 +1637,7 @@ class Controller:
                 "allocated_size": None
             }
 
-        details = {
+        details: dict[str, object] = {
             "exists": True,
             "size": stat_result.st_size,
             "mtime": stat_result.st_mtime,
@@ -1502,7 +1658,7 @@ class Controller:
                                 file_name: str,
                                 path_pair_id: Optional[str] = None,
                                 is_dir: bool = False,
-                                current_state: Optional[Any] = None,
+                                current_state: Optional[object] = None,
                                 remote_base_dir_path: Optional[str] = None,
                                 local_base_dir_path: Optional[str] = None,
                                 stopped_marked: bool = False):
@@ -1550,8 +1706,10 @@ class Controller:
             parsed_identifier = json.loads(identifier)
         except (TypeError, ValueError, json.JSONDecodeError):
             return identifier
-        if isinstance(parsed_identifier, list) and len(parsed_identifier) == 2 and isinstance(parsed_identifier[1], str):
-            return parsed_identifier[1]
+        if isinstance(parsed_identifier, list):
+            parsed_items = cast(list[object], parsed_identifier)
+            if len(parsed_items) == 2 and isinstance(parsed_items[1], str):
+                return parsed_items[1]
         return identifier
 
     def __is_target_archive_trace_enabled(self) -> bool:
@@ -1566,7 +1724,7 @@ class Controller:
         return selector_name == file_name
 
     @staticmethod
-    def __summarize_target_archive_file(file: ModelFile) -> dict:
+    def __summarize_target_archive_file(file: ModelFile) -> dict[str, object]:
         return {
             "file_id": file.file_id,
             "name": file.name,
@@ -1579,7 +1737,9 @@ class Controller:
             "is_extractable": file.is_extractable,
         }
 
-    def __find_target_archive_model_file(self, file_name: str, file_id: Optional[str] = None):
+    def __find_target_archive_model_file(
+        self, file_name: str, file_id: Optional[str] = None
+    ) -> Optional[ModelFile]:
         try:
             file_ids = self.__model.get_file_ids()
         except AttributeError:
@@ -1595,10 +1755,10 @@ class Controller:
                 return file
         return None
 
-    def __trace_target_archive_event(self, event: str, payload: dict):
+    def __trace_target_archive_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_target_archive_trace_enabled():
             return
-        trace_payload = {
+        trace_payload: dict[str, object] = {
             "event": event,
             "target_selector": self.__target_archive_trace_file_id,
         }
@@ -1612,14 +1772,14 @@ class Controller:
     def __record_breadcrumb(self,
                             stage: str,
                             message: str,
-                            details: Optional[dict] = None,
+                            details: Optional[dict[str, object]] = None,
                             event_type: str = "diagnostic",
                             file_id: Optional[str] = None,
                             path_pair_id: Optional[str] = None,
                             path_pair_name: Optional[str] = None,
                             corr_id: Optional[str] = None,
                             flow_id: Optional[str] = None,
-                            trace_scope: str = "flow"):
+                            trace_scope: str = "flow") -> None:
         breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
         if breadcrumb_trace is None:
             return
@@ -1661,9 +1821,9 @@ class Controller:
     def __record_command_breadcrumb(self,
                                     command: "Controller.Command",
                                     message: str,
-                                    details: dict,
+                                    details: dict[str, object],
                                     event_type: str = "state_transition",
-                                    file: Optional[ModelFile] = None):
+                                    file: Optional[ModelFile] = None) -> None:
         self.__record_breadcrumb(
             stage="command",
             message=message,
@@ -1682,7 +1842,7 @@ class Controller:
         except (NotImplementedError, AttributeError):
             return None
 
-    def __trace_corr_id_from_files(self, files, fallback: str):
+    def __trace_corr_id_from_files(self, files: Optional[Sequence[object]], fallback: str) -> str:
         if files is not None:
             for file in files:
                 path_pair_id = getattr(file, "path_pair_id", None)
@@ -1693,7 +1853,9 @@ class Controller:
                     return file_id
         return fallback
 
-    def __extract_status_matches_failed_result(self, status: ExtractStatus, failed_results) -> bool:
+    def __extract_status_matches_failed_result(
+        self, status: ExtractStatus, failed_results: list[ExtractFailedResult]
+    ) -> bool:
         status_file_id = getattr(status, "file_id", None)
         status_path_pair_id = getattr(status, "path_pair_id", None)
         for result in failed_results or []:
@@ -1713,7 +1875,9 @@ class Controller:
                 return True
         return False
 
-    def __active_extracting_file_tuple(self, status: ExtractStatus):
+    def __active_extracting_file_tuple(
+        self, status: ExtractStatus
+    ) -> tuple[str, Optional[str], Optional[str]]:
         path_pair_id = getattr(status, "path_pair_id", None)
         path_pair_name = getattr(status, "path_pair_name", None)
         if path_pair_name is None:
@@ -1721,7 +1885,7 @@ class Controller:
             path_pair_name = getattr(path_pair, "name", None)
         return status.name, path_pair_id, path_pair_name
 
-    def __temp_diag(self, stage: str, file_id: Optional[str] = None, **payload):
+    def __temp_diag(self, stage: str, file_id: Optional[str] = None, **payload: object) -> None:
         self.__record_breadcrumb(
             stage=stage,
             message=stage,
@@ -1764,8 +1928,8 @@ class Controller:
             return True
         return matching_file_ids <= 1
 
-    def clear_extracted_marker(self, file: ModelFile):
-        stale_extracted_file_names = set()
+    def clear_extracted_marker(self, file: ModelFile) -> None:
+        stale_extracted_file_names: set[str] = set()
         if file.file_id in self.__persist.extracted_file_names:
             stale_extracted_file_names.add(file.file_id)
         if file.name in self.__persist.extracted_file_names and self.__is_model_file_name_unambiguous(file.name):
@@ -2024,10 +2188,14 @@ class Controller:
 
     def __deferred_delete_commands(self) -> List["Controller.Command"]:
         commands = getattr(self, "_Controller__deferred_delete_command_refs", None)
-        if commands is None:
+        if not isinstance(commands, list):
             commands = []
             self.__deferred_delete_command_refs = commands
-        return commands
+        command_items = cast(list[object], commands)
+        if not all(isinstance(command, Controller.Command) for command in command_items):
+            self.__deferred_delete_command_refs = []
+            return self.__deferred_delete_command_refs
+        return cast(list[Controller.Command], command_items)
 
     def __active_command_matches_delete(
         self,
@@ -2075,9 +2243,11 @@ class Controller:
             for command_process in self.__active_command_processes
         )
 
-    def __has_active_command_for_file(self, file_id: str, action: Optional["Controller.Command.Action"] = None) -> bool:
+    def _has_active_command_for_file(self, file_id: str, action: Optional["Controller.Command.Action"] = None) -> bool:
         with self.__command_state_lock():
             return self.__has_active_command_for_file_unlocked(file_id, action)
+
+    __has_active_command_for_file = _has_active_command_for_file
 
     def __has_pending_delete_command_unlocked(
         self,
@@ -2146,9 +2316,9 @@ class Controller:
     def __queue_delete_local_process(
         self,
         file: ModelFile,
-        post_callback: Callable,
+        post_callback: Callable[[], None],
         command: Optional["Controller.Command"] = None
-    ):
+    ) -> None:
         delete_local_path, delete_local_name = self.__get_delete_local_target(file)
         process = DeleteLocalProcess(
             local_path=delete_local_path,
@@ -2168,10 +2338,10 @@ class Controller:
             self.__active_command_processes.append(command_wrapper)
         command_wrapper.process.start()
 
-    def __recover_interrupted_downloads(self, remote_files):
+    def __recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None:
         self.__startup_recovery_done = True
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
-        remote_names_by_pair = {}
+        remote_names_by_pair: dict[Optional[str], set[str]] = {}
         for remote_file in remote_files:
             remote_names_by_pair.setdefault(getattr(remote_file, "path_pair_id", None), set()).add(remote_file.name)
 
@@ -2223,7 +2393,7 @@ class Controller:
                         staging_path,
                         False
                     )
-                    queue_kwargs = {}
+                    queue_kwargs: dict[str, str] = {}
                     exclude_patterns = Controller.__get_exclude_patterns(self)
                     if exclude_patterns.strip():
                         queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -2248,13 +2418,20 @@ class Controller:
         if not isinstance(pending, dict):
             pending = {}
             self.__pending_queue_dispatches = pending
-        return pending
+        pending_items = cast(dict[object, object], pending)
+        if not all(
+            isinstance(file_id, str) and isinstance(dispatch, PendingQueueDispatch)
+            for file_id, dispatch in pending_items.items()
+        ):
+            self.__pending_queue_dispatches = {}
+            return self.__pending_queue_dispatches
+        return cast(dict[str, PendingQueueDispatch], pending_items)
 
     def __reconcile_queue_dispatch_pending(self) -> None:
         pending = self.__queue_dispatch_pending()
-        for file_id, dispatch in list(pending.items()):
+        for file_id in list(pending):
             try:
-                file = self.__model.get_file(file_id)
+                self.__model.get_file(file_id)
             except ModelError:
                 del pending[file_id]
                 continue
@@ -2268,18 +2445,22 @@ class Controller:
                 # owns duplicate suppression.
                 del pending[file_id]
 
-    def __set_active_scanner_files(self, active_files):
+    def __set_active_scanner_files(
+        self, active_files: list[tuple[str, Optional[str], Optional[str]]]
+    ) -> None:
         if isinstance(self.__active_scanner, MultiPathActiveScanner):
             self.__active_scanner.set_active_files(active_files)
         else:
             self.__active_scanner.set_active_files([name for name, _, _ in active_files])
 
-    def __update_model(self):
+    def _update_model_compat(self) -> None:
         updater = getattr(self, "_Controller__updater", None)
         if not isinstance(updater, ModelUpdater):
             updater = ModelUpdater(self)
             self.__updater = updater
         updater.update()
+
+    __update_model = _update_model_compat
 
     def __process_commands(self):
         def _notify_failure(_command: Controller.Command,
@@ -2303,13 +2484,13 @@ class Controller:
             for _callback in _command.callbacks:
                 _callback.on_failure(_msg, _error_code)
 
-        deferred_commands = []
+        deferred_commands: list[Controller.Command] = []
         # Queue commands are drained before the next model refresh. Retain
         # accepted identities until their authoritative lifecycle is observed
         # (or bounded reconciliation expires an unobserved acknowledgement).
         self.__reconcile_queue_dispatch_pending()
         pending_queue_dispatches = self.__queue_dispatch_pending()
-        stopped_queue_lifecycle_ids = set()
+        stopped_queue_lifecycle_ids: set[str] = set()
         while not self.__command_queue.empty():
             command = self.__command_queue.get()
             self.logger.info("Received command {} for file {}".format(str(command.action), command.filename))
@@ -2414,7 +2595,7 @@ class Controller:
                             local_base_dir_path,
                             stopped_marked
                         )
-                        queue_kwargs = {}
+                        queue_kwargs: dict[str, str] = {}
                         exclude_patterns = Controller.__get_exclude_patterns(self)
                         if exclude_patterns.strip():
                             queue_kwargs["exclude_patterns"] = exclude_patterns
@@ -2837,12 +3018,16 @@ class Controller:
                             len(self.__active_command_processes)
                         )
                         continue
-                    config = cast(Any, self.__context.config)
+                    config = self.__context.config
                     process = DeleteRemoteProcess(
-                        remote_address=config.lftp.remote_address,
-                        remote_username=config.lftp.remote_username,
+                        remote_address=Controller.__runtime_str_or_default(
+                            config.lftp.remote_address, ""
+                        ),
+                        remote_username=Controller.__runtime_str_or_default(
+                            config.lftp.remote_username, ""
+                        ),
                         remote_password=self.__ssh_password,
-                        remote_port=config.lftp.remote_port,
+                        remote_port=Controller.__runtime_int_or_default(config.lftp.remote_port, 22),
                         remote_path=path_pair.remote_path if (path_pair := self.__get_path_pair(file.path_pair_id))
                         else self.__legacy_remote_path,
                         file_name=file.name
@@ -2897,11 +3082,7 @@ class Controller:
 
     def __log_memory_usage(self):
         with self.__model_lock:
-            get_ids = getattr(self.__model, "get_file_ids", None)
-            if callable(get_ids):
-                model_file_count = len(cast(List[str], get_ids()))
-            else:
-                model_file_count = len(self.__model.get_file_names())
+            model_file_count = len(self.__model.get_file_ids())
 
         self.__memory_monitor.log_if_due(
             model_file_count=model_file_count,
@@ -2970,7 +3151,7 @@ class Controller:
         """
         self.__temp_diag("cleanup_commands", active_command_count=len(self.__active_command_processes))
         now_monotonic = time.monotonic()
-        still_active_processes = []
+        still_active_processes: list[Controller.CommandProcessWrapper] = []
         for command_process in self.__active_command_processes:
             if command_process.process.is_alive():
                 if self.__delete_command_is_stale(command_process, now_monotonic):
@@ -3171,3 +3352,21 @@ class Controller:
                     self.__teardown_process("completed command process", command_process.process, terminate=False)
         with self.__command_state_lock():
             self.__active_command_processes = still_active_processes
+
+    _Controller__active_extracting_file_tuple = __active_extracting_file_tuple
+    _Controller__extract_status_matches_failed_result = __extract_status_matches_failed_result
+    _Controller__find_target_archive_model_file = __find_target_archive_model_file
+    _Controller__get_path_pair = __get_path_pair
+    _Controller__is_explicitly_stopped = __is_explicitly_stopped
+    _Controller__is_target_archive_trace_enabled = __is_target_archive_trace_enabled
+    _Controller__move_from_staging = __move_from_staging
+    _Controller__queue_delete_local_process = __queue_delete_local_process
+    _Controller__record_breadcrumb = __record_breadcrumb
+    _Controller__recover_interrupted_downloads = __recover_interrupted_downloads
+    _Controller__set_active_scanner_files = __set_active_scanner_files
+    _Controller__should_auto_purge_local_file = __should_auto_purge_local_file
+    _Controller__summarize_target_archive_file = __summarize_target_archive_file
+    _Controller__target_archive_trace_selector_matches_file = __target_archive_trace_selector_matches_file
+    _Controller__temp_diag = __temp_diag
+    _Controller__trace_corr_id_from_files = __trace_corr_id_from_files
+    _Controller__trace_target_archive_event = __trace_target_archive_event

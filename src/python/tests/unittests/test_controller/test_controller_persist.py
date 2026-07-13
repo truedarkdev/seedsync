@@ -211,3 +211,17 @@ class TestControllerPersist(unittest.TestCase):
 
         with self.assertRaises(PersistError):
             ControllerPersist.from_str("[]")
+
+    def test_from_str_rejects_malformed_persisted_name_collections_without_partial_result(self):
+        for field_name in ("downloaded", "extracted", "stopped"):
+            for malformed_value in ({"not": "an array"}, ["valid-name", 42]):
+                with self.subTest(field=field_name, value=malformed_value):
+                    payload = {
+                        "downloaded": ["downloaded-valid"],
+                        "extracted": ["extracted-valid"],
+                        "stopped": ["stopped-valid"],
+                    }
+                    payload[field_name] = malformed_value
+
+                    with self.assertRaises(PersistError):
+                        ControllerPersist.from_str(json.dumps(payload))
