@@ -1,5 +1,9 @@
 @use '../../common/common' as *;
 
+// Keep row mode aligned with file-list.component.scss; fixed columns need
+// about 900px for readable filenames and details.
+$file-layout-desktop-min-width: 900px;
+
 .file {
     padding: 10px;
 }
@@ -306,8 +310,8 @@
 }
 
 
-/* Medium and large screens */
-@media only screen and (min-width: $medium-min-width) {
+/* Desktop-width layout */
+@media only screen and (min-width: $file-layout-desktop-min-width) {
     /* enable row hover */
     .file:not(.selected):hover {
         background-color: $secondary-light-color;
