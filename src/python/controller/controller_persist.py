@@ -2,7 +2,9 @@
 
 import json
 import re
-from typing import cast
+from contextlib import contextmanager
+from threading import RLock
+from typing import cast, Iterator
 
 from common import overrides, Constants, Persist, PersistError
 
@@ -30,11 +32,18 @@ class ControllerPersist(Persist):
     __KEY_FINAL_MOVE_SUCCEEDED = "final_move_succeeded"
 
     def __init__(self):
+        self.__lock = RLock()
         self.downloaded_file_names: set[str] = set()
         self.extracted_file_names: set[str] = set()
         self.stopped_file_names: set[str] = set()
         self.move_failure_counts: dict[str, int] = {}
         self.final_move_succeeded_file_names: set[str] = set()
+
+    @contextmanager
+    def state_transaction(self) -> Iterator[None]:
+        """Guard a complete mutation transaction against persistence snapshots."""
+        with self.__lock:
+            yield
 
     @staticmethod
     def _read_string_set(value: object, field_name: str) -> set[str]:
@@ -113,10 +122,11 @@ class ControllerPersist(Persist):
 
     @overrides(Persist)
     def to_str(self) -> str:
-        dct: dict[str, object] = {}
-        dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES] = list(self.downloaded_file_names)
-        dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES] = list(self.extracted_file_names)
-        dct[ControllerPersist.__KEY_STOPPED_FILE_NAMES] = list(self.stopped_file_names)
-        dct[ControllerPersist.__KEY_MOVE_FAILURE_COUNTS] = self.move_failure_counts
-        dct[ControllerPersist.__KEY_FINAL_MOVE_SUCCEEDED] = list(self.final_move_succeeded_file_names)
+        with self.state_transaction():
+            dct: dict[str, object] = {}
+            dct[ControllerPersist.__KEY_DOWNLOADED_FILE_NAMES] = list(self.downloaded_file_names)
+            dct[ControllerPersist.__KEY_EXTRACTED_FILE_NAMES] = list(self.extracted_file_names)
+            dct[ControllerPersist.__KEY_STOPPED_FILE_NAMES] = list(self.stopped_file_names)
+            dct[ControllerPersist.__KEY_MOVE_FAILURE_COUNTS] = dict(self.move_failure_counts)
+            dct[ControllerPersist.__KEY_FINAL_MOVE_SUCCEEDED] = list(self.final_move_succeeded_file_names)
         return json.dumps(dct, indent=Constants.JSON_PRETTY_PRINT_INDENT)

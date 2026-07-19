@@ -111,12 +111,13 @@ class TestControllerPersist(unittest.TestCase):
             i = 0
             while not stop.is_set():
                 name = names[i % len(names)]
-                persist.downloaded_file_names.add(name)
-                persist.extracted_file_names.add(name)
-                persist.stopped_file_names.add(name)
-                persist.downloaded_file_names.discard(name)
-                persist.extracted_file_names.discard(name)
-                persist.stopped_file_names.discard(name)
+                with persist.state_transaction():
+                    persist.downloaded_file_names.add(name)
+                    persist.extracted_file_names.add(name)
+                    persist.stopped_file_names.add(name)
+                    persist.downloaded_file_names.discard(name)
+                    persist.extracted_file_names.discard(name)
+                    persist.stopped_file_names.discard(name)
                 i += 1
 
         thread = threading.Thread(target=mutate_sets)
@@ -128,6 +129,92 @@ class TestControllerPersist(unittest.TestCase):
         finally:
             stop.set()
             thread.join()
+
+    def test_to_str_blocks_mutation_during_collection_snapshot(self):
+        iterating = threading.Event()
+        continue_iteration = threading.Event()
+        mutation_started = threading.Event()
+        mutation_finished = threading.Event()
+
+        class PausingSet(set):
+            def __iter__(self):
+                iterator = super().__iter__()
+                yield next(iterator)
+                iterating.set()
+                if not continue_iteration.wait(2):
+                    raise AssertionError("mutation did not run")
+                yield from iterator
+
+        persist = ControllerPersist()
+        persist.downloaded_file_names = PausingSet({"one", "two"})
+        serialization_result = {}
+
+        def serialize():
+            serialization_result["content"] = persist.to_str()
+
+        def mutate():
+            mutation_started.set()
+            with persist.state_transaction():
+                persist.downloaded_file_names.add("three")
+            mutation_finished.set()
+
+        serialization_thread = threading.Thread(target=serialize)
+        serialization_thread.start()
+        self.assertTrue(iterating.wait(2))
+
+        mutation_thread = threading.Thread(target=mutate)
+        mutation_thread.start()
+        self.assertTrue(mutation_started.wait(2))
+        self.assertFalse(mutation_finished.wait(0.05))
+        continue_iteration.set()
+
+        serialization_thread.join(2)
+        mutation_thread.join(2)
+        self.assertFalse(serialization_thread.is_alive())
+        self.assertFalse(mutation_thread.is_alive())
+        self.assertEqual(
+            {"one", "two"},
+            set(json.loads(serialization_result["content"])["downloaded"]),
+        )
+        self.assertIn("three", persist.downloaded_file_names)
+
+    def test_to_str_observes_complete_multi_field_mutation(self):
+        mutation_halfway = threading.Event()
+        continue_mutation = threading.Event()
+        serialization_started = threading.Event()
+        serialization_finished = threading.Event()
+        serialization_result = {}
+        persist = ControllerPersist()
+
+        def mutate():
+            with persist.state_transaction():
+                persist.downloaded_file_names.add("transaction")
+                mutation_halfway.set()
+                self.assertTrue(continue_mutation.wait(2))
+                persist.extracted_file_names.add("transaction")
+
+        def serialize():
+            serialization_started.set()
+            serialization_result["content"] = persist.to_str()
+            serialization_finished.set()
+
+        mutation_thread = threading.Thread(target=mutate)
+        mutation_thread.start()
+        self.assertTrue(mutation_halfway.wait(2))
+
+        serialization_thread = threading.Thread(target=serialize)
+        serialization_thread.start()
+        self.assertTrue(serialization_started.wait(2))
+        self.assertFalse(serialization_finished.wait(0.05))
+        continue_mutation.set()
+
+        mutation_thread.join(2)
+        serialization_thread.join(2)
+        self.assertFalse(mutation_thread.is_alive())
+        self.assertFalse(serialization_thread.is_alive())
+        dct = json.loads(serialization_result["content"])
+        self.assertIn("transaction", dct["downloaded"])
+        self.assertIn("transaction", dct["extracted"])
 
     def test_persist_key_helpers(self):
         self.assertEqual("plain-name", persist_key(None, "plain-name"))
