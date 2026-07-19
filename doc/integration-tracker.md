@@ -85,12 +85,12 @@ Temporary commit ledgers:
 
 ## rapidcopy
 - Source branch: `rapidcopy/master`
-- Last fully processed upstream commit: `d82e0d2084e3a12b1cb871e04e2799e24d145170`
-- Fork tip at last full review: `d82e0d2084e3a12b1cb871e04e2799e24d145170`
-- Last full review date: `2026-07-10`
-- Status: fully dispositioned through this tip; no active conservative imports pending
+- Last fully processed upstream commit: `5861981ca`
+- Fork tip at last full review: `5861981ca`
+- Last full review date: `2026-07-19`
+- Status: fully dispositioned through this tip; the grouped mobile UI follow-up remains pending implementation and maintainer approval
 - Integrated so far: locally useful rapidcopy ideas have already been adapted where they fit this fork, especially around path-pairs, UI workflow polish, packaging/runtime hardening, logs/files improvements, targeted reliability fixes, and a local optional `rclone` transfer backend that keeps `lftp` as the default engine, while branding, theme-system, and other identity-shifting changes remain intentionally out; the `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` refresh was fully dispositioned separately as backend-migration / rebrand noise rather than imported wholesale, and the RapidCopy rebrand remains deferred, product-decision, or out-of-scope rather than imported behavior.
-- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `d82e0d2084e3a12b1cb871e04e2799e24d145170`, preserving the current-master topology rather than assuming the legacy marker is a direct ancestor.
+- Resume when new upstream appears: fetch `rapidcopy`, then continue from the next commit after `5861981ca`, preserving the current-master topology rather than assuming the legacy marker is a direct ancestor.
 - Notes:
   - Completed frozen refresh on `2026-04-01`; the frozen range was `1b96fb80938d398d7fca701771f11c13df5a0bc7` through `dc9c68c37c43eba7487654dacf7c7b08f64eb12a`.
   - Per-commit explorer re-audit finalized the disputed frozen-range dispositions as `cb20dc899ccabce453c2ae4d44e9e0153f7a74ea` `intentionally skipped` because the current workflow shape has moved past that exact `if:` guard pattern, plus `acf1a0c64eb4becb14ffec3104613238bd8cbbd5` and `dc9c68c37c43eba7487654dacf7c7b08f64eb12a` as `needs new integration task` because both are stale failure-cleanup items that should only be revived on fresh repro.
@@ -101,6 +101,11 @@ Temporary commit ledgers:
   - Refresh delta `dc9c68c37c43eba7487654dacf7c7b08f64eb12a..b113ae7220d531c2bf200d2cc7c6857c43fb154c` is fully dispositioned as backend-migration / rebrand noise: the RapidCopy replacement-style `rclone` migration was not imported wholesale, while a later local `rclone-transfer-protocol-fit` integration added `rclone` as an optional SFTP-only backend with `lftp` preserved as the default/current backend; the README/docker-compose/docs and RapidCopy rebrand pieces remain deferred or wrapper-only.
   - Local `rclone-transfer-protocol-fit` follow-up added backend selection normalization, a shared transfer-backend factory, guarded rclone settings, Docker/deb runtime dependencies, focused Python/Angular tests, and live Docker/browser validation evidence while preserving the existing `lftp` SFTP/FTPS path.
   - Current-master refresh through `d82e0d2084e3a12b1cb871e04e2799e24d145170` is fully dispositioned: `9d3c6726` is adapted locally for scanner/delete filesystem races and extraction-worker failure containment; applicable `73ef43a14` SSH child cleanup and WSGI socket-timeout protections are adapted, while its process sleep, bounded stream queue, and SSE heartbeat are already covered locally and its obsolete validation-process watchdog is inapplicable; `dac5de74`, `8226b22a`, and `d82e0d20` are covered or inapplicable in the evolved local architecture. Reviewer/security closure passed, focused final tests reported 145 passed and 56 skipped, and the fresh Docker/API/Playwright/SSE verifier path passed.
+  - Frozen post-checkpoint range `d82e0d2084e3a12b1cb871e04e2799e24d145170..5861981ca` is fully dispositioned oldest-to-newest: `4348a23f0` is integrated/adapted selectively for the confirmed `ControllerPersist` concurrency fix (one shared `RLock` transaction across `Controller.process`, AutoQueue-facing `clear_extracted_marker`, and snapshot serialization); its aggregate SSE/filesystem/auth/rclone portions are already covered, and its old chunk validation is intentionally superseded by full SHA-256 validation. `2fe3d8672` is covered elsewhere by existing auth/path/security adaptations. `f2ac3f0bd` is covered elsewhere by the optional rclone backend while preserving lftp as the default; its performance/default changes are not imported blindly. `61aa00da3` needs area reopen / maintainer-approved UI lane; its broad visual overhaul is not accepted wholesale. `41177e249` is intentionally skipped/covered by local README/backend/API-key docs and fork identity policy. `5861981ca` is intentionally skipped as release/version bookkeeping.
+  - Advancing the checkpoint to `5861981ca` records explicit audit dispositions for all six commits; it does not mean the deferred mobile UI area is implemented or approved.
+
+## Dedicated Follow-up Lanes
+- Mobile file-list scrolling/template follow-up (grouped provenance for existing nitrobass24 rows `614`/`624` and RapidCopy `61aa00da3`): sources `nitrobass24` commits `4bb0f274` and `74f08bee6`, plus RapidCopy `61aa00da3`. Reopen only for a maintainer-approved UI lane; adapt responsive scrolling/shared row behavior onto the current UI, preserve SeedSync's look, capture Docker/Playwright PNG evidence, then request intent approval before final gates. Status: worker iteration pending; approval required; no wholesale visual overhaul is accepted.
 
 ## nitrobass24
 - Source branch: `nitrobass24/develop`

@@ -1066,6 +1066,10 @@ class Controller:
         )
 
     def process(self):
+        with self.__persist.state_transaction():
+            self.__process_persist_transaction()
+
+    def __process_persist_transaction(self):
         """
         Advance the controller state
         This method should return relatively quickly as the heavy lifting is done by concurrent tasks
@@ -1929,6 +1933,10 @@ class Controller:
         return matching_file_ids <= 1
 
     def clear_extracted_marker(self, file: ModelFile) -> None:
+        with self.__persist.state_transaction():
+            self.__clear_extracted_marker_in_state_transaction(file)
+
+    def __clear_extracted_marker_in_state_transaction(self, file: ModelFile) -> None:
         stale_extracted_file_names: set[str] = set()
         if file.file_id in self.__persist.extracted_file_names:
             stale_extracted_file_names.add(file.file_id)

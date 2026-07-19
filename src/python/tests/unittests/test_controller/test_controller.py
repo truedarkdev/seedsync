@@ -1223,6 +1223,39 @@ class TestController(unittest.TestCase):
         self.controller._Controller__updater.update.assert_not_called()
         self.controller._Controller__log_memory_usage.assert_not_called()
 
+    def test_process_holds_persist_transaction_across_controller_tick(self):
+        persist = ControllerPersist()
+        self.controller._Controller__persist = persist
+        process_started = threading.Event()
+        continue_process = threading.Event()
+        serialization_started = threading.Event()
+        serialization_finished = threading.Event()
+
+        def process_tick():
+            process_started.set()
+            self.assertTrue(continue_process.wait(2))
+
+        def serialize():
+            serialization_started.set()
+            persist.to_str()
+            serialization_finished.set()
+
+        self.controller._Controller__process_persist_transaction = process_tick
+        process_thread = threading.Thread(target=self.controller.process)
+        process_thread.start()
+        self.assertTrue(process_started.wait(2))
+
+        serialization_thread = threading.Thread(target=serialize)
+        serialization_thread.start()
+        self.assertTrue(serialization_started.wait(2))
+        self.assertFalse(serialization_finished.wait(0.05))
+        continue_process.set()
+
+        process_thread.join(2)
+        serialization_thread.join(2)
+        self.assertFalse(process_thread.is_alive())
+        self.assertFalse(serialization_thread.is_alive())
+
     def test_configure_lftp_applies_net_socket_buffer_when_configured(self):
         self.controller._Controller__context.config.lftp.net_socket_buffer = "512K"
 
@@ -2915,6 +2948,57 @@ class TestController(unittest.TestCase):
 
         self.assertEqual({"archive.zip"}, self.controller._Controller__persist.extracted_file_names)
         self.controller._Controller__model_builder.set_extracted_files.assert_not_called()
+
+    def test_clear_extracted_marker_waits_for_persist_snapshot(self):
+        iterating = threading.Event()
+        continue_iteration = threading.Event()
+        mutation_started = threading.Event()
+        mutation_finished = threading.Event()
+
+        class PausingSet(set):
+            def __iter__(self):
+                iterator = super().__iter__()
+                yield next(iterator)
+                iterating.set()
+                if not continue_iteration.wait(2):
+                    raise AssertionError("clear_extracted_marker did not run")
+                yield from iterator
+
+        file = ModelFile("archive.zip", False)
+        persist = ControllerPersist()
+        persist.extracted_file_names = PausingSet({file.file_id, "other"})
+        self.controller._Controller__persist = persist
+        self.controller._Controller__model.get_file_ids.return_value = {file.file_id}
+        self.controller._Controller__model.get_file.return_value = file
+        serialization_result = {}
+
+        def serialize():
+            serialization_result["content"] = persist.to_str()
+
+        def clear_marker():
+            mutation_started.set()
+            self.controller.clear_extracted_marker(file)
+            mutation_finished.set()
+
+        serialization_thread = threading.Thread(target=serialize)
+        serialization_thread.start()
+        self.assertTrue(iterating.wait(2))
+
+        mutation_thread = threading.Thread(target=clear_marker)
+        mutation_thread.start()
+        self.assertTrue(mutation_started.wait(2))
+        self.assertFalse(mutation_finished.wait(0.05))
+        continue_iteration.set()
+
+        serialization_thread.join(2)
+        mutation_thread.join(2)
+        self.assertFalse(serialization_thread.is_alive())
+        self.assertFalse(mutation_thread.is_alive())
+        self.assertIn(
+            file.file_id,
+            json.loads(serialization_result["content"])["extracted"],
+        )
+        self.assertNotIn(file.file_id, persist.extracted_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_keeps_staging_only_completed_markers_from_repromoting_snapshot(self, diff_models):
