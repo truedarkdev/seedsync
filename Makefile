@@ -34,7 +34,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
+.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -153,6 +153,10 @@ run-tests-python-native:
 	# native host python tests
 	mkdir -p ${PYTEST_ARTIFACT_DIR}
 	cd ${SOURCEDIR}/python && poetry run pytest -p no:cacheprovider
+
+run-tests-python-wsl:
+	# WSL/Linux live SSH + archive lane; pass EXTRA_ARGS=--preflight-only for a smoke check.
+	bash ${SOURCEDIR}/docker/test/python/run_wsl_lane.sh --live-ssh ${EXTRA_ARGS}
 
 # Local Python lint/typecheck lane. Poetry-managed dependency refresh stays deferred on this host.
 check-python-tooling: lint-python typecheck-python

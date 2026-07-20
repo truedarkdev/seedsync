@@ -6,6 +6,7 @@ RUN ls -l /app/python
 RUN apt-get update && \
     apt-get install -y \
         openssh-server \
+        libstring-crc32-perl \
         p7zip \
         p7zip-full \
         p7zip-rar \
