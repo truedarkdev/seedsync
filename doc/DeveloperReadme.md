@@ -26,7 +26,7 @@ https://docs.docker.com/compose/install/
 
 6. Install the rest:
    ```bash
-   sudo apt-get install -y lftp python3-dev rar
+   sudo apt-get install -y lftp perl libstring-crc32-perl python3-dev p7zip-full p7zip-rar rar
    ```
 
 ## Fetch code
@@ -248,6 +248,67 @@ like:
 mkdir -p ../../tmp/pytest
 poetry run pytest --junitxml=../../tmp/pytest/python-unit.xml
 ```
+
+### WSL bounded live Python lane
+
+To run the meaningful live SSH/LFTP/controller tests and archive-backed tests,
+use the tracked WSL lane from the repository root:
+
+```bash
+make run-tests-python-wsl
+```
+
+The lane starts or reuses the named `seedsync_test_e2e_remote` Docker service
+with `SEEDSYNC_REMOTE_FILES_DIR` set explicitly, waits for `127.0.0.1:1234`,
+checks the fixture `remoteuser`/`remotepass` login on port `1234` plus the
+local `seedsynctest` SSH login on port `22`, then validates Poetry/pytest,
+LFTP, Perl with its `String::CRC32` module (required by LFTP's
+`verify-file` helper), `7z`, its RAR codec, and `rar` before enabling
+`SEEDSYNC_LIVE_SSH_TESTS=1`. Missing test tools fail fast with an install
+command (`perl`, `libstring-crc32-perl`, `p7zip-full`, `p7zip-rar`, and
+`rar`); `--provision-test-tools` is an explicit opt-in to apt-based
+provisioning (`--provision-archive-tools` remains a deprecated alias).
+Provisioning is automation-safe: the lane uses direct apt as
+root or noninteractive `sudo -n`; it never prompts for a sudo password. If
+that is unavailable, use the reported `wsl.exe -u root -- bash -lc ...`
+command and rerun preflight. Compose auth tokens are accepted from the
+environment or generated ephemerally when absent; token values are never
+printed or written to artifacts. Supplied tokens are scoped to Compose/auth
+bootstrap and are cleared before Python collection in every invocation mode;
+they are not used as
+general pytest credentials. The runner requests mode `0700` for run
+directories and `0600` for artifact files, on filesystems that honor POSIX
+modes; Windows-backed WSL `/mnt/c` DrvFS commonly reports or applies
+mount-derived permissions instead. Use Windows ACLs or a Linux-owned checkout
+or artifact location when POSIX privacy guarantees are required. The runner
+restores the caller's umask before pytest so fixture-created files remain
+accessible to the test SSH user. No secret values are written to artifacts.
+Pytest nodeids are collected once and run in batches of about
+30 tests (not files), with collection and execution counts recorded. The lane
+writes JUnit, logs, `progress.tsv`, `progress.txt`, `summary.txt`,
+`failures.txt`, and the selected manifest under
+`tmp/pytest/runs/<timestamp>/`.
+
+For a worker self-check, run only the preflight or one selected nodeid:
+
+```bash
+make run-tests-python-wsl EXTRA_ARGS="--preflight-only"
+bash src/docker/test/python/run_wsl_lane.sh --live-ssh --limit 1
+bash src/docker/test/python/run_wsl_lane.sh --self-test
+```
+
+Without `--provision-test-tools`, preflight reports all host-side missing
+prerequisites in one pass and never installs Python or test tooling implicitly.
+The deterministic self-test
+covers batch selection, the Perl CRC32 dependency decision, and treats a
+simulated unexpected pytest exit as a harness error.
+
+These checks are implementation feedback, not verification. The complete
+`make run-tests-python-wsl` command is the verifier/final validation lane; do
+not claim the WSL lane as final evidence unless every batch completes with a
+zero-failure summary. The intentional
+`test_download_with_excessive_connections` stress test remains skipped by its
+existing marker.
 
 ### Linux/WSL SSH and Archive Baseline
 

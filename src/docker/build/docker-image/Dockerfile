@@ -35,6 +35,7 @@ RUN set -eux; \
         build-essential \
         libssl-dev \
         lftp \
+        libstring-crc32-perl \
         rclone \
         openssh-client \
         p7zip \
