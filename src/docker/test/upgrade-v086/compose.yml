@@ -1,0 +1,90 @@
+services:
+  legacy:
+    image: seedsync/upgrade-v086:legacy-ff2a10399
+    container_name: seedsync-upgrade-v086-${RUN_ID:?RUN_ID is required}
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: []
+    environment:
+      SEEDSYNC_LAB_REMOTE_HOST: upgrade_remote
+      SEEDSYNC_LAB_REMOTE_USER: remoteuser
+      SEEDSYNC_LAB_REMOTE_PASSWORD: remotepass
+      SEEDSYNC_LAB_REMOTE_PORT: "1234"
+      SEEDSYNC_LAB_REMOTE_PATH: /home/remoteuser/files
+      SEEDSYNC_LAB_LOCAL_PATH: /downloads
+      SEEDSYNC_LAB_EXTRACT_PATH: /downloads
+    volumes:
+      - type: bind
+        source: ${RUN_DIR}/config
+        target: /config
+      - type: bind
+        source: ${RUN_DIR}/downloads
+        target: /downloads
+      - type: bind
+        source: ${RUN_DIR}/mounts
+        target: /mounts
+      - type: bind
+        source: ${RUN_DIR}/logs
+        target: /logs
+    tmpfs:
+      - /tmp:mode=1777
+    networks: [upgrade_lab]
+    depends_on:
+      upgrade_remote:
+        condition: service_started
+
+  browser_proxy:
+    image: seedsync/upgrade-v086/proxy
+    container_name: seedsync-upgrade-v086-proxy-${RUN_ID}
+    build:
+      context: .
+      dockerfile: proxy.Dockerfile
+    restart: "no"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: []
+    entrypoint: ["/usr/sbin/nginx"]
+    command: ["-g", "daemon off;"]
+    ports:
+      - "127.0.0.1:${HOST_PORT:?HOST_PORT is required}:8800"
+    tmpfs:
+      - /tmp:mode=1777
+      - /var/run:mode=1777
+    networks: [upgrade_lab, browser_access]
+    depends_on:
+      legacy:
+        condition: service_started
+
+  upgrade_remote:
+    image: seedsync/upgrade-v086/remote
+    container_name: seedsync-upgrade-v086-ssh-${RUN_ID}
+    build:
+      context: ../../../../
+      dockerfile: src/docker/test/upgrade-v086/remote.Dockerfile
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER, SYS_CHROOT]
+    volumes:
+      - type: bind
+        source: ${RUN_DIR}/remote-files
+        target: /home/remoteuser/files
+      - type: bind
+        source: ${SOURCE_DIR:?SOURCE_DIR is required}/src/python
+        target: /opt/seedsync-python
+        read_only: true
+    networks: [upgrade_lab]
+
+networks:
+  upgrade_lab:
+    name: ${LAB_NETWORK:?LAB_NETWORK is required}
+    external: true
+  browser_access:
+    name: ${BROWSER_NETWORK:?BROWSER_NETWORK is required}
+    external: true

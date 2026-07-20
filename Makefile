@@ -34,7 +34,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl clean coverage-python check-python-tooling lint-python typecheck-python
+.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl upgrade-v086-preflight upgrade-v086-build upgrade-v086-start upgrade-v086-status upgrade-v086-stop clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -127,6 +127,21 @@ verify-scanfs-glibc:
 
 preflight-linux-wsl:
 	bash ${SOURCEDIR}/docker/test/check_linux_wsl_baseline.sh
+
+upgrade-v086-preflight:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh preflight
+
+upgrade-v086-build:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh build
+
+upgrade-v086-start:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh start
+
+upgrade-v086-status:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh status
+
+upgrade-v086-stop:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh stop
 
 test-image:
 	# python run
