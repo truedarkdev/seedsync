@@ -12,6 +12,10 @@ make upgrade-v086-preflight
 make upgrade-v086-build [RUN_ID=lab-a]
 make upgrade-v086-start [RUN_ID=lab-a]
 make upgrade-v086-status [RUN_ID=lab-a]
+make upgrade-v086-restart [RUN_ID=lab-a]
+make upgrade-v086-build-transient [RUN_ID=transient-a]
+make upgrade-v086-start-transient [RUN_ID=transient-a]
+make upgrade-v086-transient [RUN_ID=transient-a]
 make upgrade-v086-stop [RUN_ID=lab-a]
 ```
 
@@ -38,6 +42,28 @@ configuration, downloads, remote hosts, credentials, or state. Run artifacts
 use a restrictive umask and permissions where the filesystem supports them, but
 DrvFS mode bits are not confidentiality enforcement; keep sensitive material
 outside this lab and rely on host ACLs for access control.
+
+The tracked `fixture-manifest.json` is the source of truth for the stable
+legacy model matrix: backend/UI state, AutoQueue expectation, persist markers,
+and the future migration invariant are validated before materialization. The
+manifest validator rejects unsafe/non-NFC/ambiguous paths, case-fold
+collisions, and oversized generated/text payloads; model validation checks the
+complete nested child tree rather than roots only. The
+restart waits for a fresh scan/model settlement and checks exact historical
+`controller.persist` keys and marker sets. Stable status/restart commands refuse
+transient-mode runs. Use `upgrade-v086-build-transient`,
+`upgrade-v086-start-transient`, then `upgrade-v086-transient` on a dedicated
+transient-mode run to exercise real historical
+lftp and extraction behavior; it records bounded JSON evidence for QUEUED,
+DOWNLOADING, and EXTRACTING and records states that are too brief to observe
+instead of fabricating them. That command recreates the run with a temporary
+historical lftp rc (`net:limit-rate=256K`, queue/file parallelism 1) so two
+transient downloads can expose queueing without an unbounded transfer or
+timing-sensitive large fixture. The dedicated run also overrides the pinned
+historical config's parallel-job/file and connection defaults to one, because
+the legacy controller reapplies those settings after loading the rc file. A
+stable retained run cannot be converted in place; this prevents transient
+controls or outputs from contaminating the stable migration oracle.
 
 The Compose service and bind-mounted `/config`, `/downloads`, `/mounts`, and
 `/logs` contract are deliberately stable for this disposable legacy fixture.

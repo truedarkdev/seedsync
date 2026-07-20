@@ -7,11 +7,15 @@ readonly LAB_DIR="${ROOT_DIR}/src/docker/test/upgrade-v086"
 readonly CACHE_DIR="${ROOT_DIR}/tmp/upgrade-v086/cache"
 readonly RUNS_DIR="${ROOT_DIR}/tmp/upgrade-v086/runs"
 readonly IMAGE_TAG="seedsync/upgrade-v086:legacy-ff2a10399"
+readonly FIXTURE_MANIFEST="${LAB_DIR}/fixture-manifest.json"
+readonly FIXTURE_GENERATOR="${LAB_DIR}/fixture.py"
 readonly PYTHON_BASE_DIGEST="sha256:e191a71397fd61fbddb6712cd43ef9a2c17df0b5e7ba67607128554cd6bff267"
 readonly ANGULAR_BASE_DIGEST="sha256:360ac6d2ab708d2d682b70dd4f89e4340d48a5710f8e2acb86993efdbd1c1487"
 
 redact() {
-  sed -E 's/(remote_password|SEEDSYNC_LAB_REMOTE_PASSWORD|password)[[:space:]]*[:=][[:space:]]*[^[:space:],}]*/\1=<redacted>/Ig'
+  sed -E -e 's/(remote_password|SEEDSYNC_LAB_REMOTE_PASSWORD|password)[[:space:]]*[:=][[:space:]]*[^[:space:],}]*/\1=<redacted>/Ig' \
+    -e 's#(sftp://[^:[:space:]]+:)[^@[:space:]]+@#\1<redacted>@#g' \
+    -e 's/remotepass/<redacted>/gI'
 }
 
 die() { echo "upgrade-v086: $*" >&2; exit 1; }
@@ -71,6 +75,7 @@ require_tools() {
   command -v python >/dev/null || die "python is required for network overlap checks"
   docker compose version >/dev/null || die "docker compose is required"
   git cat-file -e "${LEGACY_COMMIT}^{commit}" 2>/dev/null || die "historical commit ${LEGACY_COMMIT} is unavailable; fetch it without switching the worktree"
+  python "${FIXTURE_GENERATOR}" validate --manifest "${FIXTURE_MANIFEST}" >/dev/null || die "fixture manifest validation failed"
 }
 
 prepare_source() {
@@ -96,6 +101,8 @@ prepare_source() {
 
 create_run() {
   local id="$1"
+  local mode="${2:-stable}"
+  [[ "$mode" == stable || "$mode" == transient ]] || die "invalid run mode"
   validate_run_id "$id"
   ensure_runs_root
   local run_dir="${RUNS_DIR}/${id}"
@@ -110,8 +117,8 @@ create_run() {
   root_real="$(realpath -e "${RUNS_DIR}")"
   [[ "$run_real" == "$root_real"/* ]] || die "run directory escaped runs root"
   check_run_tree "$id"
-  printf 'synthetic legacy download for %s\n' "${id}" > "${run_dir}/downloads/legacy-fixture.txt"
-  printf 'synthetic remote fixture for %s\n' "${id}" > "${run_dir}/remote-files/legacy-fixture.txt"
+  python "${FIXTURE_GENERATOR}" materialize --manifest "${FIXTURE_MANIFEST}" --run-dir "${run_dir}" || die "unable to materialize fixture manifest"
+  printf '%s\n' "$mode" > "${run_dir}/config/lab-mode"
   printf '{"run_id":"%s","source_commit":"%s","source_tree":"%s","image":"%s","credentials":"synthetic-only"}\n' \
     "$id" "$LEGACY_COMMIT" "$(git rev-parse "${LEGACY_COMMIT}^{tree}")" "$IMAGE_TAG" > "${run_dir}/evidence/manifest.json"
   [[ ! -L "${RUNS_DIR}/latest" ]] || die "latest pointer must not be a symlink"
@@ -132,6 +139,8 @@ preflight() {
 
 build() {
   require_tools
+  local mode="${1:-stable}"
+  [[ "$mode" == stable || "$mode" == transient ]] || die "invalid build mode"
   local id
   id="${RUN_ID:-$(run_id)}"
   validate_run_id "$id"
@@ -139,7 +148,7 @@ build() {
   source_dir="$(prepare_source)"
   local tree
   tree="$(git rev-parse "${LEGACY_COMMIT}^{tree}")"
-  local dockerfile_digest entrypoint_digest compose_digest remote_dockerfile_digest proxy_dockerfile_digest proxy_config_digest lab_script_digest angular_lock_digest helper_digest
+  local dockerfile_digest entrypoint_digest compose_digest remote_dockerfile_digest proxy_dockerfile_digest proxy_config_digest lab_script_digest angular_lock_digest fixture_manifest_digest fixture_generator_digest transient_probe_digest helper_digest
   dockerfile_digest="$(sha256sum "${LAB_DIR}/Dockerfile" | cut -d' ' -f1)"
   entrypoint_digest="$(sha256sum "${LAB_DIR}/entrypoint.sh" | cut -d' ' -f1)"
   compose_digest="$(sha256sum "${LAB_DIR}/compose.yml" | cut -d' ' -f1)"
@@ -148,7 +157,10 @@ build() {
   proxy_config_digest="$(sha256sum "${LAB_DIR}/proxy-nginx.conf" | cut -d' ' -f1)"
   lab_script_digest="$(sha256sum "${LAB_DIR}/lab.sh" | cut -d' ' -f1)"
   angular_lock_digest="$(sha256sum "${LAB_DIR}/angular-package-lock.json" | cut -d' ' -f1)"
-  helper_digest="$(cat "${LAB_DIR}/Dockerfile" "${LAB_DIR}/entrypoint.sh" "${LAB_DIR}/compose.yml" "${LAB_DIR}/remote.Dockerfile" "${LAB_DIR}/proxy.Dockerfile" "${LAB_DIR}/proxy-nginx.conf" "${LAB_DIR}/lab.sh" "${LAB_DIR}/angular-package-lock.json" | sha256sum | cut -d' ' -f1)"
+  fixture_manifest_digest="$(sha256sum "${FIXTURE_MANIFEST}" | cut -d' ' -f1)"
+  fixture_generator_digest="$(sha256sum "${FIXTURE_GENERATOR}" | cut -d' ' -f1)"
+  transient_probe_digest="$(sha256sum "${LAB_DIR}/transient.py" | cut -d' ' -f1)"
+  helper_digest="$(cat "${LAB_DIR}/Dockerfile" "${LAB_DIR}/entrypoint.sh" "${LAB_DIR}/compose.yml" "${LAB_DIR}/remote.Dockerfile" "${LAB_DIR}/proxy.Dockerfile" "${LAB_DIR}/proxy-nginx.conf" "${LAB_DIR}/lab.sh" "${LAB_DIR}/angular-package-lock.json" "${FIXTURE_MANIFEST}" "${FIXTURE_GENERATOR}" "${LAB_DIR}/transient.py" | sha256sum | cut -d' ' -f1)"
   if docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1 \
     && [[ "$(docker image inspect --format '{{index .Config.Labels "org.seedsync.upgrade-v086.source-commit"}}' "${IMAGE_TAG}")" == "${LEGACY_COMMIT}" ]] \
     && [[ "$(docker image inspect --format '{{index .Config.Labels "org.seedsync.upgrade-v086.source-tree"}}' "${IMAGE_TAG}")" == "${tree}" ]] \
@@ -165,13 +177,13 @@ build() {
       --file "${LAB_DIR}/Dockerfile" "${source_dir}"
   fi
   local run_dir
-  run_dir="$(create_run "$id")"
+  run_dir="$(create_run "$id" "$mode")"
   local image_id image_digest
   image_id="$(docker image inspect --format '{{.Id}}' "${IMAGE_TAG}")"
   image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{else}}unpublished:${image_id}{{end}}' "${IMAGE_TAG}")"
   local base_digest="${PYTHON_BASE_DIGEST}"
-  printf '{"run_id":"%s","source_commit":"%s","source_tree":"%s","lab_helper_digest":"%s","dockerfile_digest":"%s","entrypoint_digest":"%s","compose_digest":"%s","remote_dockerfile_digest":"%s","proxy_dockerfile_digest":"%s","proxy_config_digest":"%s","lab_script_digest":"%s","angular_package_lock_digest":"%s","image":"%s","image_id":"%s","image_digest":"%s","base_image":"python:3.8-slim-bullseye","base_digest":"%s","angular_base_image":"node:12.16","angular_base_digest":"%s","credentials":"synthetic-only"}\n' \
-    "$id" "$LEGACY_COMMIT" "${tree}" "${helper_digest}" "${dockerfile_digest}" "${entrypoint_digest}" "${compose_digest}" "${remote_dockerfile_digest}" "${proxy_dockerfile_digest}" "${proxy_config_digest}" "${lab_script_digest}" "${angular_lock_digest}" "$IMAGE_TAG" "$image_id" "$image_digest" "$base_digest" "$ANGULAR_BASE_DIGEST" > "${run_dir}/evidence/manifest.json"
+  printf '{"run_id":"%s","source_commit":"%s","source_tree":"%s","lab_helper_digest":"%s","dockerfile_digest":"%s","entrypoint_digest":"%s","compose_digest":"%s","remote_dockerfile_digest":"%s","proxy_dockerfile_digest":"%s","proxy_config_digest":"%s","lab_script_digest":"%s","angular_package_lock_digest":"%s","fixture_manifest_digest":"%s","fixture_generator_digest":"%s","transient_probe_digest":"%s","image":"%s","image_id":"%s","image_digest":"%s","base_image":"python:3.8-slim-bullseye","base_digest":"%s","angular_base_image":"node:12.16","angular_base_digest":"%s","credentials":"synthetic-only"}\n' \
+    "$id" "$LEGACY_COMMIT" "${tree}" "${helper_digest}" "${dockerfile_digest}" "${entrypoint_digest}" "${compose_digest}" "${remote_dockerfile_digest}" "${proxy_dockerfile_digest}" "${proxy_config_digest}" "${lab_script_digest}" "${angular_lock_digest}" "${fixture_manifest_digest}" "${fixture_generator_digest}" "${transient_probe_digest}" "$IMAGE_TAG" "$image_id" "$image_digest" "$base_digest" "$ANGULAR_BASE_DIGEST" > "${run_dir}/evidence/manifest.json"
   echo "run: ${id}"
   echo "image: ${image_id}"
 }
@@ -185,6 +197,22 @@ selected_run_dir() {
   validate_run_id "$id"
   check_run_tree "$id"
   printf '%s' "${id}"
+}
+
+run_mode() {
+  local id="$1"
+  local mode_file="${RUNS_DIR}/${id}/config/lab-mode"
+  [[ -s "$mode_file" ]] || die "run mode marker is missing"
+  local mode
+  mode="$(tr -d '\r\n' < "$mode_file")"
+  [[ "$mode" == stable || "$mode" == transient ]] || die "invalid run mode marker"
+  printf '%s' "$mode"
+}
+
+require_mode() {
+  local id="$1"
+  local expected="$2"
+  [[ "$(run_mode "$id")" == "$expected" ]] || die "run mode is $(run_mode "$id"); expected $expected"
 }
 
 network_names() {
@@ -236,18 +264,27 @@ ensure_networks() {
 compose() {
   local id="$1"
   shift
+  local transient_mode=0
+  if [[ "${1:-}" == --transient-mode ]]; then
+    transient_mode=1
+    shift
+  fi
   local run_dir="${RUNS_DIR}/${id}"
   local project="seedsync-upgrade-v086-$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
   local networks
   networks=($(network_names "$id"))
-  SOURCE_DIR="$(prepare_source)" RUN_ID="$id" RUN_DIR="$run_dir" HOST_PORT="${HOST_PORT:-18806}" LAB_NETWORK="${networks[0]}" BROWSER_NETWORK="${networks[1]}" \
+  local autoqueue_enabled autoqueue_patterns_only autoqueue_auto_extract
+  read -r autoqueue_enabled autoqueue_patterns_only autoqueue_auto_extract < <(python "${FIXTURE_GENERATOR}" config --manifest "${FIXTURE_MANIFEST}")
+  local lftp_home=""
+  [[ "$transient_mode" == 1 ]] && lftp_home="/config/.lftp"
+  SOURCE_DIR="$(prepare_source)" RUN_ID="$id" RUN_DIR="$run_dir" HOST_PORT="${HOST_PORT:-18806}" LAB_NETWORK="${networks[0]}" BROWSER_NETWORK="${networks[1]}" AUTOQUEUE_ENABLED="$autoqueue_enabled" AUTOQUEUE_PATTERNS_ONLY="$autoqueue_patterns_only" AUTOQUEUE_AUTO_EXTRACT="$autoqueue_auto_extract" LAB_TRANSIENT_MODE="$transient_mode" TRANSIENT_LFTP_HOME="$lftp_home" \
     docker compose -p "$project" -f "${LAB_DIR}/compose.yml" "$@"
 }
 
 record_runtime_digests() {
   local id="$1"
   local run_dir="${RUNS_DIR}/${id}"
-  local dockerfile_digest entrypoint_digest compose_digest remote_dockerfile_digest proxy_dockerfile_digest proxy_config_digest lab_script_digest angular_lock_digest
+  local dockerfile_digest entrypoint_digest compose_digest remote_dockerfile_digest proxy_dockerfile_digest proxy_config_digest lab_script_digest angular_lock_digest fixture_manifest_digest fixture_generator_digest transient_probe_digest
   dockerfile_digest="$(sha256sum "${LAB_DIR}/Dockerfile" | cut -d' ' -f1)"
   entrypoint_digest="$(sha256sum "${LAB_DIR}/entrypoint.sh" | cut -d' ' -f1)"
   compose_digest="$(sha256sum "${LAB_DIR}/compose.yml" | cut -d' ' -f1)"
@@ -256,6 +293,9 @@ record_runtime_digests() {
   proxy_config_digest="$(sha256sum "${LAB_DIR}/proxy-nginx.conf" | cut -d' ' -f1)"
   lab_script_digest="$(sha256sum "${LAB_DIR}/lab.sh" | cut -d' ' -f1)"
   angular_lock_digest="$(sha256sum "${LAB_DIR}/angular-package-lock.json" | cut -d' ' -f1)"
+  fixture_manifest_digest="$(sha256sum "${FIXTURE_MANIFEST}" | cut -d' ' -f1)"
+  fixture_generator_digest="$(sha256sum "${FIXTURE_GENERATOR}" | cut -d' ' -f1)"
+  transient_probe_digest="$(sha256sum "${LAB_DIR}/transient.py" | cut -d' ' -f1)"
   local container="seedsync-upgrade-v086-${id}"
   docker cp "${container}:/usr/share/doc/seedsync-upgrade-v086/inventory/dpkg.txt" "${run_dir}/evidence/dpkg-inventory.txt"
   docker cp "${container}:/usr/share/doc/seedsync-upgrade-v086/inventory/pip.txt" "${run_dir}/evidence/pip-inventory.txt"
@@ -269,6 +309,9 @@ record_runtime_digests() {
     printf 'proxy_config_digest=%s\n' "$proxy_config_digest"
     printf 'lab_script_digest=%s\n' "$lab_script_digest"
     printf 'angular_package_lock_digest=%s\n' "$angular_lock_digest"
+    printf 'fixture_manifest_digest=%s\n' "$fixture_manifest_digest"
+    printf 'fixture_generator_digest=%s\n' "$fixture_generator_digest"
+    printf 'transient_probe_digest=%s\n' "$transient_probe_digest"
     printf 'dpkg_inventory_digest=%s\n' "$(sha256sum "${run_dir}/evidence/dpkg-inventory.txt" | cut -d' ' -f1)"
     printf 'pip_inventory_digest=%s\n' "$(sha256sum "${run_dir}/evidence/pip-inventory.txt" | cut -d' ' -f1)"
     printf 'npm_inventory_digest=%s\n' "$(sha256sum "${run_dir}/evidence/npm-inventory.json" | cut -d' ' -f1)"
@@ -323,12 +366,250 @@ PY
   die "timed out waiting for first successful remote scan; see ${status_file} and compose.log"
 }
 
+model_snapshot() {
+  python - "http://127.0.0.1:${HOST_PORT:-18806}/server/stream" <<'PY'
+import json
+import sys
+import urllib.request
+
+with urllib.request.urlopen(sys.argv[1], timeout=5) as response:
+    data = []
+    event = None
+    while True:
+        line = response.readline()
+        if not line:
+            break
+        if line.startswith(b"event:"):
+            event = line.decode("utf-8").split(":", 1)[1].strip()
+        if line.startswith(b"data:"):
+            data.append(line.decode("utf-8").split(":", 1)[1].strip())
+        elif line in (b"\n", b"\r\n") and data and event == "model-init":
+            print("".join(data))
+            break
+        elif line in (b"\n", b"\r\n"):
+            data = []
+            event = None
+PY
+}
+
+validate_model_snapshot() {
+  local model_file="$1"
+  python - "${FIXTURE_MANIFEST}" "$model_file" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+model = json.load(open(sys.argv[2], encoding="utf-8"))
+by_name = {item["name"]: item for item in model}
+expected_names = {case["name"] for case in manifest["cases"]}
+generated_roots = set(manifest.get("generated_roots", []))
+if set(by_name) != expected_names | generated_roots:
+    raise SystemExit("model roots differ from fixture manifest: expected {} got {}".format(sorted(expected_names | generated_roots), sorted(by_name)))
+
+def walk(items):
+    for item in items:
+        yield item
+        yield from walk(item.get("children", []))
+
+all_items = list(walk(model))
+excluded = set(manifest["excluded"])
+if any(item["name"] in excluded for item in all_items):
+    raise SystemExit("scanner exclusion leaked into model")
+
+import io
+import zipfile
+
+def payload(source):
+    if "content" in source:
+        return str(source["content"]).encode("utf-8")
+    if "generated_bytes" in source:
+        size = int(source["generated_bytes"])
+        return (b"seedsync-v086-transient-" * ((size // 24) + 1))[:size]
+    if "archive" in source:
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_STORED) as archive:
+            for member, content in source["archive"].items():
+                archive.writestr(member, payload(content) if isinstance(content, dict) else str(content).encode("utf-8"))
+        return out.getvalue()
+    return None
+
+def expected_node(name, remote, local, state=None):
+    if isinstance(local, dict) and local.get("same_as_remote"):
+        local = remote
+    remote_dir = isinstance(remote, dict) and "directory" in remote
+    local_dir = isinstance(local, dict) and "directory" in local
+    is_dir = remote_dir or local_dir
+    node = {"name": name, "is_dir": is_dir, "remote_size": None, "local_size": None, "children": []}
+    if is_dir:
+        def expand(mapping):
+            tree = {}
+            for relative, value in mapping.items():
+                cursor = tree
+                parts = relative.split("/")
+                for part in parts[:-1]:
+                    cursor = cursor.setdefault(part, {})
+                cursor[parts[-1]] = value
+            return tree
+        remote_children = expand(remote.get("directory", {})) if remote_dir else {}
+        local_children = expand(local.get("directory", {})) if local_dir else {}
+        for child in sorted(set(remote_children) | set(local_children)):
+            r = remote_children.get(child)
+            l = local_children.get(child)
+            if l == {"same_as_remote": True}:
+                l = r
+            if isinstance(r, str):
+                r = {"content": r}
+            if isinstance(l, str):
+                l = {"content": l}
+            if isinstance(r, dict) and not ("content" in r or "generated_bytes" in r or "archive" in r or "directory" in r):
+                r = {"directory": r}
+            if isinstance(l, dict) and not ("content" in l or "generated_bytes" in l or "archive" in l or "directory" in l):
+                l = {"directory": l}
+            node["children"].append(expected_node(child, r, l))
+        node["remote_size"] = sum(child["remote_size"] or 0 for child in node["children"]) if remote_dir else None
+        node["local_size"] = sum(child["local_size"] or 0 for child in node["children"]) if local_dir else None
+    else:
+        if remote is not None:
+            remote_payload = payload(remote)
+            if remote_payload is None:
+                raise ValueError("unsupported remote source for {}: {}".format(name, remote))
+            node["remote_size"] = len(remote_payload)
+        if local is not None:
+            local_payload = payload(local)
+            if local_payload is None:
+                raise ValueError("unsupported local source for {}: {}".format(name, local))
+            node["local_size"] = len(local_payload)
+    node["state"] = state or ("downloaded" if not is_dir and node["remote_size"] is not None and node["local_size"] is not None and node["local_size"] >= node["remote_size"] else "default")
+    return node
+
+def compare_tree(actual, expected, path):
+    if set(actual) != set(expected):
+        raise SystemExit("{} child names differ: expected {} got {}".format(path, sorted(expected), sorted(actual)))
+    for name, exp in expected.items():
+        item = actual[name]
+        for field in ("is_dir", "remote_size", "local_size", "state"):
+            if item.get(field) != exp[field]:
+                raise SystemExit("{} field {} expected {!r} got {!r}".format(path + "/" + name, field, exp[field], item.get(field)))
+        compare_tree({child["name"]: child for child in item.get("children", [])}, {child["name"]: child for child in exp["children"]}, path + "/" + name)
+
+expected = {}
+for case in manifest["cases"]:
+    remote = case.get("remote")
+    local = case.get("local")
+    if local and local.get("same_as_remote"):
+        local = remote
+    node = expected_node(case["name"], remote, local, case["expected"]["backend_state"])
+    if case["expected"]["backend_state"] in {"downloaded", "extracted"} and node["local_size"] is None:
+        node["local_size"] = node["remote_size"]
+    expected[case["name"]] = node
+generated = {}
+for case in manifest["cases"]:
+    if case["expected"]["autoqueue"] != "auto-extract":
+        continue
+    for member, content in case["remote"].get("archive", {}).items():
+        parts = member.split("/")
+        if parts and parts[0] == "extracted":
+            parts = parts[1:]
+        cursor = generated
+        for part in parts[:-1]:
+            cursor = cursor.setdefault(part, {"__node__": expected_node(part, None, {"directory": {}})})
+        member_source = content if isinstance(content, dict) else {"content": str(content)}
+        cursor[parts[-1]] = {"__node__": expected_node(parts[-1], None, member_source)}
+if generated:
+    def generated_node(name, tree):
+        children = []
+        for child, value in tree.items():
+            if "__node__" in value:
+                node = value["__node__"]
+                if isinstance(value, dict) and len(value) == 1:
+                    children.append(node)
+            else:
+                children.append(generated_node(child, value))
+        return {"name": name, "is_dir": True, "state": "default", "remote_size": None, "local_size": sum(c.get("local_size") or 0 for c in children), "children": children}
+    expected["extracted"] = generated_node("extracted", generated)
+actual = {item["name"]: item for item in model}
+compare_tree(actual, expected, "model")
+
+for case in manifest["cases"]:
+    item = by_name[case["name"]]
+    expected = case["expected"]
+    backend = item["state"]
+    remote = item.get("remote_size") or 0
+    local = item.get("local_size") or 0
+    ui = "stopped" if backend == "default" and local > 0 and remote > 0 else backend
+    if backend != expected["backend_state"] or ui != expected["ui_status"]:
+        raise SystemExit("{} expected backend/ui {}/{} got {}/{}".format(case["id"], expected["backend_state"], expected["ui_status"], backend, ui))
+print("ok")
+PY
+}
+
+wait_for_manifest_model() {
+  local id="$1"
+  local run_dir="${RUNS_DIR}/${id}"
+  local model_file="${run_dir}/evidence/model.json"
+  local error_file="${run_dir}/evidence/model-validation-error.txt"
+  local attempts=0
+  while (( attempts < 45 )); do
+    if model_snapshot > "${model_file}.tmp" 2>/dev/null && validate_model_snapshot "${model_file}.tmp" > /dev/null 2> "$error_file"; then
+      mv "${model_file}.tmp" "$model_file"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  [[ -s "${model_file}.tmp" ]] && mv "${model_file}.tmp" "$model_file"
+  die "fixture model did not settle to manifest expectations; see ${model_file}"
+}
+
+validate_persisted_markers() {
+  local id="$1"
+  local persist_file="${RUNS_DIR}/${id}/config/controller.persist"
+  python - "${FIXTURE_MANIFEST}" "$persist_file" <<'PY'
+import json
+import sys
+
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+persist = json.load(open(sys.argv[2], encoding="utf-8"))
+if set(persist) != {"downloaded", "extracted"}:
+    raise SystemExit("controller.persist keys differ from historical contract: {}".format(sorted(persist)))
+for key in ("downloaded", "extracted"):
+    if not isinstance(persist[key], list) or len(persist[key]) != len(set(persist[key])) or not all(isinstance(item, str) for item in persist[key]):
+        raise SystemExit("controller.persist {} marker array is malformed".format(key))
+    actual = set(persist[key])
+    required = {case["name"] for case in manifest["cases"] if case["expected"]["persistence"].get(key)}
+    if actual != required:
+        raise SystemExit("controller.persist {} markers differ: expected {} got {}".format(key, sorted(required), sorted(actual)))
+PY
+}
+
+wait_for_persisted_markers() {
+  local id="$1"
+  local run_dir="${RUNS_DIR}/${id}"
+  local error_file="${run_dir}/evidence/persist-validation-error.txt"
+  local attempts=0
+  while (( attempts < 30 )); do
+    if validate_persisted_markers "$id" > /dev/null 2> "$error_file"; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 1
+  done
+  die "controller.persist did not settle to exact manifest markers; see ${error_file}"
+}
+
 start() {
+  local mode="${1:-stable}"
+  [[ "$mode" == stable || "$mode" == transient ]] || die "invalid start mode"
   local id
   id="$(selected_run_dir)"
+  require_mode "$id" "$mode"
   validate_host_port "${HOST_PORT:-18806}"
   ensure_networks "$id"
-  compose "$id" up -d --build --force-recreate
+  if [[ "$mode" == transient ]]; then
+    compose "$id" --transient-mode up -d --build --force-recreate
+  else
+    compose "$id" up -d --build --force-recreate
+  fi
   local run_dir="${RUNS_DIR}/${id}"
   record_runtime_digests "$id"
   compose "$id" ps > "${run_dir}/evidence/compose-ps.txt"
@@ -339,6 +620,7 @@ start() {
 status() {
   local id
   id="$(selected_run_dir)"
+  require_mode "$id" stable
   local run_dir="${RUNS_DIR}/${id}"
   validate_host_port "${HOST_PORT:-18806}"
   ensure_networks "$id"
@@ -350,6 +632,7 @@ status() {
   compose "$id" ps
   curl --fail --silent --show-error --max-time 10 "http://127.0.0.1:${HOST_PORT:-18806}/" | redact > "${run_dir}/evidence/http-root.html" || die "legacy HTTP endpoint is unhealthy"
   wait_for_remote_scan "$id"
+  wait_for_manifest_model "$id"
   compose "$id" logs --no-color | redact > "${run_dir}/evidence/compose.log"
   if grep -q 'ScannerError' "${run_dir}/evidence/compose.log"; then
     die "ScannerError present in collected logs"
@@ -363,9 +646,94 @@ stop() {
   compose "$id" stop
 }
 
+restart() {
+  local id
+  id="$(selected_run_dir)"
+  require_mode "$id" stable
+  stop
+  start
+  wait_for_remote_scan "$id"
+  wait_for_manifest_model "$id"
+  wait_for_persisted_markers "$id"
+}
+
+transient() {
+  local id
+  id="$(selected_run_dir)"
+  require_mode "$id" transient
+  validate_host_port "${HOST_PORT:-18806}"
+  local transient_lftp_home=/config/.lftp transient_parallel_jobs=1 transient_parallel_files=1 transient_connections=1
+  [[ "$transient_lftp_home" == /config/.lftp && "$transient_parallel_jobs" =~ ^[1-9][0-9]*$ && "$transient_parallel_files" =~ ^[1-9][0-9]*$ && "$transient_connections" =~ ^[1-9][0-9]*$ ]] || die "invalid fixed transient lftp controls"
+  local run_dir="${RUNS_DIR}/${id}"
+  [[ ! -e "${run_dir}/evidence/transient-state.json" && ! -e "${run_dir}/evidence/transient-summary.json" ]] || die "transient probe is single-use for a run; choose a fresh RUN_ID"
+  local transient_name
+  while IFS= read -r transient_name; do
+    [[ ! -e "${run_dir}/downloads/${transient_name}" ]] || die "transient fixture already has local output: ${transient_name}; choose a fresh RUN_ID"
+  done < <(python - "${FIXTURE_MANIFEST}" <<'PY'
+import json
+import sys
+manifest = json.load(open(sys.argv[1], encoding="utf-8"))
+for case in manifest["cases"]:
+    if case.get("transient"):
+        print(case["name"])
+PY
+)
+  local lftp_host_home="${run_dir}/config/.lftp"
+  [[ ! -e "$lftp_host_home" && ! -L "$lftp_host_home" ]] || die "transient lftp control directory already exists; choose a fresh RUN_ID"
+  mkdir -m 700 "$lftp_host_home" || die "unable to create transient lftp control directory"
+  printf 'set net:limit-rate 256K\nset cmd:queue-parallel 1\nset mirror:parallel-transfer-count 1\nset pget:default-n 1\nset mirror:use-pget-n 1\nset net:connection-limit 1\nset net:timeout 3\nset net:max-retries 1\nset net:reconnect-interval-base 1\n' > "${lftp_host_home}/rc"
+  stop
+  start transient
+  local container="seedsync-upgrade-v086-${id}"
+  docker exec "$container" sh -c 'test "$LFTP_HOME" = /config/.lftp && test "$(grep -Ec "^set (net:limit-rate 256K|cmd:queue-parallel 1|mirror:parallel-transfer-count 1|pget:default-n 1|mirror:use-pget-n 1|net:connection-limit 1|net:timeout 3|net:max-retries 1|net:reconnect-interval-base 1)$" /config/.lftp/rc)" -eq 9 && grep -E "^(num_max_parallel_downloads|num_max_parallel_files_per_download|num_max_connections_per_root_file|num_max_connections_per_dir_file|num_max_total_connections) = 1$" /config/settings.cfg && cat /config/.lftp/rc' > "${run_dir}/evidence/lftp-controls.txt" || die "transient lftp controls were not loaded inside legacy container"
+  timeout 35s docker exec "$container" sh -c '
+    probe_dir="/tmp/upgrade-v086-lftp-probe-$$" && mkdir "$probe_dir"
+    LFTP_HOME=/config/.lftp lftp -p 1234 -u remoteuser,remotepass sftp://upgrade_remote <<EOF || true
+set cmd:queue-parallel 1
+set net:limit-rate 256K
+set net:timeout 3
+set net:max-retries 1
+set net:reconnect-interval-base 1
+set mirror:parallel-transfer-count 1
+set pget:default-n 1
+queue pget -c "/home/remoteuser/files/transient-large.bin" -o "$probe_dir/"
+queue pget -c "/home/remoteuser/files/transient-manual.zip" -o "$probe_dir/"
+jobs -v
+sleep 2
+jobs -v
+kill all
+bye
+EOF
+  ' | sed -E 's#(sftp://[^:]+:)[^@]+@#\1<redacted>@#g' > "${run_dir}/evidence/lftp-jobs.txt" || die "transient lftp jobs probe failed"
+  grep -q "Commands queued:" "${run_dir}/evidence/lftp-jobs.txt" || die "transient lftp jobs probe did not expose a queued command"
+  timeout 20s docker exec "$container" sh -c '
+    printf "value=0\\n"
+    LFTP_HOME=/config/.lftp lftp -p 1234 -u remoteuser,remotepass sftp://upgrade_remote <<EOF || true
+set cmd:queue-parallel 0
+set net:timeout 3
+set net:max-retries 1
+set -a | grep cmd:queue-parallel
+bye
+EOF
+    printf "value=false\\n"
+    LFTP_HOME=/config/.lftp lftp -p 1234 -u remoteuser,remotepass sftp://upgrade_remote <<EOF || true
+set cmd:queue-parallel false
+set net:timeout 3
+set net:max-retries 1
+bye
+EOF
+  ' 2>&1 | sed -E 's#(sftp://[^:]+:)[^@]+@#\1<redacted>@#g' > "${run_dir}/evidence/lftp-setting-guard.txt"
+  printf 'historical_controller_minimum=1 (num_parallel_jobs setter rejects values below one)\n' >> "${run_dir}/evidence/lftp-setting-guard.txt"
+  grep -q "set cmd:queue-parallel 0" "${run_dir}/evidence/lftp-setting-guard.txt" || die "transient lftp setting guard did not prove raw lftp accepts 0"
+  grep -q "invalid unsigned number" "${run_dir}/evidence/lftp-setting-guard.txt" || die "transient lftp setting guard did not prove raw lftp rejects false"
+  wait_for_remote_scan "$id"
+  python "${LAB_DIR}/transient.py" --base-url "http://127.0.0.1:${HOST_PORT:-18806}" --evidence "${run_dir}/evidence/transient-state.json" > "${run_dir}/evidence/transient-summary.json"
+  compose "$id" logs --no-color | redact > "${run_dir}/evidence/compose.log"
+}
+
 usage() {
   cat <<'EOF'
-Usage: lab.sh <preflight|build|start|status|stop>
+Usage: lab.sh <preflight|build|build-transient|start|status|restart|transient|stop>
 
 RUN_ID selects a retained run; build creates a unique run when omitted.
 HOST_PORT defaults to 18806 and binds only to loopback.
@@ -376,9 +744,12 @@ main() {
   umask 077
   case "${1:-}" in
     preflight) preflight ;;
-    build) build ;;
-    start) start ;;
+    build) build stable ;;
+    build-transient) build transient ;;
+    start) start "${2:-stable}" ;;
     status) status ;;
+    restart) restart ;;
+    transient) transient ;;
     stop) stop ;;
     *) usage; return 2 ;;
   esac

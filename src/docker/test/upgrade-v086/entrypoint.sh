@@ -29,6 +29,23 @@ replace remote_port "${SEEDSYNC_LAB_REMOTE_PORT:-1234}"
 replace remote_path "${SEEDSYNC_LAB_REMOTE_PATH:-/home/remoteuser/files}"
 replace local_path "${SEEDSYNC_LAB_LOCAL_PATH:-/downloads}"
 replace extract_path "${SEEDSYNC_LAB_EXTRACT_PATH:-/downloads}"
+replace enabled "${SEEDSYNC_LAB_AUTOQUEUE_ENABLED:-true}"
+replace patterns_only "${SEEDSYNC_LAB_AUTOQUEUE_PATTERNS_ONLY:-true}"
+replace auto_extract "${SEEDSYNC_LAB_AUTOQUEUE_AUTO_EXTRACT:-true}"
+case "${SEEDSYNC_LAB_TRANSIENT_MODE:-0}" in
+  0)
+    [ -z "${LFTP_HOME:-}" ] || { echo 'ambient LFTP_HOME is not accepted on stable runs' >&2; exit 1; }
+    ;;
+  1)
+    [ "${LFTP_HOME:-}" = /config/.lftp ] || { echo 'transient LFTP_HOME must be /config/.lftp' >&2; exit 1; }
+    replace num_max_parallel_downloads 1
+    replace num_max_parallel_files_per_download 1
+    replace num_max_connections_per_root_file 1
+    replace num_max_connections_per_dir_file 1
+    replace num_max_total_connections 1
+    ;;
+  *) echo 'invalid transient mode' >&2; exit 1 ;;
+esac
 
 if [ -n "${SEEDSYNC_LAB_REMOTE_HOST:-}" ]; then
   attempts=0
