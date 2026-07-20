@@ -34,7 +34,7 @@ endif
 DOCKER=${DOCKER_BUILDKIT_FLAGS} DOCKER_BUILDKIT=1 docker
 DOCKER_COMPOSE=${DOCKER_BUILDKIT_FLAGS} COMPOSE_DOCKER_CLI_BUILD=1 DOCKER_BUILDKIT=1 docker compose
 
-.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl upgrade-v086-preflight upgrade-v086-build upgrade-v086-start upgrade-v086-status upgrade-v086-stop clean coverage-python check-python-tooling lint-python typecheck-python
+.PHONY: builddir deb docker-image test-image tests-python run-tests-python run-tests-python-native run-tests-python-wsl verify-deb-glibc verify-scanfs-glibc preflight-linux-wsl upgrade-v086-preflight upgrade-v086-build upgrade-v086-start upgrade-v086-status upgrade-v086-restart upgrade-v086-build-transient upgrade-v086-start-transient upgrade-v086-transient upgrade-v086-stop clean coverage-python check-python-tooling lint-python typecheck-python
 
 all: deb docker-image
 
@@ -137,8 +137,20 @@ upgrade-v086-build:
 upgrade-v086-start:
 	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh start
 
+upgrade-v086-build-transient:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh build-transient
+
+upgrade-v086-start-transient:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh start transient
+
 upgrade-v086-status:
 	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh status
+
+upgrade-v086-restart:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh restart
+
+upgrade-v086-transient:
+	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh transient
 
 upgrade-v086-stop:
 	bash ${SOURCEDIR}/docker/test/upgrade-v086/lab.sh stop
