@@ -65,6 +65,40 @@ the legacy controller reapplies those settings after loading the rc file. A
 stable retained run cannot be converted in place; this prevents transient
 controls or outputs from contaminating the stable migration oracle.
 
+`fixture-evidence.json` is materialized beside `fixture-expected.json` in every
+run. It declares all seven backend states, the frontend-derived `stopped`
+state, stable versus transient classifications, the minimal stable topology
+coverage (root file, root directory, nested directory, and child file), derived
+and source-validated from each fixture's actual remote/local shape, the
+AutoQueue positive/negative mapping, transient probe targets, and intentional
+exclusions. It is a generated evidence contract, not an assertion that timing-
+dependent states were stable. `transient-state.json` records each bounded
+observation's target, observed flag, timestamps, timeout, current state, and
+states seen; `transient-summary.json` is the same JSON echoed for shell logs.
+An unobserved transient is reported as a bounded limitation and is never
+converted into a hard stable expectation.
+
+The transient command requires both the canonical pinned manifest and the
+generated fixture evidence; it rebuilds and compares the complete contract
+before issuing any queue or extract action, failing closed on stale or altered
+artifacts.
+
+The directory fixtures intentionally exercise aggregate remote/local sizes:
+`root-directory-default` has no local aggregate, while
+`root-directory-stopped` has one partial child plus one complete nested child;
+`nested-specials` adds distinct duplicate basenames in different directories.
+This is the representative directory behavior, not a Cartesian copy of every
+state across every topology.
+
+Stable browser evidence checklist (after `upgrade-v086-status`): capture the
+dashboard with the complete stable state set and representative topologies,
+then inspect AutoQueue settings and the status filter/sort controls supported
+by the pinned UI. Capture a restart recovery view after
+`upgrade-v086-restart`, and record any console/page errors. On a dedicated
+transient run, capture only states actually reported in `transient-state.json`;
+do not label a screenshot as queued, downloading, or extracting when the probe
+timed out or ended in another current state.
+
 The Compose service and bind-mounted `/config`, `/downloads`, `/mounts`, and
 `/logs` contract are deliberately stable for this disposable legacy fixture.
 This foundation slice does not accept arbitrary image overrides or perform

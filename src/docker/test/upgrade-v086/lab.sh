@@ -727,7 +727,7 @@ EOF
   grep -q "set cmd:queue-parallel 0" "${run_dir}/evidence/lftp-setting-guard.txt" || die "transient lftp setting guard did not prove raw lftp accepts 0"
   grep -q "invalid unsigned number" "${run_dir}/evidence/lftp-setting-guard.txt" || die "transient lftp setting guard did not prove raw lftp rejects false"
   wait_for_remote_scan "$id"
-  python "${LAB_DIR}/transient.py" --base-url "http://127.0.0.1:${HOST_PORT:-18806}" --evidence "${run_dir}/evidence/transient-state.json" > "${run_dir}/evidence/transient-summary.json"
+  python "${LAB_DIR}/transient.py" --base-url "http://127.0.0.1:${HOST_PORT:-18806}" --manifest "${FIXTURE_MANIFEST}" --fixture-evidence "${run_dir}/evidence/fixture-evidence.json" --evidence "${run_dir}/evidence/transient-state.json" > "${run_dir}/evidence/transient-summary.json"
   compose "$id" logs --no-color | redact > "${run_dir}/evidence/compose.log"
 }
 
