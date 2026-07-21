@@ -1,0 +1,9 @@
+{
+    "patterns": [
+        "{\"pattern\": \"substring\"}",
+        "{\"pattern\": \"glob-*.dat\"}",
+        "{\"pattern\": \"case-positive\"}",
+        "{\"pattern\": \"auto-extract\"}",
+        "{\"pattern\": \"nonarchive\"}"
+    ]
+}

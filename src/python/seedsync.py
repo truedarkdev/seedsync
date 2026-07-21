@@ -27,6 +27,7 @@ from web import WebAppJob, WebAppBuilder
 from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
 from web.handler.historical_log import create_historical_log_handler
+from migration import MigrationCoordinator, MigrationDecision
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
@@ -65,6 +66,12 @@ class Seedsync:
 
         # Parse the args
         args = self._parse_args(sys.argv[1:])
+
+        # Migration preflight must precede every loader that can normalize,
+        # back up, or persist legacy state. A later migration-only web slice
+        # can consume this decision without constructing the normal runtime.
+        self.migration_coordinator = MigrationCoordinator(args.config_dir)
+        self.migration_decision: MigrationDecision = self.migration_coordinator.require_normal_startup()
 
         # Create/load config
         config = None

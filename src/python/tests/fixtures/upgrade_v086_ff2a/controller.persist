@@ -1,0 +1,17 @@
+{
+    "downloaded": [
+        "auto-extract.zip",
+        "nonarchive.txt",
+        "extracted-archive.zip",
+        "deleted-marker.bin",
+        "positive-substring.mkv",
+        "Case-Positive.ISO",
+        "downloaded-equal.bin",
+        "glob-positive.dat",
+        "Nested Set"
+    ],
+    "extracted": [
+        "auto-extract.zip",
+        "extracted-archive.zip"
+    ]
+}

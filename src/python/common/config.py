@@ -603,6 +603,8 @@ class Config(Persist):
             config_dict = dict(config_dict)
             if "transfer_backend" not in config_dict:
                 config_dict["transfer_backend"] = "lftp"
+            if "rate_limit" not in config_dict:
+                config_dict["rate_limit"] = "0"
             if "remote_python_path" not in config_dict:
                 config_dict["remote_python_path"] = "python3"
             if "net_socket_buffer" not in config_dict:
