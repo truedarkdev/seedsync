@@ -23,11 +23,62 @@
     }
   },
   "generated_roots": ["extracted"],
+  "evidence_contract": {
+    "states": {
+      "backend": ["default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted"],
+      "ui_derived": ["stopped"],
+      "stable": ["default", "stopped", "downloaded", "deleted", "extracted"],
+      "transient": ["queued", "downloading", "extracting"]
+    },
+    "stable_coverage": [
+      {"case_id": "default-remote-only", "ui_status": "default", "topologies": ["root-file"]},
+      {"case_id": "stopped-partial-local", "ui_status": "stopped", "topologies": ["root-file"]},
+      {"case_id": "downloaded-equal", "ui_status": "downloaded", "topologies": ["root-file"]},
+      {"case_id": "deleted-marker", "ui_status": "deleted", "topologies": ["root-file"]},
+      {"case_id": "extracted-archive", "ui_status": "extracted", "topologies": ["root-file"]},
+      {"case_id": "root-directory-default", "ui_status": "default", "topologies": ["root-directory", "nested-directory", "child-file"]},
+      {"case_id": "root-directory-stopped", "ui_status": "stopped", "topologies": ["root-directory", "nested-directory", "child-file"]},
+      {"case_id": "nested-specials", "ui_status": "downloaded", "topologies": ["root-directory", "nested-directory", "child-file"]}
+    ],
+    "transient_probes": [
+      {"case_id": "transient-manual", "target": "queued", "timeout_seconds": 45},
+      {"case_id": "transient-large", "target": "downloading", "timeout_seconds": 45},
+      {"case_id": "transient-manual", "target": "extracting", "timeout_seconds": 45}
+    ],
+    "autoqueue": {
+      "rules": {
+        "substring": "case-insensitive substring",
+        "glob": "case-insensitive fnmatch wildcard"
+      },
+      "positive": [
+        {"case_id": "substring-match", "match": "substring"},
+        {"case_id": "glob-match", "match": "glob"},
+        {"case_id": "case-insensitive-match", "match": "case-insensitive"},
+        {"case_id": "auto-extract-positive", "match": "auto-extract"},
+        {"case_id": "nonarchive-negative", "match": "nonarchive"}
+      ],
+      "negative": [
+        {"case_id": "default-remote-only", "reason": "basename matches no configured pattern"},
+        {"case_id": "negative-nonmatch", "reason": "basename matches no configured pattern"}
+      ],
+      "out_of_run": [
+        "disabled AutoQueue mode is a historical config branch and is not mixed into the enabled stable run",
+        "patternless AutoQueue mode is a historical config branch and is not mixed into the enabled stable run",
+        "overlapping pattern precedence is intentionally not asserted"
+      ]
+    },
+    "exclusions": [
+      {"id": "same-directory-duplicate-identity", "reason": "the historical per-directory basename identity cannot represent same-directory duplicates"},
+      {"id": "timing-dependent-transient-stable-oracles", "reason": "queued, downloading, and extracting are observed only through bounded probes and are never stable fixture expectations"},
+      {"id": "directory-extracted-stable-case", "reason": "EXTRACTED is a persisted archive marker; directory aggregation is represented by root/nested directory cases instead"}
+    ]
+  },
   "cases": [
     {
       "id": "default-remote-only",
       "name": "default-remote-only.bin",
       "remote": {"content": "remote-only"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve remote-only default as a not-yet-downloaded item"}
     },
     {
@@ -35,6 +86,7 @@
       "name": "stopped-partial.bin",
       "remote": {"content": "0123456789abcdef"},
       "local": {"content": "012345"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "default", "ui_status": "stopped", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve resumable partial local bytes without inventing a backend stopped state"}
     },
     {
@@ -43,6 +95,7 @@
       "remote": {"content": "complete-file"},
       "local": {"same_as_remote": true},
       "markers": {"downloaded": true},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "unmatched", "persistence": {"downloaded": true}, "migration_invariant": "preserve equal local and remote completion"}
     },
     {
@@ -50,6 +103,7 @@
       "name": "deleted-marker.bin",
       "remote": {"content": "downloaded-then-removed"},
       "markers": {"downloaded": true},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "deleted", "ui_status": "deleted", "autoqueue": "unmatched", "persistence": {"downloaded": true}, "migration_invariant": "retain downloaded history while local content is absent"}
     },
     {
@@ -58,54 +112,63 @@
       "remote": {"archive": {"inside/readme.txt": "archive payload"}},
       "local": {"same_as_remote": true},
       "markers": {"downloaded": true, "extracted": true},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "extracted", "ui_status": "extracted", "autoqueue": "unmatched", "persistence": {"downloaded": true, "extracted": true}, "migration_invariant": "preserve archive completion and extraction history"}
     },
     {
       "id": "substring-match",
       "name": "positive-substring.mkv",
       "remote": {"content": "substring payload"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "substring", "persistence": {"downloaded": true}, "migration_invariant": "preserve basename substring AutoQueue match and settled download"}
     },
     {
       "id": "glob-match",
       "name": "glob-positive.dat",
       "remote": {"content": "glob payload"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "glob", "persistence": {"downloaded": true}, "migration_invariant": "preserve basename fnmatch AutoQueue match and settled download"}
     },
     {
       "id": "case-insensitive-match",
       "name": "Case-Positive.ISO",
       "remote": {"content": "case payload"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "case-insensitive", "persistence": {"downloaded": true}, "migration_invariant": "preserve case-insensitive basename AutoQueue matching"}
     },
     {
       "id": "negative-nonmatch",
       "name": "negative-nonmatch.bin",
       "remote": {"content": "not queued"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "do not queue a basename that matches no configured pattern"}
     },
     {
       "id": "auto-extract-positive",
       "name": "auto-extract.zip",
       "remote": {"archive": {"extracted/file.txt": "auto extract payload"}},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "extracted", "ui_status": "extracted", "autoqueue": "auto-extract", "persistence": {"downloaded": true, "extracted": true}, "migration_invariant": "preserve enabled AutoQueue archive download followed by extraction"}
     },
     {
       "id": "nonarchive-negative",
       "name": "nonarchive.txt",
       "remote": {"content": "plain text"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "nonarchive", "persistence": {"downloaded": true}, "migration_invariant": "preserve AutoQueue download without extracting a nonarchive"}
     },
     {
       "id": "local-only",
       "name": "local-only.txt",
       "local": {"content": "local residue"},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve local-only content without treating it as a remote download"}
     },
     {
       "id": "zero-byte",
       "name": "zero-byte.bin",
       "remote": {"content": ""},
+      "topologies": ["root-file"],
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve zero-byte remote metadata without queueing it"}
     },
     {
@@ -114,12 +177,29 @@
       "remote": {"directory": {"zero.bin": "", "space name.txt": "space", "unicøde.txt": "unicode", "punctuation[1].txt": "punctuation", "dupe-a/same.txt": "A", "dupe-b/same.txt": "B"}},
       "local": {"same_as_remote": true},
       "markers": {"downloaded": true},
+      "topologies": ["root-directory", "nested-directory", "child-file"],
       "expected": {"backend_state": "downloaded", "ui_status": "downloaded", "autoqueue": "unmatched", "persistence": {"downloaded": true}, "migration_invariant": "preserve nested aggregation, zero bytes, Unicode, punctuation, spaces, and distinct duplicate basenames"}
+    },
+    {
+      "id": "root-directory-default",
+      "name": "root-directory-default",
+      "remote": {"directory": {"pending.txt": "pending directory payload", "nested/child.bin": "nested child payload"}},
+      "topologies": ["root-directory", "nested-directory", "child-file"],
+      "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve a remote directory tree before any local download"}
+    },
+    {
+      "id": "root-directory-stopped",
+      "name": "root-directory-stopped",
+      "remote": {"directory": {"partial.txt": "0123456789abcdef", "nested/child.bin": "nested child payload"}},
+      "local": {"directory": {"partial.txt": "012345", "nested/child.bin": "nested child payload"}},
+      "topologies": ["root-directory", "nested-directory", "child-file"],
+      "expected": {"backend_state": "default", "ui_status": "stopped", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "preserve aggregate partial directory bytes as frontend stopped without inventing a backend state"}
     },
     {
       "id": "transient-large",
       "name": "transient-large.bin",
       "remote": {"generated_bytes": 8388608},
+      "topologies": ["root-file"],
       "transient": true,
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "bounded transient probe only; do not use timing-derived state as stable migration input"}
     },
@@ -127,6 +207,7 @@
       "id": "transient-manual",
       "name": "transient-manual.zip",
       "remote": {"archive": {"extracted/payload.bin": {"generated_bytes": 8388608}}},
+      "topologies": ["root-file"],
       "transient": true,
       "expected": {"backend_state": "default", "ui_status": "default", "autoqueue": "unmatched", "persistence": {}, "migration_invariant": "bounded extractor probe only; do not use timing-derived extraction state as stable migration input"}
     }

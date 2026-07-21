@@ -14,6 +14,9 @@ HISTORICAL_COMMIT = "ff2a1039935beccbbf7ec76134b41d2e91137742"
 BACKEND_STATES = {"default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted"}
 UI_STATES = BACKEND_STATES | {"stopped"}
 AUTOQUEUE_EXPECTATIONS = {"unmatched", "substring", "glob", "case-insensitive", "auto-extract", "nonarchive"}
+TOPOLOGIES = {"root-file", "root-directory", "nested-directory", "child-file"}
+STABLE_UI_STATES = ["default", "stopped", "downloaded", "deleted", "extracted"]
+TRANSIENT_UI_STATES = ["queued", "downloading", "extracting"]
 MAX_CASES = 64
 MAX_ENTRIES = 512
 MAX_TOTAL_UNCOMPRESSED_BYTES = 64 * 1024 * 1024
@@ -99,6 +102,54 @@ def bounded_generated(value):
     return value
 
 
+def _resolved_source(case, key):
+    source = case.get(key)
+    if isinstance(source, dict) and source.get("same_as_remote"):
+        return case.get("remote")
+    return source
+
+
+def _directory_shape(source):
+    """Return whether a directory source contains nested paths and file entries."""
+    if not isinstance(source, dict) or "directory" not in source:
+        return False, False
+    nested = False
+    child_file = False
+
+    def walk(mapping, depth):
+        nonlocal nested, child_file
+        if not isinstance(mapping, dict):
+            return
+        for relative, content in mapping.items():
+            parts = PurePosixPath(relative).parts
+            below_root = depth > 0 or len(parts) > 1
+            nested = nested or below_root
+            if isinstance(content, dict) and set(content) == {"directory"}:
+                walk(content["directory"], depth + len(parts))
+            else:
+                child_file = True
+
+    walk(source["directory"], 0)
+    return nested, child_file
+
+
+def derive_topologies(case):
+    """Derive the exact topology represented by a case's source shapes."""
+    sources = [_resolved_source(case, "remote"), _resolved_source(case, "local")]
+    directory_sources = [source for source in sources if isinstance(source, dict) and "directory" in source]
+    if not directory_sources:
+        if not any(source is not None for source in sources):
+            raise ValueError("{} has no remote or local source to derive topology".format(case.get("id")))
+        return {"root-file"}
+    topologies = {"root-directory"}
+    shapes = [_directory_shape(source) for source in directory_sources]
+    if any(shape[0] for shape in shapes):
+        topologies.add("nested-directory")
+    if any(shape[1] for shape in shapes):
+        topologies.add("child-file")
+    return topologies
+
+
 def register_path(kind, path, seen, counters):
     key = unicodedata.normalize("NFC", str(path)).casefold()
     if key in seen:
@@ -136,6 +187,7 @@ def load_manifest(path):
         raise ValueError("fixture case count must be between 1 and {}".format(MAX_CASES))
     names = set()
     ids = set()
+    cases_by_id = {}
     counters = {"entries": 0, "generated": 0, "total": 0, "text": 0}
     remote_seen = {}
     local_seen = {}
@@ -150,6 +202,7 @@ def load_manifest(path):
         safe_relative(name)
         ids.add(case_id)
         names.add(name)
+        cases_by_id[case_id] = case
         if expected.get("backend_state") not in BACKEND_STATES:
             raise ValueError("{} uses an unknown historical backend state".format(case_id))
         if expected.get("ui_status") not in UI_STATES:
@@ -158,6 +211,21 @@ def load_manifest(path):
             raise ValueError("{} uses an unknown AutoQueue expectation".format(case_id))
         if not expected.get("migration_invariant"):
             raise ValueError("{} is missing a migration invariant".format(case_id))
+        if "topologies" not in case:
+            raise ValueError("{} is missing an exact topology declaration".format(case_id))
+        if (
+            not isinstance(case["topologies"], list)
+            or not case["topologies"]
+            or not set(case["topologies"]) <= TOPOLOGIES
+        ):
+            raise ValueError("{} uses malformed topology declarations".format(case_id))
+        derived_topologies = derive_topologies(case)
+        if set(case["topologies"]) != derived_topologies:
+            raise ValueError(
+                "{} topology declaration differs from fixture sources: expected {} got {}".format(
+                    case_id, sorted(derived_topologies), sorted(case["topologies"])
+                )
+            )
         markers = case.get("markers", {})
         if set(markers) - {"downloaded", "extracted"}:
             raise ValueError("{} uses unknown controller.persist markers".format(case_id))
@@ -193,7 +261,119 @@ def load_manifest(path):
     generated_roots = manifest.get("generated_roots", [])
     if not isinstance(generated_roots, list) or not all(isinstance(item, str) and item for item in generated_roots):
         raise ValueError("generated_roots must be a list of names")
+    validate_evidence_contract(manifest.get("evidence_contract"), cases_by_id)
     return manifest
+
+
+def validate_evidence_contract(contract, cases_by_id):
+    """Validate the explicit stable/transient evidence matrix.
+
+    This contract is intentionally separate from fixture expectations so that
+    transient observations remain best-effort and cannot be mistaken for
+    deterministic migration or screenshot oracles.
+    """
+    if not isinstance(contract, dict):
+        raise ValueError("manifest evidence_contract must be an object")
+    required = {"states", "stable_coverage", "transient_probes", "autoqueue", "exclusions"}
+    if set(contract) != required:
+        raise ValueError("manifest evidence_contract keys differ: expected {}".format(sorted(required)))
+    states = contract["states"]
+    if not isinstance(states, dict) or set(states) != {"backend", "ui_derived", "stable", "transient"}:
+        raise ValueError("evidence state declarations are malformed")
+    if states["backend"] != ["default", "downloading", "queued", "downloaded", "deleted", "extracting", "extracted"]:
+        raise ValueError("evidence backend states do not match the pinned historical contract")
+    if states["ui_derived"] != ["stopped"] or states["stable"] != STABLE_UI_STATES or states["transient"] != TRANSIENT_UI_STATES:
+        raise ValueError("evidence stable/transient UI state declarations are malformed")
+
+    coverage = contract["stable_coverage"]
+    if not isinstance(coverage, list) or not coverage:
+        raise ValueError("evidence stable_coverage must be a non-empty list")
+    covered_states = set()
+    covered_topologies = set()
+    covered_case_ids = set()
+    for entry in coverage:
+        if not isinstance(entry, dict) or set(entry) != {"case_id", "ui_status", "topologies"}:
+            raise ValueError("stable coverage entries must contain case_id, ui_status, and topologies")
+        case = cases_by_id.get(entry["case_id"])
+        if case is None or case.get("transient"):
+            raise ValueError("stable coverage references an unknown or transient case: {}".format(entry.get("case_id")))
+        if entry["case_id"] in covered_case_ids:
+            raise ValueError("stable coverage case IDs must be unique: {}".format(entry["case_id"]))
+        if entry["ui_status"] not in STABLE_UI_STATES or case["expected"]["ui_status"] != entry["ui_status"]:
+            raise ValueError("stable coverage state disagrees with case {}".format(entry["case_id"]))
+        topologies = entry["topologies"]
+        if not isinstance(topologies, list) or not topologies or not set(topologies) <= TOPOLOGIES:
+            raise ValueError("stable coverage topologies are malformed for {}".format(entry["case_id"]))
+        derived_topologies = derive_topologies(case)
+        if set(topologies) != derived_topologies:
+            raise ValueError("stable coverage topologies differ from fixture sources for {}".format(entry["case_id"]))
+        covered_states.add(entry["ui_status"])
+        covered_topologies.update(topologies)
+        covered_case_ids.add(entry["case_id"])
+    if covered_states != set(STABLE_UI_STATES):
+        raise ValueError("stable coverage must include every stable UI state")
+    if covered_topologies != TOPOLOGIES:
+        raise ValueError("stable coverage must include root-file, root-directory, nested-directory, and child-file")
+
+    probes = contract["transient_probes"]
+    if not isinstance(probes, list) or {item.get("target") for item in probes if isinstance(item, dict)} != set(TRANSIENT_UI_STATES):
+        raise ValueError("transient probes must cover queued, downloading, and extracting")
+    seen_targets = set()
+    for probe in probes:
+        if not isinstance(probe, dict) or set(probe) != {"case_id", "target", "timeout_seconds"}:
+            raise ValueError("transient probe entries are malformed")
+        if probe["target"] in seen_targets or probe["target"] not in TRANSIENT_UI_STATES:
+            raise ValueError("transient probe targets must be unique historical transient states")
+        case = cases_by_id.get(probe["case_id"])
+        if case is None or not case.get("transient") or case["expected"]["backend_state"] != "default":
+            raise ValueError("transient probe references an invalid case: {}".format(probe["case_id"]))
+        if isinstance(probe["timeout_seconds"], bool) or not isinstance(probe["timeout_seconds"], int) or not 1 <= probe["timeout_seconds"] <= 300:
+            raise ValueError("transient probe timeout must be between 1 and 300 seconds")
+        seen_targets.add(probe["target"])
+
+    autoqueue = contract["autoqueue"]
+    if not isinstance(autoqueue, dict) or set(autoqueue) != {"rules", "positive", "negative", "out_of_run"}:
+        raise ValueError("evidence AutoQueue mapping is malformed")
+    if autoqueue["rules"] != {
+        "substring": "case-insensitive substring",
+        "glob": "case-insensitive fnmatch wildcard",
+    }:
+        raise ValueError("evidence AutoQueue matching rules are malformed")
+    positive = autoqueue["positive"]
+    if not isinstance(positive, list) or not positive:
+        raise ValueError("evidence AutoQueue positive mapping must be non-empty")
+    positive_ids = set()
+    for entry in positive:
+        if not isinstance(entry, dict) or set(entry) != {"case_id", "match"}:
+            raise ValueError("evidence AutoQueue positive entries are malformed")
+        case = cases_by_id.get(entry["case_id"])
+        if case is None or case["expected"]["autoqueue"] != entry["match"] or entry["case_id"] in positive_ids:
+            raise ValueError("evidence AutoQueue positive mapping disagrees with {}".format(entry.get("case_id")))
+        positive_ids.add(entry["case_id"])
+    negative = autoqueue["negative"]
+    if not isinstance(negative, list) or not negative:
+        raise ValueError("evidence AutoQueue negative mapping must be non-empty")
+    negative_ids = set()
+    for entry in negative:
+        if not isinstance(entry, dict) or set(entry) != {"case_id", "reason"}:
+            raise ValueError("evidence AutoQueue negative entries are malformed")
+        case = cases_by_id.get(entry["case_id"])
+        if case is None or case["expected"]["autoqueue"] != "unmatched" or entry["case_id"] in negative_ids or not entry["reason"]:
+            raise ValueError("evidence AutoQueue negative mapping disagrees with {}".format(entry.get("case_id")))
+        negative_ids.add(entry["case_id"])
+    if not isinstance(autoqueue["out_of_run"], list) or not all(isinstance(item, str) and item for item in autoqueue["out_of_run"]):
+        raise ValueError("evidence AutoQueue out_of_run declarations are malformed")
+    if positive_ids & negative_ids:
+        raise ValueError("evidence AutoQueue positive and negative mappings overlap")
+
+    exclusions = contract["exclusions"]
+    if not isinstance(exclusions, list):
+        raise ValueError("evidence exclusions must be a list")
+    exclusion_ids = {item.get("id") for item in exclusions if isinstance(item, dict)}
+    if exclusion_ids != {"same-directory-duplicate-identity", "timing-dependent-transient-stable-oracles", "directory-extracted-stable-case"}:
+        raise ValueError("evidence exclusions must document duplicate identity, transient timing, and directory extraction")
+    if any(not isinstance(item, dict) or set(item) != {"id", "reason"} or not item["reason"] for item in exclusions):
+        raise ValueError("evidence exclusion entries are malformed")
 
 
 def write_bytes(root, relative, data):
@@ -287,6 +467,36 @@ def materialize(manifest, run_dir):
     (run_dir / "evidence" / "fixture-expected.json").write_text(
         json.dumps(expected, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
+
+    (run_dir / "evidence" / "fixture-evidence.json").write_text(
+        json.dumps(build_fixture_evidence(manifest), indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+
+
+def build_fixture_evidence(manifest):
+    """Build the deterministic evidence payload from a validated manifest."""
+    evidence_contract = manifest["evidence_contract"]
+    case_index = []
+    for case in manifest["cases"]:
+        case_index.append({
+            "case_id": case["id"],
+            "name": case["name"],
+            "topologies": sorted(derive_topologies(case)),
+            "backend_state": case["expected"]["backend_state"],
+            "ui_status": case["expected"]["ui_status"],
+            "autoqueue": case["expected"]["autoqueue"],
+        })
+    fixture_evidence = {
+        "schema_version": 1,
+        "historical_commit": HISTORICAL_COMMIT,
+        "states": evidence_contract["states"],
+        "stable_coverage": evidence_contract["stable_coverage"],
+        "transient_probes": evidence_contract["transient_probes"],
+        "autoqueue": evidence_contract["autoqueue"],
+        "exclusions": evidence_contract["exclusions"],
+        "case_index": case_index,
+    }
+    return fixture_evidence
 
 
 def main():
