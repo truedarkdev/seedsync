@@ -40,6 +40,18 @@ It uses LFTP to transfer files fast!
 * API keys - require web UI/API authentication when configured
 * Fully open source!
 
+### What's new in v0.9.0
+
+* **Sync more than one folder** with path pairs for separate remote and local libraries in one SeedSync instance.
+* **Progress you can trust** with smoother live byte updates that stay closer to active, stopped, resumed, and completed transfers.
+* **Safer local access** by claiming a trusted browser, remembering approved sessions, and rotating or revoking scoped API keys.
+* **Notifications where you want them** for selected download, extraction, and remote-delete events through a webhook or Apprise.
+* **Choose your transfer engine** between LFTP with SFTP or FTPS and rclone with SFTP.
+* **Find problems faster** by searching retained logs by text, severity, logger, or time range while sensitive values stay redacted.
+* **Large libraries, your way** - show every download at once or choose 25, 50, 100, or 1,000 per page, with faster list updates, search, filters, sorting, and bulk actions for big queues.
+
+When v0.8.6 configuration needs migration, SeedSync exposes only a read-only migration checkpoint. Direct/package launches bind that checkpoint to `127.0.0.1` unless `--web-bind-host` is explicitly supplied; Docker keeps its explicit `SEEDSYNC_WEB_BIND_HOST` setting. The checkpoint reuses a valid legacy `[Web] port` value from `settings.cfg` (range 1-65535) and otherwise falls back to port 8800; Docker deployments with a custom legacy port must publish that same container port. Migration start remains unavailable until retained backup and restore support is implemented and validated.
+
 ## How it works
 
 Install SeedSync on a local machine.

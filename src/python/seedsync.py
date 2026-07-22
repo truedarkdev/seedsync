@@ -23,7 +23,7 @@ from common import Localization, Status, ConfigError, Persist, PersistError
 from common import PathPairManager
 from common.json_formatter import JsonFormatter
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
-from web import WebAppJob, WebAppBuilder
+from web import MigrationWebRuntime, WebAppJob, WebAppBuilder
 from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
 from web.handler.historical_log import create_historical_log_handler
@@ -68,10 +68,28 @@ class Seedsync:
         args = self._parse_args(sys.argv[1:])
 
         # Migration preflight must precede every loader that can normalize,
-        # back up, or persist legacy state. A later migration-only web slice
-        # can consume this decision without constructing the normal runtime.
+        # back up, or persist legacy state.
         self.migration_coordinator = MigrationCoordinator(args.config_dir)
-        self.migration_decision: MigrationDecision = self.migration_coordinator.require_normal_startup()
+        self.migration_decision: MigrationDecision = self.migration_coordinator.preflight()
+        if not self.migration_decision.allows_normal_startup:
+            # Docker/package entrypoints use --exit for a short bootstrap probe
+            # before launching the real service with its actual asset paths.
+            # Keep that probe loader-free and finite when legacy state blocks
+            # normal startup, so it cannot become the migration web process.
+            self.migration_exit_requested = bool(args.exit)
+            if self.migration_exit_requested:
+                return
+            # Read only the bounded legacy web port needed to keep the
+            # deliberately isolated pre-migration surface reachable.
+            self.migration_runtime = MigrationWebRuntime(
+                bind_host=args.web_bind_host or "127.0.0.1",
+                port=self.migration_coordinator.legacy_web_port(),
+                html_path=args.html,
+                coordinator=self.migration_coordinator,
+            )
+            signal.signal(signal.SIGTERM, self.signal)
+            signal.signal(signal.SIGINT, self.signal)
+            return
 
         # Create/load config
         config = None
@@ -103,7 +121,7 @@ class Seedsync:
         ctx_args.html_path = args.html
         ctx_args.debug = is_debug
         ctx_args.exit = args.exit
-        ctx_args.web_bind_host = args.web_bind_host
+        ctx_args.web_bind_host = Seedsync._resolve_normal_web_bind_host(args.web_bind_host)
 
         # Logger setup
         # We separate the main log from the web-access log
@@ -167,6 +185,12 @@ class Seedsync:
         )
 
     def run(self):
+        if getattr(self, "migration_exit_requested", False):
+            raise ServiceExit()
+        if hasattr(self, "migration_runtime"):
+            self.migration_runtime.run()
+            return
+
         self.context.logger.info("Starting SeedSync")
         self.context.logger.info("Platform: {}".format(platform.machine()))
         self.api_key_store.ensure_bootstrap_proof()
@@ -345,6 +369,9 @@ class Seedsync:
     def signal(self, signum: int, _: Optional[FrameType]) -> NoReturn:
         # noinspection PyUnresolvedReferences
         # Signals is a generated enum
+        if hasattr(self, "migration_runtime"):
+            self.migration_runtime.stop()
+            raise ServiceExit()
         self.context.logger.info("Caught signal {}".format(signal.Signals(signum).name))
         raise ServiceExit()
 
@@ -469,8 +496,9 @@ class Seedsync:
                             default=default_scanfs_path,
                             help="Path to scanfs executable")
         parser.add_argument("--web-bind-host",
-                            default="0.0.0.0",
-                            help="Host/IP address for the web server to bind to")
+                            default=None,
+                            help=("Host/IP address for the web server to bind to; migration mode defaults "
+                                  "to 127.0.0.1 unless this option is explicitly supplied"))
 
         return parser.parse_args(args)
 
@@ -576,6 +604,10 @@ class Seedsync:
             if normalized in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
                 return normalized
         return "INFO"
+
+    @staticmethod
+    def _resolve_normal_web_bind_host(web_bind_host: Optional[str]) -> str:
+        return web_bind_host or "0.0.0.0"
 
     @staticmethod
     def _detect_incomplete_config(

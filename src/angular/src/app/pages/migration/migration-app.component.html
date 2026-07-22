@@ -1,0 +1,158 @@
+<main class="migration-page">
+    <article class="migration-shell" aria-labelledby="migration-heading">
+        <section class="handoff-panel">
+            <header class="brand" aria-label="SeedSync">
+                <img src="/assets/logo.png" alt="" width="68" height="68">
+                <span class="brand-name"><b>Seed</b>Sync</span>
+            </header>
+
+            <div class="state-region" [attr.aria-busy]="loading">
+                <div *ngIf="loading" class="loading-state" role="status">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <span>Checking migration status...</span>
+                </div>
+
+                <div *ngIf="loadError && !loading" class="error-state" role="alert">
+                    <p class="eyebrow">Migration checkpoint</p>
+                    <h1 id="migration-heading">Status unavailable</h1>
+                    <p>SeedSync could not read the migration status response. No migration operation was attempted.</p>
+                    <button type="button" class="secondary-button" (click)="refresh()">Recheck status</button>
+                </div>
+
+                <ng-container *ngIf="status && !loading">
+                    <div class="status-copy" aria-live="polite">
+                        <p class="eyebrow">Configuration checkpoint</p>
+                        <h1 id="migration-heading">{{stateLabel}}</h1>
+                        <p class="orientation">{{stateCopy}}</p>
+                    </div>
+
+                    <div *ngIf="isConfirmedV086Migration" class="migration-route" aria-label="Detected migration path">
+                        <span>
+                            <small>From</small>
+                            <strong>{{sourceVersionLabel}}</strong>
+                        </span>
+                        <span class="route-arrow" aria-hidden="true">&#8594;</span>
+                        <span>
+                            <small>To</small>
+                            <strong>{{targetVersionLabel}}</strong>
+                        </span>
+                    </div>
+
+                    <p class="paused-note"><span aria-hidden="true">&#10074;&#10074;</span> Transfers, queueing, settings, and normal APIs are paused.</p>
+
+                    <section class="readiness" aria-labelledby="readiness-heading">
+                        <div class="readiness-heading-row">
+                            <p class="readiness-label">Safety prerequisite</p>
+                            <span class="readiness-state">Not ready</span>
+                        </div>
+                        <h2 id="readiness-heading">Complete backup and restore required</h2>
+                        <p>A retained backup and proven restore path must be ready before migration can start. This build does not provide that capability yet.</p>
+                    </section>
+
+                    <div class="actions">
+                        <div *ngIf="isConfirmedV086Migration" class="blocked-action">
+                            <button type="button" class="primary-button" disabled aria-describedby="migration-blocker">Start migration</button>
+                            <p id="migration-blocker">Blocked until backup and restore readiness is implemented and validated.</p>
+                        </div>
+                        <button type="button" class="secondary-button" (click)="refresh()">Recheck status</button>
+                    </div>
+                </ng-container>
+            </div>
+        </section>
+
+        <section class="feature-panel" aria-label="What's new in SeedSync">
+            <ng-container *ngIf="status && !loading && featureSlides.length; else featureFallback">
+                <div class="feature-stage">
+                    <div class="feature-swap"
+                         *ngFor="let feature of activeFeatureView; trackBy: trackFeature">
+                        <div class="feature-copy">
+                            <p class="eyebrow">What's new &middot; {{activeFeatureIndex + 1}} of {{featureSlides.length}}</p>
+                            <h2>{{feature.title}}</h2>
+                            <p>{{feature.summary}}</p>
+                        </div>
+
+                        <div class="feature-viewport" aria-live="off">
+                            <figure>
+                                <img [src]="feature.imageSrc"
+                                     [attr.alt]="feature.secondaryImageSrc && pathPairOverviewVisible ? '' : feature.imageAlt"
+                                     [attr.aria-hidden]="feature.secondaryImageSrc && pathPairOverviewVisible ? 'true' : null"
+                                     [class.feature-image-layer]="!!feature.secondaryImageSrc"
+                                     [class.is-visible]="!feature.secondaryImageSrc || !pathPairOverviewVisible"
+                                     [class.image-contain]="feature.imageTreatment === 'contain'"
+                                     [class.image-progress]="feature.imageTreatment === 'progress'"
+                                     [class.image-claim]="feature.imageTreatment === 'claim'"
+                                     [class.image-notifications]="feature.imageTreatment === 'notifications'"
+                                     [class.image-transfer]="feature.imageTreatment === 'transfer'"
+                                     [class.image-logs]="feature.imageTreatment === 'logs'"
+                                     [class.image-queue]="feature.imageTreatment === 'queue'">
+                                <img *ngIf="feature.secondaryImageSrc"
+                                     class="feature-image-layer feature-image-secondary"
+                                     [class.is-visible]="pathPairOverviewVisible"
+                                     [class.image-overview]="feature.secondaryImageTreatment === 'overview'"
+                                     [src]="feature.secondaryImageSrc"
+                                     [attr.alt]="pathPairOverviewVisible ? feature.secondaryImageAlt : ''"
+                                     [attr.aria-hidden]="pathPairOverviewVisible ? null : 'true'">
+                                <div *ngIf="feature.secondaryImageSrc"
+                                     class="feature-image-controls"
+                                     role="group"
+                                     [attr.aria-label]="(pathPairOverviewVisible ? 'Image 2 of 2 for ' : 'Image 1 of 2 for ') + feature.title">
+                                    <button type="button"
+                                            class="feature-image-selector"
+                                            [class.is-active]="!pathPairOverviewVisible"
+                                            [attr.aria-label]="'Show ' + feature.imageSelectorLabel + ' image'"
+                                            [attr.aria-current]="!pathPairOverviewVisible ? 'true' : null"
+                                            [attr.aria-pressed]="!pathPairOverviewVisible"
+                                            (click)="showFeatureImage(0)">
+                                        <span aria-hidden="true"></span>
+                                    </button>
+                                    <button type="button"
+                                            class="feature-image-selector"
+                                            [class.is-active]="pathPairOverviewVisible"
+                                            [attr.aria-label]="'Show ' + feature.secondaryImageSelectorLabel + ' image'"
+                                            [attr.aria-current]="pathPairOverviewVisible ? 'true' : null"
+                                            [attr.aria-pressed]="pathPairOverviewVisible"
+                                            (click)="showFeatureImage(1)">
+                                        <span aria-hidden="true"></span>
+                                    </button>
+                                </div>
+                            </figure>
+                        </div>
+                    </div>
+
+                    <div class="feature-controls">
+                        <div class="arrow-controls">
+                            <button type="button" class="icon-button" (click)="previousFeature()" aria-label="Previous feature">&#8592;</button>
+                            <button type="button" class="icon-button" (click)="nextFeature()" aria-label="Next feature">&#8594;</button>
+                        </div>
+                        <div class="slide-controls" aria-label="Choose a feature">
+                            <button *ngFor="let slide of featureSlides; let index = index"
+                                    type="button"
+                                    [class.is-active]="index === activeFeatureIndex"
+                                    [attr.aria-label]="'Show feature ' + (index + 1) + ': ' + slide.title"
+                                    [attr.aria-current]="index === activeFeatureIndex ? 'true' : null"
+                                    (click)="showFeature(index)"></button>
+                        </div>
+                        <label class="auto-page-control">
+                            <input #autoPageInput
+                                   type="checkbox"
+                                   aria-label="Automatically advance feature slides"
+                                   [checked]="autoAdvanceEnabled"
+                                   (change)="setAutoAdvanceEnabled(autoPageInput.checked)">
+                            <span>Auto-advance slides</span>
+                        </label>
+                    </div>
+                </div>
+            </ng-container>
+
+            <ng-template #featureFallback>
+                <div class="feature-placeholder">
+                    <p class="eyebrow">Migration overview</p>
+                    <h2>SeedSync is keeping your configuration safe</h2>
+                    <p *ngIf="loading">The migration details will appear here after the readiness check.</p>
+                    <p *ngIf="loadError">Recheck the status to restore the migration overview.</p>
+                    <p *ngIf="status && !featureSlides.length">No feature details were reported for this migration.</p>
+                </div>
+            </ng-template>
+        </section>
+    </article>
+</main>

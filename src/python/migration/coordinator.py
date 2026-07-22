@@ -287,6 +287,16 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _valid_receipt_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
 def _ensure_under(path: Path, root: Path) -> Path:
     resolved_root = root.resolve()
     resolved = path.resolve(strict=True)
@@ -1232,38 +1242,29 @@ class MigrationCoordinator:
             decision = self._decision_from_metadata(metadata)
             if decision.state == MigrationState.RUNNING:
                 lock_state = self._lock_state(decision.migration_id)
-                if lock_state == "orphaned":
-                    self._reclaim_orphan_lock(decision.migration_id)
-                    return self._record_failure(decision.migration_id, "Previous migration attempt was interrupted", True)
-                if lock_state == "missing":
-                    return self._record_failure(decision.migration_id, "Previous migration attempt was interrupted", True)
+                if lock_state in ("orphaned", "missing"):
+                    return self._failure_decision(
+                        decision.migration_id, "Previous migration attempt was interrupted", True,
+                    )
                 return decision
-            if self._lock_state(decision.migration_id) == "orphaned":
-                self._reclaim_orphan_lock(decision.migration_id)
             if decision.state in (MigrationState.REQUIRED, MigrationState.FAILED):
                 return decision
-            return self._advance_lineage(metadata, decision.state)
+            if decision.state == MigrationState.COMPLETE:
+                return self._validate_completed_lineage(metadata)
+            return self._failure_decision(None, "Migration lineage metadata is invalid", False)
 
         relevant = [path for path in self.config_dir.iterdir() if path.name not in (LOCK_FILE, METADATA_FILE)]
         if not relevant:
-            decision = MigrationDecision(MigrationState.NOT_REQUIRED)
-            self._write_metadata(decision, current_schema=CURRENT_SCHEMA_ID, applied_migrations=[], attempt=0)
-            return decision
+            return MigrationDecision(MigrationState.NOT_REQUIRED)
         matches = [spec for spec in self.registry if spec.source_schema == "original-v0.8.6" and spec.fingerprint(self.config_dir)]
         if len(matches) == 1:
             spec = matches[0]
-            decision = self._decision_for_spec(MigrationState.REQUIRED, spec)
-            self._write_metadata(
-                decision, current_schema=spec.source_schema, applied_migrations=[], attempt=0,
-            )
-            return decision
+            return self._decision_for_spec(MigrationState.REQUIRED, spec)
         if len(matches) > 1:
-            return self._record_failure(None, "Configuration matches more than one selected migration", False)
+            return self._failure_decision(None, "Configuration matches more than one selected migration", False)
         if _looks_current(self.config_dir):
-            decision = MigrationDecision(MigrationState.NOT_REQUIRED)
-            self._write_metadata(decision, current_schema=CURRENT_SCHEMA_ID, applied_migrations=[], attempt=0)
-            return self._advance_lineage(self._read_metadata() or {}, MigrationState.NOT_REQUIRED)
-        return self._record_failure(None, "Nonempty configuration has an unsupported or ambiguous schema", False)
+            return MigrationDecision(MigrationState.NOT_REQUIRED)
+        return self._failure_decision(None, "Nonempty configuration has an unsupported or ambiguous schema", False)
 
     def apply_confirmed(self, *, retry: bool = False) -> MigrationDecision:
         """Apply exactly one pending migration after explicit caller confirmation."""
@@ -1297,6 +1298,11 @@ class MigrationCoordinator:
             lock_bytes: bytes | None = None
             descriptor: int | None = None
             try:
+                lock_state = self._lock_state(spec.migration_id)
+                if lock_state == "orphaned":
+                    self._reclaim_orphan_lock(spec.migration_id)
+                elif lock_state != "missing":
+                    raise MigrationBlockedError(decision)
                 lock_bytes = json.dumps({
                     "lock_version": 1, "pid": os.getpid(), "hostname": socket.gethostname(),
                     "migration_id": spec.migration_id, "created_at": _utc_now(),
@@ -1329,6 +1335,8 @@ class MigrationCoordinator:
                 return complete
             except FileExistsError:
                 raise MigrationBlockedError(self.preflight())
+            except MigrationBlockedError:
+                raise
             except Exception as exc:
                 failed = self._record_failure(
                     spec.migration_id,
@@ -1347,38 +1355,80 @@ class MigrationCoordinator:
             raise MigrationBlockedError(decision)
         return decision
 
-    def _advance_lineage(self, metadata: Mapping[str, object], terminal_state: MigrationState) -> MigrationDecision:
-        current_schema = metadata.get("current_schema")
-        if not isinstance(current_schema, str):
-            return self._record_failure(None, "Migration lineage metadata is invalid", False)
-        applied = self._applied(metadata)
-        last_id = applied[-1] if applied else None
-        last_spec = self._spec(last_id)
-        if last_spec is not None:
-            try:
-                last_spec.validate(self.config_dir)
-            except Exception as exc:
-                return self._record_failure(
-                    last_id, "Completed migration validation failed: {}".format(type(exc).__name__), True,
-                )
-        candidates = [
-            spec for spec in self.registry
-            if spec.source_schema == current_schema and spec.migration_id not in applied and spec.fingerprint(self.config_dir)
-        ]
-        if len(candidates) > 1:
-            return self._record_failure(None, "Schema lineage matches more than one selected migration", False)
-        if candidates:
+    def legacy_web_port(self, default: int = 8800) -> int:
+        """Read only the bounded legacy Web port needed by migration mode."""
+        try:
+            settings = _parse_settings(self.config_dir / "settings.cfg", self.config_dir)
+            value = settings.get("Web", "port")
+            if not value.isascii() or not value.isdecimal():
+                return default
+            port = int(value)
+            return port if 1 <= port <= 65535 else default
+        except (OSError, ValueError, configparser.Error):
+            return default
+
+    def _expected_completed_specs(self) -> tuple[MigrationSpec, ...]:
+        lineage: list[MigrationSpec] = []
+        schema = "original-v0.8.6"
+        while True:
+            candidates = [spec for spec in self.registry if spec.source_schema == schema]
+            if not candidates:
+                return tuple(lineage)
+            if len(candidates) != 1:
+                return ()
             spec = candidates[0]
-            decision = self._decision_for_spec(MigrationState.REQUIRED, spec)
-            self._write_metadata(
-                decision, current_schema=current_schema, applied_migrations=applied,
-                attempt=int(metadata.get("attempt", 0)),
+            lineage.append(spec)
+            schema = spec.target_schema
+            if len(lineage) > len(self.registry):
+                return ()
+        return tuple(lineage)
+
+    def _validate_completed_lineage(self, metadata: Mapping[str, object]) -> MigrationDecision:
+        expected_specs = self._expected_completed_specs()
+        try:
+            applied = self._applied(metadata)
+        except ValueError:
+            applied = []
+        known_ids = [spec.migration_id for spec in expected_specs]
+        applied_specs = expected_specs[:len(applied)]
+        last_spec = applied_specs[-1] if applied_specs else None
+        expected_backup = str(Path(BACKUP_ROOT) / last_spec.migration_id) if last_spec else None
+        valid_receipt = (
+            last_spec is not None
+            and len(applied) <= len(expected_specs)
+            and applied == known_ids[:len(applied)]
+            and metadata.get("metadata_version") == 2
+            and metadata.get("receipt_version") == 1
+            and metadata.get("state") == MigrationState.COMPLETE.value
+            and metadata.get("migration_id") == last_spec.migration_id
+            and metadata.get("source_schema") == last_spec.source_schema
+            and metadata.get("target_schema") == last_spec.target_schema
+            and metadata.get("current_schema") == last_spec.target_schema
+            and type(metadata.get("attempt")) is int
+            and cast(int, metadata.get("attempt")) >= 1
+            and _valid_receipt_timestamp(metadata.get("completed_at"))
+            and _valid_receipt_timestamp(metadata.get("updated_at"))
+            and metadata.get("backup") == expected_backup
+            and metadata.get("error") is None
+            and metadata.get("retryable") is False
+        )
+        if not valid_receipt:
+            return self._failure_decision(None, "Completed migration lineage is invalid", False)
+        try:
+            last_spec.validate(self.config_dir)
+            _validate_manifest(self.config_dir / cast(str, expected_backup), self.config_dir, last_spec)
+        except Exception as exc:
+            return self._failure_decision(
+                last_spec.migration_id,
+                "Completed migration validation failed: {}".format(type(exc).__name__),
+                True,
             )
-            return decision
-        decision = self._decision_from_metadata(metadata)
-        if decision.state != terminal_state:
-            decision = MigrationDecision(terminal_state)
-        return decision
+        if len(applied) < len(expected_specs):
+            next_spec = expected_specs[len(applied)]
+            if next_spec.source_schema != last_spec.target_schema or not next_spec.fingerprint(self.config_dir):
+                return self._failure_decision(None, "Completed migration lineage does not match configuration", False)
+            return self._decision_for_spec(MigrationState.REQUIRED, next_spec)
+        return self._decision_for_spec(MigrationState.COMPLETE, last_spec)
 
     def _lock_state(self, migration_id: str | None) -> str:
         if not self.lock_path.exists():
@@ -1459,14 +1509,7 @@ class MigrationCoordinator:
         return list(cast(list[str], value))
 
     def _record_failure(self, migration_id: str | None, error: str, retryable: bool) -> MigrationDecision:
-        spec = self._spec(migration_id)
-        decision = self._decision_for_spec(MigrationState.FAILED, spec) if spec is not None else MigrationDecision(
-            MigrationState.FAILED,
-        )
-        decision = MigrationDecision(
-            state=decision.state, migration_id=decision.migration_id, source_schema=decision.source_schema,
-            target_schema=decision.target_schema, features=decision.features, error=error, retryable=retryable,
-        )
+        decision = self._failure_decision(migration_id, error, retryable)
         metadata = self._read_metadata() or {}
         try:
             applied = self._applied(metadata)
@@ -1475,6 +1518,17 @@ class MigrationCoordinator:
         self._write_metadata(
             decision, current_schema=metadata.get("current_schema"), applied_migrations=applied,
             attempt=int(metadata.get("attempt", 0)),
+        )
+        return decision
+
+    def _failure_decision(self, migration_id: str | None, error: str, retryable: bool) -> MigrationDecision:
+        spec = self._spec(migration_id)
+        decision = self._decision_for_spec(MigrationState.FAILED, spec) if spec is not None else MigrationDecision(
+            MigrationState.FAILED,
+        )
+        decision = MigrationDecision(
+            state=decision.state, migration_id=decision.migration_id, source_schema=decision.source_schema,
+            target_schema=decision.target_schema, features=decision.features, error=error, retryable=retryable,
         )
         return decision
 
