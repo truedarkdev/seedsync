@@ -1,3 +1,10 @@
+seedsync (0.9.0) stable; urgency=low
+
+  * Added multiple path pairs, improved transfer progress, safer local access,
+    configurable notifications, transfer backend choices, and searchable logs
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Tue, 21 Jul 2026 18:32:54 +0200
+
 seedsync (0.8.6) stable; urgency=low
 
   * Fixed broken rar extraction in previous release

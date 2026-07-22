@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import web.web_app_job as web_app_job
-from web.web_app_job import MyWSGIRefServer, _BoundedWSGIServer, _RequestHandler, _RequestLoggingMiddleware
+from web.web_app_job import WebAppJob, MyWSGIRefServer, _BoundedWSGIServer, _RequestHandler, _RequestLoggingMiddleware
 
 
 class _FakeSocket:
@@ -235,6 +235,39 @@ class TestMyWSGIRefServer(unittest.TestCase):
         fake_server.handle_request.assert_not_called()
         fake_server.server_close.assert_called_once_with()
         self.assertIsNone(server.server)
+
+
+class TestWebAppJob(unittest.TestCase):
+    def test_setup_constructs_server_with_normal_runtime_bind_host(self):
+        for bind_host in ("0.0.0.0", "127.0.0.1"):
+            with self.subTest(bind_host=bind_host):
+                access_logger = MagicMock()
+                context = SimpleNamespace(
+                    logger=MagicMock(),
+                    web_access_logger=access_logger,
+                    config=SimpleNamespace(web=SimpleNamespace(port=8800)),
+                    args=SimpleNamespace(web_bind_host=bind_host, debug=False),
+                )
+                app = MagicMock()
+
+                with patch("web.web_app_job.MyWSGIRefServer") as server_type, \
+                     patch("web.web_app_job.Thread") as thread_type:
+                    WebAppJob(context, app).setup()
+
+                server_type.assert_called_once_with(
+                    access_logger,
+                    host=bind_host,
+                    port=8800,
+                )
+                thread_type.assert_called_once_with(
+                    target=web_app_job.bottle.run,
+                    kwargs={
+                        "app": app,
+                        "server": server_type.return_value,
+                        "debug": False,
+                    },
+                )
+                thread_type.return_value.start.assert_called_once_with()
 
 
 class TestWebAppJobImport(unittest.TestCase):

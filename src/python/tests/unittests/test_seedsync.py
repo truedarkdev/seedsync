@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, ServiceRestart, AppError
 from controller import AutoQueuePattern, AutoQueuePersist
+from migration import MigrationDecision, MigrationState
 from seedsync import Seedsync, _configure_multiprocessing_start_method
 from web.auth_store import ApiKeyStore
 
@@ -28,6 +29,70 @@ def _read_history_entries(file_path):
 
 
 class TestSeedsync(unittest.TestCase):
+    def test_blocking_migration_constructs_only_migration_runtime(self):
+        decision = MigrationDecision(
+            state=MigrationState.REQUIRED,
+            migration_id="original-v0.8.6-to-current-v1",
+            source_schema="original-v0.8.6",
+        )
+        argv = [
+            "seedsync.py", "-c", "/config", "--html", "/html", "--scanfs", "/scanfs",
+            "--web-bind-host", "127.0.0.1",
+        ]
+        coordinator = MagicMock()
+        coordinator.preflight.return_value = decision
+        coordinator.legacy_web_port.return_value = 9876
+
+        with patch.object(sys, "argv", argv), \
+             patch("seedsync.MigrationCoordinator", return_value=coordinator), \
+             patch("seedsync.MigrationWebRuntime") as migration_runtime, \
+             patch("seedsync.Config.from_file") as config_loader, \
+             patch("seedsync.PathPairManager") as path_pair_manager, \
+             patch("seedsync.signal.signal"):
+            seedsync = Seedsync()
+
+        migration_runtime.assert_called_once_with(
+            bind_host="127.0.0.1",
+            port=9876,
+            html_path="/html",
+            coordinator=coordinator,
+        )
+        config_loader.assert_not_called()
+        path_pair_manager.assert_not_called()
+        self.assertFalse(hasattr(seedsync, "context"))
+
+    def test_migration_run_does_not_enter_normal_runtime(self):
+        seedsync = Seedsync.__new__(Seedsync)
+        seedsync.migration_runtime = MagicMock()
+
+        with patch("seedsync.Controller") as controller, patch("seedsync.WebAppBuilder") as web_builder:
+            seedsync.run()
+
+        seedsync.migration_runtime.run.assert_called_once_with()
+        controller.assert_not_called()
+        web_builder.assert_not_called()
+
+    def test_blocking_migration_exit_probe_stays_finite_and_loader_free(self):
+        decision = MigrationDecision(state=MigrationState.REQUIRED)
+        argv = [
+            "seedsync.py", "-c", "/config", "--html", "/", "--scanfs", "/", "--exit",
+        ]
+        coordinator = MagicMock()
+        coordinator.preflight.return_value = decision
+
+        with patch.object(sys, "argv", argv), \
+             patch("seedsync.MigrationCoordinator", return_value=coordinator), \
+             patch("seedsync.MigrationWebRuntime") as migration_runtime, \
+             patch("seedsync.Config.from_file") as config_loader, \
+             patch("seedsync.PathPairManager") as path_pair_manager:
+            seedsync = Seedsync()
+
+        migration_runtime.assert_not_called()
+        config_loader.assert_not_called()
+        path_pair_manager.assert_not_called()
+        with self.assertRaises(ServiceExit):
+            seedsync.run()
+
     def test_configure_multiprocessing_selects_spawn(self):
         with patch("seedsync.multiprocessing.set_start_method") as set_start_method:
             _configure_multiprocessing_start_method()
@@ -118,7 +183,28 @@ class TestSeedsync(unittest.TestCase):
             "--html", "/path/to/html",
             "--scanfs", "/path/to/scanfs",
         ])
-        self.assertEqual("0.0.0.0", args.web_bind_host)
+        self.assertIsNone(args.web_bind_host)
+
+    def test_blocking_migration_defaults_to_loopback_but_explicit_bind_is_preserved(self):
+        decision = MigrationDecision(state=MigrationState.REQUIRED)
+        coordinator = MagicMock()
+        coordinator.preflight.return_value = decision
+        coordinator.legacy_web_port.return_value = 8800
+        base_argv = ["seedsync.py", "-c", "/config", "--html", "/html", "--scanfs", "/scanfs"]
+        for explicit, expected in (([], "127.0.0.1"), (["--web-bind-host", "0.0.0.0"], "0.0.0.0")):
+            with self.subTest(expected=expected), patch.object(sys, "argv", base_argv + explicit), \
+                 patch("seedsync.MigrationCoordinator", return_value=coordinator), \
+                 patch("seedsync.MigrationWebRuntime") as migration_runtime, \
+                 patch("seedsync.signal.signal"):
+                Seedsync()
+            self.assertEqual(expected, migration_runtime.call_args.kwargs["bind_host"])
+
+    def test_normal_runtime_bind_defaults_to_all_interfaces_but_preserves_explicit_host(self):
+        self.assertEqual("0.0.0.0", Seedsync._resolve_normal_web_bind_host(None))
+        self.assertEqual(
+            "127.0.0.1",
+            Seedsync._resolve_normal_web_bind_host("127.0.0.1"),
+        )
 
     def test_apply_umask_from_env_skips_empty_or_unset_values(self):
         with patch("seedsync.os.umask") as umask, patch.dict(os.environ, {}, clear=True):

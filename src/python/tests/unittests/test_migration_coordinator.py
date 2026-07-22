@@ -16,6 +16,7 @@ from controller import AutoQueuePersist, ControllerPersist
 from migration import (
     MigrationBlockedError,
     MigrationCoordinator,
+    MigrationDecision,
     MigrationFeature,
     MigrationSpec,
     MigrationState,
@@ -97,6 +98,29 @@ class TestMigrationCoordinator(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
+    @staticmethod
+    def _tree_bytes(root: Path) -> dict[str, bytes]:
+        return {
+            str(path.relative_to(root)): path.read_bytes()
+            for path in root.rglob("*")
+            if path.is_file()
+        }
+
+    @staticmethod
+    def _write_running_metadata(root: Path, decision: MigrationDecision) -> None:
+        (root / "migration-state.json").write_text(json.dumps({
+            "metadata_version": 2,
+            "state": "running",
+            "migration_id": decision.migration_id,
+            "source_schema": decision.source_schema,
+            "target_schema": decision.target_schema,
+            "current_schema": decision.source_schema,
+            "applied_migrations": [],
+            "attempt": 1,
+            "error": None,
+            "retryable": False,
+        }), encoding="utf-8")
+
     @unittest.skipUnless(os.name == "nt", "Windows-specific process liveness regression")
     def test_windows_process_liveness_probe_does_not_call_os_kill(self) -> None:
         with patch("migration.coordinator.os.kill", side_effect=AssertionError("unsafe Windows liveness probe")):
@@ -114,6 +138,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertTrue(decision.features)
         for name, content in before.items():
             self.assertEqual(content, (self.root / name).read_bytes())
+        self.assertEqual(set(before), {path.name for path in self.root.iterdir()})
         self.assertFalse((self.root / "path_pairs.json").exists())
         self.assertFalse((self.root / "api-keys.json").exists())
 
@@ -133,7 +158,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         decision = coordinator.preflight()
 
         self.assertEqual(MigrationState.REQUIRED, decision.state)
-        self.assertEqual(set(before) | {"migration-state.json"}, {path.name for path in self.root.iterdir()})
+        self.assertEqual(set(before), {path.name for path in self.root.iterdir()})
         for name, content in before.items():
             self.assertEqual(content, (self.root / name).read_bytes())
 
@@ -159,11 +184,58 @@ class TestMigrationCoordinator(unittest.TestCase):
 
     def test_ambiguous_nonempty_config_fails_closed(self) -> None:
         (self.root / "settings.cfg").write_text("[General]\nverbose=True\n", encoding="utf-8")
+        before = self._tree_bytes(self.root)
         decision = MigrationCoordinator(self.root).preflight()
         self.assertEqual(MigrationState.FAILED, decision.state)
         self.assertFalse(decision.retryable)
+        self.assertEqual(before, self._tree_bytes(self.root))
         with self.assertRaises(MigrationBlockedError):
             MigrationCoordinator(self.root).require_normal_startup()
+
+    def test_repeated_inspection_is_byte_preserving_for_required_failed_and_current(self) -> None:
+        roots = {
+            "required": self.root / "required",
+            "failed": self.root / "failed",
+            "current": self.root / "current",
+        }
+        MigrationFixture(roots["required"]).write()
+        roots["failed"].mkdir()
+        (roots["failed"] / "settings.cfg").write_text("[General]\nverbose=True\n", encoding="utf-8")
+        roots["current"].mkdir()
+        (roots["current"] / "settings.cfg").write_text(
+            Seedsync._create_default_config().to_str(), encoding="utf-8",
+        )
+        for name, root in roots.items():
+            with self.subTest(name=name):
+                before = self._tree_bytes(root)
+                coordinator = MigrationCoordinator(root)
+                coordinator.preflight()
+                coordinator.status()
+                coordinator.status()
+                self.assertEqual(before, self._tree_bytes(root))
+
+    def test_forged_or_unknown_completed_lineage_fails_closed_without_rewrite(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        coordinator.apply_confirmed()
+        receipt_path = self.root / "migration-state.json"
+        valid = json.loads(receipt_path.read_text(encoding="utf-8"))
+        for name, applied, migration_id in (
+            ("empty", [], valid["migration_id"]),
+            ("unknown", ["unknown-migration"], "unknown-migration"),
+            ("mismatched", valid["applied_migrations"], "unknown-migration"),
+        ):
+            with self.subTest(name=name):
+                forged = dict(valid, applied_migrations=applied, migration_id=migration_id)
+                receipt_path.write_text(json.dumps(forged), encoding="utf-8")
+                before = self._tree_bytes(self.root)
+                decision = MigrationCoordinator(self.root).preflight()
+                self.assertEqual(MigrationState.FAILED, decision.state)
+                self.assertFalse(decision.allows_normal_startup)
+                self.assertEqual(before, self._tree_bytes(self.root))
+                with self.assertRaises(MigrationBlockedError):
+                    MigrationCoordinator(self.root).require_normal_startup()
+        receipt_path.write_text(json.dumps(valid), encoding="utf-8")
 
     def test_legacy_shape_with_current_auth_state_is_ambiguous(self) -> None:
         MigrationFixture(self.root).write()
@@ -171,6 +243,15 @@ class TestMigrationCoordinator(unittest.TestCase):
         decision = MigrationCoordinator(self.root).preflight()
         self.assertEqual(MigrationState.FAILED, decision.state)
         self.assertFalse(decision.retryable)
+
+    def test_legacy_web_port_is_bounded_and_malformed_values_fall_back(self) -> None:
+        for value, expected in (("9876", 9876), ("0", 8800), ("65536", 8800), ("not-a-port", 8800)):
+            with self.subTest(value=value):
+                root = self.root / value.replace("-", "_")
+                MigrationFixture(root).write(LEGACY_SETTINGS.replace("port = 8800", "port = {}".format(value)))
+                before = self._tree_bytes(root)
+                self.assertEqual(expected, MigrationCoordinator(root).legacy_web_port())
+                self.assertEqual(before, self._tree_bytes(root))
 
     def test_apply_preserves_semantics_creates_backup_and_leaves_first_claim_open(self) -> None:
         fixture = MigrationFixture(self.root)
@@ -329,7 +410,7 @@ class TestMigrationCoordinator(unittest.TestCase):
 
         recovered = coordinator.preflight()
         self.assertEqual(MigrationState.REQUIRED, recovered.state)
-        self.assertFalse(lock_path.exists())
+        self.assertTrue(lock_path.exists())
         self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
 
     def test_completed_orphan_lock_is_reclaimed_before_advancing_lineage(self) -> None:
@@ -358,7 +439,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         pending = MigrationCoordinator(self.root, default_migration_registry() + (second_spec,)).preflight()
         self.assertEqual(MigrationState.REQUIRED, pending.state)
         self.assertEqual(second_spec.migration_id, pending.migration_id)
-        self.assertFalse(lock_path.exists())
+        self.assertTrue(lock_path.exists())
 
     def test_unvalidated_nonrunning_locks_remain_and_block_apply(self) -> None:
         cases = {
@@ -400,9 +481,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         required = coordinator.preflight()
-        metadata = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
-        metadata["state"] = "running"
-        (self.root / "migration-state.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._write_running_metadata(self.root, required)
         (self.root / ".migration.lock").write_text(json.dumps({
             "lock_version": 1,
             "pid": 99999999,
@@ -415,16 +494,14 @@ class TestMigrationCoordinator(unittest.TestCase):
         decision = restarted.preflight()
         self.assertEqual(MigrationState.FAILED, decision.state)
         self.assertTrue(decision.retryable)
-        self.assertFalse((self.root / ".migration.lock").exists())
+        self.assertTrue((self.root / ".migration.lock").exists())
         self.assertEqual(MigrationState.COMPLETE, restarted.apply_confirmed(retry=True).state)
 
     def test_active_running_lock_is_not_reclaimed(self) -> None:
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         required = coordinator.preflight()
-        metadata = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
-        metadata["state"] = "running"
-        (self.root / "migration-state.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._write_running_metadata(self.root, required)
         lock_path = self.root / ".migration.lock"
         lock_path.write_text(json.dumps({
             "lock_version": 1,
@@ -442,9 +519,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         required = coordinator.preflight()
-        metadata = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
-        metadata["state"] = "running"
-        (self.root / "migration-state.json").write_text(json.dumps(metadata), encoding="utf-8")
+        self._write_running_metadata(self.root, required)
         lock_path = self.root / ".migration.lock"
 
         lock_path.write_text("not-json", encoding="utf-8")
@@ -882,9 +957,32 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(self.root).write()
         argv = ["seedsync.py", "-c", str(self.root), "--html", str(self.root), "--scanfs", "scanfs"]
         with patch.object(sys, "argv", argv), patch.object(Config, "from_file") as config_loader:
-            with self.assertRaises(MigrationBlockedError):
-                Seedsync()
+            seedsync = Seedsync()
         config_loader.assert_not_called()
+        self.assertEqual(MigrationState.REQUIRED, seedsync.migration_decision.state)
+        self.assertTrue(hasattr(seedsync, "migration_runtime"))
+
+    def test_blocked_startup_is_byte_preserving_for_required_failed_and_stale_states(self) -> None:
+        roots = {
+            "required": self.root / "required-startup",
+            "failed": self.root / "failed-startup",
+            "stale": self.root / "stale-startup",
+        }
+        MigrationFixture(roots["required"]).write()
+        roots["failed"].mkdir()
+        (roots["failed"] / "settings.cfg").write_text("[General]\nverbose=True\n", encoding="utf-8")
+        MigrationFixture(roots["stale"]).write()
+        stale_decision = MigrationCoordinator(roots["stale"]).preflight()
+        self._write_running_metadata(roots["stale"], stale_decision)
+
+        for name, root in roots.items():
+            with self.subTest(name=name):
+                before = self._tree_bytes(root)
+                argv = ["seedsync.py", "-c", str(root), "--html", str(root), "--scanfs", "scanfs"]
+                with patch.object(sys, "argv", argv), patch("seedsync.signal.signal"):
+                    seedsync = Seedsync()
+                self.assertFalse(seedsync.migration_decision.allows_normal_startup)
+                self.assertEqual(before, self._tree_bytes(root))
 
 
 if __name__ == "__main__":
