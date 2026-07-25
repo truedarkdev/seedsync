@@ -7,8 +7,10 @@ from .coordinator import (
     MigrationFeature,
     MigrationSpec,
     MigrationState,
+    ValidatedBackupReader,
     default_migration_registry,
 )
+from .backup_restore import BackupRestoreError
 
 __all__ = [
     "MigrationBlockedError",
@@ -17,5 +19,7 @@ __all__ = [
     "MigrationFeature",
     "MigrationSpec",
     "MigrationState",
+    "ValidatedBackupReader",
     "default_migration_registry",
+    "BackupRestoreError",
 ]

@@ -15,11 +15,19 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence, cast
 
 from common import Config, PathPair, PathPairManager
 from controller import AutoQueuePersist, ControllerPersist
+from .backup_restore import (
+    BackupRestoreError,
+    create_retained_backup,
+    resolve_backup,
+    restore_backup,
+    validate_backup,
+)
+from .runtime_exclusion import RuntimeExclusion, RuntimeExclusionError
 
 
 CURRENT_SCHEMA_ID = "seedsync-current-v1"
@@ -28,8 +36,6 @@ LOCK_FILE = ".migration.lock"
 BACKUP_ROOT = "migration-backups"
 _MAX_JSON_BYTES = 256 * 1024
 _MAX_RELEVANT_FILE_BYTES = 16 * 1024 * 1024
-_MAX_BACKUP_BYTES = 64 * 1024 * 1024
-_MAX_BACKUP_FILES = 16
 _root_transaction_state = threading.local()
 _windows_api_cache = None
 
@@ -244,8 +250,75 @@ class MigrationDecision:
 
 
 Fingerprint = Callable[[Path], bool]
-Apply = Callable[[Path, Path], None]
 Validate = Callable[[Path], None]
+
+
+class ValidatedBackupReader:
+    """An immutable, manifest-bound view of a migration's declared inputs."""
+
+    def __init__(self, payloads: Mapping[str, bytes]):
+        self.__payloads = dict(payloads)
+
+    @classmethod
+    def freeze(
+        cls,
+        backup_dir: Path,
+        config_root: Path,
+        manifest: Mapping[str, object],
+        declared_inputs: Sequence[str],
+    ) -> "ValidatedBackupReader":
+        manifest_entries = manifest.get("entries")
+        if not isinstance(manifest_entries, list):
+            raise ValueError("Migration backup manifest entries are invalid")
+        entries = {
+            cast(str, entry.get("path")): entry
+            for entry in manifest_entries
+            if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+        }
+        payloads: dict[str, bytes] = {}
+        total_size = 0
+        for declared in declared_inputs:
+            relative = PurePosixPath(declared)
+            if (
+                not declared
+                or declared != relative.as_posix()
+                or relative.is_absolute()
+                or "\\" in declared
+                or any(part in ("", ".", "..") for part in relative.parts)
+                or declared in payloads
+            ):
+                raise ValueError("Migration input declaration is invalid")
+            entry = entries.get(declared)
+            if not isinstance(entry, dict) or entry.get("type") != "file":
+                raise ValueError("Declared migration input is absent from the retained backup")
+            size, digest = entry.get("size"), entry.get("sha256")
+            if type(size) is not int or cast(int, size) > _MAX_RELEVANT_FILE_BYTES:
+                raise ValueError("Declared migration input exceeds the size limit")
+            total_size += cast(int, size)
+            if total_size > _MAX_RELEVANT_FILE_BYTES * max(1, len(declared_inputs)):
+                raise ValueError("Declared migration inputs exceed the aggregate size limit")
+            payload = _read_bytes(
+                backup_dir / "data" / Path(*relative.parts),
+                config_root,
+                _MAX_RELEVANT_FILE_BYTES,
+                owner_only=True,
+            )
+            if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                raise ValueError("Declared migration input changed after backup validation")
+            payloads[declared] = payload
+        return cls(payloads)
+
+    def read_bytes(self, relative_path: str) -> bytes:
+        try:
+            return self.__payloads[relative_path]
+        except KeyError as exc:
+            raise ValueError("Migration spec requested an undeclared backup input") from exc
+
+    def read_text(self, relative_path: str) -> str:
+        return self.read_bytes(relative_path).decode("utf-8")
+
+
+Apply = Callable[[Path, ValidatedBackupReader], None]
 
 
 @dataclass(frozen=True)
@@ -258,6 +331,7 @@ class MigrationSpec:
     fingerprint: Fingerprint
     apply: Apply
     validate: Validate
+    input_files: tuple[str, ...] = ()
 
 
 _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
@@ -276,13 +350,6 @@ _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
     "Web": frozenset(("port",)),
     "AutoQueue": frozenset(("enabled", "patterns_only", "auto_extract")),
 }
-_BACKUP_FILES = (
-    "settings.cfg", "controller.persist", "autoqueue.persist", "path_pairs.json",
-    "api-keys.json", "api-keys.history.jsonl",
-)
-_BACKUP_FILE_SET = frozenset(_BACKUP_FILES)
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -318,6 +385,7 @@ def _regular_file(path: Path, root: Path, max_bytes: int = _MAX_RELEVANT_FILE_BY
 
 def _open_anchored(
     path: Path, root: Path, flags: int, *, owner_control: bool = False, delete_control: bool = False,
+    allow_final_reparse: bool = False,
 ) -> int:
     """Open a root-contained path without following its final link."""
     root_path = Path(os.path.abspath(root))
@@ -387,7 +455,11 @@ def _open_anchored(
             if component is None:
                 _verify_transaction_root(root_path, _handle_identity(directory_handle, windows_handle=True))
 
-        desired_access = 0x40000000 if flags & os.O_WRONLY else 0x80000000
+        desired_access = 0
+        if flags & (os.O_WRONLY | os.O_RDWR):
+            desired_access |= 0x40000000
+        if not flags & os.O_WRONLY:
+            desired_access |= 0x80000000
         if owner_control:
             desired_access |= 0x00060000  # READ_CONTROL | WRITE_DAC
         if delete_control:
@@ -425,7 +497,9 @@ def _open_anchored(
             io_status = IoStatusBlock()
             status = ntdll.NtCreateFile(
                 ctypes.byref(handle), desired_access, ctypes.byref(attributes), ctypes.byref(io_status),
-                None, 0, 0x1, 2 if flags & os.O_EXCL else 1, 0x00200060, None, 0,
+                None, 0, 0x1,
+                2 if flags & os.O_EXCL else (3 if flags & os.O_CREAT else 1),
+                0x00200060, None, 0,
             )
             if status >= 0 and creation_trustees:
                 try:
@@ -454,7 +528,7 @@ def _open_anchored(
             wintypes.HANDLE(handle), file_attribute_tag_info, ctypes.byref(tag_info), ctypes.sizeof(tag_info),
         ):
             raise OSError(ctypes.get_last_error(), "Unable to inspect migration file handle")
-        if tag_info.FileAttributes & file_attribute_reparse_point:
+        if tag_info.FileAttributes & file_attribute_reparse_point and not allow_final_reparse:
             raise ValueError("Migration input must not be a reparse point")
 
         required = kernel32.GetFinalPathNameByHandleW(wintypes.HANDLE(handle), None, 0, 0)
@@ -557,7 +631,9 @@ def _secure_unlink(path: Path, root: Path) -> None:
     import msvcrt
     from ctypes import wintypes
 
-    descriptor = _open_anchored(path, root, os.O_RDONLY, delete_control=True)
+    descriptor = _open_anchored(
+        path, root, os.O_RDONLY, delete_control=True, allow_final_reparse=True,
+    )
     try:
         class FileDispositionInfo(ctypes.Structure):
             _fields_ = (("DeleteFile", wintypes.BOOL),)
@@ -572,9 +648,37 @@ def _secure_unlink(path: Path, root: Path) -> None:
         os.close(descriptor)
 
 
-def _windows_rename_fd(descriptor: int, directory_handle: int, target_name: str) -> None:
+def _secure_rmdir(path: Path, root: Path) -> None:
+    if os.name == "posix":
+        with _mutation_parent(path, root) as (directory_fd, name):
+            os.rmdir(name, dir_fd=directory_fd)
+        return
+
     import ctypes
-    import msvcrt
+    from ctypes import wintypes
+
+    with _mutation_parent(path, root) as (parent_handle, target_path):
+        handle = _windows_open_directory(
+            parent_handle, target_path.name, delete_control=True,
+        )
+        try:
+            class FileDispositionInfo(ctypes.Structure):
+                _fields_ = (("DeleteFile", wintypes.BOOL),)
+
+            info = FileDispositionInfo(True)
+            kernel32, _, _ = _windows_api()
+            if not kernel32.SetFileInformationByHandle(
+                wintypes.HANDLE(handle), 4, ctypes.byref(info), ctypes.sizeof(info),
+            ):
+                raise OSError(ctypes.get_last_error(), "Unable to remove anchored migration directory")
+        finally:
+            _windows_api()[0].CloseHandle(wintypes.HANDLE(handle))
+
+
+def _windows_rename_handle(
+    handle: int, directory_handle: int, target_name: str, *, replace: bool = True,
+) -> None:
+    import ctypes
     from ctypes import wintypes
 
     class FileRenameInformation(ctypes.Structure):
@@ -589,14 +693,14 @@ def _windows_rename_fd(descriptor: int, directory_handle: int, target_name: str)
         _fields_ = (("Status", ctypes.c_void_p), ("Information", ctypes.c_size_t))
 
     info = FileRenameInformation()
-    info.ReplaceIfExists = True
+    info.ReplaceIfExists = replace
     info.RootDirectory = directory_handle
     info.FileNameLength = len(target_name.encode("utf-16-le"))
     info.FileName = target_name
     io_status = IoStatusBlock()
     _, _, ntdll = _windows_api()
     status = ntdll.NtSetInformationFile(
-        wintypes.HANDLE(msvcrt.get_osfhandle(descriptor)), ctypes.byref(io_status),
+        wintypes.HANDLE(handle), ctypes.byref(io_status),
         ctypes.byref(info), ctypes.sizeof(info), 10,
     )
     if status < 0:
@@ -604,8 +708,15 @@ def _windows_rename_fd(descriptor: int, directory_handle: int, target_name: str)
         raise OSError(error, "Unable to commit anchored migration file")
 
 
+def _windows_rename_fd(descriptor: int, directory_handle: int, target_name: str) -> None:
+    import msvcrt
+
+    _windows_rename_handle(msvcrt.get_osfhandle(descriptor), directory_handle, target_name)
+
+
 def _windows_open_directory(
     directory_handle: int, name: str, *, create: bool = False, owner_control: bool = False,
+    delete_control: bool = False,
 ) -> int:
     import ctypes
     from ctypes import wintypes
@@ -638,7 +749,8 @@ def _windows_open_directory(
         created_handle = wintypes.HANDLE()
         io_status = IoStatusBlock()
         status = ntdll.NtCreateFile(
-            ctypes.byref(created_handle), 0x00100080 | (0x00060000 if owner_control else 0),
+            ctypes.byref(created_handle), 0x00100080 | (0x00060000 if owner_control else 0)
+            | (0x00010000 if delete_control else 0),
             ctypes.byref(attributes), ctypes.byref(io_status),
             None, 0, 0x3, 2 if create else 1, 0x00200021, None, 0,
         )
@@ -1044,87 +1156,28 @@ def _looks_current(config_dir: Path) -> bool:
         return False
 
 
-def _validate_manifest(backup_dir: Path, config_dir: Path, spec: MigrationSpec) -> None:
-    manifest = _read_json_object(backup_dir / "manifest.json", config_dir, owner_only=True)
+def _validate_manifest(backup_dir: Path, config_dir: Path, spec: MigrationSpec) -> dict[str, object]:
+    manifest = validate_backup(backup_dir, config_dir)
     if (
-        manifest.get("manifest_version") != 1
-        or manifest.get("migration_id") != spec.migration_id
+        manifest.get("migration_id") != spec.migration_id
         or manifest.get("source_schema") != spec.source_schema
         or manifest.get("target_schema") != spec.target_schema
     ):
-        raise ValueError("Existing migration backup manifest is invalid")
-    files = manifest.get("files")
-    if not isinstance(files, list) or len(files) > _MAX_BACKUP_FILES:
-        raise ValueError("Existing migration backup manifest is invalid")
-    seen: set[str] = set()
-    total = 0
-    for entry_value in cast(list[object], files):
-        if not isinstance(entry_value, dict):
-            raise ValueError("Existing migration backup manifest is invalid")
-        entry = cast(dict[str, object], entry_value)
-        name, digest, size = entry.get("name"), entry.get("sha256"), entry.get("size")
-        if name not in _BACKUP_FILE_SET or name in seen or not isinstance(digest, str) or type(size) is not int:
-            raise ValueError("Existing migration backup manifest is invalid")
-        seen.add(cast(str, name))
-        if cast(int, size) < 0 or cast(int, size) > _MAX_RELEVANT_FILE_BYTES:
-            raise ValueError("Existing migration backup manifest is invalid")
-        total += cast(int, size)
-        if total > _MAX_BACKUP_BYTES:
-            raise ValueError("Existing migration backup exceeds the size limit")
-        backup_file = backup_dir / cast(str, name)
-        payload = _read_bytes(backup_file, config_dir, owner_only=True)
-        if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
-            raise ValueError("Existing migration backup failed digest validation")
+        raise ValueError("Existing migration backup manifest identity is invalid")
+    return manifest
 
 
 def _backup_metadata(config_dir: Path, spec: MigrationSpec) -> Path:
-    backup_root = config_dir / BACKUP_ROOT
-    _safe_directory(backup_root, config_dir, create=True, private=True)
-    backup_dir = backup_root / spec.migration_id
-    _safe_directory(backup_dir, config_dir, create=True, private=True)
-    _make_private_directory(backup_dir, config_dir)
-    _make_private_directory(backup_root, config_dir)
-    manifest_path = backup_dir / "manifest.json"
-    if manifest_path.is_symlink():
-        raise ValueError("Existing migration backup manifest must not be a link")
-    if manifest_path.exists():
-        _validate_manifest(backup_dir, config_dir, spec)
-        return backup_dir
-
-    entries: list[dict[str, object]] = []
-    total = 0
-    for name in _BACKUP_FILES:
-        source = config_dir / name
-        if source.is_symlink():
-            raise ValueError("Migration backup input must not be a link")
-        if not source.exists():
-            continue
-        payload = _read_bytes(source, config_dir)
-        total += len(payload)
-        if total > _MAX_BACKUP_BYTES:
-            raise ValueError("Migration backup exceeds the size limit")
-        destination = backup_dir / name
-        if destination.exists():
-            if _read_bytes(destination, config_dir, owner_only=True) != payload:
-                raise ValueError("Partial migration backup does not match its source")
-        else:
-            _write_private_backup(destination, payload, config_dir)
-        entries.append({"name": name, "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
-    manifest = {
-        "manifest_version": 1,
-        "migration_id": spec.migration_id,
-        "source_schema": spec.source_schema,
-        "target_schema": spec.target_schema,
-        "created_at": _utc_now(),
-        "files": entries,
-    }
-    _atomic_write(manifest_path, json.dumps(manifest, indent=2, sort_keys=True) + "\n", config_dir)
-    _validate_manifest(backup_dir, config_dir, spec)
-    return backup_dir
+    return create_retained_backup(
+        config_dir,
+        migration_id=spec.migration_id,
+        source_schema=spec.source_schema,
+        target_schema=spec.target_schema,
+    )
 
 
-def _apply_v086(config_dir: Path, source_dir: Path) -> None:
-    source_settings = _read_text(source_dir / "settings.cfg", config_dir)
+def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
+    source_settings = source.read_text("settings.cfg")
     config = Config.from_str(source_settings)
     remote_path, local_path = config.lftp.remote_path, config.lftp.local_path
     if not isinstance(remote_path, str) or not remote_path or remote_path.startswith("<"):
@@ -1144,8 +1197,8 @@ def _apply_v086(config_dir: Path, source_dir: Path) -> None:
             "local_path": pair.local_path, "enabled": pair.enabled, "auto_queue": pair.auto_queue,
         }],
     }, indent=2)
-    controller = ControllerPersist.from_str(_read_text(source_dir / "controller.persist", config_dir))
-    autoqueue = AutoQueuePersist.from_str(_read_text(source_dir / "autoqueue.persist", config_dir))
+    controller = ControllerPersist.from_str(source.read_text("controller.persist"))
+    autoqueue = AutoQueuePersist.from_str(source.read_text("autoqueue.persist"))
 
     _atomic_write(config_dir / "settings.cfg", config.to_str(), config_dir)
     _atomic_write(config_dir / "path_pairs.json", path_pair_content, config_dir)
@@ -1174,6 +1227,7 @@ def default_migration_registry() -> tuple[MigrationSpec, ...]:
             MigrationFeature("First claim", "Leaves administrator setup available after the upgrade."),
         ),
         fingerprint=_legacy_v086_fingerprint, apply=_apply_v086, validate=_validate_v086_result,
+        input_files=("settings.cfg", "controller.persist", "autoqueue.persist"),
     ),)
 
 
@@ -1210,10 +1264,10 @@ def _process_is_alive(pid: int) -> bool:
 class MigrationCoordinator:
     """Stable preflight/status/apply boundary for selected-major migrations."""
 
-    _process_lock = threading.Lock()
+    _process_lock = threading.RLock()
 
     def __init__(self, config_dir: str | os.PathLike[str], registry: Sequence[MigrationSpec] | None = None) -> None:
-        self.config_dir = Path(config_dir)
+        self.config_dir = Path(os.path.abspath(config_dir))
         self.metadata_path = self.config_dir / METADATA_FILE
         self.lock_path = self.config_dir / LOCK_FILE
         self.registry = tuple(sorted(registry or default_migration_registry(), key=lambda item: item.order))
@@ -1253,7 +1307,10 @@ class MigrationCoordinator:
                 return self._validate_completed_lineage(metadata)
             return self._failure_decision(None, "Migration lineage metadata is invalid", False)
 
-        relevant = [path for path in self.config_dir.iterdir() if path.name not in (LOCK_FILE, METADATA_FILE)]
+        relevant = [
+            path for path in self.config_dir.iterdir()
+            if path.name not in (LOCK_FILE, METADATA_FILE, ".seedsync.runtime.lock")
+        ]
         if not relevant:
             return MigrationDecision(MigrationState.NOT_REQUIRED)
         matches = [spec for spec in self.registry if spec.source_schema == "original-v0.8.6" and spec.fingerprint(self.config_dir)]
@@ -1278,6 +1335,17 @@ class MigrationCoordinator:
 
     def _apply_confirmed_anchored(self, *, retry: bool = False) -> MigrationDecision:
         with self._process_lock:
+            try:
+                with RuntimeExclusion(self.config_dir, "migration-apply"):
+                    return self._apply_confirmed_exclusive(retry=retry)
+            except RuntimeExclusionError as exc:
+                decision = self._failure_decision(
+                    None, "Migration refused because the SeedSync runtime is active", True,
+                )
+                raise MigrationBlockedError(decision) from exc
+
+    def _apply_confirmed_exclusive(self, *, retry: bool = False) -> MigrationDecision:
+        with self._process_lock:
             decision = self.preflight()
             if decision.state == MigrationState.RUNNING:
                 raise MigrationBlockedError(decision)
@@ -1297,6 +1365,8 @@ class MigrationCoordinator:
 
             lock_bytes: bytes | None = None
             descriptor: int | None = None
+            backup_ready = False
+            backup_anchor = None
             try:
                 lock_state = self._lock_state(spec.migration_id)
                 if lock_state == "orphaned":
@@ -1315,21 +1385,46 @@ class MigrationCoordinator:
                 os.write(descriptor, lock_bytes)
                 os.fsync(descriptor)
                 attempt = int(metadata.get("attempt", 0)) + 1
+                recorded_backup = metadata.get("backup")
+                if isinstance(recorded_backup, str):
+                    candidate_backup = self.config_dir / recorded_backup
+                    candidate_manifest = validate_backup(candidate_backup, self.config_dir)
+                    if candidate_manifest.get("migration_id") == spec.migration_id:
+                        _validate_manifest(candidate_backup, self.config_dir, spec)
+                        backup_dir = candidate_backup
+                    else:
+                        backup_dir = _backup_metadata(self.config_dir, spec)
+                else:
+                    backup_dir = _backup_metadata(self.config_dir, spec)
+                backup_anchor = _mutation_parent(backup_dir / "data" / ".apply-anchor", self.config_dir)
+                backup_anchor.__enter__()
+                manifest = _validate_manifest(backup_dir, self.config_dir, spec)
+                source = ValidatedBackupReader.freeze(
+                    backup_dir, self.config_dir, manifest, spec.input_files,
+                )
+                backup_ready = True
+                # The retained backup is fully copied, fsynced, published, and
+                # validated before checkpoint metadata or migration outputs may
+                # mutate the old configuration inventory.
                 running = self._decision_for_spec(MigrationState.RUNNING, spec)
                 self._write_metadata(
                     running, current_schema=metadata.get("current_schema", spec.source_schema),
                     applied_migrations=self._applied(metadata), attempt=attempt,
+                    backup=backup_dir.relative_to(self.config_dir).as_posix(),
                 )
-                backup_dir = _backup_metadata(self.config_dir, spec)
-                spec.apply(self.config_dir, backup_dir)
+                spec.apply(self.config_dir, source)
                 spec.validate(self.config_dir)
+                # A same-owner writer cannot influence the already-frozen
+                # migration inputs. Revalidate before issuing the completion
+                # receipt so later corruption is never silently accepted.
+                _validate_manifest(backup_dir, self.config_dir, spec)
                 applied = self._applied(metadata)
                 if spec.migration_id not in applied:
                     applied.append(spec.migration_id)
                 complete = self._decision_for_spec(MigrationState.COMPLETE, spec)
                 self._write_metadata(
                     complete, current_schema=spec.target_schema, applied_migrations=applied,
-                    attempt=attempt, backup=str(backup_dir.relative_to(self.config_dir)),
+                    attempt=attempt, backup=backup_dir.relative_to(self.config_dir).as_posix(),
                     receipt_version=1, completed_at=_utc_now(),
                 )
                 return complete
@@ -1338,15 +1433,76 @@ class MigrationCoordinator:
             except MigrationBlockedError:
                 raise
             except Exception as exc:
-                failed = self._record_failure(
-                    spec.migration_id,
-                    "Migration step failed ({}); the metadata backup was retained".format(type(exc).__name__)[:500],
-                    True,
-                )
+                error = "Migration step failed ({})".format(type(exc).__name__)[:500]
+                if backup_ready:
+                    failed = self._record_failure(
+                        spec.migration_id, error + "; the full configuration backup was retained", True,
+                    )
+                else:
+                    failed = self._failure_decision(
+                        spec.migration_id, error + "; configuration was not mutated", True,
+                    )
                 raise MigrationBlockedError(failed) from exc
             finally:
+                if backup_anchor is not None:
+                    backup_anchor.__exit__(None, None, None)
                 if descriptor is not None:
                     os.close(descriptor)
+                    self._remove_owned_lock(lock_bytes)
+
+    def restore_offline(self, backup_reference: str) -> dict[str, int]:
+        """Restore a retained backup while normal/web runtime remains unconstructed."""
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+        with _root_transaction(self.config_dir, self._root_identity):
+            try:
+                exclusion = RuntimeExclusion(self.config_dir, "migration-restore")
+            except RuntimeExclusionError as exc:
+                raise BackupRestoreError("Offline restore refused because SeedSync is active") from exc
+            with exclusion, self._process_lock:
+                backup_dir = resolve_backup(self.config_dir, backup_reference)
+                if self.lock_path.exists() or self.lock_path.is_symlink():
+                    reclaimable = False
+                    try:
+                        existing_lock = _read_json_object(self.lock_path, self.config_dir, 4096)
+                        reclaimable = (
+                            existing_lock.get("lock_version") == 1
+                            and existing_lock.get("migration_id") == "restore:" + backup_dir.name
+                            and existing_lock.get("hostname") == socket.gethostname()
+                            and type(existing_lock.get("pid")) is int
+                            and not _process_is_alive(cast(int, existing_lock["pid"]))
+                        )
+                    except Exception:
+                        reclaimable = False
+                    if not reclaimable:
+                        raise BackupRestoreError(
+                            "Offline restore refused because a migration transaction lock already exists"
+                        )
+                    _secure_unlink(self.lock_path, self.config_dir)
+                lock_bytes = json.dumps({
+                    "lock_version": 1,
+                    "pid": os.getpid(),
+                    "hostname": socket.gethostname(),
+                    "migration_id": "restore:" + backup_dir.name,
+                    "created_at": _utc_now(),
+                }, sort_keys=True).encode("utf-8")
+                descriptor: int | None = None
+                try:
+                    descriptor = _open_anchored(
+                        self.lock_path, self.config_dir, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        owner_control=os.name == "nt",
+                    )
+                    _restrict_fd_to_owner(descriptor)
+                    os.write(descriptor, lock_bytes)
+                    os.fsync(descriptor)
+                    with _mutation_parent(backup_dir / "data" / ".restore-anchor", self.config_dir):
+                        return restore_backup(self.config_dir, backup_dir)
+                finally:
+                    if descriptor is not None:
+                        os.close(descriptor)
                     self._remove_owned_lock(lock_bytes)
 
     def require_normal_startup(self) -> MigrationDecision:
@@ -1392,7 +1548,15 @@ class MigrationCoordinator:
         known_ids = [spec.migration_id for spec in expected_specs]
         applied_specs = expected_specs[:len(applied)]
         last_spec = applied_specs[-1] if applied_specs else None
-        expected_backup = str(Path(BACKUP_ROOT) / last_spec.migration_id) if last_spec else None
+        expected_backup = metadata.get("backup") if last_spec else None
+        valid_backup_path = False
+        if isinstance(expected_backup, str):
+            backup_path = Path(expected_backup)
+            valid_backup_path = (
+                len(backup_path.parts) == 2
+                and backup_path.parts[0] == BACKUP_ROOT
+                and not backup_path.parts[1].startswith(".")
+            )
         valid_receipt = (
             last_spec is not None
             and len(applied) <= len(expected_specs)
@@ -1408,7 +1572,7 @@ class MigrationCoordinator:
             and cast(int, metadata.get("attempt")) >= 1
             and _valid_receipt_timestamp(metadata.get("completed_at"))
             and _valid_receipt_timestamp(metadata.get("updated_at"))
-            and metadata.get("backup") == expected_backup
+            and valid_backup_path
             and metadata.get("error") is None
             and metadata.get("retryable") is False
         )
@@ -1515,9 +1679,12 @@ class MigrationCoordinator:
             applied = self._applied(metadata)
         except ValueError:
             applied = []
+        extra: dict[str, object] = {}
+        if isinstance(metadata.get("backup"), str):
+            extra["backup"] = metadata["backup"]
         self._write_metadata(
             decision, current_schema=metadata.get("current_schema"), applied_migrations=applied,
-            attempt=int(metadata.get("attempt", 0)),
+            attempt=int(metadata.get("attempt", 0)), **extra,
         )
         return decision
 

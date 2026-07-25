@@ -13,6 +13,7 @@ from typing import Optional, Type, TypeVar, cast
 import shutil
 import platform
 import tempfile
+from pathlib import Path
 from types import FrameType
 from typing import NoReturn, Sequence
 
@@ -27,7 +28,8 @@ from web import MigrationWebRuntime, WebAppJob, WebAppBuilder
 from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
 from web.handler.historical_log import create_historical_log_handler
-from migration import MigrationCoordinator, MigrationDecision
+from migration import BackupRestoreError, MigrationCoordinator, MigrationDecision
+from migration.runtime_exclusion import RuntimeExclusion, RuntimeExclusionError
 
 
 T_Persist = TypeVar('T_Persist', bound=Persist)
@@ -67,6 +69,25 @@ class Seedsync:
         # Parse the args
         args = self._parse_args(sys.argv[1:])
 
+        if args.restore_migration_backup is not None:
+            if not args.confirm_restore or not args.confirm_stopped:
+                raise SystemExit(
+                    "Offline restore requires both --confirm-restore and --confirm-stopped"
+                )
+            coordinator = MigrationCoordinator(args.config_dir)
+            try:
+                result = coordinator.restore_offline(args.restore_migration_backup)
+            except (BackupRestoreError, OSError, ValueError) as exc:
+                raise SystemExit("Offline migration restore refused: {}".format(exc)) from exc
+            sys.stdout.write(
+                "Restored migration backup {} ({} files, {} directories, {} bytes).\n".format(
+                    args.restore_migration_backup,
+                    result["files"], result["directories"], result["total_size"],
+                )
+            )
+            self.restore_exit_requested = True
+            return
+
         # Migration preflight must precede every loader that can normalize,
         # back up, or persist legacy state.
         self.migration_coordinator = MigrationCoordinator(args.config_dir)
@@ -90,6 +111,11 @@ class Seedsync:
             signal.signal(signal.SIGTERM, self.signal)
             signal.signal(signal.SIGINT, self.signal)
             return
+
+        try:
+            self.runtime_exclusion = RuntimeExclusion(Path(args.config_dir), "normal-runtime")
+        except RuntimeExclusionError as exc:
+            raise SystemExit("SeedSync configuration root is already in use") from exc
 
         # Create/load config
         config = None
@@ -185,6 +211,16 @@ class Seedsync:
         )
 
     def run(self):
+        try:
+            return self._run_with_exclusion()
+        finally:
+            exclusion = getattr(self, "runtime_exclusion", None)
+            if exclusion is not None:
+                exclusion.release()
+
+    def _run_with_exclusion(self):
+        if getattr(self, "restore_exit_requested", False):
+            raise ServiceExit()
         if getattr(self, "migration_exit_requested", False):
             raise ServiceExit()
         if hasattr(self, "migration_runtime"):
@@ -467,6 +503,10 @@ class Seedsync:
     @staticmethod
     def _parse_args(args: Sequence[str]) -> argparse.Namespace:
         parser = argparse.ArgumentParser(description="Seedsync daemon")
+        restore_requested = any(
+            value == "--restore-migration-backup" or value.startswith("--restore-migration-backup=")
+            for value in args
+        )
         parser.add_argument("-c", "--config_dir", required=True, help="Path to config directory")
         parser.add_argument("--logdir", help="Directory for log files")
         parser.add_argument("-d", "--debug", action="store_true", help="Enable debug logs")
@@ -482,7 +522,7 @@ class Seedsync:
         # noinspection PyProtectedMember
         default_html_path = os.path.join(meipass, "html") if is_frozen and meipass is not None else None
         parser.add_argument("--html",
-                            required=not is_frozen,
+                            required=not is_frozen and not restore_requested,
                             default=default_html_path,
                             help="Path to directory containing html resources")
 
@@ -492,15 +532,31 @@ class Seedsync:
         # noinspection PyProtectedMember
         default_scanfs_path = os.path.join(meipass, "scanfs") if is_frozen and meipass is not None else None
         parser.add_argument("--scanfs",
-                            required=not is_frozen,
+                            required=not is_frozen and not restore_requested,
                             default=default_scanfs_path,
                             help="Path to scanfs executable")
         parser.add_argument("--web-bind-host",
                             default=None,
                             help=("Host/IP address for the web server to bind to; migration mode defaults "
                                   "to 127.0.0.1 unless this option is explicitly supplied"))
+        parser.add_argument(
+            "--restore-migration-backup",
+            metavar="BACKUP_ID_OR_PATH",
+            help="Offline-only: restore one retained migration backup and exit",
+        )
+        parser.add_argument(
+            "--confirm-restore", action="store_true",
+            help="Confirm removal of post-backup files under the exact config root",
+        )
+        parser.add_argument(
+            "--confirm-stopped", action="store_true",
+            help="Confirm that all SeedSync processes using this config root are stopped",
+        )
 
-        return parser.parse_args(args)
+        parsed = parser.parse_args(args)
+        if parsed.restore_migration_backup is None and (parsed.confirm_restore or parsed.confirm_stopped):
+            parser.error("restore confirmation flags require --restore-migration-backup")
+        return parsed
 
     @staticmethod
     def _apply_umask_from_env():
