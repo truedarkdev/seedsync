@@ -107,6 +107,11 @@ class TestMigrationCoordinator(unittest.TestCase):
         }
 
     @staticmethod
+    def _recorded_backup(root: Path) -> Path:
+        receipt = json.loads((root / "migration-state.json").read_text(encoding="utf-8"))
+        return root / receipt["backup"]
+
+    @staticmethod
     def _write_running_metadata(root: Path, decision: MigrationDecision) -> None:
         (root / "migration-state.json").write_text(json.dumps({
             "metadata_version": 2,
@@ -282,9 +287,12 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual({"*.mkv", "archive"}, {pattern.pattern for pattern in autoqueue.patterns})
         self.assertFalse((self.root / "api-keys.json").exists())
 
-        backup = self.root / "migration-backups" / "original-v0.8.6-to-current-v1"
+        backup = self._recorded_backup(self.root)
         manifest = json.loads((backup / "manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(source_digests, {entry["name"]: entry["sha256"] for entry in manifest["files"]})
+        self.assertEqual(source_digests, {
+            entry["path"]: entry["sha256"]
+            for entry in manifest["entries"] if entry["path"] in source_digests
+        })
         receipt = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
         self.assertEqual("complete", receipt["state"])
         self.assertEqual(1, receipt["receipt_version"])
@@ -318,7 +326,7 @@ class TestMigrationCoordinator(unittest.TestCase):
 
         retry_spec = type(spec)(
             spec.migration_id, spec.order, spec.source_schema, spec.target_schema,
-            spec.features, spec.fingerprint, fail_after_writes, spec.validate,
+            spec.features, spec.fingerprint, fail_after_writes, spec.validate, spec.input_files,
         )
         coordinator = MigrationCoordinator(self.root, (retry_spec,))
         with self.assertRaises(MigrationBlockedError) as context:
@@ -466,7 +474,11 @@ class TestMigrationCoordinator(unittest.TestCase):
                 lock_path = root / ".migration.lock"
                 payload = payload_factory(required.migration_id)
                 lock_path.write_text("not-json" if payload is None else json.dumps(payload), encoding="utf-8")
-                before = {item.name: item.read_bytes() for item in root.iterdir() if item.name != ".migration.lock"}
+                excluded_locks = {".migration.lock", ".seedsync.runtime.lock"}
+                before = {
+                    item.name: item.read_bytes()
+                    for item in root.iterdir() if item.name not in excluded_locks
+                }
 
                 self.assertEqual(MigrationState.REQUIRED, coordinator.preflight().state)
                 with self.assertRaises(MigrationBlockedError):
@@ -474,7 +486,8 @@ class TestMigrationCoordinator(unittest.TestCase):
                 self.assertTrue(lock_path.exists())
                 self.assertFalse((root / "path_pairs.json").exists())
                 self.assertEqual(before, {
-                    item.name: item.read_bytes() for item in root.iterdir() if item.name != ".migration.lock"
+                    item.name: item.read_bytes()
+                    for item in root.iterdir() if item.name not in excluded_locks
                 })
 
     def test_orphaned_running_lock_becomes_retryable_and_can_resume(self) -> None:
@@ -556,7 +569,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         finally:
             outside.unlink(missing_ok=True)
 
-    def test_hostile_backup_manifest_entry_is_rejected(self) -> None:
+    def test_hostile_unpublished_backup_manifest_is_rejected_before_mutation(self) -> None:
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         required = coordinator.preflight()
@@ -570,8 +583,9 @@ class TestMigrationCoordinator(unittest.TestCase):
         with self.assertRaises(MigrationBlockedError) as context:
             coordinator.apply_confirmed()
         self.assertEqual(MigrationState.FAILED, context.exception.decision.state)
+        self.assertFalse((self.root / "path_pairs.json").exists())
 
-    def test_matching_partial_backup_is_reused_and_conflict_is_rejected(self) -> None:
+    def test_conflicting_published_backup_data_is_never_reused_or_overwritten(self) -> None:
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         required = coordinator.preflight()
@@ -584,7 +598,11 @@ class TestMigrationCoordinator(unittest.TestCase):
                 backup / "settings.cfg", (self.root / "settings.cfg").read_bytes(), self.root,
             )
 
-        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        partial_content = (backup / "settings.cfg").read_bytes()
+        with self.assertRaises(MigrationBlockedError):
+            coordinator.apply_confirmed()
+        self.assertEqual(partial_content, (backup / "settings.cfg").read_bytes())
+        self.assertFalse((self.root / "path_pairs.json").exists())
 
         conflicting_root = self.root / "conflicting"
         MigrationFixture(conflicting_root).write()
@@ -598,9 +616,10 @@ class TestMigrationCoordinator(unittest.TestCase):
             migration_coordinator._write_private_backup(
                 backup / "settings.cfg", b"different", conflicting_root,
             )
-        with self.assertRaises(MigrationBlockedError) as context:
+        with self.assertRaises(MigrationBlockedError):
             conflicting.apply_confirmed()
-        self.assertEqual(MigrationState.FAILED, context.exception.decision.state)
+        self.assertEqual(b"different", (backup / "settings.cfg").read_bytes())
+        self.assertFalse((conflicting_root / "path_pairs.json").exists())
 
     def test_backup_files_are_private_and_descriptor_reads_do_not_reopen_paths(self) -> None:
         MigrationFixture(self.root).write()
@@ -609,9 +628,9 @@ class TestMigrationCoordinator(unittest.TestCase):
         with patch.object(Path, "read_bytes", side_effect=AssertionError("path was reopened by name")):
             self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
 
-        backup = self.root / "migration-backups" / "original-v0.8.6-to-current-v1"
+        backup = self._recorded_backup(self.root)
         for name in ("settings.cfg", "controller.persist", "autoqueue.persist", "manifest.json"):
-            path = backup / name
+            path = backup / name if name == "manifest.json" else backup / "data" / name
             self.assertTrue(path.is_file())
             if os.name == "posix":
                 self.assertEqual(0, stat.S_IMODE(path.stat().st_mode) & 0o077)
@@ -664,10 +683,10 @@ class TestMigrationCoordinator(unittest.TestCase):
             self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
 
         self.assertTrue((config_root / "migration-state.json").is_file())
-        self.assertTrue((config_root / "migration-backups" / "original-v0.8.6-to-current-v1" / "manifest.json").is_file())
+        self.assertTrue((self._recorded_backup(config_root) / "manifest.json").is_file())
         self.assertTrue((config_root / "path_pairs.json").is_file())
         self.assertTrue({
-            "migration-state.json", "manifest.json", "settings.cfg", "path_pairs.json",
+            "migration-state.json", "settings.cfg", "path_pairs.json",
             "controller.persist", "autoqueue.persist",
         }.issubset(set(committed_names)))
 
@@ -722,20 +741,13 @@ class TestMigrationCoordinator(unittest.TestCase):
             os.replace(original_root, config_root)
 
     def test_new_and_reused_backup_directories_are_private(self) -> None:
-        for state in ("new", "reused"):
+        for state in ("new",):
             with self.subTest(state=state):
                 root = self.root / state
                 MigrationFixture(root).write()
                 coordinator = MigrationCoordinator(root)
-                required = coordinator.preflight()
+                coordinator.preflight()
                 backup_root = root / "migration-backups"
-                backup_dir = backup_root / required.migration_id
-                if state == "reused":
-                    with migration_coordinator._root_transaction(root, coordinator._root_identity):
-                        migration_coordinator._safe_directory(
-                            backup_dir, root, create=True, private=True,
-                        )
-
                 if os.name == "nt":
                     original_restrict = migration_coordinator._restrict_windows_handle_to_owner
                     restricted_handles = []
@@ -754,26 +766,27 @@ class TestMigrationCoordinator(unittest.TestCase):
                 with patcher:
                     self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
 
+                retained_backup = self._recorded_backup(root)
+
                 if os.name == "posix":
                     self.assertEqual(0, stat.S_IMODE(backup_root.stat().st_mode) & 0o077)
-                    self.assertEqual(0, stat.S_IMODE(backup_dir.stat().st_mode) & 0o077)
+                    self.assertEqual(0, stat.S_IMODE(retained_backup.stat().st_mode) & 0o077)
                 else:
-                    self.assertGreaterEqual(len(restricted_handles), 2)
+                    self.assertGreaterEqual(len(restricted_handles), 1)
 
     @unittest.skipUnless(os.name == "nt", "Windows ACL regression")
     def test_insecure_existing_backup_objects_fail_before_secret_writes(self) -> None:
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
-        required = coordinator.preflight()
-        backup = self.root / "migration-backups" / required.migration_id
+        coordinator.preflight()
+        backup = self.root / "migration-backups"
         backup.mkdir(parents=True)
-        (backup / "settings.cfg").write_bytes((self.root / "settings.cfg").read_bytes())
 
         with self.assertRaises(MigrationBlockedError):
             coordinator.apply_confirmed()
 
         self.assertFalse((self.root / "path_pairs.json").exists())
-        self.assertFalse((backup / "manifest.json").exists())
+        self.assertEqual([], list(backup.glob("*/manifest.json")))
 
     @unittest.skipUnless(os.name == "nt", "Windows native ABI regression")
     def test_windows_native_prototypes_creation_descriptor_and_handle_cleanup(self) -> None:
@@ -845,8 +858,8 @@ class TestMigrationCoordinator(unittest.TestCase):
                 root = self.root / name
                 MigrationFixture(root).write()
                 coordinator = MigrationCoordinator(root)
-                required = coordinator.preflight()
-                backup = root / "migration-backups" / required.migration_id
+                coordinator.preflight()
+                backup = root / "migration-backups"
                 backup.mkdir(parents=True)
                 handle = kernel32.CreateFileW(
                     str(backup), 0x00060000, 0x7, None, 3, 0x02000000, None,
@@ -878,7 +891,7 @@ class TestMigrationCoordinator(unittest.TestCase):
 
                 with self.assertRaises(MigrationBlockedError):
                     coordinator.apply_confirmed()
-                self.assertFalse((backup / "manifest.json").exists())
+                self.assertEqual([], list(backup.glob("*/manifest.json")))
                 self.assertFalse((root / "path_pairs.json").exists())
 
     @unittest.skipUnless(os.name == "nt", "Windows native handle cleanup regression")
