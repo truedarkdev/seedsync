@@ -12,18 +12,30 @@ app-bulk-actions-bar {
     display: none;
 }
 
-/* striped rows */
-#file-list > .file-row:nth-child(even of .file-row) {
+/* Keep striping based on the logical index, not the mounted slice. */
+#file-list .file-row.logical-even {
     background-color: $primary-lighter-color;
 }
 
 /* list separator */
-#file-list > .file-row {
+#file-list .file-row {
     border-bottom: 1px solid #ddd;
 }
 
-#file-list > .file-row:last-child {
+#file-list .file-row.logical-last {
     border-bottom: none;
+}
+
+#file-list .file-window-spacer {
+    display: block;
+    width: 100%;
+    pointer-events: none;
+}
+
+// Let the page viewport keep its logical anchor when a measured row expands
+// above it; this intentionally does not create a nested scrolling container.
+#file-list .file-rows {
+    overflow-anchor: auto;
 }
 
 /* Pagination bar */

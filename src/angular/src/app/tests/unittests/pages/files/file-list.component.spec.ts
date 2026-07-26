@@ -1,4 +1,4 @@
-import {BehaviorSubject, of, throwError} from "rxjs";
+import {BehaviorSubject, of, Subject, throwError} from "rxjs";
 
 import * as Immutable from "immutable";
 
@@ -20,12 +20,16 @@ class MockViewFileService {
     private _totalFilteredCount = new BehaviorSubject(0);
     private _currentPage = new BehaviorSubject(0);
     private _pageSize = new BehaviorSubject(50);
+    queue = jasmine.createSpy("queue").and.returnValue(of(new WebReaction(true, "ok", null)));
     stop = jasmine.createSpy("stop").and.returnValue(
         of(new WebReaction(false, null, "Operation timed out"))
     );
+    extract = jasmine.createSpy("extract").and.returnValue(of(new WebReaction(true, "ok", null)));
     deleteLocal = jasmine.createSpy("deleteLocal").and.returnValue(
         of(new WebReaction(true, "ok", null))
     );
+    deleteRemote = jasmine.createSpy("deleteRemote").and.returnValue(of(new WebReaction(true, "ok", null)));
+    validate = jasmine.createSpy("validate").and.returnValue(of(new WebReaction(true, "ok", null)));
     retryMove = jasmine.createSpy("retryMove").and.returnValue(
         of(new WebReaction(true, "ok", null))
     );
@@ -79,11 +83,11 @@ class MockChangeDetectorRef {
 }
 
 function createViewFile(props: any = {}): ViewFile {
-    return new ViewFile({
+    return new ViewFile(Object.assign({
         fileId: props.fileId || "file-1",
         name: props.name || "sample",
         isStoppable: props.isStoppable != null ? props.isStoppable : true
-    });
+    }, props));
 }
 
 describe("Testing file list component", () => {
@@ -261,5 +265,344 @@ describe("Testing file list component", () => {
         expect(component.pageStart).toBe(1);
         expect(component.pageEnd).toBe(17);
         expect(component.totalPages).toBe(1);
+    });
+
+    it("should keep the complete logical list while bounding the mounted large-list slice", () => {
+        const files = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `file-${index}`,
+            name: `sample-${index}`
+        })).toList();
+
+        mockViewFileService.setFilteredFiles(files);
+        (component as any).updateVisibleRange();
+
+        expect(component.logicalFiles.size).toBe(1000);
+        expect(component.visibleFiles.length).toBeGreaterThan(0);
+        expect(component.visibleFiles.length).toBeLessThan(100);
+        expect(component.renderedStartIndex).toBe(0);
+        expect(component.renderedEndIndex).toBe(component.visibleFiles.length);
+    });
+
+    it("should advance the rendered logical range when the page scrolls", () => {
+        const files = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `file-${index}`,
+            name: `sample-${index}`
+        })).toList();
+
+        mockViewFileService.setFilteredFiles(files);
+        (component as any).updateVisibleRange();
+        const initialStart = component.renderedStartIndex;
+
+        component.onWindowScroll(5000);
+        (component as any).updateVisibleRange();
+
+        expect(component.renderedStartIndex).toBeGreaterThan(initialStart);
+        expect(component.renderedEndIndex).toBeLessThanOrEqual(1000);
+        expect(component.visibleFiles[0].fileId).toBe(`file-${component.renderedStartIndex}`);
+    });
+
+    it("should use measured variable row heights when calculating spacers", () => {
+        const files = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `file-${index}`,
+            name: `sample-${index}`
+        })).toList();
+
+        mockViewFileService.setFilteredFiles(files);
+        (component as any).updateVisibleRange();
+        const before = component.bottomSpacerHeight;
+
+        (component as any).updateRowHeight("file-0", 240);
+        (component as any).updateVisibleRange();
+
+        expect(component.topSpacerHeight).toBe(0);
+        expect(component.bottomSpacerHeight).toBeGreaterThan(before);
+    });
+
+    it("should retain a hard mounted-row bound even when measured rows are unusually short", () => {
+        const files = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `short-${index}`,
+            name: `short-${index}`
+        })).toList();
+
+        mockViewFileService.setFilteredFiles(files);
+        files.forEach(file => (component as any).updateRowHeight(file.fileId, 1));
+        (component as any).updateVisibleRange();
+
+        expect(component.logicalFiles.size).toBe(1000);
+        expect(component.visibleFiles.length).toBeLessThanOrEqual(80);
+    });
+
+    it("should render small page sizes without dropping logical rows", () => {
+        [25, 50, 100].forEach(size => {
+            const files = Immutable.Range(0, size).map(index => createViewFile({
+                fileId: `file-${size}-${index}`,
+                name: `sample-${size}-${index}`
+            })).toList();
+
+            mockViewFileService.setFilteredFiles(files);
+            (component as any).updateVisibleRange();
+
+            expect(component.logicalFiles.size).toBe(size);
+            expect(component.visibleFiles.length).toBe(size);
+            expect(component.renderedStartIndex).toBe(0);
+            expect(component.renderedEndIndex).toBe(size);
+        });
+    });
+
+    it("should rebuild the window when filtering or sorting changes the logical page", () => {
+        const initialFiles = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `file-${index}`,
+            name: `sample-${index}`
+        })).toList();
+        mockViewFileService.setFilteredFiles(initialFiles);
+        component.onWindowScroll(4000);
+        (component as any).updateVisibleRange();
+        expect(component.renderedStartIndex).toBeGreaterThan(0);
+
+        const filteredFiles = Immutable.Range(0, 25).map(index => createViewFile({
+            fileId: `filtered-${index}`,
+            name: `filtered-${index}`
+        })).toList();
+        mockViewFileService.setFilteredFiles(filteredFiles);
+        (component as any).updateVisibleRange();
+
+        expect(component.logicalFiles.size).toBe(25);
+        expect(component.visibleFiles.length).toBe(25);
+        expect(component.renderedStartIndex).toBe(0);
+        expect(component.renderedEndIndex).toBe(25);
+    });
+
+    it("should retain an in-flight action lock across row remounts and clear it only on completion", () => {
+        const completion = new Subject<WebReaction>();
+        mockViewFileService.stop.and.returnValue(completion.asObservable());
+        const file = createViewFile({fileId: "in-flight", isStoppable: true});
+
+        component.onStop(file);
+        expect(component.activeActionFor(file)).toBe(FileAction.STOP);
+
+        // The old row may be destroyed by windowing; a remounted row reads the
+        // parent-owned action state and must not issue a duplicate request.
+        (component as any).fileComponents = {toArray: () => []};
+        expect(component.activeActionFor(file)).toBe(FileAction.STOP);
+        component.onStop(file);
+        expect(mockViewFileService.stop).toHaveBeenCalledTimes(1);
+
+        completion.next(new WebReaction(true, "ok", null));
+        completion.complete();
+        expect(component.activeActionFor(file)).toBeNull();
+    });
+
+    it("should keep status-driven actions locked after HTTP acknowledgement until the model transition", () => {
+        const cases = [
+            {
+                action: FileAction.QUEUE,
+                service: "queue",
+                invoke: (file: ViewFile) => component.onQueue(file),
+                unrelatedFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.DOWNLOADED)),
+                nextFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.QUEUED))
+            },
+            {
+                action: FileAction.EXTRACT,
+                service: "extract",
+                invoke: (file: ViewFile) => component.onExtract(file),
+                unrelatedFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.DOWNLOADED)),
+                nextFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.EXTRACTING))
+            },
+            {
+                action: FileAction.DELETE_REMOTE,
+                service: "deleteRemote",
+                invoke: (file: ViewFile) => component.onDeleteRemote(file),
+                unrelatedFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.DOWNLOADED)),
+                nextFile: (file: ViewFile) => new ViewFile(file.set("isRemotelyDeletable", false))
+            },
+            {
+                action: FileAction.VALIDATE,
+                service: "validate",
+                invoke: (file: ViewFile) => component.onValidate(file),
+                unrelatedFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.DOWNLOADED)),
+                nextFile: (file: ViewFile) => new ViewFile(file.set("status", ViewFile.Status.VALIDATING))
+            }
+        ];
+
+        cases.forEach(({action, service, invoke, unrelatedFile, nextFile}, index) => {
+            const completion = new Subject<WebReaction>();
+            (mockViewFileService as any)[service].and.returnValue(completion.asObservable());
+            const file = createViewFile({
+                fileId: `status-driven-${index}`,
+                isRemotelyDeletable: action === FileAction.DELETE_REMOTE
+            });
+            mockViewFileService.setFilteredFiles(Immutable.List([file]));
+
+            invoke(file);
+            expect(component.activeActionFor(file)).toBe(action);
+
+            completion.next(new WebReaction(true, "accepted", null));
+            expect(component.activeActionFor(file)).toBe(action);
+            completion.complete();
+            expect(component.activeActionFor(file)).toBe(action);
+
+            const unrelated = unrelatedFile(file);
+            mockViewFileService.setFilteredFiles(Immutable.List([unrelated]));
+            expect(component.activeActionFor(unrelated)).toBe(action);
+
+            const transitionedFile = nextFile(file);
+            mockViewFileService.setFilteredFiles(Immutable.List([transitionedFile]));
+            expect(component.activeActionFor(transitionedFile)).toBeNull();
+        });
+    });
+
+    it("should require a genuine status transition for same-status model emissions", () => {
+        const cases = [
+            {
+                action: FileAction.QUEUE,
+                service: "queue",
+                status: ViewFile.Status.QUEUED,
+                sameStatusField: "downloadingSpeed",
+                nextStatus: ViewFile.Status.DOWNLOADING,
+                invoke: (file: ViewFile) => component.onQueue(file)
+            },
+            {
+                action: FileAction.EXTRACT,
+                service: "extract",
+                status: ViewFile.Status.EXTRACTED,
+                sameStatusField: "localSize",
+                nextStatus: ViewFile.Status.EXTRACTING,
+                invoke: (file: ViewFile) => component.onExtract(file)
+            },
+            {
+                action: FileAction.VALIDATE,
+                service: "validate",
+                status: ViewFile.Status.VALIDATED,
+                sameStatusField: "validationProgress",
+                nextStatus: ViewFile.Status.VALIDATING,
+                invoke: (file: ViewFile) => component.onValidate(file)
+            },
+            {
+                action: FileAction.VALIDATE,
+                service: "validate",
+                status: ViewFile.Status.CORRUPT,
+                sameStatusField: "validationError",
+                nextStatus: ViewFile.Status.VALIDATING,
+                invoke: (file: ViewFile) => component.onValidate(file)
+            }
+        ];
+
+        cases.forEach(({action, service, status, sameStatusField, nextStatus, invoke}, index) => {
+            const completion = new Subject<WebReaction>();
+            (mockViewFileService as any)[service].and.returnValue(completion.asObservable());
+            const file = createViewFile({
+                fileId: `same-status-${index}`,
+                status,
+                isQueueable: action === FileAction.QUEUE,
+                isExtractable: action === FileAction.EXTRACT,
+                isArchive: action === FileAction.EXTRACT,
+                isValidatable: action === FileAction.VALIDATE
+            });
+            mockViewFileService.setFilteredFiles(Immutable.List([file]));
+
+            invoke(file);
+            completion.next(new WebReaction(true, "accepted", null));
+            completion.complete();
+
+            const sameStatusFile = new ViewFile(file.set(sameStatusField, "updated"));
+            mockViewFileService.setFilteredFiles(Immutable.List([sameStatusFile]));
+            expect(component.activeActionFor(sameStatusFile)).toBe(action);
+
+            const transitionedFile = new ViewFile(sameStatusFile.set("status", nextStatus));
+            mockViewFileService.setFilteredFiles(Immutable.List([transitionedFile]));
+            expect(component.activeActionFor(transitionedFile)).toBeNull();
+        });
+    });
+
+    it("should clear a status-driven action on completion without an acknowledgement", () => {
+        const completion = new Subject<WebReaction>();
+        mockViewFileService.queue.and.returnValue(completion.asObservable());
+        const file = createViewFile({fileId: "completion-only", isQueueable: true});
+        mockViewFileService.setFilteredFiles(Immutable.List([file]));
+
+        component.onQueue(file);
+        expect(component.activeActionFor(file)).toBe(FileAction.QUEUE);
+
+        completion.complete();
+
+        expect(component.activeActionFor(file)).toBeNull();
+    });
+
+    it("should clear a response-driven action on completion without an acknowledgement", () => {
+        const completion = new Subject<WebReaction>();
+        mockViewFileService.stop.and.returnValue(completion.asObservable());
+        const file = createViewFile({fileId: "response-completion-only", isStoppable: true});
+        mockViewFileService.setFilteredFiles(Immutable.List([file]));
+
+        component.onStop(file);
+        expect(component.activeActionFor(file)).toBe(FileAction.STOP);
+
+        completion.complete();
+
+        expect(component.activeActionFor(file)).toBeNull();
+    });
+
+    it("should clear an action error after the row remounts and reject duplicate requests", () => {
+        const request = new Subject<WebReaction>();
+        mockViewFileService.queue.and.returnValue(request.asObservable());
+        const file = createViewFile({fileId: "remount-error", isQueueable: true});
+        mockViewFileService.setFilteredFiles(Immutable.List([file]));
+
+        component.onQueue(file);
+        (component as any).fileComponents = {toArray: () => []};
+        component.onQueue(file);
+        expect(mockViewFileService.queue).toHaveBeenCalledTimes(1);
+
+        request.error(new Error("request failed"));
+
+        expect(component.activeActionFor(file)).toBeNull();
+    });
+
+    it("should clear a synchronous action factory failure and allow a retry", () => {
+        const file = createViewFile({fileId: "sync-failure", isQueueable: true});
+        mockViewFileService.queue.and.callFake(() => {
+            throw new Error("factory failed");
+        });
+
+        component.onQueue(file);
+        expect(component.activeActionFor(file)).toBeNull();
+
+        component.onQueue(file);
+        expect(mockViewFileService.queue).toHaveBeenCalledTimes(2);
+        expect(component.activeActionFor(file)).toBeNull();
+    });
+
+    it("should preserve the queue action enum value when exposing the parent lock", () => {
+        const completion = new Subject<WebReaction>();
+        mockViewFileService.queue.and.returnValue(completion.asObservable());
+        const file = createViewFile({fileId: "queue-lock", isQueueable: true});
+
+        component.onQueue(file);
+
+        expect(component.activeActionFor(file)).toBe(FileAction.QUEUE);
+        expect(mockViewFileService.queue).toHaveBeenCalledTimes(1);
+        completion.next(new WebReaction(true, "ok", null));
+        expect(component.activeActionFor(file)).toBe(FileAction.QUEUE);
+
+        const queuedFile = new ViewFile(file.set("status", ViewFile.Status.QUEUED));
+        mockViewFileService.setFilteredFiles(Immutable.List([queuedFile]));
+        expect(component.activeActionFor(queuedFile)).toBeNull();
+    });
+
+    it("should reuse the cached height index for repeated unchanged range updates", () => {
+        const files = Immutable.Range(0, 1000).map(index => createViewFile({
+            fileId: `cached-${index}`,
+            name: `cached-${index}`
+        })).toList();
+        mockViewFileService.setFilteredFiles(files);
+        (component as any).updateVisibleRange();
+        const rebuilds = (component as any)._heightIndexRebuilds;
+
+        for (let index = 0; index < 8; index++) {
+            component.onWindowScroll(index * 500);
+            (component as any).updateVisibleRange();
+        }
+
+        expect((component as any)._heightIndexRebuilds).toBe(rebuilds);
     });
 });

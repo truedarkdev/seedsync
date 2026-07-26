@@ -53,22 +53,32 @@
             </span>
         </div>
     </div>
-    <div class="file-row" *ngFor="let file of currentFiles; trackBy: identify">
-        <app-file
-            [file]="file"
-            [options]="options"
-            [isBulkSelected]="(selectedFileIds | async)?.has(file.fileId || file.name)"
-            [showActions]="file.isSelected"
-            (click)="onSelect(file)"
-            (toggleSelectionEvent)="onSelectionToggle($event)"
-            (queueEvent)="onQueue($event)"
-            (stopEvent)="onStop($event)"
-            (extractEvent)="onExtract($event)"
-            (deleteLocalEvent)="onDeleteLocal($event)"
-            (deleteRemoteEvent)="onDeleteRemote($event)"
-            (validateEvent)="onValidate($event)"
-            (retryMoveEvent)="onRetryMove($event)">
-        </app-file>
+    <div #rowsContainer class="file-rows">
+        <div class="file-window-spacer" [style.height.px]="topSpacerHeight" aria-hidden="true"></div>
+        <div #fileRow class="file-row"
+             *ngFor="let file of visibleFiles; let visibleIndex = index; trackBy: identify"
+             [class.logical-even]="(renderedStartIndex + visibleIndex) % 2 === 1"
+             [class.logical-last]="renderedStartIndex + visibleIndex === currentFiles.size - 1"
+             [attr.data-logical-index]="renderedStartIndex + visibleIndex"
+             [attr.data-file-key]="identify(renderedStartIndex + visibleIndex, file)">
+            <app-file
+                [file]="file"
+                [options]="options"
+                [isBulkSelected]="(selectedFileIds | async)?.has(file.fileId || file.name)"
+                [showActions]="file.isSelected"
+                [pendingAction]="activeActionFor(file)"
+                (click)="onSelect(file)"
+                (toggleSelectionEvent)="onSelectionToggle($event)"
+                (queueEvent)="onQueue($event)"
+                (stopEvent)="onStop($event)"
+                (extractEvent)="onExtract($event)"
+                (deleteLocalEvent)="onDeleteLocal($event)"
+                (deleteRemoteEvent)="onDeleteRemote($event)"
+                (validateEvent)="onValidate($event)"
+                (retryMoveEvent)="onRetryMove($event)">
+            </app-file>
+        </div>
+        <div class="file-window-spacer" [style.height.px]="bottomSpacerHeight" aria-hidden="true"></div>
     </div>
 </div>
 <div id="pagination-bar" *ngIf="totalCount > 0">
