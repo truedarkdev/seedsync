@@ -58,7 +58,10 @@ function createViewFile(props: any = {}): ViewFile {
         isLocallyDeletable: props.isLocallyDeletable || false,
         isRemotelyDeletable: props.isRemotelyDeletable || false,
         isValidatable: props.isValidatable || false,
-        isMoveRetryable: props.isMoveRetryable || false
+        isMoveRetryable: props.isMoveRetryable || false,
+        percentDownloaded: props.percentDownloaded !== undefined ? props.percentDownloaded : 0,
+        transferredSize: props.transferredSize !== undefined ? props.transferredSize : 0,
+        displaySizeTotal: props.displaySizeTotal !== undefined ? props.displaySizeTotal : 0
     });
 }
 
@@ -298,6 +301,26 @@ describe("Testing file component", () => {
         ).toBe(72);
         expect(style.marginTop).toBe("-16px");
         expect(style.marginBottom).toBe("-12px");
+    });
+
+    it("should keep the progress percentage and byte totals in one composition", () => {
+        const file = createViewFile({
+            status: ViewFile.Status.DOWNLOADING,
+            percentDownloaded: 0,
+            transferredSize: 0,
+            displaySizeTotal: 1024
+        });
+        fixture.componentInstance.file = file;
+        fixture.componentInstance.options = of(null) as any;
+
+        fixture.detectChanges();
+
+        const composition = fixture.debugElement.query(By.css(".progress-composition"));
+        expect(composition).not.toBeNull();
+        expect(composition.query(By.css(".progress"))).not.toBeNull();
+        expect(composition.query(By.css(".progress-percent")).nativeElement.textContent.trim())
+            .toBe("0%");
+        expect(composition.query(By.css(".size_info")).nativeElement.textContent).toContain("of");
     });
 
     it("should clear the active action when resetActiveAction is called", () => {
