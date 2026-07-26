@@ -1,5 +1,5 @@
 <main class="migration-page">
-    <article class="migration-shell" aria-labelledby="migration-heading">
+    <article class="migration-shell migration-shell--state-stable" aria-labelledby="migration-heading">
         <section class="handoff-panel">
             <header class="brand" aria-label="SeedSync">
                 <img src="/assets/logo.png" alt="" width="68" height="68">
@@ -22,19 +22,30 @@
                 <ng-container *ngIf="status && !loading">
                     <div class="status-copy" aria-live="polite">
                         <p class="eyebrow">Configuration checkpoint</p>
-                        <h1 id="migration-heading">{{stateLabel}}</h1>
+                        <div class="status-heading-row" [class.is-success]="isMigrationComplete">
+                            <span *ngIf="isMigrationComplete"
+                                  class="success-mark"
+                                  role="img"
+                                  aria-label="Migration succeeded">&#10003;</span>
+                            <h1 id="migration-heading">{{stateLabel}}</h1>
+                        </div>
                         <p class="orientation">{{stateCopy}}</p>
                     </div>
 
-                    <div *ngIf="isConfirmedV086Migration" class="migration-route" aria-label="Detected migration path">
-                        <span>
-                            <small>From</small>
+                    <div *ngIf="isV086MigrationPath"
+                         class="migration-route"
+                         [class.is-complete]="isMigrationComplete"
+                         [attr.aria-label]="versionRouteAriaLabel">
+                        <span class="migration-route-source">
+                            <small>{{sourceVersionStateLabel}}</small>
                             <strong>{{sourceVersionLabel}}</strong>
                         </span>
                         <span class="route-arrow" aria-hidden="true">&#8594;</span>
-                        <span>
-                            <small>To</small>
-                            <strong>{{targetVersionLabel}}</strong>
+                        <span class="migration-route-target">
+                            <small>{{targetVersionStateLabel}}</small>
+                            <strong><span *ngIf="isMigrationComplete"
+                                          class="version-success-mark"
+                                          aria-hidden="true">&#10003;</span><span class="version-value">{{targetVersionLabel}}</span></strong>
                         </span>
                     </div>
 
@@ -43,16 +54,28 @@
                     <section class="readiness" aria-labelledby="readiness-heading">
                         <div class="readiness-heading-row">
                             <p class="readiness-label">Safety prerequisite</p>
-                            <span class="readiness-state">Not ready</span>
+                            <span class="readiness-state">{{readinessLabel}}</span>
                         </div>
-                        <h2 id="readiness-heading">Complete backup and restore required</h2>
-                        <p>A retained backup and proven restore path must be ready before migration can start. This build does not provide that capability yet.</p>
+                        <h2 id="readiness-heading">{{readinessHeading}}</h2>
+                        <p *ngIf="!status.backup.complete_restore_ready">SeedSync will create, fsync, and validate a complete retained backup before changing your configuration. Restore remains an offline command and is not available from this page.</p>
+                        <p *ngIf="status.backup.complete_restore_ready">The complete retained backup is validated and remains available for an explicit offline restore.</p>
+                        <p>{{status.operation.message}}</p>
                     </section>
 
                     <div class="actions">
-                        <div *ngIf="isConfirmedV086Migration" class="blocked-action">
-                            <button type="button" class="primary-button" disabled aria-describedby="migration-blocker">Start migration</button>
-                            <p id="migration-blocker">Blocked until backup and restore readiness is implemented and validated.</p>
+                        <div *ngIf="(status.capabilities.apply && isConfirmedV086Migration) || status.capabilities.retry" class="blocked-action">
+                            <label class="migration-confirmation">
+                                <input #migrationConfirmation
+                                       type="checkbox"
+                                       [checked]="migrationConfirmed"
+                                       (change)="setMigrationConfirmed(migrationConfirmation.checked)">
+                                <span>I understand normal services stay paused and confirm this migration.</span>
+                            </label>
+                            <button type="button"
+                                    class="primary-button"
+                                    [disabled]="!canStartMigration"
+                                    (click)="startMigration()">{{actionBusy ? 'Starting...' : actionLabel}}</button>
+                            <p *ngIf="actionError" role="alert">The request was not accepted. Recheck status before trying again.</p>
                         </div>
                         <button type="button" class="secondary-button" (click)="refresh()">Recheck status</button>
                     </div>

@@ -24,7 +24,7 @@ function parseFeature(value: unknown): MigrationFeature {
 
 export function parseMigrationStatus(value: unknown): MigrationStatus {
     if (!isObject(value) ||
-        value.schema_version !== 1 ||
+        value.schema_version !== 2 ||
         value.mode !== "migration_required" ||
         typeof value.state !== "string" ||
         !MIGRATION_STATES.includes(value.state as MigrationState) ||
@@ -36,19 +36,31 @@ export function parseMigrationStatus(value: unknown): MigrationStatus {
             typeof value.error.code === "string" && typeof value.error.message === "string")) ||
         typeof value.retryable !== "boolean" ||
         !isObject(value.capabilities) ||
-        value.capabilities.apply !== false ||
-        value.capabilities.retry !== false ||
+        typeof value.capabilities.apply !== "boolean" ||
+        typeof value.capabilities.retry !== "boolean" ||
         value.capabilities.restore !== false ||
         !isObject(value.backup) ||
         value.backup.required !== true ||
-        value.backup.complete_restore_ready !== false ||
-        value.backup.status !== "not_ready" ||
-        value.blocker !== "complete_backup_restore_not_ready") {
+        typeof value.backup.complete_restore_ready !== "boolean" ||
+        (value.backup.status !== "created_before_apply" && value.backup.status !== "ready") ||
+        !isObject(value.operation) ||
+        !["idle", "running", "succeeded", "failed"].includes(value.operation.status as string) ||
+        typeof value.operation.message !== "string" ||
+        !isObject(value.action) ||
+        typeof value.action.csrf_token !== "string" ||
+        value.action.csrf_token.length < 20 || value.action.csrf_token.length > 256 ||
+        typeof value.action.confirmation !== "string" ||
+        value.action.confirmation.length > 256 ||
+        (value.capabilities.apply === true && value.state !== "required") ||
+        (value.capabilities.retry === true && (value.state !== "failed" || value.retryable !== true)) ||
+        ((value.capabilities.apply === true || value.capabilities.retry === true) &&
+            value.action.confirmation.length === 0) ||
+        !(value.blocker === null || typeof value.blocker === "string")) {
         throw new Error("Malformed migration status response");
     }
 
     return {
-        schema_version: 1,
+        schema_version: 2,
         mode: "migration_required",
         state: value.state as MigrationState,
         migration_id: value.migration_id as string | null,
@@ -57,9 +69,11 @@ export function parseMigrationStatus(value: unknown): MigrationStatus {
         features: value.features.map(parseFeature),
         error: value.error as MigrationStatus["error"],
         retryable: value.retryable,
-        capabilities: {apply: false, retry: false, restore: false},
-        backup: {required: true, complete_restore_ready: false, status: "not_ready"},
-        blocker: "complete_backup_restore_not_ready"
+        capabilities: value.capabilities as MigrationStatus["capabilities"],
+        backup: value.backup as MigrationStatus["backup"],
+        operation: value.operation as MigrationStatus["operation"],
+        action: value.action as MigrationStatus["action"],
+        blocker: value.blocker as string | null
     };
 }
 
@@ -69,5 +83,16 @@ export class MigrationService {
 
     loadStatus(): Observable<MigrationStatus> {
         return this.http.get<unknown>("/server/migration/v1/status").pipe(map(parseMigrationStatus));
+    }
+
+    apply(status: MigrationStatus): Observable<MigrationStatus> {
+        return this.http.post<unknown>(
+            "/server/migration/v1/apply",
+            {
+                confirmation: status.action.confirmation,
+                retry: status.capabilities.retry
+            },
+            {headers: {"X-SeedSync-Migration-CSRF": status.action.csrf_token}}
+        ).pipe(map(parseMigrationStatus));
     }
 }

@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, ServiceRestart, AppError
 from controller import AutoQueuePattern, AutoQueuePersist
 from migration import MigrationDecision, MigrationState
-from seedsync import Seedsync, _configure_multiprocessing_start_method
+from seedsync import Seedsync, _configure_multiprocessing_start_method, _run_process_loop
 from web.auth_store import ApiKeyStore
 
 
@@ -29,6 +29,19 @@ def _read_history_entries(file_path):
 
 
 class TestSeedsync(unittest.TestCase):
+    def test_process_loop_reconstructs_after_migration_runtime_returns_normally(self):
+        migration_instance = MagicMock()
+        migration_instance.run.return_value = None
+        normal_instance = MagicMock()
+        normal_instance.run.side_effect = ServiceExit()
+        factory = MagicMock(side_effect=[migration_instance, normal_instance])
+
+        _run_process_loop(factory)
+
+        self.assertEqual(2, factory.call_count)
+        migration_instance.run.assert_called_once_with()
+        normal_instance.run.assert_called_once_with()
+
     def test_blocking_migration_constructs_only_migration_runtime(self):
         decision = MigrationDecision(
             state=MigrationState.REQUIRED,
@@ -56,6 +69,7 @@ class TestSeedsync(unittest.TestCase):
             port=9876,
             html_path="/html",
             coordinator=coordinator,
+            allowed_origins=(),
         )
         config_loader.assert_not_called()
         path_pair_manager.assert_not_called()
@@ -184,6 +198,48 @@ class TestSeedsync(unittest.TestCase):
             "--scanfs", "/path/to/scanfs",
         ])
         self.assertIsNone(args.web_bind_host)
+
+    def test_args_migration_allowed_origins_support_cli_and_environment(self):
+        base = [
+            "-c", "/path/to/config", "--html", "/path/to/html",
+            "--scanfs", "/path/to/scanfs",
+        ]
+        with patch.dict(os.environ, {
+            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": "http://seed.local:8800,https://seed.example",
+        }, clear=False):
+            args = Seedsync._parse_args(base)
+        self.assertEqual(
+            ["http://seed.local:8800", "https://seed.example"],
+            args.migration_allowed_origin,
+        )
+        with patch.dict(os.environ, {}, clear=True):
+            args = Seedsync._parse_args(base + [
+                "--migration-allowed-origin", "http://seedbox.example:8800",
+                "--migration-allowed-origin", "https://seedbox.example",
+            ])
+        self.assertEqual(
+            ["http://seedbox.example:8800", "https://seedbox.example"],
+            args.migration_allowed_origin,
+        )
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            Seedsync._parse_args(base + [
+                "--migration-allowed-origin", "http://user@seedbox.example/path",
+            ])
+        with patch.dict(os.environ, {
+            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": "http://seedbox.example,,http://other.example",
+        }, clear=True), self.assertRaises(SystemExit):
+            Seedsync._parse_args(base)
+        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
+            Seedsync._parse_args(base + [
+                "--migration-allowed-origin", "http://seedbox.example",
+                "--migration-allowed-origin", "http://SEEDBOX.example:80",
+            ])
+        with patch.dict(os.environ, {
+            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": (
+                "https://seedbox.example,https://SEEDBOX.example:443"
+            ),
+        }, clear=True), self.assertRaises(SystemExit):
+            Seedsync._parse_args(base)
 
     def test_blocking_migration_defaults_to_loopback_but_explicit_bind_is_preserved(self):
         decision = MigrationDecision(state=MigrationState.REQUIRED)

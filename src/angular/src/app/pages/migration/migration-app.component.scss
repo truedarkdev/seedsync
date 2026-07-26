@@ -29,6 +29,12 @@
     animation: settle-in .32s ease-out both;
 }
 
+@media (min-width: 901px) {
+    .migration-shell--state-stable {
+        min-height: 780px;
+    }
+}
+
 .handoff-panel {
     display: flex;
     flex-direction: column;
@@ -103,6 +109,41 @@ h1 {
     letter-spacing: -.03em;
 }
 
+.status-heading-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.status-heading-row.is-success h1 {
+    color: $logo-color;
+}
+
+.success-mark {
+    width: 29px;
+    height: 29px;
+    flex: 0 0 29px;
+    display: inline-grid;
+    place-items: center;
+    border: 2px solid $logo-color;
+    border-radius: 50%;
+    color: $logo-color;
+    font-size: 17px;
+    font-weight: 800;
+    line-height: 1;
+    animation: success-mark-in .24s ease-out both;
+}
+
+@media (min-width: 901px) {
+    .status-heading-row.is-success .success-mark {
+        position: absolute;
+        top: 50%;
+        left: -35px;
+        margin-top: -14.5px;
+    }
+}
+
 h2 {
     margin: 0;
     color: #223342;
@@ -129,7 +170,7 @@ h2 {
     background: rgba(255, 255, 255, .82);
 }
 
-.migration-route span:not(.route-arrow) {
+.migration-route > span:not(.route-arrow) {
     display: grid;
     gap: 1px;
     min-width: 0;
@@ -147,6 +188,34 @@ h2 {
     overflow-wrap: anywhere;
     color: #244051;
     font-size: 13px;
+}
+
+.migration-route-source strong {
+    color: $logo-color;
+}
+
+.migration-route.is-complete .migration-route-source {
+    opacity: .62;
+}
+
+.migration-route.is-complete .migration-route-source strong {
+    color: #51616b;
+}
+
+.migration-route.is-complete .migration-route-target small,
+.migration-route.is-complete .migration-route-target strong {
+    color: $logo-color;
+}
+
+.migration-route-target strong {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+}
+
+.version-success-mark {
+    flex: 0 0 auto;
 }
 
 .route-arrow {
@@ -230,6 +299,20 @@ h2 {
     color: #687680;
     font-size: 11px;
     line-height: 1.4;
+}
+
+.migration-confirmation {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 10px;
+    color: #45545d;
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.migration-confirmation input {
+    margin-top: 2px;
 }
 
 button {
@@ -554,6 +637,11 @@ button:focus-visible {
     to { opacity: 1; transform: translateX(0); }
 }
 
+@keyframes success-mark-in {
+    from { opacity: 0; transform: scale(.82); }
+    to { opacity: 1; transform: scale(1); }
+}
+
 @media (max-width: 900px) {
     .migration-page {
         place-items: start center;
@@ -562,6 +650,7 @@ button:focus-visible {
 
     .migration-shell {
         grid-template-columns: 1fr;
+        min-height: 0;
     }
 
     .handoff-panel {
@@ -654,7 +743,8 @@ button:focus-visible {
 @media (prefers-reduced-motion: reduce) {
     .migration-shell,
     .spinner,
-    .feature-swap {
+    .feature-swap,
+    .success-mark {
         animation: none;
     }
 

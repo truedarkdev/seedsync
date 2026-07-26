@@ -350,6 +350,16 @@ _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
     "Web": frozenset(("port",)),
     "AutoQueue": frozenset(("enabled", "patterns_only", "auto_extract")),
 }
+
+# Docker/local runtime wrappers add these transport-policy values before the
+# coordinator can inspect an otherwise untouched v0.8.6 settings file. They do
+# not describe the persisted schema and must not erase truthful source identity.
+_PRE_MIGRATION_RUNTIME_GENERAL_KEYS = frozenset((
+    "trusted_browser_bootstrap_remote_addrs",
+    "config_api_redact_remote_details",
+))
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1102,6 +1112,7 @@ def _legacy_v086_fingerprint(config_dir: Path) -> bool:
             actual = set(settings.options(section))
             if section == "General":
                 actual.discard("webhook_secret")
+                actual.difference_update(_PRE_MIGRATION_RUNTIME_GENERAL_KEYS)
             if actual != set(expected):
                 return False
 
@@ -1279,6 +1290,30 @@ class MigrationCoordinator:
     def status(self) -> MigrationDecision:
         """Return the durable preflight decision without constructing normal SeedSync."""
         return self.preflight()
+
+    def retained_backup_ready(self, decision: MigrationDecision | None = None) -> bool:
+        """Report whether the durable receipt names a fully valid retained backup."""
+        decision = decision or self.preflight()
+        spec = self._spec(decision.migration_id)
+        if spec is None:
+            return False
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+        with _root_transaction(self.config_dir, self._root_identity):
+            metadata = self._read_metadata() or {}
+            reference = metadata.get("backup")
+            if not isinstance(reference, str):
+                return False
+            try:
+                backup_dir = self.config_dir / reference
+                validate_backup(backup_dir, self.config_dir)
+                _validate_manifest(backup_dir, self.config_dir, spec)
+            except (BackupRestoreError, OSError, ValueError, json.JSONDecodeError):
+                return False
+            return True
 
     def preflight(self) -> MigrationDecision:
         identity = _capture_root_identity(self.config_dir)

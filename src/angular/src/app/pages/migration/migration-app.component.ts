@@ -100,12 +100,17 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     activeFeatureView: MigrationFeatureSlide[] = [];
     activeFeatureIndex = 0;
     autoAdvanceEnabled = true;
+    migrationConfirmed = false;
+    actionBusy = false;
+    actionError = false;
 
     private featureTimer: number | null = null;
     private featureImageTimer: number | null = null;
     private pathPairOverviewShown = false;
     private reducedMotion = false;
     private motionQuery: MediaQueryList | null = null;
+    private statusPollTimer: number | null = null;
+    private normalStartupTimer: number | null = null;
 
     constructor(private readonly migrationService: MigrationService,
                 private readonly changeDetector: ChangeDetectorRef) {}
@@ -120,26 +125,40 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
 
     ngOnDestroy(): void {
         this.clearFeatureTimer();
+        this.clearStatusPoll();
+        this.clearNormalStartupNavigation();
         this.motionQuery?.removeEventListener("change", this.onMotionPreferenceChange);
     }
 
-    refresh(): void {
+    refresh(polling = false): void {
         this.clearFeatureTimer();
-        this.loading = true;
+        this.clearStatusPoll();
+        this.loading = !polling;
         this.loadError = false;
         this.migrationService.loadStatus().subscribe({
             next: status => {
                 this.status = status;
-                this.featureSlides = this.buildFeatureSlides(status.features);
-                this.activeFeatureIndex = 0;
-                this.activeFeatureView = this.featureSlides.length ? [this.featureSlides[0]] : [];
-                this.pathPairOverviewShown = this.reducedMotion;
+                if (!polling || !this.featureSlides.length) {
+                    this.featureSlides = this.buildFeatureSlides(status.features);
+                    this.activeFeatureIndex = 0;
+                    this.activeFeatureView = this.featureSlides.length ? [this.featureSlides[0]] : [];
+                    this.pathPairOverviewShown = this.reducedMotion;
+                }
                 this.loading = false;
                 this.loadError = false;
                 this.resetFeatureTimer();
+                this.scheduleStatusPoll(status);
                 this.changeDetector.markForCheck();
             },
             error: () => {
+                if (polling && this.status && (
+                    this.status.state === "running" || this.status.operation.status === "running"
+                )) {
+                    this.loading = false;
+                    this.scheduleNormalStartupNavigation(1000);
+                    this.changeDetector.markForCheck();
+                    return;
+                }
                 this.status = null;
                 this.featureSlides = [];
                 this.activeFeatureView = [];
@@ -147,6 +166,67 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
                 this.pathPairOverviewShown = false;
                 this.loading = false;
                 this.loadError = true;
+                this.changeDetector.markForCheck();
+            }
+        });
+    }
+
+    get canStartMigration(): boolean {
+        return !!this.status &&
+            (this.status.capabilities.apply || this.status.capabilities.retry) &&
+            (!this.status.capabilities.apply || this.isConfirmedV086Migration) &&
+            this.migrationConfirmed && !this.actionBusy;
+    }
+
+    get actionLabel(): string {
+        return this.status?.capabilities.retry ? "Retry migration" : "Start migration";
+    }
+
+    get readinessLabel(): string {
+        if (this.status?.backup.complete_restore_ready) {
+            return "Backup ready";
+        }
+        if (this.status?.operation.status === "running") {
+            return "In progress";
+        }
+        return "Ready to start";
+    }
+
+    get readinessHeading(): string {
+        if (this.status?.backup.complete_restore_ready ||
+            this.status?.state === "complete" || this.status?.operation.status === "succeeded") {
+            return "Retained backup ready";
+        }
+        if (this.status?.state === "running" || this.status?.operation.status === "running") {
+            return "Creating and validating retained backup";
+        }
+        return "Complete retained backup before migration";
+    }
+
+    setMigrationConfirmed(confirmed: boolean): void {
+        this.migrationConfirmed = confirmed;
+        this.actionError = false;
+    }
+
+    startMigration(): void {
+        if (!this.status || !this.canStartMigration) {
+            return;
+        }
+        this.actionBusy = true;
+        this.actionError = false;
+        this.clearStatusPoll();
+        this.migrationService.apply(this.status).subscribe({
+            next: status => {
+                this.status = status;
+                this.actionBusy = false;
+                this.migrationConfirmed = false;
+                this.scheduleStatusPoll(status);
+                this.changeDetector.markForCheck();
+            },
+            error: () => {
+                this.actionBusy = false;
+                this.actionError = true;
+                this.scheduleStatusPoll(this.status as MigrationStatus);
                 this.changeDetector.markForCheck();
             }
         });
@@ -161,8 +241,33 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     }
 
     get isConfirmedV086Migration(): boolean {
-        return this.status?.state === "required" &&
+        return this.status?.state === "required" && this.isV086MigrationPath;
+    }
+
+    get isV086MigrationPath(): boolean {
+        return this.status?.migration_id === "original-v0.8.6-to-current-v1" &&
             this.status?.source_schema === "original-v0.8.6";
+    }
+
+    get isMigrationComplete(): boolean {
+        return this.status?.state === "complete";
+    }
+
+    get sourceVersionStateLabel(): string {
+        return this.isMigrationComplete ? "Previous version" : "Detected source";
+    }
+
+    get targetVersionStateLabel(): string {
+        return this.isMigrationComplete ? "Current version" : "Migration target";
+    }
+
+    get versionRouteAriaLabel(): string {
+        if (this.isMigrationComplete) {
+            return `Version transition complete: previous version ${this.sourceVersionLabel}; ` +
+                `current version ${this.targetVersionLabel}.`;
+        }
+        return `Version transition: detected source ${this.sourceVersionLabel}; ` +
+            `migration target ${this.targetVersionLabel}.`;
     }
 
     get targetVersionLabel(): string {
@@ -229,9 +334,9 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
 
     get stateLabel(): string {
         switch (this.status?.state) {
-            case "running": return "Migration state: running";
+            case "running": return "Migration in progress";
             case "failed": return "Migration readiness check failed";
-            case "complete": return "Migration state: complete";
+            case "complete": return "Migration complete";
             case "required":
                 return this.isConfirmedV086Migration ? "Migration required" : "Migration reassessment required";
             default: return "Migration status unavailable";
@@ -241,16 +346,18 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     get stateCopy(): string {
         switch (this.status?.state) {
             case "running":
-                return "A migration was recorded as running. This checkpoint remains read-only while the state is reassessed.";
+                return "SeedSync is creating or validating the retained backup and applying the migration. Normal services remain paused.";
             case "failed":
-                return "SeedSync could not complete the readiness check. No retry or migration operation is available from this page.";
+                return this.status.retryable
+                    ? "The migration stopped safely. The retained backup remains available and you can retry."
+                    : "SeedSync could not complete the readiness check. Migration cannot be retried from this page.";
             case "complete":
-                return "Migration is recorded as complete. Recheck after the SeedSync service returns to normal startup.";
+                return "Migration completed. SeedSync is returning to normal startup and a fresh browser claim.";
             case "required":
                 if (!this.isConfirmedV086Migration) {
                     return "SeedSync could not confirm a supported migration source. No migration operation is available from this page.";
                 }
-                return "SeedSync found configuration from an earlier supported release. Your normal services are paused while migration safety is prepared.";
+                return "SeedSync found configuration from an earlier supported release. Your normal services remain paused until you confirm migration.";
             default:
                 return "SeedSync could not confirm the migration state. No migration operation is available from this page.";
         }
@@ -312,6 +419,42 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     private clearFeatureTimer(): void {
         this.clearFeatureAdvanceTimer();
         this.clearFeatureImageTimer();
+    }
+
+    private scheduleStatusPoll(status: MigrationStatus): void {
+        if (status.state === "complete" || status.operation.status === "succeeded") {
+            this.scheduleNormalStartupNavigation(2000);
+            return;
+        }
+        if (status.state !== "running" && status.operation.status !== "running") {
+            return;
+        }
+        this.statusPollTimer = window.setTimeout(() => {
+            this.statusPollTimer = null;
+            this.refresh(true);
+        }, 1000);
+    }
+
+    private scheduleNormalStartupNavigation(delayMs: number): void {
+        this.clearNormalStartupNavigation();
+        this.normalStartupTimer = window.setTimeout(() => {
+            this.normalStartupTimer = null;
+            window.location.replace("/");
+        }, delayMs);
+    }
+
+    private clearNormalStartupNavigation(): void {
+        if (this.normalStartupTimer !== null) {
+            window.clearTimeout(this.normalStartupTimer);
+            this.normalStartupTimer = null;
+        }
+    }
+
+    private clearStatusPoll(): void {
+        if (this.statusPollTimer !== null) {
+            window.clearTimeout(this.statusPollTimer);
+            this.statusPollTimer = null;
+        }
     }
 
     private clearFeatureImageTimer(): void {
