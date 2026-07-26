@@ -42,6 +42,8 @@ export class FileComponent implements OnChanges {
     @Input() options: ViewFileOptions;
     @Input() isBulkSelected = false;
     @Input() showActions = true;
+    /** Parent-owned action state survives row window unmount/remounts. */
+    @Input() pendingAction: FileAction = null;
 
     @Output() queueEvent = new EventEmitter<ViewFile>();
     @Output() stopEvent = new EventEmitter<ViewFile>();
@@ -60,6 +62,11 @@ export class FileComponent implements OnChanges {
                 private _changeDetector: ChangeDetectorRef) {}
 
     ngOnChanges(changes: SimpleChanges): void {
+        if (changes.pendingAction != null) {
+            this.activeAction = changes.pendingAction.currentValue;
+            this._changeDetector.markForCheck();
+        }
+
         if (changes.file == null) {
             return;
         }
@@ -70,14 +77,14 @@ export class FileComponent implements OnChanges {
             const oldFileKey = oldFile.fileId || oldFile.name;
             const newFileKey = newFile.fileId || newFile.name;
 
-            if (oldFileKey !== newFileKey) {
+            if (oldFileKey !== newFileKey && this.pendingAction == null) {
                 this.resetActiveAction();
-            } else if (oldFile.status !== newFile.status) {
+            } else if (oldFile.status !== newFile.status && this.pendingAction == null) {
                 this.resetActiveAction();
-            } else if (this.activeAction === FileAction.DELETE_REMOTE &&
+            } else if (this.pendingAction == null && this.activeAction === FileAction.DELETE_REMOTE &&
                        oldFile.isRemotelyDeletable && !newFile.isRemotelyDeletable) {
                 this.resetActiveAction();
-            } else if (this.activeAction === FileAction.DELETE_LOCAL &&
+            } else if (this.pendingAction == null && this.activeAction === FileAction.DELETE_LOCAL &&
                        oldFile.isLocallyDeletable && !newFile.isLocallyDeletable) {
                 this.resetActiveAction();
             }

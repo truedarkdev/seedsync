@@ -530,6 +530,64 @@ describe("Testing file component", () => {
         expect(stopButton.getAttribute("aria-disabled")).toBe("true");
     });
 
+    it("should keep an in-flight action locked when the row is unmounted and remounted", () => {
+        const file = createViewFile({
+            fileId: "durable-action",
+            status: ViewFile.Status.DOWNLOADING,
+            isStoppable: true
+        });
+        fixture.componentInstance.file = file;
+        fixture.componentInstance.options = of(null) as any;
+        fixture.componentInstance.showActions = true;
+        fixture.componentInstance.pendingAction = null;
+        const stopSpy = spyOn(fixture.componentInstance.stopEvent, "emit");
+        fixture.detectChanges();
+
+        let stopButton = fixture.nativeElement.querySelector("button.stop-action") as HTMLButtonElement;
+        stopButton.click();
+        expect(stopSpy).toHaveBeenCalledWith(file);
+        fixture.componentInstance.pendingAction = FileAction.STOP;
+        fixture.componentInstance.ngOnChanges({
+            pendingAction: new SimpleChange(null, FileAction.STOP, false)
+        });
+        fixture.detectChanges();
+        expect(stopButton.disabled).toBe(true);
+
+        fixture.destroy();
+        const remountedFixture = TestBed.createComponent(FileComponent);
+        remountedFixture.componentInstance.file = file;
+        remountedFixture.componentInstance.options = of(null) as any;
+        remountedFixture.componentInstance.showActions = true;
+        remountedFixture.componentInstance.pendingAction = FileAction.STOP;
+        remountedFixture.componentInstance.ngOnChanges({
+            file: new SimpleChange(null, file, true),
+            pendingAction: new SimpleChange(null, FileAction.STOP, true)
+        });
+        remountedFixture.detectChanges();
+        expect(remountedFixture.componentInstance.activeAction).toBe(FileAction.STOP);
+        const remountedStopSpy = spyOn(remountedFixture.componentInstance.stopEvent, "emit");
+
+        stopButton = remountedFixture.nativeElement.querySelector("button.stop-action") as HTMLButtonElement;
+        expect(stopButton.disabled).toBe(true);
+        expect(stopButton.classList.contains("loading")).toBe(true);
+        stopButton.click();
+        expect(remountedStopSpy).not.toHaveBeenCalled();
+        expect(remountedFixture.componentInstance.activeAction).toBe(FileAction.STOP);
+
+        remountedFixture.componentInstance.pendingAction = null;
+        remountedFixture.componentInstance.ngOnChanges({
+            pendingAction: new SimpleChange(FileAction.STOP, null, false)
+        });
+        expect(remountedFixture.componentInstance.activeAction).toBeNull();
+        remountedFixture.detectChanges();
+        stopButton = remountedFixture.nativeElement.querySelector("button.stop-action") as HTMLButtonElement;
+        expect(remountedFixture.componentInstance.file.isStoppable).toBe(true);
+        expect(remountedFixture.componentInstance.isStoppable()).toBe(true);
+        expect(stopButton.disabled).toBe(false);
+        expect(stopButton.classList.contains("loading")).toBe(false);
+        remountedFixture.destroy();
+    });
+
     it("should render the action controls as native buttons with the expected disabled states", () => {
         fixture.componentInstance.file = createViewFile({
             isQueueable: true,
