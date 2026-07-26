@@ -167,6 +167,28 @@ class TestMigrationCoordinator(unittest.TestCase):
         for name, content in before.items():
             self.assertEqual(content, (self.root / name).read_bytes())
 
+    def test_pinned_v086_with_runtime_injected_general_keys_remains_selected(self) -> None:
+        fixture = MigrationFixture(self.root)
+        fixture.write(LEGACY_SETTINGS.replace(
+            "[General]\n",
+            "[General]\n"
+            "trusted_browser_bootstrap_remote_addrs = 172.17.0.1\n"
+            "config_api_redact_remote_details = False\n",
+        ))
+        before = self._tree_bytes(self.root)
+
+        coordinator = MigrationCoordinator(self.root)
+        decision = coordinator.status()
+
+        self.assertEqual(MigrationState.REQUIRED, decision.state)
+        self.assertEqual("original-v0.8.6-to-current-v1", decision.migration_id)
+        self.assertEqual("original-v0.8.6", decision.source_schema)
+        self.assertFalse(coordinator.retained_backup_ready(decision))
+        self.assertEqual(decision, coordinator.status())
+        self.assertEqual(before, self._tree_bytes(self.root))
+        self.assertFalse((self.root / "migration-backups").exists())
+        self.assertFalse((self.root / "migration-state.json").exists())
+
     def test_empty_current_and_completed_receipt_are_allowed(self) -> None:
         self.assertEqual(MigrationState.NOT_REQUIRED, MigrationCoordinator(self.root).preflight().state)
 
@@ -268,9 +290,11 @@ class TestMigrationCoordinator(unittest.TestCase):
         coordinator = MigrationCoordinator(self.root)
         coordinator.preflight()
 
+        self.assertFalse(coordinator.retained_backup_ready(coordinator.status()))
         decision = coordinator.apply_confirmed()
 
         self.assertEqual(MigrationState.COMPLETE, decision.state)
+        self.assertTrue(coordinator.retained_backup_ready(decision))
         migrated = Config.from_file(str(self.root / "settings.cfg"))
         self.assertEqual("DEBUG", migrated.general.log_level)
         self.assertEqual("0", migrated.lftp.rate_limit)
@@ -283,6 +307,19 @@ class TestMigrationCoordinator(unittest.TestCase):
         controller = ControllerPersist.from_file(str(self.root / "controller.persist"))
         self.assertEqual(set(fixture.downloaded), controller.downloaded_file_names)
         self.assertEqual(set(fixture.extracted), controller.extracted_file_names)
+        serialized_controller = json.loads((self.root / "controller.persist").read_text(encoding="utf-8"))
+        self.assertEqual(
+            {
+                "downloaded", "extracted", "stopped", "move_failure_counts",
+                "final_move_succeeded",
+            },
+            set(serialized_controller),
+        )
+        self.assertEqual(set(fixture.downloaded), set(serialized_controller["downloaded"]))
+        self.assertEqual(set(fixture.extracted), set(serialized_controller["extracted"]))
+        self.assertEqual([], serialized_controller["stopped"])
+        self.assertEqual({}, serialized_controller["move_failure_counts"])
+        self.assertEqual([], serialized_controller["final_move_succeeded"])
         autoqueue = AutoQueuePersist.from_file(str(self.root / "autoqueue.persist"))
         self.assertEqual({"*.mkv", "archive"}, {pattern.pattern for pattern in autoqueue.patterns})
         self.assertFalse((self.root / "api-keys.json").exists())
@@ -298,6 +335,30 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual(1, receipt["receipt_version"])
         self.assertEqual("seedsync-current-v1", receipt["current_schema"])
         self.assertEqual(["original-v0.8.6-to-current-v1"], receipt["applied_migrations"])
+
+    def test_retained_backup_ready_revalidates_after_prior_ready_result(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        decision = coordinator.apply_confirmed()
+        self.assertTrue(coordinator.retained_backup_ready(decision))
+        metadata = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
+        backup_settings = self.root / metadata["backup"] / "data" / "settings.cfg"
+
+        backup_settings.write_bytes(backup_settings.read_bytes() + b"\ncorrupted=True\n")
+
+        self.assertFalse(coordinator.retained_backup_ready(decision))
+
+    def test_retained_backup_ready_revalidates_after_prior_ready_file_removal(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        decision = coordinator.apply_confirmed()
+        self.assertTrue(coordinator.retained_backup_ready(decision))
+        metadata = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
+        backup_settings = self.root / metadata["backup"] / "data" / "settings.cfg"
+
+        backup_settings.rename(backup_settings.with_suffix(".missing"))
+
+        self.assertFalse(coordinator.retained_backup_ready(decision))
 
     def test_known_legacy_webhook_secret_moves_to_notifications(self) -> None:
         settings = LEGACY_SETTINGS.replace("verbose = False", "verbose = False\nwebhook_secret = signing-secret")

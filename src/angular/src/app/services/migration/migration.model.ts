@@ -7,7 +7,7 @@ export interface MigrationFeature {
 }
 
 export interface MigrationStatus {
-    schema_version: 1;
+    schema_version: 2;
     mode: "migration_required";
     state: MigrationState;
     migration_id: string | null;
@@ -20,14 +20,22 @@ export interface MigrationStatus {
     } | null;
     retryable: boolean;
     capabilities: {
-        apply: false;
-        retry: false;
+        apply: boolean;
+        retry: boolean;
         restore: false;
     };
     backup: {
         required: true;
-        complete_restore_ready: false;
-        status: "not_ready";
+        complete_restore_ready: boolean;
+        status: "created_before_apply" | "ready";
     };
-    blocker: "complete_backup_restore_not_ready";
+    operation: {
+        status: "idle" | "running" | "succeeded" | "failed";
+        message: string;
+    };
+    action: {
+        csrf_token: string;
+        confirmation: string;
+    };
+    blocker: string | null;
 }

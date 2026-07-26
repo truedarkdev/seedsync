@@ -12,7 +12,7 @@ describe("MigrationAppComponent", () => {
     let service: jasmine.SpyObj<MigrationService>;
 
     const status: MigrationStatus = {
-        schema_version: 1,
+        schema_version: 2,
         mode: "migration_required",
         state: "required",
         migration_id: "original-v0.8.6-to-current-v1",
@@ -28,13 +28,15 @@ describe("MigrationAppComponent", () => {
         ],
         error: null,
         retryable: false,
-        capabilities: {apply: false, retry: false, restore: false},
-        backup: {required: true, complete_restore_ready: false, status: "not_ready"},
-        blocker: "complete_backup_restore_not_ready"
+        capabilities: {apply: true, retry: false, restore: false},
+        backup: {required: true, complete_restore_ready: false, status: "created_before_apply"},
+        operation: {status: "idle", message: "Ready to migrate."},
+        action: {csrf_token: "csrf-proof-0123456789-0123456789", confirmation: "MIGRATE original-v0.8.6-to-current-v1"},
+        blocker: null
     };
 
     beforeEach(() => {
-        service = jasmine.createSpyObj<MigrationService>("MigrationService", ["loadStatus"]);
+        service = jasmine.createSpyObj<MigrationService>("MigrationService", ["loadStatus", "apply"]);
         TestBed.configureTestingModule({
             imports: [MigrationAppComponent],
             providers: [{provide: MigrationService, useValue: service}]
@@ -46,7 +48,7 @@ describe("MigrationAppComponent", () => {
         fixture.detectChanges();
     }
 
-    it("renders an asynchronously fetched required state and disabled migration action", async () => {
+    it("renders an asynchronously fetched required state and confirmation-gated migration action", async () => {
         const response = new Subject<MigrationStatus>();
         service.loadStatus.and.returnValue(response.asObservable());
         createComponent();
@@ -59,11 +61,13 @@ describe("MigrationAppComponent", () => {
 
         const text = fixture.nativeElement.textContent;
         const startButton: HTMLButtonElement = fixture.nativeElement.querySelector(".primary-button");
+        expect(text).toContain("Migration required");
+        expect(text).not.toContain("Migration state: required");
         expect(text).toContain("v0.8.6");
         expect(text).toContain("v0.9.0");
         expect(text).not.toContain("original-v0.8.6");
-        expect(text).toContain("Complete backup and restore required");
-        expect(text).toContain("This build does not provide that capability yet");
+        expect(text).toContain("Complete retained backup before migration");
+        expect(text).toContain("will create, fsync, and validate a complete retained backup");
         expect(startButton.disabled).toBeTrue();
         expect(fixture.nativeElement.querySelector("app-sidebar")).toBeNull();
         expect(fixture.nativeElement.querySelector(".feature-copy h2").textContent).toContain("Sync more than one folder");
@@ -108,20 +112,49 @@ describe("MigrationAppComponent", () => {
         expect(fixture.nativeElement.querySelector(".secondary-button").textContent).toContain("Recheck status");
     });
 
-    it("renders failed state without enabling retry", () => {
+    it("requires confirmation, submits the guarded action, and enters running polling state", () => {
+        service.loadStatus.and.returnValue(of(status));
+        service.apply.and.returnValue(of({
+            ...status,
+            state: "running",
+            capabilities: {apply: false, retry: false, restore: false},
+            operation: {status: "running", message: "Migration running."},
+            blocker: "migration_running"
+        }));
+        createComponent();
+
+        const checkbox: HTMLInputElement = fixture.nativeElement.querySelector(".migration-confirmation input");
+        const button: HTMLButtonElement = fixture.nativeElement.querySelector(".primary-button");
+        expect(button.disabled).toBeTrue();
+        checkbox.checked = true;
+        checkbox.dispatchEvent(new Event("change"));
+        fixture.detectChanges();
+        expect(button.disabled).toBeFalse();
+        button.click();
+        fixture.detectChanges();
+
+        expect(service.apply).toHaveBeenCalledWith(status);
+        expect(fixture.componentInstance.status?.operation.status).toBe("running");
+        expect(fixture.nativeElement.textContent).toContain("Migration running");
+        fixture.destroy();
+    });
+
+    it("renders retryable failure with confirmation-gated retry", () => {
         service.loadStatus.and.returnValue(of({
             ...status,
             state: "failed",
             retryable: true,
+            capabilities: {apply: false, retry: true, restore: false},
+            operation: {status: "failed", message: "Stopped safely."},
             error: {code: "migration_preflight_failed", message: "Readiness check failed."}
         }));
         createComponent();
 
         expect(fixture.nativeElement.textContent).toContain("Migration readiness check failed");
-        expect(fixture.nativeElement.textContent).toContain("No retry or migration operation is available");
-        expect(fixture.nativeElement.textContent).not.toContain("v0.8.6");
-        expect(fixture.nativeElement.querySelector(".migration-route")).toBeNull();
-        expect(fixture.nativeElement.querySelector(".primary-button")).toBeNull();
+        expect(fixture.nativeElement.textContent).toContain("retained backup remains available");
+        expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.8.6");
+        expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.9.0");
+        expect(fixture.nativeElement.querySelector(".primary-button").textContent).toContain("Retry migration");
     });
 
     it("does not claim the v0.8.6 route for an unrecognized required source", () => {
@@ -135,14 +168,93 @@ describe("MigrationAppComponent", () => {
         expect(fixture.nativeElement.querySelector(".primary-button")).toBeNull();
     });
 
-    it("renders running and complete states as recheck-only", () => {
+    it("renders polished running and complete states with state-appropriate backup copy", () => {
         for (const stateName of ["running", "complete"] as const) {
-            service.loadStatus.and.returnValue(of({...status, state: stateName}));
+            service.loadStatus.and.returnValue(of({
+                ...status,
+                state: stateName,
+                capabilities: {apply: false, retry: false, restore: false},
+                operation: {
+                    status: stateName === "running" ? "running" : "succeeded",
+                    message: stateName
+                }
+            }));
             createComponent();
 
-            expect(fixture.nativeElement.textContent).toContain(`Migration state: ${stateName}`);
+            const text = fixture.nativeElement.textContent;
+            if (stateName === "running") {
+                expect(text).toContain("Migration in progress");
+                expect(text).toContain("Creating and validating retained backup");
+                expect(text).not.toContain("Migration state: running");
+            } else {
+                expect(text).toContain("Migration complete");
+                expect(text).toContain("Retained backup ready");
+                expect(text).not.toContain("Migration state: complete");
+                expect(text).not.toContain("Complete retained backup before migration");
+            }
+            const route: HTMLElement = fixture.nativeElement.querySelector(".migration-route");
+            expect(route.textContent).toContain("v0.8.6");
+            expect(route.textContent).toContain("v0.9.0");
             expect(fixture.nativeElement.querySelector(".primary-button")).toBeNull();
             expect(fixture.nativeElement.querySelector(".secondary-button").textContent).toContain("Recheck status");
+            fixture.destroy();
+        }
+    });
+
+    it("keeps the version transition and stable shell contract across migration states", () => {
+        for (const stateName of ["required", "running", "failed", "complete"] as const) {
+            service.loadStatus.and.returnValue(of({
+                ...status,
+                state: stateName,
+                capabilities: stateName === "required"
+                    ? status.capabilities
+                    : {apply: false, retry: stateName === "failed", restore: false},
+                operation: {
+                    status: stateName === "required" ? "idle"
+                        : stateName === "complete" ? "succeeded" : stateName,
+                    message: stateName
+                }
+            }));
+            createComponent();
+
+            const shell: HTMLElement = fixture.nativeElement.querySelector(".migration-shell");
+            const route: HTMLElement = fixture.nativeElement.querySelector(".migration-route");
+            const source: HTMLElement = route.querySelector(".migration-route-source");
+            const target: HTMLElement = route.querySelector(".migration-route-target");
+            expect(shell.classList).toContain("migration-shell--state-stable");
+            expect(route).not.toBeNull();
+            expect(route.textContent).toContain("v0.8.6");
+            expect(route.textContent).toContain("v0.9.0");
+            if (stateName === "complete") {
+                expect(route.classList).toContain("is-complete");
+                expect(route.getAttribute("aria-label")).toBe(
+                    "Version transition complete: previous version v0.8.6; current version v0.9.0."
+                );
+                expect(source.querySelector("small").textContent).toBe("Previous version");
+                expect(target.querySelector("small").textContent).toBe("Current version");
+                const versionSuccessMark: HTMLElement = target.querySelector("strong > .version-success-mark");
+                expect(versionSuccessMark).not.toBeNull();
+                expect(versionSuccessMark.getAttribute("aria-hidden")).toBe("true");
+                expect(target.querySelector("strong > .version-value").textContent).toBe("v0.9.0");
+                expect(target.querySelector("strong").textContent).toContain("✓v0.9.0");
+                const successMark: HTMLElement = fixture.nativeElement.querySelector(".success-mark");
+                expect(successMark.getAttribute("role")).toBe("img");
+                expect(successMark.getAttribute("aria-label")).toBe("Migration succeeded");
+                expect(fixture.nativeElement.querySelector(".status-heading-row").classList)
+                    .toContain("is-success");
+            } else {
+                expect(route.classList).not.toContain("is-complete");
+                expect(route.getAttribute("aria-label")).toBe(
+                    "Version transition: detected source v0.8.6; migration target v0.9.0."
+                );
+                expect(source.querySelector("small").textContent).toBe("Detected source");
+                expect(target.querySelector("small").textContent).toBe("Migration target");
+                expect(target.querySelector("strong > .version-success-mark")).toBeNull();
+                expect(target.querySelector("strong > .version-value").textContent).toBe("v0.9.0");
+                expect(fixture.nativeElement.querySelector(".success-mark")).toBeNull();
+                expect(fixture.nativeElement.querySelector(".status-heading-row").classList)
+                    .not.toContain("is-success");
+            }
             fixture.destroy();
         }
     });
