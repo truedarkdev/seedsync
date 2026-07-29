@@ -601,6 +601,28 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertIn("await classifyRecoveredFirstClaimSseTransition();", browser)
         self.assertLess(browser.index("async function establishPreRestartStability"), browser.index("async function waitForRestartRequest"))
 
+    def test_first_claim_sse_recovery_is_cached_before_late_stability_request(self):
+        browser = BROWSER_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "let firstClaimSseRecoveryPromise = null",
+            "let validatedFirstClaimSseRecovery = null",
+            "let firstClaimSseRecoveryFailure = null",
+            "void classifyRecoveredFirstClaimSseTransition();",
+            "async function observeFirstClaimSseRecovery()",
+            "const deadline = error.observedAfterMs + sseReconnectMaximumMs",
+            "claimClassification,",
+            "claimPhase,",
+            "error.claimPhase === 'post-claim-complete'",
+            "errorGeneration: browserErrorGeneration",
+            "validatedFirstClaimSseRecovery = validated",
+            "if (matching.length === 1 || firstClaimSseRecoveryPromise || validatedFirstClaimSseRecovery)",
+            "validatedFirstClaimSseRecovery.errorGeneration !== browserErrorGeneration",
+        ):
+            self.assertIn(marker, browser)
+        self.assertLess(browser.index("void classifyRecoveredFirstClaimSseTransition();"), browser.index("async function establishPreRestartStability"))
+        self.assertLess(browser.index("validatedFirstClaimSseRecovery = validated"), browser.index("async function establishPreRestartStability"))
+        self.assertIn("firstClaimSseRecoveryFailure || runtimeErrors.length || diagnosticFailures.length", browser)
+
     def test_browser_stability_handshake_is_run_bound_and_precedes_restart_request(self):
         browser = BROWSER_PATH.read_text(encoding="utf-8")
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
