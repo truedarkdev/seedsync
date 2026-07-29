@@ -1311,23 +1311,26 @@ def assert_browser_evidence(source: Path, output: Path, *, reuse: bool = False) 
             or any(type(post.get(key)) is not int for key in post_required if key not in {"classification", "phaseBoundary"})
             or post["clusterMaximumEvents"] != 4 or post["clusterMaximumMs"] != 5000
             or post["firstGeneration"] < transition["lastGeneration"] or post["lastGeneration"] < post["firstGeneration"]
-            or not isinstance(boundary, dict) or set(boundary) != {"errorGeneration", "observedAfterMs", "observedAtEpochMs"}
-            or any(type(boundary.get(key)) is not int for key in boundary) or boundary["errorGeneration"] != transition["lastGeneration"]
+            or not isinstance(boundary, dict) or set(boundary) != {"kind", "errorGeneration", "observedAfterMs", "observedAtEpochMs"}
+            or boundary.get("kind") != "pre-reuse-action-start"
+            or any(type(boundary.get(key)) is not int for key in ("errorGeneration", "observedAfterMs", "observedAtEpochMs")) or boundary["errorGeneration"] != transition["lastGeneration"]
+            or not isinstance(quiet, dict) or type(quiet.get("observedAfterMs")) is not int or type(quiet.get("observedAtEpochMs")) is not int
+            or any(type(post.get(key)) is not int for key in ("recoveryStatus", "recoveryObservedAfterMs", "modelRows", "modelObservedAfterMs"))
+            or post.get("recoveryOrigin") != proof["origin"] or post.get("recoveryPathname") != "/server/stream" or post["recoveryStatus"] != 200 or post["modelRows"] <= 0
+            or post["recoveryObservedAfterMs"] <= boundary["observedAfterMs"] or post["modelObservedAfterMs"] < post["recoveryObservedAfterMs"]
+            or not {"post-reuse-convergence-status", "post-reuse-convergence-settings"}.issubset(api)
+            or any(type(api[label].get("observedAfterMs")) is not int or type(api[label].get("observedAtEpochMs")) is not int or api[label]["observedAfterMs"] < post["modelObservedAfterMs"] or api[label]["observedAfterMs"] > quiet.get("observedAfterMs", -1) or api[label]["observedAtEpochMs"] < boundary["observedAtEpochMs"] or api[label]["observedAtEpochMs"] > quiet.get("observedAtEpochMs", -1) for label in ("post-reuse-convergence-status", "post-reuse-convergence-settings"))
             or (clean and (post["totalCount"] != 0 or post["firstGeneration"] != transition["lastGeneration"] or post["lastGeneration"] != transition["lastGeneration"]))
             or (not clean and (
                 post.get("classification") != "expected-bounded-post-reuse-sse-convergence"
                 or not 1 <= post["totalCount"] <= 4
                 or post["firstGeneration"] != transition["lastGeneration"] + 1
                 or post["lastGeneration"] - post["firstGeneration"] + 1 != post["totalCount"]
-                or any(type(post.get(key)) is not int for key in ("firstObservedAfterMs", "lastObservedAfterMs", "recoveryStatus", "recoveryObservedAfterMs", "modelRows"))
-                or any(type(post.get(key)) is not int for key in ("modelObservedAfterMs",))
+                or any(type(post.get(key)) is not int for key in ("firstObservedAfterMs", "lastObservedAfterMs"))
                 or post["firstObservedAfterMs"] <= boundary["observedAfterMs"] or post["recoveryObservedAfterMs"] <= boundary["observedAfterMs"] or post["modelObservedAfterMs"] <= boundary["observedAfterMs"]
+                or post["lastObservedAfterMs"] >= post["recoveryObservedAfterMs"]
                 or post["lastObservedAfterMs"] < post["firstObservedAfterMs"]
                 or post["lastObservedAfterMs"] - post["firstObservedAfterMs"] > post["clusterMaximumMs"]
-                or post["recoveryStatus"] != 200 or post["modelRows"] <= 0
-                or post.get("recoveryOrigin") != proof["origin"] or post.get("recoveryPathname") != "/server/stream"
-                or not {"post-reuse-convergence-status", "post-reuse-convergence-settings"}.issubset(api)
-                or any(api[label].get("observedAfterMs", -1) <= boundary["observedAfterMs"] or api[label].get("observedAtEpochMs", -1) <= boundary["observedAtEpochMs"] for label in ("post-reuse-convergence-status", "post-reuse-convergence-settings"))
             ))
             or quiet["errorGeneration"] != post["lastGeneration"] or type(quiet.get("observedAfterMs")) is not int or type(quiet.get("observedAtEpochMs")) is not int or quiet["observedAfterMs"] <= boundary["observedAfterMs"] or quiet["observedAtEpochMs"] <= boundary["observedAtEpochMs"]
         ):

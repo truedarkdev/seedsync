@@ -1104,9 +1104,22 @@ async function finalizePostReuseConvergence(stability, arm, boundary) {
     await writeRestartInvalidation('post-reuse-convergence-window-exceeded', stability, arm);
     throw new Error('post-reuse convergence exceeded its time window');
   }
+  const recovery = streamConnections.find(connection => connection.origin === arm.origin
+    && connection.pathname === '/server/stream' && connection.status === 200
+    && connection.contentType === 'text/event-stream' && connection.observedAfterMs > boundary.observedAfterMs);
+  if (!recovery) {
+    await writeRestartInvalidation('post-reuse-convergence-missing-clean-recovery', stability, arm);
+    throw new Error('clean post-reuse convergence did not observe a post-boundary stream recovery');
+  }
+  const modelRows = await requireFreshStabilityModel(15000);
+  const modelObservedAfterMs = Date.now() - browserStartedAt;
+  await requireApi('post-reuse-convergence-status', '/server/status');
+  await requireApi('post-reuse-convergence-settings', '/server/config/get');
   const transition = { kind: 'post-reuse-sse-convergence', classification: 'clean-post-reuse-convergence', totalCount: 0,
     firstGeneration: arm.restart_transport.lastGeneration, lastGeneration: arm.restart_transport.lastGeneration,
-    clusterMaximumEvents: postReuseClusterMaximumEvents, clusterMaximumMs: postReuseClusterMaximumMs, phaseBoundary: boundary };
+    clusterMaximumEvents: postReuseClusterMaximumEvents, clusterMaximumMs: postReuseClusterMaximumMs,
+    recoveryOrigin: recovery.origin, recoveryPathname: recovery.pathname, recoveryStatus: recovery.status,
+    recoveryObservedAfterMs: recovery.observedAfterMs, modelRows, modelObservedAfterMs, phaseBoundary: boundary };
   streamTransitionEvidence.push(transition); expectedTransitions.push(transition);
   return transition;
 }
@@ -1220,9 +1233,9 @@ async function main() {
     const arm = await waitForRestartArm(stability);
     await waitForRestartStopDispatch(stability, arm);
     await waitForRestartRequest(stability, arm);
+    const postReuseBoundary = { kind: 'pre-reuse-action-start', errorGeneration: browserErrorGeneration,
+      observedAfterMs: Date.now() - browserStartedAt, observedAtEpochMs: Date.now() };
     const reuse = await runReuse();
-    const postReuseBoundary = { errorGeneration: browserErrorGeneration, observedAfterMs: Date.now() - browserStartedAt,
-      observedAtEpochMs: Date.now() };
     const postReuseConvergence = await finalizePostReuseConvergence(stability, arm, postReuseBoundary);
     const postReuseQuiet = await waitForPostReuseQuiet(stability, arm, postReuseBoundary);
     await flushBrowserDiagnostics();
