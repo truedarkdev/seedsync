@@ -557,6 +557,38 @@ class ShipReadinessTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "browser/API evidence has errors"):
                         HARNESS.assert_browser_evidence(source, output)
 
+    def test_browser_first_claim_evidence_requires_real_api_status_observations(self):
+        browser = BROWSER_PATH.read_text(encoding="utf-8")
+        self.assertIn("const apiEvidence = {}", browser)
+        self.assertIn("apiEvidence[label] =", browser)
+        self.assertIn("const mergedApiEvidence", browser)
+        self.assertIn("await writeEvidence({ browserStability: ready }, 'browser-stability.json');", browser)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "browser.json", root / "contract.json"
+            baseline = {
+                "errors": [], "runtimeErrors": [], "diagnosticFailures": [],
+                "api": {
+                    "after-first-claim": {"endpoint": "/server/status", "status": 200, "readiness": "API HTTP 200"},
+                    "settings": {"endpoint": "/server/config/get", "status": 200, "readiness": "API HTTP 200"},
+                },
+                "visibleFixtureRows": {"fixture": True}, "claimButtonCount": 1,
+                "actions": {"queue:fixture": 200},
+            }
+            source.write_text(json.dumps(baseline), encoding="utf-8")
+            HARNESS.assert_browser_evidence(source, output)
+            invalid_payloads = [("absent", {key: value for key, value in baseline.items() if key != "api"})]
+            invalid_payloads.extend((str(invalid_api), {**baseline, "api": invalid_api}) for invalid_api in (
+                None, [], {},
+                {"settings": {"endpoint": "/server/config/get", "status": 503}},
+                {"fake-null": None}, {"fake-string": "status"}, {"fake-list": []},
+            ))
+            for label, payload in invalid_payloads:
+                source.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(api=label):
+                    with self.assertRaisesRegex(ValueError, "browser/API evidence has errors"):
+                        HARNESS.assert_browser_evidence(source, output)
+
     def test_browser_harness_captures_event_metadata_synchronously_and_safely(self):
         browser = BROWSER_PATH.read_text(encoding="utf-8")
         self.assertIn("captureBrowserDiagnostic('console-error'", browser)
