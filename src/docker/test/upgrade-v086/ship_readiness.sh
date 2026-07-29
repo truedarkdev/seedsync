@@ -222,13 +222,21 @@ browser_claim_reuse_worker() {
   trap request_browser_worker_shutdown USR1 HUP INT TERM
   if [[ "${SEEDSYNC_BROWSER_SESSION_PROBE:-}" == stubborn ]]; then
     printf '%s\n' "$BASHPID" > "$evidence/browser-session-probe-worker.pid"
-    bash -s -- "$raw_log" "$profile_dir" "$evidence/browser-session-probe-descendant.pid" <<'SH' & node_pid="$!"
-raw_log="$1"; profile_dir="$2"; descendant_file="$3"
+    bash -s -- "$raw_log" "$profile_dir" "$evidence/browser-session-probe-descendant.pid" "${SEEDSYNC_BROWSER_SESSION_PROBE_CONTINUE_FILE:-}" <<'SH' & node_pid="$!"
+raw_log="$1"; profile_dir="$2"; descendant_file="$3"; continue_file="$4"
 mkdir -p -- "$profile_dir"
 printf 'api_key=browser-session-probe-secret\n' > "$raw_log"
 bash -c 'trap "" TERM; sleep 30' & descendant="$!"
 printf '%s\n' "$descendant" > "$descendant_file"
-sleep .5
+# The parent self-check releases this probe only after both recorded identities
+# pass strict same-session/process-group validation.  This keeps the probe
+# membership snapshot live instead of racing a short fixed worker lifetime.
+if [[ -n "$continue_file" ]]; then
+  for (( attempt = 0; attempt < 120; attempt++ )); do
+    [[ -e "$continue_file" ]] && break
+    sleep .05
+  done
+fi
 SH
   else
     NODE_PATH="$node_path" SEEDSYNC_PLAYWRIGHT_MODULE=playwright SEEDSYNC_SHIP_EVIDENCE_HELPER="$HELPER" SEEDSYNC_SHIP_RUN_ID="$SEEDSYNC_SHIP_RUN_ID" SEEDSYNC_SHIP_PRIVATE_SCREENSHOT_ROOT="${SEEDSYNC_SHIP_PRIVATE_SCREENSHOT_ROOT:-}" SEEDSYNC_BROWSER_PROFILE_DIR="$profile_dir" SEEDSYNC_BROWSER_HANDOVER_RECOVERY=1 "$node_bin" "$BROWSER" "$base" "$evidence" claim-reuse > "$raw_log" 2>&1 & node_pid="$!"
@@ -560,10 +568,12 @@ browser_session_temp_cleanup_self_check() {
 browser_parent_cleanup_self_check() {
   local evidence raw_dir profile_dir child descendant unrelated hint_dir failed_evidence failed_raw failed_profile normal_evidence normal_raw normal_profile normal_child normal_descendant normal_started normal_status crash_evidence crash_raw crash_profile crash_child crash_descendant signal_dir signal_profile signal_evidence signal_child signal_descendant
   launch_browser_supervisor_probe() {
-    local probe_raw="$1" probe_profile="$2" probe_evidence="$3" redactor_mode="$4" attempt worker_probe descendant_probe identity
+    local probe_raw="$1" probe_profile="$2" probe_evidence="$3" redactor_mode="$4" attempt worker_probe descendant_probe identity probe_continue
     BROWSER_SESSION_RAW_DIR="$probe_raw"; BROWSER_SESSION_PROFILE_DIR="$probe_profile"; BROWSER_SESSION_EVIDENCE="$probe_evidence"
     BROWSER_SESSION_REAPED=0
-    setsid env SEEDSYNC_BROWSER_SESSION_PROBE=stubborn SEEDSYNC_BROWSER_SESSION_REDACTOR_FAIL="$redactor_mode" "$BASH" "$SCRIPT_DIR/ship_readiness.sh" browser-claim-supervisor probe "$probe_evidence" "$probe_raw" "$probe_raw/raw.log" "$probe_profile" ignored ignored &
+    probe_continue="$probe_evidence/browser-session-probe-continue"
+    rm -f -- "$probe_continue"
+    setsid env SEEDSYNC_BROWSER_SESSION_PROBE=stubborn SEEDSYNC_BROWSER_SESSION_PROBE_CONTINUE_FILE="$probe_continue" SEEDSYNC_BROWSER_SESSION_REDACTOR_FAIL="$redactor_mode" "$BASH" "$SCRIPT_DIR/ship_readiness.sh" browser-claim-supervisor probe "$probe_evidence" "$probe_raw" "$probe_raw/raw.log" "$probe_profile" ignored ignored &
     BROWSER_SESSION_PID="$!"
     BROWSER_SESSION_START_TIME="$(python "$HELPER" proc-start-time --pid "$BROWSER_SESSION_PID" 2>/dev/null || true)"
     for (( attempt = 0; attempt < 80; attempt++ )); do
@@ -575,6 +585,8 @@ browser_parent_cleanup_self_check() {
       [[ "$identity" =~ ^[1-9][0-9]*$ ]] || die "browser-session supervisor cleanup probe did not establish a verified supervisor"
       python "$HELPER" session-member-status --same-process-group --leader "$BROWSER_SESSION_PID" --pid "$identity" >/dev/null 2>&1 || die "browser-session probe child escaped the supervisor session"
     done
+    # Let the probe worker finish only after the strict membership snapshot.
+    printf '%s\n' ready > "$probe_continue"
   }
   evidence="$(mktemp -d /tmp/seedsync-browser-parent-evidence.XXXXXX)"
   raw_dir="$(mktemp -d /tmp/seedsync-browser-session.parent.XXXXXX)"
@@ -605,7 +617,7 @@ if any(payload.get(key) != value for key, value in expected.items()) or type(pay
     raise SystemExit("browser-session early failure diagnostic is incomplete")
 PY
   ! grep -F -q -- 'browser-session-probe-secret' "$evidence/browser-session-failure.json" || die "browser-session early failure diagnostic retained a secret"
-  rm -f -- "$hint_dir/sentinel"; rmdir -- "$hint_dir"; rm -f -- "$evidence/browser-session.pid" "$evidence/browser-session-probe-descendant.pid" "$evidence/browser-session-probe-worker.pid" "$evidence/browser-session.log" "$evidence/browser-session-failure.json" "$evidence/forged-completion"; rmdir -- "$evidence"
+  rm -f -- "$hint_dir/sentinel"; rmdir -- "$hint_dir"; rm -f -- "$evidence/browser-session.pid" "$evidence/browser-session-probe-descendant.pid" "$evidence/browser-session-probe-worker.pid" "$evidence/browser-session-probe-continue" "$evidence/browser-session.log" "$evidence/browser-session-failure.json" "$evidence/forged-completion"; rmdir -- "$evidence"
   cleanup_browser_claim_reuse
   normal_evidence="$(mktemp -d /tmp/seedsync-browser-parent-normal-evidence.XXXXXX)"
   normal_raw="$(mktemp -d /tmp/seedsync-browser-session.parent-normal.XXXXXX)"; normal_profile="$normal_raw/browser-profile"
@@ -620,7 +632,7 @@ PY
   kill -0 "$normal_descendant" 2>/dev/null && die "normal completion deadline left browser descendant running"
   [[ ! -e "$normal_raw" ]] || die "normal completion deadline left raw browser workspace"
   [[ -s "$normal_evidence/browser-session.log" ]] || die "normal completion deadline did not publish redacted diagnostics"
-  rm -f -- "$normal_evidence/browser-session-probe-descendant.pid" "$normal_evidence/browser-session-probe-worker.pid" "$normal_evidence/browser-session.log" "$normal_evidence/browser-session-failure.json" "$normal_evidence/forged-completion"; rmdir -- "$normal_evidence"
+  rm -f -- "$normal_evidence/browser-session-probe-descendant.pid" "$normal_evidence/browser-session-probe-worker.pid" "$normal_evidence/browser-session-probe-continue" "$normal_evidence/browser-session.log" "$normal_evidence/browser-session-failure.json" "$normal_evidence/forged-completion"; rmdir -- "$normal_evidence"
   cleanup_browser_claim_reuse
   crash_evidence="$(mktemp -d /tmp/seedsync-browser-parent-crash-evidence.XXXXXX)"
   crash_raw="$(mktemp -d /tmp/seedsync-browser-session.parent-crash.XXXXXX)"; crash_profile="$crash_raw/browser-profile"
@@ -633,7 +645,7 @@ PY
   for (( attempt = 0; attempt < 120; attempt++ )); do kill -0 "$crash_descendant" 2>/dev/null || break; sleep .05; done
   BROWSER_SESSION_REAPED=1
   cleanup_browser_session_workspace "$crash_raw" "$crash_raw/raw.log" "$crash_profile" "$crash_evidence" || die "supervisor-crash self-check could not remove its exact protected workspace"
-  rm -f -- "$crash_evidence/browser-session-probe-descendant.pid" "$crash_evidence/browser-session-probe-worker.pid" "$crash_evidence/browser-session.log"; rmdir -- "$crash_evidence"
+  rm -f -- "$crash_evidence/browser-session-probe-descendant.pid" "$crash_evidence/browser-session-probe-worker.pid" "$crash_evidence/browser-session-probe-continue" "$crash_evidence/browser-session.log"; rmdir -- "$crash_evidence"
   failed_evidence="$(mktemp -d /tmp/seedsync-browser-parent-redactor-failed-evidence.XXXXXX)"
   failed_raw="$(mktemp -d /tmp/seedsync-browser-session.parent-redactor-failed.XXXXXX)"; failed_profile="$failed_raw/browser-profile"
   launch_browser_supervisor_probe "$failed_raw" "$failed_profile" "$failed_evidence" 1
@@ -641,7 +653,7 @@ PY
   [[ ! -e "$failed_raw" ]] || die "redactor-failure cleanup left raw browser workspace"
   grep -F -q -- '"status":"redaction-failed"' "$failed_evidence/browser-session.log" || die "redactor-failure cleanup did not publish fixed safe marker"
   ! grep -F -q -- 'browser-session-probe-secret' "$failed_evidence/browser-session.log" || die "redactor-failure cleanup retained raw browser diagnostics"
-  rm -f -- "$failed_evidence/browser-session-probe-descendant.pid" "$failed_evidence/browser-session-probe-worker.pid" "$failed_evidence/browser-session.log" "$failed_evidence/browser-session-failure.json"; rmdir -- "$failed_evidence"
+  rm -f -- "$failed_evidence/browser-session-probe-descendant.pid" "$failed_evidence/browser-session-probe-worker.pid" "$failed_evidence/browser-session-probe-continue" "$failed_evidence/browser-session.log" "$failed_evidence/browser-session-failure.json"; rmdir -- "$failed_evidence"
   signal_dir="$(mktemp -d /tmp/seedsync-browser-session.parent-signal.XXXXXX)"
   signal_profile="$signal_dir/browser-profile"
   signal_evidence="$(mktemp -d /tmp/seedsync-browser-parent-signal-evidence.XXXXXX)"
@@ -659,7 +671,7 @@ PY
   [[ ! -e "$signal_dir" ]] || die "parent signal cleanup left raw workspace: $signal_dir"
   [[ -s "$signal_evidence/browser-session.log" ]] || die "parent signal cleanup did not publish redacted browser diagnostics"
   ! grep -F -q -- 'browser-session-probe-secret' "$signal_evidence/browser-session.log" || die "parent signal cleanup retained raw browser diagnostics"
-  rm -f -- "$signal_evidence/leader.pid" "$signal_evidence/browser-session-probe-descendant.pid" "$signal_evidence/browser-session-probe-worker.pid" "$signal_evidence/browser-session.log" "$signal_evidence/browser-session-failure.json"; rmdir -- "$signal_evidence"
+  rm -f -- "$signal_evidence/leader.pid" "$signal_evidence/browser-session-probe-descendant.pid" "$signal_evidence/browser-session-probe-worker.pid" "$signal_evidence/browser-session-probe-continue" "$signal_evidence/browser-session.log" "$signal_evidence/browser-session-failure.json"; rmdir -- "$signal_evidence"
 }
 fresh_repo_shell() {
   # Do not trust the caller's cwd: the WSL lab can clean a previous directory.
