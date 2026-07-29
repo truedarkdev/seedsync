@@ -617,7 +617,9 @@ class ShipReadinessTests(unittest.TestCase):
                 "kind": "post-reuse-sse-convergence", "classification": "clean-post-reuse-convergence",
                 "totalCount": 0, "firstGeneration": 6, "lastGeneration": 6,
                 "clusterMaximumEvents": 4, "clusterMaximumMs": 5000,
-                "phaseBoundary": {"errorGeneration": 6, "observedAfterMs": 58000, "observedAtEpochMs": 1700000001000},
+                "phaseBoundary": {"kind": "pre-reuse-action-start", "errorGeneration": 6, "observedAfterMs": 58000, "observedAtEpochMs": 1700000001000},
+                "recoveryOrigin": "http://127.0.0.1:18820", "recoveryPathname": "/server/stream", "recoveryStatus": 200,
+                "recoveryObservedAfterMs": 59000, "modelRows": 4, "modelObservedAfterMs": 59000,
             }
             baseline = {
                 "errors": [], "runtimeErrors": [], "diagnosticFailures": [],
@@ -625,7 +627,7 @@ class ShipReadinessTests(unittest.TestCase):
                     {"connectionId": 0, "origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "status": 502, "contentType": "other", "observedAfterMs": 49911},
                     {"connectionId": 1, "origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "status": 502, "contentType": "other", "observedAfterMs": 50200},
                 ],
-                "api": {"restart-status": {"status": 200}, "restart-settings": {"status": 200}},
+                "api": {"restart-status": {"status": 200}, "restart-settings": {"status": 200}, "post-reuse-convergence-status": {"status": 200, "observedAfterMs": 59001, "observedAtEpochMs": 1700000001500}, "post-reuse-convergence-settings": {"status": 200, "observedAfterMs": 59002, "observedAtEpochMs": 1700000001600}},
                 "visibleFixtureRows": {"fixture": True}, "expectedTransitions": [transition, convergence],
                 "streamTransitionEvidence": [dict(transition), dict(convergence)], "postReuseQuiet": {"quietWindowMs": 1500, "errorGeneration": 6, "observedAfterMs": 60000, "observedAtEpochMs": 1700000002000},
             }
@@ -634,11 +636,11 @@ class ShipReadinessTests(unittest.TestCase):
             active_convergence = {
                 "kind": "post-reuse-sse-convergence", "classification": "expected-bounded-post-reuse-sse-convergence",
                 "totalCount": 3, "firstGeneration": 7, "lastGeneration": 9,
-                "firstObservedAfterMs": 58876, "lastObservedAfterMs": 59296,
+                "firstObservedAfterMs": 56957, "lastObservedAfterMs": 57417,
                 "clusterMaximumEvents": 4, "clusterMaximumMs": 5000,
                 "recoveryOrigin": "http://127.0.0.1:18820", "recoveryPathname": "/server/stream",
                 "recoveryStatus": 200, "recoveryObservedAfterMs": 59742, "modelRows": 4, "modelObservedAfterMs": 59800,
-                "phaseBoundary": {"errorGeneration": 6, "observedAfterMs": 58000, "observedAtEpochMs": 1700000001000},
+                "phaseBoundary": {"kind": "pre-reuse-action-start", "errorGeneration": 6, "observedAfterMs": 56000, "observedAtEpochMs": 1700000001000},
             }
             active_payload = {
                 **baseline,
@@ -691,8 +693,26 @@ class ShipReadinessTests(unittest.TestCase):
             mismatched_502["streamConnections"][0]["status"] = 200
             invalid_convergence_payloads.append(mismatched_502)
             pre_boundary = json.loads(json.dumps(active_payload))
-            pre_boundary["expectedTransitions"][1]["firstObservedAfterMs"] = 58000
+            pre_boundary["expectedTransitions"][1]["firstObservedAfterMs"] = 56000
             invalid_convergence_payloads.append(pre_boundary)
+            missing_boundary_kind = json.loads(json.dumps(active_payload))
+            del missing_boundary_kind["expectedTransitions"][1]["phaseBoundary"]["kind"]
+            invalid_convergence_payloads.append(missing_boundary_kind)
+            error_after_recovery = json.loads(json.dumps(active_payload))
+            error_after_recovery["expectedTransitions"][1]["lastObservedAfterMs"] = 59743
+            invalid_convergence_payloads.append(error_after_recovery)
+            model_before_recovery = json.loads(json.dumps(active_payload))
+            model_before_recovery["expectedTransitions"][1]["modelObservedAfterMs"] = 59741
+            invalid_convergence_payloads.append(model_before_recovery)
+            api_before_model = json.loads(json.dumps(active_payload))
+            api_before_model["api"]["post-reuse-convergence-status"]["observedAfterMs"] = 59799
+            invalid_convergence_payloads.append(api_before_model)
+            api_after_quiet = json.loads(json.dumps(active_payload))
+            api_after_quiet["api"]["post-reuse-convergence-settings"]["observedAfterMs"] = 60001
+            invalid_convergence_payloads.append(api_after_quiet)
+            quiet_before_observations = json.loads(json.dumps(active_payload))
+            quiet_before_observations["postReuseQuiet"]["observedAfterMs"] = 59741
+            invalid_convergence_payloads.append(quiet_before_observations)
             for payload in invalid_convergence_payloads:
                 source.write_text(json.dumps(payload), encoding="utf-8")
                 with self.subTest(convergence=payload):
@@ -858,6 +878,7 @@ class ShipReadinessTests(unittest.TestCase):
             "post-reuse-convergence-invalid-diagnostic",
             "post-reuse-convergence-window-exceeded",
             "kind: 'post-reuse-sse-convergence'",
+            "kind: 'pre-reuse-action-start'",
             "writeEvidenceNoFlush({ ...reuse, postReuseConvergence, postReuseQuiet })",
             "browser-reuse-quiescence-invalidated",
         ):
@@ -874,6 +895,7 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertIn("recoveryStatus: recovery.status,\n        stopDispatchProof:", restart_producer)
         handoff = browser[browser.index("const arm = await waitForRestartArm(stability);"):]
         self.assertLess(handoff.index("const arm = await waitForRestartArm(stability);"), handoff.index("await waitForRestartRequest(stability, arm);"))
+        self.assertLess(handoff.index("const postReuseBoundary = { kind: 'pre-reuse-action-start'"), handoff.index("const reuse = await runReuse();"))
         self.assertLess(handoff.index("const postReuseConvergence = await finalizePostReuseConvergence(stability, arm, postReuseBoundary);"), handoff.index("const postReuseQuiet = await waitForPostReuseQuiet(stability, arm, postReuseBoundary);"))
         self.assertLess(handoff.index("await flushBrowserDiagnostics();"), handoff.index("await closeBrowserResources();"))
         self.assertLess(handoff.index("await closeBrowserResources();"), handoff.index("writeEvidenceNoFlush({ ...reuse, postReuseConvergence, postReuseQuiet });"))
