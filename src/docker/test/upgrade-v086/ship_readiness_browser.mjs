@@ -81,6 +81,8 @@ const restartClusterMaximumEvents = 8;
 const restartClusterMaximumMs = 15000;
 const restartTransportResponseCorrelationMs = 1000;
 const postReuseQuietWindowMs = 1500;
+const postReuseClusterMaximumEvents = 4;
+const postReuseClusterMaximumMs = 5000;
 const secretExposureSelector = [
   'input', 'textarea', '[contenteditable="true"]', '.secret-value',
   '[class*="password" i]', '[class*="secret" i]', '[class*="token" i]', '[class*="api" i]', '[class*="credential" i]',
@@ -115,6 +117,10 @@ function redact(value) {
 
 async function writeEvidence(payload, name = evidenceName) {
   await flushBrowserDiagnostics();
+  writeEvidenceNoFlush(payload, name);
+}
+
+function writeEvidenceNoFlush(payload, name = evidenceName) {
   const target = path.join(evidenceDir, name);
   const mergedApiEvidence = { ...apiEvidence, ...(payload.api && typeof payload.api === 'object' ? payload.api : {}) };
   fs.writeFileSync(target, redact(JSON.stringify({ errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence, firstClaimSseRecovery: validatedFirstClaimSseRecovery, firstClaimSseRecoveryFailure, navigation, ...payload, api: mergedApiEvidence }, null, 2)), { mode: 0o600 });
@@ -147,6 +153,7 @@ page.on('response', response => {
     if (url.pathname !== '/server/stream') return;
     const contentType = response.headers()['content-type'] || '';
     const connection = {
+      connectionId: streamConnections.length,
       observedAfterMs: Date.now() - browserStartedAt,
       origin: url.origin,
       pathname: url.pathname,
@@ -764,6 +771,8 @@ async function requireApi(label, endpoint) {
   apiEvidence[label] = {
     endpoint,
     status,
+    observedAfterMs: Date.now() - browserStartedAt,
+    observedAtEpochMs: Date.now(),
     readiness: status === 200 ? 'API HTTP 200' : 'API request failed',
   };
   if (status !== 200) {
@@ -814,6 +823,8 @@ function isArmedRestartSseTransportError(error, arm) {
 }
 
 function restart502StreamLocation(error, arm, usedResponses) {
+  // This is ordered temporal association only: it does not claim that the
+  // response caused the console event, and each response may be used once.
   if (error.kind !== 'console-error' || error.source !== 'error'
       || error.message !== 'Failed to load resource: the server responded with a status of 502 (Bad Gateway)'
       || error.claimClassification !== 'first-claim-bootstrap' || error.claimPhase !== 'post-claim-complete'
@@ -823,10 +834,14 @@ function restart502StreamLocation(error, arm, usedResponses) {
     if (location.origin !== arm.origin || location.pathname !== '/server/stream') return null;
     const candidates = streamConnections.filter(connection => !usedResponses.has(connection) && connection.origin === arm.origin
       && connection.pathname === '/server/stream' && connection.status === 502 && connection.contentType === 'other'
-      && Math.abs(connection.observedAfterMs - error.observedAfterMs) <= restartTransportResponseCorrelationMs);
+      && connection.observedAfterMs <= error.observedAfterMs
+      && error.observedAfterMs - connection.observedAfterMs <= restartTransportResponseCorrelationMs);
     if (candidates.length !== 1) return null;
     const response = candidates[0];
-    return { proof: { origin: location.origin, pathname: location.pathname, errorGeneration: error.error_generation, responseObservedAfterMs: response.observedAfterMs }, response };
+    return { proof: { origin: location.origin, pathname: location.pathname, errorGeneration: error.error_generation,
+      responseObservedAfterMs: response.observedAfterMs, errorObservedAfterMs: error.observedAfterMs,
+      responseConnectionId: response.connectionId,
+      temporalAssociation: 'ordered-response-before-console' }, response };
   } catch {
     return null;
   }
@@ -907,9 +922,10 @@ async function finalizeArmedRestartTransport(stability, arm, deadline) {
         badGateway502Count: resourceEntries.length, firstGeneration: first.error_generation, lastGeneration: last.error_generation,
         firstObservedAfterMs: first.observedAfterMs, lastObservedAfterMs: last.observedAfterMs,
         clusterMaximumEvents: restartClusterMaximumEvents, clusterMaximumMs: restartClusterMaximumMs,
+        recoveryStatus: recovery.status,
         stopDispatchProof: { ...arm.stop_dispatch, acknowledgedEpochMs: arm.acknowledged_epoch_ms },
         sameOriginProof: { origin: arm.origin, pathname: '/server/stream',
-          resource502Locations: resourceEntries.map(entry => entry.resource),
+          orderedTemporal502Associations: resourceEntries.map(entry => entry.resource),
           recoveryOrigin: recovery.origin, recoveryPathname: recovery.pathname, recoveryStatus: recovery.status,
           recoveryObservedAfterMs: recovery.observedAfterMs },
         modelRows,
@@ -1024,18 +1040,75 @@ async function runReuse() {
   return { url: page.url(), visibleFixtureRows, rememberedSession: true };
 }
 
-async function waitForPostReuseQuiet(stability, arm) {
+async function waitForPostReuseQuiet(stability, arm, boundary) {
   const generation = browserErrorGeneration;
+  if (generation < boundary.errorGeneration || Date.now() <= boundary.observedAtEpochMs) {
+    await writeRestartInvalidation('restart-post-reuse-quiet-boundary-invalid', stability, arm);
+    throw new Error('post-reuse quiet window started before its phase boundary');
+  }
   const quietUntil = Date.now() + postReuseQuietWindowMs;
   while (Date.now() < quietUntil) {
-    await assertRestartArmWindow(stability, arm);
     if (browserErrorGeneration !== generation || runtimeErrors.length || diagnosticFailures.length) {
       await writeRestartInvalidation('restart-post-reuse-quiet-window-invalidated', stability, arm);
       throw new Error('post-reuse quiet window was invalidated by a late browser error');
     }
     await new Promise(resolve => setTimeout(resolve, sseRecoveryPollMs));
   }
-  return { quietWindowMs: postReuseQuietWindowMs, errorGeneration: generation };
+  return { quietWindowMs: postReuseQuietWindowMs, errorGeneration: generation, observedAfterMs: Date.now() - browserStartedAt,
+    observedAtEpochMs: Date.now() };
+}
+
+async function finalizePostReuseConvergence(stability, arm, boundary) {
+  const startGeneration = arm.restart_transport.lastGeneration + 1;
+  const deadline = Date.now() + postReuseClusterMaximumMs;
+  while (Date.now() < deadline) {
+    if (!runtimeErrors.length) {
+      await new Promise(resolve => setTimeout(resolve, sseRecoveryPollMs));
+      continue;
+    }
+    if (diagnosticFailures.length || runtimeErrors.length > postReuseClusterMaximumEvents
+        || runtimeErrors.some((error, index) => error.observed_at_epoch_ms <= boundary.observedAtEpochMs
+          || error.observedAfterMs <= boundary.observedAfterMs || !isArmedRestartSseTransportError(error, arm)
+          || error.error_generation !== startGeneration + index)) {
+      await writeRestartInvalidation('post-reuse-convergence-invalid-diagnostic', stability, arm);
+      throw new Error('post-reuse convergence observed an invalid diagnostic');
+    }
+    const first = runtimeErrors[0];
+    const last = runtimeErrors.at(-1);
+    if (last.observedAfterMs - first.observedAfterMs > postReuseClusterMaximumMs) {
+      await writeRestartInvalidation('post-reuse-convergence-window-exceeded', stability, arm);
+      throw new Error('post-reuse convergence exceeded its time window');
+    }
+    const recovery = restartStreamRecovery(arm, last);
+    if (!recovery) { await new Promise(resolve => setTimeout(resolve, sseRecoveryPollMs)); continue; }
+    if (recovery.observedAfterMs <= boundary.observedAfterMs) {
+      await writeRestartInvalidation('post-reuse-convergence-pre-boundary-recovery', stability, arm);
+      throw new Error('post-reuse convergence reused a pre-boundary stream recovery');
+    }
+    const modelRows = await requireFreshStabilityModel(15000);
+    const modelObservedAfterMs = Date.now() - browserStartedAt;
+    await requireApi('post-reuse-convergence-status', '/server/status');
+    await requireApi('post-reuse-convergence-settings', '/server/config/get');
+    const entries = [...runtimeErrors];
+    const transition = { kind: 'post-reuse-sse-convergence', classification: 'expected-bounded-post-reuse-sse-convergence',
+      totalCount: entries.length, firstGeneration: first.error_generation, lastGeneration: last.error_generation,
+      firstObservedAfterMs: first.observedAfterMs, lastObservedAfterMs: last.observedAfterMs,
+      clusterMaximumEvents: postReuseClusterMaximumEvents, clusterMaximumMs: postReuseClusterMaximumMs,
+      recoveryOrigin: recovery.origin, recoveryPathname: recovery.pathname, recoveryStatus: recovery.status,
+      recoveryObservedAfterMs: recovery.observedAfterMs, modelRows, modelObservedAfterMs, phaseBoundary: boundary };
+    streamTransitionEvidence.push(transition); expectedTransitions.push(transition);
+    runtimeErrors.splice(0, runtimeErrors.length);
+    return transition;
+  }
+  if (runtimeErrors.length) {
+    await writeRestartInvalidation('post-reuse-convergence-window-exceeded', stability, arm);
+    throw new Error('post-reuse convergence exceeded its time window');
+  }
+  const transition = { kind: 'post-reuse-sse-convergence', classification: 'clean-post-reuse-convergence', totalCount: 0,
+    firstGeneration: arm.restart_transport.lastGeneration, lastGeneration: arm.restart_transport.lastGeneration,
+    clusterMaximumEvents: postReuseClusterMaximumEvents, clusterMaximumMs: postReuseClusterMaximumMs, phaseBoundary: boundary };
+  streamTransitionEvidence.push(transition); expectedTransitions.push(transition);
+  return transition;
 }
 
 async function main() {
@@ -1148,8 +1221,24 @@ async function main() {
     await waitForRestartStopDispatch(stability, arm);
     await waitForRestartRequest(stability, arm);
     const reuse = await runReuse();
-    const postReuseQuiet = await waitForPostReuseQuiet(stability, arm);
-    await writeEvidence({ ...reuse, postReuseQuiet });
+    const postReuseBoundary = { errorGeneration: browserErrorGeneration, observedAfterMs: Date.now() - browserStartedAt,
+      observedAtEpochMs: Date.now() };
+    const postReuseConvergence = await finalizePostReuseConvergence(stability, arm, postReuseBoundary);
+    const postReuseQuiet = await waitForPostReuseQuiet(stability, arm, postReuseBoundary);
+    await flushBrowserDiagnostics();
+    const acceptedSnapshot = JSON.stringify({ generation: browserErrorGeneration, errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence });
+    try {
+      await closeBrowserResources();
+      await new Promise(resolve => setImmediate(resolve));
+    } catch (error) {
+      await writeRestartInvalidation('browser-reuse-close-failed', stability, arm);
+      throw error;
+    }
+    if (acceptedSnapshot !== JSON.stringify({ generation: browserErrorGeneration, errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence })) {
+      await writeRestartInvalidation('browser-reuse-quiescence-invalidated', stability, arm);
+      throw new Error('browser diagnostics changed while accepted reuse evidence was quiescing');
+    }
+    writeEvidenceNoFlush({ ...reuse, postReuseConvergence, postReuseQuiet });
   }
 }
 
