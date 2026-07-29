@@ -1200,6 +1200,92 @@ class ShipReadinessTests(unittest.TestCase):
             with mock.patch.object(HARNESS, "_is_drvfs_evidence_root", return_value=True):
                 HARNESS.audit_retained_run(root, [], root / "audit.json", private_log_source=source)
 
+    def test_retained_secret_hint_parses_uri_userinfo_without_confusing_host_ports(self):
+        for value in (
+            "sftp://user@host:1234/path",
+            "sftp://user@[2001:db8::1]:1234/path",
+            "sftp://user:<redacted>@host:1234/path",
+            "sftp://user:<ReDaCtEd>@host:1234/path",
+            "sftp://user:@host:1234/path",
+            "sftp://user%3a%3credacted%3e@host:1234/path",
+            "sftp://user@host:1234/path@artifact",
+            "sftp://user@host:1234/path?note=@artifact",
+            "sftp://one@host:1234/a sftp://two@[2001:db8::1]:1234/b",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(HARNESS._retained_secret_hint(value))
+        self.assertTrue(HARNESS._retained_secret_hint("sftp://user:secret@host:1234/path"))
+
+    def test_retained_secret_hint_fails_closed_for_malformed_uri_like_userinfo(self):
+        for value in (
+            "sftp://user:synthetic-credential/raw@host:1234/path",
+            "sftp://user:synthetic-credential space@host:1234/path",
+            "sftp://user:synthetic-credential\ttab@host:1234/path",
+            "sftp://user%3Asynthetic-credential@host:1234/path",
+            "sftp://user:synthetic-credential@middle@host:1234/path",
+            "sftp://user:synthetic-credential/sftp://safe@host:1234/path",
+            "sftp://user:synthetic-credential sftp://safe@host:1234/path",
+            "(sftp://user:synthetic-credential/raw@host:1234/path)",
+            "endpoint=sftp://user%3Asynthetic-credential@host:1234/path",
+            "'sftp://user:synthetic-credential/raw@host:1234/path'",
+            "[sftp://user:synthetic-credential/raw@host:1234/path]",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(HARNESS._retained_secret_hint(value))
+
+    def test_retained_secret_hint_completes_for_no_userinfo_urls_and_scans_structural_boundaries(self):
+        self.assertFalse(HARNESS._retained_secret_hint("https://example.invalid/path https://other.invalid/path"))
+        self.assertFalse(HARNESS._retained_secret_hint("https://host:1234/path sftp://user@remote:1234/file"))
+        self.assertFalse(HARNESS._retained_secret_hint("https://host/path\nsftp://user@remote:1234/file"))
+        self.assertTrue(HARNESS._retained_secret_hint("sftp://safe@host:1234/path,sftp://user:synthetic-credential@host:1234/path"))
+        self.assertTrue(HARNESS._retained_secret_hint("sftp://user:synthetic-credential/sftp://safe@host:1234/path"))
+        self.assertTrue(HARNESS._retained_secret_hint("https://host:non-numeric/sftp://safe@host:1234/path"))
+        self.assertTrue(HARNESS._retained_secret_hint("https://host%3asynthetic/sftp://safe@host:1234/path"))
+
+    def test_private_log_publication_ignores_path_and_query_at_after_safe_authority(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "ship-log"
+            root.mkdir()
+            source = self._private_log_source(root, "sftp://user@host:1234/path@artifact\nsftp://two@[2001:db8::1]:1234/b?note=@artifact\n")
+            record = HARNESS.publish_private_log_snapshot(source, root, root.name)
+            self.assertEqual("logs/seedsync.log", record["relative_path"])
+
+    def test_private_log_publication_rejects_nested_scheme_before_malformed_final_at(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "ship-log"
+            root.mkdir()
+            source = self._private_log_source(root, "sftp://user:synthetic-credential/sftp://safe@host:1234/path\n")
+            with self.assertRaisesRegex(ValueError, "redacted log still contains a secret pattern"):
+                HARNESS.publish_private_log_snapshot(source, root, root.name)
+            self.assertFalse((root / "logs" / "seedsync.log").exists())
+
+    def test_private_log_publication_handles_no_at_and_structural_uri_boundaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "ship-log"
+            root.mkdir()
+            source = self._private_log_source(root, "https://example.invalid/path https://other.invalid/path\n")
+            HARNESS.publish_private_log_snapshot(source, root, root.name)
+            source.write_text("(sftp://user:synthetic-credential/raw@host:1234/path)\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "redacted log still contains a secret pattern"):
+                HARNESS.publish_private_log_snapshot(source, root, root.name)
+
+    def test_private_log_publication_accepts_redacted_username_only_uri_and_rejects_credential_uri(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "ship-log"
+            root.mkdir()
+            source = self._private_log_source(root, "sftp://remoteuser@host:1234/path\nsftp://remoteuser@[2001:db8::1]:1234/path\n")
+            record = HARNESS.publish_private_log_snapshot(source, root, root.name)
+            self.assertFalse(HARNESS._retained_secret_hint((root / "logs" / "seedsync.log").read_text(encoding="utf-8")))
+            self.assertEqual("logs/seedsync.log", record["relative_path"])
+            unsafe = source
+            unsafe.write_text("sftp://user:uri-secret@host:1234/path\n", encoding="utf-8")
+            published = HARNESS.publish_private_log_snapshot(unsafe, root, root.name)
+            self.assertNotIn("uri-secret", (root / "logs" / "seedsync.log").read_text(encoding="utf-8"))
+            self.assertEqual("logs/seedsync.log", published["relative_path"])
+            unsafe.write_text("sftp://user:synthetic-credential/raw@host:1234/path\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "redacted log still contains a secret pattern"):
+                HARNESS.publish_private_log_snapshot(unsafe, root, root.name)
+
     def test_private_log_publication_retries_torn_append_snapshot(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "ship-log"

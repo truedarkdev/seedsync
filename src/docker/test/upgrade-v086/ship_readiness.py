@@ -21,6 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
+from urllib.parse import unquote
 from typing import Any
 import uuid
 import zipfile
@@ -899,12 +900,33 @@ def _retained_secret_hint(text: str) -> bool:
                 if value and not value.startswith(("<redacted>", "{", "[")):
                     return True
             start = found + len(name)
-    scheme = lowered.find("://")
-    while scheme >= 0:
-        authority = lowered[scheme + 3:].split("/", 1)[0]
-        if ":" in authority and "@" in authority and ":<redacted>@" not in authority:
-            return True
-        scheme = lowered.find("://", scheme + 3)
+    scheme_pattern = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
+    for match in scheme_pattern.finditer(text):
+        remainder = text[match.end():]
+        terminator = re.search(r"[/\s?#]", remainder)
+        authority_end = terminator.start() if terminator else len(remainder)
+        authority = remainder[:authority_end]
+        if "@" in authority:
+            userinfo, _host_port = authority.rsplit("@", 1)
+        else:
+            eventual_at = remainder.find("@")
+            if eventual_at < 0:
+                continue
+            later_scheme = scheme_pattern.search(remainder, 1)
+            authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
+            prefix = remainder[:later_scheme.start()] if later_scheme and later_scheme.start() < eventual_at else None
+            if prefix is not None and authority_is_host_only and ":" not in unquote(prefix[authority_end:]):
+                # The following scheme is a separate occurrence only after an
+                # unambiguous no-userinfo URI; finditer will inspect it too.
+                continue
+            # This includes ambiguous host:port/path@ forms; fail closed
+            # instead of guessing that a malformed credential is harmless.
+            userinfo = remainder[:eventual_at]
+        decoded = unquote(userinfo).casefold()
+        if ":" in decoded:
+            _user, credential = decoded.split(":", 1)
+            if credential and credential != "<redacted>":
+                return True
     return False
 
 
