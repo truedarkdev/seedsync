@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 import bottle
 from bottle import static_file
 
-from migration import MigrationBlockedError, MigrationCoordinator, MigrationDecision, MigrationState
+from migration import MigrationCoordinator, MigrationDecision, MigrationState
 from .web_app_job import MyWSGIRefServer
 
 
@@ -168,6 +168,16 @@ def _safe_display_text(value: object, *, maximum_length: int) -> str:
         return ""
     printable = "".join(character for character in value if character.isprintable())
     return printable[:maximum_length]
+
+
+def _safe_diagnostic_field(value: object, *, maximum_length: int = 160) -> str:
+    """Keep log metadata single-line and inert even for unusual exception types."""
+    text = str(value)
+    safe = "".join(
+        character if character.isascii() and (character.isalnum() or character in "._:-") else "_"
+        for character in text
+    )[:maximum_length]
+    return safe or "unknown"
 
 
 def migration_status_payload(
@@ -485,16 +495,38 @@ class MigrationWebApp(bottle.Bottle):
         try:
             decision = self._coordinator.apply_confirmed(retry=retry)
             succeeded = decision.state == MigrationState.COMPLETE
-        except (MigrationBlockedError, OSError, ValueError):
-            succeeded = False
-        except Exception:
-            logging.getLogger("SeedSync.MigrationWeb").exception(
-                "Unexpected migration apply failure"
-            )
+        except Exception as error:
+            self._log_apply_failure(error)
         with self._operation_lock:
             self._execution.status = "succeeded" if succeeded else "failed"
         if succeeded:
             self._on_success()
+
+    @staticmethod
+    def _log_apply_failure(error: Exception) -> None:
+        """Record a diagnosable background failure without logging request data.
+
+        Exception text can include configuration or request values, including the
+        one-time CSRF/confirmation values handled by the migration endpoint.
+        Keep the diagnostic to the exception class and its terminal traceback
+        location; Python tracebacks do not include local values at that point.
+        """
+        traceback = error.__traceback__
+        while traceback is not None and traceback.tb_next is not None:
+            traceback = traceback.tb_next
+        if traceback is None:
+            location = "unknown"
+        else:
+            code = traceback.tb_frame.f_code
+            location = "{}:{}:{}".format(
+                _safe_diagnostic_field(Path(code.co_filename).name, maximum_length=96),
+                traceback.tb_lineno,
+                _safe_diagnostic_field(code.co_name, maximum_length=96),
+            )
+        logging.getLogger("SeedSync.MigrationWeb").error(
+            "Migration apply failed type=%s location=%s",
+            _safe_diagnostic_field(type(error).__name__, maximum_length=96), location,
+        )
 
     def _index(self) -> bottle.HTTPResponse:
         return self._serve_file("index.html")

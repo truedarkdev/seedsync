@@ -469,6 +469,57 @@ class TestMigrationWebApp(unittest.TestCase):
         self.assertFalse(self.app._execution.worker.is_alive())
         self.on_success.assert_called_once_with()
 
+    def test_background_apply_failure_records_safe_diagnostic_without_request_values(self) -> None:
+        supplied_token = "synthetic-csrf-token"
+        supplied_confirmation = "MIGRATE original-v0.8.6-to-current-v1"
+        self.app._csrf_token = supplied_token
+        def raise_apply_error(*, retry=False):
+            self.assertFalse(retry)
+            raise RuntimeError("csrf={} confirmation={}".format(supplied_token, supplied_confirmation))
+        self.coordinator.apply_confirmed.side_effect = raise_apply_error
+        headers = {
+            "Origin": "http://localhost",
+            "X-SeedSync-Migration-CSRF": supplied_token,
+        }
+        payload = {"confirmation": supplied_confirmation, "retry": False}
+
+        with self.assertLogs("SeedSync.MigrationWeb", level="ERROR") as logs:
+            response = self.client.post_json("/server/migration/v1/apply", payload, headers=headers)
+            self.assertEqual(202, response.status_int)
+            assert self.app._execution.worker is not None
+            self.app._execution.worker.join(2)
+
+        self.assertEqual("failed", self.app._execution.status)
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("type=RuntimeError", diagnostic)
+        self.assertIn("location=test_migration_web_app.py:", diagnostic)
+        self.assertNotIn(supplied_token, diagnostic)
+        self.assertNotIn(supplied_confirmation, diagnostic)
+        self.assertEqual("failed", self.client.get("/server/migration/v1/status").json["operation"]["status"])
+
+    def test_background_apply_failure_sanitizes_log_metadata_controls(self) -> None:
+        unsafe_error = type("Unsafe\nType", (Exception,), {})
+
+        def raise_apply_error(*, retry=False):
+            self.assertFalse(retry)
+            raise unsafe_error("request-value")
+
+        self.coordinator.apply_confirmed.side_effect = raise_apply_error
+        with self.assertLogs("SeedSync.MigrationWeb", level="ERROR") as logs:
+            response = self.client.post_json(
+                "/server/migration/v1/apply",
+                {"confirmation": "MIGRATE original-v0.8.6-to-current-v1", "retry": False},
+                headers={"Origin": "http://localhost", "X-SeedSync-Migration-CSRF": self.app._csrf_token},
+            )
+            self.assertEqual(202, response.status_int)
+            assert self.app._execution.worker is not None
+            self.app._execution.worker.join(2)
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("type=Unsafe_Type", diagnostic)
+        self.assertNotIn("Unsafe\nType", diagnostic)
+        self.assertNotIn("request-value", diagnostic)
+
     def test_retry_action_is_available_only_for_retryable_failed_state(self) -> None:
         failed = MigrationDecision(
             MigrationState.FAILED,

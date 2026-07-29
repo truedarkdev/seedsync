@@ -1657,6 +1657,53 @@ class TestLftp(unittest.TestCase):
         self.assertNotIn('printf \'%s\\n\' "StrictHostKeyChecking accept-new" > "${USER_HOME}/.ssh/config"', entrypoint_contents)
         self.assertIn('safe_chown "staging directory" /staging', entrypoint_contents)
         self.assertIn("check_writable_path \"$DOWNLOADS_DIR\"", entrypoint_contents)
+        self.assertIn("prepare_config_root()", entrypoint_contents)
+        self.assertIn("os.O_DIRECTORY | os.O_NOFOLLOW", entrypoint_contents)
+        self.assertIn("os.fchown(root_fd, uid, gid)", entrypoint_contents)
+        self.assertIn("os.fchmod(root_fd, 0o700)", entrypoint_contents)
+        self.assertIn("os.fchmod(root_fd, 0)", entrypoint_contents)
+        self.assertIn("require_revoked_root_state", entrypoint_contents)
+        self.assertIn("require_admitted_root_owner", entrypoint_contents)
+        self.assertIn("stat.S_IMODE(root_info.st_mode) & 0o022", entrypoint_contents)
+        self.assertIn("SEEDSYNC_CONFIG_ROOT_TEST_DELAY_SECONDS", entrypoint_contents)
+        self.assertIn("require_same_directory_identity", entrypoint_contents)
+        self.assertIn("info.st_nlink != 1", entrypoint_contents)
+        self.assertIn("os.fchown(file_fd, uid, gid)", entrypoint_contents)
+        self.assertIn("require_same_regular_identity", entrypoint_contents)
+        self.assertIn('re.sub(r"\\\\([0-7]{3})"', entrypoint_contents)
+        self.assertIn("validate_tree(root_fd, root_info.st_dev)", entrypoint_contents)
+        self.assertIn("repair_tree(root_fd, root_info.st_dev)", entrypoint_contents)
+        self.assertLess(
+            entrypoint_contents.index("require_admitted_root_owner(root_info)"),
+            entrypoint_contents.index("os.fchmod(root_fd, 0)"),
+        )
+        self.assertLess(
+            entrypoint_contents.index("require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, \"after access revocation\")"),
+            entrypoint_contents.index("validate_tree(root_fd, root_info.st_dev)"),
+        )
+        self.assertIn('if [ "${1:-}" = "--prepare-config-root" ]; then', entrypoint_contents)
+        self.assertLess(
+            entrypoint_contents.index('if [ "${1:-}" = "--prepare-config-root" ]; then'),
+            entrypoint_contents.index('mkdir -p "$CONFIG_DIR"'),
+        )
+        self.assertNotIn('safe_chown_recursive "config directory"', entrypoint_contents)
+        entrypoint_contract = repo_root / "src/docker/test/entrypoint_config_contract.sh"
+        self.assertTrue(entrypoint_contract.is_file())
+        contract_contents = entrypoint_contract.read_text(encoding="utf-8")
+        self.assertIn("chmod 0777", contract_contents)
+        self.assertIn("windows-drvfs-negative", contract_contents)
+        self.assertIn("root-link-negative", contract_contents)
+        self.assertIn("root-file-negative", contract_contents)
+        self.assertIn("nested-link-negative", contract_contents)
+        self.assertIn("nested-mount-negative", contract_contents)
+        self.assertIn("space-mountinfo", contract_contents)
+        self.assertIn("hard-link-negative", contract_contents)
+        self.assertIn("runtime-owner-idempotence", contract_contents)
+        self.assertIn("wrong-owner-negative", contract_contents)
+        self.assertIn("unsafe-root-config", contract_contents)
+        self.assertIn("unsafe-runtime-config", contract_contents)
+        self.assertIn("barrier-attacker", contract_contents)
+        self.assertIn("POSIX_VOLUME", contract_contents)
         self.assertIn('mktemp "$path/.seedsync_write_test.XXXXXX"', entrypoint_contents)
         self.assertIn('rm -f -- "$test_file"', entrypoint_contents)
         self.assertNotIn('local test_file="${path}/.seedsync_write_test"', entrypoint_contents)

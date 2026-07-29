@@ -210,6 +210,10 @@ class Seedsync:
         self.api_key_store_path: str = os.path.join(args.config_dir, Seedsync.__FILE_API_KEY_STORE)
         self.api_key_store: ApiKeyStore = self._load_persist(ApiKeyStore, self.api_key_store_path)
         self.api_key_store.bind_file_path(self.api_key_store_path)
+        if self.migration_decision.completed_auth_phase == "preclaim":
+            self.api_key_store.bind_completed_migration_claim_transition(
+                self.migration_coordinator.completed_auth_transition_binding(),
+            )
         self.api_key_store.bind_bootstrap_proof_path(
             os.path.join(tempfile.gettempdir(), Seedsync.__FILE_BOOTSTRAP_PROOF)
         )

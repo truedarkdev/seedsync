@@ -6,11 +6,14 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import stat
 import uuid
 import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, TypeGuard, TypedDict
 
 from common import Persist, PersistError
@@ -24,6 +27,14 @@ _UI_SESSION_TTL = timedelta(hours=12)
 _REMEMBERED_UI_SESSION_COOKIE_MAX_AGE = timedelta(days=3650)
 _BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
 _BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
+_COMPLETED_MIGRATION_AUTH_MAX_BYTES = 64 * 1024
+_COMPLETED_MIGRATION_STORE_NAME = "api-keys.json"
+_COMPLETED_MIGRATION_HISTORY_NAME = "api-keys.history.jsonl"
+_COMPLETED_MIGRATION_CLAIM_MARKER_NAME = "migration-claimed-auth.json"
+_COMPLETED_MIGRATION_CLAIM_MARKER_MAX_BYTES = 4096
+_COMPLETED_MIGRATION_BACKUP_NAME = re.compile(
+    r"api-keys-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{6}\.json"
+)
 
 
 class CreatedApiKey(TypedDict):
@@ -88,6 +99,369 @@ def append_api_key_store_history(
             handle.write("\n")
     except (OSError, TypeError, ValueError):
         return
+
+
+def _completed_migration_auth_error() -> ValueError:
+    # Deliberately do not include parsed content in this error: auth metadata can
+    # contain identifiers and must never turn a migration failure into disclosure.
+    return ValueError("Completed migration auth state is not an allowed pre-claim bootstrap state")
+
+
+def _strict_json_object(pairs: list[tuple[object, object]]) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for key, value in pairs:
+        if not isinstance(key, str) or key in result:
+            raise _completed_migration_auth_error()
+        result[key] = value
+    return result
+
+
+def _valid_completed_migration_timestamp(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return (
+        parsed.tzinfo is not None
+        and parsed.utcoffset() == timedelta(0)
+        and value == parsed.isoformat(timespec="seconds")
+    )
+
+
+def _read_completed_migration_auth_file(
+    root: Path, name: str, *, private: bool
+) -> bytes | None:
+    path = root / name
+    if not os.path.lexists(path):
+        return None
+    try:
+        path_info = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(path_info.st_mode) or path_info.st_nlink != 1:
+            raise _completed_migration_auth_error()
+        if os.name == "posix":
+            mode = stat.S_IMODE(path_info.st_mode)
+            if private:
+                if mode != 0o600:
+                    raise _completed_migration_auth_error()
+            elif mode & 0o022:
+                raise _completed_migration_auth_error()
+            if path_info.st_uid != os.geteuid() or path_info.st_gid != os.getegid():
+                raise _completed_migration_auth_error()
+
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened_info = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened_info.st_mode)
+                or opened_info.st_nlink != 1
+                or (opened_info.st_dev, opened_info.st_ino) != (path_info.st_dev, path_info.st_ino)
+                or opened_info.st_size > _COMPLETED_MIGRATION_AUTH_MAX_BYTES
+            ):
+                raise _completed_migration_auth_error()
+            payload = os.read(descriptor, _COMPLETED_MIGRATION_AUTH_MAX_BYTES + 1)
+            if len(payload) > _COMPLETED_MIGRATION_AUTH_MAX_BYTES:
+                raise _completed_migration_auth_error()
+            return payload
+        finally:
+            os.close(descriptor)
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, ValueError):
+            raise
+        raise _completed_migration_auth_error() from exc
+
+
+def _completed_migration_empty_store(payload: bytes) -> bool:
+    try:
+        decoded = json.loads(payload.decode("utf-8"), object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return False
+    return decoded == {
+        "version": 3,
+        "api_keys": [],
+        "ui_sessions": [],
+        "browser_handover_claimed_version": "",
+    }
+
+
+def _completed_migration_history_entry(payload: object, kind: str) -> bool:
+    if not _is_string_object_dict(payload):
+        return False
+    expected_details: Dict[str, object]
+    if kind == "proof":
+        expected_details = {"expires_at": None}
+        expected_event, expected_reason = "bootstrap_proof_created", "first_run_bootstrap_window_opened"
+    elif kind == "loaded":
+        expected_details = {
+            "api_key_count": 0,
+            "active_api_key_count": 0,
+            "ui_session_count": 0,
+            "remembered_ui_session_count": 0,
+            "browser_handover_claimed_version": "",
+            "bootstrap_proof_present": False,
+            "bootstrap_exchange_present": False,
+        }
+        expected_event, expected_reason = "store_loaded", "loaded_existing_store"
+    else:
+        expected_details = {
+            "api_key_count": 0,
+            "active_api_key_count": 0,
+            "ui_session_count": 0,
+            "remembered_ui_session_count": 0,
+            "browser_handover_claimed_version": "",
+            "bootstrap_proof_present": True,
+            "bootstrap_exchange_present": False,
+        }
+        expected_event, expected_reason = "store_saved", "persisted"
+
+    if set(payload) != {"timestamp", "event", "reason", "store_file", "details"}:
+        return False
+    if (
+        payload.get("event") != expected_event
+        or payload.get("reason") != expected_reason
+        or payload.get("store_file") != _COMPLETED_MIGRATION_STORE_NAME
+        or not _valid_completed_migration_timestamp(payload.get("timestamp"))
+    ):
+        return False
+    details = payload.get("details")
+    if not _is_string_object_dict(details) or set(details) != set(expected_details):
+        return False
+    if kind == "proof":
+        return _valid_completed_migration_timestamp(details.get("expires_at"))
+    return details == expected_details
+
+
+def _completed_migration_history_is_safe(payload: bytes, store_present: bool) -> bool:
+    try:
+        text = payload.decode("utf-8")
+        if not text.endswith("\n"):
+            return False
+        entries = [json.loads(line, object_pairs_hook=_strict_json_object) for line in text.splitlines()]
+    except (UnicodeDecodeError, ValueError, TypeError):
+        return False
+    if not entries:
+        return False
+    if not store_present:
+        return len(entries) == 1 and _completed_migration_history_entry(entries[0], "proof")
+
+    index = 0
+    while index < len(entries):
+        proof_count = 0
+        while index < len(entries) and _completed_migration_history_entry(entries[index], "proof"):
+            proof_count += 1
+            index += 1
+        if proof_count == 0:
+            return False
+        if index >= len(entries) or not _completed_migration_history_entry(entries[index], "saved"):
+            return False
+        index += 1
+        while index < len(entries) and _completed_migration_history_entry(entries[index], "saved"):
+            index += 1
+        if index == len(entries):
+            return True
+        if not _completed_migration_history_entry(entries[index], "loaded"):
+            return False
+        index += 1
+        # A normal restart records its exact empty-store load before opening
+        # the ephemeral browser proof.  With no subsequent persisted auth
+        # mutation, that terminal loader record is a safe pre-claim state.
+        if index == len(entries):
+            return True
+    return False
+
+
+def validate_completed_migration_preclaim_auth_state(config_dir: str | Path) -> None:
+    """Accept only the empty, pre-claim auth residue normal startup may create.
+
+    Migration application remains stricter: this is solely for validating a
+    receipt that was already completed before normal startup opened first-run
+    browser handover.  The accepted history is a closed grammar of events
+    emitted by ``ensure_bootstrap_proof`` and empty-store persistence.
+    """
+    root = Path(config_dir)
+    store = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_STORE_NAME, private=True)
+    history = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_HISTORY_NAME, private=False)
+    if store is None and history is None:
+        return
+    if history is None or not _completed_migration_history_is_safe(history, store is not None):
+        raise _completed_migration_auth_error()
+    if store is not None and not _completed_migration_empty_store(store):
+        raise _completed_migration_auth_error()
+
+    allowed = {_COMPLETED_MIGRATION_STORE_NAME, _COMPLETED_MIGRATION_HISTORY_NAME}
+    for candidate in root.iterdir():
+        if candidate.name in allowed or not candidate.name.startswith("api-keys"):
+            continue
+        if not _COMPLETED_MIGRATION_BACKUP_NAME.fullmatch(candidate.name):
+            raise _completed_migration_auth_error()
+        backup = _read_completed_migration_auth_file(root, candidate.name, private=True)
+        if backup is None or not _completed_migration_empty_store(backup):
+            raise _completed_migration_auth_error()
+
+
+def _completed_migration_claim_error() -> ValueError:
+    return ValueError("Completed migration claimed auth state is invalid")
+
+
+def _completed_migration_transition_binding(binding: object) -> Dict[str, str]:
+    if not isinstance(binding, dict) or set(binding) != {
+        "migration_id", "backup", "receipt_sha256", "backup_manifest_sha256",
+    }:
+        raise _completed_migration_claim_error()
+    normalized: Dict[str, str] = {}
+    for key in ("migration_id", "backup", "receipt_sha256", "backup_manifest_sha256"):
+        value = binding.get(key)
+        if not isinstance(value, str) or not value:
+            raise _completed_migration_claim_error()
+        normalized[key] = value
+    if (
+        not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,159}", normalized["migration_id"])
+        or not re.fullmatch(r"migration-backups/[A-Za-z0-9._-]{1,160}", normalized["backup"])
+        or any(not re.fullmatch(r"[0-9a-f]{64}", normalized[key]) for key in ("receipt_sha256", "backup_manifest_sha256"))
+    ):
+        raise _completed_migration_claim_error()
+    return normalized
+
+
+def _strict_completed_migration_json(payload: bytes) -> Dict[str, object]:
+    try:
+        parsed = json.loads(payload.decode("utf-8"), object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, ValueError, TypeError) as error:
+        raise _completed_migration_claim_error() from error
+    if not isinstance(parsed, dict):
+        raise _completed_migration_claim_error()
+    return parsed
+
+
+def _write_completed_migration_claim_marker(root: Path, payload: Dict[str, object]) -> None:
+    path = root / _COMPLETED_MIGRATION_CLAIM_MARKER_NAME
+    encoded = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(encoded) > _COMPLETED_MIGRATION_CLAIM_MARKER_MAX_BYTES:
+        raise _completed_migration_claim_error()
+    temporary = root / ".migration-claimed-auth.tmp-{}".format(uuid.uuid4().hex)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        os.write(descriptor, encoded)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, path)
+        if os.name == "posix":
+            os.chmod(path, 0o600)
+            directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    except OSError as error:
+        raise _completed_migration_claim_error() from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def completed_migration_claim_marker_exists(config_dir: str | Path) -> bool:
+    return os.path.lexists(Path(config_dir) / _COMPLETED_MIGRATION_CLAIM_MARKER_NAME)
+
+
+def validate_completed_migration_claimed_auth_state(config_dir: str | Path, binding: object) -> None:
+    """Validate the product-created claimed phase bound to one receipt/backup."""
+    root = Path(config_dir)
+    expected = _completed_migration_transition_binding(binding)
+    marker_bytes = _read_completed_migration_auth_file(
+        root, _COMPLETED_MIGRATION_CLAIM_MARKER_NAME, private=True,
+    )
+    if marker_bytes is None:
+        raise _completed_migration_claim_error()
+    marker = _strict_completed_migration_json(marker_bytes)
+    required = {
+        "schema", "migration_id", "backup", "receipt_sha256", "backup_manifest_sha256",
+        "browser_handover_version", "initial_admin_key_id",
+    }
+    if set(marker) != required or marker.get("schema") != 1:
+        raise _completed_migration_claim_error()
+    for key, value in expected.items():
+        if marker.get(key) != value:
+            raise _completed_migration_claim_error()
+    version, key_id = marker.get("browser_handover_version"), marker.get("initial_admin_key_id")
+    if (
+        not isinstance(version, str) or not version.strip() or len(version) > 160
+        or not isinstance(key_id, str) or not re.fullmatch(r"[0-9a-f-]{36}", key_id)
+    ):
+        raise _completed_migration_claim_error()
+
+    store_bytes = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_STORE_NAME, private=True)
+    history_bytes = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_HISTORY_NAME, private=False)
+    if store_bytes is None or history_bytes is None:
+        raise _completed_migration_claim_error()
+    raw_store = _strict_completed_migration_json(store_bytes)
+    try:
+        store = ApiKeyStore.from_str(store_bytes.decode("utf-8"))
+    except (PersistError, UnicodeDecodeError, ValueError) as error:
+        raise _completed_migration_claim_error() from error
+    if raw_store.get("version") != 3 or raw_store.get("browser_handover_claimed_version") != version:
+        raise _completed_migration_claim_error()
+    keys = raw_store.get("api_keys")
+    sessions = raw_store.get("ui_sessions")
+    if not isinstance(keys, list) or not isinstance(sessions, list):
+        raise _completed_migration_claim_error()
+    key_ids = [record.get("id") for record in keys if isinstance(record, dict)]
+    if len(key_ids) != len(keys) or len(set(key_ids)) != len(key_ids):
+        raise _completed_migration_claim_error()
+    initial = store.get_api_key(key_id)
+    if initial is None or initial.is_revoked or "admin" not in initial.scopes:
+        raise _completed_migration_claim_error()
+    active_hashes = {
+        record.id: record.secret_hash for record in store.api_keys if not record.is_revoked
+    }
+    for session in sessions:
+        if not isinstance(session, dict) or session.get("bootstrap") is True:
+            raise _completed_migration_claim_error()
+        session_key, session_hash = session.get("api_key_id"), session.get("api_key_secret_hash")
+        if not isinstance(session_key, str) or not isinstance(session_hash, str) or active_hashes.get(session_key) != session_hash:
+            raise _completed_migration_claim_error()
+
+    try:
+        lines = history_bytes.decode("utf-8").splitlines()
+        entries = [json.loads(line, object_pairs_hook=_strict_json_object) for line in lines]
+    except (UnicodeDecodeError, ValueError, TypeError) as error:
+        raise _completed_migration_claim_error() from error
+    if not lines or not history_bytes.endswith(b"\n"):
+        raise _completed_migration_claim_error()
+    initial_claim = False
+    remembered_claim = False
+    allowed_events = {
+        "store_loaded", "store_saved", "bootstrap_proof_created", "bootstrap_proof_cleared",
+        "bootstrap_exchange_created", "bootstrap_exchange_cleared", "api_key_created",
+        "ui_session_created", "api_key_updated", "api_key_rotated", "api_key_revoked", "api_key_deleted",
+    }
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) not in (
+            {"timestamp", "event", "reason", "store_file"},
+            {"timestamp", "event", "reason", "store_file", "details"},
+        ):
+            raise _completed_migration_claim_error()
+        details = entry.get("details", {})
+        if (
+            not _valid_completed_migration_timestamp(entry.get("timestamp"))
+            or entry.get("store_file") != _COMPLETED_MIGRATION_STORE_NAME
+            or entry.get("event") not in allowed_events
+            or not isinstance(entry.get("reason"), str)
+            or not isinstance(details, dict)
+        ):
+            raise _completed_migration_claim_error()
+        if entry["event"] == "api_key_created" and entry["reason"] == "initial_admin_created":
+            initial_claim = details.get("api_key_id") == key_id and details.get("browser_handover_version") == version
+        if entry["event"] == "ui_session_created" and entry["reason"] == "remembered_browser_session_created":
+            remembered_claim = remembered_claim or details.get("api_key_id") == key_id
+    if not initial_claim or not remembered_claim:
+        raise _completed_migration_claim_error()
 
 
 def _normalize_scopes(scopes: object) -> List[str]:
@@ -221,6 +595,7 @@ class ApiKeyStore(Persist):
         self.__bootstrap_proof_path: Optional[str] = None
         self.__bootstrap_proof: Optional[BootstrapProofRecord] = None
         self.__bootstrap_exchange: Optional[BootstrapExchangeRecord] = None
+        self.__completed_migration_transition_binding: Optional[Dict[str, str]] = None
 
     @property
     def file_path(self) -> Optional[str]:
@@ -232,6 +607,35 @@ class ApiKeyStore(Persist):
     def bind_bootstrap_proof_path(self, file_path: str) -> None:
         self.__bootstrap_proof_path = file_path
         self.__sync_bootstrap_proof_artifact()
+
+    def bind_completed_migration_claim_transition(self, binding: object) -> None:
+        if self.__file_path is None:
+            raise ValueError("Completed migration claim transition requires a bound auth store")
+        self.__completed_migration_transition_binding = _completed_migration_transition_binding(binding)
+
+    def complete_completed_migration_claim_transition(
+        self, initial_admin_key_id: object, browser_handover_version: object,
+    ) -> None:
+        binding = self.__completed_migration_transition_binding
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        if binding is None:
+            return
+        if not isinstance(initial_admin_key_id, str) or not version:
+            raise ValueError("Completed migration claim transition is unavailable")
+        record = self.get_api_key(initial_admin_key_id)
+        if (
+            record is None or record.is_revoked or "admin" not in record.scopes
+            or self.__browser_handover_claimed_version != version or self.__file_path is None
+        ):
+            raise ValueError("Completed migration claim transition is invalid")
+        payload: Dict[str, object] = {
+            "schema": 1,
+            **binding,
+            "browser_handover_version": version,
+            "initial_admin_key_id": record.id,
+        }
+        _write_completed_migration_claim_marker(Path(self.__file_path).parent, payload)
+        self.__completed_migration_transition_binding = None
 
     def __record_history_event(self, event: str, reason: str, **details: object) -> None:
         append_api_key_store_history(self.__file_path, event, reason, **details)

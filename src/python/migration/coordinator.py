@@ -22,6 +22,7 @@ from common import Config, PathPair, PathPairManager
 from controller import AutoQueuePersist, ControllerPersist
 from .backup_restore import (
     BackupRestoreError,
+    MANIFEST_NAME,
     create_retained_backup,
     resolve_backup,
     restore_backup,
@@ -169,6 +170,11 @@ def _handle_identity(descriptor_or_handle: int, *, windows_handle: bool = False)
 
 def _capture_root_identity(root: Path) -> tuple[int, ...]:
     if os.name == "posix":
+        info = root.lstat()
+        if root.is_symlink() or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Migration configuration root must be a real directory")
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise PermissionError("Migration configuration root must be owned by the effective user and not group/other writable")
         descriptor = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
         try:
             return _handle_identity(descriptor)
@@ -243,6 +249,7 @@ class MigrationDecision:
     features: tuple[MigrationFeature, ...] = ()
     error: str | None = None
     retryable: bool = False
+    completed_auth_phase: str | None = None
 
     @property
     def allows_normal_startup(self) -> bool:
@@ -332,6 +339,8 @@ class MigrationSpec:
     apply: Apply
     validate: Validate
     input_files: tuple[str, ...] = ()
+    validate_completed: Validate | None = None
+    validate_completed_claimed: Callable[[Path, Mapping[str, object]], None] | None = None
 
 
 _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
@@ -921,15 +930,55 @@ def _restrict_windows_handle_to_owner(handle: int) -> None:
     _verify_windows_handle_owner_only(handle)
 
 
-def _restrict_fd_to_owner(descriptor: int) -> None:
+def _restrict_fd_to_owner(
+    descriptor: int,
+    *,
+    mode: int = 0o600,
+) -> None:
+    """Require the opened object to have owner-only permissions.
+
+    Lock files are security-relevant coordination objects: an untrusted parent
+    may otherwise replace or unlink their inode and bypass exclusivity.  Every
+    migration file therefore fails closed when the backing filesystem cannot
+    prove the requested owner-only mode.
+    """
     if os.name == "posix":
-        os.fchmod(descriptor, 0o600)
+        os.fchmod(descriptor, mode)
         if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o077:
             raise PermissionError("Migration backup permissions are not owner-only")
         return
     import msvcrt
 
     _restrict_windows_handle_to_owner(msvcrt.get_osfhandle(descriptor))
+    return
+
+
+def _verify_fd_owner_only(descriptor: int) -> None:
+    """Verify a private descriptor without changing the object being read."""
+    if os.name == "posix":
+        info = os.fstat(descriptor)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise PermissionError("Migration backup permissions are not owner-only")
+        return
+    import msvcrt
+
+    _verify_windows_handle_owner_only(msvcrt.get_osfhandle(descriptor))
+
+
+def _verify_lock_descriptor(path: Path, root: Path, descriptor: int) -> None:
+    """Bind a lock fd to the currently anchored root path before trusting it."""
+    if os.name != "posix":
+        return
+    info = os.fstat(descriptor)
+    path_info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+        or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)
+    ):
+        raise PermissionError("Migration lock has unsafe identity or ownership")
+    _verify_transaction_root(root, _capture_root_identity(root))
 
 
 def _safe_directory(path: Path, root: Path, *, create: bool = False, private: bool = False) -> Path:
@@ -972,9 +1021,7 @@ def _make_private_directory(path: Path, root: Path) -> None:
                 dir_fd=directory_fd,
             )
             try:
-                os.fchmod(descriptor, 0o700)
-                if stat.S_IMODE(os.fstat(descriptor).st_mode) & 0o077:
-                    raise PermissionError("Migration backup directory permissions are not owner-only")
+                _restrict_fd_to_owner(descriptor, mode=0o700)
             finally:
                 os.close(descriptor)
             return
@@ -1005,7 +1052,7 @@ def _read_bytes(
         if info.st_size > max_bytes:
             raise ValueError("Migration input exceeds the size limit")
         if owner_only:
-            _restrict_fd_to_owner(descriptor)
+            _verify_fd_owner_only(descriptor)
         with os.fdopen(descriptor, "rb", closefd=False) as handle:
             payload = handle.read(max_bytes + 1)
         if len(payload) > max_bytes:
@@ -1218,14 +1265,35 @@ def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
 
 
 def _validate_v086_result(config_dir: Path) -> None:
+    _validate_v086_core_result(config_dir)
+    auth_state_paths = tuple(config_dir / name for name in ("api-keys.json", "api-keys.history.jsonl"))
+    if any(path.exists() or path.is_symlink() for path in auth_state_paths):
+        raise ValueError("Migration must not initialize administrator credentials")
+
+
+def _validate_v086_core_result(config_dir: Path) -> None:
     Config.from_str(_read_text(config_dir / "settings.cfg", config_dir))
     collection = PathPairManager(str(config_dir)).from_str(_read_text(config_dir / "path_pairs.json", config_dir))
     if len(collection.path_pairs) != 1 or collection.path_pairs[0].name != "Default":
         raise ValueError("Migration must create exactly one Default path pair")
     ControllerPersist.from_str(_read_text(config_dir / "controller.persist", config_dir))
     AutoQueuePersist.from_str(_read_text(config_dir / "autoqueue.persist", config_dir))
-    if (config_dir / "api-keys.json").exists():
-        raise ValueError("Migration must not initialize administrator credentials")
+
+
+def _validate_v086_completed_lineage_result(config_dir: Path) -> None:
+    # Import lazily: ``web`` also exposes migration runtime classes, so an
+    # eager package import here would create a coordinator/web import cycle.
+    from web.auth_store import validate_completed_migration_preclaim_auth_state
+
+    _validate_v086_core_result(config_dir)
+    validate_completed_migration_preclaim_auth_state(config_dir)
+
+
+def _validate_v086_completed_claimed_lineage_result(config_dir: Path, binding: Mapping[str, object]) -> None:
+    from web.auth_store import validate_completed_migration_claimed_auth_state
+
+    _validate_v086_core_result(config_dir)
+    validate_completed_migration_claimed_auth_state(config_dir, dict(binding))
 
 
 def default_migration_registry() -> tuple[MigrationSpec, ...]:
@@ -1239,6 +1307,8 @@ def default_migration_registry() -> tuple[MigrationSpec, ...]:
         ),
         fingerprint=_legacy_v086_fingerprint, apply=_apply_v086, validate=_validate_v086_result,
         input_files=("settings.cfg", "controller.persist", "autoqueue.persist"),
+        validate_completed=_validate_v086_completed_lineage_result,
+        validate_completed_claimed=_validate_v086_completed_claimed_lineage_result,
     ),)
 
 
@@ -1417,8 +1487,10 @@ class MigrationCoordinator:
                     owner_control=os.name == "nt",
                 )
                 _restrict_fd_to_owner(descriptor)
+                _verify_lock_descriptor(self.lock_path, self.config_dir, descriptor)
                 os.write(descriptor, lock_bytes)
                 os.fsync(descriptor)
+                _verify_lock_descriptor(self.lock_path, self.config_dir, descriptor)
                 attempt = int(metadata.get("attempt", 0)) + 1
                 recorded_backup = metadata.get("backup")
                 if isinstance(recorded_backup, str):
@@ -1462,7 +1534,11 @@ class MigrationCoordinator:
                     attempt=attempt, backup=backup_dir.relative_to(self.config_dir).as_posix(),
                     receipt_version=1, completed_at=_utc_now(),
                 )
-                return complete
+                return MigrationDecision(
+                    state=complete.state, migration_id=complete.migration_id, source_schema=complete.source_schema,
+                    target_schema=complete.target_schema, features=complete.features, error=complete.error,
+                    retryable=complete.retryable, completed_auth_phase="preclaim",
+                )
             except FileExistsError:
                 raise MigrationBlockedError(self.preflight())
             except MigrationBlockedError:
@@ -1531,8 +1607,10 @@ class MigrationCoordinator:
                         owner_control=os.name == "nt",
                     )
                     _restrict_fd_to_owner(descriptor)
+                    _verify_lock_descriptor(self.lock_path, self.config_dir, descriptor)
                     os.write(descriptor, lock_bytes)
                     os.fsync(descriptor)
+                    _verify_lock_descriptor(self.lock_path, self.config_dir, descriptor)
                     with _mutation_parent(backup_dir / "data" / ".restore-anchor", self.config_dir):
                         return restore_backup(self.config_dir, backup_dir)
                 finally:
@@ -1545,6 +1623,20 @@ class MigrationCoordinator:
         if not decision.allows_normal_startup:
             raise MigrationBlockedError(decision)
         return decision
+
+    def completed_auth_transition_binding(self) -> dict[str, str]:
+        """Return a receipt-bound claim capability only for validated pre-claim startup."""
+        decision = self.preflight()
+        if decision.state != MigrationState.COMPLETE or decision.completed_auth_phase != "preclaim":
+            raise MigrationBlockedError(decision)
+        with _root_transaction(self.config_dir, self._root_identity):
+            metadata = self._read_metadata()
+            spec = self._spec(decision.migration_id)
+            if metadata is None or spec is None or not isinstance(metadata.get("backup"), str):
+                raise MigrationBlockedError(self._failure_decision(None, "Completed migration lineage is invalid", False))
+            backup = self.config_dir / cast(str, metadata["backup"])
+            _validate_manifest(backup, self.config_dir, spec)
+            return self._completed_auth_binding(metadata, backup)
 
     def legacy_web_port(self, default: int = 8800) -> int:
         """Read only the bounded legacy Web port needed by migration mode."""
@@ -1614,8 +1706,19 @@ class MigrationCoordinator:
         if not valid_receipt:
             return self._failure_decision(None, "Completed migration lineage is invalid", False)
         try:
-            last_spec.validate(self.config_dir)
-            _validate_manifest(self.config_dir / cast(str, expected_backup), self.config_dir, last_spec)
+            backup_dir = self.config_dir / cast(str, expected_backup)
+            _validate_manifest(backup_dir, self.config_dir, last_spec)
+            binding = self._completed_auth_binding(metadata, backup_dir)
+            from web.auth_store import completed_migration_claim_marker_exists
+            claimed = completed_migration_claim_marker_exists(self.config_dir)
+            if claimed:
+                if last_spec.validate_completed_claimed is None:
+                    raise ValueError("Completed migration has an unsupported claimed auth phase")
+                last_spec.validate_completed_claimed(self.config_dir, binding)
+                phase = "claimed"
+            else:
+                (last_spec.validate_completed or last_spec.validate)(self.config_dir)
+                phase = "preclaim"
         except Exception as exc:
             return self._failure_decision(
                 last_spec.migration_id,
@@ -1627,7 +1730,29 @@ class MigrationCoordinator:
             if next_spec.source_schema != last_spec.target_schema or not next_spec.fingerprint(self.config_dir):
                 return self._failure_decision(None, "Completed migration lineage does not match configuration", False)
             return self._decision_for_spec(MigrationState.REQUIRED, next_spec)
-        return self._decision_for_spec(MigrationState.COMPLETE, last_spec)
+        decision = self._decision_for_spec(MigrationState.COMPLETE, last_spec)
+        return MigrationDecision(
+            state=decision.state, migration_id=decision.migration_id, source_schema=decision.source_schema,
+            target_schema=decision.target_schema, features=decision.features, error=decision.error,
+            retryable=decision.retryable, completed_auth_phase=phase,
+        )
+
+    def _completed_auth_binding(self, metadata: Mapping[str, object], backup_dir: Path) -> dict[str, str]:
+        migration_id = metadata.get("migration_id")
+        backup = metadata.get("backup")
+        if not isinstance(migration_id, str) or not isinstance(backup, str):
+            raise ValueError("Completed migration receipt binding is invalid")
+        # The receipt and already-validated manifest are read-only binding
+        # inputs. Do not tighten their descriptors here: the same validation
+        # must work from the contained read-only product verifier.
+        receipt = _read_bytes(self.metadata_path, self.config_dir, _MAX_JSON_BYTES)
+        manifest = _read_bytes(backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES)
+        return {
+            "migration_id": migration_id,
+            "backup": backup,
+            "receipt_sha256": hashlib.sha256(receipt).hexdigest(),
+            "backup_manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+        }
 
     def _lock_state(self, migration_id: str | None) -> str:
         if not self.lock_path.exists():

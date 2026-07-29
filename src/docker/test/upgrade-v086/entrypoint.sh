@@ -1,5 +1,6 @@
 #!/bin/sh
 set -eu
+umask 077
 
 CONFIG_DIR=${SEEDSYNC_CONFIG_DIR:-/config}
 HTML_DIR=${SEEDSYNC_HTML_DIR:-/app/html}

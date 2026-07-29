@@ -24,6 +24,7 @@ class RuntimeExclusion:
             _capture_root_identity,
             _open_anchored,
             _restrict_fd_to_owner,
+            _verify_lock_descriptor,
         )
 
         self.root = Path(os.path.abspath(config_root))
@@ -47,7 +48,12 @@ class RuntimeExclusion:
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise RuntimeExclusionError("SeedSync runtime lock has unsafe provenance")
             _restrict_fd_to_owner(descriptor)
+            _verify_lock_descriptor(self.path, self.root, descriptor)
             self._lock_descriptor(descriptor)
+            # Rebind the acquired OS lock to the anchored path after waiting:
+            # another same-owner process may have replaced the path while this
+            # descriptor was blocked in flock/locking.
+            _verify_lock_descriptor(self.path, self.root, descriptor)
             os.lseek(descriptor, 0, os.SEEK_SET)
             os.ftruncate(descriptor, 0)
             os.write(descriptor, payload)
