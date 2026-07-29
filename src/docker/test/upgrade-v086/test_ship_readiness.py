@@ -589,6 +589,55 @@ class ShipReadinessTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, "browser/API evidence has errors"):
                         HARNESS.assert_browser_evidence(source, output)
 
+    def test_browser_reuse_evidence_requires_the_r31i_bounded_restart_cluster(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, output = root / "browser-reuse.json", root / "contract.json"
+            transition = {
+                "kind": "restart-armed-sse-transport-cluster",
+                "classification": "expected-bounded-restart-transport-cluster",
+                "totalCount": 5, "sseEventCount": 3, "badGateway502Count": 2,
+                "firstGeneration": 2, "lastGeneration": 6,
+                "firstObservedAfterMs": 43540, "lastObservedAfterMs": 53999, "clusterMaximumEvents": 8, "clusterMaximumMs": 15000,
+                "recoveryStatus": 200, "modelRows": 4,
+                "stopDispatchProof": {"schema": 1, "run_id": "r31i", "stability_generation": 1, "arm_generation": 2,
+                                      "acknowledged_error_generation": 1, "restart_stop_dispatched": True,
+                                      "stop_dispatch_epoch_ms": 1700000000100, "acknowledgedEpochMs": 1700000000000},
+                "sameOriginProof": {
+                    "origin": "http://127.0.0.1:18820", "pathname": "/server/stream",
+                    "resource502Locations": [
+                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 3, "responseObservedAfterMs": 49911},
+                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 5, "responseObservedAfterMs": 50200},
+                    ],
+                    "recoveryOrigin": "http://127.0.0.1:18820", "recoveryPathname": "/server/stream",
+                    "recoveryStatus": 200, "recoveryObservedAfterMs": 50300,
+                },
+            }
+            baseline = {
+                "errors": [], "runtimeErrors": [], "diagnosticFailures": [],
+                "api": {"restart-status": {"status": 200}, "restart-settings": {"status": 200}},
+                "visibleFixtureRows": {"fixture": True}, "expectedTransitions": [transition],
+                "streamTransitionEvidence": [dict(transition)], "postReuseQuiet": {"quietWindowMs": 1500, "errorGeneration": 6},
+            }
+            source.write_text(json.dumps(baseline), encoding="utf-8")
+            HARNESS.assert_browser_evidence(source, output, reuse=True)
+            invalid_payloads = (
+                {**baseline, "expectedTransitions": []},
+                {**baseline, "expectedTransitions": [{**transition, "sseEventCount": 0}]},
+                {**baseline, "expectedTransitions": [{**transition, "totalCount": 9, "sseEventCount": 7}]},
+                {**baseline, "expectedTransitions": [{**transition, "badGateway502Count": 3}]},
+                {**baseline, "expectedTransitions": [{**transition, "lastObservedAfterMs": 58541}]},
+                {**baseline, "expectedTransitions": [{key: value for key, value in transition.items() if key != "sameOriginProof"}]},
+                {**baseline, "expectedTransitions": [{**transition, "sameOriginProof": {**transition["sameOriginProof"], "recoveryOrigin": "https://foreign.invalid"}}]},
+                {**baseline, "streamTransitionEvidence": []},
+                {**baseline, "streamTransitionEvidence": [{**transition, "sameOriginProof": {**transition["sameOriginProof"], "recoveryPathname": "/other"}}]},
+            )
+            for payload in invalid_payloads:
+                source.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(payload=payload):
+                    with self.assertRaisesRegex(ValueError, "browser restart transport evidence"):
+                        HARNESS.assert_browser_evidence(source, output, reuse=True)
+
     def test_browser_harness_captures_event_metadata_synchronously_and_safely(self):
         browser = BROWSER_PATH.read_text(encoding="utf-8")
         self.assertIn("captureBrowserDiagnostic('console-error'", browser)
@@ -667,20 +716,85 @@ class ShipReadinessTests(unittest.TestCase):
             "browser-stability-invalid.json",
             "stability.error_generation",
             "parsed.stability_generation !== stability.error_generation",
+            "async function waitForRestartArm(stability)",
+            "browser-restart-arm.json",
+            "browser-restart-arm-ack.json",
+            "async function waitForRestartRequest(stability, arm)",
+            "parsed.arm_generation !== arm.arm_generation",
         ):
             self.assertIn(marker, browser)
         for marker in (
             "request_browser_stability()",
             "wait_browser_stability_ready()",
+            "arm_browser_restart()",
+            "wait_browser_restart_arm_ack()",
             "browser-stability-request.json",
             "browser-stability-ready.json",
+            "browser-restart-arm.json",
+            "browser-restart-arm-ack.json",
             "stability_generation",
+            "arm_generation",
         ):
             self.assertIn(marker, launcher)
         self.assertLess(launcher.index('request_browser_stability "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
         self.assertLess(launcher.index('wait_browser_stability_ready "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
+        self.assertLess(launcher.index('arm_browser_restart "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
+        self.assertLess(launcher.index('wait_browser_restart_arm_ack "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
         finish = launcher[launcher.index("finish_browser_claim_reuse()") : launcher.index("browser_dispatch_self_check()")]
         self.assertLess(finish.index('"stability_generation": int(generation)'), finish.index('wait "$BROWSER_SESSION_PID"'))
+        self.assertLess(finish.index('"arm_generation": int(arm_generation)'), finish.index('wait "$BROWSER_SESSION_PID"'))
+
+    def test_browser_restart_arm_protocol_accepts_only_the_bounded_r31i_cluster(self):
+        browser = BROWSER_PATH.read_text(encoding="utf-8")
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "function parseRestartArm(parsed, stability)",
+            "parsed.run_id !== screenshotRunId",
+            "parsed.stability_generation !== stability.error_generation",
+            "parsed.arm_generation !== stability.error_generation + 1",
+            "function isArmedRestartSseTransportError(error, arm)",
+            "error.observed_at_epoch_ms >= arm.stop_dispatch_epoch_ms",
+            "function restart502StreamLocation(error, arm, usedResponses)",
+            "Failed to load resource: the server responded with a status of 502 (Bad Gateway)",
+            "location.origin !== arm.origin || location.pathname !== '/server/stream'",
+            "restartClusterMaximumEvents = 8",
+            "restartClusterMaximumMs = 15000",
+            "restartTransportResponseCorrelationMs = 1000",
+            "async function restartClusterEntries(stability, arm)",
+            "error.error_generation !== arm.arm_generation + index",
+            "restart-arm-cluster-over-cap",
+            "restart-arm-cluster-unexpected-diagnostic",
+            "restart-arm-cluster-wrong-generation",
+            "restart-arm-cluster-window-exceeded",
+            "async function finalizeArmedRestartTransport(stability, arm, deadline)",
+            "restart-request-missing-expected-sse-event",
+            "restart-request-missing-stream-recovery",
+            "restart-arm-post-classification-error",
+            "restart-request-wrong-run-or-generation",
+            "browser-stability-invalid.json",
+            "browser-restart-invalid.json",
+            "kind: 'restart-armed-sse-transport-cluster'",
+            "classification: 'expected-bounded-restart-transport-cluster'",
+            "totalCount: validatedEntries.length",
+            "sseEventCount: validatedEntries.length - resourceEntries.length",
+            "badGateway502Count: resourceEntries.length",
+            "sameOriginProof:",
+            "recoveryStatus: recovery.status",
+            "for (const entry of validatedEntries) runtimeErrors.splice(runtimeErrors.indexOf(entry.error), 1)",
+        ):
+            self.assertIn(marker, browser)
+        for marker in (
+            "expected_ack = expected_arm | {\"acknowledged\", \"acknowledged_error_generation\", \"acknowledged_epoch_ms\"}",
+            "browser restart arm acknowledgement is invalid",
+            "report_browser_restart_invalidation",
+            "browser-reuse.json",
+        ):
+            self.assertIn(marker, launcher)
+        self.assertLess(browser.index("async function waitForRestartArm(stability)"), browser.index("async function waitForRestartRequest(stability, arm)"))
+        handoff = browser[browser.index("const arm = await waitForRestartArm(stability);"):]
+        self.assertLess(handoff.index("const arm = await waitForRestartArm(stability);"), handoff.index("await waitForRestartRequest(stability, arm);"))
+        self.assertLess(browser.index("await finalizeArmedRestartTransport(stability, arm, deadline);"), handoff.index("await runReuse();") + browser.index("const arm = await waitForRestartArm(stability);"))
+        self.assertLess(handoff.index("const reuse = await runReuse();"), handoff.index("const postReuseQuiet = await waitForPostReuseQuiet(stability, arm);"))
 
     def test_browser_stability_request_timestamp_validator_matches_emitted_contract(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")

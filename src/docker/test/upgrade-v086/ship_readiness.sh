@@ -465,14 +465,92 @@ if (not isinstance(value, dict) or set(value) != expected or value.get("schema")
 print(value["error_generation"])
 PY
 }
-finish_browser_claim_reuse() {
-  local evidence="$1" status generation
-  [[ "$BROWSER_SESSION_REAPED" == 0 && "$evidence" == "$BROWSER_SESSION_EVIDENCE" ]] || die "browser-session parent state is unavailable"
-  generation="$(wait_browser_stability_ready "$ACTIVE_RUN_ID" "$evidence")" || die "browser stability generation is unavailable"
-  python - "$ACTIVE_RUN_ID" "$generation" "$evidence/browser-restart-request.json" <<'PY'
+report_browser_restart_invalidation() {
+  local evidence="$1" name
+  for name in browser-stability-invalid.json browser-restart-invalid.json; do
+    if [[ -f "$evidence/$name" ]]; then
+      printf 'browser restart handoff invalidation (%s):\n' "$name" >&2
+      cat "$evidence/$name" >&2
+      return 0
+    fi
+  done
+  return 1
+}
+arm_browser_restart() {
+  local id="$1" evidence="$2" generation="$3" output="$2/browser-restart-arm.json"
+  python - "$id" "$generation" "$output" <<'PY'
 import json, os, sys
 run_id, generation, output = sys.argv[1:]
-payload = {"schema": 1, "run_id": run_id, "stability_generation": int(generation), "restart_requested": True}
+payload = {"schema": 1, "run_id": run_id, "stability_generation": int(generation), "arm_generation": int(generation) + 1, "restart_armed": True}
+temporary = output + ".tmp"
+with open(temporary, "x", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+print(payload["arm_generation"])
+PY
+}
+wait_browser_restart_arm_ack() {
+  local id="$1" evidence="$2" generation="$3" arm_generation="$4" attempts=0 arm="$2/browser-restart-arm.json" ack="$2/browser-restart-arm-ack.json"
+  [[ "$BROWSER_SESSION_REAPED" == 0 && "$evidence" == "$BROWSER_SESSION_EVIDENCE" ]] || die "browser-session parent state is unavailable"
+  until [[ -f "$ack" ]]; do
+    if ! browser_session_is_known_live_child; then
+      report_browser_restart_invalidation "$evidence" || true
+      cleanup_browser_claim_reuse
+      die "in-memory browser session exited before restart arm acknowledgement; see $evidence/browser-session.log"
+    fi
+    attempts=$((attempts + 1)); (( attempts < 240 )) || { report_browser_restart_invalidation "$evidence" || true; cleanup_browser_claim_reuse; die "browser restart arm acknowledgement did not become ready"; }
+    sleep .5
+  done
+  if ! python - "$id" "$generation" "$arm_generation" "$arm" "$ack" <<'PY'
+import json, sys
+run_id, generation, arm_generation, arm_path, ack_path = sys.argv[1:]
+generation, arm_generation = int(generation), int(arm_generation)
+arm = json.load(open(arm_path, encoding="utf-8"))
+ack = json.load(open(ack_path, encoding="utf-8"))
+expected_arm = {"schema", "run_id", "stability_generation", "arm_generation", "restart_armed"}
+expected_ack = expected_arm | {"acknowledged", "acknowledged_error_generation", "acknowledged_epoch_ms"}
+if (not isinstance(arm, dict) or set(arm) != expected_arm or arm != {"schema": 1, "run_id": run_id, "stability_generation": generation, "arm_generation": arm_generation, "restart_armed": True}):
+    raise SystemExit("browser restart arm is invalid")
+if (not isinstance(ack, dict) or set(ack) != expected_ack or ack.get("schema") != 1 or ack.get("run_id") != run_id
+        or ack.get("stability_generation") != generation or ack.get("arm_generation") != arm_generation
+        or ack.get("restart_armed") is not True or ack.get("acknowledged") is not True
+        or ack.get("acknowledged_error_generation") != generation
+        or type(ack.get("acknowledged_epoch_ms")) is not int or ack["acknowledged_epoch_ms"] <= 0):
+    raise SystemExit("browser restart arm acknowledgement is invalid")
+PY
+  then
+    report_browser_restart_invalidation "$evidence" || true
+    cleanup_browser_claim_reuse
+    die "browser restart arm acknowledgement is invalid"
+  fi
+}
+publish_browser_restart_stop_dispatch() {
+  local id="$1" evidence="$2" generation="$3" arm_generation="$4" ack="$2/browser-restart-arm-ack.json" output="$2/browser-restart-stop-dispatch.json"
+  python - "$id" "$generation" "$arm_generation" "$ack" "$output" <<'PY'
+import json, os, sys, time
+run_id, generation, arm_generation, ack_path, output = sys.argv[1:]
+generation, arm_generation = int(generation), int(arm_generation)
+ack = json.load(open(ack_path, encoding="utf-8"))
+if (not isinstance(ack, dict) or ack.get("schema") != 1 or ack.get("run_id") != run_id
+        or ack.get("stability_generation") != generation or ack.get("arm_generation") != arm_generation
+        or ack.get("acknowledged") is not True or ack.get("acknowledged_error_generation") != generation):
+    raise SystemExit("browser restart arm acknowledgement is invalid before stop dispatch")
+payload = {"schema": 1, "run_id": run_id, "stability_generation": generation, "arm_generation": arm_generation,
+           "acknowledged_error_generation": generation, "restart_stop_dispatched": True,
+           "stop_dispatch_epoch_ms": time.time_ns() // 1_000_000}
+temporary = output + ".tmp"
+with open(temporary, "x", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+PY
+}
+finish_browser_claim_reuse() {
+  local evidence="$1" generation="$2" arm_generation="$3" status
+  [[ "$BROWSER_SESSION_REAPED" == 0 && "$evidence" == "$BROWSER_SESSION_EVIDENCE" ]] || die "browser-session parent state is unavailable"
+  python - "$ACTIVE_RUN_ID" "$generation" "$arm_generation" "$evidence/browser-restart-request.json" <<'PY'
+import json, os, sys
+run_id, generation, arm_generation, output = sys.argv[1:]
+payload = {"schema": 1, "run_id": run_id, "stability_generation": int(generation), "arm_generation": int(arm_generation), "restart_requested": True}
 temporary = output + ".tmp"
 with open(temporary, "x", encoding="utf-8") as stream:
     json.dump(payload, stream, sort_keys=True); stream.write("\n")
@@ -480,8 +558,14 @@ os.chmod(temporary, 0o600); os.replace(temporary, output)
 PY
   if wait "$BROWSER_SESSION_PID"; then status=0; else status="$?"; fi
   if [[ "$status" -ne 0 ]]; then
+    report_browser_restart_invalidation "$evidence" || true
     cleanup_browser_claim_reuse
     die "in-memory browser reuse session failed; see $evidence/browser-session.log"
+  fi
+  if [[ ! -f "$evidence/browser-reuse.json" ]]; then
+    report_browser_restart_invalidation "$evidence" || true
+    cleanup_browser_claim_reuse
+    die "in-memory browser reuse session did not retain browser-reuse evidence"
   fi
   cleanup_browser_claim_reuse
 }
@@ -1904,14 +1988,18 @@ full() {
   # current container is stopped.  Claim-ready only means the shell can begin
   # this checkpoint; it is not authorization to consume the restart handoff.
   request_browser_stability "$id" "$(evidence_dir "$id")"
-  wait_browser_stability_ready "$id" "$(evidence_dir "$id")" >/dev/null
+  local stability_generation restart_arm_generation
+  stability_generation="$(wait_browser_stability_ready "$id" "$(evidence_dir "$id")")" || die "browser stability generation is unavailable"
+  restart_arm_generation="$(arm_browser_restart "$id" "$(evidence_dir "$id")" "$stability_generation")" || die "browser restart arm generation is unavailable"
+  wait_browser_restart_arm_ack "$id" "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
   python "$HELPER" assert-browser --input "$(evidence_dir "$id")/browser.json" --output "$(evidence_dir "$id")/after-browser-claim-contract.json"
   capture_volume_helper_output "$id" "$(evidence_dir "$id")/current-model-contract.json" assert-current-model --before-settings "$retained_backup_dir/data/settings.cfg" --path-pairs /config/path_pairs.json --browser /evidence/ship-readiness/browser.json --fixture /evidence/fixture-evidence.json
+  publish_browser_restart_stop_dispatch "$id" "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
   stop_container "$id" migration-current-restart-stop migration-current-restart-stop "seedsync-upgrade-v086-current-${id,,}"
   current_product_claimed_auth_contract "$id"
   bounded_command "$id" migration-current-restart-start current-restart "$(timeout_seconds SEEDSYNC_SHIP_CONTAINER_TIMEOUT_SECONDS 90)" "$(evidence_dir "$id")/current-restart.txt" docker start "seedsync-upgrade-v086-current-${id,,}"
   wait_normal_runtime_readiness "$current" "$(evidence_dir "$id")/after-restart-claimed-auth.json" "$id" migration-current-restart-status "seedsync-upgrade-v086-current-${id,,}"
-  finish_browser_claim_reuse "$(evidence_dir "$id")"
+  finish_browser_claim_reuse "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
   python "$HELPER" assert-browser --input "$(evidence_dir "$id")/browser-reuse.json" --output "$(evidence_dir "$id")/after-browser-restart-contract.json" --reuse
   capture_volume_helper_output "$id" "$(evidence_dir "$id")/autoqueue-contract.json" assert-autoqueue --before-settings "$retained_backup_dir/data/settings.cfg" --persist /config/autoqueue.persist --browser /evidence/ship-readiness/browser-reuse.json --fixture /evidence/fixture-evidence.json --controller /config/controller.persist
   printf 'controller.persist and autoqueue.persist preserved across current restart\n' > "$(evidence_dir "$id")/current-restart-persist.txt"
