@@ -1226,7 +1226,8 @@ def assert_browser_evidence(source: Path, output: Path, *, reuse: bool = False) 
         or not isinstance(diagnostic_failures, list)
         or diagnostic_failures
         or not isinstance(api, dict)
-        or any(value.get("status") != 200 for value in api.values() if isinstance(value, dict))
+        or not api
+        or any(not isinstance(value, dict) or value.get("status") != 200 for value in api.values())
     ):
         raise ValueError("browser/API evidence has errors")
     if not isinstance(visible, dict) or not visible or not all(visible.values()):

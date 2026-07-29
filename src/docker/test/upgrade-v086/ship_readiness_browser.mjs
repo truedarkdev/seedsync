@@ -64,6 +64,7 @@ const diagnosticFailures = [];
 const expectedTransitions = [];
 const streamConnections = [];
 const streamTransitionEvidence = [];
+const apiEvidence = {};
 const navigation = [];
 const browserStartedAt = Date.now();
 const sseReconnectMinimumMs = 2800;
@@ -107,7 +108,8 @@ function redact(value) {
 async function writeEvidence(payload, name = evidenceName) {
   await flushBrowserDiagnostics();
   const target = path.join(evidenceDir, name);
-  fs.writeFileSync(target, redact(JSON.stringify({ errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence, firstClaimSseRecovery: validatedFirstClaimSseRecovery, firstClaimSseRecoveryFailure, navigation, ...payload }, null, 2)), { mode: 0o600 });
+  const mergedApiEvidence = { ...apiEvidence, ...(payload.api && typeof payload.api === 'object' ? payload.api : {}) };
+  fs.writeFileSync(target, redact(JSON.stringify({ errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence, firstClaimSseRecovery: validatedFirstClaimSseRecovery, firstClaimSseRecoveryFailure, navigation, ...payload, api: mergedApiEvidence }, null, 2)), { mode: 0o600 });
   fs.chmodSync(target, 0o600);
 }
 
@@ -455,7 +457,7 @@ async function establishPreRestartStability(request) {
     diagnostic_failure_count: diagnosticFailures.length, model_rows: modelRows, status: 200,
     stability_window_ms: sseStabilityWindowMs, ready_at: new Date().toISOString(),
   };
-  await writeEvidence({ browserStability: ready });
+  await writeEvidence({ browserStability: ready }, 'browser-stability.json');
   fs.writeFileSync(path.join(evidenceDir, 'browser-stability-ready.json'), `${JSON.stringify(ready)}\n`, { mode: 0o600, flag: 'wx' });
   return ready;
 }
@@ -747,6 +749,11 @@ async function requireApi(label, endpoint) {
     const response = await fetch(path, { credentials: 'same-origin' });
     return response.status;
   }, endpoint);
+  apiEvidence[label] = {
+    endpoint,
+    status,
+    readiness: status === 200 ? 'API HTTP 200' : 'API request failed',
+  };
   if (status !== 200) {
     const failure = await captureFailure(`${label}-api`, new Error(`${endpoint} HTTP ${status}`));
     navigation.push({ label: `${label}-api`, endpoint, responseStatus: status, readiness: 'failed', failure });
