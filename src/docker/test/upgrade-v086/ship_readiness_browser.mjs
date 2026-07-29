@@ -74,6 +74,13 @@ const sseReconnectMinimumMs = 2800;
 const sseReconnectMaximumMs = 25000;
 const sseRecoveryPollMs = 200;
 const sseStabilityWindowMs = 1500;
+// A restart can produce the app SSE diagnostic, one proxy 502 for that same
+// stream, then the app SSE diagnostic again. Keep the authorized cluster
+// deliberately small and short rather than accepting an open-ended outage.
+const restartClusterMaximumEvents = 8;
+const restartClusterMaximumMs = 15000;
+const restartTransportResponseCorrelationMs = 1000;
+const postReuseQuietWindowMs = 1500;
 const secretExposureSelector = [
   'input', 'textarea', '[contenteditable="true"]', '.secret-value',
   '[class*="password" i]', '[class*="secret" i]', '[class*="token" i]', '[class*="api" i]', '[class*="credential" i]',
@@ -97,6 +104,7 @@ let claimPhase = 'not-started';
 let firstClaimSseRecoveryPromise = null;
 let validatedFirstClaimSseRecovery = null;
 let firstClaimSseRecoveryFailure = null;
+let restartArm = null;
 
 function redact(value) {
   const result = spawnSync('python', [evidenceHelper, 'redact-stdin'], {
@@ -140,6 +148,8 @@ page.on('response', response => {
     const contentType = response.headers()['content-type'] || '';
     const connection = {
       observedAfterMs: Date.now() - browserStartedAt,
+      origin: url.origin,
+      pathname: url.pathname,
       status: response.status(),
       contentType: contentType.startsWith('text/event-stream') ? 'text/event-stream' : 'other',
     };
@@ -236,7 +246,9 @@ function captureBrowserDiagnostic(kind, readEvent) {
   const location = event?.location || {};
   const envelope = {
     kind,
+    error_generation: browserErrorGeneration,
     observedAfterMs: Date.now() - browserStartedAt,
+    observed_at_epoch_ms: Date.now(),
     claimClassification,
     claimPhase,
     classification: 'captured-redacted',
@@ -762,23 +774,242 @@ async function requireApi(label, endpoint) {
   navigation.push({ label: `${label}-api`, endpoint, responseStatus: status, readiness: 'API HTTP 200' });
 }
 
-async function waitForRestartRequest(stability) {
+async function writeRestartInvalidation(reason, stability, arm = restartArm) {
+  if (fs.existsSync(path.join(evidenceDir, 'browser-restart-invalid.json'))) return;
+  await writeEvidence({ browserRestartInvalidated: {
+    reason, ready_generation: stability.error_generation, error_generation: browserErrorGeneration,
+    arm_generation: arm?.arm_generation ?? null, acknowledged_error_generation: arm?.acknowledged_error_generation ?? null,
+    runtime_error_count: runtimeErrors.length, diagnostic_failure_count: diagnosticFailures.length,
+  } }, 'browser-restart-invalid.json');
+}
+
+function parseRestartArm(parsed, stability) {
+  const expected = ['arm_generation', 'restart_armed', 'run_id', 'schema', 'stability_generation'];
+  if (!parsed || Object.keys(parsed).sort().join(',') !== expected.join(',') || parsed.schema !== 1 || parsed.run_id !== screenshotRunId
+      || parsed.stability_generation !== stability.error_generation || parsed.arm_generation !== stability.error_generation + 1
+      || parsed.restart_armed !== true) {
+    throw new Error('restart arm does not match current browser stability generation');
+  }
+  return parsed;
+}
+
+function parseRestartStopDispatch(parsed, stability, arm) {
+  const expected = ['acknowledged_error_generation', 'arm_generation', 'restart_stop_dispatched', 'run_id', 'schema', 'stability_generation', 'stop_dispatch_epoch_ms'];
+  if (!parsed || Object.keys(parsed).sort().join(',') !== expected.join(',') || parsed.schema !== 1 || parsed.run_id !== screenshotRunId
+      || parsed.stability_generation !== stability.error_generation || parsed.arm_generation !== arm.arm_generation
+      || parsed.acknowledged_error_generation !== arm.acknowledged_error_generation || parsed.restart_stop_dispatched !== true
+      || !Number.isInteger(parsed.stop_dispatch_epoch_ms) || parsed.stop_dispatch_epoch_ms < arm.acknowledged_epoch_ms) {
+    throw new Error('restart stop dispatch marker does not match the acknowledged arm');
+  }
+  return parsed;
+}
+
+function isArmedRestartSseTransportError(error, arm) {
+  return error.kind === 'console-error'
+    && error.message === 'Error in stream: %O Event'
+    && error.source === 'error'
+    && error.claimClassification === 'first-claim-bootstrap'
+    && error.claimPhase === 'post-claim-complete'
+    && error.observed_at_epoch_ms >= arm.stop_dispatch_epoch_ms;
+}
+
+function restart502StreamLocation(error, arm, usedResponses) {
+  if (error.kind !== 'console-error' || error.source !== 'error'
+      || error.message !== 'Failed to load resource: the server responded with a status of 502 (Bad Gateway)'
+      || error.claimClassification !== 'first-claim-bootstrap' || error.claimPhase !== 'post-claim-complete'
+      || error.observed_at_epoch_ms < arm.stop_dispatch_epoch_ms) return null;
+  try {
+    const location = new URL(error.location?.url);
+    if (location.origin !== arm.origin || location.pathname !== '/server/stream') return null;
+    const candidates = streamConnections.filter(connection => !usedResponses.has(connection) && connection.origin === arm.origin
+      && connection.pathname === '/server/stream' && connection.status === 502 && connection.contentType === 'other'
+      && Math.abs(connection.observedAfterMs - error.observedAfterMs) <= restartTransportResponseCorrelationMs);
+    if (candidates.length !== 1) return null;
+    const response = candidates[0];
+    return { proof: { origin: location.origin, pathname: location.pathname, errorGeneration: error.error_generation, responseObservedAfterMs: response.observedAfterMs }, response };
+  } catch {
+    return null;
+  }
+}
+
+function restartClusterEntry(error, arm, usedResponses) {
+  if (isArmedRestartSseTransportError(error, arm)) return { kind: 'sse-event', error };
+  const resource = restart502StreamLocation(error, arm, usedResponses);
+  if (!resource) return null;
+  usedResponses.add(resource.response);
+  return { kind: 'stream-502', error, resource: resource.proof };
+}
+
+async function restartClusterEntries(stability, arm) {
+  if (diagnosticFailures.length || browserErrorGeneration < arm.acknowledged_error_generation) {
+    await writeRestartInvalidation('restart-arm-diagnostic-or-generation-regression', stability, arm);
+    throw new Error('restart arm window has invalid diagnostic or generation state');
+  }
+  if (arm.restart_transport) {
+    if (browserErrorGeneration !== arm.restart_transport.lastGeneration || runtimeErrors.length) {
+      await writeRestartInvalidation('restart-arm-post-classification-error', stability, arm);
+      throw new Error('restart arm window observed an error after cluster classification');
+    }
+    return [];
+  }
+  if (runtimeErrors.length > restartClusterMaximumEvents) {
+    await writeRestartInvalidation('restart-arm-cluster-over-cap', stability, arm);
+    throw new Error('restart arm transport cluster exceeded its event cap');
+  }
+  const usedResponses = new Set();
+  const entries = runtimeErrors.map(error => restartClusterEntry(error, arm, usedResponses));
+  if (entries.some(entry => entry === null)) {
+    await writeRestartInvalidation('restart-arm-cluster-unexpected-diagnostic', stability, arm);
+    throw new Error('restart arm transport cluster contains an unrelated diagnostic');
+  }
+  for (let index = 0; index < entries.length; index += 1) {
+    const error = entries[index].error;
+    if (error.error_generation !== arm.arm_generation + index
+        || (index && error.error_generation <= entries[index - 1].error.error_generation)) {
+      await writeRestartInvalidation('restart-arm-cluster-wrong-generation', stability, arm);
+      throw new Error('restart arm transport cluster has a non-monotonic generation');
+    }
+  }
+  if (entries.length && entries.at(-1).error.observedAfterMs - entries[0].error.observedAfterMs > restartClusterMaximumMs) {
+    await writeRestartInvalidation('restart-arm-cluster-window-exceeded', stability, arm);
+    throw new Error('restart arm transport cluster exceeded its time bound');
+  }
+  return entries;
+}
+
+function restartStreamRecovery(arm, lastError) {
+  return streamConnections.find(connection => connection.origin === arm.origin
+    && connection.pathname === '/server/stream' && connection.status === 200
+    && connection.contentType === 'text/event-stream' && connection.observedAfterMs >= lastError.observedAfterMs) || null;
+}
+
+async function finalizeArmedRestartTransport(stability, arm, deadline) {
+  while (true) {
+    const entries = await restartClusterEntries(stability, arm);
+    const sseEvents = entries.filter(entry => entry.kind === 'sse-event');
+    const lastError = entries.at(-1)?.error;
+    const recovery = lastError ? restartStreamRecovery(arm, lastError) : null;
+    if (sseEvents.length && recovery) {
+      let modelRows;
+      try {
+        modelRows = await requireFreshStabilityModel(15000);
+      } catch (error) {
+        await writeRestartInvalidation('restart-arm-cluster-model-recovery-failed', stability, arm);
+        throw error;
+      }
+      const validatedEntries = await restartClusterEntries(stability, arm);
+      const resourceEntries = validatedEntries.filter(entry => entry.kind === 'stream-502');
+      const first = validatedEntries[0].error;
+      const last = validatedEntries.at(-1).error;
+      const transition = {
+        kind: 'restart-armed-sse-transport-cluster', classification: 'expected-bounded-restart-transport-cluster',
+        totalCount: validatedEntries.length, sseEventCount: validatedEntries.length - resourceEntries.length,
+        badGateway502Count: resourceEntries.length, firstGeneration: first.error_generation, lastGeneration: last.error_generation,
+        firstObservedAfterMs: first.observedAfterMs, lastObservedAfterMs: last.observedAfterMs,
+        clusterMaximumEvents: restartClusterMaximumEvents, clusterMaximumMs: restartClusterMaximumMs,
+        stopDispatchProof: { ...arm.stop_dispatch, acknowledgedEpochMs: arm.acknowledged_epoch_ms },
+        sameOriginProof: { origin: arm.origin, pathname: '/server/stream',
+          resource502Locations: resourceEntries.map(entry => entry.resource),
+          recoveryOrigin: recovery.origin, recoveryPathname: recovery.pathname, recoveryStatus: recovery.status,
+          recoveryObservedAfterMs: recovery.observedAfterMs },
+        modelRows,
+      };
+      streamTransitionEvidence.push(transition);
+      expectedTransitions.push(transition);
+      for (const entry of validatedEntries) runtimeErrors.splice(runtimeErrors.indexOf(entry.error), 1);
+      arm.restart_transport = transition;
+      return transition;
+    }
+    if (Date.now() >= deadline) {
+      await writeRestartInvalidation(sseEvents.length ? 'restart-request-missing-stream-recovery' : 'restart-request-missing-expected-sse-event', stability, arm);
+      throw new Error('restart request did not produce the required bounded SSE transport cluster');
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+}
+
+async function assertRestartArmWindow(stability, arm) {
+  await restartClusterEntries(stability, arm);
+}
+
+async function waitForRestartArm(stability) {
+  const armPath = path.join(evidenceDir, 'browser-restart-arm.json');
+  const deadline = Date.now() + 120000;
+  while (!fs.existsSync(armPath)) {
+    if (browserErrorGeneration !== stability.error_generation || runtimeErrors.length || diagnosticFailures.length) {
+      await writeEvidence({ browserStabilityInvalidated: { error_generation: browserErrorGeneration, ready_generation: stability.error_generation } }, 'browser-stability-invalid.json');
+      throw new Error('browser stability ready state was invalidated before restart arm');
+    }
+    if (Date.now() >= deadline) throw new Error('timed out waiting for current-runtime restart arm');
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  let parsed;
+  try {
+    parsed = parseRestartArm(JSON.parse(fs.readFileSync(armPath, 'utf8')), stability);
+  } catch (error) {
+    await writeRestartInvalidation('restart-arm-malformed-or-wrong-generation', stability, null);
+    throw error;
+  }
+  restartArm = { ...parsed, origin: new URL(baseUrl).origin, acknowledged_error_generation: browserErrorGeneration,
+    acknowledged_at_ms: Date.now() - browserStartedAt, acknowledged_epoch_ms: Date.now(), restart_transport: null };
+  const acknowledgement = { ...parsed, acknowledged: true, acknowledged_error_generation: restartArm.acknowledged_error_generation,
+    acknowledged_epoch_ms: restartArm.acknowledged_epoch_ms };
+  fs.writeFileSync(path.join(evidenceDir, 'browser-restart-arm-ack.json'), `${JSON.stringify(acknowledgement)}\n`, { mode: 0o600, flag: 'wx' });
+  return restartArm;
+}
+
+async function waitForRestartStopDispatch(stability, arm) {
+  const markerPath = path.join(evidenceDir, 'browser-restart-stop-dispatch.json');
+  const deadline = Date.now() + 120000;
+  while (!fs.existsSync(markerPath)) {
+    if (browserErrorGeneration !== arm.acknowledged_error_generation || runtimeErrors.length || diagnosticFailures.length) {
+      await writeRestartInvalidation('restart-arm-error-before-stop-dispatch', stability, arm);
+      throw new Error('restart arm observed an error before stop dispatch');
+    }
+    if (Date.now() >= deadline) {
+      await writeRestartInvalidation('restart-stop-dispatch-timeout', stability, arm);
+      throw new Error('timed out waiting for restart stop dispatch marker');
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  let marker;
+  try {
+    marker = parseRestartStopDispatch(JSON.parse(fs.readFileSync(markerPath, 'utf8')), stability, arm);
+  } catch (error) {
+    await writeRestartInvalidation('restart-stop-dispatch-malformed-or-wrong-generation', stability, arm);
+    throw error;
+  }
+  arm.stop_dispatch_epoch_ms = marker.stop_dispatch_epoch_ms;
+  arm.stop_dispatch = marker;
+  return arm;
+}
+
+async function waitForRestartRequest(stability, arm) {
   const request = path.join(evidenceDir, 'browser-restart-request.json');
   const deadline = Date.now() + 120000;
   while (!fs.existsSync(request)) {
-    if (browserErrorGeneration !== stability.error_generation || runtimeErrors.length || diagnosticFailures.length) {
-      await writeEvidence({ browserStabilityInvalidated: { error_generation: browserErrorGeneration, ready_generation: stability.error_generation } }, 'browser-stability-invalid.json');
-      throw new Error('browser stability ready state was invalidated before restart request');
+    await assertRestartArmWindow(stability, arm);
+    if (Date.now() >= deadline) {
+      await writeRestartInvalidation('restart-request-timeout', stability, arm);
+      throw new Error('timed out waiting for current-runtime restart request');
     }
-    if (Date.now() >= deadline) throw new Error('timed out waiting for current-runtime restart request');
     await new Promise(resolve => setTimeout(resolve, 250));
   }
-  const parsed = JSON.parse(fs.readFileSync(request, 'utf8'));
-  const expected = ['restart_requested', 'run_id', 'schema', 'stability_generation'];
-  if (!parsed || Object.keys(parsed).sort().join(',') !== expected.join(',') || parsed.schema !== 1 || parsed.run_id !== screenshotRunId
-      || parsed.stability_generation !== stability.error_generation || parsed.restart_requested !== true) {
-    throw new Error('restart request does not match current browser stability generation');
+  await assertRestartArmWindow(stability, arm);
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(request, 'utf8'));
+  } catch (error) {
+    await writeRestartInvalidation('restart-request-malformed', stability, arm);
+    throw error;
   }
+  const expected = ['arm_generation', 'restart_requested', 'run_id', 'schema', 'stability_generation'];
+  if (!parsed || Object.keys(parsed).sort().join(',') !== expected.join(',') || parsed.schema !== 1 || parsed.run_id !== screenshotRunId
+      || parsed.stability_generation !== stability.error_generation || parsed.arm_generation !== arm.arm_generation || parsed.restart_requested !== true) {
+    await writeRestartInvalidation('restart-request-wrong-run-or-generation', stability, arm);
+    throw new Error('restart request does not match current browser stability and arm generations');
+  }
+  await finalizeArmedRestartTransport(stability, arm, deadline);
 }
 
 async function runReuse() {
@@ -790,7 +1021,21 @@ async function runReuse() {
   await navigateReady('restart-files', baseUrl, '/');
   const visibleFixtureRows = await requireFixtureRows('restart-files');
   await safeScreenshot(path.join(evidenceDir, 'after-restart-files.png'));
-  await writeEvidence({ url: page.url(), visibleFixtureRows, rememberedSession: true });
+  return { url: page.url(), visibleFixtureRows, rememberedSession: true };
+}
+
+async function waitForPostReuseQuiet(stability, arm) {
+  const generation = browserErrorGeneration;
+  const quietUntil = Date.now() + postReuseQuietWindowMs;
+  while (Date.now() < quietUntil) {
+    await assertRestartArmWindow(stability, arm);
+    if (browserErrorGeneration !== generation || runtimeErrors.length || diagnosticFailures.length) {
+      await writeRestartInvalidation('restart-post-reuse-quiet-window-invalidated', stability, arm);
+      throw new Error('post-reuse quiet window was invalidated by a late browser error');
+    }
+    await new Promise(resolve => setTimeout(resolve, sseRecoveryPollMs));
+  }
+  return { quietWindowMs: postReuseQuietWindowMs, errorGeneration: generation };
 }
 
 async function main() {
@@ -899,14 +1144,21 @@ async function main() {
     await writeEvidence({ claimClassification, claimPhase, persistentProfile: false, retainedCookieDatabase: false, markerAfter: 'post-claim-route-shell-status' }, 'browser-claim-ready.json');
     const stabilityRequest = await waitForStabilityRequest();
     const stability = await establishPreRestartStability(stabilityRequest);
-    await waitForRestartRequest(stability);
-    await runReuse();
+    const arm = await waitForRestartArm(stability);
+    await waitForRestartStopDispatch(stability, arm);
+    await waitForRestartRequest(stability, arm);
+    const reuse = await runReuse();
+    const postReuseQuiet = await waitForPostReuseQuiet(stability, arm);
+    await writeEvidence({ ...reuse, postReuseQuiet });
   }
 }
 
 try {
   await main();
 } catch (error) {
+  if (restartArm) {
+    await writeRestartInvalidation('browser-reuse-failed-after-restart-arm', { error_generation: restartArm.stability_generation }, restartArm);
+  }
   const failure = await captureFailure('browser-run', error);
   await writeEvidence({ url: page.url(), failure });
   process.exitCode = 1;
