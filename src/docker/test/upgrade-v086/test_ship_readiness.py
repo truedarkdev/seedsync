@@ -4,6 +4,7 @@ import importlib.util
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import shutil
@@ -648,6 +649,21 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertLess(launcher.index('wait_browser_stability_ready "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
         finish = launcher[launcher.index("finish_browser_claim_reuse()") : launcher.index("browser_dispatch_self_check()")]
         self.assertLess(finish.index('"stability_generation": int(generation)'), finish.index('wait "$BROWSER_SESSION_PID"'))
+
+    def test_browser_stability_request_timestamp_validator_matches_emitted_contract(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        match = re.search(r're\.fullmatch\(r"([^"]+)"', launcher)
+        self.assertIsNotNone(match)
+        timestamp = re.compile(match.group(1))
+        self.assertIsNotNone(timestamp.fullmatch("2026-07-29T15:24:08Z"))
+        for malformed in (
+            "2026-7-29T15:24:08Z",
+            "2026-07-29 15:24:08Z",
+            "2026-07-29T15:24:08+00:00",
+            "2026-07-29T15:24:08Z-extra",
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(timestamp.fullmatch(malformed))
 
     def test_auth_phase_boundary_binds_completed_transaction_to_auth_free_legacy_inventory(self):
         with tempfile.TemporaryDirectory() as temporary:
