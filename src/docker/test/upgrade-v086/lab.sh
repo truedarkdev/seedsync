@@ -2,21 +2,23 @@
 set -euo pipefail
 
 readonly LEGACY_COMMIT="ff2a1039935beccbbf7ec76134b41d2e91137742"
-readonly ROOT_DIR="$(git rev-parse --show-toplevel)"
+# This lab can be invoked after a previous operation removed its caller's
+# directory.  Derive the repository from this script's stable location, not
+# from the inherited cwd, then repair that cwd before any helper starts.
+readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly ROOT_DIR="$(git -C "${SCRIPT_DIR}/../../../.." rev-parse --show-toplevel)"
+cd -- "$ROOT_DIR" || { echo "upgrade-v086: unable to enter repository root" >&2; exit 1; }
 readonly LAB_DIR="${ROOT_DIR}/src/docker/test/upgrade-v086"
 readonly CACHE_DIR="${ROOT_DIR}/tmp/upgrade-v086/cache"
 readonly RUNS_DIR="${ROOT_DIR}/tmp/upgrade-v086/runs"
 readonly IMAGE_TAG="seedsync/upgrade-v086:legacy-ff2a10399"
 readonly FIXTURE_MANIFEST="${LAB_DIR}/fixture-manifest.json"
 readonly FIXTURE_GENERATOR="${LAB_DIR}/fixture.py"
+readonly EVIDENCE_HELPER="${LAB_DIR}/ship_readiness.py"
 readonly PYTHON_BASE_DIGEST="sha256:e191a71397fd61fbddb6712cd43ef9a2c17df0b5e7ba67607128554cd6bff267"
 readonly ANGULAR_BASE_DIGEST="sha256:360ac6d2ab708d2d682b70dd4f89e4340d48a5710f8e2acb86993efdbd1c1487"
 
-redact() {
-  sed -E -e 's/(remote_password|SEEDSYNC_LAB_REMOTE_PASSWORD|password)[[:space:]]*[:=][[:space:]]*[^[:space:],}]*/\1=<redacted>/Ig' \
-    -e 's#(sftp://[^:[:space:]]+:)[^@[:space:]]+@#\1<redacted>@#g' \
-    -e 's/remotepass/<redacted>/gI'
-}
+redact() { python "$EVIDENCE_HELPER" redact-stdin; }
 
 die() { echo "upgrade-v086: $*" >&2; exit 1; }
 
@@ -24,6 +26,133 @@ validate_run_id() {
   local id="$1"
   [[ "$id" != "." && "$id" != ".." ]] || die "RUN_ID cannot be . or .."
   [[ "$id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$ ]] || die "RUN_ID must be 1-32 alphanumeric characters, underscores, or hyphens"
+  [[ "$id" == "${id,,}" ]] || die "RUN_ID must be lowercase so container, network, and volume identities cannot diverge"
+}
+
+config_volume_name() { printf 'seedsync-upgrade-v086-config-%s' "$1"; }
+config_initializer_name() { printf 'seedsync-upgrade-v086-config-init-%s' "$1"; }
+validator_container_name() { printf 'seedsync-upgrade-v086-validator-%s' "$1"; }
+protected_volume_name() { printf 'seedsync-upgrade-v086-protected-%s' "$1"; }
+protected_initializer_name() { printf 'seedsync-upgrade-v086-protected-init-%s' "$1"; }
+snapshotter_container_name() { printf 'seedsync-upgrade-v086-snapshotter-%s' "$1"; }
+
+verify_config_volume() {
+  local id="$1" volume
+  validate_run_id "$id"
+  volume="$(config_volume_name "$id")"
+  python - "$volume" "$id" <<'PY'
+import json, subprocess, sys
+item = json.loads(subprocess.check_output(["docker", "volume", "inspect", sys.argv[1]], text=True))[0]
+expected_name, expected_id = sys.argv[1:]
+if item.get("Name") != expected_name:
+    raise SystemExit("config volume name mismatch")
+if item.get("Driver") != "local":
+    raise SystemExit("config volume driver is not local")
+labels = item.get("Labels") or {}
+if labels.get("seedsync.upgrade-v086.run-id") != expected_id:
+    raise SystemExit("config volume run-id label mismatch")
+if labels.get("seedsync.upgrade-v086.role") != "config":
+    raise SystemExit("config volume role label mismatch")
+PY
+}
+
+verify_protected_volume() {
+  local id="$1" volume
+  validate_run_id "$id"
+  volume="$(protected_volume_name "$id")"
+  python - "$volume" "$id" <<'PY'
+import json, subprocess, sys
+item = json.loads(subprocess.check_output(["docker", "volume", "inspect", sys.argv[1]], text=True))[0]
+expected_name, expected_id = sys.argv[1:]
+labels = item.get("Labels") or {}
+checks = {
+    "name": item.get("Name") == expected_name,
+    "driver": item.get("Driver") == "local",
+    "run-id label": labels.get("seedsync.upgrade-v086.run-id") == expected_id,
+    "role label": labels.get("seedsync.upgrade-v086.role") == "protected-artifacts",
+}
+failed = [name for name, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit("protected volume contract failed: " + ", ".join(failed))
+PY
+}
+
+verify_validator_container() {
+  local id="$1" name volume protected_volume
+  validate_run_id "$id"
+  name="$(validator_container_name "$id")"
+  volume="$(config_volume_name "$id")"
+  protected_volume="$(protected_volume_name "$id")"
+  python - "$name" "$volume" "$protected_volume" "$id" <<'PY'
+import json, subprocess, sys
+name, volume, protected_volume, run_id = sys.argv[1:]
+item = json.loads(subprocess.check_output(["docker", "container", "inspect", name], text=True))[0]
+host = item.get("HostConfig") or {}
+mounts = item.get("Mounts") or []
+config_mounts = [entry for entry in mounts if entry.get("Destination") == "/config"]
+protected_mounts = [entry for entry in mounts if entry.get("Destination") == "/protected"]
+evidence_mounts = [entry for entry in mounts if entry.get("Destination") == "/evidence"]
+checks = {
+    "container name": item.get("Name", "").lstrip("/") == name,
+    "running": (item.get("State") or {}).get("Running") is True,
+    "non-root user": (item.get("Config") or {}).get("User") == "1000:1000",
+    "read-only rootfs": host.get("ReadonlyRootfs") is True,
+    "network none": host.get("NetworkMode") == "none",
+    "all capabilities dropped": sorted(host.get("CapDrop") or []) == ["ALL"],
+    "no new privileges": "no-new-privileges:true" in (host.get("SecurityOpt") or []),
+    "one config mount": len(config_mounts) == 1,
+    "expected config volume": bool(config_mounts) and config_mounts[0].get("Name") == volume,
+    "read-only config mount": bool(config_mounts) and config_mounts[0].get("RW") is False,
+    "one protected mount": len(protected_mounts) == 1,
+    "expected protected volume": bool(protected_mounts) and protected_mounts[0].get("Name") == protected_volume,
+    "read-only protected mount": bool(protected_mounts) and protected_mounts[0].get("RW") is False,
+    "one evidence mount": len(evidence_mounts) == 1,
+    "read-only evidence mount": bool(evidence_mounts) and evidence_mounts[0].get("Type") == "bind" and bool(evidence_mounts[0].get("Source")) and evidence_mounts[0].get("RW") is False,
+    "run label": ((item.get("Config") or {}).get("Labels") or {}).get("seedsync.upgrade-v086.run-id") == run_id,
+    "role label": ((item.get("Config") or {}).get("Labels") or {}).get("seedsync.upgrade-v086.role") == "validator",
+}
+failed = [label for label, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit("validator container contract failed: " + ", ".join(failed))
+PY
+  docker exec "$name" sh -c 'test "$(stat -c "%u:%g:%a" /config)" = "1000:1000:700"' \
+    || die "retained config volume ownership or mode changed"
+  docker exec "$name" sh -c 'test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700"' \
+    || die "retained protected volume ownership or mode changed"
+  docker exec "$name" sh -c 'test -d /evidence' \
+    || die "validator evidence mount is unavailable"
+}
+
+verify_snapshotter_container() {
+  local id="$1" name config_volume protected_volume
+  validate_run_id "$id"
+  name="$(snapshotter_container_name "$id")"
+  config_volume="$(config_volume_name "$id")"
+  protected_volume="$(protected_volume_name "$id")"
+  python - "$name" "$config_volume" "$protected_volume" "$id" <<'PY'
+import json, subprocess, sys
+name, config_volume, protected_volume, run_id = sys.argv[1:]
+item = json.loads(subprocess.check_output(["docker", "container", "inspect", name], text=True))[0]
+host = item.get("HostConfig") or {}
+mounts = {entry.get("Destination"): entry for entry in item.get("Mounts") or []}
+checks = {
+    "running": (item.get("State") or {}).get("Running") is True,
+    "non-root user": (item.get("Config") or {}).get("User") == "1000:1000",
+    "read-only rootfs": host.get("ReadonlyRootfs") is True,
+    "network none": host.get("NetworkMode") == "none",
+    "all capabilities dropped": sorted(host.get("CapDrop") or []) == ["ALL"],
+    "no new privileges": "no-new-privileges:true" in (host.get("SecurityOpt") or []),
+    "read-only config": mounts.get("/config", {}).get("Name") == config_volume and mounts.get("/config", {}).get("RW") is False,
+    "writable protected storage": mounts.get("/protected", {}).get("Name") == protected_volume and mounts.get("/protected", {}).get("RW") is True,
+    "run label": ((item.get("Config") or {}).get("Labels") or {}).get("seedsync.upgrade-v086.run-id") == run_id,
+    "role label": ((item.get("Config") or {}).get("Labels") or {}).get("seedsync.upgrade-v086.role") == "snapshotter",
+}
+failed = [name for name, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit("snapshotter container contract failed: " + ", ".join(failed))
+PY
+  docker exec "$name" sh -c 'test "$(stat -c "%u:%g:%a" /config)" = "1000:1000:700" && test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700"' \
+    || die "snapshotter storage ownership or mode changed"
 }
 
 validate_host_port() {
@@ -118,7 +247,65 @@ create_run() {
   [[ "$run_real" == "$root_real"/* ]] || die "run directory escaped runs root"
   check_run_tree "$id"
   python "${FIXTURE_GENERATOR}" materialize --manifest "${FIXTURE_MANIFEST}" --run-dir "${run_dir}" || die "unable to materialize fixture manifest"
-  printf '%s\n' "$mode" > "${run_dir}/config/lab-mode"
+  local config_volume protected_volume
+  config_volume="$(config_volume_name "$id")"
+  protected_volume="$(protected_volume_name "$id")"
+  ! docker volume inspect "$config_volume" >/dev/null 2>&1 || die "retained config volume already exists; choose a fresh RUN_ID"
+  ! docker volume inspect "$protected_volume" >/dev/null 2>&1 || die "retained protected volume already exists; choose a fresh RUN_ID"
+  docker volume create --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=config" "$config_volume" >/dev/null || die "unable to create retained config volume"
+  docker volume create --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-artifacts" "$protected_volume" >/dev/null || die "unable to create retained protected volume"
+  verify_config_volume "$id" || die "created config volume failed identity verification"
+  verify_protected_volume "$id" || die "created protected volume failed identity verification"
+  local initializer protected_initializer validator snapshotter
+  initializer="$(config_initializer_name "$id")"
+  protected_initializer="$(protected_initializer_name "$id")"
+  validator="$(validator_container_name "$id")"
+  snapshotter="$(snapshotter_container_name "$id")"
+  ! docker container inspect "$initializer" >/dev/null 2>&1 || die "config initializer container already exists; choose a fresh RUN_ID"
+  ! docker container inspect "$protected_initializer" >/dev/null 2>&1 || die "protected initializer container already exists; choose a fresh RUN_ID"
+  ! docker container inspect "$validator" >/dev/null 2>&1 || die "validator container already exists; choose a fresh RUN_ID"
+  ! docker container inspect "$snapshotter" >/dev/null 2>&1 || die "snapshotter container already exists; choose a fresh RUN_ID"
+  docker create --name "$initializer" --network none --read-only --user 0:0 \
+    --security-opt no-new-privileges:true --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=config-initializer" \
+    --mount "type=bind,src=${run_dir}/config,dst=/fixture-config,readonly" \
+    --mount "type=volume,src=${config_volume},dst=/config" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'chown 0:0 /config && chmod 0700 /config && cp /fixture-config/controller.persist /config/controller.persist && cp /fixture-config/autoqueue.persist /config/autoqueue.persist && touch /config/.ship-readiness-volume-initialized && chmod 0600 /config/.ship-readiness-volume-initialized /config/controller.persist /config/autoqueue.persist && chown 1000:1000 /config/.ship-readiness-volume-initialized /config/controller.persist /config/autoqueue.persist /config && test "$(stat -c "%u:%g:%a" /config)" = "1000:1000:700" && stat -c "owner=%u:%g mode=%a path=%n" /config' >/dev/null \
+    || die "unable to create retained config volume initializer"
+  docker start --attach "$initializer" > "${run_dir}/evidence/config-volume-initialization.txt" \
+    || die "unable to initialize retained config volume ownership"
+  docker create --name "$protected_initializer" --network none --read-only --user 0:0 \
+    --security-opt no-new-privileges:true --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-initializer" \
+    --mount "type=volume,src=${protected_volume},dst=/protected" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'chown 1000:1000 /protected && chmod 0700 /protected && test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700"' >/dev/null \
+    || die "unable to create retained protected volume initializer"
+  docker start --attach "$protected_initializer" > "${run_dir}/evidence/protected-volume-initialization.txt" \
+    || die "unable to initialize retained protected volume ownership"
+  docker create --name "$validator" --network none --read-only --user 1000:1000 \
+    --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=validator" \
+    --mount "type=volume,src=${config_volume},dst=/config,readonly" \
+    --mount "type=volume,src=${protected_volume},dst=/protected,readonly" \
+    --mount "type=bind,src=${run_dir}/evidence,dst=/evidence,readonly" \
+    --entrypoint /bin/sh "$IMAGE_TAG" -c 'while :; do sleep 3600; done' >/dev/null \
+    || die "unable to create read-only config validator"
+  docker start "$validator" >/dev/null || die "unable to start read-only config validator"
+  docker create --name "$snapshotter" --network none --read-only --user 1000:1000 \
+    --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=snapshotter" \
+    --mount "type=volume,src=${config_volume},dst=/config,readonly" \
+    --mount "type=volume,src=${protected_volume},dst=/protected" \
+    --entrypoint /bin/sh "$IMAGE_TAG" -c 'while :; do sleep 3600; done' >/dev/null \
+    || die "unable to create protected snapshotter"
+  docker start "$snapshotter" >/dev/null || die "unable to start protected snapshotter"
+  verify_validator_container "$id" || die "read-only config validator failed its isolation contract"
+  verify_snapshotter_container "$id" || die "protected snapshotter failed its isolation contract"
+  printf '%s\n' "$mode" > "${run_dir}/lab-mode"
+  python - "$config_volume" "${run_dir}/evidence/config-volume.json" "$protected_volume" <<'PY'
+import json, sys
+json.dump({"schema": 1, "volume": sys.argv[1], "protected_volume": sys.argv[3], "retained": True, "mount_target": "/config", "protected_mount_target": "/protected", "storage": "docker-named-volume"}, open(sys.argv[2], "w", encoding="utf-8"), indent=2, sort_keys=True)
+PY
   printf '{"run_id":"%s","source_commit":"%s","source_tree":"%s","image":"%s","credentials":"synthetic-only"}\n' \
     "$id" "$LEGACY_COMMIT" "$(git rev-parse "${LEGACY_COMMIT}^{tree}")" "$IMAGE_TAG" > "${run_dir}/evidence/manifest.json"
   [[ ! -L "${RUNS_DIR}/latest" ]] || die "latest pointer must not be a symlink"
@@ -135,6 +322,60 @@ preflight() {
   echo "docker:        $(docker version --format '{{.Server.Version}}')"
   echo "cache:         ${CACHE_DIR}"
   echo "runs:          ${RUNS_DIR}"
+}
+
+cwd_probe() {
+  local expected_root="${1:?expected repository root required}"
+  [[ "$ROOT_DIR" == "$expected_root" ]] || die "repository root did not resolve from the script location"
+  [[ "$PWD" == "$ROOT_DIR" ]] || die "lab did not repair its inherited working directory"
+  [[ "$(git rev-parse --show-toplevel)" == "$ROOT_DIR" ]] || die "git did not run from the repaired repository directory"
+}
+
+protected_storage_self_check() {
+  local id="${RUN_ID:-probe-$(date -u +%Y%m%dt%H%M%S)-$$}"
+  validate_run_id "$id"
+  local volume="seedsync-upgrade-v086-protected-probe-${id}"
+  local initializer="seedsync-upgrade-v086-protected-probe-init-${id}"
+  local writer="seedsync-upgrade-v086-protected-probe-writer-${id}"
+  local reader="seedsync-upgrade-v086-protected-probe-reader-${id}"
+  ! docker volume inspect "$volume" >/dev/null 2>&1 || die "protected storage self-check volume already exists; choose a fresh RUN_ID"
+  for name in "$initializer" "$writer" "$reader"; do
+    ! docker container inspect "$name" >/dev/null 2>&1 || die "protected storage self-check container already exists; choose a fresh RUN_ID"
+  done
+  docker volume create --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-storage-self-check" "$volume" >/dev/null
+  docker create --name "$initializer" --network none --read-only --user 0:0 --security-opt no-new-privileges:true --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-storage-self-check-initializer" \
+    --mount "type=volume,src=${volume},dst=/protected" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'chown 1000:1000 /protected && chmod 0700 /protected && test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700"' >/dev/null
+  docker start --attach "$initializer" >/dev/null || die "protected storage self-check initializer failed"
+  docker create --name "$writer" --network none --read-only --user 1000:1000 --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-storage-self-check-writer" \
+    --mount "type=volume,src=${volume},dst=/protected" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'umask 077 && printf probe > /protected/source && tar -C /protected -cpf /protected/probe.tar source && test "$(stat -c "%u:%g:%a" /protected/source)" = "1000:1000:600" && test "$(stat -c "%u:%g:%a" /protected/probe.tar)" = "1000:1000:600"' >/dev/null
+  docker start --attach "$writer" >/dev/null || die "protected storage self-check writer failed"
+  docker create --name "$reader" --network none --read-only --user 1000:1000 --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-storage-self-check-reader" \
+    --mount "type=volume,src=${volume},dst=/protected,readonly" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700" && test "$(stat -c "%u:%g:%a" /protected/probe.tar)" = "1000:1000:600" && tar -tf /protected/probe.tar | grep -qx source && test "$(tar -xOf /protected/probe.tar source)" = probe' >/dev/null
+  docker start --attach "$reader" >/dev/null || die "protected storage self-check read-only archive access failed"
+  printf '{"schema":1,"storage":"docker-named-volume","volume":"%s","archive_mode":"0600","parent_mode":"0700","writer":"non-root-networkless-read-only-rootfs","reader":"non-root-networkless-read-only-mount"}\n' "$volume"
+}
+
+validator_evidence_path_self_check() {
+  local id="${RUN_ID:-probe-$(date -u +%Y%m%dt%H%M%S)-$$}"
+  validate_run_id "$id"
+  local evidence_dir="${ROOT_DIR}/tmp/upgrade-v086/validator-evidence-path-self-check-${id}"
+  local container="seedsync-upgrade-v086-validator-evidence-path-${id}"
+  [[ ! -e "$evidence_dir" && ! -L "$evidence_dir" ]] || die "validator evidence self-check directory already exists; choose a fresh RUN_ID"
+  ! docker container inspect "$container" >/dev/null 2>&1 || die "validator evidence self-check container already exists; choose a fresh RUN_ID"
+  mkdir -p "${evidence_dir}/ship-readiness"
+  printf '{"schema":1,"entries":[]}\n' > "${evidence_dir}/ship-readiness/before-config.json"
+  docker create --name "$container" --network none --read-only --user 1000:1000 --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=validator-evidence-path-self-check" \
+    --mount "type=bind,src=${evidence_dir},dst=/evidence,readonly" --entrypoint /bin/sh "$IMAGE_TAG" \
+    -c 'test -s /evidence/ship-readiness/before-config.json && test ! -e /evidence/before-config.json && python -c "import json; json.load(open(\"/evidence/ship-readiness/before-config.json\"))"' >/dev/null
+  docker start --attach "$container" >/dev/null || die "validator evidence path self-check failed"
+  printf '{"schema":1,"host_evidence_dir":"%s","container_evidence_dir":"/evidence","inventory":"/evidence/ship-readiness/before-config.json","container":"%s"}\n' "$evidence_dir" "$container"
 }
 
 build() {
@@ -201,7 +442,7 @@ selected_run_dir() {
 
 run_mode() {
   local id="$1"
-  local mode_file="${RUNS_DIR}/${id}/config/lab-mode"
+  local mode_file="${RUNS_DIR}/${id}/lab-mode"
   [[ -s "$mode_file" ]] || die "run mode marker is missing"
   local mode
   mode="$(tr -d '\r\n' < "$mode_file")"
@@ -269,7 +510,16 @@ compose() {
     transient_mode=1
     shift
   fi
-  local run_dir="${RUNS_DIR}/${id}"
+  local run_dir="${RUNS_DIR}/${id}" private_log_root="${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:-${run_dir}/logs}"
+  [[ -d "$private_log_root" && ! -L "$private_log_root" ]] || die "private log mount is missing or a symlink"
+  if [[ -n "${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:-}" ]]; then
+    python - "$private_log_root" <<'PY' || die "private log mount is not owner-only WSL staging"
+import os, stat, sys
+info = os.lstat(sys.argv[1])
+raise SystemExit(not (stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+                      and info.st_uid == os.geteuid() and stat.S_IMODE(info.st_mode) == 0o700))
+PY
+  fi
   local project="seedsync-upgrade-v086-$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')"
   local networks
   networks=($(network_names "$id"))
@@ -277,7 +527,8 @@ compose() {
   read -r autoqueue_enabled autoqueue_patterns_only autoqueue_auto_extract < <(python "${FIXTURE_GENERATOR}" config --manifest "${FIXTURE_MANIFEST}")
   local lftp_home=""
   [[ "$transient_mode" == 1 ]] && lftp_home="/config/.lftp"
-  SOURCE_DIR="$(prepare_source)" RUN_ID="$id" RUN_DIR="$run_dir" HOST_PORT="${HOST_PORT:-18806}" LAB_NETWORK="${networks[0]}" BROWSER_NETWORK="${networks[1]}" AUTOQUEUE_ENABLED="$autoqueue_enabled" AUTOQUEUE_PATTERNS_ONLY="$autoqueue_patterns_only" AUTOQUEUE_AUTO_EXTRACT="$autoqueue_auto_extract" LAB_TRANSIENT_MODE="$transient_mode" TRANSIENT_LFTP_HOME="$lftp_home" \
+  verify_config_volume "$id" || die "config volume identity check failed before compose mount"
+  SOURCE_DIR="$(prepare_source)" RUN_ID="$id" RUN_DIR="$run_dir" SEEDSYNC_SHIP_PRIVATE_LOG_ROOT="$private_log_root" CONFIG_VOLUME="$(config_volume_name "$id")" HOST_PORT="${HOST_PORT:-18806}" LAB_NETWORK="${networks[0]}" BROWSER_NETWORK="${networks[1]}" AUTOQUEUE_ENABLED="$autoqueue_enabled" AUTOQUEUE_PATTERNS_ONLY="$autoqueue_patterns_only" AUTOQUEUE_AUTO_EXTRACT="$autoqueue_auto_extract" LAB_TRANSIENT_MODE="$transient_mode" TRANSIENT_LFTP_HOME="$lftp_home" \
     docker compose -p "$project" -f "${LAB_DIR}/compose.yml" "$@"
 }
 
@@ -563,13 +814,13 @@ wait_for_manifest_model() {
 
 validate_persisted_markers() {
   local id="$1"
-  local persist_file="${RUNS_DIR}/${id}/config/controller.persist"
-  python - "${FIXTURE_MANIFEST}" "$persist_file" <<'PY'
+  local container="seedsync-upgrade-v086-${id}"
+  docker exec "$container" cat /config/controller.persist | python - "${FIXTURE_MANIFEST}" <<'PY'
 import json
 import sys
 
 manifest = json.load(open(sys.argv[1], encoding="utf-8"))
-persist = json.load(open(sys.argv[2], encoding="utf-8"))
+persist = json.load(sys.stdin)
 if set(persist) != {"downloaded", "extracted"}:
     raise SystemExit("controller.persist keys differ from historical contract: {}".format(sorted(persist)))
 for key in ("downloaded", "extracted"):
@@ -678,10 +929,8 @@ for case in manifest["cases"]:
         print(case["name"])
 PY
 )
-  local lftp_host_home="${run_dir}/config/.lftp"
-  [[ ! -e "$lftp_host_home" && ! -L "$lftp_host_home" ]] || die "transient lftp control directory already exists; choose a fresh RUN_ID"
-  mkdir -m 700 "$lftp_host_home" || die "unable to create transient lftp control directory"
-  printf 'set net:limit-rate 256K\nset cmd:queue-parallel 1\nset mirror:parallel-transfer-count 1\nset pget:default-n 1\nset mirror:use-pget-n 1\nset net:connection-limit 1\nset net:timeout 3\nset net:max-retries 1\nset net:reconnect-interval-base 1\n' > "${lftp_host_home}/rc"
+  local legacy_container="seedsync-upgrade-v086-${id}"
+  docker exec "$legacy_container" sh -c 'test ! -e /config/.lftp && umask 077 && mkdir /config/.lftp && printf "set net:limit-rate 256K\\nset cmd:queue-parallel 1\\nset mirror:parallel-transfer-count 1\\nset pget:default-n 1\\nset mirror:use-pget-n 1\\nset net:connection-limit 1\\nset net:timeout 3\\nset net:max-retries 1\\nset net:reconnect-interval-base 1\\n" > /config/.lftp/rc' || die "unable to create transient lftp controls in retained config volume"
   stop
   start transient
   local container="seedsync-upgrade-v086-${id}"
@@ -733,7 +982,7 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: lab.sh <preflight|build|build-transient|start|status|restart|transient|stop>
+Usage: lab.sh <preflight|build|build-transient|start|status|restart|transient|stop|verify-volume|verify-protected|verify-snapshotter|protected-storage-self-check|validator-evidence-path-self-check|cwd-probe>
 
 RUN_ID selects a retained run; build creates a unique run when omitted.
 HOST_PORT defaults to 18806 and binds only to loopback.
@@ -751,6 +1000,13 @@ main() {
     restart) restart ;;
     transient) transient ;;
     stop) stop ;;
+    verify-volume) verify_config_volume "${2:?RUN_ID required}" ;;
+    verify-validator) verify_validator_container "${2:?RUN_ID required}" ;;
+    verify-protected) verify_protected_volume "${2:?RUN_ID required}" ;;
+    verify-snapshotter) verify_snapshotter_container "${2:?RUN_ID required}" ;;
+    protected-storage-self-check) protected_storage_self_check ;;
+    validator-evidence-path-self-check) validator_evidence_path_self_check ;;
+    cwd-probe) cwd_probe "${2:?expected repository root required}" ;;
     *) usage; return 2 ;;
   esac
 }

@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from common import Config, PathPairManager
+from common import Config, PathPairManager, ServiceExit
 from controller import AutoQueuePersist, ControllerPersist
 from migration import (
     MigrationBlockedError,
@@ -23,8 +23,10 @@ from migration import (
     default_migration_registry,
 )
 from migration.coordinator import _process_is_alive
+from migration.runtime_exclusion import RuntimeExclusion
 import migration.coordinator as migration_coordinator
 from seedsync import Seedsync
+from web.auth_store import ApiKeyStore
 
 
 LEGACY_SETTINGS = """\
@@ -130,6 +132,82 @@ class TestMigrationCoordinator(unittest.TestCase):
     def test_windows_process_liveness_probe_does_not_call_os_kill(self) -> None:
         with patch("migration.coordinator.os.kill", side_effect=AssertionError("unsafe Windows liveness probe")):
             self.assertTrue(_process_is_alive(os.getpid()))
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owner-mode contract")
+    def test_private_files_remain_mode_0600_on_posix_filesystems(self) -> None:
+        path = self.root / "private"
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+        try:
+            migration_coordinator._restrict_fd_to_owner(descriptor)
+            self.assertEqual(0o600, stat.S_IMODE(os.fstat(descriptor).st_mode))
+        finally:
+            os.close(descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owner-mode contract")
+    def test_mode_failures_block_runtime_locks_and_private_storage(self) -> None:
+        unsupported = PermissionError("DrvFS chmod is unsupported")
+        path = self.root / "private"
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+        try:
+            with patch("migration.coordinator.os.fchmod", side_effect=unsupported):
+                with self.assertRaises(PermissionError):
+                    migration_coordinator._restrict_fd_to_owner(descriptor)
+        finally:
+            os.close(descriptor)
+        with patch("migration.coordinator.os.fchmod", side_effect=unsupported):
+            with self.assertRaises(PermissionError):
+                with RuntimeExclusion(self.root, "runtime-lease"):
+                    pass
+
+        from migration.backup_restore import _write_private_file
+        with patch("migration.coordinator.os.fchmod", side_effect=unsupported):
+            with self.assertRaises(PermissionError):
+                _write_private_file(self.root / "private-backup", payload=b"synthetic", root=self.root)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX owner-mode contract")
+    def test_unverified_mode_blocks_private_storage(self) -> None:
+        path = self.root / "unverified-private"
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o666)
+        try:
+            with patch("migration.coordinator.os.fchmod", return_value=None):
+                with self.assertRaisesRegex(PermissionError, "not owner-only"):
+                    migration_coordinator._restrict_fd_to_owner(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX root and lock integrity contract")
+    def test_writable_root_and_replaced_lock_are_rejected(self) -> None:
+        MigrationFixture(self.root).write()
+        os.chmod(self.root, 0o777)
+        try:
+            with self.assertRaisesRegex(PermissionError, "not group/other writable"):
+                migration_coordinator._capture_root_identity(self.root)
+        finally:
+            os.chmod(self.root, 0o700)
+        lock = self.root / ".migration.lock"
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        try:
+            migration_coordinator._restrict_fd_to_owner(descriptor)
+            os.unlink(lock)
+            replacement = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.close(replacement)
+            with self.assertRaisesRegex(PermissionError, "unsafe identity"):
+                migration_coordinator._verify_lock_descriptor(lock, self.root, descriptor)
+        finally:
+            os.close(descriptor)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX post-acquisition lock integrity contract")
+    def test_runtime_lock_replacement_while_acquiring_is_rejected(self) -> None:
+        lock = self.root / ".seedsync.runtime.lock"
+
+        def replace_after_acquisition(_descriptor: int) -> None:
+            os.unlink(lock)
+            replacement = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            os.close(replacement)
+
+        with patch.object(RuntimeExclusion, "_lock_descriptor", side_effect=replace_after_acquisition):
+            with self.assertRaisesRegex(PermissionError, "unsafe identity"):
+                RuntimeExclusion(self.root, "runtime-lease")
 
     def test_exact_legacy_requires_consent_without_mutating_source_files(self) -> None:
         fixture = MigrationFixture(self.root)
@@ -291,9 +369,18 @@ class TestMigrationCoordinator(unittest.TestCase):
         coordinator.preflight()
 
         self.assertFalse(coordinator.retained_backup_ready(coordinator.status()))
-        decision = coordinator.apply_confirmed()
+        verified_lock_names = []
+        original_verify = migration_coordinator._verify_lock_descriptor
+
+        def record_verify(path: Path, root: Path, descriptor: int) -> None:
+            verified_lock_names.append(path.name)
+            original_verify(path, root, descriptor)
+
+        with patch("migration.coordinator._verify_lock_descriptor", side_effect=record_verify):
+            decision = coordinator.apply_confirmed()
 
         self.assertEqual(MigrationState.COMPLETE, decision.state)
+        self.assertGreaterEqual(verified_lock_names.count(".migration.lock"), 2)
         self.assertTrue(coordinator.retained_backup_ready(decision))
         migrated = Config.from_file(str(self.root / "settings.cfg"))
         self.assertEqual("DEBUG", migrated.general.log_level)
@@ -335,6 +422,223 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual(1, receipt["receipt_version"])
         self.assertEqual("seedsync-current-v1", receipt["current_schema"])
         self.assertEqual(["original-v0.8.6-to-current-v1"], receipt["applied_migrations"])
+
+    def test_completed_lineage_allows_only_bootstrap_proof_history_created_after_migration(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+
+        store = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
+        self.assertIsNotNone(store.ensure_bootstrap_proof())
+
+        restarted = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertTrue(restarted.allows_normal_startup)
+
+    def test_completed_lineage_allows_repeated_empty_store_bootstrap_exit_state(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+
+        migration_runtime = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
+        migration_runtime.ensure_bootstrap_proof()
+        first = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
+        first.ensure_bootstrap_proof()
+        first.save()
+        self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(self.root).preflight().state)
+
+        second = ApiKeyStore.from_file(str(self.root / "api-keys.json"))
+        self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(self.root).preflight().state)
+        second.ensure_bootstrap_proof()
+        second.save()
+        second.save()
+        restarted = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertTrue(restarted.allows_normal_startup)
+
+    def test_completed_migration_exit_probe_is_repeatedly_finite_and_restartable(self) -> None:
+        MigrationFixture(self.root).write()
+        self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(self.root).apply_confirmed().state)
+        argv = [
+            "seedsync.py", "-c", str(self.root), "--html", str(self.root),
+            "--scanfs", str(self.root), "--exit",
+        ]
+
+        for _ in range(3):
+            with patch.object(sys, "argv", argv):
+                application = Seedsync()
+                with self.assertRaises(ServiceExit):
+                    application.run()
+            restarted = MigrationCoordinator(self.root).preflight()
+            self.assertEqual(MigrationState.COMPLETE, restarted.state)
+            self.assertTrue(restarted.allows_normal_startup)
+
+    def _complete_migrated_browser_claim(self, root: Path) -> tuple[MigrationCoordinator, str]:
+        MigrationFixture(root).write()
+        coordinator = MigrationCoordinator(root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        binding = coordinator.completed_auth_transition_binding()
+        store = ApiKeyStore(file_path=str(root / "api-keys.json"))
+        store.bind_completed_migration_claim_transition(binding)
+        self.assertIsNotNone(store.ensure_bootstrap_proof())
+        created = store.create_initial_admin_api_key_if_available("migration-claim-v1", "migration-admin")
+        self.assertIsNotNone(created)
+        assert created is not None
+        store.create_remembered_browser_session_for_api_key(created["record"].id)
+        store.complete_completed_migration_claim_transition(created["record"].id, "migration-claim-v1")
+        os.chmod(root / "api-keys.json", 0o600)
+        return coordinator, created["record"].id
+
+    def test_completed_claim_marker_allows_later_normal_restarts_only_after_real_claim(self) -> None:
+        _, key_id = self._complete_migrated_browser_claim(self.root)
+        marker = json.loads((self.root / "migration-claimed-auth.json").read_text(encoding="utf-8"))
+        self.assertEqual(1, marker["schema"])
+        self.assertEqual(key_id, marker["initial_admin_key_id"])
+        self.assertNotIn("secret", json.dumps(marker).lower())
+        for restart in range(2):
+            with self.subTest(restart=restart):
+                decision = MigrationCoordinator(self.root).preflight()
+                self.assertEqual(MigrationState.COMPLETE, decision.state)
+                self.assertEqual("claimed", decision.completed_auth_phase)
+
+    def test_completed_claimed_lineage_validation_is_read_only(self) -> None:
+        self._complete_migrated_browser_claim(self.root)
+        with patch("migration.coordinator._restrict_fd_to_owner", side_effect=AssertionError("read mutation")):
+            decision = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, decision.state)
+        self.assertEqual("claimed", decision.completed_auth_phase)
+
+    def test_completed_claim_marker_rejects_active_auth_before_transition_and_tampering(self) -> None:
+        active_root = self.root / "active-before-marker"
+        MigrationFixture(active_root).write()
+        coordinator = MigrationCoordinator(active_root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        active = ApiKeyStore(file_path=str(active_root / "api-keys.json"))
+        active.create_api_key("forged", ["admin"])
+        os.chmod(active_root / "api-keys.json", 0o600)
+        self.assertEqual(MigrationState.FAILED, MigrationCoordinator(active_root).preflight().state)
+
+        _, key_id = self._complete_migrated_browser_claim(self.root)
+        marker_path = self.root / "migration-claimed-auth.json"
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        marker["receipt_sha256"] = "0" * 64
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        os.chmod(marker_path, 0o600)
+        self.assertEqual(MigrationState.FAILED, MigrationCoordinator(self.root).preflight().state)
+        marker["receipt_sha256"] = hashlib.sha256((self.root / "migration-state.json").read_bytes()).hexdigest()
+        marker_path.write_text(json.dumps(marker), encoding="utf-8")
+        os.chmod(marker_path, 0o600)
+        store_path = self.root / "api-keys.json"
+        store_payload = json.loads(store_path.read_text(encoding="utf-8"))
+        store_payload["api_keys"] = [record for record in store_payload["api_keys"] if record["id"] != key_id]
+        store_path.write_text(json.dumps(store_payload), encoding="utf-8")
+        os.chmod(store_path, 0o600)
+        self.assertEqual(MigrationState.FAILED, MigrationCoordinator(self.root).preflight().state)
+
+    def test_completed_lineage_rejects_active_malformed_dangling_and_unsafe_auth_state(self) -> None:
+        for name in ("active", "malformed", "dangling", "unsafe"):
+            with self.subTest(name=name):
+                root = self.root / name
+                MigrationFixture(root).write()
+                self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(root).apply_confirmed().state)
+                store_path = root / "api-keys.json"
+                history_path = root / "api-keys.history.jsonl"
+                if name == "active":
+                    store = ApiKeyStore(file_path=str(store_path))
+                    store.create_api_key("administrator", ["admin"])
+                elif name == "malformed":
+                    history_path.write_text("{not json}\n", encoding="utf-8")
+                elif name == "dangling":
+                    store_path.write_text(
+                        json.dumps({
+                            "version": 3,
+                            "api_keys": [],
+                            "ui_sessions": [],
+                            "browser_handover_claimed_version": "",
+                        }),
+                        encoding="utf-8",
+                    )
+                else:
+                    store = ApiKeyStore(file_path=str(store_path))
+                    store.ensure_bootstrap_proof()
+                    store.save()
+                    if os.name == "posix":
+                        os.chmod(store_path, 0o644)
+                    else:
+                        os.link(store_path, root / "api-keys-copy.json")
+
+                decision = MigrationCoordinator(root).preflight()
+                self.assertEqual(MigrationState.FAILED, decision.state)
+                self.assertFalse(decision.allows_normal_startup)
+
+    def test_apply_stays_strict_when_bootstrap_proof_artifacts_exist(self) -> None:
+        MigrationFixture(self.root).write()
+        original = default_migration_registry()[0]
+
+        def apply_with_bootstrap_proof(config_dir: Path, source) -> None:
+            original.apply(config_dir, source)
+            ApiKeyStore(file_path=str(config_dir / "api-keys.json")).ensure_bootstrap_proof()
+
+        injected = MigrationSpec(
+            original.migration_id, original.order, original.source_schema, original.target_schema,
+            original.features, original.fingerprint, apply_with_bootstrap_proof,
+            original.validate, original.input_files,
+        )
+
+        with self.assertRaises(MigrationBlockedError) as context:
+            MigrationCoordinator(self.root, (injected,)).apply_confirmed()
+
+        self.assertEqual(MigrationState.FAILED, context.exception.decision.state)
+        self.assertTrue(context.exception.decision.retryable)
+
+    def test_apply_rejects_dangling_auth_store_and_retains_recovery_backup(self) -> None:
+        for auth_state_name in ("api-keys.json", "api-keys.history.jsonl"):
+            with self.subTest(auth_state_name=auth_state_name):
+                root = self.root / auth_state_name.replace(".", "_")
+                fixture = MigrationFixture(root)
+                fixture.write()
+                before = {
+                    name: (root / name).read_bytes()
+                    for name in ("settings.cfg", "controller.persist", "autoqueue.persist")
+                }
+                original = default_migration_registry()[0]
+
+                def apply_with_dangling_auth_store(config_dir: Path, source) -> None:
+                    original.apply(config_dir, source)
+                    try:
+                        (config_dir / auth_state_name).symlink_to("missing-auth-state")
+                    except OSError as exc:
+                        self.skipTest("symlink creation is unavailable: {}".format(exc))
+
+                injected = MigrationSpec(
+                    original.migration_id, original.order, original.source_schema, original.target_schema,
+                    original.features, original.fingerprint, apply_with_dangling_auth_store,
+                    original.validate, original.input_files,
+                )
+                coordinator = MigrationCoordinator(root, (injected,))
+
+                with self.assertRaises(MigrationBlockedError) as context:
+                    coordinator.apply_confirmed()
+
+                failed = context.exception.decision
+                self.assertEqual(MigrationState.FAILED, failed.state)
+                self.assertTrue(failed.retryable)
+                self.assertTrue((root / auth_state_name).is_symlink())
+                receipt = json.loads((root / "migration-state.json").read_text(encoding="utf-8"))
+                self.assertEqual("failed", receipt["state"])
+                self.assertEqual([], receipt.get("applied_migrations"))
+                self.assertIn("migration-backups/", receipt["backup"])
+                with self.assertRaises(MigrationBlockedError):
+                    coordinator.require_normal_startup()
+
+                coordinator.restore_offline(Path(receipt["backup"]).name)
+                self.assertFalse((root / auth_state_name).exists())
+                self.assertFalse((root / auth_state_name).is_symlink())
+                self.assertFalse((root / "path_pairs.json").exists())
+                self.assertEqual(before, {
+                    name: (root / name).read_bytes()
+                    for name in before
+                })
 
     def test_retained_backup_ready_revalidates_after_prior_ready_result(self) -> None:
         MigrationFixture(self.root).write()

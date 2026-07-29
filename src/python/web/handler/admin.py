@@ -144,6 +144,9 @@ class AdminHandler(IHandler):
                 }, status=409)
 
             ui_session = self.__auth_store.create_remembered_browser_session_for_api_key(result["record"].id)
+            self.__auth_store.complete_completed_migration_claim_transition(
+                result["record"].id, handover_version,
+            )
             response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],

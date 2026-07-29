@@ -1,0 +1,10 @@
+services:
+  seedsync:
+    volumes:
+      - type: volume
+        source: seedsync-local-config
+        target: /config
+
+volumes:
+  seedsync-local-config:
+    name: seedsync-local-config

@@ -256,9 +256,9 @@ def _hash_file(
         descriptor = os.open(path, flags)
     try:
         if owner_only:
-            from .coordinator import _restrict_fd_to_owner
+            from .coordinator import _verify_fd_owner_only
 
-            _restrict_fd_to_owner(descriptor)
+            _verify_fd_owner_only(descriptor)
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode) or _is_reparse(info):
             raise BackupRestoreError("Migration backup input must be a regular file")
@@ -520,7 +520,7 @@ def _write_private_file(
     source_root: Path | None = None,
 ) -> None:
     if os.name == "nt":
-        from .coordinator import _open_anchored, _restrict_fd_to_owner
+        from .coordinator import _open_anchored
 
         # Every private file is beneath the config root. Locate it without
         # resolving links so coordinator's anchored create enforces the root.
@@ -534,7 +534,6 @@ def _write_private_file(
         inferred_root = cursor.parent if cursor.name == BACKUP_ROOT_NAME else cursor.parent
         root = root or inferred_root
         descriptor = _open_anchored(path, root, os.O_CREAT | os.O_EXCL | os.O_WRONLY, owner_control=True)
-        _restrict_fd_to_owner(descriptor)
     else:
         if root is not None:
             from .coordinator import _open_anchored
@@ -545,7 +544,9 @@ def _write_private_file(
                 path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0), 0o600,
             )
     try:
-        os.fchmod(descriptor, 0o600) if os.name == "posix" else None
+        from .coordinator import _restrict_fd_to_owner
+
+        _restrict_fd_to_owner(descriptor)
         with os.fdopen(descriptor, "wb", closefd=False) as output:
             if source is not None:
                 if source_root is not None:

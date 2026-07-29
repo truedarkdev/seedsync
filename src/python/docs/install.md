@@ -50,8 +50,12 @@ Select the section for your platform:
     * `<config directory>` refers to the location on host machine where config files will be placed
     * any host directories you mount must already exist
 
-    By default the docker image is run under the default user (uid=1000).
-    To run as a different user, include the option `--user <uid>:<gid>`.
+    `/config` must be a real POSIX directory owned by root or the configured `PUID`, with no group or other write bits, and end with mode `0700`. The Docker entrypoint rejects any other initial owner or group/other-writable root before reading or mutating its tree; repair it first with `sudo chmod go-w <config directory>` and `sudo chown <PUID>:<PGID> <config directory>`, or use a Docker named volume. It automatically prepares admitted roots only on `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `zfs`, `tmpfs`, or `overlay`, then verifies them before starting SeedSync. Configuration entries must not be symlinks, nested mounts, or hard-linked regular files. Safe startup assumes exclusive use: no concurrent same-UID writer and no retained write-capable file descriptor. Do not use Windows shared folders, WSL DrvFS/9p/V9FS, FUSE, CIFS/SMB, NFS, virtiofs, or VirtualBox shared folders for `/config`; those paths cannot satisfy the owner-private migration and lock contract. This restriction does not change normal `/downloads` or `/mounts` permissions.
+
+    By default SeedSync runs its application process as `PUID=1000` and
+    `PGID=1000`. To use another principal, set `-e PUID=<uid> -e PGID=<gid>`.
+    Do not use Docker's `--user` option: the entrypoint must begin as root to
+    repair and verify the `/config` root before it drops privileges.
 
     If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
 
@@ -78,6 +82,13 @@ Select the section for your platform:
 
 SeedSync supports Windows via the Docker container.
 
+The `/config` mount must be a Docker named volume or other Linux-managed POSIX
+storage. Windows shared folders and WSL DrvFS paths are not supported for this
+security-sensitive mount because they cannot prove its owner-private `0700`
+contract. Use the tracked Windows Compose override below; it replaces only the
+`/config` mount with the stable `seedsync-local-config` named volume.
+`/downloads` and `/mounts` retain their ordinary shared-path behavior.
+
 1. Install Docker on Windows.
 
    1. [Docker for Windows](https://www.docker.com/docker-windows) if you have Windows 10 Pro or above
@@ -89,13 +100,25 @@ SeedSync supports Windows via the Docker container.
 3. From this repository, start the local Docker app with Docker Compose:
 
         :::powershell
-        docker compose -f compose.local.yml up -d --build seedsync
+        docker compose -f compose.local.yml -f compose.windows.yml up -d --build seedsync
 
     This starts the repo-owned local Docker path, binds the web UI to
     `http://localhost:8800`, and prepares the trusted local bootstrap source
     used by the browser bootstrap flow.
 
-    If you need different container file permissions, set `UMASK` to an octal value such as `002` in the Compose environment before starting the container. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
+    Verify that the effective configuration uses the named volume before
+    starting or migrating data:
+
+        :::powershell
+        docker compose -f compose.local.yml -f compose.windows.yml config
+
+    The `seedsync` service must show `seedsync-local-config` mounted at
+    `/config`. If `./build/docker-local/config` already contains SeedSync data,
+    stop the old deployment and copy it to the named volume using a deliberate
+    backup/migration procedure; SeedSync never copies or deletes that bind path
+    automatically.
+
+    If you need different container file permissions, set `UMASK` to an octal value such as `002` in the Compose environment before starting the container. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID. For the security-sensitive `/config` root, use the documented named volume; Windows shared folders and WSL DrvFS do not support the required owner-private `0700` contract.
 
 4. Read the one-time bootstrap proof from the running container:
 

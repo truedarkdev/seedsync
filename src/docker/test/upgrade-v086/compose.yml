@@ -22,8 +22,8 @@ services:
       SEEDSYNC_LAB_TRANSIENT_MODE: ${LAB_TRANSIENT_MODE:-0}
       LFTP_HOME: ${TRANSIENT_LFTP_HOME:-}
     volumes:
-      - type: bind
-        source: ${RUN_DIR}/config
+      - type: volume
+        source: upgrade_config
         target: /config
       - type: bind
         source: ${RUN_DIR}/downloads
@@ -32,7 +32,7 @@ services:
         source: ${RUN_DIR}/mounts
         target: /mounts
       - type: bind
-        source: ${RUN_DIR}/logs
+        source: ${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:?private log mount is required}
         target: /logs
     tmpfs:
       - /tmp:mode=1777
@@ -92,4 +92,9 @@ networks:
     external: true
   browser_access:
     name: ${BROWSER_NETWORK:?BROWSER_NETWORK is required}
+    external: true
+
+volumes:
+  upgrade_config:
+    name: ${CONFIG_VOLUME:?CONFIG_VOLUME is required}
     external: true

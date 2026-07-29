@@ -1,6 +1,7 @@
 #!/bin/bash
 
 set -euo pipefail
+umask 077
 
 DEFAULT_ID=1000
 APP_USER=seedsync
@@ -244,6 +245,281 @@ check_writable_path() {
     fi
 }
 
+prepare_config_root() {
+    local config_root="${1:-$CONFIG_DIR}"
+    local test_delay_seconds="${2:-0}"
+    local repair_test_delay_seconds="${3:-0}"
+    python3 - "$config_root" "$USER_ID" "$GROUP_ID" "$DEFAULT_ID" "$test_delay_seconds" "$repair_test_delay_seconds" <<'PY'
+import os
+import re
+import stat
+import sys
+import time
+
+root, user_id_text, group_id_text, default_id_text, test_delay_text, repair_test_delay_text = sys.argv[1:]
+uid, gid, default_uid = int(user_id_text), int(group_id_text), int(default_id_text)
+try:
+    test_delay_seconds = int(test_delay_text)
+    repair_test_delay_seconds = int(repair_test_delay_text)
+except ValueError:
+    test_delay_seconds = repair_test_delay_seconds = -1
+allowed_filesystems = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay"}
+rejected_prefixes = ("fuse",)
+rejected_filesystems = {"9p", "v9fs", "virtiofs", "cifs", "smb", "smb2", "smb3", "nfs", "nfs4", "vboxsf", "drvfs"}
+
+def fail(reason):
+    raise SystemExit(
+        "ERROR: {} config-root contract failed: {}. Use a Docker named volume or a local POSIX "
+        "filesystem ({}) owned by UID={}, GID={} with mode 0700; Windows/DrvFS, network, "
+        "and shared filesystems are unsupported for /config.".format(
+            root, reason, ", ".join(sorted(allowed_filesystems)), uid, gid,
+        )
+    )
+
+def fail_after_access_revocation(reason):
+    fail("{}; root access was already revoked and the anchored root remains mode 0000 for administrator recovery".format(reason))
+
+def decode_mount_path(value):
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+def filesystem_type(path):
+    normalized = os.path.normpath(path)
+    winner = None
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            for line in stream:
+                fields = line.rstrip("\n").split()
+                separator = fields.index("-")
+                mount_path = decode_mount_path(fields[4])
+                if normalized == mount_path or normalized.startswith(mount_path.rstrip("/") + "/"):
+                    if winner is None or len(mount_path) > len(winner[0]):
+                        winner = (mount_path, fields[separator + 1])
+    except (OSError, ValueError, IndexError):
+        fail("unable to determine filesystem type")
+    if winner is None:
+        fail("unable to determine filesystem type")
+    return winner[1]
+
+def reject_nested_mounts(path):
+    normalized = os.path.normpath(path)
+    prefix = normalized.rstrip("/") + "/"
+    try:
+        with open("/proc/self/mountinfo", encoding="utf-8") as stream:
+            for line in stream:
+                fields = line.rstrip("\n").split()
+                mount_path = decode_mount_path(fields[4])
+                if mount_path.startswith(prefix):
+                    fail("{} contains a nested mount or device".format(mount_path))
+    except (OSError, IndexError):
+        fail("unable to determine nested mount topology")
+
+def require_directory(fd, relative):
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        fail("{} is not a directory".format(relative))
+    return info
+
+def require_unlinked_regular(info, root_device, relative):
+    if not stat.S_ISREG(info.st_mode):
+        fail("{} is not a regular file".format(relative))
+    if info.st_dev != root_device:
+        fail("{} crosses into a nested mount or device".format(relative))
+    if info.st_nlink != 1:
+        fail("{} has link count {}; regular config files must not have hard links".format(relative, info.st_nlink))
+
+def require_admitted_descendant_owner(info, relative):
+    if info.st_uid not in (0, default_uid, uid):
+        fail(
+            "{} owner UID {} is neither trusted root, the image default UID {}, nor the runtime UID {}; refusing before ownership repair. "
+            "Restore the config from a trusted backup or repair its ownership before starting SeedSync".format(
+                relative, info.st_uid, default_uid, uid,
+            )
+        )
+
+def require_same_regular_identity(relative, root_device, *infos):
+    for info in infos:
+        require_unlinked_regular(info, root_device, relative)
+        require_admitted_descendant_owner(info, relative)
+    reference = infos[0]
+    for info in infos[1:]:
+        if (info.st_dev, info.st_ino) != (reference.st_dev, reference.st_ino):
+            fail("{} changed identity while ownership was being repaired".format(relative))
+
+def require_same_directory_identity(relative, root_device, *infos):
+    for info in infos:
+        if not stat.S_ISDIR(info.st_mode):
+            fail("{} is not a directory".format(relative))
+        if info.st_dev != root_device:
+            fail("{} crosses into a nested mount or device".format(relative))
+        require_admitted_descendant_owner(info, relative)
+    reference = infos[0]
+    for info in infos[1:]:
+        if (info.st_dev, info.st_ino) != (reference.st_dev, reference.st_ino):
+            fail("{} changed identity while ownership was being repaired".format(relative))
+
+def require_revoked_root_state(root_fd, initial_info, expected_uid, expected_gid, phase):
+    descriptor_info = os.fstat(root_fd)
+    path_info = os.lstat(root)
+    if (
+        not stat.S_ISDIR(descriptor_info.st_mode)
+        or stat.S_IMODE(descriptor_info.st_mode) != 0
+        or descriptor_info.st_uid != expected_uid
+        or descriptor_info.st_gid != expected_gid
+        or (descriptor_info.st_dev, descriptor_info.st_ino) != (initial_info.st_dev, initial_info.st_ino)
+        or (path_info.st_dev, path_info.st_ino) != (descriptor_info.st_dev, descriptor_info.st_ino)
+    ):
+        fail_after_access_revocation("root identity, owner, or mode changed {}".format(phase))
+
+def require_admitted_root_owner(root_info):
+    if root_info.st_uid not in (0, uid):
+        fail(
+            "root owner UID {} is neither trusted root nor the runtime UID {}; refusing before any ownership or tree mutation. "
+            "On Linux, repair the root with sudo chown {}:{} {} and sudo chmod 700 {}; on Windows, use the named-volume Compose override".format(
+                root_info.st_uid, uid, uid, gid, root, root,
+            )
+        )
+    if stat.S_IMODE(root_info.st_mode) & 0o022:
+        fail(
+            "root mode {:04o} grants group or other write access; refusing before any tree read or mutation. "
+            "On Linux, run sudo chmod go-w {} and sudo chown {}:{} {}; on Windows, use the named-volume Compose override".format(
+                stat.S_IMODE(root_info.st_mode), root, uid, gid, root,
+            )
+        )
+
+def validate_tree(directory_fd, root_device, relative="."):
+    for entry in os.scandir(directory_fd):
+        child_relative = entry.name if relative == "." else relative + "/" + entry.name
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            fail("{} contains a symlink".format(child_relative))
+        if info.st_dev != root_device:
+            fail("{} crosses into a nested mount or device".format(child_relative))
+        require_admitted_descendant_owner(info, child_relative)
+        if stat.S_ISDIR(info.st_mode):
+            child_fd = os.open(
+                entry.name,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=directory_fd,
+            )
+            try:
+                child_info = require_directory(child_fd, child_relative)
+                if child_info.st_dev != root_device:
+                    fail("{} crosses into a nested mount or device".format(child_relative))
+                require_admitted_descendant_owner(child_info, child_relative)
+                validate_tree(child_fd, root_device, child_relative)
+            finally:
+                os.close(child_fd)
+        else:
+            require_unlinked_regular(info, root_device, child_relative)
+            require_admitted_descendant_owner(info, child_relative)
+
+def repair_tree(directory_fd, root_device):
+    for entry in os.scandir(directory_fd):
+        info = entry.stat(follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode) or info.st_dev != root_device:
+            fail("configuration tree changed while ownership was being repaired")
+        if stat.S_ISDIR(info.st_mode):
+            try:
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=directory_fd,
+                )
+            except OSError as exc:
+                fail("{} cannot be opened without following links ({})".format(entry.name, exc.__class__.__name__))
+            try:
+                child_info = require_directory(child_fd, entry.name)
+                current_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                require_same_directory_identity(entry.name, root_device, info, child_info, current_name_info)
+                os.fchown(child_fd, uid, gid)
+                final_child_info = os.fstat(child_fd)
+                final_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                require_same_directory_identity(entry.name, root_device, final_child_info, final_name_info)
+                repair_tree(child_fd, root_device)
+            finally:
+                os.close(child_fd)
+        else:
+            require_unlinked_regular(info, root_device, entry.name)
+            file_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            if hasattr(os, "O_CLOEXEC"):
+                file_flags |= os.O_CLOEXEC
+            try:
+                file_fd = os.open(entry.name, file_flags, dir_fd=directory_fd)
+            except OSError as exc:
+                fail("{} cannot be opened without following links ({})".format(entry.name, exc.__class__.__name__))
+            try:
+                descriptor_info = os.fstat(file_fd)
+                name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                require_same_regular_identity(entry.name, root_device, info, descriptor_info, name_info)
+                os.fchown(file_fd, uid, gid)
+                final_descriptor_info = os.fstat(file_fd)
+                final_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                require_same_regular_identity(entry.name, root_device, final_descriptor_info, final_name_info)
+            finally:
+                os.close(file_fd)
+
+if os.path.islink(root):
+    fail("root is a symlink")
+try:
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as exc:
+    fail("cannot open a real root directory ({})".format(exc.__class__.__name__))
+try:
+    root_info = require_directory(root_fd, ".")
+    filesystem = filesystem_type(root)
+    if filesystem in rejected_filesystems or filesystem.startswith(rejected_prefixes) or filesystem not in allowed_filesystems:
+        fail("filesystem type {} is not an allowed local POSIX filesystem".format(filesystem))
+    reject_nested_mounts(root)
+    require_admitted_root_owner(root_info)
+    if test_delay_seconds < 0 or test_delay_seconds > 10 or repair_test_delay_seconds < 0 or repair_test_delay_seconds > 10:
+        fail("config-only test delays must be integers from 0 through 10 seconds")
+    try:
+        os.fchmod(root_fd, 0)
+    except OSError as exc:
+        fail("cannot revoke root access before ownership transition ({})".format(exc.__class__.__name__))
+    require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, "after access revocation")
+    # This closes new pathname traversal for every UID, including the runtime
+    # UID after root ownership changes. It cannot revoke a descriptor that a
+    # same-UID process opened before preparation, so callers must not share
+    # writable config descriptors with untrusted processes during startup.
+    if test_delay_seconds:
+        time.sleep(test_delay_seconds)
+        require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, "during the bounded config-only test delay")
+    validate_tree(root_fd, root_info.st_dev)
+    if root_info.st_uid == 0 or root_info.st_gid != gid:
+        try:
+            os.fchown(root_fd, uid, gid)
+        except OSError as exc:
+            fail_after_access_revocation("cannot assign the runtime owner ({})".format(exc.__class__.__name__))
+    require_revoked_root_state(root_fd, root_info, uid, gid, "after ownership transition")
+    if repair_test_delay_seconds:
+        time.sleep(repair_test_delay_seconds)
+        require_revoked_root_state(root_fd, root_info, uid, gid, "during the bounded repair-phase test delay")
+    repair_tree(root_fd, root_info.st_dev)
+    validate_tree(root_fd, root_info.st_dev)
+    path_info = os.lstat(root)
+    final_info = os.fstat(root_fd)
+    if (
+        not stat.S_ISDIR(final_info.st_mode)
+        or final_info.st_uid != uid
+        or final_info.st_gid != gid
+        or stat.S_IMODE(final_info.st_mode) != 0
+        or (path_info.st_dev, path_info.st_ino) != (final_info.st_dev, final_info.st_ino)
+    ):
+        fail_after_access_revocation("root owner, mode, or identity changed before access restoration")
+    try:
+        os.fchmod(root_fd, 0o700)
+    except OSError as exc:
+        fail_after_access_revocation("cannot restore runtime-private root access ({})".format(exc.__class__.__name__))
+    final_info = os.fstat(root_fd)
+    if stat.S_IMODE(final_info.st_mode) != 0o700:
+        fail("root mode did not restore to runtime-private access")
+finally:
+    os.close(root_fd)
+print("Verified config root: {} filesystem={} owner={}:{} mode=700".format(root, filesystem, uid, gid), file=sys.stderr)
+PY
+}
+
 validate_umask() {
     local umask_value="$1"
 
@@ -262,16 +538,45 @@ fi
 
 USER_ID="$(resolve_id PUID "$DEFAULT_ID")"
 GROUP_ID="$(resolve_id PGID "$DEFAULT_ID")"
+
+if [ "${1:-}" = "--prepare-config-root" ]; then
+    config_root_test_delay="${SEEDSYNC_CONFIG_ROOT_TEST_DELAY_SECONDS:-0}"
+    config_root_repair_test_delay="${SEEDSYNC_CONFIG_ROOT_REPAIR_TEST_DELAY_SECONDS:-0}"
+    case "$config_root_test_delay" in
+        (''|*[!0-9]*)
+            printf 'ERROR: SEEDSYNC_CONFIG_ROOT_TEST_DELAY_SECONDS must be an integer from 0 through 10 for --prepare-config-root\n' >&2
+            exit 1
+            ;;
+    esac
+    if [ "$config_root_test_delay" -gt 10 ]; then
+        printf 'ERROR: SEEDSYNC_CONFIG_ROOT_TEST_DELAY_SECONDS must be an integer from 0 through 10 for --prepare-config-root\n' >&2
+        exit 1
+    fi
+    case "$config_root_repair_test_delay" in
+        (''|*[!0-9]*)
+            printf 'ERROR: SEEDSYNC_CONFIG_ROOT_REPAIR_TEST_DELAY_SECONDS must be an integer from 0 through 10 for --prepare-config-root\n' >&2
+            exit 1
+            ;;
+    esac
+    if [ "$config_root_repair_test_delay" -gt 10 ]; then
+        printf 'ERROR: SEEDSYNC_CONFIG_ROOT_REPAIR_TEST_DELAY_SECONDS must be an integer from 0 through 10 for --prepare-config-root\n' >&2
+        exit 1
+    fi
+    prepare_config_root "${2:-$CONFIG_DIR}" "$config_root_test_delay" "$config_root_repair_test_delay"
+    exit 0
+fi
+
 GROUP_NAME="$(ensure_group "$GROUP_ID")"
 USER_NAME="$APP_USER"
 ensure_user "$USER_ID" "$GROUP_NAME"
 
 # Keep the bootstrap config and the runtime home writable, but avoid recursing
 # through large mounted trees unless their ownership really needs to be fixed.
-mkdir -p "$CONFIG_DIR" "$DOWNLOADS_DIR" "$MOUNTS_DIR" "$USER_HOME"
+mkdir -p "$CONFIG_DIR"
+prepare_config_root
+mkdir -p "$DOWNLOADS_DIR" "$MOUNTS_DIR" "$USER_HOME"
 mkdir -p "$USER_HOME/.ssh"
 mkdir -p /staging
-safe_chown_recursive "config directory" "$CONFIG_DIR"
 safe_chown "home directory" "$USER_HOME"
 safe_chown_recursive "home SSH directory" "$USER_HOME/.ssh"
 safe_chown "downloads directory" "$DOWNLOADS_DIR"

@@ -422,6 +422,19 @@ def materialize_source(root, relative, source):
     write_bytes(root, relative, source_bytes(source))
 
 
+def materialize_extracted_payload(root, archive):
+    """Materialize only the manifest's stable extracted-file oracle."""
+    for relative, content in archive.items():
+        parts = PurePosixPath(safe_relative(relative)).parts
+        if parts and parts[0] == "extracted":
+            parts = parts[1:]
+        if not parts:
+            raise ValueError("archive extraction member is empty")
+        target = str(PurePosixPath("extracted", *parts))
+        payload = source_bytes(content) if isinstance(content, dict) else str(content).encode("utf-8")
+        write_bytes(root, target, payload)
+
+
 def materialize(manifest, run_dir):
     run_dir = Path(run_dir).resolve()
     remote_root = run_dir / "remote-files"
@@ -446,6 +459,8 @@ def materialize(manifest, run_dir):
             downloaded.append(name)
         if markers.get("extracted"):
             extracted.append(name)
+        if case["expected"]["autoqueue"] == "auto-extract" and remote and "archive" in remote:
+            materialize_extracted_payload(local_root, remote["archive"])
 
     # The lftp scanner creates/consumes this historical status artifact, but
     # scan_fs must never expose it as a user file.
