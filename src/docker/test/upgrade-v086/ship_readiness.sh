@@ -452,7 +452,7 @@ if (not isinstance(request, dict) or set(request) != {"schema", "run_id", "reque
         or request.get("schema") != 1 or request.get("run_id") != run_id
         or request.get("request_kind") != "pre-restart-stability"
         or not isinstance(request.get("requested_at"), str)
-        or not re.fullmatch(r"\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z", request["requested_at"])):
+        or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", request["requested_at"])):
     raise SystemExit("browser stability request is invalid")
 value = json.load(open(ready_path, encoding="utf-8"))
 expected = {"schema", "run_id", "request_kind", "requested_at", "error_generation", "runtime_error_count", "diagnostic_failure_count", "model_rows", "status", "stability_window_ms", "ready_at"}
