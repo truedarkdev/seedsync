@@ -1241,6 +1241,40 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertTrue(HARNESS._retained_secret_hint("sftp://user:synthetic-credential/sftp://safe@host:1234/path"))
         self.assertTrue(HARNESS._retained_secret_hint("https://host:non-numeric/sftp://safe@host:1234/path"))
         self.assertTrue(HARNESS._retained_secret_hint("https://host%3asynthetic/sftp://safe@host:1234/path"))
+        self.assertTrue(HARNESS._retained_secret_hint("1sftp://user:synthetic-credential@host:1234/path"))
+        self.assertFalse(HARNESS._retained_secret_hint("9HTTPS://user@host:1234/path"))
+
+    def test_retained_secret_hint_scans_large_no_scheme_input_linearly(self):
+        started = time.monotonic()
+        self.assertFalse(HARNESS._retained_secret_hint("x" * (1024 * 1024)))
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_hint_scans_scheme_dense_no_at_input_bounded(self):
+        started = time.monotonic()
+        self.assertFalse(HARNESS._retained_secret_hint("x://" * (512 * 1024)))
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_hint_scans_scheme_dense_mixed_safe_input_bounded(self):
+        pattern = "https://host:1234/path sftp://user@remote:1234/file "
+        started = time.monotonic()
+        self.assertFalse(HARNESS._retained_secret_hint(pattern * ((2 * 1024 * 1024) // len(pattern))))
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_detection_scans_chunked_large_file_and_boundary_secret(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "large.log"
+            path.write_text("x" * (4096 - 8) + "password=synthetic-value" + "x" * (2 * 1024 * 1024), encoding="utf-8")
+            started = time.monotonic()
+            self.assertTrue(HARNESS._retained_secret_detected(path))
+            self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_detection_keeps_uri_token_splits_within_overlap(self):
+        for label, token in (("scheme", "sftp://user:synthetic@host"), ("encoded", "sftp://user%3Asynthetic@host"), ("at", "sftp://user:synthetic@host")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as temporary:
+                split = token.index("://") + 1 if label == "scheme" else token.index("%3A") + 1 if label == "encoded" else token.index("@")
+                path = Path(temporary) / "split.log"
+                path.write_text("x" * (4096 - split) + token, encoding="utf-8")
+                self.assertTrue(HARNESS._retained_secret_detected(path))
 
     def test_private_log_publication_ignores_path_and_query_at_after_safe_authority(self):
         with tempfile.TemporaryDirectory() as temporary:
