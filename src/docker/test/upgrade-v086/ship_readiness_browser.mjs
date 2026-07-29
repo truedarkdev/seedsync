@@ -90,6 +90,12 @@ let page;
 let shutdownRequested = false;
 let claimClassification = 'not-applicable';
 let claimPhase = 'not-started';
+// Observe first-claim SSE recovery while the shell continues its work.  The
+// later stability request consumes this in-flight/validated result instead of
+// restarting an error-relative SLA window after its deadline.
+let firstClaimSseRecoveryPromise = null;
+let validatedFirstClaimSseRecovery = null;
+let firstClaimSseRecoveryFailure = null;
 
 function redact(value) {
   const result = spawnSync('python', [evidenceHelper, 'redact-stdin'], {
@@ -101,7 +107,7 @@ function redact(value) {
 async function writeEvidence(payload, name = evidenceName) {
   await flushBrowserDiagnostics();
   const target = path.join(evidenceDir, name);
-  fs.writeFileSync(target, redact(JSON.stringify({ errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence, navigation, ...payload }, null, 2)), { mode: 0o600 });
+  fs.writeFileSync(target, redact(JSON.stringify({ errors, runtimeErrors, diagnosticFailures, expectedTransitions, streamConnections, streamTransitionEvidence, firstClaimSseRecovery: validatedFirstClaimSseRecovery, firstClaimSseRecoveryFailure, navigation, ...payload }, null, 2)), { mode: 0o600 });
   fs.chmodSync(target, 0o600);
 }
 
@@ -130,11 +136,15 @@ page.on('response', response => {
     const url = new URL(response.url());
     if (url.pathname !== '/server/stream') return;
     const contentType = response.headers()['content-type'] || '';
-    streamConnections.push({
+    const connection = {
       observedAfterMs: Date.now() - browserStartedAt,
       status: response.status(),
       contentType: contentType.startsWith('text/event-stream') ? 'text/event-stream' : 'other',
-    });
+    };
+    streamConnections.push(connection);
+    if (connection.status === 200 && connection.contentType === 'text/event-stream') {
+      void classifyRecoveredFirstClaimSseTransition();
+    }
   } catch {
     diagnosticFailures.push({ kind: 'stream-response', classification: 'response-lifecycle-capture-failed', source: 'unavailable', location: 'unavailable', message: 'redacted diagnostic unavailable' });
   }
@@ -225,6 +235,8 @@ function captureBrowserDiagnostic(kind, readEvent) {
   const envelope = {
     kind,
     observedAfterMs: Date.now() - browserStartedAt,
+    claimClassification,
+    claimPhase,
     classification: 'captured-redacted',
     source: safeDiagnosticField(event?.source),
     location: {
@@ -241,20 +253,22 @@ function captureBrowserDiagnostic(kind, readEvent) {
     envelope.message = message;
   }
   runtimeErrors.push(envelope);
+  void classifyRecoveredFirstClaimSseTransition();
 }
 
 function isFirstClaimSseTransportError(error) {
   return error.kind === 'console-error'
     && error.message === 'Error in stream: %O Event'
     && error.source === 'error'
+    && error.claimClassification === 'first-claim-bootstrap'
+    && error.claimPhase === 'post-claim-complete'
     && claimClassification === 'first-claim-bootstrap'
     && claimPhase === 'post-claim-complete';
 }
 
-async function classifyRecoveredFirstClaimSseTransition() {
-  if (claimClassification !== 'first-claim-bootstrap' || claimPhase !== 'post-claim-complete') return;
+async function observeFirstClaimSseRecovery() {
   const matching = runtimeErrors.filter(isFirstClaimSseTransportError);
-  if (!matching.length) return;
+  if (matching.length !== 1) return null;
   const error = matching[0];
   const transition = {
     kind: 'first-claim-sse-transport', matchingCount: matching.length, classification: 'recovery-pending',
@@ -282,7 +296,7 @@ async function classifyRecoveredFirstClaimSseTransition() {
       transition.classification = 'recovery-aborted-error';
       transition.repeatedCount = currentMatching.length;
       transition.otherErrorCount = otherErrors.length;
-      return;
+      return null;
     }
     const state = recoveryState();
     transition.pollCount += 1;
@@ -315,14 +329,14 @@ async function classifyRecoveredFirstClaimSseTransition() {
     }), { timeoutMs: modelTimeoutMs, minimumRows: fixtureNames.length });
   } catch {
     transition.classification = 'model-not-fresh';
-    return;
+    return null;
   }
     try {
       await requireApi('first-claim-sse-recovery-status', '/server/status');
       transition.statusAfterRecovery = 200;
     } catch {
       transition.classification = 'status-not-ready';
-      return;
+      return null;
     }
     const stabilityUntil = Date.now() + sseStabilityWindowMs;
     while (Date.now() < stabilityUntil) {
@@ -332,7 +346,7 @@ async function classifyRecoveredFirstClaimSseTransition() {
         transition.classification = 'recovery-unstable';
         transition.repeatedCount = repeated.length;
         transition.otherErrorCount = otherErrors.length;
-        return;
+        return null;
       }
       await new Promise(resolve => setTimeout(resolve, sseRecoveryPollMs));
     }
@@ -340,7 +354,15 @@ async function classifyRecoveredFirstClaimSseTransition() {
     transition.classification = 'recovered-after-single-transport-error';
     transition.stabilityWindowMs = sseStabilityWindowMs;
     expectedTransitions.push({ kind: transition.kind, count: 1, timingClass: 'post-claim-stateful-reconnect', errorObservedAfterMs: error.observedAfterMs, recoveryObservedAfterMs: state.recovery.observedAfterMs, recoveryLatencyMs: transition.recoveryLatencyMs, maximumRecoveryMs: sseReconnectMaximumMs, pollCount: transition.pollCount, modelFresh: true, recoveryModelRows: transition.recoveryModelRows, statusAfterRecovery: 200, stabilityWindowMs: sseStabilityWindowMs });
-    return;
+    const validated = {
+      ...transition,
+      errorGeneration: browserErrorGeneration,
+      claimClassification,
+      claimPhase,
+      validatedAtMs: Date.now() - browserStartedAt,
+    };
+    validatedFirstClaimSseRecovery = validated;
+    return validated;
   }
   const finalState = recoveryState();
   transition.classification = 'recovery-timeout';
@@ -348,6 +370,19 @@ async function classifyRecoveredFirstClaimSseTransition() {
   transition.streamAttemptCount = finalState.attemptCount;
   transition.ignoredPreMinimumCount = finalState.ignoredPreMinimumCount;
   transition.streamStatuses = finalState.statuses;
+  return null;
+}
+
+function classifyRecoveredFirstClaimSseTransition() {
+  if (validatedFirstClaimSseRecovery) return Promise.resolve(validatedFirstClaimSseRecovery);
+  if (firstClaimSseRecoveryPromise) return firstClaimSseRecoveryPromise;
+  if (claimClassification !== 'first-claim-bootstrap' || claimPhase !== 'post-claim-complete'
+      || runtimeErrors.filter(isFirstClaimSseTransportError).length !== 1) return Promise.resolve(null);
+  firstClaimSseRecoveryPromise = observeFirstClaimSseRecovery().catch(() => {
+    firstClaimSseRecoveryFailure = { classification: 'recovery-classifier-failed' };
+    return null;
+  });
+  return firstClaimSseRecoveryPromise;
 }
 
 async function requireFreshStabilityModel(timeoutMs) {
@@ -393,9 +428,14 @@ async function establishPreRestartStability(request) {
   if (diagnosticFailures.length || otherErrors.length || matching.length > 1) {
     throw new Error('browser stability checkpoint observed repeated or non-transport errors');
   }
-  if (matching.length === 1) {
+  if (matching.length === 1 || firstClaimSseRecoveryPromise || validatedFirstClaimSseRecovery) {
     await classifyRecoveredFirstClaimSseTransition();
-    if (runtimeErrors.length || diagnosticFailures.length || streamTransitionEvidence.at(-1)?.classification !== 'recovered-after-single-transport-error') {
+    if (firstClaimSseRecoveryFailure || runtimeErrors.length || diagnosticFailures.length
+        || !validatedFirstClaimSseRecovery
+        || validatedFirstClaimSseRecovery.claimClassification !== 'first-claim-bootstrap'
+        || validatedFirstClaimSseRecovery.claimPhase !== 'post-claim-complete'
+        || validatedFirstClaimSseRecovery.errorGeneration !== browserErrorGeneration
+        || validatedFirstClaimSseRecovery.classification !== 'recovered-after-single-transport-error') {
       throw new Error('browser stability checkpoint did not recover the first-claim transport error');
     }
   }
