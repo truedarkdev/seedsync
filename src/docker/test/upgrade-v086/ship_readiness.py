@@ -900,28 +900,42 @@ def _retained_secret_hint(text: str) -> bool:
                 if value and not value.startswith(("<redacted>", "{", "[")):
                     return True
             start = found + len(name)
-    scheme_pattern = re.compile(r"(?i)[a-z][a-z0-9+.-]*://")
-    for match in scheme_pattern.finditer(text):
-        remainder = text[match.end():]
-        terminator = re.search(r"[/\s?#]", remainder)
-        authority_end = terminator.start() if terminator else len(remainder)
-        authority = remainder[:authority_end]
+    scheme_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+.-")
+    terminator_pattern = re.compile(r"[/\s?#]")
+    occurrences: list[tuple[int, int]] = []
+    at_positions = [index for index, character in enumerate(text) if character == "@"]
+    marker = 0
+    while (marker := text.find("://", marker)) >= 0:
+        start = marker
+        while start and text[start - 1] in scheme_chars:
+            start -= 1
+        candidate = next((index for index in range(start, marker) if text[index].isalpha()), None)
+        if candidate is not None:
+            occurrences.append((candidate, marker + 3))
+        marker += 3
+    at_cursor = 0
+    for index, (_start, scheme_end) in enumerate(occurrences):
+        terminator = terminator_pattern.search(text, scheme_end)
+        authority_end = terminator.start() if terminator else len(text)
+        authority = text[scheme_end:authority_end]
         if "@" in authority:
             userinfo, _host_port = authority.rsplit("@", 1)
         else:
-            eventual_at = remainder.find("@")
-            if eventual_at < 0:
+            while at_cursor < len(at_positions) and at_positions[at_cursor] <= scheme_end:
+                at_cursor += 1
+            if at_cursor == len(at_positions):
                 continue
-            later_scheme = scheme_pattern.search(remainder, 1)
+            eventual_at = at_positions[at_cursor]
+            later_scheme = occurrences[index + 1][0] if index + 1 < len(occurrences) else -1
             authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
-            prefix = remainder[:later_scheme.start()] if later_scheme and later_scheme.start() < eventual_at else None
-            if prefix is not None and authority_is_host_only and ":" not in unquote(prefix[authority_end:]):
+            prefix_end = later_scheme if 0 <= later_scheme < eventual_at else -1
+            if prefix_end >= 0 and authority_is_host_only and ":" not in unquote(text[authority_end:prefix_end]):
                 # The following scheme is a separate occurrence only after an
                 # unambiguous no-userinfo URI; finditer will inspect it too.
                 continue
             # This includes ambiguous host:port/path@ forms; fail closed
             # instead of guessing that a malformed credential is harmless.
-            userinfo = remainder[:eventual_at]
+            userinfo = text[scheme_end:eventual_at]
         decoded = unquote(userinfo).casefold()
         if ":" in decoded:
             _user, credential = decoded.split(":", 1)
