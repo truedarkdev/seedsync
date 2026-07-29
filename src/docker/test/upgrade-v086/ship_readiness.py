@@ -1217,6 +1217,7 @@ def assert_browser_evidence(source: Path, output: Path, *, reuse: bool = False) 
     errors = payload.get("errors")
     runtime_errors = payload.get("runtimeErrors")
     diagnostic_failures = payload.get("diagnosticFailures")
+    stream_connections = payload.get("streamConnections")
     api = payload.get("api")
     visible = payload.get("visibleFixtureRows")
     if (
@@ -1241,7 +1242,7 @@ def assert_browser_evidence(source: Path, output: Path, *, reuse: bool = False) 
     else:
         transitions = payload.get("expectedTransitions")
         stream_evidence = payload.get("streamTransitionEvidence")
-        if not isinstance(transitions, list) or not isinstance(stream_evidence, list) or not {"restart-status", "restart-settings"}.issubset(api):
+        if not isinstance(transitions, list) or not isinstance(stream_evidence, list) or not isinstance(stream_connections, list) or not {"restart-status", "restart-settings"}.issubset(api):
             raise ValueError("browser restart transport evidence is missing")
         restart = [item for item in transitions if isinstance(item, dict) and item.get("kind") == "restart-armed-sse-transport-cluster"]
         if len(restart) != 1:
@@ -1267,24 +1268,73 @@ def assert_browser_evidence(source: Path, output: Path, *, reuse: bool = False) 
             or not isinstance(proof, dict) or proof.get("pathname") != "/server/stream"
             or proof.get("recoveryPathname") != "/server/stream" or proof.get("recoveryStatus") != 200
             or not isinstance(proof.get("origin"), str) or proof["origin"] != proof.get("recoveryOrigin")
-            or not isinstance(proof.get("resource502Locations"), list) or len(proof["resource502Locations"]) != transition["badGateway502Count"]
+            or not isinstance(proof.get("orderedTemporal502Associations"), list) or len(proof["orderedTemporal502Associations"]) != transition["badGateway502Count"]
             or not isinstance(stop_proof, dict) or set(stop_proof) != {"schema", "run_id", "stability_generation", "arm_generation", "acknowledged_error_generation", "restart_stop_dispatched", "stop_dispatch_epoch_ms", "acknowledgedEpochMs"}
             or stop_proof.get("schema") != 1 or stop_proof.get("restart_stop_dispatched") is not True
             or any(type(stop_proof.get(key)) is not int for key in ("stability_generation", "arm_generation", "acknowledged_error_generation", "stop_dispatch_epoch_ms", "acknowledgedEpochMs"))
             or stop_proof["arm_generation"] != stop_proof["stability_generation"] + 1 or stop_proof["acknowledged_error_generation"] != stop_proof["stability_generation"]
             or stop_proof["stop_dispatch_epoch_ms"] < stop_proof["acknowledgedEpochMs"]
-            or not isinstance(quiet, dict) or quiet.get("quietWindowMs") != 1500 or type(quiet.get("errorGeneration")) is not int or quiet["errorGeneration"] != transition["lastGeneration"]
+            or not isinstance(quiet, dict) or quiet.get("quietWindowMs") != 1500 or type(quiet.get("errorGeneration")) is not int
         ):
             raise ValueError("browser restart transport evidence is invalid")
-        if any(not isinstance(location, dict) or set(location) != {"origin", "pathname", "errorGeneration", "responseObservedAfterMs"}
+        associations = proof["orderedTemporal502Associations"]
+        if (len({item.get("errorGeneration") for item in associations if isinstance(item, dict)}) != len(associations)
+                or len({item.get("responseConnectionId") for item in associations if isinstance(item, dict)}) != len(associations)
+                or any(not isinstance(location, dict) or set(location) != {"origin", "pathname", "errorGeneration", "responseObservedAfterMs", "errorObservedAfterMs", "responseConnectionId", "temporalAssociation"}
                or location.get("origin") != proof["origin"] or location.get("pathname") != "/server/stream"
                or type(location.get("errorGeneration")) is not int or not transition["firstGeneration"] <= location["errorGeneration"] <= transition["lastGeneration"]
                or type(location.get("responseObservedAfterMs")) is not int or not transition["firstObservedAfterMs"] <= location["responseObservedAfterMs"] <= transition["lastObservedAfterMs"]
-               for location in proof["resource502Locations"]):
+               or type(location.get("errorObservedAfterMs")) is not int or not transition["firstObservedAfterMs"] <= location["errorObservedAfterMs"] <= transition["lastObservedAfterMs"]
+               or location["responseObservedAfterMs"] > location["errorObservedAfterMs"]
+               or location["errorObservedAfterMs"] - location["responseObservedAfterMs"] > 1000
+               or type(location.get("responseConnectionId")) is not int or location["responseConnectionId"] < 0 or location["responseConnectionId"] >= len(stream_connections)
+               or not isinstance(stream_connections[location["responseConnectionId"]], dict)
+               or stream_connections[location["responseConnectionId"]].get("connectionId") != location["responseConnectionId"]
+               or stream_connections[location["responseConnectionId"]].get("origin") != proof["origin"] or stream_connections[location["responseConnectionId"]].get("pathname") != "/server/stream"
+               or stream_connections[location["responseConnectionId"]].get("status") != 502 or stream_connections[location["responseConnectionId"]].get("contentType") != "other"
+               or stream_connections[location["responseConnectionId"]].get("observedAfterMs") != location["responseObservedAfterMs"]
+               or location.get("temporalAssociation") != "ordered-response-before-console"
+               for location in associations)):
             raise ValueError("browser restart transport evidence has invalid 502 correlation")
         retained = [item for item in stream_evidence if isinstance(item, dict) and item.get("kind") == transition["kind"]]
         if len(retained) != 1 or retained[0] != transition:
             raise ValueError("browser restart transport evidence was not retained consistently")
+        convergence = [item for item in transitions if isinstance(item, dict) and item.get("kind") == "post-reuse-sse-convergence"]
+        if len(convergence) != 1:
+            raise ValueError("browser post-reuse convergence evidence is ambiguous")
+        post = convergence[0]
+        clean = post.get("classification") == "clean-post-reuse-convergence"
+        post_required = ("classification", "totalCount", "firstGeneration", "lastGeneration", "clusterMaximumEvents", "clusterMaximumMs", "phaseBoundary")
+        boundary = post.get("phaseBoundary")
+        if (
+            any(key not in post for key in post_required)
+            or any(type(post.get(key)) is not int for key in post_required if key not in {"classification", "phaseBoundary"})
+            or post["clusterMaximumEvents"] != 4 or post["clusterMaximumMs"] != 5000
+            or post["firstGeneration"] < transition["lastGeneration"] or post["lastGeneration"] < post["firstGeneration"]
+            or not isinstance(boundary, dict) or set(boundary) != {"errorGeneration", "observedAfterMs", "observedAtEpochMs"}
+            or any(type(boundary.get(key)) is not int for key in boundary) or boundary["errorGeneration"] != transition["lastGeneration"]
+            or (clean and (post["totalCount"] != 0 or post["firstGeneration"] != transition["lastGeneration"] or post["lastGeneration"] != transition["lastGeneration"]))
+            or (not clean and (
+                post.get("classification") != "expected-bounded-post-reuse-sse-convergence"
+                or not 1 <= post["totalCount"] <= 4
+                or post["firstGeneration"] != transition["lastGeneration"] + 1
+                or post["lastGeneration"] - post["firstGeneration"] + 1 != post["totalCount"]
+                or any(type(post.get(key)) is not int for key in ("firstObservedAfterMs", "lastObservedAfterMs", "recoveryStatus", "recoveryObservedAfterMs", "modelRows"))
+                or any(type(post.get(key)) is not int for key in ("modelObservedAfterMs",))
+                or post["firstObservedAfterMs"] <= boundary["observedAfterMs"] or post["recoveryObservedAfterMs"] <= boundary["observedAfterMs"] or post["modelObservedAfterMs"] <= boundary["observedAfterMs"]
+                or post["lastObservedAfterMs"] < post["firstObservedAfterMs"]
+                or post["lastObservedAfterMs"] - post["firstObservedAfterMs"] > post["clusterMaximumMs"]
+                or post["recoveryStatus"] != 200 or post["modelRows"] <= 0
+                or post.get("recoveryOrigin") != proof["origin"] or post.get("recoveryPathname") != "/server/stream"
+                or not {"post-reuse-convergence-status", "post-reuse-convergence-settings"}.issubset(api)
+                or any(api[label].get("observedAfterMs", -1) <= boundary["observedAfterMs"] or api[label].get("observedAtEpochMs", -1) <= boundary["observedAtEpochMs"] for label in ("post-reuse-convergence-status", "post-reuse-convergence-settings"))
+            ))
+            or quiet["errorGeneration"] != post["lastGeneration"] or type(quiet.get("observedAfterMs")) is not int or type(quiet.get("observedAtEpochMs")) is not int or quiet["observedAfterMs"] <= boundary["observedAfterMs"] or quiet["observedAtEpochMs"] <= boundary["observedAtEpochMs"]
+        ):
+            raise ValueError("browser post-reuse convergence evidence is invalid")
+        post_retained = [item for item in stream_evidence if isinstance(item, dict) and item.get("kind") == post["kind"]]
+        if len(post_retained) != 1 or post_retained[0] != post:
+            raise ValueError("browser post-reuse convergence evidence was not retained consistently")
     json_dump(output, {"reuse": reuse, "api_endpoints": sorted(api), "visible_fixture_rows": sorted(visible), "actions": sorted((payload.get("actions") or {}).keys())})
 
 

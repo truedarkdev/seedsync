@@ -1870,8 +1870,20 @@ PY
 }
 
 stop_container() {
-  local id="$1" phase_name="$2" label="$3" name="$4"
+  local id="$1" phase_name="$2" label="$3" name="$4" dispatch_mode="${5:-}" generation="${6:-}" arm_generation="${7:-}"
   docker container inspect "$name" >/dev/null 2>&1 || return 0
+  if [[ "$dispatch_mode" == restart-dispatch ]]; then
+    # Publish from the timeout-launched command immediately before exec'ing
+    # docker, so a successful marker is never produced merely on function entry.
+    export -f publish_browser_restart_stop_dispatch
+    bounded_command "$id" "$phase_name" "$label" "$(timeout_seconds SEEDSYNC_SHIP_STOP_TIMEOUT_SECONDS 45)" "$(evidence_dir "$id")/${label}.log" bash -c '
+      publish_browser_restart_stop_dispatch "$1" "$2" "$3" "$4" || exit $?
+      exec docker stop --time 20 "$5"
+    ' -- "$id" "$(evidence_dir "$id")" "$generation" "$arm_generation" "$name"
+    return
+  elif [[ -n "$dispatch_mode" ]]; then
+    die "unknown stop dispatch mode: $dispatch_mode"
+  fi
   bounded_command "$id" "$phase_name" "$label" "$(timeout_seconds SEEDSYNC_SHIP_STOP_TIMEOUT_SECONDS 45)" "$(evidence_dir "$id")/${label}.log" docker stop --time 20 "$name"
 }
 
@@ -1994,8 +2006,7 @@ full() {
   wait_browser_restart_arm_ack "$id" "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
   python "$HELPER" assert-browser --input "$(evidence_dir "$id")/browser.json" --output "$(evidence_dir "$id")/after-browser-claim-contract.json"
   capture_volume_helper_output "$id" "$(evidence_dir "$id")/current-model-contract.json" assert-current-model --before-settings "$retained_backup_dir/data/settings.cfg" --path-pairs /config/path_pairs.json --browser /evidence/ship-readiness/browser.json --fixture /evidence/fixture-evidence.json
-  publish_browser_restart_stop_dispatch "$id" "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
-  stop_container "$id" migration-current-restart-stop migration-current-restart-stop "seedsync-upgrade-v086-current-${id,,}"
+  stop_container "$id" migration-current-restart-stop migration-current-restart-stop "seedsync-upgrade-v086-current-${id,,}" restart-dispatch "$stability_generation" "$restart_arm_generation"
   current_product_claimed_auth_contract "$id"
   bounded_command "$id" migration-current-restart-start current-restart "$(timeout_seconds SEEDSYNC_SHIP_CONTAINER_TIMEOUT_SECONDS 90)" "$(evidence_dir "$id")/current-restart.txt" docker start "seedsync-upgrade-v086-current-${id,,}"
   wait_normal_runtime_readiness "$current" "$(evidence_dir "$id")/after-restart-claimed-auth.json" "$id" migration-current-restart-status "seedsync-upgrade-v086-current-${id,,}"

@@ -605,21 +605,49 @@ class ShipReadinessTests(unittest.TestCase):
                                       "stop_dispatch_epoch_ms": 1700000000100, "acknowledgedEpochMs": 1700000000000},
                 "sameOriginProof": {
                     "origin": "http://127.0.0.1:18820", "pathname": "/server/stream",
-                    "resource502Locations": [
-                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 3, "responseObservedAfterMs": 49911},
-                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 5, "responseObservedAfterMs": 50200},
+                    "orderedTemporal502Associations": [
+                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 3, "responseObservedAfterMs": 49911, "errorObservedAfterMs": 50000, "responseConnectionId": 0, "temporalAssociation": "ordered-response-before-console"},
+                        {"origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "errorGeneration": 5, "responseObservedAfterMs": 50200, "errorObservedAfterMs": 50300, "responseConnectionId": 1, "temporalAssociation": "ordered-response-before-console"},
                     ],
                     "recoveryOrigin": "http://127.0.0.1:18820", "recoveryPathname": "/server/stream",
                     "recoveryStatus": 200, "recoveryObservedAfterMs": 50300,
                 },
             }
+            convergence = {
+                "kind": "post-reuse-sse-convergence", "classification": "clean-post-reuse-convergence",
+                "totalCount": 0, "firstGeneration": 6, "lastGeneration": 6,
+                "clusterMaximumEvents": 4, "clusterMaximumMs": 5000,
+                "phaseBoundary": {"errorGeneration": 6, "observedAfterMs": 58000, "observedAtEpochMs": 1700000001000},
+            }
             baseline = {
                 "errors": [], "runtimeErrors": [], "diagnosticFailures": [],
+                "streamConnections": [
+                    {"connectionId": 0, "origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "status": 502, "contentType": "other", "observedAfterMs": 49911},
+                    {"connectionId": 1, "origin": "http://127.0.0.1:18820", "pathname": "/server/stream", "status": 502, "contentType": "other", "observedAfterMs": 50200},
+                ],
                 "api": {"restart-status": {"status": 200}, "restart-settings": {"status": 200}},
-                "visibleFixtureRows": {"fixture": True}, "expectedTransitions": [transition],
-                "streamTransitionEvidence": [dict(transition)], "postReuseQuiet": {"quietWindowMs": 1500, "errorGeneration": 6},
+                "visibleFixtureRows": {"fixture": True}, "expectedTransitions": [transition, convergence],
+                "streamTransitionEvidence": [dict(transition), dict(convergence)], "postReuseQuiet": {"quietWindowMs": 1500, "errorGeneration": 6, "observedAfterMs": 60000, "observedAtEpochMs": 1700000002000},
             }
             source.write_text(json.dumps(baseline), encoding="utf-8")
+            HARNESS.assert_browser_evidence(source, output, reuse=True)
+            active_convergence = {
+                "kind": "post-reuse-sse-convergence", "classification": "expected-bounded-post-reuse-sse-convergence",
+                "totalCount": 3, "firstGeneration": 7, "lastGeneration": 9,
+                "firstObservedAfterMs": 58876, "lastObservedAfterMs": 59296,
+                "clusterMaximumEvents": 4, "clusterMaximumMs": 5000,
+                "recoveryOrigin": "http://127.0.0.1:18820", "recoveryPathname": "/server/stream",
+                "recoveryStatus": 200, "recoveryObservedAfterMs": 59742, "modelRows": 4, "modelObservedAfterMs": 59800,
+                "phaseBoundary": {"errorGeneration": 6, "observedAfterMs": 58000, "observedAtEpochMs": 1700000001000},
+            }
+            active_payload = {
+                **baseline,
+                "api": {**baseline["api"], "post-reuse-convergence-status": {"status": 200, "observedAfterMs": 59850, "observedAtEpochMs": 1700000001500}, "post-reuse-convergence-settings": {"status": 200, "observedAfterMs": 59900, "observedAtEpochMs": 1700000001600}},
+                "expectedTransitions": [transition, active_convergence],
+                "streamTransitionEvidence": [dict(transition), dict(active_convergence)],
+                "postReuseQuiet": {"quietWindowMs": 1500, "errorGeneration": 9, "observedAfterMs": 60000, "observedAtEpochMs": 1700000002000},
+            }
+            source.write_text(json.dumps(active_payload), encoding="utf-8")
             HARNESS.assert_browser_evidence(source, output, reuse=True)
             invalid_payloads = (
                 {**baseline, "expectedTransitions": []},
@@ -627,15 +655,48 @@ class ShipReadinessTests(unittest.TestCase):
                 {**baseline, "expectedTransitions": [{**transition, "totalCount": 9, "sseEventCount": 7}]},
                 {**baseline, "expectedTransitions": [{**transition, "badGateway502Count": 3}]},
                 {**baseline, "expectedTransitions": [{**transition, "lastObservedAfterMs": 58541}]},
+                {**baseline, "expectedTransitions": [{key: value for key, value in transition.items() if key != "recoveryStatus"}, convergence]},
                 {**baseline, "expectedTransitions": [{key: value for key, value in transition.items() if key != "sameOriginProof"}]},
                 {**baseline, "expectedTransitions": [{**transition, "sameOriginProof": {**transition["sameOriginProof"], "recoveryOrigin": "https://foreign.invalid"}}]},
                 {**baseline, "streamTransitionEvidence": []},
+                {**baseline, "streamTransitionEvidence": [{**transition, "recoveryStatus": 503}, convergence]},
                 {**baseline, "streamTransitionEvidence": [{**transition, "sameOriginProof": {**transition["sameOriginProof"], "recoveryPathname": "/other"}}]},
             )
             for payload in invalid_payloads:
                 source.write_text(json.dumps(payload), encoding="utf-8")
                 with self.subTest(payload=payload):
                     with self.assertRaisesRegex(ValueError, "browser restart transport evidence"):
+                        HARNESS.assert_browser_evidence(source, output, reuse=True)
+            invalid_convergence_payloads = []
+            for field, value in (
+                ("firstGeneration", 8), ("lastGeneration", 10), ("recoveryStatus", 502),
+                ("recoveryPathname", "/other"), ("modelRows", 0),
+            ):
+                payload = json.loads(json.dumps(active_payload))
+                payload["expectedTransitions"][1][field] = value
+                invalid_convergence_payloads.append(payload)
+            missing_api = json.loads(json.dumps(active_payload))
+            del missing_api["api"]["post-reuse-convergence-settings"]
+            invalid_convergence_payloads.append(missing_api)
+            wrong_quiet = json.loads(json.dumps(active_payload))
+            wrong_quiet["postReuseQuiet"]["errorGeneration"] = 6
+            invalid_convergence_payloads.append(wrong_quiet)
+            reverse_502 = json.loads(json.dumps(active_payload))
+            reverse_502["expectedTransitions"][0]["sameOriginProof"]["orderedTemporal502Associations"][0]["responseObservedAfterMs"] = 50001
+            invalid_convergence_payloads.append(reverse_502)
+            duplicate_502 = json.loads(json.dumps(active_payload))
+            duplicate_502["expectedTransitions"][0]["sameOriginProof"]["orderedTemporal502Associations"][1]["responseConnectionId"] = 0
+            invalid_convergence_payloads.append(duplicate_502)
+            mismatched_502 = json.loads(json.dumps(active_payload))
+            mismatched_502["streamConnections"][0]["status"] = 200
+            invalid_convergence_payloads.append(mismatched_502)
+            pre_boundary = json.loads(json.dumps(active_payload))
+            pre_boundary["expectedTransitions"][1]["firstObservedAfterMs"] = 58000
+            invalid_convergence_payloads.append(pre_boundary)
+            for payload in invalid_convergence_payloads:
+                source.write_text(json.dumps(payload), encoding="utf-8")
+                with self.subTest(convergence=payload):
+                    with self.assertRaisesRegex(ValueError, "browser (restart transport|post-reuse convergence) evidence"):
                         HARNESS.assert_browser_evidence(source, output, reuse=True)
 
     def test_browser_harness_captures_event_metadata_synchronously_and_safely(self):
@@ -740,6 +801,14 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertLess(launcher.index('wait_browser_stability_ready "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
         self.assertLess(launcher.index('arm_browser_restart "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
         self.assertLess(launcher.index('wait_browser_restart_arm_ack "$id"'), launcher.index('stop_container "$id" migration-current-restart-stop'))
+        stop_container = launcher[launcher.index("stop_container() {") : launcher.index("wait_for_downloads() {")]
+        self.assertIn('dispatch_mode="${5:-}"', stop_container)
+        self.assertIn('[[ "$dispatch_mode" == restart-dispatch ]]', stop_container)
+        self.assertIn('export -f publish_browser_restart_stop_dispatch', stop_container)
+        self.assertIn('exec docker stop --time 20 "$5"', stop_container)
+        self.assertIn('publish_browser_restart_stop_dispatch "$1" "$2" "$3" "$4" || exit $?', stop_container)
+        self.assertLess(stop_container.index('publish_browser_restart_stop_dispatch'), stop_container.index('docker stop --time 20 "$name"'))
+        self.assertIn('restart-dispatch "$stability_generation" "$restart_arm_generation"', launcher)
         finish = launcher[launcher.index("finish_browser_claim_reuse()") : launcher.index("browser_dispatch_self_check()")]
         self.assertLess(finish.index('"stability_generation": int(generation)'), finish.index('wait "$BROWSER_SESSION_PID"'))
         self.assertLess(finish.index('"arm_generation": int(arm_generation)'), finish.index('wait "$BROWSER_SESSION_PID"'))
@@ -760,6 +829,9 @@ class ShipReadinessTests(unittest.TestCase):
             "restartClusterMaximumEvents = 8",
             "restartClusterMaximumMs = 15000",
             "restartTransportResponseCorrelationMs = 1000",
+            "connection.observedAfterMs <= error.observedAfterMs",
+            "orderedTemporal502Associations",
+            "temporalAssociation: 'ordered-response-before-console'",
             "async function restartClusterEntries(stability, arm)",
             "error.error_generation !== arm.arm_generation + index",
             "restart-arm-cluster-over-cap",
@@ -781,6 +853,13 @@ class ShipReadinessTests(unittest.TestCase):
             "sameOriginProof:",
             "recoveryStatus: recovery.status",
             "for (const entry of validatedEntries) runtimeErrors.splice(runtimeErrors.indexOf(entry.error), 1)",
+            "async function finalizePostReuseConvergence(stability, arm, boundary)",
+            "postReuseClusterMaximumEvents = 4",
+            "post-reuse-convergence-invalid-diagnostic",
+            "post-reuse-convergence-window-exceeded",
+            "kind: 'post-reuse-sse-convergence'",
+            "writeEvidenceNoFlush({ ...reuse, postReuseConvergence, postReuseQuiet })",
+            "browser-reuse-quiescence-invalidated",
         ):
             self.assertIn(marker, browser)
         for marker in (
@@ -791,10 +870,15 @@ class ShipReadinessTests(unittest.TestCase):
         ):
             self.assertIn(marker, launcher)
         self.assertLess(browser.index("async function waitForRestartArm(stability)"), browser.index("async function waitForRestartRequest(stability, arm)"))
+        restart_producer = browser[browser.index("async function finalizeArmedRestartTransport(stability, arm, deadline)"):browser.index("async function assertRestartArmWindow(stability, arm)")]
+        self.assertIn("recoveryStatus: recovery.status,\n        stopDispatchProof:", restart_producer)
         handoff = browser[browser.index("const arm = await waitForRestartArm(stability);"):]
         self.assertLess(handoff.index("const arm = await waitForRestartArm(stability);"), handoff.index("await waitForRestartRequest(stability, arm);"))
+        self.assertLess(handoff.index("const postReuseConvergence = await finalizePostReuseConvergence(stability, arm, postReuseBoundary);"), handoff.index("const postReuseQuiet = await waitForPostReuseQuiet(stability, arm, postReuseBoundary);"))
+        self.assertLess(handoff.index("await flushBrowserDiagnostics();"), handoff.index("await closeBrowserResources();"))
+        self.assertLess(handoff.index("await closeBrowserResources();"), handoff.index("writeEvidenceNoFlush({ ...reuse, postReuseConvergence, postReuseQuiet });"))
         self.assertLess(browser.index("await finalizeArmedRestartTransport(stability, arm, deadline);"), handoff.index("await runReuse();") + browser.index("const arm = await waitForRestartArm(stability);"))
-        self.assertLess(handoff.index("const reuse = await runReuse();"), handoff.index("const postReuseQuiet = await waitForPostReuseQuiet(stability, arm);"))
+        self.assertLess(handoff.index("const reuse = await runReuse();"), handoff.index("const postReuseQuiet = await waitForPostReuseQuiet(stability, arm, postReuseBoundary);"))
 
     def test_browser_stability_request_timestamp_validator_matches_emitted_contract(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
