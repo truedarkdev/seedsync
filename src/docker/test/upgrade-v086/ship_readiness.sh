@@ -2342,7 +2342,11 @@ full() {
   stop_container "$id" restore-legacy-stop restore-legacy-stop "$legacy_container"
   stop_container "$id" restore-legacy-proxy-stop restore-legacy-proxy-stop "seedsync-upgrade-v086-proxy-${id,,}"
   capture_volume_inventory "$id" restore-config --legacy-config
-  snapshot_volume_config "$id" after-restore-config restore-config
+  # Preserve the legacy-filtered inventory for before/after equality, but bind
+  # the full protected archive (including retained migration infrastructure)
+  # to a fresh full inventory captured from the same stopped runtime state.
+  capture_volume_inventory "$id" after-restore-config-full
+  snapshot_volume_config "$id" after-restore-config after-restore-config-full
   python - "$HELPER" "$(evidence_dir "$id")/before-config.json" "$(evidence_dir "$id")/restore-config.json" "$(evidence_dir "$id")/restore-config-compare.json" <<'PY'
 import importlib.util, json, sys
 spec = importlib.util.spec_from_file_location("ship_readiness", sys.argv[1]); helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
