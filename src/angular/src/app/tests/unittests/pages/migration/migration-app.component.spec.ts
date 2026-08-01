@@ -249,6 +249,28 @@ describe("MigrationAppComponent", () => {
         }
     });
 
+    it("opens the explicit browser bootstrap after normal SeedSync becomes ready", () => {
+        const completed: MigrationStatus = {
+            ...status,
+            state: "complete",
+            capabilities: {apply: false, retry: false, continue: true, restore: false},
+            operation: {status: "succeeded", message: "Migration complete."}
+        };
+        service.loadStatus.and.returnValue(of(completed));
+        service.continue.and.returnValue(of({
+            ...completed,
+            capabilities: {apply: false, retry: false, continue: false, restore: false},
+            normal_startup: {released: true, requires_continue: false}
+        }));
+        service.probeNormalStartup.and.returnValue(of(undefined));
+        createComponent();
+        const replaceLocation = spyOn<any>(fixture.componentInstance, "replaceLocation");
+
+        (fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).click();
+
+        expect(replaceLocation).toHaveBeenCalledOnceWith("/bootstrap");
+    });
+
     it("offers an explicit retry when normal bootstrap does not return in time", () => {
         jasmine.clock().install();
         try {
