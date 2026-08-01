@@ -1804,6 +1804,106 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertLess(launcher.index(snapshot), launcher.index(consumer))
         self.assertNotIn('snapshot_volume_config "$id" after-current-restart after-config', launcher)
 
+    def test_downloads_restore_uses_private_archive_staging_and_exact_baseline_equality(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        lab = MODULE_PATH.with_name("lab.sh").read_text(encoding="utf-8")
+        snapshot_stop = 'stop_container "$id" migration-stop-legacy-proxy migration-stop-legacy-proxy'
+        before_inventory = 'capture_inventory "$id" before-downloads "$(run_dir "$id")/downloads"'
+        snapshot = 'snapshot_downloads_baseline "$id"'
+        config_restore = 'row "$id" restore-offline passed "evidence/ship-readiness/restore.log"'
+        restore = 'restore_downloads_baseline "$id"'
+        reboot = 'run_lab_bounded "$id" "$legacy_port" restore-legacy-start'
+        for marker in (snapshot_stop, before_inventory, snapshot, config_restore, restore, reboot):
+            self.assertIn(marker, launcher)
+        self.assertLess(launcher.index(snapshot_stop), launcher.index(before_inventory))
+        self.assertLess(launcher.index(before_inventory), launcher.index(snapshot))
+        self.assertLess(launcher.index(config_restore), launcher.index(restore))
+        self.assertLess(launcher.index(restore), launcher.index(reboot))
+        restore_body = launcher[launcher.index("restore_downloads_baseline() {"):launcher.index("snapshot_downloads_tree() {")]
+        self.assertLess(restore_body.index('assert_download_restore_runtimes_stopped "$id"'),
+                        restore_body.index('create_downloads_restorer "$id"'))
+        self.assertLess(restore_body.index('create_downloads_restorer "$id"'),
+                        restore_body.index('verify_downloads_baseline_for_restore "$id"'))
+        self.assertLess(restore_body.index('snapshot_downloads_tree "$id" after-current-downloads after-current-downloads'),
+                        restore_body.index('verify_downloads_baseline_for_restore "$id"'))
+        self.assertLess(restore_body.index('verify_downloads_baseline_for_restore "$id"'),
+                        restore_body.index('tar -C "$stage" -xpf /protected/before-downloads.tar'))
+        self.assertLess(restore_body.index('restore-downloads-staging-compare.json'),
+                        restore_body.index('guarded_downloads_baseline_replacement "$id"'))
+        self.assertLess(restore_body.index('verify_downloads_recovery_for_restore "$id"'),
+                        restore_body.index('verify_downloads_baseline_for_restore "$id"'))
+        for marker in (
+            'before-downloads.tar', 'before-downloads-restore-consumer-verification.json',
+            'assert_download_restore_runtimes_stopped', 'restore-downloads-staging-compare.json',
+            'restore-downloads-compare.json', 'after-current-downloads', 'snapshot_downloads_tree',
+            'verify_downloads_baseline_for_restore', 'find /downloads -mindepth 1 -maxdepth 1',
+            'legacy reboot is blocked', 'validate-archive --archive /protected/before-downloads.tar',
+            'bind-archive-inventory --archive /protected/before-downloads.tar',
+            'verify_downloads_recovery_for_restore', 'after-current-downloads-replacement-consumer-verification.json',
+            'restore-downloads-in-progress.json', 'guarded_downloads_baseline_replacement',
+            'rollback_downloads_after_failed_replacement', 'restore_downloads_recovery_tree',
+            'rollback-downloads-staging-compare.json', 'rollback-downloads-compare.json',
+            'rollback-complete-verifier-blocked', 'prior interrupted restore marker',
+        ):
+            self.assertIn(marker, launcher)
+        for marker in (
+            'downloads_snapshotter_container_name()', 'downloads_restorer_container_name()',
+            'seedsync.upgrade-v086.role=downloads-snapshotter',
+            'seedsync.upgrade-v086.role=downloads-restorer', '--network none --read-only --user 1000:1000',
+            'exactly two mounts', 'exact downloads source', 'downloads mount access',
+            'verify-downloads-snapshotter', 'verify-downloads-restorer', 'check-run-tree',
+            'create-downloads-restorer', 'create_downloads_restorer_container()',
+        ):
+            self.assertIn(marker, lab)
+        create_run = lab[lab.index("create_run() {"):lab.index("preflight() {")]
+        self.assertNotIn('downloads_restorer="', create_run)
+        self.assertNotIn('docker start "$downloads_restorer"', create_run)
+        self.assertIn('restore-current-proxy-stop', launcher)
+
+    def test_existing_downloads_restorer_is_reused_only_after_full_isolation_verification(self):
+        lab = MODULE_PATH.with_name("lab.sh").read_text(encoding="utf-8")
+        body = lab[lab.index("create_downloads_restorer_container() {"):lab.index("validate_host_port() {")]
+        self.assertIn('if docker container inspect "$name" >/dev/null 2>&1; then', body)
+        self.assertIn('verify_downloads_restorer_container "$id" true || die "existing downloads restorer failed its exact isolation contract"', body)
+        self.assertIn('docker start "$name" >/dev/null || die "unable to restart verified downloads restorer"', body)
+        self.assertIn('verify_downloads_restorer_container "$id" || die "restarted downloads restorer failed its exact isolation contract"', body)
+        self.assertIn('return 0', body)
+        self.assertLess(body.index('docker container inspect "$name"'), body.index('docker create --name "$name"'))
+
+    def test_downloads_restore_guard_covers_marker_replacement_compare_and_signal_rollback(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        guard = launcher[launcher.index("guarded_downloads_baseline_replacement() ("):launcher.index("assert_download_restore_runtimes_stopped() {")]
+        for marker in (
+            "trap 'status=$?; rollback", "baseline replacement interrupted by HUP",
+            "baseline replacement interrupted by INT", "baseline replacement interrupted by TERM",
+            'write_downloads_restore_marker "$id" replacement-in-progress',
+            'find /downloads -mindepth 1 -maxdepth 1', 'capture_inventory "$id" restore-downloads',
+            'restore-downloads-compare.json', 'rm -f -- "$(downloads_restore_marker "$id")"',
+        ):
+            self.assertIn(marker, guard)
+        self.assertLess(guard.index('write_downloads_restore_marker "$id" replacement-in-progress'),
+                        guard.index('find /downloads -mindepth 1 -maxdepth 1'))
+        self.assertLess(guard.index('find /downloads -mindepth 1 -maxdepth 1'),
+                        guard.index('restore-downloads-compare.json'))
+        self.assertLess(guard.index('restore-downloads-compare.json'),
+                        guard.index('rm -f -- "$(downloads_restore_marker "$id")"'))
+
+    def test_retained_downloads_restore_marker_recovers_before_legacy_boot(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        gate = launcher[launcher.index("recover_marked_downloads_before_legacy_start() {"):launcher.index("restore_downloads_baseline() {")]
+        full = launcher[launcher.index("full() {"):launcher.index('  run_lab_bounded "$id" "$legacy_port" before-legacy-start')]
+        for marker in (
+            'assert_download_restore_runtimes_stopped "$id"', 'verify_protected_volume "$id"',
+            'create_downloads_restorer "$id"', 'rollback_downloads_after_failed_replacement',
+            'rollback evidence blocks this verifier invocation before legacy start',
+        ):
+            self.assertIn(marker, gate)
+        for marker in ('downloads restore requires labelled network identity', 'downloads restore requires exact lab-only'):
+            self.assertIn(marker, launcher)
+        self.assertIn('recover_marked_downloads_before_legacy_start "$id"', full)
+        self.assertLess(full.index('recover_marked_downloads_before_legacy_start "$id"'),
+                        full.index('run_lab_bootstrap_bounded "$id"'))
+
     def test_fresh_shell_skips_login_profiles_and_validator_uses_evidence_child_path(self):
         source = LAUNCHER_PATH.read_text(encoding="utf-8")
         fresh_shell = source[source.index("fresh_repo_shell() {"):source.index("run_lab() {")]
@@ -1811,18 +1911,27 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertIn('validator_evidence_path "${inventory_label}.json"', source)
         self.assertIn('validator_evidence_path "${label}-protected-storage.json"', source)
 
-    def test_topology_includes_the_hardened_snapshotter(self):
+    def test_topology_includes_the_hardened_snapshotters_and_keeps_restorer_lazy(self):
         source = LAUNCHER_PATH.read_text(encoding="utf-8")
         for marker in (
             "'snapshotter': 'seedsync-upgrade-v086-snapshotter-' + run_id.lower()",
-            "expected_running = {names['current'], names['current_proxy'], names['remote'], names['validator'], names['snapshotter']}",
+            "'downloads_snapshotter': 'seedsync-upgrade-v086-downloads-snapshotter-' + run_id.lower()",
+            "expected_running = {names['current'], names['current_proxy'], names['remote'], names['validator'], names['snapshotter'], names['downloads_snapshotter']}",
             "snapshotter must have no network", "snapshotter root filesystem must be read-only",
             "snapshotter capabilities must be dropped", "snapshotter must prohibit new privileges",
             "snapshotter must run as the retained-volume owner",
             "snapshotter config mount must be the exact retained volume read-only",
             "snapshotter protected mount must be the exact retained volume writable",
+            "downloads snapshotter must have no network", "downloads snapshotter root filesystem must be read-only",
+            "downloads snapshotter capabilities must be dropped", "downloads snapshotter must prohibit new privileges",
+            "downloads snapshotter must run as the retained-volume owner", "downloads snapshotter must have exactly two mounts",
+            "downloads snapshotter downloads mount must be the exact run source read-only",
+            "downloads snapshotter protected mount must be the exact retained volume writable",
+            "downloads snapshotter labels must bind the exact run and role",
         ):
             self.assertIn(marker, source)
+        topology = source[source.index("assert_current_topology() {"):source.index("capture_current_provenance() {")]
+        self.assertNotIn("downloads_restorer", topology)
 
     def test_browser_screenshots_check_rendered_secret_controls_before_capture(self):
         browser = BROWSER_PATH.read_text(encoding="utf-8")
