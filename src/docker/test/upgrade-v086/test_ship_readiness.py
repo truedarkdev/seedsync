@@ -1812,6 +1812,20 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertLess(launcher.index(snapshot), launcher.index(consumer))
         self.assertNotIn('snapshot_volume_config "$id" after-current-restart after-config', launcher)
 
+    def test_after_restore_archive_uses_full_stopped_inventory_without_weakening_legacy_compare(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        proxy_stop = 'stop_container "$id" restore-legacy-proxy-stop restore-legacy-proxy-stop'
+        filtered = 'capture_volume_inventory "$id" restore-config --legacy-config'
+        full = 'capture_volume_inventory "$id" after-restore-config-full'
+        snapshot = 'snapshot_volume_config "$id" after-restore-config after-restore-config-full'
+        compare = '"$(evidence_dir "$id")/before-config.json" "$(evidence_dir "$id")/restore-config.json"'
+        for marker in (proxy_stop, filtered, full, snapshot, compare):
+            self.assertIn(marker, launcher)
+        self.assertLess(launcher.index(proxy_stop), launcher.index(filtered))
+        self.assertLess(launcher.index(filtered), launcher.index(full))
+        self.assertLess(launcher.index(full), launcher.index(snapshot))
+        self.assertNotIn('snapshot_volume_config "$id" after-restore-config restore-config', launcher)
+
     def test_downloads_restore_uses_private_archive_staging_and_exact_baseline_equality(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
         lab = MODULE_PATH.with_name("lab.sh").read_text(encoding="utf-8")
