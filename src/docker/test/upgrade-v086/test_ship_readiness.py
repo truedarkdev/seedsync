@@ -1221,6 +1221,8 @@ class ShipReadinessTests(unittest.TestCase):
             "sftp://user:synthetic-credential/raw@host:1234/path",
             "sftp://user:synthetic-credential space@host:1234/path",
             "sftp://user:synthetic-credential\ttab@host:1234/path",
+            "sftp://user:synthetic-credential/raw\n@host:1234/path",
+            "sftp://user:synthetic-credential/raw\r\n@host:1234/path",
             "sftp://user%3Asynthetic-credential@host:1234/path",
             "sftp://user:synthetic-credential@middle@host:1234/path",
             "sftp://user:synthetic-credential/sftp://safe@host:1234/path",
@@ -1240,6 +1242,37 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertFalse(HARNESS._retained_secret_hint("https://example.invalid/path https://other.invalid/path"))
         self.assertFalse(HARNESS._retained_secret_hint("https://host:1234/path sftp://user@remote:1234/file"))
         self.assertFalse(HARNESS._retained_secret_hint("https://host/path\nsftp://user@remote:1234/file"))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            "Warning at file:///app/node_modules/font.scss:5:8:\nSass @import is deprecated"
+        ))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            "More info: https://sass-lang.com/d/slash-div\nnode_modules/font.scss 4:11 @import"
+        ))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            "Warning at file:///app/font.scss:5:8:\n#14 31.76 5 | @import \"variables\";"
+        ))
+        self.assertTrue(HARNESS._retained_secret_hint(
+            "More info: https://sass-lang.com/d/slash-div\nuser:review-secret@internal.example"
+        ))
+        self.assertTrue(HARNESS._retained_secret_hint(
+            "file:///tmp/source.scss\nuser:review-secret@internal.example"
+        ))
+        self.assertTrue(HARNESS._retained_secret_hint(
+            "https://host:443/path\nSass @import user:review-secret@internal.example"
+        ))
+        self.assertTrue(HARNESS._retained_secret_hint(
+            "file:///tmp/source.scss\nuser:review-secret/raw@internal.example"
+        ))
+        self.assertTrue(HARNESS._retained_secret_hint(
+            "https://host:443/path\nSass @import user:review-secret/raw@internal.example"
+        ))
+        for malformed in (
+            "user:review-secret@internal.example:bad",
+            "user:review-secret@internal_host",
+            "user:review-secret@internal.example,",
+        ):
+            self.assertTrue(HARNESS._retained_secret_hint("file:///tmp/a\n" + malformed))
+        self.assertFalse(HARNESS._retained_secret_hint("mailto:person@example.com"))
         self.assertFalse(HARNESS._retained_secret_hint(
             '{"resolved":"https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz","from":"pkg@1.2.3"}'
         ))
@@ -1263,6 +1296,20 @@ class ShipReadinessTests(unittest.TestCase):
         started = time.monotonic()
         self.assertFalse(HARNESS._retained_secret_hint("x" * (1024 * 1024)))
         self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_hint_scans_colon_dense_no_at_input_linearly(self):
+        started = time.monotonic()
+        self.assertFalse(HARNESS._retained_secret_hint("a:" * (512 * 1024)))
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_hint_scans_dense_sass_import_traces_linearly(self):
+        for separator in ("\n", "\r"):
+            with self.subTest(separator=repr(separator)):
+                trace = "#14 31.76 Sass @import is deprecated" + separator
+                value = "https://sass-lang.com/d/import" + separator + trace * ((1024 * 1024) // len(trace))
+                started = time.monotonic()
+                self.assertFalse(HARNESS._retained_secret_hint(value))
+                self.assertLess(time.monotonic() - started, 3.0)
 
     def test_retained_secret_hint_scans_scheme_dense_no_at_input_bounded(self):
         started = time.monotonic()
