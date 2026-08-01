@@ -1007,6 +1007,28 @@ class ShipReadinessTests(unittest.TestCase):
                 json.loads(output.read_text(encoding="utf-8"))["unexpected_current_files"],
             )
 
+    def test_behavior_contract_normalizes_semantically_unordered_controller_lists(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.json"
+            settings = root / "settings.cfg"
+            controller = root / "controller.persist"
+            autoqueue = root / "autoqueue.persist"
+            fixture = root / "fixture.json"
+            first = root / "first.json"
+            second = root / "second.json"
+            comparison = root / "comparison.json"
+            model.write_text("[]", encoding="utf-8")
+            settings.write_text("[General]\ndebug = false\n", encoding="utf-8")
+            autoqueue.write_text('{"patterns": []}', encoding="utf-8")
+            fixture.write_text('{"case_index": []}', encoding="utf-8")
+            controller.write_text('{"downloaded": ["b", "a"], "extracted": ["z", "x"]}', encoding="utf-8")
+            HARNESS.behavior_contract(model, settings, controller, autoqueue, fixture, first)
+            controller.write_text('{"downloaded": ["a", "b"], "extracted": ["x", "z"]}', encoding="utf-8")
+            HARNESS.behavior_contract(model, settings, controller, autoqueue, fixture, second)
+            HARNESS.compare_contract(first, second, comparison)
+            self.assertTrue(json.loads(comparison.read_text(encoding="utf-8"))["equal"])
+
     def test_current_runtime_uses_recovery_bootstrap_before_browser_authenticated_checks(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
         browser = BROWSER_PATH.read_text(encoding="utf-8")
