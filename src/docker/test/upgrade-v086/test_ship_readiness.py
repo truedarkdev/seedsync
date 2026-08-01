@@ -964,6 +964,38 @@ class ShipReadinessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "complete boundary"):
                 HARNESS.assert_migration_apply_auth_boundary(status, legacy_auth, output)
 
+    def test_legacy_inventory_excludes_entire_migration_infrastructure_subtree(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "settings.cfg").write_text("[General]\n", encoding="utf-8")
+            backup_data = root / "migration-backups" / "backup" / "data"
+            backup_data.mkdir(parents=True)
+            (backup_data / "controller.persist").write_text("{}", encoding="utf-8")
+            (root / ".seedsync.runtime.lock").write_text("runtime", encoding="utf-8")
+            paths = [entry["path"] for entry in HARNESS.inventory(root, legacy_config=True)["entries"]]
+            self.assertEqual(["settings.cfg"], paths)
+
+    def test_restore_assertion_ignores_retained_backup_but_rejects_current_generated_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            settings = root / "settings.cfg"
+            settings.write_text("[General]\n", encoding="utf-8")
+            expected = HARNESS.inventory(root, legacy_config=True)
+            backup_data = root / "migration-backups" / "backup" / "data"
+            backup_data.mkdir(parents=True)
+            (backup_data / "settings.cfg").write_text("[General]\n", encoding="utf-8")
+            output = root / "restore.json"
+            HARNESS.assert_restore(root, expected, output)
+            self.assertEqual([], json.loads(output.read_text(encoding="utf-8"))["unexpected_current_files"])
+            (root / "path_pairs.json").write_text("{}", encoding="utf-8")
+            (root / ".migration.lock").write_text("locked", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "legacy configuration contract"):
+                HARNESS.assert_restore(root, expected, output)
+            self.assertEqual(
+                [".migration.lock", "path_pairs.json"],
+                json.loads(output.read_text(encoding="utf-8"))["unexpected_current_files"],
+            )
+
     def test_current_runtime_uses_recovery_bootstrap_before_browser_authenticated_checks(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
         browser = BROWSER_PATH.read_text(encoding="utf-8")
@@ -1815,14 +1847,19 @@ class ShipReadinessTests(unittest.TestCase):
     def test_after_restore_archive_uses_full_stopped_inventory_without_weakening_legacy_compare(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
         proxy_stop = 'stop_container "$id" restore-legacy-proxy-stop restore-legacy-proxy-stop'
+        downloads_restore = 'restore_downloads_baseline "$id"'
         filtered = 'capture_volume_inventory "$id" restore-config --legacy-config'
+        reboot = 'run_lab_bounded "$id" "$legacy_port" restore-legacy-start'
         full = 'capture_volume_inventory "$id" after-restore-config-full'
         snapshot = 'snapshot_volume_config "$id" after-restore-config after-restore-config-full'
-        compare = '"$(evidence_dir "$id")/before-config.json" "$(evidence_dir "$id")/restore-config.json"'
-        for marker in (proxy_stop, filtered, full, snapshot, compare):
+        compare = 'capture_volume_helper_output "$id" "$(evidence_dir "$id")/restore-config-compare.json" assert-restore'
+        expected = '--config-root /config --expected "$(validator_evidence_path before-config.json)"'
+        for marker in (proxy_stop, downloads_restore, filtered, reboot, full, snapshot, compare, expected):
             self.assertIn(marker, launcher)
-        self.assertLess(launcher.index(proxy_stop), launcher.index(filtered))
-        self.assertLess(launcher.index(filtered), launcher.index(full))
+        self.assertLess(launcher.index(downloads_restore), launcher.index(filtered))
+        self.assertLess(launcher.index(filtered), launcher.index(compare))
+        self.assertLess(launcher.index(compare), launcher.index(reboot))
+        self.assertLess(launcher.index(proxy_stop), launcher.index(full))
         self.assertLess(launcher.index(full), launcher.index(snapshot))
         self.assertNotIn('snapshot_volume_config "$id" after-restore-config restore-config', launcher)
 

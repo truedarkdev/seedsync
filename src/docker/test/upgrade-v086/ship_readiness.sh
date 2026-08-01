@@ -2333,6 +2333,14 @@ full() {
     /bin/bash -lc "python -c 'import tarfile; tarfile.open(\"/protected/after-current-restart.tar\").getmembers()' && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/python/scan_fs.py --restore-migration-backup '$backup' --confirm-restore --confirm-stopped"
   row "$id" restore-offline passed "evidence/ship-readiness/restore.log"
   restore_downloads_baseline "$id"
+  # Prove byte-exact restore before the pinned legacy runtime can legitimately
+  # rewrite semantically unordered persistence lists during startup/shutdown.
+  capture_volume_inventory "$id" restore-config --legacy-config
+  capture_volume_helper_output "$id" "$(evidence_dir "$id")/restore-config-compare.json" assert-restore \
+    --config-root /config --expected "$(validator_evidence_path before-config.json)"
+  row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-config-compare.json"
+  row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-downloads-compare.json"
+  row "$id" restore-infrastructure passed "evidence/ship-readiness/restore-config-compare.json"
   run_lab_bounded "$id" "$legacy_port" restore-legacy-start restore-legacy-start "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-start.log" start
   run_lab_bounded "$id" "$legacy_port" restore-legacy-status restore-legacy-status "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-status.log" status
   run_browser_bounded "$id" restore-legacy-browser-launch "http://127.0.0.1:${legacy_port}" "$(evidence_dir "$id")" legacy-restore
@@ -2341,23 +2349,11 @@ full() {
   capture_volume_behavior_contract "$id" /evidence/ship-readiness/after-reboot-model.json /evidence/fixture-evidence.json "$(evidence_dir "$id")/after-reboot-behavior-contract.json"
   stop_container "$id" restore-legacy-stop restore-legacy-stop "$legacy_container"
   stop_container "$id" restore-legacy-proxy-stop restore-legacy-proxy-stop "seedsync-upgrade-v086-proxy-${id,,}"
-  capture_volume_inventory "$id" restore-config --legacy-config
   # Preserve the legacy-filtered inventory for before/after equality, but bind
   # the full protected archive (including retained migration infrastructure)
   # to a fresh full inventory captured from the same stopped runtime state.
   capture_volume_inventory "$id" after-restore-config-full
   snapshot_volume_config "$id" after-restore-config after-restore-config-full
-  python - "$HELPER" "$(evidence_dir "$id")/before-config.json" "$(evidence_dir "$id")/restore-config.json" "$(evidence_dir "$id")/restore-config-compare.json" <<'PY'
-import importlib.util, json, sys
-spec = importlib.util.spec_from_file_location("ship_readiness", sys.argv[1]); helper = importlib.util.module_from_spec(spec); spec.loader.exec_module(helper)
-before, after, output = map(__import__("pathlib").Path, sys.argv[2:])
-differences = helper.compare(json.loads(before.read_text()), json.loads(after.read_text()))
-helper.json_dump(output, {"legacy_inventory_equal": not differences, "different_paths": differences, "comparison_storage": "docker-named-volume"})
-if differences: raise SystemExit("restored config inventory differs")
-PY
-  row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-config-compare.json"
-  row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-downloads-compare.json"
-  row "$id" restore-infrastructure passed "evidence/ship-readiness/restore-config-compare.json"
   python "$HELPER" compare-contract --expected "$(evidence_dir "$id")/before-behavior-contract.json" --actual "$(evidence_dir "$id")/after-reboot-behavior-contract.json" --output "$(evidence_dir "$id")/reboot-parity.json"
   row "$id" restore-pinned-reboot passed "evidence/ship-readiness/after-restore-legacy-browser-contract.json"
   row "$id" restore-pinned-reboot passed "evidence/ship-readiness/reboot-parity.json"
