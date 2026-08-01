@@ -67,7 +67,10 @@ describe("MigrationAppComponent", () => {
         expect(text).toContain("v0.9.0");
         expect(text).not.toContain("original-v0.8.6");
         expect(text).toContain("Complete retained backup before migration");
-        expect(text).toContain("will create, fsync, and validate a complete retained backup");
+        expect(text).toContain("creates and validates a retained configuration backup");
+        expect(text).toContain("Downloads and mounts are not changed");
+        expect(text).not.toContain("Ready to migrate.");
+        expect(fixture.nativeElement.querySelectorAll(".secondary-button").length).toBe(0);
         expect(startButton.disabled).toBeTrue();
         expect(fixture.nativeElement.querySelector("app-sidebar")).toBeNull();
         expect(fixture.nativeElement.querySelector(".feature-copy h2").textContent).toContain("Sync more than one folder");
@@ -155,6 +158,7 @@ describe("MigrationAppComponent", () => {
         expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.8.6");
         expect(fixture.nativeElement.querySelector(".migration-route").textContent).toContain("v0.9.0");
         expect(fixture.nativeElement.querySelector(".primary-button").textContent).toContain("Retry migration");
+        expect(fixture.nativeElement.querySelector(".secondary-button")).toBeNull();
     });
 
     it("does not claim the v0.8.6 route for an unrecognized required source", () => {
@@ -176,7 +180,7 @@ describe("MigrationAppComponent", () => {
                 capabilities: {apply: false, retry: false, restore: false},
                 operation: {
                     status: stateName === "running" ? "running" : "succeeded",
-                    message: stateName
+                    message: stateName === "running" ? "Operation continues safely." : stateName
                 }
             }));
             createComponent();
@@ -185,6 +189,7 @@ describe("MigrationAppComponent", () => {
             if (stateName === "running") {
                 expect(text).toContain("Migration in progress");
                 expect(text).toContain("Creating and validating retained backup");
+                expect(text).toContain("Operation continues safely.");
                 expect(text).not.toContain("Migration state: running");
             } else {
                 expect(text).toContain("Migration complete");

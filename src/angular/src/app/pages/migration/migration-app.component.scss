@@ -30,8 +30,86 @@
 }
 
 @media (min-width: 901px) {
+    .migration-page {
+        min-height: 100svh;
+        padding: 16px;
+    }
+
     .migration-shell--state-stable {
-        min-height: 780px;
+        height: min(700px, calc(100svh - 32px));
+        min-height: 0;
+    }
+
+    .handoff-panel,
+    .feature-panel {
+        padding: 24px;
+    }
+
+    .brand img {
+        width: 56px;
+        height: 56px;
+    }
+
+    .brand-name {
+        font-size: 34px;
+    }
+
+    .state-region {
+        min-height: 0;
+    }
+
+    .orientation {
+        margin-top: 9px;
+        line-height: 1.48;
+    }
+
+    .migration-route {
+        margin-top: 16px;
+        padding: 10px 12px;
+    }
+
+    .paused-note {
+        margin-top: 10px;
+    }
+
+    .readiness {
+        margin-top: 16px;
+        padding: 12px;
+    }
+
+    .actions {
+        margin-top: 16px;
+    }
+
+    .migration-confirmation {
+        margin-bottom: 7px;
+    }
+
+    .feature-stage,
+    .feature-swap {
+        gap: 12px;
+    }
+
+    .feature-swap {
+        grid-template-rows: minmax(76px, auto) minmax(0, 1fr);
+    }
+
+    .feature-copy > p:last-child {
+        margin-top: 5px;
+        line-height: 1.4;
+    }
+
+    .feature-viewport {
+        height: clamp(230px, 25vw, 320px);
+    }
+
+    .feature-controls {
+        gap: 10px;
+    }
+
+    .feature-image-controls {
+        bottom: 8px;
+        right: 8px;
     }
 }
 

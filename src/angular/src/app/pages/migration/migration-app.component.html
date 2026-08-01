@@ -57,9 +57,9 @@
                             <span class="readiness-state">{{readinessLabel}}</span>
                         </div>
                         <h2 id="readiness-heading">{{readinessHeading}}</h2>
-                        <p *ngIf="!status.backup.complete_restore_ready">SeedSync will create, fsync, and validate a complete retained backup before changing your configuration. Restore remains an offline command and is not available from this page.</p>
-                        <p *ngIf="status.backup.complete_restore_ready">The complete retained backup is validated and remains available for an explicit offline restore.</p>
-                        <p>{{status.operation.message}}</p>
+                        <p *ngIf="!status.backup.complete_restore_ready">SeedSync creates and validates a retained configuration backup before changing your configuration. Downloads and mounts are not changed.</p>
+                        <p *ngIf="status.backup.complete_restore_ready">A validated retained configuration backup is ready for an explicit offline restore.</p>
+                        <p *ngIf="status.operation.status !== 'idle'">{{status.operation.message}}</p>
                     </section>
 
                     <div class="actions">
@@ -77,7 +77,10 @@
                                     (click)="startMigration()">{{actionBusy ? 'Starting...' : actionLabel}}</button>
                             <p *ngIf="actionError" role="alert">The request was not accepted. Recheck status before trying again.</p>
                         </div>
-                        <button type="button" class="secondary-button" (click)="refresh()">Recheck status</button>
+                        <button *ngIf="!status.capabilities.apply && !status.capabilities.retry"
+                                type="button"
+                                class="secondary-button"
+                                (click)="refresh()">Recheck status</button>
                     </div>
                 </ng-container>
             </div>
