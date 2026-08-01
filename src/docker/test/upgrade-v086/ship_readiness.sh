@@ -122,6 +122,14 @@ node_binary() {
   [[ -n "$candidate" ]] || die "a WSL Node runtime is required; set SEEDSYNC_NODE_BIN"
   printf '%s' "$candidate"
 }
+playwright_chromium_binary() {
+  local node_path node_bin module candidate
+  node_path="$(playwright_node_path)"; node_bin="$(node_binary)"; module="${SEEDSYNC_PLAYWRIGHT_MODULE:-playwright}"
+  [[ -d "$node_path" && -x "$node_bin" ]] || die "Playwright Node runtime is unavailable"
+  candidate="$(NODE_PATH="$node_path" SEEDSYNC_PLAYWRIGHT_MODULE="$module" "$node_bin" -e 'const { chromium } = require(process.env.SEEDSYNC_PLAYWRIGHT_MODULE); process.stdout.write(chromium.executablePath())')" || die "unable to resolve Playwright Chromium"
+  [[ -x "$candidate" ]] || die "Playwright Chromium executable is unavailable: $candidate"
+  printf '%s' "$candidate"
+}
 run_browser() {
   local id="$1" node_path node_bin; shift; node_path="$(playwright_node_path)"; node_bin="$(node_binary)"
   [[ -d "$node_path" ]] || die "Playwright NODE_PATH is unavailable: $node_path"
@@ -1614,7 +1622,7 @@ focused_migration_tests() {
 }
 
 focused_after_tests() {
-  local id="$1" safe_xml="$(evidence_dir "$id")/after-safe-operations.xml" safe_log="$(evidence_dir "$id")/after-safe-operations.log" notification_xml="$(evidence_dir "$id")/after-notification-redaction.xml" notification_log="$(evidence_dir "$id")/after-notification-redaction.log"
+  local id="$1" safe_xml="$(evidence_dir "$id")/after-safe-operations.xml" safe_log="$(evidence_dir "$id")/after-safe-operations.log" notification_xml="$(evidence_dir "$id")/after-notification-redaction.xml" notification_log="$(evidence_dir "$id")/after-notification-redaction.log" chrome_bin
   bounded_command "$id" after-focused-safe-tests focused-safe-tests "$(timeout_seconds SEEDSYNC_SHIP_FOCUSED_PYTEST_TIMEOUT_SECONDS 900)" "$safe_log" bash -lc 'cd -- "$1"; shift; exec python -m pytest -q "$@"' bash "$ROOT_DIR/src/python" \
     tests/integration/test_web/test_handler/test_controller.py::TestControllerHandler::test_validate \
     tests/integration/test_web/test_handler/test_controller.py::TestControllerHandler::test_delete_local_rejects_path_traversal_without_path_leak \
@@ -1627,9 +1635,10 @@ focused_after_tests() {
     tests/unittests/test_web/test_handler/test_notifications_handler.py::TestNotificationsAdminHandler::test_admin_can_select_apprise_without_exposing_endpoint_key \
     --junitxml="$notification_xml"
   row "$id" after-notification-redaction passed "evidence/ship-readiness/$(basename "$notification_xml")"
-  bounded_command "$id" after-focused-angular-tests focused-angular-tests "$(timeout_seconds SEEDSYNC_SHIP_FOCUSED_ANGULAR_TIMEOUT_SECONDS 1200)" "$(evidence_dir "$id")/after-files-pagination.log" bash -lc 'cd -- "$1"; shift; exec npx ng test "$@"' bash "$ROOT_DIR/src/angular" --watch=false --browsers=ChromeHeadless --progress=false \
-    --include tests/unittests/services/files/view-file.service.spec.ts \
-    --include tests/unittests/pages/files/file-list.component.spec.ts
+  chrome_bin="$(playwright_chromium_binary)"
+  bounded_command "$id" after-focused-angular-tests focused-angular-tests "$(timeout_seconds SEEDSYNC_SHIP_FOCUSED_ANGULAR_TIMEOUT_SECONDS 1200)" "$(evidence_dir "$id")/after-files-pagination.log" env CHROME_BIN="$chrome_bin" bash -lc 'cd -- "$1"; shift; exec npx ng test "$@"' bash "$ROOT_DIR/src/angular" --watch=false --browsers=ChromeHeadless --progress=false \
+    --include src/app/tests/unittests/services/files/view-file.service.spec.ts \
+    --include src/app/tests/unittests/pages/files/file-list.component.spec.ts
   row "$id" after-files-pagination passed "evidence/ship-readiness/after-files-pagination.log"
 }
 
@@ -2081,6 +2090,7 @@ worker_self_check() {
   bash -n "$0" "$LAB"
   fresh_repo_shell bash -c 'test "$PWD" = "$1"' bash "$ROOT_DIR"
   browser_dispatch_self_check
+  [[ -x "$(playwright_chromium_binary)" ]] || die "Playwright Chromium resolver self-check failed"
   browser_shutdown_self_check
   browser_readiness_policy_self_check
   browser_session_temp_cleanup_self_check
