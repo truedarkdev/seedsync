@@ -172,6 +172,15 @@ mounts = item.get("Mounts") or []
 protected = [entry for entry in mounts if entry.get("Destination") == "/protected"]
 downloads = [entry for entry in mounts if entry.get("Destination") == "/downloads"]
 labels = (item.get("Config") or {}).get("Labels") or {}
+downloads_mount_source = downloads[0].get("Source", "") if downloads else ""
+downloads_source_exact = bool(downloads) and os.path.realpath(downloads_mount_source) == downloads_source
+# Docker Desktop can rewrite a later writable WSL bind to its private proxy
+# path.  A running restorer proves that proxy refers to the exact source by
+# matching /downloads device+inode with the already exact-verified snapshotter.
+docker_desktop_wsl_proxy = (
+    role == "downloads-restorer"
+    and downloads_mount_source.startswith("/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/")
+)
 checks = {
     "container name": item.get("Name", "").lstrip("/") == name,
     "running": (item.get("State") or {}).get("Running") is True or allow_stopped == "true",
@@ -186,7 +195,7 @@ checks = {
     "protected mount access": bool(protected) and protected[0].get("RW") is (protected_rw == "true"),
     "one downloads bind": len(downloads) == 1,
     "downloads is a bind": bool(downloads) and downloads[0].get("Type") == "bind",
-    "exact downloads source": bool(downloads) and os.path.realpath(downloads[0].get("Source", "")) == downloads_source,
+    "exact downloads source": downloads_source_exact or docker_desktop_wsl_proxy,
     "downloads mount access": bool(downloads) and downloads[0].get("RW") is (downloads_rw == "true"),
     "run label": labels.get("seedsync.upgrade-v086.run-id") == run_id,
     "role label": labels.get("seedsync.upgrade-v086.role") == role,
@@ -198,6 +207,17 @@ PY
   if [[ "$allow_stopped" == true && "$(docker inspect --format '{{.State.Running}}' "$name")" != true ]]; then return 0; fi
   docker exec "$name" sh -c 'test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700" && test -d /downloads && test ! -L /downloads' \
     || die "downloads helper storage contract changed"
+  if [[ "$role" == downloads-restorer ]]; then
+    local snapshotter snapshot_identity restorer_identity
+    snapshotter="$(downloads_snapshotter_container_name "$id")"
+    verify_downloads_snapshotter_container "$id" || die "downloads restorer source identity requires the exact verified snapshotter"
+    snapshot_identity="$(docker exec "$snapshotter" stat -c '%d:%i' /downloads)" \
+      || die "unable to read downloads snapshotter source identity"
+    restorer_identity="$(docker exec "$name" stat -c '%d:%i' /downloads)" \
+      || die "unable to read downloads restorer source identity"
+    [[ "$restorer_identity" == "$snapshot_identity" ]] \
+      || die "downloads restorer bind does not reference the exact snapshotter source"
+  fi
 }
 
 verify_downloads_snapshotter_container() {
