@@ -989,9 +989,15 @@ class ShipReadinessTests(unittest.TestCase):
             backup_data = root / "migration-backups" / "backup" / "data"
             backup_data.mkdir(parents=True)
             (backup_data / "settings.cfg").write_text("[General]\n", encoding="utf-8")
+            (root / ".seedsync.runtime.lock").write_text("runtime", encoding="utf-8")
             output = root / "restore.json"
             HARNESS.assert_restore(root, expected, output)
-            self.assertEqual([], json.loads(output.read_text(encoding="utf-8"))["unexpected_current_files"])
+            restored = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([], restored["unexpected_current_files"])
+            self.assertEqual(
+                [".seedsync.runtime.lock", "migration-backups"],
+                restored["expected_runtime_files"],
+            )
             (root / "path_pairs.json").write_text("{}", encoding="utf-8")
             (root / ".migration.lock").write_text("locked", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "legacy configuration contract"):
