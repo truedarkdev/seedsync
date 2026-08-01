@@ -1870,6 +1870,18 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertIn('return 0', body)
         self.assertLess(body.index('docker container inspect "$name"'), body.index('docker create --name "$name"'))
 
+    def test_downloads_restorer_accepts_only_exact_or_proven_docker_desktop_bind_source(self):
+        lab = MODULE_PATH.with_name("lab.sh").read_text(encoding="utf-8")
+        body = lab[lab.index("verify_downloads_helper_container() {"):lab.index("validate_host_port() {")]
+        for marker in (
+            'downloads_source_exact =', 'docker_desktop_wsl_proxy =',
+            '/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/',
+            'verify_downloads_snapshotter_container "$id"',
+            "stat -c '%d:%i' /downloads", '[[ "$restorer_identity" == "$snapshot_identity" ]]',
+            'downloads restorer bind does not reference the exact snapshotter source',
+        ):
+            self.assertIn(marker, body)
+
     def test_downloads_restore_guard_covers_marker_replacement_compare_and_signal_rollback(self):
         launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
         guard = launcher[launcher.index("guarded_downloads_baseline_replacement() ("):launcher.index("assert_download_restore_runtimes_stopped() {")]
