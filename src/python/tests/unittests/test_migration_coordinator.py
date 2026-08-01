@@ -226,6 +226,40 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertFalse((self.root / "path_pairs.json").exists())
         self.assertFalse((self.root / "api-keys.json").exists())
 
+    def test_completed_migration_requires_durable_continue_before_normal_startup(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+
+        completed = coordinator.apply_confirmed()
+
+        self.assertEqual(MigrationState.COMPLETE, completed.state)
+        self.assertFalse(completed.normal_startup_released)
+        self.assertFalse(coordinator.preflight().allows_normal_startup)
+        with self.assertRaises(MigrationBlockedError):
+            coordinator.require_normal_startup()
+
+        released = coordinator.release_normal_startup()
+
+        self.assertTrue(released.normal_startup_released)
+        self.assertTrue(released.allows_normal_startup)
+        self.assertEqual(released, coordinator.release_normal_startup())
+        persisted = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
+        self.assertTrue(persisted["normal_startup_released"])
+        self.assertTrue(MigrationCoordinator(self.root).require_normal_startup().normal_startup_released)
+
+    def test_completed_receipt_without_continue_gate_remains_startable(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        coordinator.apply_confirmed()
+        receipt_path = self.root / "migration-state.json"
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        del receipt["normal_startup_released"]
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+        restarted = MigrationCoordinator(self.root).require_normal_startup()
+
+        self.assertTrue(restarted.normal_startup_released)
+
     def test_pinned_ff2a_fixture_requires_consent_without_source_mutation(self) -> None:
         fixture_root = Path(__file__).parents[1] / "fixtures" / "upgrade_v086_ff2a"
         provenance = (fixture_root / "PROVENANCE.md").read_text(encoding="utf-8")
@@ -421,6 +455,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         receipt = json.loads((self.root / "migration-state.json").read_text(encoding="utf-8"))
         self.assertEqual("complete", receipt["state"])
         self.assertEqual(1, receipt["receipt_version"])
+        self.assertFalse(receipt["normal_startup_released"])
         self.assertEqual("seedsync-current-v1", receipt["current_schema"])
         self.assertEqual(["original-v0.8.6-to-current-v1"], receipt["applied_migrations"])
 
@@ -428,6 +463,10 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        with self.assertRaises(MigrationBlockedError):
+            coordinator.require_normal_startup()
+        released = coordinator.release_normal_startup()
+        self.assertTrue(released.normal_startup_released)
 
         store = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
         self.assertIsNotNone(store.ensure_bootstrap_proof())
@@ -440,6 +479,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)
         self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        coordinator.release_normal_startup()
 
         migration_runtime = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
         migration_runtime.ensure_bootstrap_proof()
@@ -540,7 +580,9 @@ class TestMigrationCoordinator(unittest.TestCase):
 
     def test_completed_migration_exit_probe_is_repeatedly_finite_and_restartable(self) -> None:
         MigrationFixture(self.root).write()
-        self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(self.root).apply_confirmed().state)
+        coordinator = MigrationCoordinator(self.root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        coordinator.release_normal_startup()
         argv = [
             "seedsync.py", "-c", str(self.root), "--html", str(self.root),
             "--scanfs", str(self.root), "--exit",
@@ -559,6 +601,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         MigrationFixture(root).write()
         coordinator = MigrationCoordinator(root)
         self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        coordinator.release_normal_startup()
         binding = coordinator.completed_auth_transition_binding()
         store = ApiKeyStore(file_path=str(root / "api-keys.json"))
         store.bind_completed_migration_claim_transition(binding)
@@ -583,6 +626,19 @@ class TestMigrationCoordinator(unittest.TestCase):
                 self.assertEqual(MigrationState.COMPLETE, decision.state)
                 self.assertEqual("claimed", decision.completed_auth_phase)
 
+    def test_claimed_completed_migration_allows_intentionally_empty_path_pairs_after_restart(self) -> None:
+        self._complete_migrated_browser_claim(self.root)
+        manager = PathPairManager(str(self.root))
+        pairs = manager.get_all_pairs()
+        self.assertEqual(1, len(pairs))
+        manager.remove_pair(pairs[0].id)
+
+        restarted = MigrationCoordinator(self.root).require_normal_startup()
+
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertEqual("claimed", restarted.completed_auth_phase)
+        self.assertEqual([], PathPairManager(str(self.root)).get_all_pairs())
+
     def test_completed_claimed_lineage_validation_is_read_only(self) -> None:
         self._complete_migrated_browser_claim(self.root)
         with patch("migration.coordinator._restrict_fd_to_owner", side_effect=AssertionError("read mutation")):
@@ -595,6 +651,7 @@ class TestMigrationCoordinator(unittest.TestCase):
         eligibility = coordinator.recovery_eligibility()
         self.assertTrue(eligibility["eligible"])
         self.assertEqual("original-v0.8.6-to-current-v1", eligibility["migration_id"])
+        self.assertEqual("RESTORE", eligibility["confirmation"])
 
         coordinator.request_recovery_restore(
             confirmation=eligibility["confirmation"], other_instances_stopped=True,
@@ -637,6 +694,10 @@ class TestMigrationCoordinator(unittest.TestCase):
         with self.assertRaises(ValueError):
             coordinator.request_recovery_restore(
                 confirmation=eligibility["confirmation"] + " now", other_instances_stopped=True,
+            )
+        with self.assertRaises(ValueError):
+            coordinator.request_recovery_restore(
+                confirmation="restore", other_instances_stopped=True,
             )
         self.assertFalse((self.root / ".migration-recovery-intent.json").exists())
 

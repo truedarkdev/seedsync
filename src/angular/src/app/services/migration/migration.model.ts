@@ -22,7 +22,12 @@ export interface MigrationStatus {
     capabilities: {
         apply: boolean;
         retry: boolean;
+        continue: boolean;
         restore: false;
+    };
+    normal_startup: {
+        released: boolean;
+        requires_continue: boolean;
     };
     backup: {
         required: true;

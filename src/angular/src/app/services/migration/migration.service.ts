@@ -38,7 +38,11 @@ export function parseMigrationStatus(value: unknown): MigrationStatus {
         !isObject(value.capabilities) ||
         typeof value.capabilities.apply !== "boolean" ||
         typeof value.capabilities.retry !== "boolean" ||
+        typeof value.capabilities.continue !== "boolean" ||
         value.capabilities.restore !== false ||
+        !isObject(value.normal_startup) ||
+        typeof value.normal_startup.released !== "boolean" ||
+        typeof value.normal_startup.requires_continue !== "boolean" ||
         !isObject(value.backup) ||
         value.backup.required !== true ||
         typeof value.backup.complete_restore_ready !== "boolean" ||
@@ -53,6 +57,8 @@ export function parseMigrationStatus(value: unknown): MigrationStatus {
         value.action.confirmation.length > 256 ||
         (value.capabilities.apply === true && value.state !== "required") ||
         (value.capabilities.retry === true && (value.state !== "failed" || value.retryable !== true)) ||
+        (value.capabilities.continue === true &&
+            (value.state !== "complete" || value.normal_startup.requires_continue !== true)) ||
         ((value.capabilities.apply === true || value.capabilities.retry === true) &&
             value.action.confirmation.length === 0) ||
         !(value.blocker === null || typeof value.blocker === "string")) {
@@ -70,6 +76,7 @@ export function parseMigrationStatus(value: unknown): MigrationStatus {
         error: value.error as MigrationStatus["error"],
         retryable: value.retryable,
         capabilities: value.capabilities as MigrationStatus["capabilities"],
+        normal_startup: value.normal_startup as MigrationStatus["normal_startup"],
         backup: value.backup as MigrationStatus["backup"],
         operation: value.operation as MigrationStatus["operation"],
         action: value.action as MigrationStatus["action"],
@@ -94,5 +101,17 @@ export class MigrationService {
             },
             {headers: {"X-SeedSync-Migration-CSRF": status.action.csrf_token}}
         ).pipe(map(parseMigrationStatus));
+    }
+
+    continue(status: MigrationStatus): Observable<MigrationStatus> {
+        return this.http.post<unknown>(
+            "/server/migration/v1/continue",
+            {},
+            {headers: {"X-SeedSync-Migration-CSRF": status.action.csrf_token}}
+        ).pipe(map(parseMigrationStatus));
+    }
+
+    probeNormalStartup(): Observable<void> {
+        return this.http.get("/bootstrap", {responseType: "text"}).pipe(map(() => undefined));
     }
 }

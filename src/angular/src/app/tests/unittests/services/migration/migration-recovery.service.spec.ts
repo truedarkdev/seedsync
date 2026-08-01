@@ -8,7 +8,7 @@ describe("MigrationRecoveryService", () => {
     let http: HttpTestingController;
     const status: any = {
         eligible: true, migration_id: "original-v0.8.6-to-current-v1", backup_id: "original-v0.8.6-to-current-v1-a1",
-        source_schema: "original-v0.8.6", target_schema: "seedsync-current-v1", confirmation: "RESTORE original-v0.8.6-to-current-v1"
+        source_schema: "original-v0.8.6", target_schema: "seedsync-current-v1", confirmation: "RESTORE"
     };
 
     beforeEach(() => {
@@ -45,7 +45,8 @@ describe("MigrationRecoveryService", () => {
             schema_version: 2, mode: "migration_required", state: "required",
             migration_id: "original-v0.8.6-to-current-v1", source_schema: "original-v0.8.6", target_schema: "current-v1",
             features: [], error: null, retryable: false,
-            capabilities: {apply: true, retry: false, restore: false},
+            capabilities: {apply: true, retry: false, continue: false, restore: false},
+            normal_startup: {released: false, requires_continue: false},
             backup: {required: true, complete_restore_ready: false, status: "created_before_apply"},
             operation: {status: "idle", message: "Ready"},
             action: {csrf_token: "csrf-proof-0123456789-0123456789", confirmation: "MIGRATE original-v0.8.6-to-current-v1"}, blocker: null
