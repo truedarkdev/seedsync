@@ -499,6 +499,7 @@ _SCREENSHOT_MAX_PIXELS = 64 * 1024 * 1024
 _LOG_PUBLICATION_POLICY_VERSION = 1
 _LOG_PUBLICATION_MAX_BYTES = 512 * 1024
 _RETAINED_DIRECT_SCAN_MAX_BYTES = 1024 * 1024
+_SASS_TRACE_PREFIX_MAX_CHARS = 512
 _LOG_PUBLICATION_RELATIVE_PATH = "logs/seedsync.log"
 _LOG_REDACTION_CLASSES = {
     "assignment": SECRET,
@@ -922,55 +923,79 @@ def _retained_secret_hint(text: str) -> bool:
         if "@" in authority:
             userinfo, _host_port = authority.rsplit("@", 1)
         else:
-            while at_cursor < len(at_positions) and at_positions[at_cursor] <= scheme_end:
-                at_cursor += 1
-            if at_cursor == len(at_positions):
-                continue
-            eventual_at = at_positions[at_cursor]
-            intervening = text[authority_end:eventual_at]
-            authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
+            userinfo = None
+            while True:
+                while at_cursor < len(at_positions) and at_positions[at_cursor] <= scheme_end:
+                    at_cursor += 1
+                if at_cursor == len(at_positions):
+                    break
+                eventual_at = at_positions[at_cursor]
+                authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
+                scheme = text[scheme_start:scheme_end - 3].casefold()
+                local_file_uri = scheme == "file" and not authority and text[scheme_end:scheme_end + 1] == "/"
+                trace_window_start = max(authority_end, eventual_at - _SASS_TRACE_PREFIX_MAX_CHARS)
+                line_start = max(
+                    text.rfind("\n", trace_window_start, eventual_at),
+                    text.rfind("\r", trace_window_start, eventual_at),
+                )
+                trace_prefix = text[line_start + 1:eventual_at] if line_start >= trace_window_start else ""
+                import_end = eventual_at + len("@import")
+                sass_import_trace = (
+                    (authority_is_host_only or local_file_uri)
+                    and line_start >= trace_window_start
+                    and text[eventual_at:import_end] == "@import"
+                    and (import_end == len(text) or text[import_end].isspace())
+                    and re.fullmatch(
+                        r"(?:#[0-9]+\s+[0-9.]+\s+)?(?:Sass\s+|node_modules/[A-Za-z0-9_./-]+\s+\d+:\d+\s+|\d+\s+\|\s+)",
+                        trace_prefix,
+                    ) is not None
+                )
+                if sass_import_trace:
+                    # Consume only this compiler directive. Finding its line
+                    # starts at the candidate, so dense traces stay bounded.
+                    at_cursor += 1
+                    continue
 
-            def has_unescaped(delimiter: str) -> bool:
-                offset = intervening.find(delimiter)
-                while offset >= 0:
-                    backslashes = 0
-                    cursor = offset - 1
-                    while cursor >= 0 and intervening[cursor] == "\\":
-                        backslashes += 1
-                        cursor -= 1
-                    if backslashes % 2 == 0:
-                        return True
-                    offset = intervening.find(delimiter, offset + 1)
-                return False
+                intervening = text[authority_end:eventual_at]
 
-            quoted_boundary = (
-                scheme_start > 0
-                and text[scheme_start - 1] in ('"', "'")
-                and has_unescaped(text[scheme_start - 1])
-            )
-            markdown_boundary = scheme_start > 0 and text[scheme_start - 1] == "(" and has_unescaped(")")
-            code_fence_boundary = (
-                "```" in intervening
-                and text.count("```", 0, scheme_start) % 2 == 1
-                and has_unescaped("```")
-            )
-            if authority_is_host_only and (quoted_boundary or markdown_boundary or code_fence_boundary):
-                # Exact quoted-value and Markdown-link boundaries prove that a
-                # later at-sign belongs to another retained value (for example
-                # npm's adjacent URL / ``package@version`` fields or a README's
-                # fenced ``package@tag`` command). Requiring a valid host-only
-                # authority preserves fail-closed handling for delimiter-injected
-                # malformed credential remnants.
+                def has_unescaped(delimiter: str) -> bool:
+                    offset = intervening.find(delimiter)
+                    while offset >= 0:
+                        backslashes = 0
+                        cursor = offset - 1
+                        while cursor >= 0 and intervening[cursor] == "\\":
+                            backslashes += 1
+                            cursor -= 1
+                        if backslashes % 2 == 0:
+                            return True
+                        offset = intervening.find(delimiter, offset + 1)
+                    return False
+
+                quoted_boundary = (
+                    scheme_start > 0
+                    and text[scheme_start - 1] in ('"', "'")
+                    and has_unescaped(text[scheme_start - 1])
+                )
+                markdown_boundary = scheme_start > 0 and text[scheme_start - 1] == "(" and has_unescaped(")")
+                code_fence_boundary = (
+                    "```" in intervening
+                    and text.count("```", 0, scheme_start) % 2 == 1
+                    and has_unescaped("```")
+                )
+                if authority_is_host_only and (quoted_boundary or markdown_boundary or code_fence_boundary):
+                    # Preserve the established exact-value boundary behavior.
+                    break
+                later_scheme = occurrences[index + 1][0] if index + 1 < len(occurrences) else -1
+                prefix_end = later_scheme if 0 <= later_scheme < eventual_at else -1
+                if prefix_end >= 0 and authority_is_host_only and ":" not in unquote(text[authority_end:prefix_end]):
+                    # The following scheme is a separate occurrence; its own
+                    # iteration will inspect the associated at-sign.
+                    break
+                # This includes ambiguous host:port/path@ forms; fail closed.
+                userinfo = text[scheme_end:eventual_at]
+                break
+            if userinfo is None:
                 continue
-            later_scheme = occurrences[index + 1][0] if index + 1 < len(occurrences) else -1
-            prefix_end = later_scheme if 0 <= later_scheme < eventual_at else -1
-            if prefix_end >= 0 and authority_is_host_only and ":" not in unquote(text[authority_end:prefix_end]):
-                # The following scheme is a separate occurrence only after an
-                # unambiguous no-userinfo URI; finditer will inspect it too.
-                continue
-            # This includes ambiguous host:port/path@ forms; fail closed
-            # instead of guessing that a malformed credential is harmless.
-            userinfo = text[scheme_end:eventual_at]
         decoded = unquote(userinfo).casefold()
         if ":" in decoded:
             _user, credential = decoded.split(":", 1)
