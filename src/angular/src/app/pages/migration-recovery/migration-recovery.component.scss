@@ -17,6 +17,10 @@ dl div { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 16px; 
 dl div:last-child { border-bottom: 0; }
 dt { color: #687780; font-size: 11px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
 dd { margin: 0; color: #283c4a; font-size: 14px; line-height: 1.45; }
+.recovery-outcomes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+.recovery-outcomes > div { padding: 11px 12px; border-left: 3px solid #a84335; background: #fdf9f8; }
+.recovery-outcomes h2 { color: #6d2e26; font-size: 15px; }
+.recovery-outcomes p { margin: 5px 0 0; color: #596a75; font-size: 12px; line-height: 1.42; }
 .danger-zone { margin-top: 28px; padding-left: 18px; border-left: 3px solid #a84335; }
 .attestation { display: flex; align-items: flex-start; gap: 10px; color: #43535d; font-size: 13px; line-height: 1.5; }
 .attestation input { margin-top: 3px; accent-color: #a84335; }
@@ -45,5 +49,6 @@ footer { padding: 18px 34px 25px; border-top: 1px solid rgba(31,42,51,.09); colo
 .spinner { width: 20px; height: 20px; flex: 0 0 20px; border: 2px solid rgba(168,67,53,.22); border-top-color: #a84335; border-radius: 50%; animation: spin .75s linear infinite; }
 @keyframes settle { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 600px) { .recovery-page { display: block; padding: 12px; } .recovery-brand, .recovery-content { padding-left: 21px; padding-right: 21px; } footer { padding-left: 21px; padding-right: 21px; } dl div { grid-template-columns: 1fr; gap: 4px; } .actions { align-items: stretch; flex-direction: column; } .actions button { width: 100%; } }
+@media (min-width: 601px) { .recovery-page { min-height: 100svh; padding: 16px; } .recovery-shell { height: min(700px, calc(100svh - 32px)); } .recovery-brand { padding: 16px 24px 12px; font-size: 28px; } .recovery-brand img { width: 48px; height: 48px; } .recovery-content { padding: 20px 24px; } h1 { font-size: clamp(28px, 3.5vw, 36px); } .orientation { margin-top: 8px; line-height: 1.42; } .recovery-details { margin-top: 14px; } dl div { grid-template-columns: 122px minmax(0, 1fr); gap: 12px; padding: 9px 0; } .recovery-outcomes { gap: 9px; margin-top: 12px; } .recovery-outcomes > div { padding: 8px 9px; } .recovery-outcomes p { line-height: 1.32; } .danger-zone { margin-top: 14px; padding-left: 13px; } .attestation { line-height: 1.35; } .confirmation-phrase { gap: 5px; margin-top: 10px; } .confirmation-phrase input { min-height: 35px; padding: 6px 8px; } .actions { margin-top: 12px; } button { min-height: 36px; } footer { padding: 11px 24px 14px; line-height: 1.35; } }
+@media (max-width: 600px) { .recovery-page { display: block; padding: 12px; } .recovery-brand, .recovery-content { padding-left: 21px; padding-right: 21px; } footer { padding-left: 21px; padding-right: 21px; } dl div { grid-template-columns: 1fr; gap: 4px; } .recovery-outcomes { grid-template-columns: 1fr; } .actions { align-items: stretch; flex-direction: column; } .actions button { width: 100%; } }
 @media (prefers-reduced-motion: reduce) { .recovery-shell, .spinner { animation: none; } }

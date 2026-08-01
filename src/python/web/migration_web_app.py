@@ -212,10 +212,17 @@ def migration_status_payload(
         and decision.retryable
         and not operation_running
     )
+    continue_available = (
+        decision.state == MigrationState.COMPLETE
+        and not decision.normal_startup_released
+        and not operation_running
+    )
     if operation_running:
         blocker = "migration_running"
-    elif decision.state == MigrationState.COMPLETE:
+    elif decision.state == MigrationState.COMPLETE and not decision.normal_startup_released:
         blocker = "normal_startup_pending"
+    elif decision.state == MigrationState.COMPLETE:
+        blocker = None
     elif decision.state == MigrationState.FAILED and not decision.retryable:
         blocker = "migration_not_retryable"
     elif not (apply_available or retry_available):
@@ -223,6 +230,9 @@ def migration_status_payload(
     else:
         blocker = None
 
+    normal_startup_released = (
+        decision.normal_startup_released if decision.state == MigrationState.COMPLETE else False
+    )
     return {
         "schema_version": 2,
         "mode": "migration_required",
@@ -236,7 +246,12 @@ def migration_status_payload(
         "capabilities": {
             "apply": apply_available,
             "retry": retry_available,
+            "continue": continue_available,
             "restore": False,
+        },
+        "normal_startup": {
+            "released": normal_startup_released,
+            "requires_continue": decision.state == MigrationState.COMPLETE and not normal_startup_released,
         },
         "backup": {
             "required": True,
@@ -248,7 +263,7 @@ def migration_status_payload(
             "message": {
                 "idle": "Ready to create and validate the retained backup before migration.",
                 "running": "Creating or validating the retained backup and applying the migration.",
-                "succeeded": "Migration completed. SeedSync is returning to normal startup.",
+                "succeeded": "Migration completed. Review the checkpoint, then continue to SeedSync when ready.",
                 "failed": "Migration stopped safely. Review the status before retrying.",
             }.get("running" if operation_running else operation_status, "Migration status changed."),
         },
@@ -289,13 +304,13 @@ class MigrationWebApp(bottle.Bottle):
         html_path: str,
         coordinator: MigrationCoordinator,
         *,
-        on_success: Callable[[], None] | None = None,
+        on_continue: Callable[[], None] | None = None,
         allowed_origins: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self._html_root = Path(html_path).resolve()
         self._coordinator = coordinator
-        self._on_success = on_success or (lambda: None)
+        self._on_continue = on_continue or (lambda: None)
         self._csrf_token = secrets.token_urlsafe(32)
         validated_origins = validate_migration_allowed_origins(allowed_origins)
         self._allowed_origins = frozenset(_canonical_origin(value) for value in validated_origins)
@@ -306,8 +321,10 @@ class MigrationWebApp(bottle.Bottle):
         self.hook("before_request")(self._deny_unregistered_server_routes)
         self.hook("after_request")(self._apply_security_headers)
         self.get("/")(self._redirect_to_migration)
+        self.get("/bootstrap")(self._normal_startup_not_ready)
         self.get("/server/migration/v1/status")(self._status)
         self.post("/server/migration/v1/apply")(self._apply)
+        self.post("/server/migration/v1/continue")(self._continue_normal_startup)
         self.get("/migration")(self._index)
         self.get("/migration/")(self._index)
         self.get("/migration/<spa_path:path>")(self._migration_fallback)
@@ -332,6 +349,7 @@ class MigrationWebApp(bottle.Bottle):
         if (
             bottle.request.path not in {
                 "/server/migration/v1/status", "/server/migration/v1/apply",
+                "/server/migration/v1/continue",
             }
             or (
                 bottle.request.path.endswith("/status")
@@ -339,6 +357,10 @@ class MigrationWebApp(bottle.Bottle):
             )
             or (
                 bottle.request.path.endswith("/apply")
+                and bottle.request.method != "POST"
+            )
+            or (
+                bottle.request.path.endswith("/continue")
                 and bottle.request.method != "POST"
             )
         ):
@@ -354,6 +376,13 @@ class MigrationWebApp(bottle.Bottle):
     @staticmethod
     def _redirect_to_migration() -> bottle.HTTPResponse:
         return bottle.redirect("/migration")
+
+    def _normal_startup_not_ready(self) -> bottle.HTTPResponse:
+        """Keep the normal-runtime readiness probe distinct during migration."""
+        return self._apply_security_headers(bottle.HTTPResponse(
+            body='{"ready":false}', status=503,
+            content_type="application/json; charset=utf-8",
+        ))
 
     def _status(self) -> bottle.HTTPResponse:
         try:
@@ -499,8 +528,32 @@ class MigrationWebApp(bottle.Bottle):
             self._log_apply_failure(error)
         with self._operation_lock:
             self._execution.status = "succeeded" if succeeded else "failed"
-        if succeeded:
-            self._on_success()
+
+    def _continue_normal_startup(self) -> bottle.HTTPResponse:
+        """Release the completed checkpoint only after a protected user action."""
+        supplied_token = bottle.request.headers.get("X-SeedSync-Migration-CSRF", "")
+        if not self._same_origin_request() or not secrets.compare_digest(
+            supplied_token, self._csrf_token,
+        ):
+            bottle.abort(403)
+        body = self._read_apply_body()
+        if body != {}:
+            bottle.abort(400)
+        with self._operation_lock:
+            if self._execution.worker is not None and self._execution.worker.is_alive():
+                bottle.abort(409)
+            try:
+                decision = self._coordinator.release_normal_startup()
+            except Exception:
+                bottle.abort(409)
+            self._execution.status = "succeeded"
+        response = self._apply_security_headers(bottle.HTTPResponse(
+            body=json.dumps(self._payload(decision), sort_keys=True, separators=(",", ":")),
+            status=202,
+            content_type="application/json; charset=utf-8",
+        ))
+        self._on_continue()
+        return response
 
     @staticmethod
     def _log_apply_failure(error: Exception) -> None:
@@ -571,7 +624,7 @@ class MigrationWebRuntime:
         self._restart_timer: threading.Timer | None = None
         self.app = MigrationWebApp(
             html_path, coordinator,
-            on_success=self._schedule_normal_startup,
+            on_continue=self._schedule_normal_startup,
             allowed_origins=allowed_origins,
         )
         self._bind_host = bind_host
@@ -594,9 +647,9 @@ class MigrationWebRuntime:
     def _schedule_normal_startup(self) -> None:
         if self._restart_timer is not None:
             return
-        # Give the polling SPA a bounded opportunity to observe completion,
+        # Allow the protected continue response to leave this WSGI server,
         # then return control to seedsync.py's existing reconstruction loop.
-        timer = threading.Timer(2.0, self.stop)
+        timer = threading.Timer(0.15, self.stop)
         timer.daemon = True
         self._restart_timer = timer
         timer.start()

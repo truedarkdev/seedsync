@@ -9,7 +9,7 @@ describe("MigrationRecoveryComponent", () => {
     let service: jasmine.SpyObj<MigrationRecoveryService>;
     const status: any = {
         eligible: true, migration_id: "original-v0.8.6-to-current-v1", backup_id: "original-v0.8.6-to-current-v1-a1",
-        source_schema: "original-v0.8.6", target_schema: "seedsync-current-v1", confirmation: "RESTORE original-v0.8.6-to-current-v1"
+        source_schema: "original-v0.8.6", target_schema: "seedsync-current-v1", confirmation: "RESTORE"
     };
 
     beforeEach(() => {
@@ -34,8 +34,14 @@ describe("MigrationRecoveryComponent", () => {
 
         const button: HTMLButtonElement = fixture.nativeElement.querySelector(".danger-action");
         const checkbox: HTMLInputElement = fixture.nativeElement.querySelector(".attestation input");
-        expect(fixture.nativeElement.textContent).toContain("Undo this upgrade");
+        expect(fixture.nativeElement.textContent).toContain("Restore this migration backup");
         expect(fixture.nativeElement.textContent).toContain(status.backup_id);
+        expect(fixture.nativeElement.textContent).toContain("current SeedSync image then returns to the migration checkpoint");
+        expect(fixture.nativeElement.textContent).toContain("Retry upgrade");
+        expect(fixture.nativeElement.textContent).toContain("Return to v0.8.6");
+        expect(fixture.nativeElement.textContent).toContain("Docker > SeedSync > Edit");
+        expect(fixture.nativeElement.textContent).toContain("previous v0.8.6 Repository/image tag");
+        expect(fixture.nativeElement.querySelector(".confirmation-phrase code").textContent).toContain("RESTORE");
         expect(fixture.nativeElement.querySelector("app-sidebar")).toBeNull();
         expect(button.disabled).toBeTrue();
 

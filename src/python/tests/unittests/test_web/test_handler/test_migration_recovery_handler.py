@@ -31,7 +31,7 @@ class TestMigrationRecoveryHandler(unittest.TestCase):
     def test_status_exposes_only_public_receipt_bound_eligibility(self) -> None:
         self.coordinator.recovery_eligibility.return_value = {
             "eligible": True, "migration_id": "v086", "backup_id": "v086-a1",
-            "confirmation": "RESTORE v086", "receipt_sha256": "secret-receipt",
+            "confirmation": "RESTORE", "receipt_sha256": "secret-receipt",
             "backup_manifest_sha256": "secret-manifest",
         }
 
@@ -51,19 +51,19 @@ class TestMigrationRecoveryHandler(unittest.TestCase):
 
         response = self.client.post_json(
             "/server/admin/migration-recovery/v1/restore",
-            {"confirmation": "RESTORE v086", "other_instances_stopped": True},
+            {"confirmation": "RESTORE", "other_instances_stopped": True},
             extra_environ=self._headers(),
         )
         self.assertEqual(202, response.status_int)
         self.coordinator.request_recovery_restore.assert_called_once_with(
-            confirmation="RESTORE v086", other_instances_stopped=True,
+            confirmation="RESTORE", other_instances_stopped=True,
         )
         self.restart.assert_called_once_with()
 
     def test_restore_rejects_backup_or_unknown_client_fields(self) -> None:
         response = self.client.post_json(
             "/server/admin/migration-recovery/v1/restore",
-            {"confirmation": "RESTORE v086", "other_instances_stopped": True, "backup": "/tmp/anywhere"},
+            {"confirmation": "RESTORE", "other_instances_stopped": True, "backup": "/tmp/anywhere"},
             extra_environ=self._headers(), expect_errors=True,
         )
         self.assertEqual(409, response.status_int)

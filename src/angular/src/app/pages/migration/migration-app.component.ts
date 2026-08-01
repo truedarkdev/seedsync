@@ -103,6 +103,7 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     migrationConfirmed = false;
     actionBusy = false;
     actionError = false;
+    normalStartupReleaseAccepted = false;
 
     private featureTimer: number | null = null;
     private featureImageTimer: number | null = null;
@@ -110,7 +111,9 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     private reducedMotion = false;
     private motionQuery: MediaQueryList | null = null;
     private statusPollTimer: number | null = null;
-    private normalStartupTimer: number | null = null;
+    private normalStartupProbeTimer: number | null = null;
+    private normalStartupProbeAttempts = 0;
+    private static readonly NORMAL_STARTUP_PROBE_MAX_ATTEMPTS = 120;
 
     constructor(private readonly migrationService: MigrationService,
                 private readonly changeDetector: ChangeDetectorRef) {}
@@ -126,7 +129,7 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     ngOnDestroy(): void {
         this.clearFeatureTimer();
         this.clearStatusPoll();
-        this.clearNormalStartupNavigation();
+        this.clearNormalStartupProbe();
         this.motionQuery?.removeEventListener("change", this.onMotionPreferenceChange);
     }
 
@@ -151,14 +154,6 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
                 this.changeDetector.markForCheck();
             },
             error: () => {
-                if (polling && this.status && (
-                    this.status.state === "running" || this.status.operation.status === "running"
-                )) {
-                    this.loading = false;
-                    this.scheduleNormalStartupNavigation(1000);
-                    this.changeDetector.markForCheck();
-                    return;
-                }
                 this.status = null;
                 this.featureSlides = [];
                 this.activeFeatureView = [];
@@ -180,6 +175,18 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
 
     get actionLabel(): string {
         return this.status?.capabilities.retry ? "Retry migration" : "Start migration";
+    }
+
+    get canContinueToSeedSync(): boolean {
+        return !!this.status && (this.status.capabilities.continue || this.normalStartupReleaseAccepted) &&
+            !this.actionBusy;
+    }
+
+    get continueLabel(): string {
+        if (this.actionBusy) {
+            return "Starting SeedSync...";
+        }
+        return this.actionError ? "Retry checking SeedSync" : "Continue to SeedSync";
     }
 
     get readinessLabel(): string {
@@ -232,6 +239,34 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
         });
     }
 
+    continueToSeedSync(): void {
+        if (!this.status || !this.canContinueToSeedSync) {
+            return;
+        }
+        this.actionBusy = true;
+        this.actionError = false;
+        if (this.normalStartupReleaseAccepted) {
+            this.beginNormalStartupProbe();
+            this.changeDetector.markForCheck();
+            return;
+        }
+        this.migrationService.continue(this.status).subscribe({
+            next: () => {
+                this.normalStartupReleaseAccepted = true;
+                // The migration-only server now stops and the process loop
+                // rebuilds the normal runtime. Do not navigate into a restart:
+                // wait for the normal bootstrap route before changing pages.
+                this.beginNormalStartupProbe();
+                this.changeDetector.markForCheck();
+            },
+            error: () => {
+                this.actionBusy = false;
+                this.actionError = true;
+                this.changeDetector.markForCheck();
+            }
+        });
+    }
+
     get activeFeature(): MigrationFeatureSlide | null {
         return this.featureSlides[this.activeFeatureIndex] || null;
     }
@@ -251,6 +286,10 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
 
     get isMigrationComplete(): boolean {
         return this.status?.state === "complete";
+    }
+
+    get isMigrationRunning(): boolean {
+        return this.status?.state === "running" || this.status?.operation.status === "running";
     }
 
     get sourceVersionStateLabel(): string {
@@ -333,8 +372,10 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     }
 
     get stateLabel(): string {
+        if (this.isMigrationRunning) {
+            return "Migration in progress";
+        }
         switch (this.status?.state) {
-            case "running": return "Migration in progress";
             case "failed": return "Migration readiness check failed";
             case "complete": return "Migration complete";
             case "required":
@@ -344,15 +385,16 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     }
 
     get stateCopy(): string {
+        if (this.isMigrationRunning) {
+            return "SeedSync is creating or validating the retained backup and applying the migration. Normal services remain paused.";
+        }
         switch (this.status?.state) {
-            case "running":
-                return "SeedSync is creating or validating the retained backup and applying the migration. Normal services remain paused.";
             case "failed":
                 return this.status.retryable
                     ? "The migration stopped safely. The retained backup remains available and you can retry."
                     : "SeedSync could not complete the readiness check. Migration cannot be retried from this page.";
             case "complete":
-                return "Migration completed. SeedSync is returning to normal startup and a fresh browser claim.";
+                return "The migration and retained backup are ready. Continue when you are ready to start normal SeedSync and claim this browser.";
             case "required":
                 if (!this.isConfirmedV086Migration) {
                     return "SeedSync could not confirm a supported migration source. No migration operation is available from this page.";
@@ -422,10 +464,6 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     }
 
     private scheduleStatusPoll(status: MigrationStatus): void {
-        if (status.state === "complete" || status.operation.status === "succeeded") {
-            this.scheduleNormalStartupNavigation(2000);
-            return;
-        }
         if (status.state !== "running" && status.operation.status !== "running") {
             return;
         }
@@ -435,19 +473,38 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
         }, 1000);
     }
 
-    private scheduleNormalStartupNavigation(delayMs: number): void {
-        this.clearNormalStartupNavigation();
-        this.normalStartupTimer = window.setTimeout(() => {
-            this.normalStartupTimer = null;
-            window.location.replace("/");
-        }, delayMs);
+    private beginNormalStartupProbe(): void {
+        this.clearNormalStartupProbe();
+        this.normalStartupProbeAttempts = 0;
+        this.probeNormalStartup();
     }
 
-    private clearNormalStartupNavigation(): void {
-        if (this.normalStartupTimer !== null) {
-            window.clearTimeout(this.normalStartupTimer);
-            this.normalStartupTimer = null;
+    private probeNormalStartup(): void {
+        this.migrationService.probeNormalStartup().subscribe({
+            next: () => window.location.replace("/"),
+            error: () => {
+                this.normalStartupProbeAttempts += 1;
+                if (this.normalStartupProbeAttempts >= MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_ATTEMPTS) {
+                    this.normalStartupProbeTimer = null;
+                    this.actionBusy = false;
+                    this.actionError = true;
+                    this.changeDetector.markForCheck();
+                    return;
+                }
+                this.normalStartupProbeTimer = window.setTimeout(() => {
+                    this.normalStartupProbeTimer = null;
+                    this.probeNormalStartup();
+                }, 250);
+            }
+        });
+    }
+
+    private clearNormalStartupProbe(): void {
+        if (this.normalStartupProbeTimer !== null) {
+            window.clearTimeout(this.normalStartupProbeTimer);
+            this.normalStartupProbeTimer = null;
         }
+        this.normalStartupProbeAttempts = 0;
     }
 
     private clearStatusPoll(): void {

@@ -28,7 +28,8 @@ describe("MigrationAppComponent", () => {
         ],
         error: null,
         retryable: false,
-        capabilities: {apply: true, retry: false, restore: false},
+        capabilities: {apply: true, retry: false, continue: false, restore: false},
+        normal_startup: {released: false, requires_continue: false},
         backup: {required: true, complete_restore_ready: false, status: "created_before_apply"},
         operation: {status: "idle", message: "Ready to migrate."},
         action: {csrf_token: "csrf-proof-0123456789-0123456789", confirmation: "MIGRATE original-v0.8.6-to-current-v1"},
@@ -36,7 +37,9 @@ describe("MigrationAppComponent", () => {
     };
 
     beforeEach(() => {
-        service = jasmine.createSpyObj<MigrationService>("MigrationService", ["loadStatus", "apply"]);
+        service = jasmine.createSpyObj<MigrationService>(
+            "MigrationService", ["loadStatus", "apply", "continue", "probeNormalStartup"]
+        );
         TestBed.configureTestingModule({
             imports: [MigrationAppComponent],
             providers: [{provide: MigrationService, useValue: service}]
@@ -119,8 +122,8 @@ describe("MigrationAppComponent", () => {
         service.loadStatus.and.returnValue(of(status));
         service.apply.and.returnValue(of({
             ...status,
-            state: "running",
-            capabilities: {apply: false, retry: false, restore: false},
+            state: "required",
+            capabilities: {apply: false, retry: false, continue: false, restore: false},
             operation: {status: "running", message: "Migration running."},
             blocker: "migration_running"
         }));
@@ -138,7 +141,9 @@ describe("MigrationAppComponent", () => {
 
         expect(service.apply).toHaveBeenCalledWith(status);
         expect(fixture.componentInstance.status?.operation.status).toBe("running");
+        expect(fixture.nativeElement.textContent).toContain("Migration in progress");
         expect(fixture.nativeElement.textContent).toContain("Migration running");
+        expect(fixture.nativeElement.querySelector(".migration-shell--running")).not.toBeNull();
         fixture.destroy();
     });
 
@@ -147,7 +152,7 @@ describe("MigrationAppComponent", () => {
             ...status,
             state: "failed",
             retryable: true,
-            capabilities: {apply: false, retry: true, restore: false},
+            capabilities: {apply: false, retry: true, continue: false, restore: false},
             operation: {status: "failed", message: "Stopped safely."},
             error: {code: "migration_preflight_failed", message: "Readiness check failed."}
         }));
@@ -177,7 +182,7 @@ describe("MigrationAppComponent", () => {
             service.loadStatus.and.returnValue(of({
                 ...status,
                 state: stateName,
-                capabilities: {apply: false, retry: false, restore: false},
+                capabilities: {apply: false, retry: false, continue: stateName === "complete", restore: false},
                 operation: {
                     status: stateName === "running" ? "running" : "succeeded",
                     message: stateName === "running" ? "Operation continues safely." : stateName
@@ -200,9 +205,82 @@ describe("MigrationAppComponent", () => {
             const route: HTMLElement = fixture.nativeElement.querySelector(".migration-route");
             expect(route.textContent).toContain("v0.8.6");
             expect(route.textContent).toContain("v0.9.0");
-            expect(fixture.nativeElement.querySelector(".primary-button")).toBeNull();
-            expect(fixture.nativeElement.querySelector(".secondary-button").textContent).toContain("Recheck status");
+            if (stateName === "complete") {
+                expect(fixture.nativeElement.querySelector(".primary-button").textContent)
+                    .toContain("Continue to SeedSync");
+                expect(fixture.nativeElement.querySelector(".secondary-button")).toBeNull();
+                expect(text).toContain("Continue when you are ready");
+            } else {
+                expect(fixture.nativeElement.querySelector(".primary-button")).toBeNull();
+                expect(fixture.nativeElement.querySelector(".secondary-button")).toBeNull();
+            }
             fixture.destroy();
+        }
+    });
+
+    it("keeps completion stable until the user continues to SeedSync", () => {
+        jasmine.clock().install();
+        try {
+            const completed: MigrationStatus = {
+                ...status,
+                state: "complete",
+                capabilities: {apply: false, retry: false, continue: true, restore: false},
+                operation: {status: "succeeded", message: "Migration complete."}
+            };
+            service.loadStatus.and.returnValue(of(completed));
+            service.continue.and.returnValue(of({
+                ...completed,
+                capabilities: {apply: false, retry: false, continue: false, restore: false},
+                normal_startup: {released: true, requires_continue: false}
+            }));
+            service.probeNormalStartup.and.returnValue(throwError(() => new Error("restarting")));
+            createComponent();
+
+            jasmine.clock().tick(5000);
+            expect(service.continue).not.toHaveBeenCalled();
+
+            const button: HTMLButtonElement = fixture.nativeElement.querySelector(".primary-button");
+            button.click();
+            expect(service.continue).toHaveBeenCalledWith(completed);
+            expect(service.probeNormalStartup).toHaveBeenCalled();
+            expect((fixture.componentInstance as any).normalStartupProbeTimer).not.toBeNull();
+        } finally {
+            jasmine.clock().uninstall();
+        }
+    });
+
+    it("offers an explicit retry when normal bootstrap does not return in time", () => {
+        jasmine.clock().install();
+        try {
+            const completed: MigrationStatus = {
+                ...status,
+                state: "complete",
+                capabilities: {apply: false, retry: false, continue: true, restore: false},
+                operation: {status: "succeeded", message: "Migration complete."}
+            };
+            service.loadStatus.and.returnValue(of(completed));
+            service.continue.and.returnValue(of({
+                ...completed,
+                capabilities: {apply: false, retry: false, continue: false, restore: false},
+                normal_startup: {released: true, requires_continue: false}
+            }));
+            service.probeNormalStartup.and.returnValue(throwError(() => new Error("restarting")));
+            createComponent();
+
+            (fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).click();
+            (fixture.componentInstance as any).normalStartupProbeAttempts = 119;
+            (fixture.componentInstance as any).probeNormalStartup();
+            fixture.detectChanges();
+
+            expect(fixture.componentInstance.actionBusy).toBeFalse();
+            expect(fixture.nativeElement.textContent).toContain("taking longer than expected");
+            expect((fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).textContent)
+                .toContain("Retry checking SeedSync");
+            (fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).click();
+            expect(service.continue).toHaveBeenCalledTimes(1);
+            expect(service.probeNormalStartup).toHaveBeenCalledTimes(3);
+        } finally {
+            jasmine.clock().uninstall();
         }
     });
 
@@ -213,7 +291,7 @@ describe("MigrationAppComponent", () => {
                 state: stateName,
                 capabilities: stateName === "required"
                     ? status.capabilities
-                    : {apply: false, retry: stateName === "failed", restore: false},
+                    : {apply: false, retry: stateName === "failed", continue: stateName === "complete", restore: false},
                 operation: {
                     status: stateName === "required" ? "idle"
                         : stateName === "complete" ? "succeeded" : stateName,

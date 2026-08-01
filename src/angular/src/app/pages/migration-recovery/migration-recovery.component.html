@@ -34,16 +34,27 @@
 
                 <ng-container *ngIf="!reconnecting">
                     <p class="eyebrow">Migration recovery</p>
-                    <h1 id="recovery-heading">Undo this upgrade</h1>
-                    <p class="orientation">Return the configuration from this completed migration to its verified pre-upgrade state, then retry the upgrade when you are ready.</p>
+                    <h1 id="recovery-heading">Restore this migration backup</h1>
+                    <p class="orientation">This restores the configuration saved before the upgrade. The current SeedSync image then returns to the migration checkpoint, ready to retry.</p>
 
                     <div *ngIf="status.eligible; else unavailable" class="recovery-details">
                         <dl>
                             <div><dt>Validated backup</dt><dd>{{status.backup_id}}</dd></div>
-                            <div><dt>Restores</dt><dd>Configuration from {{status.source_schema}}</dd></div>
+                            <div><dt>Restores</dt><dd>Configuration saved before this upgrade</dd></div>
                             <div><dt>Does not change</dt><dd>Downloads, mounts, and transfer staging</dd></div>
                         </dl>
                     </div>
+
+                    <section *ngIf="status.eligible" class="recovery-outcomes" aria-label="Choose what to do after restoring configuration">
+                        <div>
+                            <h2>Retry upgrade</h2>
+                            <p>The button below restores configuration, then returns to the migration checkpoint so you can retry with the current image.</p>
+                        </div>
+                        <div>
+                            <h2>Return to v0.8.6</h2>
+                            <p>Use the same configuration restore, then change the deployed SeedSync image. In Unraid: Docker &gt; SeedSync &gt; Edit, restore the previous v0.8.6 Repository/image tag, then Apply.</p>
+                        </div>
+                    </section>
 
                     <ng-template #unavailable>
                         <div class="recovery-unavailable" role="status">
@@ -66,7 +77,7 @@
                         </label>
                         <div class="actions">
                             <button type="button" class="danger-action" [disabled]="!canRestore" (click)="requestRestore()">
-                                {{actionBusy ? 'Preparing recovery…' : 'Undo upgrade and try again'}}
+                                {{actionBusy ? 'Preparing recovery…' : 'Restore configuration and retry'}}
                             </button>
                             <button type="button" class="quiet-action" (click)="refresh()">Recheck status</button>
                         </div>

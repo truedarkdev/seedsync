@@ -254,10 +254,13 @@ class MigrationDecision:
     error: str | None = None
     retryable: bool = False
     completed_auth_phase: str | None = None
+    normal_startup_released: bool = True
 
     @property
     def allows_normal_startup(self) -> bool:
-        return self.state in (MigrationState.NOT_REQUIRED, MigrationState.COMPLETE)
+        return self.state == MigrationState.NOT_REQUIRED or (
+            self.state == MigrationState.COMPLETE and self.normal_startup_released
+        )
 
 
 Fingerprint = Callable[[Path], bool]
@@ -1296,7 +1299,13 @@ def _validate_v086_completed_lineage_result(config_dir: Path) -> None:
 def _validate_v086_completed_claimed_lineage_result(config_dir: Path, binding: Mapping[str, object]) -> None:
     from web.auth_store import validate_completed_migration_claimed_auth_state
 
-    _validate_v086_core_result(config_dir)
+    # Once the first administrator has claimed the migrated app, current
+    # configuration becomes user-owned mutable state. Keep validating that it
+    # is parseable as the current schema, but do not require the migration's
+    # original one-Default-pair output forever: deleting or editing that pair
+    # is a normal supported action and must survive restart.
+    if not _looks_current(config_dir):
+        raise ValueError("Claimed migration configuration is not a valid current schema")
     validate_completed_migration_claimed_auth_state(config_dir, dict(binding))
 
 
@@ -1417,7 +1426,7 @@ class MigrationCoordinator:
                 "source_schema": spec.source_schema,
                 "target_schema": spec.target_schema,
                 "backup_id": backup_dir.name,
-                "confirmation": "RESTORE {}".format(spec.migration_id),
+                "confirmation": "RESTORE",
                 "receipt_sha256": binding["receipt_sha256"],
                 "backup_manifest_sha256": binding["backup_manifest_sha256"],
             }
@@ -1699,12 +1708,12 @@ class MigrationCoordinator:
                 self._write_metadata(
                     complete, current_schema=spec.target_schema, applied_migrations=applied,
                     attempt=attempt, backup=backup_dir.relative_to(self.config_dir).as_posix(),
-                    receipt_version=1, completed_at=_utc_now(),
+                    receipt_version=1, completed_at=_utc_now(), normal_startup_released=False,
                 )
                 return MigrationDecision(
                     state=complete.state, migration_id=complete.migration_id, source_schema=complete.source_schema,
                     target_schema=complete.target_schema, features=complete.features, error=complete.error,
-                    retryable=complete.retryable, completed_auth_phase="preclaim",
+                    retryable=complete.retryable, completed_auth_phase="preclaim", normal_startup_released=False,
                 )
             except FileExistsError:
                 raise MigrationBlockedError(self.preflight())
@@ -1790,6 +1799,51 @@ class MigrationCoordinator:
         if not decision.allows_normal_startup:
             raise MigrationBlockedError(decision)
         return decision
+
+    def release_normal_startup(self) -> MigrationDecision:
+        """Durably release one newly completed migration into normal startup.
+
+        Completion receipts written before this checkpoint existed intentionally
+        remain released. Newly written receipts explicitly retain the migration
+        web runtime until this method commits the user's continue action.
+        """
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+        with _root_transaction(self.config_dir, self._root_identity):
+            with self._process_lock:
+                decision = self.preflight()
+                if decision.state != MigrationState.COMPLETE:
+                    raise MigrationBlockedError(decision)
+                if decision.normal_startup_released:
+                    return decision
+                try:
+                    with RuntimeExclusion(self.config_dir, "migration-normal-startup-release"):
+                        decision = self.preflight()
+                        if decision.state != MigrationState.COMPLETE:
+                            raise MigrationBlockedError(decision)
+                        if decision.normal_startup_released:
+                            return decision
+                        metadata = self._read_metadata()
+                        if metadata is None:
+                            raise MigrationBlockedError(
+                                self._failure_decision(None, "Completed migration lineage is invalid", False)
+                            )
+                        released = dict(metadata)
+                        released["normal_startup_released"] = True
+                        released["updated_at"] = _utc_now()
+                        _atomic_write(
+                            self.metadata_path,
+                            json.dumps(released, indent=2, sort_keys=True) + "\n",
+                            self.config_dir,
+                        )
+                except RuntimeExclusionError as exc:
+                    raise MigrationBlockedError(
+                        self._failure_decision(None, "Normal startup release refused because SeedSync is active", True)
+                    ) from exc
+        return self.preflight()
 
     def completed_auth_transition_binding(self) -> dict[str, str]:
         """Return a receipt-bound claim capability only for validated pre-claim startup."""
@@ -1877,6 +1931,10 @@ class MigrationCoordinator:
             and valid_backup_path
             and metadata.get("error") is None
             and metadata.get("retryable") is False
+            and (
+                "normal_startup_released" not in metadata
+                or type(metadata.get("normal_startup_released")) is bool
+            )
         )
         if not valid_receipt:
             return self._failure_decision(None, "Completed migration lineage is invalid", False)
@@ -1916,6 +1974,7 @@ class MigrationCoordinator:
             state=decision.state, migration_id=decision.migration_id, source_schema=decision.source_schema,
             target_schema=decision.target_schema, features=decision.features, error=decision.error,
             retryable=decision.retryable, completed_auth_phase=phase,
+            normal_startup_released=metadata.get("normal_startup_released", True),
         )
 
     def _completed_auth_binding(self, metadata: Mapping[str, object], backup_dir: Path) -> dict[str, str]:

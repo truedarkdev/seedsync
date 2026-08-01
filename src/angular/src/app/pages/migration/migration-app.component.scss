@@ -121,6 +121,14 @@
     background: linear-gradient(180deg, #fbfdfb 0%, #f3f8f4 100%);
 }
 
+.migration-shell--complete .handoff-panel {
+    background: linear-gradient(180deg, #f8fdf9 0%, #edf8f0 100%);
+}
+
+.migration-shell--running .handoff-panel {
+    background: linear-gradient(180deg, #f8fbfe 0%, #eef4fa 100%);
+}
+
 .brand {
     display: flex;
     align-items: center;
@@ -325,6 +333,16 @@ h2 {
     background: rgba($primary-light-color, .38);
 }
 
+.readiness--complete {
+    border-color: rgba($logo-color, .25);
+    background: rgba($logo-color, .08);
+}
+
+.readiness--running {
+    border-color: rgba($primary-color, .28);
+    background: rgba($primary-light-color, .22);
+}
+
 .readiness-heading-row {
     display: flex;
     align-items: center;
@@ -372,7 +390,30 @@ h2 {
     flex: 1;
 }
 
+.completed-action {
+    flex: 1;
+}
+
 .blocked-action p {
+    margin: 7px 0 0;
+    color: #687680;
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.completed-action > p:first-child {
+    max-width: 330px;
+    margin: 0 0 10px;
+    color: #3c5b49;
+    font-size: 12px;
+    line-height: 1.45;
+}
+
+.completed-action .primary-button {
+    width: min(100%, 220px);
+}
+
+.completed-action [role="alert"] {
     margin: 7px 0 0;
     color: #687680;
     font-size: 11px;

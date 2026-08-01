@@ -35,9 +35,9 @@ class TestMigrationWebApp(unittest.TestCase):
         self.coordinator = MagicMock()
         self.coordinator.status.return_value = self.decision
         self.coordinator.retained_backup_ready.return_value = False
-        self.on_success = MagicMock()
+        self.on_continue = MagicMock()
         self.app = MigrationWebApp(
-            str(html_root), self.coordinator, on_success=self.on_success,
+            str(html_root), self.coordinator, on_continue=self.on_continue,
         )
         self.client = TestApp(self.app)
 
@@ -52,7 +52,7 @@ class TestMigrationWebApp(unittest.TestCase):
             self.decision, csrf_token=self.app._csrf_token,
         ), json.loads(response.text))
         self.assertEqual(
-            {"apply": True, "retry": False, "restore": False},
+            {"apply": True, "retry": False, "continue": False, "restore": False},
             response.json["capabilities"],
         )
         self.assertEqual(
@@ -108,7 +108,7 @@ class TestMigrationWebApp(unittest.TestCase):
                 self.coordinator.status.return_value = MigrationDecision(state=state, retryable=True)
                 payload = self.client.get("/server/migration/v1/status").json
                 self.assertEqual(state.value, payload["state"])
-                self.assertEqual({"apply": False, "retry": False, "restore": False}, payload["capabilities"])
+                self.assertEqual({"apply": False, "retry": False, "continue": False, "restore": False}, payload["capabilities"])
 
         self.coordinator.status.return_value = MigrationDecision(
             state=MigrationState.FAILED,
@@ -116,7 +116,20 @@ class TestMigrationWebApp(unittest.TestCase):
             retryable=True,
         )
         payload = self.client.get("/server/migration/v1/status").json
-        self.assertEqual({"apply": False, "retry": True, "restore": False}, payload["capabilities"])
+        self.assertEqual({"apply": False, "retry": True, "continue": False, "restore": False}, payload["capabilities"])
+
+    def test_completed_checkpoint_exposes_continue_until_normal_startup_is_released(self) -> None:
+        self.coordinator.status.return_value = MigrationDecision(
+            state=MigrationState.COMPLETE,
+            migration_id=self.decision.migration_id,
+            normal_startup_released=False,
+        )
+
+        payload = self.client.get("/server/migration/v1/status").json
+
+        self.assertEqual({"apply": False, "retry": False, "continue": True, "restore": False}, payload["capabilities"])
+        self.assertEqual({"released": False, "requires_continue": True}, payload["normal_startup"])
+        self.assertEqual("normal_startup_pending", payload["blocker"])
 
     def test_status_failure_returns_generic_non_leaky_failed_contract(self) -> None:
         self.coordinator.status.side_effect = OSError(r"cannot open C:\private\settings.cfg")
@@ -143,6 +156,7 @@ class TestMigrationWebApp(unittest.TestCase):
         self.assertIn("migration", self.client.get("/main.js").text)
         self.assertEqual(200, self.client.get("/assets/migration/progress.png").status_int)
         self.assertEqual(404, self.client.get("/assets/private.png", expect_errors=True).status_int)
+        self.assertEqual(503, self.client.get("/bootstrap", expect_errors=True).status_int)
 
     def test_migration_entry_uses_index_from_configured_distribution_root(self) -> None:
         distribution_root = Path(self.temp_dir.name) / "app" / "html"
@@ -165,10 +179,10 @@ class TestMigrationWebApp(unittest.TestCase):
             "/server/admin/bootstrap/v1/status",
             "/server/stream",
             "/settings",
-            "/bootstrap",
         ):
             with self.subTest(path=path):
                 self.assertEqual(404, self.client.get(path, expect_errors=True).status_int)
+        self.assertEqual(503, self.client.get("/bootstrap", expect_errors=True).status_int)
 
         self.assertEqual(404, self.client.get(
             "/server/migration/v1/apply", expect_errors=True,
@@ -432,7 +446,7 @@ class TestMigrationWebApp(unittest.TestCase):
             server.stop()
             server_thread.join(2)
 
-    def test_apply_is_background_single_flight_and_success_requests_normal_startup(self) -> None:
+    def test_apply_is_background_single_flight_and_waits_for_explicit_continue(self) -> None:
         entered = threading.Event()
         release = threading.Event()
 
@@ -467,12 +481,12 @@ class TestMigrationWebApp(unittest.TestCase):
         assert self.app._execution.worker is not None
         self.app._execution.worker.join(2)
         self.assertFalse(self.app._execution.worker.is_alive())
-        self.on_success.assert_called_once_with()
+        self.on_continue.assert_not_called()
 
     def test_background_apply_failure_records_safe_diagnostic_without_request_values(self) -> None:
         supplied_token = "synthetic-csrf-token"
         supplied_confirmation = "MIGRATE original-v0.8.6-to-current-v1"
-        self.app._csrf_token = supplied_token
+        object.__setattr__(self.app, "_csrf_token", supplied_token)
         def raise_apply_error(*, retry=False):
             self.assertFalse(retry)
             raise RuntimeError("csrf={} confirmation={}".format(supplied_token, supplied_confirmation))
@@ -545,7 +559,44 @@ class TestMigrationWebApp(unittest.TestCase):
         assert self.app._execution.worker is not None
         self.app._execution.worker.join(2)
         self.coordinator.apply_confirmed.assert_called_once_with(retry=True)
-        self.on_success.assert_not_called()
+        self.on_continue.assert_not_called()
+
+    def test_continue_requires_same_origin_csrf_and_releases_before_notifying_runtime(self) -> None:
+        pending = MigrationDecision(
+            MigrationState.COMPLETE,
+            migration_id=self.decision.migration_id,
+            source_schema=self.decision.source_schema,
+            normal_startup_released=False,
+        )
+        released = MigrationDecision(
+            MigrationState.COMPLETE,
+            migration_id=self.decision.migration_id,
+            source_schema=self.decision.source_schema,
+            normal_startup_released=True,
+        )
+        self.coordinator.status.return_value = pending
+        self.coordinator.release_normal_startup.return_value = released
+        headers = {
+            "Origin": "http://localhost",
+            "X-SeedSync-Migration-CSRF": self.app._csrf_token,
+        }
+
+        self.assertEqual(403, self.client.post_json(
+            "/server/migration/v1/continue", {},
+            headers={"Origin": "http://attacker.example", "X-SeedSync-Migration-CSRF": self.app._csrf_token},
+            expect_errors=True,
+        ).status_int)
+        self.assertEqual(400, self.client.post_json(
+            "/server/migration/v1/continue", {"unexpected": True}, headers=headers, expect_errors=True,
+        ).status_int)
+        response = self.client.post_json("/server/migration/v1/continue", {}, headers=headers)
+
+        self.assertEqual(202, response.status_int)
+        self.coordinator.release_normal_startup.assert_called_once_with()
+        self.assertTrue(response.json["normal_startup"]["released"])
+        self.assertFalse(response.json["capabilities"]["continue"])
+        self.assertIsNone(response.json["blocker"])
+        self.on_continue.assert_called_once_with()
 
     def test_runtime_uses_supplied_bind_host_and_legacy_port(self) -> None:
         runtime = MigrationWebRuntime(
@@ -568,7 +619,7 @@ class TestMigrationWebApp(unittest.TestCase):
             runtime._schedule_normal_startup()
             runtime._schedule_normal_startup()
 
-        timer_type.assert_called_once_with(2.0, runtime.stop)
+        timer_type.assert_called_once_with(0.15, runtime.stop)
         self.assertTrue(timer.daemon)
         timer.start.assert_called_once_with()
 
@@ -651,7 +702,7 @@ class TestMigrationWebApp(unittest.TestCase):
             self.assertEqual("original-v0.8.6-to-current-v1", payload["migration_id"])
             self.assertEqual("original-v0.8.6", payload["source_schema"])
             self.assertEqual(
-                {"apply": True, "retry": False, "restore": False},
+                {"apply": True, "retry": False, "continue": False, "restore": False},
                 payload["capabilities"],
             )
             self.assertFalse(payload["backup"]["complete_restore_ready"])
