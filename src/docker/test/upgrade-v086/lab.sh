@@ -625,7 +625,8 @@ compose() {
     transient_mode=1
     shift
   fi
-  local run_dir="${RUNS_DIR}/${id}" private_log_root="${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:-${run_dir}/logs}"
+  local run_dir="${RUNS_DIR}/${id}"
+  local private_log_root="${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:-${run_dir}/logs}"
   [[ -d "$private_log_root" && ! -L "$private_log_root" ]] || die "private log mount is missing or a symlink"
   if [[ -n "${SEEDSYNC_SHIP_PRIVATE_LOG_ROOT:-}" ]]; then
     python - "$private_log_root" <<'PY' || die "private log mount is not owner-only WSL staging"
