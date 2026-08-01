@@ -2050,10 +2050,11 @@ full() {
   backup="${retained_backup_dir##*/}"
   [[ -n "$backup" ]] || die "retained migration backup was not found"
   stop_container "$id" restore-current-stop restore-current-stop "seedsync-upgrade-v086-current-${id,,}"
-  snapshot_volume_config "$id" after-current-restart after-config
+  capture_volume_inventory "$id" after-current-restart-config
+  snapshot_volume_config "$id" after-current-restart after-current-restart-config
   verify_config_volume "$id"
   verify_protected_volume "$id"
-  verify_snapshot_for_consumer "$id" after-current-restart after-config "$(evidence_dir "$id")/after-current-restart-archive-consumer-verification.json"
+  verify_snapshot_for_consumer "$id" after-current-restart after-current-restart-config "$(evidence_dir "$id")/after-current-restart-archive-consumer-verification.json"
   bounded_command "$id" restore-offline restore-offline "$(timeout_seconds SEEDSYNC_SHIP_RESTORE_TIMEOUT_SECONDS 180)" "$(evidence_dir "$id")/restore.log" docker run --name "seedsync-upgrade-v086-restore-${id,,}" --network none \
     --mount "type=volume,src=$(protected_volume "$id"),dst=/protected,readonly" \
     --mount "type=volume,src=$(config_volume "$id"),dst=/config" "seedsync/upgrade-v086:current-${id,,}" \
