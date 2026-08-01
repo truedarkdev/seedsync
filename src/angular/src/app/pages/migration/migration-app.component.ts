@@ -481,7 +481,7 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
 
     private probeNormalStartup(): void {
         this.migrationService.probeNormalStartup().subscribe({
-            next: () => window.location.replace("/"),
+            next: () => this.replaceLocation("/bootstrap"),
             error: () => {
                 this.normalStartupProbeAttempts += 1;
                 if (this.normalStartupProbeAttempts >= MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_ATTEMPTS) {
@@ -497,6 +497,10 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
                 }, 250);
             }
         });
+    }
+
+    private replaceLocation(path: string): void {
+        window.location.replace(path);
     }
 
     private clearNormalStartupProbe(): void {
