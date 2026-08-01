@@ -132,6 +132,7 @@ let claimPhase = 'not-started';
 let firstClaimSseRecoveryPromise = null;
 let validatedFirstClaimSseRecovery = null;
 let firstClaimSseRecoveryFailure = null;
+let recoveredFirstClaimModel = null;
 let restartArm = null;
 
 function redact(value) {
@@ -350,7 +351,7 @@ async function observeFirstClaimSseRecovery() {
     if (modelTimeoutMs < 1000) break;
     transition.modelProbeStartedAfterMs = Date.now() - browserStartedAt;
     try {
-      transition.recoveryModelRows = await page.evaluate(({ timeoutMs, minimumRows }) => new Promise((resolve, reject) => {
+      const recoveredModel = await page.evaluate(({ timeoutMs, minimumRows }) => new Promise((resolve, reject) => {
       const source = new EventSource('/server/stream');
       const timeout = setTimeout(() => { source.close(); reject(new Error('recovery model timed out')); }, timeoutMs);
       source.addEventListener('model-init', event => {
@@ -359,11 +360,20 @@ async function observeFirstClaimSseRecovery() {
         try {
           const model = JSON.parse(event.data);
           if (!Array.isArray(model) || model.length < minimumRows) throw new Error('recovery model was stale');
-          resolve(model.length);
+          const normalize = file => ({
+            name: file.name, is_dir: file.is_dir, state: file.state,
+            remote_size: file.remote_size, local_size: file.local_size,
+            file_id: file.file_id, path_pair_id: file.path_pair_id,
+            path_pair_name: file.path_pair_name,
+            children: (file.children || []).map(normalize),
+          });
+          resolve(model.map(normalize));
         } catch (error) { reject(error); }
       });
       source.onerror = () => { source.close(); clearTimeout(timeout); reject(new Error('recovery model stream failed')); };
     }), { timeoutMs: modelTimeoutMs, minimumRows: fixtureNames.length });
+      transition.recoveryModelRows = recoveredModel.length;
+      recoveredFirstClaimModel = recoveredModel;
   } catch {
     transition.classification = 'model-not-fresh';
     return null;
@@ -1200,7 +1210,11 @@ async function main() {
   }, endpoints);
   for (const endpoint of endpoints) if (api[endpoint].status !== 200) throw new Error(`API ${endpoint}: ${api[endpoint].status}`);
 
-  const model = await page.evaluate(() => new Promise((resolve, reject) => {
+  // The recovery classifier may already own the fresh-model probe. Await it
+  // before opening another EventSource, then reuse the normalized model it
+  // proved instead of racing two concurrent one-shot streams.
+  await classifyRecoveredFirstClaimSseTransition();
+  const model = recoveredFirstClaimModel || await page.evaluate(() => new Promise((resolve, reject) => {
     const source = new EventSource('/server/stream');
     const timeout = setTimeout(() => { source.close(); reject(new Error('timed out waiting for model-init')); }, 15000);
     source.addEventListener('model-init', event => {

@@ -778,6 +778,7 @@ class ShipReadinessTests(unittest.TestCase):
             "let firstClaimSseRecoveryPromise = null",
             "let validatedFirstClaimSseRecovery = null",
             "let firstClaimSseRecoveryFailure = null",
+            "let recoveredFirstClaimModel = null",
             "void classifyRecoveredFirstClaimSseTransition();",
             "async function observeFirstClaimSseRecovery()",
             "const deadline = error.observedAfterMs + sseReconnectMaximumMs",
@@ -786,6 +787,7 @@ class ShipReadinessTests(unittest.TestCase):
             "error.claimPhase === 'post-claim-complete'",
             "errorGeneration: browserErrorGeneration",
             "validatedFirstClaimSseRecovery = validated",
+            "recoveredFirstClaimModel = recoveredModel",
             "if (matching.length === 1 || firstClaimSseRecoveryPromise || validatedFirstClaimSseRecovery)",
             "validatedFirstClaimSseRecovery.errorGeneration !== browserErrorGeneration",
         ):
@@ -793,6 +795,9 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertLess(browser.index("void classifyRecoveredFirstClaimSseTransition();"), browser.index("async function establishPreRestartStability"))
         self.assertLess(browser.index("validatedFirstClaimSseRecovery = validated"), browser.index("async function establishPreRestartStability"))
         self.assertIn("firstClaimSseRecoveryFailure || runtimeErrors.length || diagnosticFailures.length", browser)
+        model_reuse = "const model = recoveredFirstClaimModel || await page.evaluate"
+        self.assertIn(model_reuse, browser)
+        self.assertLess(browser.index("await classifyRecoveredFirstClaimSseTransition();", browser.index("const endpoints =")), browser.index(model_reuse))
 
     def test_browser_stability_handshake_is_run_bound_and_precedes_restart_request(self):
         browser = BROWSER_PATH.read_text(encoding="utf-8")
