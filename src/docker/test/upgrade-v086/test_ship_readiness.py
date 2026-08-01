@@ -1717,6 +1717,14 @@ class ShipReadinessTests(unittest.TestCase):
         ):
             self.assertIn(marker, source)
 
+    def test_restored_legacy_browser_uses_bounded_private_profile_launcher(self):
+        source = LAUNCHER_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            'run_browser_bounded "$id" restore-legacy-browser-launch "http://127.0.0.1:${legacy_port}" "$(evidence_dir "$id")" legacy-restore',
+            source,
+        )
+        self.assertNotIn('run_browser "$id"', source)
+
     def test_launcher_exposes_current_runtime_from_browser_network_and_retains_http_failures(self):
         source = LAUNCHER_PATH.read_text(encoding="utf-8")
         for policy_marker in (
