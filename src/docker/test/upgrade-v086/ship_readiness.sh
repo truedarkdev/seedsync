@@ -130,11 +130,6 @@ playwright_chromium_binary() {
   [[ -x "$candidate" ]] || die "Playwright Chromium executable is unavailable: $candidate"
   printf '%s' "$candidate"
 }
-run_browser() {
-  local id="$1" node_path node_bin; shift; node_path="$(playwright_node_path)"; node_bin="$(node_binary)"
-  [[ -d "$node_path" ]] || die "Playwright NODE_PATH is unavailable: $node_path"
-  ( umask 077; NODE_PATH="$node_path" SEEDSYNC_PLAYWRIGHT_MODULE=playwright SEEDSYNC_SHIP_EVIDENCE_HELPER="$HELPER" SEEDSYNC_SHIP_RUN_ID="$id" SEEDSYNC_SHIP_PRIVATE_SCREENSHOT_ROOT="$PRIVATE_SCREENSHOT_ROOT" "$node_bin" "$BROWSER" "$@" )
-}
 run_browser_bounded() {
   local id="$1" phase_name="$2" base_url="$3" evidence="$4" mode="$5" limit raw_dir profile_dir raw_stdout raw_stderr diagnostic failure status started="$SECONDS" node_path node_bin
   limit="$(timeout_seconds SEEDSYNC_SHIP_BROWSER_TIMEOUT_SECONDS 90)"
@@ -2340,7 +2335,7 @@ full() {
   restore_downloads_baseline "$id"
   run_lab_bounded "$id" "$legacy_port" restore-legacy-start restore-legacy-start "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-start.log" start
   run_lab_bounded "$id" "$legacy_port" restore-legacy-status restore-legacy-status "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-status.log" status
-  run_browser "$id" "http://127.0.0.1:${legacy_port}" "$(evidence_dir "$id")" legacy-restore
+  run_browser_bounded "$id" restore-legacy-browser-launch "http://127.0.0.1:${legacy_port}" "$(evidence_dir "$id")" legacy-restore
   python "$HELPER" assert-legacy-browser --input "$(evidence_dir "$id")/browser-legacy-restore.json" --output "$(evidence_dir "$id")/after-restore-legacy-browser-contract.json"
   cp "$(run_dir "$id")/evidence/model.json" "$(evidence_dir "$id")/after-reboot-model.json"
   capture_volume_behavior_contract "$id" /evidence/ship-readiness/after-reboot-model.json /evidence/fixture-evidence.json "$(evidence_dir "$id")/after-reboot-behavior-contract.json"
