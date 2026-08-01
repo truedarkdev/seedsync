@@ -1791,6 +1791,19 @@ class ShipReadinessTests(unittest.TestCase):
             self.assertIn(marker, lab)
         self.assertIn("contains only a safe storage manifest", readme)
 
+    def test_restore_snapshot_binds_to_fresh_stopped_runtime_inventory(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        stopped = 'stop_container "$id" restore-current-stop restore-current-stop'
+        inventory = 'capture_volume_inventory "$id" after-current-restart-config'
+        snapshot = 'snapshot_volume_config "$id" after-current-restart after-current-restart-config'
+        consumer = 'verify_snapshot_for_consumer "$id" after-current-restart after-current-restart-config'
+        for marker in (stopped, inventory, snapshot, consumer):
+            self.assertIn(marker, launcher)
+        self.assertLess(launcher.index(stopped), launcher.index(inventory))
+        self.assertLess(launcher.index(inventory), launcher.index(snapshot))
+        self.assertLess(launcher.index(snapshot), launcher.index(consumer))
+        self.assertNotIn('snapshot_volume_config "$id" after-current-restart after-config', launcher)
+
     def test_fresh_shell_skips_login_profiles_and_validator_uses_evidence_child_path(self):
         source = LAUNCHER_PATH.read_text(encoding="utf-8")
         fresh_shell = source[source.index("fresh_repo_shell() {"):source.index("run_lab() {")]
