@@ -926,6 +926,15 @@ def _retained_secret_hint(text: str) -> bool:
             if at_cursor == len(at_positions):
                 continue
             eventual_at = at_positions[at_cursor]
+            intervening = text[authority_end:eventual_at]
+            if any(delimiter in intervening for delimiter in ('"', "'", ")")):
+                # A closing string or Markdown-link delimiter proves that a
+                # later at-sign belongs to another retained value (for example
+                # npm's adjacent ``resolved`` URL / ``from: package@version``
+                # fields or a README's ``package@tag`` command), not to malformed
+                # userinfo from this URI. Keep whitespace and path separators
+                # ambiguous so split credential remnants still fail closed.
+                continue
             later_scheme = occurrences[index + 1][0] if index + 1 < len(occurrences) else -1
             authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
             prefix_end = later_scheme if 0 <= later_scheme < eventual_at else -1

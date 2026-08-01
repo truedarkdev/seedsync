@@ -1237,6 +1237,15 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertFalse(HARNESS._retained_secret_hint("https://example.invalid/path https://other.invalid/path"))
         self.assertFalse(HARNESS._retained_secret_hint("https://host:1234/path sftp://user@remote:1234/file"))
         self.assertFalse(HARNESS._retained_secret_hint("https://host/path\nsftp://user@remote:1234/file"))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            '{"resolved":"https://registry.npmjs.org/pkg/-/pkg-1.2.3.tgz","from":"pkg@1.2.3"}'
+        ))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            '{"source":"https://github.com/truedarkdev/seedsync","patch":"@@ -1 +1 @@"}'
+        ))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            "[TypeScript](https://typescriptlang.org/) install typescript@next"
+        ))
         self.assertTrue(HARNESS._retained_secret_hint("sftp://safe@host:1234/path,sftp://user:synthetic-credential@host:1234/path"))
         self.assertTrue(HARNESS._retained_secret_hint("sftp://user:synthetic-credential/sftp://safe@host:1234/path"))
         self.assertTrue(HARNESS._retained_secret_hint("https://host:non-numeric/sftp://safe@host:1234/path"))
