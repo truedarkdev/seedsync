@@ -35,6 +35,8 @@ validator_container_name() { printf 'seedsync-upgrade-v086-validator-%s' "$1"; }
 protected_volume_name() { printf 'seedsync-upgrade-v086-protected-%s' "$1"; }
 protected_initializer_name() { printf 'seedsync-upgrade-v086-protected-init-%s' "$1"; }
 snapshotter_container_name() { printf 'seedsync-upgrade-v086-snapshotter-%s' "$1"; }
+downloads_snapshotter_container_name() { printf 'seedsync-upgrade-v086-downloads-snapshotter-%s' "$1"; }
+downloads_restorer_container_name() { printf 'seedsync-upgrade-v086-downloads-restorer-%s' "$1"; }
 
 verify_config_volume() {
   local id="$1" volume
@@ -155,6 +157,88 @@ PY
     || die "snapshotter storage ownership or mode changed"
 }
 
+verify_downloads_helper_container() {
+  local id="$1" role="$2" name="$3" protected_rw="$4" downloads_rw="$5" allow_stopped="${6:-false}" run_dir protected_volume
+  validate_run_id "$id"
+  check_run_tree "$id"
+  run_dir="${RUNS_DIR}/${id}"
+  protected_volume="$(protected_volume_name "$id")"
+  python - "$name" "$protected_volume" "$id" "$role" "$(realpath -e "${run_dir}/downloads")" "$protected_rw" "$downloads_rw" "$allow_stopped" <<'PY'
+import json, os, subprocess, sys
+name, protected_volume, run_id, role, downloads_source, protected_rw, downloads_rw, allow_stopped = sys.argv[1:]
+item = json.loads(subprocess.check_output(["docker", "container", "inspect", name], text=True))[0]
+host = item.get("HostConfig") or {}
+mounts = item.get("Mounts") or []
+protected = [entry for entry in mounts if entry.get("Destination") == "/protected"]
+downloads = [entry for entry in mounts if entry.get("Destination") == "/downloads"]
+labels = (item.get("Config") or {}).get("Labels") or {}
+checks = {
+    "container name": item.get("Name", "").lstrip("/") == name,
+    "running": (item.get("State") or {}).get("Running") is True or allow_stopped == "true",
+    "non-root user": (item.get("Config") or {}).get("User") == "1000:1000",
+    "read-only rootfs": host.get("ReadonlyRootfs") is True,
+    "network none": host.get("NetworkMode") == "none",
+    "all capabilities dropped": sorted(host.get("CapDrop") or []) == ["ALL"],
+    "no new privileges": "no-new-privileges:true" in (host.get("SecurityOpt") or []),
+    "exactly two mounts": len(mounts) == 2,
+    "one protected mount": len(protected) == 1,
+    "expected protected volume": bool(protected) and protected[0].get("Name") == protected_volume,
+    "protected mount access": bool(protected) and protected[0].get("RW") is (protected_rw == "true"),
+    "one downloads bind": len(downloads) == 1,
+    "downloads is a bind": bool(downloads) and downloads[0].get("Type") == "bind",
+    "exact downloads source": bool(downloads) and os.path.realpath(downloads[0].get("Source", "")) == downloads_source,
+    "downloads mount access": bool(downloads) and downloads[0].get("RW") is (downloads_rw == "true"),
+    "run label": labels.get("seedsync.upgrade-v086.run-id") == run_id,
+    "role label": labels.get("seedsync.upgrade-v086.role") == role,
+}
+failed = [label for label, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit("downloads helper contract failed: " + ", ".join(failed))
+PY
+  if [[ "$allow_stopped" == true && "$(docker inspect --format '{{.State.Running}}' "$name")" != true ]]; then return 0; fi
+  docker exec "$name" sh -c 'test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700" && test -d /downloads && test ! -L /downloads' \
+    || die "downloads helper storage contract changed"
+}
+
+verify_downloads_snapshotter_container() {
+  local id="$1"
+  verify_downloads_helper_container "$id" "downloads-snapshotter" "$(downloads_snapshotter_container_name "$id")" true false
+}
+
+verify_downloads_restorer_container() {
+  local id="$1" allow_stopped="${2:-false}"
+  verify_downloads_helper_container "$id" "downloads-restorer" "$(downloads_restorer_container_name "$id")" false true "$allow_stopped"
+}
+
+create_downloads_restorer_container() {
+  local id="$1" name run_dir protected_volume
+  validate_run_id "$id"
+  check_run_tree "$id"
+  run_dir="${RUNS_DIR}/${id}"
+  protected_volume="$(protected_volume_name "$id")"
+  verify_protected_volume "$id"
+  name="$(downloads_restorer_container_name "$id")"
+  if docker container inspect "$name" >/dev/null 2>&1; then
+    # An interrupted restore intentionally retains this fixed helper. Reuse it
+    # only after the full name/label/mount/isolation contract is rechecked.
+    verify_downloads_restorer_container "$id" true || die "existing downloads restorer failed its exact isolation contract"
+    if [[ "$(docker inspect --format '{{.State.Running}}' "$name")" != true ]]; then
+      docker start "$name" >/dev/null || die "unable to restart verified downloads restorer"
+    fi
+    verify_downloads_restorer_container "$id" || die "restarted downloads restorer failed its exact isolation contract"
+    return 0
+  fi
+  docker create --name "$name" --network none --read-only --user 1000:1000 \
+    --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=downloads-restorer" \
+    --mount "type=volume,src=${protected_volume},dst=/protected,readonly" \
+    --mount "type=bind,src=${run_dir}/downloads,dst=/downloads" \
+    --entrypoint /bin/sh "$IMAGE_TAG" -c 'while :; do sleep 3600; done' >/dev/null \
+    || die "unable to create protected downloads restorer"
+  docker start "$name" >/dev/null || die "unable to start protected downloads restorer"
+  verify_downloads_restorer_container "$id" || die "downloads restorer failed its isolation contract"
+}
+
 validate_host_port() {
   local port="$1"
   [[ "$port" =~ ^[0-9]+$ ]] || die "HOST_PORT must be numeric"
@@ -256,15 +340,17 @@ create_run() {
   docker volume create --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=protected-artifacts" "$protected_volume" >/dev/null || die "unable to create retained protected volume"
   verify_config_volume "$id" || die "created config volume failed identity verification"
   verify_protected_volume "$id" || die "created protected volume failed identity verification"
-  local initializer protected_initializer validator snapshotter
+  local initializer protected_initializer validator snapshotter downloads_snapshotter
   initializer="$(config_initializer_name "$id")"
   protected_initializer="$(protected_initializer_name "$id")"
   validator="$(validator_container_name "$id")"
   snapshotter="$(snapshotter_container_name "$id")"
+  downloads_snapshotter="$(downloads_snapshotter_container_name "$id")"
   ! docker container inspect "$initializer" >/dev/null 2>&1 || die "config initializer container already exists; choose a fresh RUN_ID"
   ! docker container inspect "$protected_initializer" >/dev/null 2>&1 || die "protected initializer container already exists; choose a fresh RUN_ID"
   ! docker container inspect "$validator" >/dev/null 2>&1 || die "validator container already exists; choose a fresh RUN_ID"
   ! docker container inspect "$snapshotter" >/dev/null 2>&1 || die "snapshotter container already exists; choose a fresh RUN_ID"
+  ! docker container inspect "$downloads_snapshotter" >/dev/null 2>&1 || die "downloads snapshotter container already exists; choose a fresh RUN_ID"
   docker create --name "$initializer" --network none --read-only --user 0:0 \
     --security-opt no-new-privileges:true --cap-drop ALL --cap-add CHOWN --cap-add FOWNER \
     --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=config-initializer" \
@@ -299,8 +385,17 @@ create_run() {
     --entrypoint /bin/sh "$IMAGE_TAG" -c 'while :; do sleep 3600; done' >/dev/null \
     || die "unable to create protected snapshotter"
   docker start "$snapshotter" >/dev/null || die "unable to start protected snapshotter"
+  docker create --name "$downloads_snapshotter" --network none --read-only --user 1000:1000 \
+    --security-opt no-new-privileges:true --cap-drop ALL \
+    --label "seedsync.upgrade-v086.run-id=${id}" --label "seedsync.upgrade-v086.role=downloads-snapshotter" \
+    --mount "type=bind,src=${run_dir}/downloads,dst=/downloads,readonly" \
+    --mount "type=volume,src=${protected_volume},dst=/protected" \
+    --entrypoint /bin/sh "$IMAGE_TAG" -c 'while :; do sleep 3600; done' >/dev/null \
+    || die "unable to create protected downloads snapshotter"
+  docker start "$downloads_snapshotter" >/dev/null || die "unable to start protected downloads snapshotter"
   verify_validator_container "$id" || die "read-only config validator failed its isolation contract"
   verify_snapshotter_container "$id" || die "protected snapshotter failed its isolation contract"
+  verify_downloads_snapshotter_container "$id" || die "downloads snapshotter failed its isolation contract"
   printf '%s\n' "$mode" > "${run_dir}/lab-mode"
   python - "$config_volume" "${run_dir}/evidence/config-volume.json" "$protected_volume" <<'PY'
 import json, sys
@@ -982,7 +1077,7 @@ EOF
 
 usage() {
   cat <<'EOF'
-Usage: lab.sh <preflight|build|build-transient|start|status|restart|transient|stop|verify-volume|verify-protected|verify-snapshotter|protected-storage-self-check|validator-evidence-path-self-check|cwd-probe>
+Usage: lab.sh <preflight|build|build-transient|start|status|restart|transient|stop|check-run-tree|verify-volume|verify-protected|verify-snapshotter|verify-downloads-snapshotter|create-downloads-restorer|verify-downloads-restorer|protected-storage-self-check|validator-evidence-path-self-check|cwd-probe>
 
 RUN_ID selects a retained run; build creates a unique run when omitted.
 HOST_PORT defaults to 18806 and binds only to loopback.
@@ -1000,10 +1095,14 @@ main() {
     restart) restart ;;
     transient) transient ;;
     stop) stop ;;
+    check-run-tree) check_run_tree "${2:?RUN_ID required}" ;;
     verify-volume) verify_config_volume "${2:?RUN_ID required}" ;;
     verify-validator) verify_validator_container "${2:?RUN_ID required}" ;;
     verify-protected) verify_protected_volume "${2:?RUN_ID required}" ;;
     verify-snapshotter) verify_snapshotter_container "${2:?RUN_ID required}" ;;
+    verify-downloads-snapshotter) verify_downloads_snapshotter_container "${2:?RUN_ID required}" ;;
+    create-downloads-restorer) create_downloads_restorer_container "${2:?RUN_ID required}" ;;
+    verify-downloads-restorer) verify_downloads_restorer_container "${2:?RUN_ID required}" ;;
     protected-storage-self-check) protected_storage_self_check ;;
     validator-evidence-path-self-check) validator_evidence_path_self_check ;;
     cwd-probe) cwd_probe "${2:?expected repository root required}" ;;

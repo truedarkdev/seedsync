@@ -62,6 +62,21 @@ never archive bytes. Those
 archives can contain synthetic credentials and remain
 `protected-synthetic-secret`, while the final audit scans every publishable
 evidence, log, and screenshot artifact.
+
+After the initial downloads inventory and legacy/proxy shutdown, the lane also
+archives the exact `/downloads` baseline as `before-downloads.tar` in that same
+protected volume. A dedicated, run-labelled download snapshotter has only the
+exact run downloads bind mounted read-only plus the protected volume writable;
+the separate restorer reverses those access modes. Both are networkless,
+non-root, read-only-rootfs containers with all capabilities dropped and
+no-new-privileges. Immediately before the offline restore can reboot legacy,
+the lane revalidates the archive digest and inventory binding, snapshots the
+post-current downloads tree for recovery, extracts only to a private staging
+directory under the exact downloads mount, compares staging to the original
+inventory, then replaces the downloads contents. A final exact inventory
+comparison blocks the pinned reboot on any mismatch. Archive bytes never enter
+the run tree or evidence; manifests retain only safe identity, mode, digest,
+and inventory metadata.
 Manually remove retained containers, networks, volumes, and run directories
 only after the investigation is no longer needed.
 

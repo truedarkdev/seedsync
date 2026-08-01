@@ -1092,6 +1092,12 @@ validator_container() {
 snapshotter_container() {
   printf 'seedsync-upgrade-v086-snapshotter-%s' "$1"
 }
+downloads_snapshotter_container() {
+  printf 'seedsync-upgrade-v086-downloads-snapshotter-%s' "$1"
+}
+downloads_restorer_container() {
+  printf 'seedsync-upgrade-v086-downloads-restorer-%s' "$1"
+}
 protected_volume() {
   printf 'seedsync-upgrade-v086-protected-%s' "$1"
 }
@@ -1103,6 +1109,10 @@ verify_config_volume() { fresh_repo_shell bash "$LAB" verify-volume "$1" >/dev/n
 verify_validator() { fresh_repo_shell bash "$LAB" verify-validator "$1" >/dev/null || die "read-only validator isolation check failed"; }
 verify_protected_volume() { fresh_repo_shell bash "$LAB" verify-protected "$1" >/dev/null || die "protected volume identity check failed"; }
 verify_snapshotter() { fresh_repo_shell bash "$LAB" verify-snapshotter "$1" >/dev/null || die "protected snapshotter isolation check failed"; }
+verify_downloads_snapshotter() { fresh_repo_shell bash "$LAB" verify-downloads-snapshotter "$1" >/dev/null || die "downloads snapshotter isolation check failed"; }
+create_downloads_restorer() { fresh_repo_shell bash "$LAB" create-downloads-restorer "$1" >/dev/null || die "downloads restorer creation failed"; }
+verify_downloads_restorer() { fresh_repo_shell bash "$LAB" verify-downloads-restorer "$1" >/dev/null || die "downloads restorer isolation check failed"; }
+verify_run_tree() { fresh_repo_shell bash "$LAB" check-run-tree "$1" >/dev/null || die "lab run tree identity check failed"; }
 
 capture_volume_inventory() {
   local id label legacy_flag output
@@ -1384,6 +1394,255 @@ verify_snapshot_for_consumer() {
   [[ -s "$inventory_path" ]] || die "archive consumer inventory is missing or empty: ${inventory_label}"
   [[ -s "$manifest_path" ]] || die "archive consumer manifest is missing or empty: ${label}"
   capture_volume_helper_output "$id" "$output" verify-protected-archive --archive "/protected/${label}.tar" --inventory "$(validator_evidence_path "${inventory_label}.json")" --manifest "$(validator_evidence_path "${label}-protected-storage.json")"
+}
+
+snapshot_downloads_baseline() {
+  local id="$1" inventory_path snapshotter manifest validation binding metadata
+  stabilize_repo_cwd
+  verify_run_tree "$id"
+  inventory_path="$(evidence_dir "$id")/before-downloads.json"
+  snapshotter="$(downloads_snapshotter_container "$id")"
+  manifest="$(evidence_dir "$id")/before-downloads-protected-storage.json"
+  validation="$(evidence_dir "$id")/before-downloads-archive-validation.json"
+  binding="$(evidence_dir "$id")/before-downloads-archive-inventory-binding.json"
+  [[ -s "$inventory_path" ]] || die "downloads baseline inventory is missing or empty"
+  verify_protected_volume "$id"
+  verify_downloads_snapshotter "$id"
+  # Archive bytes remain exclusively in the protected named volume. The
+  # snapshotter has only the exact resolved run downloads bind (read-only) and
+  # that volume (writable); it cannot publish or alter the source tree.
+  metadata="$(docker exec "$snapshotter" sh -c 'archive=/protected/before-downloads.tar; test ! -e "$archive"; umask 077; tar -C /downloads -cpf "$archive" .; test "$(stat -c "%u:%g:%a" /protected)" = "1000:1000:700"; test "$(stat -c "%u:%g:%a" "$archive")" = "1000:1000:600"; sha256sum "$archive" | cut -d" " -f1')" \
+    || die "protected downloads baseline snapshot did not satisfy the storage contract"
+  [[ "$metadata" =~ ^[0-9a-f]{64}$ ]] || die "protected downloads baseline digest is invalid"
+  capture_volume_helper_output "$id" "$validation" validate-archive --archive /protected/before-downloads.tar
+  capture_volume_helper_output "$id" "$binding" bind-archive-inventory --archive /protected/before-downloads.tar --inventory "$(validator_evidence_path before-downloads.json)"
+  python - "$manifest" "$(protected_volume "$id")" "$metadata" "$binding" <<'PY'
+import json, os, sys
+output, volume, digest, binding_path = sys.argv[1:]
+binding = json.load(open(binding_path, encoding="utf-8"))
+if binding.get("exact_inventory_match") is not True:
+    raise SystemExit("downloads baseline archive inventory binding is incomplete")
+payload = {"schema": 1, "classification": "protected-download-baseline", "storage": "docker-named-volume",
+           "volume": volume, "archive": "before-downloads.tar", "sha256": digest, "archive_mode": "0600",
+           "parent_mode": "0700", "owner": "1000:1000", "inventory_sha256": binding["inventory_sha256"],
+           "inventory_entry_count": binding["entry_count"], "validator_access": "read-only postvalidated without extraction"}
+temporary = output + ".tmp"
+with open(temporary, "x", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+PY
+}
+
+verify_downloads_baseline_for_restore() {
+  local id="$1" output="$2"
+  verify_run_tree "$id"
+  [[ -s "$(evidence_dir "$id")/before-downloads.json" ]] || die "downloads baseline inventory is missing or empty"
+  [[ -s "$(evidence_dir "$id")/before-downloads-protected-storage.json" ]] || die "downloads baseline manifest is missing or empty"
+  verify_protected_volume "$id"
+  verify_downloads_restorer "$id"
+  capture_volume_helper_output "$id" "$output" verify-protected-archive --archive /protected/before-downloads.tar --inventory "$(validator_evidence_path before-downloads.json)" --manifest "$(validator_evidence_path before-downloads-protected-storage.json)"
+}
+
+verify_downloads_recovery_for_restore() {
+  local id="$1" output="$2"
+  verify_run_tree "$id"
+  [[ -s "$(evidence_dir "$id")/after-current-downloads.json" ]] || die "downloads recovery inventory is missing or empty"
+  [[ -s "$(evidence_dir "$id")/after-current-downloads-protected-storage.json" ]] || die "downloads recovery manifest is missing or empty"
+  verify_protected_volume "$id"
+  verify_downloads_restorer "$id"
+  capture_volume_helper_output "$id" "$output" verify-protected-archive --archive /protected/after-current-downloads.tar --inventory "$(validator_evidence_path after-current-downloads.json)" --manifest "$(validator_evidence_path after-current-downloads-protected-storage.json)"
+}
+
+downloads_restore_marker() { printf '%s/restore-downloads-in-progress.json' "$(evidence_dir "$1")"; }
+write_downloads_restore_marker() {
+  local id="$1" state="$2" detail="$3" marker="$(downloads_restore_marker "$1")"
+  python - "$marker" "$id" "$state" "$detail" <<'PY'
+import json, os, sys, time
+output, run_id, state, detail = sys.argv[1:]
+payload = {"schema": 1, "run_id": run_id, "state": state, "detail": detail,
+           "protected_recovery_archive": "after-current-downloads.tar", "baseline_archive": "before-downloads.tar",
+           "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+temporary = output + ".tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump(payload, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+PY
+}
+
+restore_downloads_recovery_tree() {
+  local id="$1" restorer="$2" stage_name="$3" reason="$4" stage_host
+  verify_run_tree "$id"
+  verify_downloads_recovery_for_restore "$id" "$(evidence_dir "$id")/after-current-downloads-rollback-consumer-verification.json"
+  stage_host="$(run_dir "$id")/downloads/${stage_name}"
+  if [[ -e "$stage_host" || -L "$stage_host" ]]; then
+    docker exec "$restorer" sh -c 'stage=/downloads/$1; test -e "$stage" -o -L "$stage"; rm -rf -- "$stage"; test ! -e "$stage"' sh "$stage_name" \
+      || { write_downloads_restore_marker "$id" rollback-failed "unable to remove exact stale rollback staging path"; return 1; }
+  fi
+  docker exec "$restorer" sh -c 'stage=/downloads/$1; umask 077; test ! -e "$stage"; mkdir -m 700 "$stage"; tar -C "$stage" -xpf /protected/after-current-downloads.tar' sh "$stage_name" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery archive extraction failed"; return 1; }
+  capture_inventory "$id" rollback-downloads-staging "$stage_host" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery staging inventory failed"; return 1; }
+  python "$HELPER" compare-inventory --expected "$(evidence_dir "$id")/after-current-downloads.json" --root "$stage_host" --output "$(evidence_dir "$id")/rollback-downloads-staging-compare.json" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery staging differs from retained post-current inventory"; return 1; }
+  docker exec "$restorer" sh -c 'stage=/downloads/$1; test -d "$stage" && test ! -L "$stage"; find /downloads -mindepth 1 -maxdepth 1 ! -name "$1" -exec rm -rf -- {} +; find "$stage" -mindepth 1 -maxdepth 1 -exec mv -- {} /downloads/ \;; rmdir -- "$stage"; test ! -e "$stage"' sh "$stage_name" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery replacement failed"; return 1; }
+  capture_inventory "$id" rollback-downloads "$(run_dir "$id")/downloads" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery post-replacement inventory failed"; return 1; }
+  python "$HELPER" compare-inventory --expected "$(evidence_dir "$id")/after-current-downloads.json" --root "$(run_dir "$id")/downloads" --output "$(evidence_dir "$id")/rollback-downloads-compare.json" \
+    || { write_downloads_restore_marker "$id" rollback-failed "recovery post-replacement inventory differs"; return 1; }
+  write_downloads_restore_marker "$id" rollback-complete-verifier-blocked "$reason"
+  python - "$(evidence_dir "$id")/restore-downloads-rollback.json" "$id" "$reason" <<'PY'
+import json, os, sys
+output, run_id, reason = sys.argv[1:]
+temporary = output + ".tmp"
+with open(temporary, "w", encoding="utf-8") as stream:
+    json.dump({"schema": 1, "run_id": run_id, "status": "recovered-and-blocked", "reason": reason,
+               "recovery_archive": "after-current-downloads.tar", "exact_inventory_match": True}, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+PY
+}
+
+rollback_downloads_after_failed_replacement() {
+  local id="$1" restorer="$2" reason="$3" stage_name=".seedsync-upgrade-v086-rollback-staging-${1}"
+  trap - ERR HUP INT TERM
+  if restore_downloads_recovery_tree "$id" "$restorer" "$stage_name" "$reason"; then return 0; fi
+  write_downloads_restore_marker "$id" rollback-failed "${reason}; retained recovery archive could not be restored"
+  return 1
+}
+
+guarded_downloads_baseline_replacement() (
+  set -Eeuo pipefail
+  local id="$1" restorer="$2" stage_name="$3"
+  rollback() {
+    local status="$1" reason="$2"
+    trap - ERR HUP INT TERM
+    rollback_downloads_after_failed_replacement "$id" "$restorer" "$reason" || true
+    exit "$status"
+  }
+  trap 'status=$?; rollback "$status" "baseline replacement command failed"' ERR
+  trap 'rollback 129 "baseline replacement interrupted by HUP"' HUP
+  trap 'rollback 130 "baseline replacement interrupted by INT"' INT
+  trap 'rollback 143 "baseline replacement interrupted by TERM"' TERM
+  # The guard begins before the marker is written and remains armed through the
+  # final exact inventory comparison and marker removal.
+  write_downloads_restore_marker "$id" replacement-in-progress "baseline staging exactly matched before-downloads inventory"
+  docker exec "$restorer" sh -c 'stage=/downloads/$1; test -d "$stage" && test ! -L "$stage"; find /downloads -mindepth 1 -maxdepth 1 ! -name "$1" -exec rm -rf -- {} +; find "$stage" -mindepth 1 -maxdepth 1 -exec mv -- {} /downloads/ \;; rmdir -- "$stage"; test ! -e "$stage"' sh "$stage_name"
+  capture_inventory "$id" restore-downloads "$(run_dir "$id")/downloads"
+  python "$HELPER" compare-inventory --expected "$(evidence_dir "$id")/before-downloads.json" --root "$(run_dir "$id")/downloads" --output "$(evidence_dir "$id")/restore-downloads-compare.json"
+  rm -f -- "$(downloads_restore_marker "$id")"
+)
+
+assert_download_restore_runtimes_stopped() {
+  local id="$1"
+  python - "$id" <<'PY'
+import json, subprocess, sys
+run_id = sys.argv[1].lower()
+names = {
+    "legacy": "seedsync-upgrade-v086-" + run_id,
+    "legacy proxy": "seedsync-upgrade-v086-proxy-" + run_id,
+    "current": "seedsync-upgrade-v086-current-" + run_id,
+    "current proxy": "seedsync-upgrade-v086-current-proxy-" + run_id,
+}
+lab_network = "seedsync-upgrade-v086-lab-" + run_id
+browser_network = "seedsync-upgrade-v086-browser-" + run_id
+network_inspect = json.loads(subprocess.check_output(["docker", "network", "inspect", lab_network, browser_network], text=True))
+for network in network_inspect:
+    labels = network.get("Labels") or {}
+    if labels.get("seedsync.upgrade-v086.run-id") != run_id:
+        raise SystemExit("downloads restore requires labelled network identity")
+expected_networks = {
+    "legacy": {lab_network}, "current": {lab_network},
+    "legacy proxy": {lab_network, browser_network}, "current proxy": {lab_network, browser_network},
+}
+for role, name in names.items():
+    item = json.loads(subprocess.check_output(["docker", "container", "inspect", name], text=True))[0]
+    if (item.get("State") or {}).get("Running"):
+        raise SystemExit("downloads restore requires stopped " + role)
+    actual_networks = set((item.get("NetworkSettings") or {}).get("Networks") or {})
+    if actual_networks != expected_networks[role]:
+        raise SystemExit("downloads restore requires exact lab-only " + role + " network identity")
+PY
+}
+
+recover_marked_downloads_before_legacy_start() {
+  local id="$1" marker restorer
+  marker="$(downloads_restore_marker "$id")"
+  [[ -e "$marker" || -L "$marker" ]] || return 0
+  # A retained marker is a prior interrupted destructive operation. Verify the
+  # retained lab identity and stopped app/proxy runtime before touching the
+  # exact downloads bind; never let a new legacy boot mask this condition.
+  verify_run_tree "$id"
+  assert_download_restore_runtimes_stopped "$id"
+  verify_protected_volume "$id"
+  create_downloads_restorer "$id"
+  restorer="$(downloads_restorer_container "$id")"
+  rollback_downloads_after_failed_replacement "$id" "$restorer" "pre-legacy retained restore marker" \
+    || die "retained downloads restore marker could not be recovered before legacy start"
+  die "retained downloads restore was recovered; rollback evidence blocks this verifier invocation before legacy start"
+}
+
+restore_downloads_baseline() {
+  local id="$1" restorer stage_name stage_host replacement_status
+  stabilize_repo_cwd
+  verify_run_tree "$id"
+  assert_download_restore_runtimes_stopped "$id"
+  create_downloads_restorer "$id"
+  restorer="$(downloads_restorer_container "$id")"
+  stage_name=".seedsync-upgrade-v086-restore-staging-${id}"
+  stage_host="$(run_dir "$id")/downloads/${stage_name}"
+  if [[ -e "$(downloads_restore_marker "$id")" || -L "$(downloads_restore_marker "$id")" ]]; then
+    rollback_downloads_after_failed_replacement "$id" "$restorer" "prior interrupted restore marker" \
+      || die "prior downloads restore marker could not be recovered"
+    die "prior downloads restore was recovered; retained rollback evidence blocks legacy reboot"
+  fi
+  [[ ! -e "$stage_host" && ! -L "$stage_host" ]] || die "downloads restore staging path already exists"
+  # Preserve the current post-migration tree before any replacement. This is a
+  # protected recovery snapshot, never a host/evidence archive.
+  capture_inventory "$id" after-current-downloads "$(run_dir "$id")/downloads"
+  snapshot_downloads_tree "$id" after-current-downloads after-current-downloads
+  verify_downloads_recovery_for_restore "$id" "$(evidence_dir "$id")/after-current-downloads-replacement-consumer-verification.json"
+  # This is intentionally the final operation before extraction: stale,
+  # swapped, malformed, or mis-bound archive metadata must block replacement.
+  verify_downloads_baseline_for_restore "$id" "$(evidence_dir "$id")/before-downloads-restore-consumer-verification.json"
+  docker exec "$restorer" sh -c 'stage=/downloads/$1; umask 077; test ! -e "$stage"; mkdir -m 700 "$stage"; tar -C "$stage" -xpf /protected/before-downloads.tar' sh "$stage_name" \
+    || die "downloads baseline extraction to private staging failed"
+  capture_inventory "$id" restore-downloads-staging "$stage_host"
+  python "$HELPER" compare-inventory --expected "$(evidence_dir "$id")/before-downloads.json" --root "$stage_host" --output "$(evidence_dir "$id")/restore-downloads-staging-compare.json" \
+    || die "downloads staging inventory differs from the baseline"
+  # Only after staging is an exact match, replace exact /downloads contents.
+  # The retained marker and guarded trap restore the protected post-current
+  # tree after normal errors or handled interruption, then block legacy reboot.
+  set +e
+  guarded_downloads_baseline_replacement "$id" "$restorer" "$stage_name"
+  replacement_status="$?"
+  set -e
+  [[ "$replacement_status" == 0 ]] || die "downloads baseline replacement failed; legacy reboot is blocked"
+}
+
+snapshot_downloads_tree() {
+  local id="$1" label="$2" inventory_label="$3" snapshotter manifest validation binding metadata inventory_path
+  inventory_path="$(evidence_dir "$id")/${inventory_label}.json"
+  snapshotter="$(downloads_snapshotter_container "$id")"
+  manifest="$(evidence_dir "$id")/${label}-protected-storage.json"
+  validation="$(evidence_dir "$id")/${label}-archive-validation.json"
+  binding="$(evidence_dir "$id")/${label}-archive-inventory-binding.json"
+  [[ -s "$inventory_path" ]] || die "downloads recovery inventory is missing or empty"
+  verify_run_tree "$id"; verify_protected_volume "$id"; verify_downloads_snapshotter "$id"
+  metadata="$(docker exec "$snapshotter" sh -c 'archive=/protected/$1.tar; test ! -e "$archive"; umask 077; tar -C /downloads -cpf "$archive" .; test "$(stat -c "%u:%g:%a" "$archive")" = "1000:1000:600"; sha256sum "$archive" | cut -d" " -f1' sh "$label")" \
+    || die "protected downloads recovery snapshot failed"
+  [[ "$metadata" =~ ^[0-9a-f]{64}$ ]] || die "protected downloads recovery digest is invalid"
+  capture_volume_helper_output "$id" "$validation" validate-archive --archive "/protected/${label}.tar"
+  capture_volume_helper_output "$id" "$binding" bind-archive-inventory --archive "/protected/${label}.tar" --inventory "$(validator_evidence_path "${inventory_label}.json")"
+  python - "$manifest" "$label" "$(protected_volume "$id")" "$metadata" "$binding" <<'PY'
+import json, os, sys
+output, label, volume, digest, binding_path = sys.argv[1:]
+binding = json.load(open(binding_path, encoding="utf-8"))
+if binding.get("exact_inventory_match") is not True: raise SystemExit("downloads recovery archive inventory binding is incomplete")
+temporary = output + ".tmp"
+with open(temporary, "x", encoding="utf-8") as stream:
+    json.dump({"schema": 1, "classification": "protected-download-recovery", "storage": "docker-named-volume", "volume": volume, "archive": label + ".tar", "sha256": digest, "archive_mode": "0600", "parent_mode": "0700", "owner": "1000:1000", "inventory_sha256": binding["inventory_sha256"], "inventory_entry_count": binding["entry_count"]}, stream, sort_keys=True); stream.write("\n")
+os.chmod(temporary, 0o600); os.replace(temporary, output)
+PY
 }
 
 capture_before_filesystem_failure() {
@@ -1767,9 +2026,10 @@ PY
 
 assert_current_topology() {
   local id="$1" port="$2" output="$(evidence_dir "$1")/current-topology.json" failure="$(evidence_dir "$1")/current-topology-failure.json"
-  python - "$id" "$port" "$output" "$failure" <<'PY'
-import json, subprocess, sys
-run_id, port, output, failure_output = sys.argv[1:]
+  verify_run_tree "$id"
+  python - "$id" "$port" "$(realpath -e "$(run_dir "$id")/downloads")" "$output" "$failure" <<'PY'
+import json, os, subprocess, sys
+run_id, port, downloads_source, output, failure_output = sys.argv[1:]
 names = {
     'current': 'seedsync-upgrade-v086-current-' + run_id.lower(),
     'current_proxy': 'seedsync-upgrade-v086-current-proxy-' + run_id.lower(),
@@ -1778,6 +2038,7 @@ names = {
     'remote': 'seedsync-upgrade-v086-ssh-' + run_id.lower(),
     'validator': 'seedsync-upgrade-v086-validator-' + run_id.lower(),
     'snapshotter': 'seedsync-upgrade-v086-snapshotter-' + run_id.lower(),
+    'downloads_snapshotter': 'seedsync-upgrade-v086-downloads-snapshotter-' + run_id.lower(),
 }
 inspect = json.loads(subprocess.check_output(['docker', 'inspect', *names.values()], text=True))
 by_name = {entry['Name'].lstrip('/'): entry for entry in inspect}
@@ -1797,13 +2058,14 @@ for role, name in names.items():
         'security_opt': sorted(entry['HostConfig'].get('SecurityOpt') or []),
         'network_mode': entry['HostConfig'].get('NetworkMode'),
         'user': entry['Config'].get('User'),
-        'mounts': [{'destination': mount.get('Destination'), 'name': mount.get('Name'), 'rw': mount.get('RW')} for mount in entry.get('Mounts', [])],
+        'labels': (entry.get('Config') or {}).get('Labels') or {},
+        'mounts': [{'destination': mount.get('Destination'), 'type': mount.get('Type'), 'source': mount.get('Source'), 'name': mount.get('Name'), 'rw': mount.get('RW')} for mount in entry.get('Mounts', [])],
     }
 run_prefix = 'seedsync-upgrade-v086-'
 run_suffix = '-' + run_id.lower()
 running_all = set(filter(None, subprocess.check_output(['docker', 'ps', '--format', '{{.Names}}'], text=True).splitlines()))
 running = {name for name in running_all if name.startswith(run_prefix) and name.endswith(run_suffix)}
-expected_running = {names['current'], names['current_proxy'], names['remote'], names['validator'], names['snapshotter']}
+expected_running = {names['current'], names['current_proxy'], names['remote'], names['validator'], names['snapshotter'], names['downloads_snapshotter']}
 def fail(reason):
     payload = {
         'schema': 1, 'run_id': run_id, 'reason': reason,
@@ -1845,7 +2107,19 @@ snapshotter_config = [mount for mount in summary['snapshotter']['mounts'] if mou
 snapshotter_protected = [mount for mount in summary['snapshotter']['mounts'] if mount['destination'] == '/protected']
 require(len(snapshotter_config) == 1 and snapshotter_config[0]['name'] == 'seedsync-upgrade-v086-config-' + run_id.lower() and snapshotter_config[0]['rw'] is False, 'snapshotter config mount must be the exact retained volume read-only')
 require(len(snapshotter_protected) == 1 and snapshotter_protected[0]['name'] == 'seedsync-upgrade-v086-protected-' + run_id.lower() and snapshotter_protected[0]['rw'] is True, 'snapshotter protected mount must be the exact retained volume writable')
-require(running == expected_running, 'only current app, current proxy, remote fixture, validator, and snapshotter may run for this lab')
+require(summary['downloads_snapshotter']['network_mode'] == 'none', 'downloads snapshotter must have no network')
+require(summary['downloads_snapshotter']['read_only_rootfs'] is True, 'downloads snapshotter root filesystem must be read-only')
+require(summary['downloads_snapshotter']['cap_drop'] == ['ALL'], 'downloads snapshotter capabilities must be dropped')
+require('no-new-privileges:true' in summary['downloads_snapshotter']['security_opt'], 'downloads snapshotter must prohibit new privileges')
+require(summary['downloads_snapshotter']['user'] == '1000:1000', 'downloads snapshotter must run as the retained-volume owner')
+downloads_snapshotter_mounts = summary['downloads_snapshotter']['mounts']
+downloads_snapshotter_downloads = [mount for mount in downloads_snapshotter_mounts if mount['destination'] == '/downloads']
+downloads_snapshotter_protected = [mount for mount in downloads_snapshotter_mounts if mount['destination'] == '/protected']
+require(len(downloads_snapshotter_mounts) == 2, 'downloads snapshotter must have exactly two mounts')
+require(len(downloads_snapshotter_downloads) == 1 and downloads_snapshotter_downloads[0]['type'] == 'bind' and os.path.realpath(downloads_snapshotter_downloads[0]['source'] or '') == downloads_source and downloads_snapshotter_downloads[0]['rw'] is False, 'downloads snapshotter downloads mount must be the exact run source read-only')
+require(len(downloads_snapshotter_protected) == 1 and downloads_snapshotter_protected[0]['name'] == 'seedsync-upgrade-v086-protected-' + run_id.lower() and downloads_snapshotter_protected[0]['rw'] is True, 'downloads snapshotter protected mount must be the exact retained volume writable')
+require(summary['downloads_snapshotter']['labels'].get('seedsync.upgrade-v086.run-id') == run_id and summary['downloads_snapshotter']['labels'].get('seedsync.upgrade-v086.role') == 'downloads-snapshotter', 'downloads snapshotter labels must bind the exact run and role')
+require(running == expected_running, 'only current app, current proxy, remote fixture, validator, and snapshotters may run for this lab')
 require(summary['legacy']['running'] is False and summary['legacy_proxy']['running'] is False, 'legacy app and proxy must be stopped')
 dual_homed = {role for role, entry in summary.items() if entry['running'] and set(entry['networks']) == {lab, browser}}
 require(dual_homed == {'current_proxy'}, 'current proxy must be the sole running browser-to-lab bridge')
@@ -1946,6 +2220,7 @@ full() {
   validate_port CURRENT_PORT "$current_port"
   [[ "$legacy_port" != "$current_port" ]] || die "HOST_PORT and CURRENT_PORT must differ"
   require_tools
+  recover_marked_downloads_before_legacy_start "$id"
   run_lab_bootstrap_bounded "$id" "$legacy_port" "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_BUILD_TIMEOUT_SECONDS 2700)"
   mkdir -p "$(evidence_dir "$id")"
   initialize_private_staging_root "$id"
@@ -1973,7 +2248,6 @@ full() {
   phase "$id" before-legacy-browser-assert running "asserting first legacy browser evidence"
   python "$HELPER" assert-legacy-browser --input "$(evidence_dir "$id")/browser-legacy.json" --output "$(evidence_dir "$id")/before-legacy-browser-contract.json"
   capture_redacted_volume_settings "$id" before-settings-redacted
-  capture_inventory "$id" before-downloads "$(run_dir "$id")/downloads"
   capture_inventory "$id" before-remote-files "$(run_dir "$id")/remote-files"
   cp "$(run_dir "$id")/evidence/model.json" "$(evidence_dir "$id")/before-model.json"
   capture_volume_behavior_contract "$id" /evidence/ship-readiness/before-model.json /evidence/fixture-evidence.json "$(evidence_dir "$id")/before-behavior-contract.json"
@@ -1982,6 +2256,8 @@ full() {
   phase "$id" migration-stop-legacy running "stop only the legacy app; remote fixture and run evidence are retained"
   stop_container "$id" migration-stop-legacy migration-stop-legacy "seedsync-upgrade-v086-${id,,}"
   stop_container "$id" migration-stop-legacy-proxy migration-stop-legacy-proxy "seedsync-upgrade-v086-proxy-${id,,}"
+  capture_inventory "$id" before-downloads "$(run_dir "$id")/downloads"
+  snapshot_downloads_baseline "$id"
   capture_before_filesystem_inventory "$id"
   start_current "$id" "$current_port"
   local current="http://127.0.0.1:${current_port}"
@@ -2050,6 +2326,7 @@ full() {
   backup="${retained_backup_dir##*/}"
   [[ -n "$backup" ]] || die "retained migration backup was not found"
   stop_container "$id" restore-current-stop restore-current-stop "seedsync-upgrade-v086-current-${id,,}"
+  stop_container "$id" restore-current-proxy-stop restore-current-proxy-stop "seedsync-upgrade-v086-current-proxy-${id,,}"
   capture_volume_inventory "$id" after-current-restart-config
   snapshot_volume_config "$id" after-current-restart after-current-restart-config
   verify_config_volume "$id"
@@ -2060,6 +2337,7 @@ full() {
     --mount "type=volume,src=$(config_volume "$id"),dst=/config" "seedsync/upgrade-v086:current-${id,,}" \
     /bin/bash -lc "python -c 'import tarfile; tarfile.open(\"/protected/after-current-restart.tar\").getmembers()' && exec python /app/python/seedsync.py -c /config --html /app/html --scanfs /app/python/scan_fs.py --restore-migration-backup '$backup' --confirm-restore --confirm-stopped"
   row "$id" restore-offline passed "evidence/ship-readiness/restore.log"
+  restore_downloads_baseline "$id"
   run_lab_bounded "$id" "$legacy_port" restore-legacy-start restore-legacy-start "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-start.log" start
   run_lab_bounded "$id" "$legacy_port" restore-legacy-status restore-legacy-status "$(timeout_seconds SEEDSYNC_SHIP_LEGACY_LAB_TIMEOUT_SECONDS 900)" "$(evidence_dir "$id")/restore-legacy-status.log" status
   run_browser "$id" "http://127.0.0.1:${legacy_port}" "$(evidence_dir "$id")" legacy-restore
@@ -2079,6 +2357,7 @@ helper.json_dump(output, {"legacy_inventory_equal": not differences, "different_
 if differences: raise SystemExit("restored config inventory differs")
 PY
   row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-config-compare.json"
+  row "$id" restore-exact-inventory passed "evidence/ship-readiness/restore-downloads-compare.json"
   row "$id" restore-infrastructure passed "evidence/ship-readiness/restore-config-compare.json"
   python "$HELPER" compare-contract --expected "$(evidence_dir "$id")/before-behavior-contract.json" --actual "$(evidence_dir "$id")/after-reboot-behavior-contract.json" --output "$(evidence_dir "$id")/reboot-parity.json"
   row "$id" restore-pinned-reboot passed "evidence/ship-readiness/after-restore-legacy-browser-contract.json"
@@ -2312,11 +2591,12 @@ topology_and_apply_contract_self_check() {
 def assert_topology(containers):
     running = {name for name, item in containers.items() if item['running']}
     checks = (
-        (running == {'current', 'current_proxy', 'remote', 'validator', 'snapshotter'}, 'running roles'),
+        (running == {'current', 'current_proxy', 'remote', 'validator', 'snapshotter', 'downloads_snapshotter'}, 'running roles'),
         (containers['current']['networks'] == {'lab'}, 'current networks'),
         (containers['remote']['networks'] == {'lab'}, 'remote networks'),
         (containers['validator']['networks'] == set(), 'validator networks'),
         (containers['snapshotter']['networks'] == set(), 'snapshotter networks'),
+        (containers['downloads_snapshotter']['networks'] == set(), 'downloads snapshotter networks'),
         (containers['legacy']['running'] is False, 'legacy stopped'),
         (containers['legacy_proxy']['running'] is False, 'legacy proxy stopped'),
         ({name for name, item in containers.items() if item['running'] and item['networks'] == {'lab', 'browser'}} == {'current_proxy'}, 'sole bridge'),
@@ -2330,6 +2610,7 @@ valid = {
     'remote': {'running': True, 'networks': {'lab'}},
     'validator': {'running': True, 'networks': set()},
     'snapshotter': {'running': True, 'networks': set()},
+    'downloads_snapshotter': {'running': True, 'networks': set()},
     'legacy': {'running': False, 'networks': {'lab'}},
     'legacy_proxy': {'running': False, 'networks': {'lab', 'browser'}},
 }
