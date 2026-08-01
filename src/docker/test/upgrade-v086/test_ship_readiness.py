@@ -1589,6 +1589,15 @@ class ShipReadinessTests(unittest.TestCase):
         self.assertIn("--browser /evidence/ship-readiness/browser.json", invocation)
         self.assertNotIn("--browser /evidence/ship-readiness/browser-reuse.json", invocation)
 
+    def test_focused_angular_lane_uses_the_playwright_chromium_executable(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        self.assertIn("playwright_chromium_binary()", launcher)
+        self.assertIn("chromium.executablePath()", launcher)
+        invocation = next(line for line in launcher.splitlines() if "focused-angular-tests" in line and "bounded_command" in line)
+        self.assertIn('env CHROME_BIN="$chrome_bin"', invocation)
+        self.assertIn("--include src/app/tests/unittests/services/files/view-file.service.spec.ts", launcher)
+        self.assertIn("--include src/app/tests/unittests/pages/files/file-list.component.spec.ts", launcher)
+
     def test_failure_summary_records_unproven_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
