@@ -1,12 +1,13 @@
 import json
+import hashlib
 import os
 import shutil
 import tempfile
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from common import Config
-from web.auth_store import ApiKeyStore
+from web.auth_store import ApiKeyStore, validate_completed_migration_claimed_auth_state
 from web.handler.admin import AdminHandler
 from web.web_app import WebApp
 from webtest import TestApp
@@ -67,6 +68,142 @@ class TestAdminHandler(unittest.TestCase):
             "HTTP_ORIGIN": origin,
             "HTTP_REFERER": "{}/dashboard".format(origin),
         }
+
+    @staticmethod
+    def _completed_migration_binding():
+        return {
+            "migration_id": "original-v0.8.6-to-current-v1",
+            "backup": "migration-backups/original-v0.8.6-to-current-v1-0123456789abcdef0123456789abcdef",
+            "receipt_sha256": "a" * 64,
+            "backup_manifest_sha256": "b" * 64,
+        }
+
+    def _migration_claim_app(self, store: ApiKeyStore):
+        store.bind_completed_migration_claim_transition(self._completed_migration_binding())
+        app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(app)
+        app.add_default_routes()
+        return TestApp(app)
+
+    def test_completed_migration_blank_recovery_version_claims_with_stable_marker_version(self):
+        migration_root = os.path.join(self.temp_dir, "migration-blank")
+        os.makedirs(migration_root)
+        store_path = os.path.join(migration_root, "api-keys.json")
+        store = ApiKeyStore(file_path=store_path)
+        app = self._migration_claim_app(store)
+
+        response = app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+            extra_environ=self._same_origin_headers(),
+        )
+
+        self.assertEqual(201, response.status_int)
+        marker_path = os.path.join(migration_root, "migration-claimed-auth.json")
+        marker = json.loads(open(marker_path, encoding="utf-8").read())
+        binding = self._completed_migration_binding()
+        canonical = "\n".join("{}={}".format(key, binding[key]) for key in (
+            "migration_id", "backup", "receipt_sha256", "backup_manifest_sha256",
+        ))
+        self.assertEqual(
+            "migration-claim-{}".format(hashlib.sha256(canonical.encode("utf-8")).hexdigest()),
+            marker["browser_handover_version"],
+        )
+        validate_completed_migration_claimed_auth_state(migration_root, self._completed_migration_binding())
+        self.assertFalse(store.get_browser_handover_state(self.context.config)["open"])
+
+    def test_completed_migration_nonblank_recovery_version_remains_exact(self):
+        self.context.config.general.browser_handover_recovery_version = "replay-v2"
+        migration_root = os.path.join(self.temp_dir, "migration-replay")
+        os.makedirs(migration_root)
+        store = ApiKeyStore(file_path=os.path.join(migration_root, "api-keys.json"))
+        app = self._migration_claim_app(store)
+
+        response = app.post_json(
+            "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+            extra_environ=self._same_origin_headers(),
+        )
+
+        self.assertEqual(201, response.status_int)
+        marker = json.loads(open(os.path.join(migration_root, "migration-claimed-auth.json"), encoding="utf-8").read())
+        self.assertEqual("replay-v2", marker["browser_handover_version"])
+        self.assertEqual("replay-v2", store.get_browser_handover_state(self.context.config)["configured_version"])
+
+    def test_completed_migration_transition_precheck_failure_persists_no_partial_auth_state(self):
+        migration_root = os.path.join(self.temp_dir, "migration-precheck")
+        os.makedirs(migration_root)
+        store_path = os.path.join(migration_root, "api-keys.json")
+        store = ApiKeyStore(file_path=store_path)
+        app = self._migration_claim_app(store)
+
+        with patch.object(store, "validate_completed_migration_claim_transition", side_effect=ValueError("forced transition failure")):
+            response = app.post_json(
+                "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+                extra_environ=self._same_origin_headers(), expect_errors=True,
+            )
+
+        self.assertEqual(400, response.status_int)
+        self.assertEqual([], store.api_keys)
+        self.assertFalse(os.path.exists(store_path))
+        self.assertFalse(os.path.exists(os.path.splitext(store_path)[0] + ".history.jsonl"))
+
+    def test_completed_migration_marker_write_failure_rolls_back_auth_state(self):
+        migration_root = os.path.join(self.temp_dir, "migration-marker-failure")
+        os.makedirs(migration_root)
+        store_path = os.path.join(migration_root, "api-keys.json")
+        store = ApiKeyStore(file_path=store_path)
+        store.save()
+        history_path = os.path.splitext(store_path)[0] + ".history.jsonl"
+        before_store = open(store_path, "rb").read()
+        before_history = open(history_path, "rb").read()
+        app = self._migration_claim_app(store)
+
+        with patch("web.auth_store._write_completed_migration_claim_marker", side_effect=ValueError("forced marker failure")):
+            response = app.post_json(
+                "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+                extra_environ=self._same_origin_headers(), expect_errors=True,
+            )
+
+        self.assertEqual(400, response.status_int)
+        self.assertEqual([], store.api_keys)
+        self.assertTrue(store.get_browser_handover_state(self.context.config)["open"])
+        self.assertEqual(before_store, open(store_path, "rb").read())
+        self.assertEqual(before_history, open(history_path, "rb").read())
+        self.assertFalse(os.path.exists(os.path.join(migration_root, "migration-claimed-auth.json")))
+
+    def test_completed_migration_each_required_history_write_failure_aborts_claim(self):
+        migration_root = os.path.join(self.temp_dir, "migration-history-failure")
+        os.makedirs(migration_root)
+        store_path = os.path.join(migration_root, "api-keys.json")
+        store = ApiKeyStore(file_path=store_path)
+        app = self._migration_claim_app(store)
+        from web import auth_store as auth_store_module
+
+        original_append = auth_store_module.append_api_key_store_history
+        for failing_write in range(1, 5):
+            with self.subTest(failing_write=failing_write):
+                required_write_count = 0
+
+                def append_with_failure(file_path, event, reason, *, required=False, **details):
+                    nonlocal required_write_count
+                    if required:
+                        required_write_count += 1
+                        if required_write_count == failing_write:
+                            raise ValueError("forced required history failure")
+                    return original_append(file_path, event, reason, required=required, **details)
+
+                with patch("web.auth_store.append_api_key_store_history", side_effect=append_with_failure):
+                    response = app.post_json(
+                        "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+                        extra_environ=self._same_origin_headers(), expect_errors=True,
+                    )
+
+                self.assertEqual(400, response.status_int)
+                self.assertEqual([], store.api_keys)
+                self.assertTrue(store.get_browser_handover_state(self.context.config)["open"])
+                self.assertFalse(os.path.exists(store_path))
+                self.assertFalse(os.path.exists(os.path.splitext(store_path)[0] + ".history.jsonl"))
+                self.assertFalse(os.path.exists(os.path.join(migration_root, "migration-claimed-auth.json")))
+                self.assertFalse(os.path.exists(os.path.join(migration_root, ".migration-claim-auth.journal.json")))
 
     def test_legacy_token_is_rejected_for_admin_routes(self):
         resp = self.test_app.get(

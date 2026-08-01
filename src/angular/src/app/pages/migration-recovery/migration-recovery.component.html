@@ -1,0 +1,81 @@
+<main class="recovery-page">
+    <article class="recovery-shell" aria-labelledby="recovery-heading">
+        <header class="recovery-brand" aria-label="SeedSync">
+            <img src="/assets/logo.png" alt="" width="58" height="58">
+            <span><b>Seed</b>Sync</span>
+        </header>
+
+        <section class="recovery-content" [attr.aria-busy]="loading || actionBusy">
+            <div *ngIf="loading" class="recovery-loading" role="status">
+                <span class="spinner" aria-hidden="true"></span> Checking recovery status…
+            </div>
+
+            <div *ngIf="loadError && !loading" class="recovery-error" role="alert">
+                <p class="eyebrow">Migration recovery</p>
+                <h1 id="recovery-heading">Recovery status unavailable</h1>
+                <p>SeedSync did not expose a recovery status. No configuration was changed.</p>
+                <button type="button" class="quiet-action" (click)="refresh()">Recheck status</button>
+            </div>
+
+            <ng-container *ngIf="status && !loading">
+                <div *ngIf="reconnecting" class="recovery-reconnecting" role="status" aria-live="polite">
+                    <span class="spinner" aria-hidden="true"></span>
+                    <div>
+                        <p class="eyebrow">Recovery in progress</p>
+                        <h1 id="recovery-heading">Restoring your migration backup</h1>
+                        <p>SeedSync is stopping normal services, restoring the verified configuration, then returning to the migration checkpoint.</p>
+                        <p *ngIf="!reconnectTimedOut">Waiting for the migration checkpoint (attempt {{reconnectAttempt + 1}})…</p>
+                        <div *ngIf="reconnectTimedOut" class="reconnect-timeout" role="alert">
+                            <p>SeedSync has not become reachable at the migration checkpoint yet. The restore request remains protected; check the container or app log, then retry this connection check.</p>
+                            <button type="button" class="quiet-action" (click)="retryReconnect()">Retry connection check</button>
+                        </div>
+                    </div>
+                </div>
+
+                <ng-container *ngIf="!reconnecting">
+                    <p class="eyebrow">Migration recovery</p>
+                    <h1 id="recovery-heading">Undo this upgrade</h1>
+                    <p class="orientation">Return the configuration from this completed migration to its verified pre-upgrade state, then retry the upgrade when you are ready.</p>
+
+                    <div *ngIf="status.eligible; else unavailable" class="recovery-details">
+                        <dl>
+                            <div><dt>Validated backup</dt><dd>{{status.backup_id}}</dd></div>
+                            <div><dt>Restores</dt><dd>Configuration from {{status.source_schema}}</dd></div>
+                            <div><dt>Does not change</dt><dd>Downloads, mounts, and transfer staging</dd></div>
+                        </dl>
+                    </div>
+
+                    <ng-template #unavailable>
+                        <div class="recovery-unavailable" role="status">
+                            <h2>Recovery is not available</h2>
+                            <p>{{status.reason || 'A claimed, completed migration with a verified backup is required.'}}</p>
+                        </div>
+                    </ng-template>
+
+                    <div *ngIf="status.eligible" class="danger-zone">
+                        <label class="attestation">
+                            <input #confirmation type="checkbox" [checked]="confirmationChecked"
+                                   (change)="confirmationChecked = confirmation.checked">
+                            <span>I understand this restores the saved configuration and I confirm that no other SeedSync instance is using this configuration directory.</span>
+                        </label>
+                        <label class="confirmation-phrase">
+                            <span>Type <code>{{status.confirmation}}</code> to confirm</span>
+                            <input type="text" autocomplete="off" spellcheck="false"
+                                   [value]="confirmationPhrase"
+                                   (input)="confirmationPhrase = $any($event.target).value">
+                        </label>
+                        <div class="actions">
+                            <button type="button" class="danger-action" [disabled]="!canRestore" (click)="requestRestore()">
+                                {{actionBusy ? 'Preparing recovery…' : 'Undo upgrade and try again'}}
+                            </button>
+                            <button type="button" class="quiet-action" (click)="refresh()">Recheck status</button>
+                        </div>
+                        <p *ngIf="actionError" class="action-error" role="alert">{{actionError}}</p>
+                    </div>
+                </ng-container>
+            </ng-container>
+        </section>
+
+        <footer>Recovery uses the backup that SeedSync verified during this migration. It cannot select another backup or a filesystem path.</footer>
+    </article>
+</main>

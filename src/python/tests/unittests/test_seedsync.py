@@ -42,6 +42,26 @@ class TestSeedsync(unittest.TestCase):
         migration_instance.run.assert_called_once_with()
         normal_instance.run.assert_called_once_with()
 
+    def test_process_loop_reconstructs_only_after_recovery_shutdown_releases_runtime(self):
+        events = []
+
+        class ArmedRuntime:
+            def run(self):
+                events.extend(["restore-armed", "normal-cleanup", "runtime-exclusion-released"])
+                raise ServiceRestart()
+
+        class ReconstructedMigrationCheckpoint:
+            def run(self):
+                events.extend(["intent-consumed-offline", "legacy-migration-required"])
+                raise ServiceExit()
+
+        _run_process_loop(MagicMock(side_effect=[ArmedRuntime(), ReconstructedMigrationCheckpoint()]))
+
+        self.assertEqual([
+            "restore-armed", "normal-cleanup", "runtime-exclusion-released",
+            "intent-consumed-offline", "legacy-migration-required",
+        ], events)
+
     def test_blocking_migration_constructs_only_migration_runtime(self):
         decision = MigrationDecision(
             state=MigrationState.REQUIRED,

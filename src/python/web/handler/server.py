@@ -10,6 +10,7 @@ class ServerHandler(IHandler):
     def __init__(self, context: Context) -> None:
         self.logger = context.logger.getChild("ServerActionHandler")
         self.__request_restart = False
+        self.__request_recovery_restore = False
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp) -> None:
@@ -25,6 +26,14 @@ class ServerHandler(IHandler):
         :return:
         """
         return self.__request_restart
+
+    def request_recovery_restore(self) -> None:
+        """Request a graceful reconstruction for a receipt-bound restore."""
+        self.logger.info("Received a migration recovery restore action")
+        self.__request_recovery_restore = True
+
+    def is_recovery_restore_requested(self) -> bool:
+        return self.__request_recovery_restore
 
     def __handle_action_restart(self) -> HTTPResponse:
         """

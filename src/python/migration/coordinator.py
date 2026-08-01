@@ -7,6 +7,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import socket
 import stat
 import threading
@@ -23,6 +24,8 @@ from controller import AutoQueuePersist, ControllerPersist
 from .backup_restore import (
     BackupRestoreError,
     MANIFEST_NAME,
+    RESTORE_JOURNAL_NAME,
+    _fsync_directory,
     create_retained_backup,
     resolve_backup,
     restore_backup,
@@ -34,6 +37,7 @@ from .runtime_exclusion import RuntimeExclusion, RuntimeExclusionError
 CURRENT_SCHEMA_ID = "seedsync-current-v1"
 METADATA_FILE = "migration-state.json"
 LOCK_FILE = ".migration.lock"
+RECOVERY_INTENT_FILE = ".migration-recovery-intent.json"
 BACKUP_ROOT = "migration-backups"
 _MAX_JSON_BYTES = 256 * 1024
 _MAX_RELEVANT_FILE_BYTES = 16 * 1024 * 1024
@@ -1351,6 +1355,7 @@ class MigrationCoordinator:
         self.config_dir = Path(os.path.abspath(config_dir))
         self.metadata_path = self.config_dir / METADATA_FILE
         self.lock_path = self.config_dir / LOCK_FILE
+        self.recovery_intent_path = self.config_dir / RECOVERY_INTENT_FILE
         self.registry = tuple(sorted(registry or default_migration_registry(), key=lambda item: item.order))
         self._root_identity: tuple[int, ...] | None = None
         ids = [spec.migration_id for spec in self.registry]
@@ -1385,6 +1390,168 @@ class MigrationCoordinator:
                 return False
             return True
 
+    def recovery_eligibility(self) -> dict[str, object]:
+        """Return the sole completed-migration backup that browser recovery may use.
+
+        The client never selects a path.  Eligibility is derived from the
+        current, validated completion receipt and only after the post-migration
+        browser handover has been claimed.
+        """
+        decision = self.preflight()
+        if decision.state != MigrationState.COMPLETE or decision.completed_auth_phase != "claimed":
+            return {"eligible": False, "reason": "A claimed, completed migration is required."}
+        with _root_transaction(self.config_dir, self._root_identity):
+            metadata = self._read_metadata()
+            spec = self._spec(decision.migration_id)
+            if metadata is None or spec is None or not isinstance(metadata.get("backup"), str):
+                return {"eligible": False, "reason": "The completed migration receipt is unavailable."}
+            try:
+                backup_dir = self.config_dir / cast(str, metadata["backup"])
+                _validate_manifest(backup_dir, self.config_dir, spec)
+                binding = self._completed_auth_binding(metadata, backup_dir)
+            except Exception:
+                return {"eligible": False, "reason": "The retained migration backup could not be validated."}
+            return {
+                "eligible": True,
+                "migration_id": spec.migration_id,
+                "source_schema": spec.source_schema,
+                "target_schema": spec.target_schema,
+                "backup_id": backup_dir.name,
+                "confirmation": "RESTORE {}".format(spec.migration_id),
+                "receipt_sha256": binding["receipt_sha256"],
+                "backup_manifest_sha256": binding["backup_manifest_sha256"],
+            }
+
+    def request_recovery_restore(self, *, confirmation: str, other_instances_stopped: bool) -> None:
+        """Durably arm one receipt-bound offline restore for the next process loop.
+
+        This method deliberately accepts no backup reference.  It revalidates
+        the receipt and writes an owner-private intent that is consumed only
+        after the current normal-runtime exclusion lease has been released.
+        """
+        eligibility = self.recovery_eligibility()
+        if eligibility.get("eligible") is not True:
+            raise ValueError(cast(str, eligibility.get("reason", "Migration recovery is unavailable.")))
+        expected = cast(str, eligibility["confirmation"])
+        if not isinstance(confirmation, str) or not secrets.compare_digest(confirmation, expected):
+            raise ValueError("Recovery confirmation did not match the completed migration")
+        if other_instances_stopped is not True:
+            raise ValueError("Confirm that no other SeedSync instance uses this configuration")
+        payload = {
+            "intent_version": 1,
+            "phase": "armed",
+            "migration_id": eligibility["migration_id"],
+            "backup": "{}/{}".format(BACKUP_ROOT, eligibility["backup_id"]),
+            "receipt_sha256": eligibility["receipt_sha256"],
+            "backup_manifest_sha256": eligibility["backup_manifest_sha256"],
+            "requested_at": _utc_now(),
+        }
+        with _root_transaction(self.config_dir, self._root_identity):
+            if self.recovery_intent_path.exists() or self.recovery_intent_path.is_symlink():
+                raise ValueError("A migration recovery restore is already pending")
+            _atomic_write(
+                self.recovery_intent_path,
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                self.config_dir,
+            )
+
+    def consume_recovery_restore_intent(self) -> bool:
+        """Run a previously armed restore before normal configuration is loaded.
+
+        A malformed or stale intent fails closed.  It is intentionally retained
+        on a restore interruption so the next controlled start can retry the
+        same receipt-bound operation instead of accidentally constructing a
+        normal runtime over uncertain state.
+        """
+        if not self.recovery_intent_path.exists() and not self.recovery_intent_path.is_symlink():
+            return False
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+        with _root_transaction(self.config_dir, self._root_identity):
+            intent = _read_json_object(self.recovery_intent_path, self.config_dir, owner_only=True)
+            expected_keys = {
+                "intent_version", "phase", "migration_id", "backup", "receipt_sha256",
+                "backup_manifest_sha256", "requested_at",
+            }
+            if (
+                set(intent) != expected_keys or intent.get("intent_version") != 1
+                or intent.get("phase") not in {"armed", "converging"}
+            ):
+                raise ValueError("Migration recovery intent is invalid")
+            phase = cast(str, intent["phase"])
+            migration_id = intent.get("migration_id")
+            backup = intent.get("backup")
+            receipt_hash = intent.get("receipt_sha256")
+            manifest_hash = intent.get("backup_manifest_sha256")
+            if not all(isinstance(value, str) and value for value in (migration_id, backup, receipt_hash, manifest_hash)):
+                raise ValueError("Migration recovery intent is invalid")
+            metadata = self._read_metadata()
+            spec = self._spec(cast(str, migration_id))
+            if spec is None:
+                raise ValueError("Migration recovery intent no longer matches a completed migration")
+            if metadata is not None and (
+                metadata.get("migration_id") != migration_id or metadata.get("backup") != backup
+            ):
+                raise ValueError("Migration recovery intent no longer matches a completed migration")
+            backup_dir = self.config_dir / cast(str, backup)
+            _validate_manifest(backup_dir, self.config_dir, spec)
+            if not secrets.compare_digest(
+                cast(str, manifest_hash),
+                hashlib.sha256(_read_bytes(backup_dir / MANIFEST_NAME, self.config_dir, _MAX_JSON_BYTES)).hexdigest(),
+            ):
+                raise ValueError("Migration recovery intent no longer matches the retained backup")
+            if metadata is not None:
+                binding = self._completed_auth_binding(metadata, backup_dir)
+                if not (
+                    secrets.compare_digest(cast(str, receipt_hash), binding["receipt_sha256"])
+                    and secrets.compare_digest(cast(str, manifest_hash), binding["backup_manifest_sha256"])
+                ):
+                    raise ValueError("Migration recovery intent no longer matches the retained backup")
+            else:
+                # A convergence interruption can happen after the completed
+                # receipt was removed but before final inventory validation.
+                # Retry only when the owner-private restore journal identifies
+                # this backup, or when the exact legacy fingerprint is already
+                # present after a crash between convergence and intent consume.
+                journal = self.config_dir / RESTORE_JOURNAL_NAME
+                journal_matches = False
+                if journal.exists() or journal.is_symlink():
+                    try:
+                        journal_data = _read_json_object(journal, self.config_dir, owner_only=True)
+                        journal_matches = journal_data.get("backup_id") == backup_dir.name
+                    except Exception:
+                        journal_matches = False
+                if phase != "converging" or (not journal_matches and not spec.fingerprint(self.config_dir)):
+                    raise ValueError("Migration recovery intent no longer matches a recoverable restore state")
+            if phase == "armed":
+                # Persist the phase before restore convergence can delete the
+                # receipt. The owner-private intent retains the
+                # previously validated binding for interruption recovery.
+                intent["phase"] = "converging"
+                _atomic_write(
+                    self.recovery_intent_path,
+                    json.dumps(intent, indent=2, sort_keys=True) + "\n",
+                    self.config_dir,
+                )
+        self.restore_offline(Path(cast(str, backup)).name)
+        # The restore has now completed its final inventory check and root
+        # fsync. Consume the intent only afterwards; failures above leave it
+        # behind so normal startup stays blocked and a controlled retry is
+        # possible.
+        self._consume_recovery_intent_after_restore()
+        return True
+
+    def _consume_recovery_intent_after_restore(self) -> None:
+        """Durably remove the single-use intent only after restore success."""
+        with _root_transaction(self.config_dir, self._root_identity):
+            if not self.recovery_intent_path.exists() or self.recovery_intent_path.is_symlink():
+                raise ValueError("Migration recovery restore completed without its retained intent")
+            _secure_unlink(self.recovery_intent_path, self.config_dir)
+            _fsync_directory(self.config_dir, self.config_dir)
+
     def preflight(self) -> MigrationDecision:
         identity = _capture_root_identity(self.config_dir)
         if self._root_identity is None:
@@ -1414,7 +1581,7 @@ class MigrationCoordinator:
 
         relevant = [
             path for path in self.config_dir.iterdir()
-            if path.name not in (LOCK_FILE, METADATA_FILE, ".seedsync.runtime.lock")
+            if path.name not in (LOCK_FILE, METADATA_FILE, RECOVERY_INTENT_FILE, ".seedsync.runtime.lock")
         ]
         if not relevant:
             return MigrationDecision(MigrationState.NOT_REQUIRED)
@@ -1638,6 +1805,14 @@ class MigrationCoordinator:
             _validate_manifest(backup, self.config_dir, spec)
             return self._completed_auth_binding(metadata, backup)
 
+    def completed_claimed_auth_handover_version(self) -> str:
+        """Return the marker-bound version only after claimed lineage validation."""
+        decision = self.preflight()
+        if decision.state != MigrationState.COMPLETE or decision.completed_auth_phase != "claimed":
+            raise MigrationBlockedError(decision)
+        from web.auth_store import completed_migration_claimed_browser_handover_version
+        return completed_migration_claimed_browser_handover_version(self.config_dir)
+
     def legacy_web_port(self, default: int = 8800) -> int:
         """Read only the bounded legacy Web port needed by migration mode."""
         try:
@@ -1709,7 +1884,13 @@ class MigrationCoordinator:
             backup_dir = self.config_dir / cast(str, expected_backup)
             _validate_manifest(backup_dir, self.config_dir, last_spec)
             binding = self._completed_auth_binding(metadata, backup_dir)
-            from web.auth_store import completed_migration_claim_marker_exists
+            from web.auth_store import (
+                completed_migration_claim_marker_exists,
+                recover_completed_migration_claim_journal,
+            )
+            # A browser first-claim can be interrupted after durable auth
+            # writes.  Recover its journal before classifying preclaim/claimed.
+            recover_completed_migration_claim_journal(self.config_dir)
             claimed = completed_migration_claim_marker_exists(self.config_dir)
             if claimed:
                 if last_spec.validate_completed_claimed is None:

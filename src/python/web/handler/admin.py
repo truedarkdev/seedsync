@@ -128,8 +128,13 @@ class AdminHandler(IHandler):
             return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_bootstrap_first_api_key(self) -> HTTPResponse:
+        completed_migration_transaction_started = False
         try:
-            handover_version = self.__browser_handover_version()
+            handover_version = self.__auth_store.effective_browser_handover_version(self.__config)
+            # Complete-migration marker prerequisites must fail before key,
+            # session, or history persistence can begin.
+            self.__auth_store.validate_completed_migration_claim_transition(handover_version)
+            completed_migration_transaction_started = self.__auth_store.begin_completed_migration_claim_transaction()
             data = self.__load_request_json()
             name = data.get("name", "bootstrap-admin")
             if not isinstance(name, str):
@@ -139,6 +144,8 @@ class AdminHandler(IHandler):
                 name=name,
             )
             if result is None:
+                if completed_migration_transaction_started:
+                    self.__auth_store.abort_completed_migration_claim_transaction()
                 return self.__json_response({
                     "error": "First-admin browser bootstrap is only available when the initial handover window is open"
                 }, status=409)
@@ -147,6 +154,9 @@ class AdminHandler(IHandler):
             self.__auth_store.complete_completed_migration_claim_transition(
                 result["record"].id, handover_version,
             )
+            if completed_migration_transaction_started:
+                self.__auth_store.finish_completed_migration_claim_transaction()
+                completed_migration_transaction_started = False
             response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],
@@ -161,7 +171,14 @@ class AdminHandler(IHandler):
                 max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
-        except (TypeError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
+            if completed_migration_transaction_started:
+                try:
+                    self.__auth_store.abort_completed_migration_claim_transaction()
+                except (OSError, ValueError):
+                    return self.__json_response({
+                        "error": "Completed migration first claim could not be rolled back safely"
+                    }, status=500)
             return self.__json_response({"error": str(exc)}, status=400)
 
     def __handle_remember_browser_session(self) -> HTTPResponse:
@@ -268,13 +285,6 @@ class AdminHandler(IHandler):
             return self.__json_response({"error": str(exc)}, status=404)
         except ValueError as exc:
             return self.__json_response({"error": str(exc)}, status=400)
-
-    def __browser_handover_version(self) -> str:
-        general_config = getattr(self.__config, "general", None)
-        if general_config is None:
-            return ""
-        handover_version = getattr(general_config, "browser_handover_recovery_version", "")
-        return handover_version if isinstance(handover_version, str) else ""
 
     @staticmethod
     def __query_flag(name: str) -> bool:
