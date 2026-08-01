@@ -1583,6 +1583,12 @@ class ShipReadinessTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 HARNESS.assert_autoqueue(settings, root / "autoqueue.persist", root / "browser.json", root / "fixture.json", root / "controller.persist", root / "out.json")
 
+    def test_autoqueue_contract_uses_the_claim_browser_api_and_model_evidence(self):
+        launcher = LAUNCHER_PATH.read_text(encoding="utf-8")
+        invocation = next(line for line in launcher.splitlines() if "assert-autoqueue" in line)
+        self.assertIn("--browser /evidence/ship-readiness/browser.json", invocation)
+        self.assertNotIn("--browser /evidence/ship-readiness/browser-reuse.json", invocation)
+
     def test_failure_summary_records_unproven_rows(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
