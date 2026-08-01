@@ -1197,8 +1197,9 @@ def inventory(root: Path, *, legacy_config: bool = False) -> dict[str, Any]:
         raise ValueError("inventory root must be a real directory")
     entries: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
-        relative = path.relative_to(root).as_posix()
-        if legacy_config and len(path.relative_to(root).parts) == 1 and path.name in MIGRATION_INFRASTRUCTURE:
+        relative_path = path.relative_to(root)
+        relative = relative_path.as_posix()
+        if legacy_config and relative_path.parts and relative_path.parts[0] in MIGRATION_INFRASTRUCTURE:
             continue
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
@@ -1759,7 +1760,8 @@ def assert_migration_apply_auth_boundary(status_path: Path, legacy_auth_path: Pa
 
 def assert_restore(config_root: Path, expected: dict[str, Any], output: Path) -> None:
     differences = compare(expected, inventory(config_root, legacy_config=True))
-    generated = [name for name in ("migration-state.json", "path_pairs.json", "api-keys.json") if (config_root / name).exists()]
+    forbidden_after_restore = (MIGRATION_INFRASTRUCTURE - {"migration-backups"}) | {"path_pairs.json", "api-keys.json"}
+    generated = [name for name in sorted(forbidden_after_restore) if (config_root / name).exists()]
     json_dump(output, {"legacy_inventory_equal": not differences, "different_paths": differences, "unexpected_current_files": generated})
     if differences or generated:
         raise ValueError("offline restore did not return the legacy configuration contract")
