@@ -498,6 +498,7 @@ _SCREENSHOT_MAX_DIMENSION = 16384
 _SCREENSHOT_MAX_PIXELS = 64 * 1024 * 1024
 _LOG_PUBLICATION_POLICY_VERSION = 1
 _LOG_PUBLICATION_MAX_BYTES = 512 * 1024
+_RETAINED_DIRECT_SCAN_MAX_BYTES = 1024 * 1024
 _LOG_PUBLICATION_RELATIVE_PATH = "logs/seedsync.log"
 _LOG_REDACTION_CLASSES = {
     "assignment": SECRET,
@@ -914,7 +915,7 @@ def _retained_secret_hint(text: str) -> bool:
             occurrences.append((candidate, marker + 3))
         marker += 3
     at_cursor = 0
-    for index, (_start, scheme_end) in enumerate(occurrences):
+    for index, (scheme_start, scheme_end) in enumerate(occurrences):
         terminator = terminator_pattern.search(text, scheme_end)
         authority_end = terminator.start() if terminator else len(text)
         authority = text[scheme_end:authority_end]
@@ -927,16 +928,41 @@ def _retained_secret_hint(text: str) -> bool:
                 continue
             eventual_at = at_positions[at_cursor]
             intervening = text[authority_end:eventual_at]
-            if any(delimiter in intervening for delimiter in ('"', "'", ")")):
-                # A closing string or Markdown-link delimiter proves that a
+            authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
+
+            def has_unescaped(delimiter: str) -> bool:
+                offset = intervening.find(delimiter)
+                while offset >= 0:
+                    backslashes = 0
+                    cursor = offset - 1
+                    while cursor >= 0 and intervening[cursor] == "\\":
+                        backslashes += 1
+                        cursor -= 1
+                    if backslashes % 2 == 0:
+                        return True
+                    offset = intervening.find(delimiter, offset + 1)
+                return False
+
+            quoted_boundary = (
+                scheme_start > 0
+                and text[scheme_start - 1] in ('"', "'")
+                and has_unescaped(text[scheme_start - 1])
+            )
+            markdown_boundary = scheme_start > 0 and text[scheme_start - 1] == "(" and has_unescaped(")")
+            code_fence_boundary = (
+                "```" in intervening
+                and text.count("```", 0, scheme_start) % 2 == 1
+                and has_unescaped("```")
+            )
+            if authority_is_host_only and (quoted_boundary or markdown_boundary or code_fence_boundary):
+                # Exact quoted-value and Markdown-link boundaries prove that a
                 # later at-sign belongs to another retained value (for example
-                # npm's adjacent ``resolved`` URL / ``from: package@version``
-                # fields or a README's ``package@tag`` command), not to malformed
-                # userinfo from this URI. Keep whitespace and path separators
-                # ambiguous so split credential remnants still fail closed.
+                # npm's adjacent URL / ``package@version`` fields or a README's
+                # fenced ``package@tag`` command). Requiring a valid host-only
+                # authority preserves fail-closed handling for delimiter-injected
+                # malformed credential remnants.
                 continue
             later_scheme = occurrences[index + 1][0] if index + 1 < len(occurrences) else -1
-            authority_is_host_only = bool(re.fullmatch(r"(?:\[[0-9a-f:.]+\]|[a-z0-9.-]+)(?::\d+)?", authority, re.IGNORECASE))
             prefix_end = later_scheme if 0 <= later_scheme < eventual_at else -1
             if prefix_end >= 0 and authority_is_host_only and ":" not in unquote(text[authority_end:prefix_end]):
                 # The following scheme is a separate occurrence only after an
@@ -959,7 +985,7 @@ def _retained_secret_detected(path: Path) -> bool:
         size = path.stat().st_size
     except OSError:
         raise
-    if size <= 64 * 1024:
+    if size <= _RETAINED_DIRECT_SCAN_MAX_BYTES:
         return _retained_secret_hint(path.read_text(encoding="utf-8", errors="replace"))
     overlap = ""
     with path.open("rb") as stream:

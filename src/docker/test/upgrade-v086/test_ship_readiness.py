@@ -1225,6 +1225,9 @@ class ShipReadinessTests(unittest.TestCase):
             "sftp://user:synthetic-credential@middle@host:1234/path",
             "sftp://user:synthetic-credential/sftp://safe@host:1234/path",
             "sftp://user:synthetic-credential sftp://safe@host:1234/path",
+            "sftp://user:synthetic-credential/raw'@host:1234/path",
+            'sftp://user:synthetic-credential/raw"@host:1234/path',
+            "sftp://user:synthetic-credential/raw)@host:1234/path",
             "(sftp://user:synthetic-credential/raw@host:1234/path)",
             "endpoint=sftp://user%3Asynthetic-credential@host:1234/path",
             "'sftp://user:synthetic-credential/raw@host:1234/path'",
@@ -1245,6 +1248,9 @@ class ShipReadinessTests(unittest.TestCase):
         ))
         self.assertFalse(HARNESS._retained_secret_hint(
             "[TypeScript](https://typescriptlang.org/) install typescript@next"
+        ))
+        self.assertFalse(HARNESS._retained_secret_hint(
+            "```\ngit clone https://github.com/example/project.git\n```\nnpm install project@next"
         ))
         self.assertTrue(HARNESS._retained_secret_hint("sftp://safe@host:1234/path,sftp://user:synthetic-credential@host:1234/path"))
         self.assertTrue(HARNESS._retained_secret_hint("sftp://user:synthetic-credential/sftp://safe@host:1234/path"))
@@ -1276,6 +1282,20 @@ class ShipReadinessTests(unittest.TestCase):
             started = time.monotonic()
             self.assertTrue(HARNESS._retained_secret_detected(path))
             self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_retained_secret_detection_preserves_safe_uri_context_in_bounded_direct_scan(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "npm-inventory.json"
+            prefix = "x" * (70 * 1024)
+            safe_metadata = (
+                '{"resolved":"https://registry.npmjs.org/package/-/'
+                + "x" * 650
+                + '","from":"package@1.2.3"}'
+            )
+            path.write_text(prefix + safe_metadata, encoding="utf-8")
+            self.assertGreater(path.stat().st_size, 64 * 1024)
+            self.assertLessEqual(path.stat().st_size, HARNESS._RETAINED_DIRECT_SCAN_MAX_BYTES)
+            self.assertFalse(HARNESS._retained_secret_detected(path))
 
     def test_retained_secret_detection_keeps_uri_token_splits_within_overlap(self):
         for label, token in (("scheme", "sftp://user:synthetic@host"), ("encoded", "sftp://user%3Asynthetic@host"), ("at", "sftp://user:synthetic@host")):
