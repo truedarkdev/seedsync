@@ -1760,9 +1760,15 @@ def assert_migration_apply_auth_boundary(status_path: Path, legacy_auth_path: Pa
 
 def assert_restore(config_root: Path, expected: dict[str, Any], output: Path) -> None:
     differences = compare(expected, inventory(config_root, legacy_config=True))
-    forbidden_after_restore = (MIGRATION_INFRASTRUCTURE - {"migration-backups"}) | {"path_pairs.json", "api-keys.json"}
+    # The restore command itself acquires the normal-runtime exclusion lock;
+    # that persistent lock file is expected even though no runtime remains
+    # active. Retained backups are likewise intentional. Other migration and
+    # current-schema files must be gone before the pinned legacy reboot.
+    allowed_after_restore = {"migration-backups", ".seedsync.runtime.lock"}
+    forbidden_after_restore = (MIGRATION_INFRASTRUCTURE - allowed_after_restore) | {"path_pairs.json", "api-keys.json"}
     generated = [name for name in sorted(forbidden_after_restore) if (config_root / name).exists()]
-    json_dump(output, {"legacy_inventory_equal": not differences, "different_paths": differences, "unexpected_current_files": generated})
+    retained_runtime_files = [name for name in sorted(allowed_after_restore) if (config_root / name).exists()]
+    json_dump(output, {"legacy_inventory_equal": not differences, "different_paths": differences, "unexpected_current_files": generated, "expected_runtime_files": retained_runtime_files})
     if differences or generated:
         raise ValueError("offline restore did not return the legacy configuration contract")
 
