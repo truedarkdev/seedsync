@@ -1289,10 +1289,16 @@ def behavior_contract(model_path: Path, settings_path: Path, controller_path: Pa
     settings = {section: {key: redact(value) for key, value in sorted(parser.items(section)) if not SECRET.search(key)} for section in sorted(parser.sections())}
     model = json.loads(model_path.read_text(encoding="utf-8"))
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    controller_persist = json.loads(controller_path.read_text(encoding="utf-8"))
+    if isinstance(controller_persist, dict):
+        for key in ("downloaded", "extracted"):
+            values = controller_persist.get(key)
+            if isinstance(values, list) and all(isinstance(value, str) for value in values):
+                controller_persist[key] = sorted(values)
     contract = {
         "schema": 1,
         "settings": settings,
-        "controller_persist": json.loads(controller_path.read_text(encoding="utf-8")),
+        "controller_persist": controller_persist,
         "autoqueue_persist": json.loads(autoqueue_path.read_text(encoding="utf-8")),
         "fixture_cases": fixture.get("case_index", []),
         "model": _model_contract(model),
