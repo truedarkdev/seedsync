@@ -10,7 +10,13 @@ if (environment.production) {
 const path = window.location.pathname.replace(/\/+$/, "") || "/";
 const isMigrationPath = path === "/migration" || path.startsWith("/migration/");
 
-const bootstrap = isMigrationPath
+const bootstrap = path === "/migration/recovery"
+    ? import("./app/pages/migration-recovery/migration-recovery.component").then(({MigrationRecoveryComponent}) =>
+        bootstrapApplication(MigrationRecoveryComponent, {
+            providers: [provideHttpClient()]
+        })
+    )
+    : isMigrationPath
     ? import("./app/pages/migration/migration-app.component").then(({MigrationAppComponent}) =>
         bootstrapApplication(MigrationAppComponent, {
             providers: [provideHttpClient()]

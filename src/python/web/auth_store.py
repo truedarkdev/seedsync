@@ -2,6 +2,7 @@
 
 import binascii
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -14,7 +15,7 @@ import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, TypeGuard, TypedDict
+from typing import Dict, List, Mapping, Optional, Sequence, TypeGuard, TypedDict
 
 from common import Persist, PersistError
 
@@ -32,6 +33,8 @@ _COMPLETED_MIGRATION_STORE_NAME = "api-keys.json"
 _COMPLETED_MIGRATION_HISTORY_NAME = "api-keys.history.jsonl"
 _COMPLETED_MIGRATION_CLAIM_MARKER_NAME = "migration-claimed-auth.json"
 _COMPLETED_MIGRATION_CLAIM_MARKER_MAX_BYTES = 4096
+_COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME = ".migration-claim-auth.journal.json"
+_COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES = _COMPLETED_MIGRATION_AUTH_MAX_BYTES * 3 + 4096
 _COMPLETED_MIGRATION_BACKUP_NAME = re.compile(
     r"api-keys-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{6}\.json"
 )
@@ -75,7 +78,7 @@ def _history_file_path(file_path: Optional[str]) -> Optional[str]:
 
 
 def append_api_key_store_history(
-    file_path: Optional[str], event: str, reason: str, **details: object
+    file_path: Optional[str], event: str, reason: str, *, required: bool = False, **details: object
 ) -> None:
     history_path = _history_file_path(file_path)
     if history_path is None or file_path is None:
@@ -97,7 +100,12 @@ def append_api_key_store_history(
         with open(history_path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True))
             handle.write("\n")
-    except (OSError, TypeError, ValueError):
+            if required:
+                handle.flush()
+                os.fsync(handle.fileno())
+    except (OSError, TypeError, ValueError) as exc:
+        if required:
+            raise ValueError("Required completed migration claim history could not be persisted") from exc
         return
 
 
@@ -131,9 +139,11 @@ def _valid_completed_migration_timestamp(value: object) -> bool:
 
 
 def _read_completed_migration_auth_file(
-    root: Path, name: str, *, private: bool
+    root: Path, name: str, *, private: bool, max_bytes: int = _COMPLETED_MIGRATION_AUTH_MAX_BYTES,
 ) -> bytes | None:
     path = root / name
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("Completed migration auth file limit is invalid")
     if not os.path.lexists(path):
         return None
     try:
@@ -150,18 +160,21 @@ def _read_completed_migration_auth_file(
             if path_info.st_uid != os.geteuid() or path_info.st_gid != os.getegid():
                 raise _completed_migration_auth_error()
 
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+        )
         try:
             opened_info = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(opened_info.st_mode)
                 or opened_info.st_nlink != 1
                 or (opened_info.st_dev, opened_info.st_ino) != (path_info.st_dev, path_info.st_ino)
-                or opened_info.st_size > _COMPLETED_MIGRATION_AUTH_MAX_BYTES
+                or opened_info.st_size > max_bytes
             ):
                 raise _completed_migration_auth_error()
-            payload = os.read(descriptor, _COMPLETED_MIGRATION_AUTH_MAX_BYTES + 1)
-            if len(payload) > _COMPLETED_MIGRATION_AUTH_MAX_BYTES:
+            payload = os.read(descriptor, max_bytes + 1)
+            if len(payload) > max_bytes:
                 raise _completed_migration_auth_error()
             return payload
         finally:
@@ -324,6 +337,15 @@ def _completed_migration_transition_binding(binding: object) -> Dict[str, str]:
     return normalized
 
 
+def _migration_claim_browser_handover_version(binding: Mapping[str, str]) -> str:
+    """Return a bounded, non-secret, receipt-bound browser claim identifier."""
+    canonical = "\n".join(
+        "{}={}".format(key, binding[key])
+        for key in ("migration_id", "backup", "receipt_sha256", "backup_manifest_sha256")
+    )
+    return "migration-claim-{}".format(hashlib.sha256(canonical.encode("utf-8")).hexdigest())
+
+
 def _strict_completed_migration_json(payload: bytes) -> Dict[str, object]:
     try:
         parsed = json.loads(payload.decode("utf-8"), object_pairs_hook=_strict_json_object)
@@ -368,6 +390,181 @@ def _write_completed_migration_claim_marker(root: Path, payload: Dict[str, objec
 
 def completed_migration_claim_marker_exists(config_dir: str | Path) -> bool:
     return os.path.lexists(Path(config_dir) / _COMPLETED_MIGRATION_CLAIM_MARKER_NAME)
+
+
+def _write_completed_migration_private_file(root: Path, name: str, content: bytes, mode: int = 0o600) -> None:
+    temporary = root / ".{}.tmp-{}".format(name, uuid.uuid4().hex)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0),
+            mode,
+        )
+        offset = 0
+        while offset < len(content):
+            offset += os.write(descriptor, content[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(temporary, root / name)
+        if os.name == "posix":
+            os.chmod(root / name, mode)
+        if os.name == "posix":
+            directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _claim_journal_artifact(root: Path, name: str) -> Dict[str, object]:
+    path = root / name
+    if not os.path.lexists(path):
+        return {"present": False}
+    before = path.lstat()
+    private = name != _COMPLETED_MIGRATION_HISTORY_NAME
+    content = _read_completed_migration_auth_file(
+        root, name, private=private, max_bytes=_COMPLETED_MIGRATION_AUTH_MAX_BYTES,
+    )
+    after = path.lstat()
+    if (
+        content is None
+        or path.is_symlink()
+        or not stat.S_ISREG(after.st_mode)
+        or (before.st_dev, before.st_ino, before.st_nlink) != (after.st_dev, after.st_ino, after.st_nlink)
+    ):
+        raise ValueError("Completed migration claim transaction file is unsafe")
+    return {
+        "present": True,
+        "mode": stat.S_IMODE(after.st_mode),
+        "content": base64.b64encode(content).decode("ascii"),
+    }
+
+
+def begin_completed_migration_claim_journal(config_dir: str | Path) -> None:
+    root = Path(config_dir)
+    journal_path = root / _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME
+    if os.path.lexists(journal_path):
+        raise ValueError("Completed migration claim transaction recovery is required")
+    artifacts = {
+        name: _claim_journal_artifact(root, name)
+        for name in (
+            _COMPLETED_MIGRATION_STORE_NAME,
+            _COMPLETED_MIGRATION_HISTORY_NAME,
+            _COMPLETED_MIGRATION_CLAIM_MARKER_NAME,
+        )
+    }
+    payload = json.dumps({"schema": 1, "phase": "prepared", "artifacts": artifacts}, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if len(payload) > _COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES:
+        raise ValueError("Completed migration claim transaction is too large")
+    _write_completed_migration_private_file(root, _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME, payload)
+
+
+def commit_completed_migration_claim_journal(config_dir: str | Path) -> None:
+    root = Path(config_dir)
+    payload = _read_completed_migration_auth_file(
+        root, _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME, private=True,
+        max_bytes=_COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES,
+    )
+    if payload is None:
+        raise ValueError("Completed migration claim transaction is unavailable")
+    parsed = _strict_completed_migration_json(payload)
+    if parsed.get("schema") != 1 or parsed.get("phase") != "prepared" or not isinstance(parsed.get("artifacts"), dict):
+        raise ValueError("Completed migration claim transaction journal is invalid")
+    parsed["phase"] = "committed"
+    _write_completed_migration_private_file(
+        root,
+        _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME,
+        json.dumps(parsed, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+
+
+def recover_completed_migration_claim_journal(config_dir: str | Path) -> bool:
+    """Restore preclaim auth files after an interrupted completed-migration claim."""
+    root = Path(config_dir)
+    journal_path = root / _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME
+    payload = _read_completed_migration_auth_file(
+        root,
+        _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME,
+        private=True,
+        max_bytes=_COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES,
+    )
+    if payload is None:
+        return False
+    if len(payload) > _COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES:
+        raise ValueError("Completed migration claim transaction journal is invalid")
+    try:
+        parsed = _strict_completed_migration_json(payload)
+        artifacts = parsed.get("artifacts")
+        names = {
+            _COMPLETED_MIGRATION_STORE_NAME,
+            _COMPLETED_MIGRATION_HISTORY_NAME,
+            _COMPLETED_MIGRATION_CLAIM_MARKER_NAME,
+        }
+        phase = parsed.get("phase")
+        if parsed.get("schema") != 1 or phase not in ("prepared", "committed") or not isinstance(artifacts, dict) or set(artifacts) != names:
+            raise ValueError
+        if phase == "committed":
+            clear_completed_migration_claim_journal(root)
+            return False
+        for name in names:
+            artifact = artifacts[name]
+            if not isinstance(artifact, dict) or type(artifact.get("present")) is not bool:
+                raise ValueError
+            path = root / name
+            if artifact["present"]:
+                content, mode = artifact.get("content"), artifact.get("mode")
+                if not isinstance(content, str) or type(mode) is not int:
+                    raise ValueError
+                decoded = base64.b64decode(content.encode("ascii"), validate=True)
+                if len(decoded) > _COMPLETED_MIGRATION_AUTH_MAX_BYTES:
+                    raise ValueError
+                _write_completed_migration_private_file(root, name, decoded, mode)
+            elif os.path.lexists(path):
+                info = path.lstat()
+                if path.is_symlink() or not stat.S_ISREG(info.st_mode):
+                    raise ValueError
+                path.unlink()
+        journal_path.unlink()
+        if os.name == "posix":
+            directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        return True
+    except (OSError, TypeError, ValueError, binascii.Error) as exc:
+        raise ValueError("Completed migration claim transaction journal is invalid") from exc
+
+
+def _fsync_completed_migration_directory(root: Path) -> None:
+    if os.name != "posix":
+        return
+    directory = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def clear_completed_migration_claim_journal(config_dir: str | Path) -> None:
+    root = Path(config_dir)
+    journal_path = root / _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME
+    if not os.path.lexists(journal_path):
+        raise ValueError("Completed migration claim transaction is unavailable")
+    info = journal_path.lstat()
+    if journal_path.is_symlink() or not stat.S_ISREG(info.st_mode):
+        raise ValueError("Completed migration claim transaction file is unsafe")
+    journal_path.unlink()
+    _fsync_completed_migration_directory(root)
 
 
 def validate_completed_migration_claimed_auth_state(config_dir: str | Path, binding: object) -> None:
@@ -462,6 +659,20 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
             remembered_claim = remembered_claim or details.get("api_key_id") == key_id
     if not initial_claim or not remembered_claim:
         raise _completed_migration_claim_error()
+
+
+def completed_migration_claimed_browser_handover_version(config_dir: str | Path) -> str:
+    """Read the already-validated completed-migration marker version."""
+    root = Path(config_dir)
+    marker_bytes = _read_completed_migration_auth_file(
+        root, _COMPLETED_MIGRATION_CLAIM_MARKER_NAME, private=True,
+    )
+    if marker_bytes is None:
+        raise _completed_migration_claim_error()
+    version = _strict_completed_migration_json(marker_bytes).get("browser_handover_version")
+    if not isinstance(version, str) or not version.strip():
+        raise _completed_migration_claim_error()
+    return version.strip()
 
 
 def _normalize_scopes(scopes: object) -> List[str]:
@@ -580,6 +791,16 @@ class BootstrapExchangeRecord:
     expires_at: str = ""
 
 
+@dataclass
+class _CompletedMigrationClaimRuntimeState:
+    api_keys: List[ApiKeyRecord]
+    ui_sessions: Dict[str, UiSessionRecord]
+    browser_handover_claimed_version: str
+    bootstrap_proof: Optional[BootstrapProofRecord]
+    bootstrap_exchange: Optional[BootstrapExchangeRecord]
+    transition_binding: Optional[Dict[str, str]]
+
+
 class ApiKeyStore(Persist):
     __KEY_VERSION = "version"
     __KEY_API_KEYS = "api_keys"
@@ -596,6 +817,8 @@ class ApiKeyStore(Persist):
         self.__bootstrap_proof: Optional[BootstrapProofRecord] = None
         self.__bootstrap_exchange: Optional[BootstrapExchangeRecord] = None
         self.__completed_migration_transition_binding: Optional[Dict[str, str]] = None
+        self.__completed_migration_claimed_handover_version = ""
+        self.__completed_migration_claim_transaction: Optional[_CompletedMigrationClaimRuntimeState] = None
 
     @property
     def file_path(self) -> Optional[str]:
@@ -613,6 +836,80 @@ class ApiKeyStore(Persist):
             raise ValueError("Completed migration claim transition requires a bound auth store")
         self.__completed_migration_transition_binding = _completed_migration_transition_binding(binding)
 
+    def bind_completed_migration_claimed_handover_version(self, version: object) -> None:
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError("Completed migration claimed handover version is invalid")
+        self.__completed_migration_claimed_handover_version = version.strip()
+
+    def effective_browser_handover_version(self, config: object) -> str:
+        """Return the configured replay version or a stable completed-migration claim id."""
+        configured = self.__configured_browser_handover_version(config)
+        if configured:
+            return configured
+        binding = self.__completed_migration_transition_binding
+        if binding is not None:
+            return _migration_claim_browser_handover_version(binding)
+        return self.__completed_migration_claimed_handover_version
+
+    def validate_completed_migration_claim_transition(self, browser_handover_version: object) -> None:
+        """Validate transition prerequisites before first-admin state mutates."""
+        binding = self.__completed_migration_transition_binding
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        if binding is None:
+            return
+        if not version or self.__file_path is None:
+            raise ValueError("Completed migration claim transition is unavailable")
+        if completed_migration_claim_marker_exists(Path(self.__file_path).parent):
+            raise ValueError("Completed migration claim transition is unavailable")
+
+    def begin_completed_migration_claim_transaction(self) -> bool:
+        """Journal the preclaim state before any completed-migration auth mutation."""
+        with self.__state_lock:
+            if self.__completed_migration_transition_binding is None:
+                return False
+            if self.__file_path is None or self.__completed_migration_claim_transaction is not None:
+                raise ValueError("Completed migration claim transition is unavailable")
+            begin_completed_migration_claim_journal(Path(self.__file_path).parent)
+            self.__completed_migration_claim_transaction = _CompletedMigrationClaimRuntimeState(
+                api_keys=copy.deepcopy(self.__api_keys),
+                ui_sessions=copy.deepcopy(self.__ui_sessions),
+                browser_handover_claimed_version=self.__browser_handover_claimed_version,
+                bootstrap_proof=copy.deepcopy(self.__bootstrap_proof),
+                bootstrap_exchange=copy.deepcopy(self.__bootstrap_exchange),
+                transition_binding=copy.deepcopy(self.__completed_migration_transition_binding),
+            )
+            return True
+
+    def abort_completed_migration_claim_transaction(self) -> None:
+        """Use the durable journal to abandon a failed claim in this process."""
+        with self.__state_lock:
+            state = self.__completed_migration_claim_transaction
+            if state is None or self.__file_path is None:
+                return
+            recover_completed_migration_claim_journal(Path(self.__file_path).parent)
+            self.__api_keys = copy.deepcopy(state.api_keys)
+            self.__ui_sessions = copy.deepcopy(state.ui_sessions)
+            self.__browser_handover_claimed_version = state.browser_handover_claimed_version
+            self.__bootstrap_proof = copy.deepcopy(state.bootstrap_proof)
+            self.__bootstrap_exchange = copy.deepcopy(state.bootstrap_exchange)
+            self.__completed_migration_transition_binding = copy.deepcopy(state.transition_binding)
+            self.__completed_migration_claim_transaction = None
+            self.__sync_bootstrap_proof_artifact()
+
+    def finish_completed_migration_claim_transaction(self) -> None:
+        with self.__state_lock:
+            if self.__completed_migration_claim_transaction is None or self.__file_path is None:
+                raise ValueError("Completed migration claim transition is unavailable")
+            root = Path(self.__file_path).parent
+            commit_completed_migration_claim_journal(root)
+            self.__completed_migration_claim_transaction = None
+            # Cleanup is advisory after the durable committed phase.  A later
+            # startup consumes it before claimed-lineage validation.
+            try:
+                clear_completed_migration_claim_journal(root)
+            except OSError:
+                pass
+
     def complete_completed_migration_claim_transition(
         self, initial_admin_key_id: object, browser_handover_version: object,
     ) -> None:
@@ -620,7 +917,8 @@ class ApiKeyStore(Persist):
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
         if binding is None:
             return
-        if not isinstance(initial_admin_key_id, str) or not version:
+        self.validate_completed_migration_claim_transition(version)
+        if not isinstance(initial_admin_key_id, str):
             raise ValueError("Completed migration claim transition is unavailable")
         record = self.get_api_key(initial_admin_key_id)
         if (
@@ -635,10 +933,15 @@ class ApiKeyStore(Persist):
             "initial_admin_key_id": record.id,
         }
         _write_completed_migration_claim_marker(Path(self.__file_path).parent, payload)
+        self.__completed_migration_claimed_handover_version = version
         self.__completed_migration_transition_binding = None
 
     def __record_history_event(self, event: str, reason: str, **details: object) -> None:
-        append_api_key_store_history(self.__file_path, event, reason, **details)
+        append_api_key_store_history(
+            self.__file_path, event, reason,
+            required=self.__completed_migration_claim_transaction is not None,
+            **details,
+        )
 
     def __history_snapshot(self) -> Dict[str, object]:
         return {
@@ -892,7 +1195,7 @@ class ApiKeyStore(Persist):
         self.claim_initial_admin_if_available(browser_handover_version)
 
     def get_browser_handover_state(self, config: object) -> Dict[str, object]:
-        version = self.__get_browser_handover_version(config)
+        version = self.effective_browser_handover_version(config)
         return {
             "configured_version": version,
             "claimed_version": self.__browser_handover_claimed_version,
@@ -1124,7 +1427,14 @@ class ApiKeyStore(Persist):
         directory = os.path.dirname(self.__file_path)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        self.to_file(self.__file_path)
+        if self.__completed_migration_claim_transaction is not None:
+            _write_completed_migration_private_file(
+                Path(self.__file_path).parent,
+                Path(self.__file_path).name,
+                self.to_str().encode("utf-8"),
+            )
+        else:
+            self.to_file(self.__file_path)
         self.__record_history_event("store_saved", "persisted", **self.__history_snapshot())
 
     @classmethod
@@ -1304,9 +1614,9 @@ class ApiKeyStore(Persist):
             json.dump(payload, handle, indent=2)
 
     @staticmethod
-    def __get_browser_handover_version(config: object) -> str:
+    def __configured_browser_handover_version(config: object) -> str:
         general_config = getattr(config, "general", None)
         if general_config is None:
             return ""
         browser_handover_version = getattr(general_config, "browser_handover_recovery_version", "")
-        return browser_handover_version if isinstance(browser_handover_version, str) else ""
+        return browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""

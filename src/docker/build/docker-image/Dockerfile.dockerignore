@@ -15,7 +15,9 @@ docker-compose*.yml
 .git
 .idea
 build
+tmp
 src/angular/dist
+src/angular/.angular/cache
 src/python/tests
 src/python/build
 .ruff_cache

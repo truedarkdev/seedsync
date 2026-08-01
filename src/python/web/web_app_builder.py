@@ -19,6 +19,7 @@ from .handler.status import StatusHandler
 from .handler.path_pairs import PathPairsHandler
 from .handler.breadcrumb_trace import BreadcrumbTraceHandler
 from .handler.notifications import NotificationsAdminHandler
+from .handler.migration_recovery import MigrationRecoveryHandler
 from .handler.historical_log import HistoricalLogHandler, HistoricalLogStore
 
 
@@ -52,7 +53,8 @@ class WebAppBuilder:
                  controller: Controller,
                  auto_queue_persist: AutoQueuePersist,
                  auth_store: Optional[ApiKeyStore] = None,
-                 notifier: Optional[NotificationService] = None) -> None:
+                 notifier: Optional[NotificationService] = None,
+                 migration_coordinator: object | None = None) -> None:
         self.__context = context
         self.__controller = controller
         self.__auth_store = auth_store
@@ -78,10 +80,15 @@ class WebAppBuilder:
         ) if history_path else None
         self.admin_handler = None
         self.notifications_admin_handler = None
+        self.migration_recovery_handler = None
         if self.__auth_store is not None:
             self.admin_handler = AdminHandler(context.config, self.__auth_store)
             if notifier is not None:
                 self.notifications_admin_handler = NotificationsAdminHandler(context.config, notifier)
+            if migration_coordinator is not None:
+                self.migration_recovery_handler = MigrationRecoveryHandler(
+                    migration_coordinator, self.server_handler.request_recovery_restore,
+                )
         self.path_pairs_handler = None
         path_pair_manager = getattr(context, "path_pair_manager", None)
         if path_pair_manager is not None:
@@ -123,6 +130,8 @@ class WebAppBuilder:
             self.admin_handler.add_routes(web_app)
         if self.notifications_admin_handler is not None:
             self.notifications_admin_handler.add_routes(web_app)
+        if self.migration_recovery_handler is not None:
+            self.migration_recovery_handler.add_routes(web_app)
         if self.path_pairs_handler is not None:
             self.path_pairs_handler.add_routes(web_app)
 

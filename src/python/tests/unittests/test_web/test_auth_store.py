@@ -4,8 +4,14 @@ import unittest
 import json
 import threading
 
-from common import PersistError
-from web.auth_store import ApiKeyStore
+from common import Config, PersistError
+from web.auth_store import (
+    ApiKeyStore,
+    begin_completed_migration_claim_journal,
+    completed_migration_claimed_browser_handover_version,
+    recover_completed_migration_claim_journal,
+    validate_completed_migration_claimed_auth_state,
+)
 
 
 def _read_history_entries(file_path):
@@ -19,6 +25,74 @@ def _read_history_entries(file_path):
 
 
 class TestApiKeyStore(unittest.TestCase):
+    def test_long_migration_id_uses_bounded_claim_version_across_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            binding = {
+                "migration_id": "m" + "a" * 159,
+                "backup": "migration-backups/long-migration-boundary",
+                "receipt_sha256": "a" * 64,
+                "backup_manifest_sha256": "b" * 64,
+            }
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            store.bind_completed_migration_claim_transition(binding)
+            version = store.effective_browser_handover_version(Config())
+            self.assertLessEqual(len(version), 160)
+            self.assertTrue(store.begin_completed_migration_claim_transaction())
+            created = store.create_initial_admin_api_key_if_available(version, "migration-admin")
+            self.assertIsNotNone(created)
+            assert created is not None
+            store.create_remembered_browser_session_for_api_key(created["record"].id)
+            store.complete_completed_migration_claim_transition(created["record"].id, version)
+            store.finish_completed_migration_claim_transaction()
+            validate_completed_migration_claimed_auth_state(temp_dir, binding)
+            restarted = ApiKeyStore.from_file(store_path)
+            restarted.bind_completed_migration_claimed_handover_version(
+                completed_migration_claimed_browser_handover_version(temp_dir)
+            )
+            self.assertFalse(restarted.get_browser_handover_state(Config())["open"])
+
+    def test_blank_config_reopens_ordinary_claim_but_not_explicit_claimed_migration(self):
+        config = Config()
+        ordinary = ApiKeyStore()
+        self.assertIsNotNone(ordinary.create_initial_admin_api_key_if_available("r1", "admin"))
+        ordinary_state = ordinary.get_browser_handover_state(config)
+        self.assertEqual("", ordinary_state["configured_version"])
+        self.assertTrue(ordinary_state["open"])
+
+        claimed_migration = ApiKeyStore()
+        self.assertIsNotNone(claimed_migration.create_initial_admin_api_key_if_available("migration-claim-v1", "admin"))
+        claimed_migration.bind_completed_migration_claimed_handover_version("migration-claim-v1")
+        migration_state = claimed_migration.get_browser_handover_state(config)
+        self.assertEqual("migration-claim-v1", migration_state["configured_version"])
+        self.assertFalse(migration_state["open"])
+
+    def test_completed_migration_claim_journal_reads_valid_over_64k_payload(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            history_path = os.path.join(temp_dir, "api-keys.history.jsonl")
+            store_payload = b'{"version":3,"api_keys":[],"ui_sessions":[],"browser_handover_claimed_version":""}'
+            history_payload = b"x" * (60 * 1024)
+            with open(store_path, "wb") as handle:
+                handle.write(store_payload)
+            with open(history_path, "wb") as handle:
+                handle.write(history_payload)
+            if os.name == "posix":
+                os.chmod(store_path, 0o600)
+
+            begin_completed_migration_claim_journal(temp_dir)
+            journal_path = os.path.join(temp_dir, ".migration-claim-auth.journal.json")
+            self.assertGreater(os.path.getsize(journal_path), 64 * 1024)
+            with open(history_path, "wb") as handle:
+                handle.write(b"interrupted claim residue")
+
+            self.assertTrue(recover_completed_migration_claim_journal(temp_dir))
+            with open(store_path, "rb") as handle:
+                self.assertEqual(store_payload, handle.read())
+            with open(history_path, "rb") as handle:
+                self.assertEqual(history_payload, handle.read())
+            self.assertFalse(os.path.exists(journal_path))
+
     def test_create_update_revoke_and_rotate_persist_without_raw_secret(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store_path = os.path.join(temp_dir, "api-keys.json")

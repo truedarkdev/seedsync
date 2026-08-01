@@ -14,6 +14,7 @@ from unittest.mock import patch
 from common import Config, PathPairManager, ServiceExit
 from controller import AutoQueuePersist, ControllerPersist
 from migration import (
+    BackupRestoreError,
     MigrationBlockedError,
     MigrationCoordinator,
     MigrationDecision,
@@ -456,6 +457,87 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual(MigrationState.COMPLETE, restarted.state)
         self.assertTrue(restarted.allows_normal_startup)
 
+    def _assert_interrupted_completed_claim_recovers_to_preclaim(self, *, after_remembered_session: bool) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        before = self._tree_bytes(self.root)
+        store = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
+        store.bind_completed_migration_claim_transition(coordinator.completed_auth_transition_binding())
+        self.assertTrue(store.begin_completed_migration_claim_transaction())
+        created = store.create_initial_admin_api_key_if_available("migration-claim-v1", "migration-admin")
+        self.assertIsNotNone(created)
+        assert created is not None
+        if after_remembered_session:
+            store.create_remembered_browser_session_for_api_key(created["record"].id)
+
+        restarted = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertEqual("preclaim", restarted.completed_auth_phase)
+        self.assertEqual(before, self._tree_bytes(self.root))
+
+    def test_completed_claim_interruption_after_initial_key_recovers_before_preclaim_validation(self) -> None:
+        self._assert_interrupted_completed_claim_recovers_to_preclaim(after_remembered_session=False)
+
+    def test_completed_claim_interruption_after_remembered_session_recovers_before_preclaim_validation(self) -> None:
+        self._assert_interrupted_completed_claim_recovers_to_preclaim(after_remembered_session=True)
+
+    def test_completed_claim_required_history_failures_are_restartable_preclaim(self) -> None:
+        from web import auth_store as auth_store_module
+
+        original_append = auth_store_module.append_api_key_store_history
+        for failing_write in range(1, 5):
+            with self.subTest(failing_write=failing_write):
+                root = self.root / "history-failure-{}".format(failing_write)
+                MigrationFixture(root).write()
+                coordinator = MigrationCoordinator(root)
+                self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+                before = self._tree_bytes(root)
+                store = ApiKeyStore(file_path=str(root / "api-keys.json"))
+                store.bind_completed_migration_claim_transition(coordinator.completed_auth_transition_binding())
+                self.assertTrue(store.begin_completed_migration_claim_transaction())
+                required_write_count = 0
+
+                def append_with_failure(file_path, event, reason, *, required=False, **details):
+                    nonlocal required_write_count
+                    if required:
+                        required_write_count += 1
+                        if required_write_count == failing_write:
+                            raise ValueError("forced required history failure")
+                    return original_append(file_path, event, reason, required=required, **details)
+
+                with patch("web.auth_store.append_api_key_store_history", side_effect=append_with_failure):
+                    with self.assertRaises(ValueError):
+                        created = store.create_initial_admin_api_key_if_available("migration-claim-v1", "migration-admin")
+                        if created is not None:
+                            store.create_remembered_browser_session_for_api_key(created["record"].id)
+
+                restarted = MigrationCoordinator(root).preflight()
+                self.assertEqual(MigrationState.COMPLETE, restarted.state)
+                self.assertEqual("preclaim", restarted.completed_auth_phase)
+                self.assertEqual(before, self._tree_bytes(root))
+
+    def test_committed_claim_cleanup_fsync_failure_preserves_claimed_restart(self) -> None:
+        MigrationFixture(self.root).write()
+        coordinator = MigrationCoordinator(self.root)
+        self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+        store = ApiKeyStore(file_path=str(self.root / "api-keys.json"))
+        store.bind_completed_migration_claim_transition(coordinator.completed_auth_transition_binding())
+        self.assertTrue(store.begin_completed_migration_claim_transaction())
+        created = store.create_initial_admin_api_key_if_available("migration-claim-v1", "migration-admin")
+        self.assertIsNotNone(created)
+        assert created is not None
+        store.create_remembered_browser_session_for_api_key(created["record"].id)
+        store.complete_completed_migration_claim_transition(created["record"].id, "migration-claim-v1")
+
+        with patch("web.auth_store._fsync_completed_migration_directory", side_effect=OSError("after unlink")):
+            store.finish_completed_migration_claim_transaction()
+
+        self.assertFalse((self.root / ".migration-claim-auth.journal.json").exists())
+        restarted = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertEqual("claimed", restarted.completed_auth_phase)
+
     def test_completed_migration_exit_probe_is_repeatedly_finite_and_restartable(self) -> None:
         MigrationFixture(self.root).write()
         self.assertEqual(MigrationState.COMPLETE, MigrationCoordinator(self.root).apply_confirmed().state)
@@ -507,6 +589,95 @@ class TestMigrationCoordinator(unittest.TestCase):
             decision = MigrationCoordinator(self.root).preflight()
         self.assertEqual(MigrationState.COMPLETE, decision.state)
         self.assertEqual("claimed", decision.completed_auth_phase)
+
+    def test_claimed_completed_migration_can_arm_and_consume_only_its_receipt_backup(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        eligibility = coordinator.recovery_eligibility()
+        self.assertTrue(eligibility["eligible"])
+        self.assertEqual("original-v0.8.6-to-current-v1", eligibility["migration_id"])
+
+        coordinator.request_recovery_restore(
+            confirmation=eligibility["confirmation"], other_instances_stopped=True,
+        )
+        intent_path = self.root / ".migration-recovery-intent.json"
+        self.assertTrue(intent_path.is_file())
+        if os.name == "posix":
+            self.assertEqual(0, stat.S_IMODE(intent_path.stat().st_mode) & 0o077)
+
+        with RuntimeExclusion(self.root, "normal-runtime"):
+            with self.assertRaises(BackupRestoreError):
+                coordinator.consume_recovery_restore_intent()
+        self.assertTrue(intent_path.exists())
+
+        self.assertTrue(coordinator.consume_recovery_restore_intent())
+        self.assertFalse(intent_path.exists())
+        restored = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.REQUIRED, restored.state)
+
+    def test_recovery_intent_rejects_client_like_backup_tampering_before_restore(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        eligibility = coordinator.recovery_eligibility()
+        coordinator.request_recovery_restore(
+            confirmation=eligibility["confirmation"], other_instances_stopped=True,
+        )
+        intent_path = self.root / ".migration-recovery-intent.json"
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        intent["backup"] = "migration-backups/not-a-receipt-backup"
+        intent_path.write_text(json.dumps(intent), encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(intent_path, 0o600)
+
+        with self.assertRaises(ValueError):
+            coordinator.consume_recovery_restore_intent()
+        self.assertTrue(intent_path.exists())
+
+    def test_recovery_intent_requires_exact_visible_confirmation_phrase(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        eligibility = coordinator.recovery_eligibility()
+        with self.assertRaises(ValueError):
+            coordinator.request_recovery_restore(
+                confirmation=eligibility["confirmation"] + " now", other_instances_stopped=True,
+            )
+        self.assertFalse((self.root / ".migration-recovery-intent.json").exists())
+
+    def test_recovery_intent_survives_failure_after_receipt_cleanup_before_final_inventory(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        eligibility = coordinator.recovery_eligibility()
+        coordinator.request_recovery_restore(
+            confirmation=eligibility["confirmation"], other_instances_stopped=True,
+        )
+        intent_path = self.root / ".migration-recovery-intent.json"
+
+        with patch("migration.backup_restore._walk_inventory", side_effect=BackupRestoreError("injected final inventory failure")):
+            with self.assertRaises(BackupRestoreError):
+                coordinator.consume_recovery_restore_intent()
+
+        intent = json.loads(intent_path.read_text(encoding="utf-8"))
+        self.assertEqual("converging", intent["phase"])
+        self.assertFalse((self.root / "migration-state.json").exists())
+        self.assertFalse((self.root / ".migration-restore.json").exists())
+
+        self.assertTrue(coordinator.consume_recovery_restore_intent())
+        self.assertFalse(intent_path.exists())
+        self.assertEqual(MigrationState.REQUIRED, MigrationCoordinator(self.root).preflight().state)
+
+    def test_recovery_intent_survives_failure_after_final_inventory_before_intent_cleanup(self) -> None:
+        coordinator, _ = self._complete_migrated_browser_claim(self.root)
+        eligibility = coordinator.recovery_eligibility()
+        coordinator.request_recovery_restore(
+            confirmation=eligibility["confirmation"], other_instances_stopped=True,
+        )
+        intent_path = self.root / ".migration-recovery-intent.json"
+
+        with patch.object(coordinator, "_consume_recovery_intent_after_restore", side_effect=OSError("injected intent cleanup failure")):
+            with self.assertRaises(OSError):
+                coordinator.consume_recovery_restore_intent()
+
+        self.assertTrue(intent_path.exists())
+        self.assertFalse((self.root / "migration-state.json").exists())
+        self.assertFalse((self.root / ".migration-restore.json").exists())
+        self.assertTrue(coordinator.consume_recovery_restore_intent())
+        self.assertFalse(intent_path.exists())
 
     def test_completed_claim_marker_rejects_active_auth_before_transition_and_tampering(self) -> None:
         active_root = self.root / "active-before-marker"

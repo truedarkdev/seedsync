@@ -155,6 +155,10 @@ class WebApp(bottle.Bottle):
         self.route("/autoqueue")(self.__index)
         self.route("/logs")(self.__index)
         self.route("/about")(self.__index)
+        # This standalone recovery checkpoint intentionally has no normal
+        # router/nav entry.  It still serves the shared Angular shell, but the
+        # page itself requires an authenticated admin browser session.
+        self.route("/migration/recovery")(self.__migration_recovery_index)
         # For static files
         self.route("/<file_path:path>")(self.__static)
 
@@ -326,11 +330,9 @@ class WebApp(bottle.Bottle):
         return remote_addrs if isinstance(remote_addrs, str) else ""
 
     def __get_browser_handover_version(self) -> str:
-        general_config = getattr(self.__config, "general", None)
-        if general_config is None:
+        if self.__auth_store is None:
             return ""
-        browser_handover_version = getattr(general_config, "browser_handover_recovery_version", "")
-        return browser_handover_version if isinstance(browser_handover_version, str) else ""
+        return self.__auth_store.effective_browser_handover_version(self.__config)
 
     def __is_browser_handover_open(self) -> bool:
         if self.__auth_store is None:
@@ -1306,6 +1308,14 @@ class WebApp(bottle.Bottle):
         :return:
         """
         return self.__index()
+
+    def __migration_recovery_index(self) -> bottle.HTTPResponse:
+        self.__authorize_browser_bootstrap()
+        session_scopes = self.__get_ui_session_scopes()
+        if session_scopes is None:
+            bottle.redirect("/bootstrap")
+        self.__authorize_scopes("admin", session_scopes)
+        return self.__static("index.html")
 
     # noinspection PyMethodMayBeStatic
     def __static(self, file_path: str) -> bottle.HTTPResponse:

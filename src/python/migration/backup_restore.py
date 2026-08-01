@@ -49,6 +49,7 @@ MAX_MANIFEST_BYTES = 4 * 1024 * 1024
 _EXCLUDED_TOP_LEVEL_NAMES = frozenset({
     BACKUP_ROOT_NAME,
     ".migration.lock",
+    ".migration-recovery-intent.json",
     ".seedsync.runtime.lock",
     "migration-state.json",
     RESTORE_JOURNAL_NAME,
@@ -2069,7 +2070,10 @@ def _restore_backup_convergence(
         relative = PurePosixPath(child.name)
         if child.name in {"migration-state.json", RESTORE_JOURNAL_NAME} or (
             is_migration_infrastructure(relative)
-            and child.name not in {BACKUP_ROOT_NAME, ".migration.lock", ".seedsync.runtime.lock"}
+            and child.name not in {
+                BACKUP_ROOT_NAME, ".migration.lock", ".migration-recovery-intent.json",
+                ".seedsync.runtime.lock",
+            }
         ):
             if child.exists() or child.is_symlink():
                 _assert_root_identity(config_root, root_identity)

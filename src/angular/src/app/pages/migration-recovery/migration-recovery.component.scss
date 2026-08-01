@@ -1,0 +1,49 @@
+@use '../../common/common' as *;
+
+:host { display: block; min-height: 100vh; color: #25313b; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+.recovery-page { min-height: 100vh; display: grid; place-items: center; padding: 32px; background: #f4f6f5; }
+.recovery-shell { width: min(720px, 100%); overflow: hidden; border-top: 4px solid #a84335; border-radius: 14px; background: #fff; box-shadow: 0 18px 46px rgba(31,42,51,.12); animation: settle .28s ease-out both; }
+.recovery-brand { display: flex; align-items: center; gap: 11px; padding: 27px 34px 18px; border-bottom: 1px solid rgba(31,42,51,.09); color: $logo-color; font-family: $logo-font; font-size: 32px; letter-spacing: -1px; }
+.recovery-brand img { object-fit: contain; }
+.recovery-content { padding: 38px 34px 34px; }
+.eyebrow { margin: 0 0 9px; color: #a84335; font-size: 11px; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }
+h1, h2, p, dd { overflow-wrap: anywhere; }
+h1 { margin: 0; color: #1a2b39; font-size: clamp(30px, 5vw, 42px); line-height: 1.08; letter-spacing: -.03em; }
+h2 { margin: 0; font-size: 18px; }
+.orientation { max-width: 610px; margin: 15px 0 0; color: #52636f; font-size: 15px; line-height: 1.6; }
+.recovery-details { margin-top: 27px; border-top: 1px solid #dbe1e4; border-bottom: 1px solid #dbe1e4; }
+dl { margin: 0; }
+dl div { display: grid; grid-template-columns: 145px minmax(0, 1fr); gap: 16px; padding: 14px 0; border-bottom: 1px solid #edf0f1; }
+dl div:last-child { border-bottom: 0; }
+dt { color: #687780; font-size: 11px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
+dd { margin: 0; color: #283c4a; font-size: 14px; line-height: 1.45; }
+.danger-zone { margin-top: 28px; padding-left: 18px; border-left: 3px solid #a84335; }
+.attestation { display: flex; align-items: flex-start; gap: 10px; color: #43535d; font-size: 13px; line-height: 1.5; }
+.attestation input { margin-top: 3px; accent-color: #a84335; }
+.confirmation-phrase { display: grid; gap: 7px; margin-top: 16px; color: #43535d; font-size: 13px; line-height: 1.45; }
+.confirmation-phrase code { color: #6d2e26; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.confirmation-phrase input { min-height: 39px; max-width: 440px; padding: 8px 10px; border: 1px solid #bdc8ce; border-radius: 4px; color: #283c4a; font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.confirmation-phrase input:focus { border-color: #a84335; outline: 3px solid rgba(168,67,53,.14); }
+.actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-top: 20px; }
+button { min-height: 40px; padding: 8px 15px; border-radius: 4px; font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+button:focus-visible { outline: 3px solid rgba(168,67,53,.28); outline-offset: 2px; }
+.danger-action { border: 1px solid #8c352a; color: #fff; background: #a84335; }
+.danger-action:hover:not(:disabled) { background: #8c352a; }
+.danger-action:disabled { opacity: .55; cursor: not-allowed; }
+.quiet-action { border: 1px solid #bdc8ce; color: #344b5a; background: #fff; }
+.quiet-action:hover { border-color: #71828d; }
+.action-error { margin: 14px 0 0; color: #a84335; font-size: 13px; line-height: 1.45; }
+.recovery-loading, .recovery-reconnecting { display: flex; align-items: flex-start; gap: 12px; color: #52636f; }
+.recovery-reconnecting h1 { font-size: clamp(27px, 4vw, 36px); }
+.recovery-reconnecting p:last-child, .recovery-error p, .recovery-unavailable p { color: #596a75; line-height: 1.55; }
+.reconnect-timeout { margin-top: 15px; padding: 13px; border-left: 3px solid #a84335; background: #fdf9f8; }
+.reconnect-timeout p { margin-top: 0; }
+.recovery-error .quiet-action { margin-top: 14px; }
+.recovery-unavailable { margin-top: 26px; padding: 19px; border: 1px solid #d9c6c2; background: #fdf9f8; }
+.recovery-unavailable p { margin: 8px 0 0; font-size: 14px; }
+footer { padding: 18px 34px 25px; border-top: 1px solid rgba(31,42,51,.09); color: #687780; font-size: 12px; line-height: 1.5; }
+.spinner { width: 20px; height: 20px; flex: 0 0 20px; border: 2px solid rgba(168,67,53,.22); border-top-color: #a84335; border-radius: 50%; animation: spin .75s linear infinite; }
+@keyframes settle { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (max-width: 600px) { .recovery-page { display: block; padding: 12px; } .recovery-brand, .recovery-content { padding-left: 21px; padding-right: 21px; } footer { padding-left: 21px; padding-right: 21px; } dl div { grid-template-columns: 1fr; gap: 4px; } .actions { align-items: stretch; flex-direction: column; } .actions button { width: 100%; } }
+@media (prefers-reduced-motion: reduce) { .recovery-shell, .spinner { animation: none; } }

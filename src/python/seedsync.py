@@ -94,6 +94,12 @@ class Seedsync:
         # Migration preflight must precede every loader that can normalize,
         # back up, or persist legacy state.
         self.migration_coordinator = MigrationCoordinator(args.config_dir)
+        try:
+            self.migration_coordinator.consume_recovery_restore_intent()
+        except (BackupRestoreError, OSError, ValueError) as exc:
+            raise SystemExit(
+                "Migration recovery restore is incomplete or unsafe; normal startup remains blocked: {}".format(exc)
+            ) from exc
         self.migration_decision: MigrationDecision = self.migration_coordinator.preflight()
         if not self.migration_decision.allows_normal_startup:
             # Docker/package entrypoints use --exit for a short bootstrap probe
@@ -214,6 +220,10 @@ class Seedsync:
             self.api_key_store.bind_completed_migration_claim_transition(
                 self.migration_coordinator.completed_auth_transition_binding(),
             )
+        elif self.migration_decision.completed_auth_phase == "claimed":
+            self.api_key_store.bind_completed_migration_claimed_handover_version(
+                self.migration_coordinator.completed_claimed_auth_handover_version(),
+            )
         self.api_key_store.bind_bootstrap_proof_path(
             os.path.join(tempfile.gettempdir(), Seedsync.__FILE_BOOTSTRAP_PROOF)
         )
@@ -260,7 +270,8 @@ class Seedsync:
 
         # Create web app
         web_app_builder = WebAppBuilder(
-            self.context, controller, self.auto_queue_persist, self.api_key_store, notifier=notifier
+            self.context, controller, self.auto_queue_persist, self.api_key_store, notifier=notifier,
+            migration_coordinator=getattr(self, "migration_coordinator", None),
         )
         web_app = web_app_builder.build()
 
@@ -324,6 +335,8 @@ class Seedsync:
                     controller_job.propagate_exception()
 
                 # Check if a restart is requested
+                if web_app_builder.server_handler.is_recovery_restore_requested() is True:
+                    raise ServiceRestart()
                 if web_app_builder.server_handler.is_restart_requested():
                     if controller_start_isolated:
                         self.context.logger.warning(
