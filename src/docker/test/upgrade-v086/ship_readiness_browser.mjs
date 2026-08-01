@@ -33,6 +33,32 @@ if (process.argv[2] === '--shutdown-self-check') {
   }
 }
 
+function firstClaimSseRecoveryState(connections, errorObservedAfterMs, expectedOrigin) {
+  const afterError = connections.filter(connection => connection.observedAfterMs > errorObservedAfterMs);
+  const postError = afterError.filter(connection => connection.origin === expectedOrigin);
+  return {
+    ignoredOtherOriginCount: afterError.length - postError.length,
+    attemptCount: postError.length,
+    statuses: postError.map(connection => connection.status),
+    recovery: postError.find(connection => connection.status === 200 && connection.contentType === 'text/event-stream'),
+  };
+}
+
+if (process.argv[2] === '--first-claim-sse-recovery-self-check') {
+  const origin = 'http://127.0.0.1:18816';
+  const state = firstClaimSseRecoveryState([
+    { observedAfterMs: 900, origin, status: 200, contentType: 'text/event-stream' },
+    { observedAfterMs: 1000, origin, status: 200, contentType: 'text/event-stream' },
+    { observedAfterMs: 1200, origin: 'http://other.invalid', status: 200, contentType: 'text/event-stream' },
+    { observedAfterMs: 1400, origin, status: 200, contentType: 'text/event-stream' },
+  ], 1000, origin);
+  if (state.attemptCount !== 1 || state.ignoredOtherOriginCount !== 1 || state.recovery?.observedAfterMs !== 1400) {
+    throw new Error('early same-origin post-error SSE recovery was not selected exactly');
+  }
+  process.stdout.write(JSON.stringify({ recoveryObservedAfterMs: state.recovery.observedAfterMs }) + '\n');
+  process.exit(0);
+}
+
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.SEEDSYNC_PLAYWRIGHT_MODULE || 'playwright');
 
@@ -43,6 +69,7 @@ if (process.argv[2] === '--dispatch-check') {
 
 const [baseUrl, evidenceDir, mode = 'claim'] = process.argv.slice(2);
 if (!baseUrl || !evidenceDir) throw new Error('usage: ship_readiness_browser.mjs <base-url> <evidence-dir>');
+const expectedStreamOrigin = new URL(baseUrl).origin;
 const evidenceHelper = process.env.SEEDSYNC_SHIP_EVIDENCE_HELPER;
 if (!evidenceHelper) throw new Error('SEEDSYNC_SHIP_EVIDENCE_HELPER is required for retained browser evidence');
 const screenshotRunId = process.env.SEEDSYNC_SHIP_RUN_ID;
@@ -67,10 +94,9 @@ const streamTransitionEvidence = [];
 const apiEvidence = {};
 const navigation = [];
 const browserStartedAt = Date.now();
-const sseReconnectMinimumMs = 2800;
-// The client retries SSE after three seconds.  Under container restart/load the
-// observed recovery is later than one retry, so allow bounded state progress
-// through several retry opportunities instead of accepting a fixed page-age.
+// Allow bounded state progress through several retry opportunities. Recovery
+// may also be immediate when post-claim navigation opens a fresh stream before
+// the client's timed retry would be needed.
 const sseReconnectMaximumMs = 25000;
 const sseRecoveryPollMs = 200;
 const sseStabilityWindowMs = 1500;
@@ -293,23 +319,13 @@ async function observeFirstClaimSseRecovery() {
   const error = matching[0];
   const transition = {
     kind: 'first-claim-sse-transport', matchingCount: matching.length, classification: 'recovery-pending',
-    errorObservedAfterMs: error.observedAfterMs, minimumRetryMs: sseReconnectMinimumMs,
-    maximumRecoveryMs: sseReconnectMaximumMs, pollIntervalMs: sseRecoveryPollMs, pollCount: 0,
+    errorObservedAfterMs: error.observedAfterMs, maximumRecoveryMs: sseReconnectMaximumMs,
+    pollIntervalMs: sseRecoveryPollMs, pollCount: 0,
     claimCompletedAtMs,
   };
   streamTransitionEvidence.push(transition);
-  const earliestRecoveryAfterMs = error.observedAfterMs + sseReconnectMinimumMs;
   const deadline = error.observedAfterMs + sseReconnectMaximumMs;
-  const recoveryState = () => {
-    const afterError = streamConnections.filter(connection => connection.observedAfterMs >= error.observedAfterMs);
-    const postError = afterError.filter(connection => connection.observedAfterMs >= earliestRecoveryAfterMs);
-    return {
-      ignoredPreMinimumCount: afterError.length - postError.length,
-      attemptCount: postError.length,
-      statuses: postError.map(connection => connection.status),
-      recovery: postError.find(connection => connection.status === 200 && connection.contentType === 'text/event-stream'),
-    };
-  };
+  const recoveryState = () => firstClaimSseRecoveryState(streamConnections, error.observedAfterMs, expectedStreamOrigin);
   while (Date.now() - browserStartedAt < deadline) {
     const currentMatching = runtimeErrors.filter(isFirstClaimSseTransportError);
     const otherErrors = runtimeErrors.filter(item => !isFirstClaimSseTransportError(item));
@@ -321,7 +337,7 @@ async function observeFirstClaimSseRecovery() {
     }
     const state = recoveryState();
     transition.pollCount += 1;
-    transition.ignoredPreMinimumCount = state.ignoredPreMinimumCount;
+    transition.ignoredOtherOriginCount = state.ignoredOtherOriginCount;
     transition.streamAttemptCount = state.attemptCount;
     transition.streamStatuses = state.statuses;
     if (!state.recovery) {
@@ -389,7 +405,7 @@ async function observeFirstClaimSseRecovery() {
   transition.classification = 'recovery-timeout';
   transition.elapsedAfterErrorMs = Date.now() - browserStartedAt - error.observedAfterMs;
   transition.streamAttemptCount = finalState.attemptCount;
-  transition.ignoredPreMinimumCount = finalState.ignoredPreMinimumCount;
+  transition.ignoredOtherOriginCount = finalState.ignoredOtherOriginCount;
   transition.streamStatuses = finalState.statuses;
   return null;
 }

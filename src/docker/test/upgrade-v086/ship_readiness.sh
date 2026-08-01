@@ -603,6 +603,12 @@ for result, expected in zip(sys.argv[1:], ("timed out", "simulated close failure
         raise SystemExit("browser shutdown fallback self-check did not report " + expected)
 PY
 }
+browser_first_claim_sse_recovery_self_check() {
+  local node_bin result
+  node_bin="$(node_binary)"
+  result="$("$node_bin" "$BROWSER" --first-claim-sse-recovery-self-check)"
+  [[ "$result" == '{"recoveryObservedAfterMs":1400}' ]] || die "browser early SSE recovery self-check failed"
+}
 browser_readiness_policy_self_check() {
   python - "$BROWSER" <<'PY'
 from pathlib import Path
@@ -2092,6 +2098,7 @@ worker_self_check() {
   browser_dispatch_self_check
   [[ -x "$(playwright_chromium_binary)" ]] || die "Playwright Chromium resolver self-check failed"
   browser_shutdown_self_check
+  browser_first_claim_sse_recovery_self_check
   browser_readiness_policy_self_check
   browser_session_temp_cleanup_self_check
   browser_parent_cleanup_self_check
