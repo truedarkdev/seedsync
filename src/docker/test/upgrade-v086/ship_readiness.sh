@@ -2012,7 +2012,7 @@ full() {
   wait_normal_runtime_readiness "$current" "$(evidence_dir "$id")/after-restart-claimed-auth.json" "$id" migration-current-restart-status "seedsync-upgrade-v086-current-${id,,}"
   finish_browser_claim_reuse "$(evidence_dir "$id")" "$stability_generation" "$restart_arm_generation"
   python "$HELPER" assert-browser --input "$(evidence_dir "$id")/browser-reuse.json" --output "$(evidence_dir "$id")/after-browser-restart-contract.json" --reuse
-  capture_volume_helper_output "$id" "$(evidence_dir "$id")/autoqueue-contract.json" assert-autoqueue --before-settings "$retained_backup_dir/data/settings.cfg" --persist /config/autoqueue.persist --browser /evidence/ship-readiness/browser-reuse.json --fixture /evidence/fixture-evidence.json --controller /config/controller.persist
+  capture_volume_helper_output "$id" "$(evidence_dir "$id")/autoqueue-contract.json" assert-autoqueue --before-settings "$retained_backup_dir/data/settings.cfg" --persist /config/autoqueue.persist --browser /evidence/ship-readiness/browser.json --fixture /evidence/fixture-evidence.json --controller /config/controller.persist
   printf 'controller.persist and autoqueue.persist preserved across current restart\n' > "$(evidence_dir "$id")/current-restart-persist.txt"
   assert_current_runtime_health "$id"
   row "$id" migration-retained-backup passed "evidence/ship-readiness/migration-contract.json"
