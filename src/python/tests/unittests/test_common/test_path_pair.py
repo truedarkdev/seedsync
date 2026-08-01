@@ -155,6 +155,34 @@ class TestPathPairManager(unittest.TestCase):
 
         self.assertEqual([second.id, first.id], [pair.id for pair in reloaded.load().path_pairs])
 
+    def test_migrate_from_config_imports_when_path_pairs_file_is_missing(self):
+        self.assertFalse(os.path.exists(self.manager.file_path))
+
+        self.assertTrue(self.manager.migrate_from_config("/remote/downloads", "/downloads"))
+
+        self.assertEqual(1, len(self.manager.get_all_pairs()))
+        self.assertEqual("Default", self.manager.get_all_pairs()[0].name)
+        self.assertTrue(os.path.isfile(self.manager.file_path))
+
+    def test_migrate_from_config_preserves_persisted_empty_collection_after_restart(self):
+        pair = PathPair(name="Downloads", remote_path="/remote/downloads", local_path="/downloads")
+        self.manager.add_pair(pair)
+        self.manager.remove_pair(pair.id)
+
+        reloaded = PathPairManager(self.temp_dir)
+        reloaded.load()
+        self.assertEqual([], reloaded.get_all_pairs())
+        self.assertTrue(os.path.isfile(reloaded.file_path))
+
+        self.assertFalse(reloaded.migrate_from_config("/remote/legacy", "/downloads/legacy"))
+        self.assertEqual([], reloaded.get_all_pairs())
+
+    @patch("common.path_pair.os.path.lexists", return_value=True)
+    def test_migrate_from_config_does_not_replace_existing_dangling_path_entry(self, _):
+        self.assertFalse(self.manager.migrate_from_config("/remote/legacy", "/downloads/legacy"))
+        self.assertEqual([], self.manager.get_all_pairs())
+        self.assertFalse(os.path.exists(self.manager.file_path))
+
     def test_load_backs_up_and_recovers_from_malformed_file(self):
         with open(self.manager.file_path, "w", encoding="utf-8") as handle:
             handle.write("{\"path_pairs\": [null]}")

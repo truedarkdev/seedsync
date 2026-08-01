@@ -360,7 +360,11 @@ class PathPairManager:
 
     def migrate_from_config(self, remote_path: str, local_path: str) -> bool:
         with self._lock:
-            if self.collection.path_pairs:
+            # Legacy paths are imported only for installations that have never
+            # persisted a path-pair collection.  An existing empty collection
+            # is intentional (for example, after deleting the final pair) and
+            # must remain empty across restarts.
+            if self.collection.path_pairs or os.path.lexists(self._file_path):
                 return False
             if not remote_path or not local_path:
                 return False
