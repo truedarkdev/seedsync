@@ -531,9 +531,44 @@ class TestMigrationCoordinator(unittest.TestCase):
         second.ensure_bootstrap_proof()
         second.save()
         second.save()
+        second.clear_bootstrap_proof(reason="expired")
+        second.save()
+        second.save()
+        history_path = self.root / "api-keys.history.jsonl"
+        last_empty_save = history_path.read_text(encoding="utf-8").splitlines()[-1]
+        with history_path.open("a", encoding="utf-8") as history:
+            for _ in range(550):
+                history.write(last_empty_save + "\n")
+        self.assertGreater(history_path.stat().st_size, 64 * 1024)
         restarted = MigrationCoordinator(self.root).preflight()
         self.assertEqual(MigrationState.COMPLETE, restarted.state)
         self.assertTrue(restarted.allows_normal_startup)
+
+    def test_completed_lineage_rejects_non_expiry_proof_clear_and_incoherent_empty_saves(self) -> None:
+        for name, arrange in (
+            (
+                "consumed-proof",
+                lambda store: (
+                    store.ensure_bootstrap_proof(),
+                    store.save(),
+                    store.clear_bootstrap_proof(reason="consumed"),
+                    store.save(),
+                ),
+            ),
+            ("save-without-proof", lambda store: store.save()),
+        ):
+            with self.subTest(name=name):
+                root = self.root / name
+                MigrationFixture(root).write()
+                coordinator = MigrationCoordinator(root)
+                self.assertEqual(MigrationState.COMPLETE, coordinator.apply_confirmed().state)
+                coordinator.release_normal_startup()
+                store = ApiKeyStore(file_path=str(root / "api-keys.json"))
+                arrange(store)
+
+                decision = MigrationCoordinator(root).preflight()
+                self.assertEqual(MigrationState.FAILED, decision.state)
+                self.assertFalse(decision.allows_normal_startup)
 
     def _assert_interrupted_completed_claim_recovers_to_preclaim(self, *, after_remembered_session: bool) -> None:
         MigrationFixture(self.root).write()

@@ -25,6 +25,27 @@ def _read_history_entries(file_path):
 
 
 class TestApiKeyStore(unittest.TestCase):
+    def test_unchanged_store_saves_coalesce_history_snapshots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+
+            store.save()
+            store.save()
+            store.ensure_bootstrap_proof()
+            store.save()
+            store.save()
+            store.clear_bootstrap_proof(reason="expired")
+            store.save()
+            store.save()
+
+            saved = [
+                entry["details"]["bootstrap_proof_present"]
+                for entry in _read_history_entries(store_path)
+                if entry["event"] == "store_saved"
+            ]
+            self.assertEqual([False, True, False], saved)
+
     def test_long_migration_id_uses_bounded_claim_version_across_restart(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             binding = {
@@ -72,7 +93,7 @@ class TestApiKeyStore(unittest.TestCase):
             store_path = os.path.join(temp_dir, "api-keys.json")
             history_path = os.path.join(temp_dir, "api-keys.history.jsonl")
             store_payload = b'{"version":3,"api_keys":[],"ui_sessions":[],"browser_handover_claimed_version":""}'
-            history_payload = b"x" * (60 * 1024)
+            history_payload = b"x" * (1024 * 1024)
             with open(store_path, "wb") as handle:
                 handle.write(store_payload)
             with open(history_path, "wb") as handle:
