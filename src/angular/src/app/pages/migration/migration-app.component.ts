@@ -113,7 +113,9 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     private statusPollTimer: number | null = null;
     private normalStartupProbeTimer: number | null = null;
     private normalStartupProbeAttempts = 0;
+    private normalStartupProbeStartedAt = 0;
     private static readonly NORMAL_STARTUP_PROBE_MAX_ATTEMPTS = 120;
+    private static readonly NORMAL_STARTUP_PROBE_MAX_WAIT_MS = 30000;
 
     constructor(private readonly migrationService: MigrationService,
                 private readonly changeDetector: ChangeDetectorRef) {}
@@ -476,15 +478,39 @@ export class MigrationAppComponent implements OnInit, OnDestroy {
     private beginNormalStartupProbe(): void {
         this.clearNormalStartupProbe();
         this.normalStartupProbeAttempts = 0;
+        this.normalStartupProbeStartedAt = Date.now();
+        console.info("[SeedSync migration] Waiting for normal startup.", {
+            max_attempts: MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_ATTEMPTS
+        });
         this.probeNormalStartup();
     }
 
     private probeNormalStartup(): void {
-        this.migrationService.probeNormalStartup().subscribe({
-            next: () => this.replaceLocation("/bootstrap"),
-            error: () => {
+        const attempt = this.normalStartupProbeAttempts + 1;
+        this.migrationService.probeNormalStartup(attempt).subscribe({
+            next: () => {
+                console.info("[SeedSync migration] Normal startup is ready.", {
+                    attempt,
+                    elapsed_ms: Date.now() - this.normalStartupProbeStartedAt
+                });
+                this.replaceLocation("/bootstrap");
+            },
+            error: (error: unknown) => {
                 this.normalStartupProbeAttempts += 1;
-                if (this.normalStartupProbeAttempts >= MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_ATTEMPTS) {
+                const elapsedMs = Date.now() - this.normalStartupProbeStartedAt;
+                const exhausted = this.normalStartupProbeAttempts >=
+                        MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_ATTEMPTS ||
+                    elapsedMs >= MigrationAppComponent.NORMAL_STARTUP_PROBE_MAX_WAIT_MS;
+                if (attempt === 1 || attempt % 10 === 0 ||
+                    exhausted) {
+                    console.warn("[SeedSync migration] Normal startup probe did not complete.", {
+                        attempt,
+                        elapsed_ms: elapsedMs,
+                        error: error instanceof Error ? error.name : "UnknownError",
+                        will_retry: !exhausted
+                    });
+                }
+                if (exhausted) {
                     this.normalStartupProbeTimer = null;
                     this.actionBusy = false;
                     this.actionError = true;

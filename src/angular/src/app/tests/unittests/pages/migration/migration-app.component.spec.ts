@@ -242,7 +242,7 @@ describe("MigrationAppComponent", () => {
             const button: HTMLButtonElement = fixture.nativeElement.querySelector(".primary-button");
             button.click();
             expect(service.continue).toHaveBeenCalledWith(completed);
-            expect(service.probeNormalStartup).toHaveBeenCalled();
+            expect(service.probeNormalStartup).toHaveBeenCalledWith(1);
             expect((fixture.componentInstance as any).normalStartupProbeTimer).not.toBeNull();
         } finally {
             jasmine.clock().uninstall();
@@ -268,6 +268,7 @@ describe("MigrationAppComponent", () => {
 
         (fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).click();
 
+        expect(service.probeNormalStartup).toHaveBeenCalledOnceWith(1);
         expect(replaceLocation).toHaveBeenCalledOnceWith("/bootstrap");
     });
 
@@ -301,6 +302,7 @@ describe("MigrationAppComponent", () => {
             (fixture.nativeElement.querySelector(".primary-button") as HTMLButtonElement).click();
             expect(service.continue).toHaveBeenCalledTimes(1);
             expect(service.probeNormalStartup).toHaveBeenCalledTimes(3);
+            expect(service.probeNormalStartup.calls.allArgs()).toEqual([[1], [120], [1]]);
         } finally {
             jasmine.clock().uninstall();
         }

@@ -1,12 +1,13 @@
 import {Injectable} from "@angular/core";
 import {HttpClient} from "@angular/common/http";
 import {Observable} from "rxjs";
-import {map} from "rxjs/operators";
+import {map, timeout} from "rxjs/operators";
 
 import {MigrationFeature, MigrationState, MigrationStatus} from "./migration.model";
 
 
 const MIGRATION_STATES: MigrationState[] = ["required", "running", "failed", "complete"];
+const NORMAL_STARTUP_PROBE_TIMEOUT_MS = 1000;
 
 function isObject(value: unknown): value is Record<string, unknown> {
     return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -111,7 +112,13 @@ export class MigrationService {
         ).pipe(map(parseMigrationStatus));
     }
 
-    probeNormalStartup(): Observable<void> {
-        return this.http.get("/bootstrap", {responseType: "text"}).pipe(map(() => undefined));
+    probeNormalStartup(attempt = 1): Observable<void> {
+        return this.http.get("/bootstrap", {
+            params: {seedsync_startup_probe: String(attempt)},
+            responseType: "text"
+        }).pipe(
+            timeout(NORMAL_STARTUP_PROBE_TIMEOUT_MS),
+            map(() => undefined)
+        );
     }
 }
