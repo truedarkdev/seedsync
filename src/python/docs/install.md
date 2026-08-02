@@ -50,12 +50,21 @@ Select the section for your platform:
     * `<config directory>` refers to the location on host machine where config files will be placed
     * any host directories you mount must already exist
 
-    `/config` must be a real POSIX directory owned by root or the configured `PUID`, with no group or other write bits, and end with mode `0700`. The Docker entrypoint rejects any other initial owner or group/other-writable root before reading or mutating its tree; repair it first with `sudo chmod go-w <config directory>` and `sudo chown <PUID>:<PGID> <config directory>`, or use a Docker named volume. It automatically prepares admitted roots only on `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `zfs`, `tmpfs`, or `overlay`, then verifies them before starting SeedSync. Configuration entries must not be symlinks, nested mounts, or hard-linked regular files. Safe startup assumes exclusive use: no concurrent same-UID writer and no retained write-capable file descriptor. Do not use Windows shared folders, WSL DrvFS/9p/V9FS, FUSE, CIFS/SMB, NFS, virtiofs, or VirtualBox shared folders for `/config`; those paths cannot satisfy the owner-private migration and lock contract. This restriction does not change normal `/downloads` or `/mounts` permissions.
+    For new deployments, `/config` must be a real POSIX directory owned by root or the configured `PUID`, with no group or other write bits, and end with mode `0700`. The root-start entrypoint rejects any other initial owner or group/other-writable root before reading or mutating its tree; repair it first with `sudo chmod go-w <config directory>` and `sudo chown <PUID>:<PGID> <config directory>`, or use a Docker named volume. It automatically prepares admitted roots only on `ext2`, `ext3`, `ext4`, `xfs`, `btrfs`, `zfs`, `tmpfs`, or `overlay`, then verifies them before starting SeedSync. Configuration entries must not be symlinks, nested mounts, or hard-linked regular files. Safe startup assumes exclusive use: no concurrent same-UID writer and no retained write-capable file descriptor. Do not use Windows shared folders, WSL DrvFS/9p/V9FS, CIFS/SMB, NFS, virtiofs, or VirtualBox shared folders for `/config`; those paths cannot satisfy the owner-private migration and lock contract. This restriction does not change normal `/downloads` or `/mounts` permissions.
 
     By default SeedSync runs its application process as `PUID=1000` and
-    `PGID=1000`. To use another principal, set `-e PUID=<uid> -e PGID=<gid>`.
-    Do not use Docker's `--user` option: the entrypoint must begin as root to
-    repair and verify the `/config` root before it drops privileges.
+    `PGID=1000`. To use another principal in a new deployment, set
+    `-e PUID=<uid> -e PGID=<gid>` and let the entrypoint start as root.
+
+    Existing Unraid-style deployments that already set Docker's `--user`
+    option are detected automatically. In this legacy compatibility mode,
+    SeedSync derives the current UID/GID instead of trying to modify users or
+    drop privileges. It accepts an existing Unraid `fuse.shfs` `/config` bind
+    only when the root and every entry already have exactly that UID/GID, and
+    then narrows the root to mode `0700`. Symlinks, nested mounts, hard-linked
+    files, owner mismatches, and conflicting `PUID`/`PGID` values still abort
+    startup. This compatibility path is intended for image-only upgrades; use
+    the root-start `PUID`/`PGID` model for new deployments.
 
     If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
 

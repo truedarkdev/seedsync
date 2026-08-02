@@ -101,6 +101,88 @@ docker run --rm --name "${RUN_ID}-posix-preflight" \
     /bin/true \
     > "${EVIDENCE_DIR}/posix-preflight.log" 2>&1
 
+LEGACY_CONFIG="$POSIX_PROBE/legacy-nonroot-config"
+LEGACY_DOWNLOADS="$POSIX_PROBE/legacy-nonroot-downloads"
+LEGACY_MOUNTS="$POSIX_PROBE/legacy-nonroot-mounts"
+docker run --rm --name "${RUN_ID}-legacy-nonroot-fixture" \
+    --user 0:0 \
+    --mount "type=bind,src=${POSIX_PROBE},dst=/probe" \
+    --entrypoint /bin/sh "$IMAGE" -c "\
+        mkdir -p /probe/legacy-nonroot-config /probe/legacy-nonroot-downloads /probe/legacy-nonroot-mounts && \
+        printf 'legacy non-root sentinel\\n' > /probe/legacy-nonroot-config/sentinel && \
+        chown -R ${RUNTIME_UID}:${RUNTIME_GID} \
+            /probe/legacy-nonroot-config /probe/legacy-nonroot-downloads /probe/legacy-nonroot-mounts && \
+        chmod 0777 /probe/legacy-nonroot-config && \
+        chmod 0775 /probe/legacy-nonroot-downloads /probe/legacy-nonroot-mounts"
+docker run --rm --name "${RUN_ID}-legacy-nonroot-first" \
+    --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+    --mount "type=bind,src=${LEGACY_CONFIG},dst=/config" \
+    --mount "type=bind,src=${LEGACY_DOWNLOADS},dst=/downloads" \
+    --mount "type=bind,src=${LEGACY_MOUNTS},dst=/mounts" \
+    --mount "type=bind,src=${ENTRYPOINT},dst=/scripts/entrypoint.sh,readonly" \
+    --entrypoint /scripts/entrypoint.sh "$IMAGE" python3 -c "import tempfile; assert tempfile.gettempdir() == '/tmp/seedsync-home-${RUNTIME_UID}/tmp'" \
+    > "${EVIDENCE_DIR}/legacy-nonroot-first.log" 2>&1
+docker run --rm --name "${RUN_ID}-legacy-nonroot-second" \
+    --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+    --mount "type=bind,src=${LEGACY_CONFIG},dst=/config" \
+    --mount "type=bind,src=${LEGACY_DOWNLOADS},dst=/downloads" \
+    --mount "type=bind,src=${LEGACY_MOUNTS},dst=/mounts" \
+    --mount "type=bind,src=${ENTRYPOINT},dst=/scripts/entrypoint.sh,readonly" \
+    --entrypoint /scripts/entrypoint.sh "$IMAGE" /bin/true \
+    > "${EVIDENCE_DIR}/legacy-nonroot-idempotence.log" 2>&1
+grep -Fq "Using legacy non-root compatibility: UID=${RUNTIME_UID} GID=${RUNTIME_GID}" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
+grep -Fq "mode=legacy-nonroot" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
+grep -Fq "Running as: ${RUNTIME_UID}:${RUNTIME_GID} (UID=${RUNTIME_UID}, GID=${RUNTIME_GID}, HOME=/tmp/seedsync-home-${RUNTIME_UID}, TMPDIR=/tmp/seedsync-home-${RUNTIME_UID}/tmp)" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
+docker run --rm --name "${RUN_ID}-legacy-nonroot-stat" \
+    --user 0:0 \
+    --mount "type=bind,src=${LEGACY_CONFIG},dst=/config" \
+    --entrypoint /bin/sh "$IMAGE" -c 'stat -c "uid=%u gid=%g mode=%a" /config /config/sentinel; grep -Fx "legacy non-root sentinel" /config/sentinel' \
+    > "${EVIDENCE_DIR}/legacy-nonroot-after.txt"
+grep -Fxq "uid=${RUNTIME_UID} gid=${RUNTIME_GID} mode=700" "${EVIDENCE_DIR}/legacy-nonroot-after.txt"
+grep -Fxq 'legacy non-root sentinel' "${EVIDENCE_DIR}/legacy-nonroot-after.txt"
+if docker run --rm --name "${RUN_ID}-legacy-nonroot-id-mismatch" \
+    --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+    -e "PUID=$((RUNTIME_UID + 1))" -e "PGID=${RUNTIME_GID}" \
+    --mount "type=bind,src=${LEGACY_CONFIG},dst=/config" \
+    --mount "type=bind,src=${ENTRYPOINT},dst=/scripts/entrypoint.sh,readonly" \
+    --entrypoint /scripts/entrypoint.sh "$IMAGE" --prepare-config-root \
+    > "${EVIDENCE_DIR}/legacy-nonroot-id-mismatch.log" 2>&1; then
+    echo "ERROR: legacy non-root startup unexpectedly accepted conflicting PUID/PGID" >&2
+    exit 1
+fi
+grep -Fq "PUID/PGID must match Docker --user (${RUNTIME_UID}:${RUNTIME_GID})" "${EVIDENCE_DIR}/legacy-nonroot-id-mismatch.log"
+
+LEGACY_WRONG_OWNER_CONFIG="$POSIX_PROBE/legacy-nonroot-wrong-owner-config"
+docker run --rm --name "${RUN_ID}-legacy-nonroot-wrong-owner-fixture" \
+    --user 0:0 \
+    --mount "type=bind,src=${POSIX_PROBE},dst=/probe" \
+    --entrypoint /bin/sh "$IMAGE" -c "\
+        mkdir -p /probe/legacy-nonroot-wrong-owner-config && \
+        printf 'must remain unchanged\\n' > /probe/legacy-nonroot-wrong-owner-config/sentinel && \
+        chown ${RUNTIME_UID}:${RUNTIME_GID} /probe/legacy-nonroot-wrong-owner-config && \
+        chmod 0777 /probe/legacy-nonroot-wrong-owner-config && \
+        chown ${WRONG_OWNER_UID}:${WRONG_OWNER_GID} /probe/legacy-nonroot-wrong-owner-config/sentinel && \
+        chmod 0644 /probe/legacy-nonroot-wrong-owner-config/sentinel"
+if docker run --rm --name "${RUN_ID}-legacy-nonroot-wrong-owner-negative" \
+    --user "${RUNTIME_UID}:${RUNTIME_GID}" \
+    --mount "type=bind,src=${LEGACY_WRONG_OWNER_CONFIG},dst=/config" \
+    --mount "type=bind,src=${ENTRYPOINT},dst=/scripts/entrypoint.sh,readonly" \
+    --entrypoint /scripts/entrypoint.sh "$IMAGE" --prepare-config-root \
+    > "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-negative.log" 2>&1; then
+    echo "ERROR: legacy non-root startup unexpectedly accepted a foreign-owned config entry" >&2
+    exit 1
+fi
+grep -Fq "owner ${WRONG_OWNER_UID}:${WRONG_OWNER_GID} does not match the legacy runtime owner ${RUNTIME_UID}:${RUNTIME_GID}" \
+    "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-negative.log"
+docker run --rm --name "${RUN_ID}-legacy-nonroot-wrong-owner-stat" \
+    --user 0:0 \
+    --mount "type=bind,src=${LEGACY_WRONG_OWNER_CONFIG},dst=/config" \
+    --entrypoint /bin/sh "$IMAGE" -c 'stat -c "uid=%u gid=%g mode=%a" /config /config/sentinel; grep -Fx "must remain unchanged" /config/sentinel' \
+    > "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-after.txt"
+grep -Fxq "uid=${RUNTIME_UID} gid=${RUNTIME_GID} mode=500" "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-after.txt"
+grep -Fxq "uid=${WRONG_OWNER_UID} gid=${WRONG_OWNER_GID} mode=644" "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-after.txt"
+grep -Fxq 'must remain unchanged' "${EVIDENCE_DIR}/legacy-nonroot-wrong-owner-after.txt"
+
 if docker run --rm --name "${RUN_ID}-drvfs-negative" \
     -e "PUID=${RUNTIME_UID}" -e "PGID=${RUNTIME_GID}" \
     --mount "type=bind,src=${WINDOWS_CONFIG},dst=/config" \
@@ -340,7 +422,7 @@ docker run --rm --name "${RUN_ID}-barrier-prepare" \
     --entrypoint /scripts/entrypoint.sh "$IMAGE" --prepare-config-root /probe/barrier-root-config \
     > "${EVIDENCE_DIR}/barrier-prepare.log" 2>&1 &
 barrier_prepare_pid=$!
-for attempt in $(seq 1 60); do
+for attempt in $(seq 1 200); do
     [ "$(stat -c '%a' "$POSIX_PROBE/barrier-root-config")" = "0" ] && break
     sleep 0.1
 done
@@ -382,7 +464,7 @@ docker run --rm --name "${RUN_ID}-repair-race-prepare" \
     --entrypoint /scripts/entrypoint.sh "$IMAGE" --prepare-config-root /probe/repair-race-config \
     > "${EVIDENCE_DIR}/repair-race-prepare.log" 2>&1 &
 repair_prepare_pid=$!
-for attempt in $(seq 1 60); do
+for attempt in $(seq 1 200); do
     [ "$(stat -c '%u:%a' "$POSIX_PROBE/repair-race-config")" = "${RUNTIME_UID}:0" ] && break
     sleep 0.1
 done
@@ -398,7 +480,10 @@ grep -Eqi 'permission denied|operation not permitted' "${EVIDENCE_DIR}/repair-ra
 docker run --rm --name "${RUN_ID}-repair-race-window-stat" --user 0:0 --mount "type=bind,src=${POSIX_PROBE},dst=/probe" \
     --entrypoint /bin/sh "$IMAGE" -c 'stat -c "uid=%u gid=%g mode=%a dev=%d inode=%i" /probe/repair-race-config/runtime-writable-child; sha256sum /probe/repair-race-config/runtime-writable-child' \
     > "${EVIDENCE_DIR}/repair-race-window.txt"
-cmp "${EVIDENCE_DIR}/repair-race-before.txt" "${EVIDENCE_DIR}/repair-race-window.txt"
+# The bounded delay proves the mode-0000 barrier and attacker denial. Docker
+# command startup can outlast that delay, so this later observation may also
+# see the intended ownership repair; compare stable inode/content fields here.
+sed -E 's/^uid=[0-9]+ gid=[0-9]+ mode=[0-9]+ //' "${EVIDENCE_DIR}/repair-race-before.txt" | cmp - <(sed -E 's/^uid=[0-9]+ gid=[0-9]+ mode=[0-9]+ //' "${EVIDENCE_DIR}/repair-race-window.txt")
 wait "$repair_prepare_pid"
 docker run --rm --name "${RUN_ID}-repair-race-after" --user 0:0 --mount "type=bind,src=${POSIX_PROBE},dst=/probe" \
     --entrypoint /bin/sh "$IMAGE" -c 'stat -c "uid=%u gid=%g mode=%a dev=%d inode=%i" /probe/repair-race-config/runtime-writable-child; sha256sum /probe/repair-race-config/runtime-writable-child' \

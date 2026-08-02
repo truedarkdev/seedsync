@@ -1661,7 +1661,8 @@ class TestLftp(unittest.TestCase):
         self.assertIn("os.O_DIRECTORY | os.O_NOFOLLOW", entrypoint_contents)
         self.assertIn("os.fchown(root_fd, uid, gid)", entrypoint_contents)
         self.assertIn("os.fchmod(root_fd, 0o700)", entrypoint_contents)
-        self.assertIn("os.fchmod(root_fd, 0)", entrypoint_contents)
+        self.assertIn("revoked_mode = 0o500 if legacy_mode else 0", entrypoint_contents)
+        self.assertIn("os.fchmod(root_fd, revoked_mode)", entrypoint_contents)
         self.assertIn("require_revoked_root_state", entrypoint_contents)
         self.assertIn("require_admitted_root_owner", entrypoint_contents)
         self.assertIn("stat.S_IMODE(root_info.st_mode) & 0o022", entrypoint_contents)
@@ -1675,12 +1676,18 @@ class TestLftp(unittest.TestCase):
         self.assertIn("repair_tree(root_fd, root_info.st_dev)", entrypoint_contents)
         self.assertLess(
             entrypoint_contents.index("require_admitted_root_owner(root_info)"),
-            entrypoint_contents.index("os.fchmod(root_fd, 0)"),
+            entrypoint_contents.index("os.fchmod(root_fd, revoked_mode)"),
         )
         self.assertLess(
-            entrypoint_contents.index("require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, \"after access revocation\")"),
+            entrypoint_contents.index("require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, revoked_mode, \"after access revocation\")"),
             entrypoint_contents.index("validate_tree(root_fd, root_info.st_dev)"),
         )
+        self.assertIn('LEGACY_NONROOT_MODE=1', entrypoint_contents)
+        self.assertIn('legacy_unraid_filesystem = "fuse.shfs"', entrypoint_contents)
+        self.assertIn('PUID/PGID must match Docker --user', entrypoint_contents)
+        self.assertIn('mode_label = "legacy-nonroot" if legacy_mode else "strict"', entrypoint_contents)
+        self.assertIn('export TMPDIR="$RUNTIME_TMP_DIR"', entrypoint_contents)
+        self.assertIn('safe_chown_recursive "runtime temporary directory" "$RUNTIME_TMP_DIR"', entrypoint_contents)
         self.assertIn('if [ "${1:-}" = "--prepare-config-root" ]; then', entrypoint_contents)
         self.assertLess(
             entrypoint_contents.index('if [ "${1:-}" = "--prepare-config-root" ]; then'),
@@ -1702,6 +1709,9 @@ class TestLftp(unittest.TestCase):
         self.assertIn("wrong-owner-negative", contract_contents)
         self.assertIn("unsafe-root-config", contract_contents)
         self.assertIn("unsafe-runtime-config", contract_contents)
+        self.assertIn("legacy-nonroot-first", contract_contents)
+        self.assertIn("legacy-nonroot-id-mismatch", contract_contents)
+        self.assertIn("legacy-nonroot-wrong-owner-negative", contract_contents)
         self.assertIn("barrier-attacker", contract_contents)
         self.assertIn("POSIX_VOLUME", contract_contents)
         self.assertIn('mktemp "$path/.seedsync_write_test.XXXXXX"', entrypoint_contents)
