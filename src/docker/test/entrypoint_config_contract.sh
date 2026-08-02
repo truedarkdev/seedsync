@@ -120,7 +120,7 @@ docker run --rm --name "${RUN_ID}-legacy-nonroot-first" \
     --mount "type=bind,src=${LEGACY_DOWNLOADS},dst=/downloads" \
     --mount "type=bind,src=${LEGACY_MOUNTS},dst=/mounts" \
     --mount "type=bind,src=${ENTRYPOINT},dst=/scripts/entrypoint.sh,readonly" \
-    --entrypoint /scripts/entrypoint.sh "$IMAGE" python3 -c "import tempfile; assert tempfile.gettempdir() == '/tmp/seedsync-home-${RUNTIME_UID}/tmp'" \
+    --entrypoint /scripts/entrypoint.sh "$IMAGE" python3 -c "import os, pwd, subprocess, tempfile; assert tempfile.gettempdir() == '/tmp/seedsync-home-${RUNTIME_UID}/tmp'; assert pwd.getpwuid(os.getuid()).pw_dir == '/tmp/seedsync-home-${RUNTIME_UID}'; subprocess.run(['ssh', '-G', 'example.invalid'], check=True, stdout=subprocess.DEVNULL)" \
     > "${EVIDENCE_DIR}/legacy-nonroot-first.log" 2>&1
 docker run --rm --name "${RUN_ID}-legacy-nonroot-second" \
     --user "${RUNTIME_UID}:${RUNTIME_GID}" \
@@ -132,7 +132,8 @@ docker run --rm --name "${RUN_ID}-legacy-nonroot-second" \
     > "${EVIDENCE_DIR}/legacy-nonroot-idempotence.log" 2>&1
 grep -Fq "Using legacy non-root compatibility: UID=${RUNTIME_UID} GID=${RUNTIME_GID}" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
 grep -Fq "mode=legacy-nonroot" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
-grep -Fq "Running as: ${RUNTIME_UID}:${RUNTIME_GID} (UID=${RUNTIME_UID}, GID=${RUNTIME_GID}, HOME=/tmp/seedsync-home-${RUNTIME_UID}, TMPDIR=/tmp/seedsync-home-${RUNTIME_UID}/tmp)" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
+grep -Fq "Configured runtime identity for legacy Docker --user UID=${RUNTIME_UID} GID=${RUNTIME_GID}" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
+grep -Fq "Running as: seedsync-runtime-${RUNTIME_UID}:seedsync-runtime-${RUNTIME_GID} (UID=${RUNTIME_UID}, GID=${RUNTIME_GID}, HOME=/tmp/seedsync-home-${RUNTIME_UID}, TMPDIR=/tmp/seedsync-home-${RUNTIME_UID}/tmp)" "${EVIDENCE_DIR}/legacy-nonroot-first.log"
 docker run --rm --name "${RUN_ID}-legacy-nonroot-stat" \
     --user 0:0 \
     --mount "type=bind,src=${LEGACY_CONFIG},dst=/config" \

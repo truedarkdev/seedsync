@@ -118,6 +118,9 @@ class Seedsync:
             signal.signal(signal.SIGINT, self.signal)
             return
 
+        if self.migration_coordinator.repair_completed_v086_docker_paths():
+            self.migration_decision = self.migration_coordinator.preflight()
+
         try:
             self.runtime_exclusion = RuntimeExclusion(Path(args.config_dir), "normal-runtime")
         except RuntimeExclusionError as exc:

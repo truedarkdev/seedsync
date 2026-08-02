@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence, cast
 
 from common import Config, PathPair, PathPairManager
+from common.path_pair import is_running_in_docker
 from controller import AutoQueuePersist, ControllerPersist
 from .backup_restore import (
     BackupRestoreError,
@@ -39,6 +40,8 @@ METADATA_FILE = "migration-state.json"
 LOCK_FILE = ".migration.lock"
 RECOVERY_INTENT_FILE = ".migration-recovery-intent.json"
 BACKUP_ROOT = "migration-backups"
+LEGACY_DOCKER_LOCAL_PATHS = frozenset(("downloads", "downloads/"))
+DOCKER_LOCAL_PATH = "/downloads"
 _MAX_JSON_BYTES = 256 * 1024
 _MAX_RELEVANT_FILE_BYTES = 16 * 1024 * 1024
 _root_transaction_state = threading.local()
@@ -1241,6 +1244,13 @@ def _backup_metadata(config_dir: Path, spec: MigrationSpec) -> Path:
     )
 
 
+def _normalize_v086_docker_local_path(local_path: str) -> str:
+    """Map only the original Docker image's relative default mount path."""
+    if is_running_in_docker() and local_path in LEGACY_DOCKER_LOCAL_PATHS:
+        return DOCKER_LOCAL_PATH
+    return local_path
+
+
 def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
     source_settings = source.read_text("settings.cfg")
     config = Config.from_str(source_settings)
@@ -1249,6 +1259,8 @@ def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
         raise ValueError("Legacy remote path is not valid")
     if not isinstance(local_path, str) or not local_path or local_path.startswith("<"):
         raise ValueError("Legacy local path is not valid")
+    local_path = _normalize_v086_docker_local_path(local_path)
+    config.lftp.local_path = local_path
 
     pair = PathPair(
         id=str(uuid.uuid5(uuid.NAMESPACE_URL, "seedsync:v086:{}\n{}".format(remote_path, local_path))),
@@ -1799,6 +1811,89 @@ class MigrationCoordinator:
         if not decision.allows_normal_startup:
             raise MigrationBlockedError(decision)
         return decision
+
+    def repair_completed_v086_docker_paths(self) -> bool:
+        """Repair the exact legacy Docker default after a retained migration.
+
+        v0.8.6 Docker templates could persist ``downloads`` even though the
+        mounted runtime path is ``/downloads``. Older 0.9.0 migration builds
+        copied that value into both current working files. Repair only a
+        validated, released, pre-claim migration so retained backup data and
+        later user-owned path-pair edits remain untouched.
+        """
+        if not is_running_in_docker():
+            return False
+
+        identity = _capture_root_identity(self.config_dir)
+        if self._root_identity is None:
+            self._root_identity = identity
+        elif identity != self._root_identity:
+            raise ValueError("Migration configuration root identity changed")
+
+        with _root_transaction(self.config_dir, self._root_identity):
+            with self._process_lock:
+                try:
+                    with RuntimeExclusion(self.config_dir, "migration-docker-path-repair"):
+                        decision = self._preflight_anchored()
+                        if (
+                            decision.state != MigrationState.COMPLETE
+                            or decision.migration_id != "original-v0.8.6-to-current-v1"
+                            or decision.completed_auth_phase != "preclaim"
+                            or not decision.normal_startup_released
+                        ):
+                            return False
+
+                        config = Config.from_str(_read_text(self.config_dir / "settings.cfg", self.config_dir))
+                        collection = PathPairManager(str(self.config_dir)).from_str(
+                            _read_text(self.config_dir / "path_pairs.json", self.config_dir)
+                        )
+                        settings_changed = config.lftp.local_path in LEGACY_DOCKER_LOCAL_PATHS
+                        changed_pairs = [
+                            pair for pair in collection.path_pairs
+                            if pair.local_path in LEGACY_DOCKER_LOCAL_PATHS
+                        ]
+                        if not settings_changed and not changed_pairs:
+                            return False
+
+                        if settings_changed:
+                            config.lftp.local_path = DOCKER_LOCAL_PATH
+                            _atomic_write(
+                                self.config_dir / "settings.cfg",
+                                config.to_str(),
+                                self.config_dir,
+                            )
+                        if changed_pairs:
+                            for pair in changed_pairs:
+                                pair.local_path = DOCKER_LOCAL_PATH
+                            path_pair_content = json.dumps({
+                                "version": collection.version,
+                                "path_pairs": [{
+                                    "id": pair.id,
+                                    "name": pair.name,
+                                    "remote_path": pair.remote_path,
+                                    "local_path": pair.local_path,
+                                    "enabled": pair.enabled,
+                                    "auto_queue": pair.auto_queue,
+                                } for pair in collection.path_pairs],
+                            }, indent=2)
+                            _atomic_write(
+                                self.config_dir / "path_pairs.json",
+                                path_pair_content,
+                                self.config_dir,
+                            )
+
+                        repaired = self._preflight_anchored()
+                        if repaired.state != MigrationState.COMPLETE:
+                            raise ValueError("Docker path repair invalidated completed migration state")
+                        return True
+                except RuntimeExclusionError as exc:
+                    raise MigrationBlockedError(
+                        self._failure_decision(
+                            None,
+                            "Docker path repair refused because SeedSync is active",
+                            True,
+                        )
+                    ) from exc
 
     def release_normal_startup(self) -> MigrationDecision:
         """Durably release one newly completed migration into normal startup.
