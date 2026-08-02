@@ -229,7 +229,21 @@ safe_chown_recursive() {
 check_writable_path() {
     local path="$1"
 
-    if ! setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- bash -c '
+    if [ "$LEGACY_NONROOT_MODE" = "1" ]; then
+        if bash -c '
+            path="$1"
+            test_file=$(mktemp "$path/.seedsync_write_test.XXXXXX") || {
+                printf "ERROR: failed to create writable-path probe under %s\n" "$path" >&2
+                exit 1
+            }
+            rm -f -- "$test_file" || {
+                printf "ERROR: failed to remove writable-path probe %s under %s\n" "$test_file" "$path" >&2
+                exit 1
+            }
+        ' bash "$path"; then
+            return 0
+        fi
+    elif setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- bash -c '
         path="$1"
         test_file=$(mktemp "$path/.seedsync_write_test.XXXXXX") || {
             printf "ERROR: failed to create writable-path probe under %s\n" "$path" >&2
@@ -240,44 +254,50 @@ check_writable_path() {
             exit 1
         }
     ' bash "$path"; then
-        echo "ERROR: $path is not writable by $USER_NAME:$GROUP_NAME (UID=$USER_ID,GID=$GROUP_ID)" >&2
-        exit 1
+        return 0
     fi
+
+    echo "ERROR: $path is not writable by $USER_NAME:$GROUP_NAME (UID=$USER_ID,GID=$GROUP_ID)" >&2
+    exit 1
 }
 
 prepare_config_root() {
     local config_root="${1:-$CONFIG_DIR}"
     local test_delay_seconds="${2:-0}"
     local repair_test_delay_seconds="${3:-0}"
-    python3 - "$config_root" "$USER_ID" "$GROUP_ID" "$DEFAULT_ID" "$test_delay_seconds" "$repair_test_delay_seconds" <<'PY'
+    python3 - "$config_root" "$USER_ID" "$GROUP_ID" "$DEFAULT_ID" "$test_delay_seconds" "$repair_test_delay_seconds" "$LEGACY_NONROOT_MODE" <<'PY'
 import os
 import re
 import stat
 import sys
 import time
 
-root, user_id_text, group_id_text, default_id_text, test_delay_text, repair_test_delay_text = sys.argv[1:]
+root, user_id_text, group_id_text, default_id_text, test_delay_text, repair_test_delay_text, legacy_mode_text = sys.argv[1:]
 uid, gid, default_uid = int(user_id_text), int(group_id_text), int(default_id_text)
+legacy_mode = legacy_mode_text == "1"
 try:
     test_delay_seconds = int(test_delay_text)
     repair_test_delay_seconds = int(repair_test_delay_text)
 except ValueError:
     test_delay_seconds = repair_test_delay_seconds = -1
 allowed_filesystems = {"ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "tmpfs", "overlay"}
+legacy_unraid_filesystem = "fuse.shfs"
 rejected_prefixes = ("fuse",)
 rejected_filesystems = {"9p", "v9fs", "virtiofs", "cifs", "smb", "smb2", "smb3", "nfs", "nfs4", "vboxsf", "drvfs"}
 
 def fail(reason):
+    compatibility = " Legacy non-root compatibility admits fuse.shfs only when /config is already owned by the current UID/GID." if legacy_mode else ""
     raise SystemExit(
         "ERROR: {} config-root contract failed: {}. Use a Docker named volume or a local POSIX "
         "filesystem ({}) owned by UID={}, GID={} with mode 0700; Windows/DrvFS, network, "
-        "and shared filesystems are unsupported for /config.".format(
-            root, reason, ", ".join(sorted(allowed_filesystems)), uid, gid,
+        "and shared filesystems are unsupported for /config.{}".format(
+            root, reason, ", ".join(sorted(allowed_filesystems)), uid, gid, compatibility,
         )
     )
 
 def fail_after_access_revocation(reason):
-    fail("{}; root access was already revoked and the anchored root remains mode 0000 for administrator recovery".format(reason))
+    barrier_mode = "0500" if legacy_mode else "0000"
+    fail("{}; root access was already revoked and the anchored root remains mode {} for administrator recovery".format(reason, barrier_mode))
 
 def decode_mount_path(value):
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
@@ -328,6 +348,14 @@ def require_unlinked_regular(info, root_device, relative):
         fail("{} has link count {}; regular config files must not have hard links".format(relative, info.st_nlink))
 
 def require_admitted_descendant_owner(info, relative):
+    if legacy_mode:
+        if info.st_uid != uid or info.st_gid != gid:
+            fail(
+                "{} owner {}:{} does not match the legacy runtime owner {}:{}; refusing without root privileges".format(
+                    relative, info.st_uid, info.st_gid, uid, gid,
+                )
+            )
+        return
     if info.st_uid not in (0, default_uid, uid):
         fail(
             "{} owner UID {} is neither trusted root, the image default UID {}, nor the runtime UID {}; refusing before ownership repair. "
@@ -357,12 +385,12 @@ def require_same_directory_identity(relative, root_device, *infos):
         if (info.st_dev, info.st_ino) != (reference.st_dev, reference.st_ino):
             fail("{} changed identity while ownership was being repaired".format(relative))
 
-def require_revoked_root_state(root_fd, initial_info, expected_uid, expected_gid, phase):
+def require_revoked_root_state(root_fd, initial_info, expected_uid, expected_gid, expected_mode, phase):
     descriptor_info = os.fstat(root_fd)
     path_info = os.lstat(root)
     if (
         not stat.S_ISDIR(descriptor_info.st_mode)
-        or stat.S_IMODE(descriptor_info.st_mode) != 0
+        or stat.S_IMODE(descriptor_info.st_mode) != expected_mode
         or descriptor_info.st_uid != expected_uid
         or descriptor_info.st_gid != expected_gid
         or (descriptor_info.st_dev, descriptor_info.st_ino) != (initial_info.st_dev, initial_info.st_ino)
@@ -371,6 +399,14 @@ def require_revoked_root_state(root_fd, initial_info, expected_uid, expected_gid
         fail_after_access_revocation("root identity, owner, or mode changed {}".format(phase))
 
 def require_admitted_root_owner(root_info):
+    if legacy_mode:
+        if root_info.st_uid != uid or root_info.st_gid != gid:
+            fail(
+                "legacy non-root /config owner {}:{} does not match the running process {}:{}".format(
+                    root_info.st_uid, root_info.st_gid, uid, gid,
+                )
+            )
+        return
     if root_info.st_uid not in (0, uid):
         fail(
             "root owner UID {} is neither trusted root nor the runtime UID {}; refusing before any ownership or tree mutation. "
@@ -431,7 +467,10 @@ def repair_tree(directory_fd, root_device):
                 child_info = require_directory(child_fd, entry.name)
                 current_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
                 require_same_directory_identity(entry.name, root_device, info, child_info, current_name_info)
-                os.fchown(child_fd, uid, gid)
+                if child_info.st_uid != uid or child_info.st_gid != gid:
+                    if legacy_mode:
+                        fail("{} ownership requires root repair".format(entry.name))
+                    os.fchown(child_fd, uid, gid)
                 final_child_info = os.fstat(child_fd)
                 final_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
                 require_same_directory_identity(entry.name, root_device, final_child_info, final_name_info)
@@ -451,7 +490,10 @@ def repair_tree(directory_fd, root_device):
                 descriptor_info = os.fstat(file_fd)
                 name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
                 require_same_regular_identity(entry.name, root_device, info, descriptor_info, name_info)
-                os.fchown(file_fd, uid, gid)
+                if descriptor_info.st_uid != uid or descriptor_info.st_gid != gid:
+                    if legacy_mode:
+                        fail("{} ownership requires root repair".format(entry.name))
+                    os.fchown(file_fd, uid, gid)
                 final_descriptor_info = os.fstat(file_fd)
                 final_name_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
                 require_same_regular_identity(entry.name, root_device, final_descriptor_info, final_name_info)
@@ -467,34 +509,36 @@ except OSError as exc:
 try:
     root_info = require_directory(root_fd, ".")
     filesystem = filesystem_type(root)
-    if filesystem in rejected_filesystems or filesystem.startswith(rejected_prefixes) or filesystem not in allowed_filesystems:
+    filesystem_allowed = filesystem in allowed_filesystems or (legacy_mode and filesystem == legacy_unraid_filesystem)
+    if filesystem in rejected_filesystems or (filesystem.startswith(rejected_prefixes) and filesystem != legacy_unraid_filesystem) or not filesystem_allowed:
         fail("filesystem type {} is not an allowed local POSIX filesystem".format(filesystem))
     reject_nested_mounts(root)
     require_admitted_root_owner(root_info)
     if test_delay_seconds < 0 or test_delay_seconds > 10 or repair_test_delay_seconds < 0 or repair_test_delay_seconds > 10:
         fail("config-only test delays must be integers from 0 through 10 seconds")
+    revoked_mode = 0o500 if legacy_mode else 0
     try:
-        os.fchmod(root_fd, 0)
+        os.fchmod(root_fd, revoked_mode)
     except OSError as exc:
         fail("cannot revoke root access before ownership transition ({})".format(exc.__class__.__name__))
-    require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, "after access revocation")
-    # This closes new pathname traversal for every UID, including the runtime
-    # UID after root ownership changes. It cannot revoke a descriptor that a
-    # same-UID process opened before preparation, so callers must not share
-    # writable config descriptors with untrusted processes during startup.
+    require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, revoked_mode, "after access revocation")
+    # Strict mode closes new pathname traversal for every UID. Legacy non-root
+    # mode cannot remove owner traversal from the process that must inspect the
+    # tree, so it narrows group/other access and relies on exact current-UID/GID
+    # ownership plus the descriptor identity checks below.
     if test_delay_seconds:
         time.sleep(test_delay_seconds)
-        require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, "during the bounded config-only test delay")
+        require_revoked_root_state(root_fd, root_info, root_info.st_uid, root_info.st_gid, revoked_mode, "during the bounded config-only test delay")
     validate_tree(root_fd, root_info.st_dev)
     if root_info.st_uid == 0 or root_info.st_gid != gid:
         try:
             os.fchown(root_fd, uid, gid)
         except OSError as exc:
             fail_after_access_revocation("cannot assign the runtime owner ({})".format(exc.__class__.__name__))
-    require_revoked_root_state(root_fd, root_info, uid, gid, "after ownership transition")
+    require_revoked_root_state(root_fd, root_info, uid, gid, revoked_mode, "after ownership transition")
     if repair_test_delay_seconds:
         time.sleep(repair_test_delay_seconds)
-        require_revoked_root_state(root_fd, root_info, uid, gid, "during the bounded repair-phase test delay")
+        require_revoked_root_state(root_fd, root_info, uid, gid, revoked_mode, "during the bounded repair-phase test delay")
     repair_tree(root_fd, root_info.st_dev)
     validate_tree(root_fd, root_info.st_dev)
     path_info = os.lstat(root)
@@ -503,7 +547,7 @@ try:
         not stat.S_ISDIR(final_info.st_mode)
         or final_info.st_uid != uid
         or final_info.st_gid != gid
-        or stat.S_IMODE(final_info.st_mode) != 0
+        or stat.S_IMODE(final_info.st_mode) != revoked_mode
         or (path_info.st_dev, path_info.st_ino) != (final_info.st_dev, final_info.st_ino)
     ):
         fail_after_access_revocation("root owner, mode, or identity changed before access restoration")
@@ -516,7 +560,8 @@ try:
         fail("root mode did not restore to runtime-private access")
 finally:
     os.close(root_fd)
-print("Verified config root: {} filesystem={} owner={}:{} mode=700".format(root, filesystem, uid, gid), file=sys.stderr)
+mode_label = "legacy-nonroot" if legacy_mode else "strict"
+print("Verified config root: {} filesystem={} owner={}:{} mode=700 mode={}".format(root, filesystem, uid, gid, mode_label), file=sys.stderr)
 PY
 }
 
@@ -536,8 +581,23 @@ if [ -n "${UMASK:-}" ]; then
     umask "$UMASK"
 fi
 
-USER_ID="$(resolve_id PUID "$DEFAULT_ID")"
-GROUP_ID="$(resolve_id PGID "$DEFAULT_ID")"
+CURRENT_UID="$(id -u)"
+CURRENT_GID="$(id -g)"
+LEGACY_NONROOT_MODE=0
+
+if [ "$CURRENT_UID" -eq 0 ]; then
+    USER_ID="$(resolve_id PUID "$DEFAULT_ID")"
+    GROUP_ID="$(resolve_id PGID "$DEFAULT_ID")"
+else
+    LEGACY_NONROOT_MODE=1
+    USER_ID="$(resolve_id PUID "$CURRENT_UID")"
+    GROUP_ID="$(resolve_id PGID "$CURRENT_GID")"
+    if [ "$USER_ID" -ne "$CURRENT_UID" ] || [ "$GROUP_ID" -ne "$CURRENT_GID" ]; then
+        echo "ERROR: PUID/PGID must match Docker --user (${CURRENT_UID}:${CURRENT_GID}) in legacy non-root mode" >&2
+        exit 1
+    fi
+fi
+export LEGACY_NONROOT_MODE
 
 if [ "${1:-}" = "--prepare-config-root" ]; then
     config_root_test_delay="${SEEDSYNC_CONFIG_ROOT_TEST_DELAY_SECONDS:-0}"
@@ -566,23 +626,35 @@ if [ "${1:-}" = "--prepare-config-root" ]; then
     exit 0
 fi
 
-GROUP_NAME="$(ensure_group "$GROUP_ID")"
-USER_NAME="$APP_USER"
-ensure_user "$USER_ID" "$GROUP_NAME"
+if [ "$LEGACY_NONROOT_MODE" = "1" ]; then
+    GROUP_NAME="$(getent group "$GROUP_ID" | cut -d: -f1 || true)"
+    USER_NAME="$(getent passwd "$USER_ID" | cut -d: -f1 || true)"
+    GROUP_NAME="${GROUP_NAME:-$GROUP_ID}"
+    USER_NAME="${USER_NAME:-$USER_ID}"
+    USER_HOME="/tmp/seedsync-home-${USER_ID}"
+    echo "Using legacy non-root compatibility: UID=$USER_ID GID=$GROUP_ID HOME=$USER_HOME" >&2
+else
+    GROUP_NAME="$(ensure_group "$GROUP_ID")"
+    USER_NAME="$APP_USER"
+    ensure_user "$USER_ID" "$GROUP_NAME"
+fi
 
 # Keep the bootstrap config and the runtime home writable, but avoid recursing
 # through large mounted trees unless their ownership really needs to be fixed.
 mkdir -p "$CONFIG_DIR"
 prepare_config_root
 mkdir -p "$DOWNLOADS_DIR" "$MOUNTS_DIR" "$USER_HOME"
-mkdir -p "$USER_HOME/.ssh"
+RUNTIME_TMP_DIR="$USER_HOME/tmp"
+mkdir -p "$USER_HOME/.ssh" "$RUNTIME_TMP_DIR"
 mkdir -p /staging
 safe_chown "home directory" "$USER_HOME"
 safe_chown_recursive "home SSH directory" "$USER_HOME/.ssh"
+safe_chown_recursive "runtime temporary directory" "$RUNTIME_TMP_DIR"
 safe_chown "downloads directory" "$DOWNLOADS_DIR"
 safe_chown "mounts directory" "$MOUNTS_DIR"
 safe_chown "staging directory" /staging
 chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
+chmod 700 "$RUNTIME_TMP_DIR" 2>/dev/null || true
 ensure_ssh_host_key_config
 
 check_writable_path "$DOWNLOADS_DIR"
@@ -593,11 +665,15 @@ fi
 unset BASH_ENV ENV
 
 export HOME="$USER_HOME"
-echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME)" >&2
+export TMPDIR="$RUNTIME_TMP_DIR"
+echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME, TMPDIR=$TMPDIR)" >&2
 
 export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_local_path
 
 # Keep bootstrap and command/argument forwarding in the existing non-root
 # shell, but make tini the resulting PID 1 so it forwards signals and reaps
 # children spawned by the application.
+if [ "$LEGACY_NONROOT_MODE" = "1" ]; then
+    exec tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
+fi
 exec setpriv --reuid="$USER_ID" --regid="$GROUP_ID" --clear-groups -- tini -g -- bash -lc 'set -euo pipefail; bootstrap_default_config; exec "$@"' bash "$@"
