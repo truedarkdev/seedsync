@@ -655,7 +655,7 @@ class TestSeedsync(unittest.TestCase):
                 history_text = handle.read()
             self.assertNotIn(sensitive_marker, history_text)
 
-    def test_persist_uses_api_key_store_save_history(self):
+    def test_persist_coalesces_unchanged_api_key_store_save_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store_path = os.path.join(temp_dir, "api-keys.json")
             config_path = os.path.join(temp_dir, "settings.cfg")
@@ -688,7 +688,7 @@ class TestSeedsync(unittest.TestCase):
                 entry for entry in updated_history
                 if entry["event"] == "store_saved"
             ])
-            self.assertEqual(initial_save_count + 1, updated_save_count)
+            self.assertEqual(initial_save_count, updated_save_count)
             self.assertTrue(seedsync.controller_persist.to_file.called)
             self.assertTrue(seedsync.auto_queue_persist.to_file.called)
 

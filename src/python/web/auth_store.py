@@ -29,12 +29,17 @@ _REMEMBERED_UI_SESSION_COOKIE_MAX_AGE = timedelta(days=3650)
 _BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
 _BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
 _COMPLETED_MIGRATION_AUTH_MAX_BYTES = 64 * 1024
+_COMPLETED_MIGRATION_HISTORY_MAX_BYTES = 1024 * 1024
 _COMPLETED_MIGRATION_STORE_NAME = "api-keys.json"
 _COMPLETED_MIGRATION_HISTORY_NAME = "api-keys.history.jsonl"
 _COMPLETED_MIGRATION_CLAIM_MARKER_NAME = "migration-claimed-auth.json"
 _COMPLETED_MIGRATION_CLAIM_MARKER_MAX_BYTES = 4096
 _COMPLETED_MIGRATION_CLAIM_JOURNAL_NAME = ".migration-claim-auth.journal.json"
-_COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES = _COMPLETED_MIGRATION_AUTH_MAX_BYTES * 3 + 4096
+# The journal contains one base64 copy of each auth artifact.  Twice their
+# maximum raw size covers base64's 4/3 expansion plus the bounded JSON fields.
+_COMPLETED_MIGRATION_CLAIM_JOURNAL_MAX_BYTES = (
+    2 * (_COMPLETED_MIGRATION_AUTH_MAX_BYTES * 2 + _COMPLETED_MIGRATION_HISTORY_MAX_BYTES) + 4096
+)
 _COMPLETED_MIGRATION_BACKUP_NAME = re.compile(
     r"api-keys-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{6}\.json"
 )
@@ -205,6 +210,9 @@ def _completed_migration_history_entry(payload: object, kind: str) -> bool:
     if kind == "proof":
         expected_details = {"expires_at": None}
         expected_event, expected_reason = "bootstrap_proof_created", "first_run_bootstrap_window_opened"
+    elif kind == "expired_proof":
+        expected_details = {}
+        expected_event, expected_reason = "bootstrap_proof_cleared", "expired"
     elif kind == "loaded":
         expected_details = {
             "api_key_count": 0,
@@ -216,19 +224,24 @@ def _completed_migration_history_entry(payload: object, kind: str) -> bool:
             "bootstrap_exchange_present": False,
         }
         expected_event, expected_reason = "store_loaded", "loaded_existing_store"
-    else:
+    elif kind in ("saved_with_proof", "saved_without_proof"):
         expected_details = {
             "api_key_count": 0,
             "active_api_key_count": 0,
             "ui_session_count": 0,
             "remembered_ui_session_count": 0,
             "browser_handover_claimed_version": "",
-            "bootstrap_proof_present": True,
+            "bootstrap_proof_present": kind == "saved_with_proof",
             "bootstrap_exchange_present": False,
         }
         expected_event, expected_reason = "store_saved", "persisted"
+    else:
+        return False
 
-    if set(payload) != {"timestamp", "event", "reason", "store_file", "details"}:
+    expected_keys = {"timestamp", "event", "reason", "store_file"}
+    if expected_details:
+        expected_keys.add("details")
+    if set(payload) != expected_keys:
         return False
     if (
         payload.get("event") != expected_event
@@ -237,6 +250,8 @@ def _completed_migration_history_entry(payload: object, kind: str) -> bool:
         or not _valid_completed_migration_timestamp(payload.get("timestamp"))
     ):
         return False
+    if not expected_details:
+        return True
     details = payload.get("details")
     if not _is_string_object_dict(details) or set(details) != set(expected_details):
         return False
@@ -258,30 +273,36 @@ def _completed_migration_history_is_safe(payload: bytes, store_present: bool) ->
     if not store_present:
         return len(entries) == 1 and _completed_migration_history_entry(entries[0], "proof")
 
-    index = 0
-    while index < len(entries):
-        proof_count = 0
-        while index < len(entries) and _completed_migration_history_entry(entries[index], "proof"):
-            proof_count += 1
-            index += 1
-        if proof_count == 0:
+    proof_present = False
+    proof_issued = False
+    store_saved = False
+    for entry in entries:
+        if _completed_migration_history_entry(entry, "proof"):
+            # More than one runtime can open the same still-unclaimed browser
+            # handover before the first empty store is persisted.  Both proofs
+            # remain ephemeral, so repeated creation is still pre-claim state.
+            proof_present = True
+            proof_issued = True
+        elif _completed_migration_history_entry(entry, "expired_proof"):
+            if not proof_present:
+                return False
+            proof_present = False
+        elif _completed_migration_history_entry(entry, "loaded"):
+            if not store_saved:
+                return False
+            # Browser proofs are intentionally absent from the durable store.
+            proof_present = False
+        elif _completed_migration_history_entry(entry, "saved_with_proof"):
+            if not proof_present:
+                return False
+            store_saved = True
+        elif _completed_migration_history_entry(entry, "saved_without_proof"):
+            if proof_present or not proof_issued:
+                return False
+            store_saved = True
+        else:
             return False
-        if index >= len(entries) or not _completed_migration_history_entry(entries[index], "saved"):
-            return False
-        index += 1
-        while index < len(entries) and _completed_migration_history_entry(entries[index], "saved"):
-            index += 1
-        if index == len(entries):
-            return True
-        if not _completed_migration_history_entry(entries[index], "loaded"):
-            return False
-        index += 1
-        # A normal restart records its exact empty-store load before opening
-        # the ephemeral browser proof.  With no subsequent persisted auth
-        # mutation, that terminal loader record is a safe pre-claim state.
-        if index == len(entries):
-            return True
-    return False
+    return store_saved
 
 
 def validate_completed_migration_preclaim_auth_state(config_dir: str | Path) -> None:
@@ -294,7 +315,12 @@ def validate_completed_migration_preclaim_auth_state(config_dir: str | Path) -> 
     """
     root = Path(config_dir)
     store = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_STORE_NAME, private=True)
-    history = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_HISTORY_NAME, private=False)
+    history = _read_completed_migration_auth_file(
+        root,
+        _COMPLETED_MIGRATION_HISTORY_NAME,
+        private=False,
+        max_bytes=_COMPLETED_MIGRATION_HISTORY_MAX_BYTES,
+    )
     if store is None and history is None:
         return
     if history is None or not _completed_migration_history_is_safe(history, store is not None):
@@ -431,8 +457,13 @@ def _claim_journal_artifact(root: Path, name: str) -> Dict[str, object]:
         return {"present": False}
     before = path.lstat()
     private = name != _COMPLETED_MIGRATION_HISTORY_NAME
+    max_bytes = (
+        _COMPLETED_MIGRATION_HISTORY_MAX_BYTES
+        if name == _COMPLETED_MIGRATION_HISTORY_NAME
+        else _COMPLETED_MIGRATION_AUTH_MAX_BYTES
+    )
     content = _read_completed_migration_auth_file(
-        root, name, private=private, max_bytes=_COMPLETED_MIGRATION_AUTH_MAX_BYTES,
+        root, name, private=private, max_bytes=max_bytes,
     )
     after = path.lstat()
     if (
@@ -525,7 +556,12 @@ def recover_completed_migration_claim_journal(config_dir: str | Path) -> bool:
                 if not isinstance(content, str) or type(mode) is not int:
                     raise ValueError
                 decoded = base64.b64decode(content.encode("ascii"), validate=True)
-                if len(decoded) > _COMPLETED_MIGRATION_AUTH_MAX_BYTES:
+                max_bytes = (
+                    _COMPLETED_MIGRATION_HISTORY_MAX_BYTES
+                    if name == _COMPLETED_MIGRATION_HISTORY_NAME
+                    else _COMPLETED_MIGRATION_AUTH_MAX_BYTES
+                )
+                if len(decoded) > max_bytes:
                     raise ValueError
                 _write_completed_migration_private_file(root, name, decoded, mode)
             elif os.path.lexists(path):
@@ -594,7 +630,12 @@ def validate_completed_migration_claimed_auth_state(config_dir: str | Path, bind
         raise _completed_migration_claim_error()
 
     store_bytes = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_STORE_NAME, private=True)
-    history_bytes = _read_completed_migration_auth_file(root, _COMPLETED_MIGRATION_HISTORY_NAME, private=False)
+    history_bytes = _read_completed_migration_auth_file(
+        root,
+        _COMPLETED_MIGRATION_HISTORY_NAME,
+        private=False,
+        max_bytes=_COMPLETED_MIGRATION_HISTORY_MAX_BYTES,
+    )
     if store_bytes is None or history_bytes is None:
         raise _completed_migration_claim_error()
     raw_store = _strict_completed_migration_json(store_bytes)
@@ -819,6 +860,7 @@ class ApiKeyStore(Persist):
         self.__completed_migration_transition_binding: Optional[Dict[str, str]] = None
         self.__completed_migration_claimed_handover_version = ""
         self.__completed_migration_claim_transaction: Optional[_CompletedMigrationClaimRuntimeState] = None
+        self.__last_saved_history_snapshot: Optional[Dict[str, object]] = None
 
     @property
     def file_path(self) -> Optional[str]:
@@ -1435,7 +1477,10 @@ class ApiKeyStore(Persist):
             )
         else:
             self.to_file(self.__file_path)
-        self.__record_history_event("store_saved", "persisted", **self.__history_snapshot())
+        snapshot = self.__history_snapshot()
+        if snapshot != self.__last_saved_history_snapshot:
+            self.__record_history_event("store_saved", "persisted", **snapshot)
+            self.__last_saved_history_snapshot = copy.deepcopy(snapshot)
 
     @classmethod
     def from_file(cls, file_path: str) -> "ApiKeyStore":
