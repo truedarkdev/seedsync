@@ -451,10 +451,10 @@ class TestConfigHandlerSet(unittest.TestCase):
         mock_to_file.assert_called_once_with()
         reconfigure_hook.assert_not_called()
 
-    def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
+    def test_obsolete_bootstrap_allowlist_is_not_a_config_option(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
-        inner.has_property.return_value = True
+        inner.has_property.return_value = False
         self.config.general = inner
 
         response = self.handler._ConfigHandler__handle_set_config(
@@ -463,11 +463,8 @@ class TestConfigHandlerSet(unittest.TestCase):
             "172.25.0.1/32"
         )
 
-        self.assertEqual(403, response.status_code)
-        self.assertEqual(
-            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via request body",
-            response.body
-        )
+        self.assertEqual(404, response.status_code)
+        self.assertIn("has no option 'trusted_browser_bootstrap_remote_addrs'", response.body)
         inner.set_property.assert_not_called()
 
 
@@ -541,7 +538,7 @@ class TestConfigHandlerRoutes(unittest.TestCase):
             body
         )
 
-    def test_set_route_blocks_trusted_browser_bootstrap_remote_addrs_from_body(self):
+    def test_set_route_rejects_obsolete_bootstrap_allowlist_option(self):
         config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
 
@@ -552,12 +549,9 @@ class TestConfigHandlerRoutes(unittest.TestCase):
             api_token=self.admin_api_token,
         )
 
-        self.assertEqual(403, status_code)
-        self.assertIsNone(config.general.trusted_browser_bootstrap_remote_addrs)
-        self.assertIn(
-            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via request body",
-            body
-        )
+        self.assertEqual(404, status_code)
+        self.assertFalse(config.general.has_property("trusted_browser_bootstrap_remote_addrs"))
+        self.assertIn("has no option 'trusted_browser_bootstrap_remote_addrs'", body)
 
     def test_set_route_allows_empty_remote_password_from_body(self):
         config = self._new_config()

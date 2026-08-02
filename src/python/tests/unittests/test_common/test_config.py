@@ -253,7 +253,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("*.nfo,Sample/", general.exclude_patterns)
         self.assertEqual("token-value", general.api_token)
         self.assertEqual("", general.allowed_hostname)
-        self.assertEqual("172.25.0.1/32", general.trusted_browser_bootstrap_remote_addrs)
+        self.assertFalse(general.has_property("trusted_browser_bootstrap_remote_addrs"))
         self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
         self.assertEqual(False, general.breadcrumb_trace_enabled)
         self.assertEqual(128, general.breadcrumb_trace_retention_depth)
@@ -860,6 +860,7 @@ class TestConfig(unittest.TestCase):
         [General]
         debug=True
         verbose=True
+        trusted_browser_bootstrap_remote_addrs=172.25.0.1/32
         browser_handover_recovery_version=2026.04.03
 
         [Lftp]
@@ -912,7 +913,7 @@ class TestConfig(unittest.TestCase):
             self.assertEqual("", config.general.api_token)
             self.assertEqual("", config.general.exclude_patterns)
             self.assertEqual("", config.general.allowed_hostname)
-            self.assertEqual("", config.general.trusted_browser_bootstrap_remote_addrs)
+            self.assertFalse(config.general.has_property("trusted_browser_bootstrap_remote_addrs"))
             self.assertEqual("2026.04.03", config.general.browser_handover_recovery_version)
             self.assertEqual(False, config.general.breadcrumb_trace_enabled)
             self.assertEqual(128, config.general.breadcrumb_trace_retention_depth)
@@ -955,6 +956,18 @@ class TestConfig(unittest.TestCase):
             self.assertEqual(False, config.autoqueue.auto_delete_remote)
             self.assertEqual("standard", config.logging.log_format)
 
+            with tempfile.NamedTemporaryFile("w", delete=False) as saved_config_file:
+                saved_config_path = saved_config_file.name
+            try:
+                config.to_file(saved_config_path)
+                with open(saved_config_path, "r", encoding="utf-8") as saved_config_file:
+                    self.assertNotIn(
+                        "trusted_browser_bootstrap_remote_addrs",
+                        saved_config_file.read(),
+                    )
+            finally:
+                os.remove(saved_config_path)
+
             # unknown section error
             with open(config_path, "a") as config_file:
                 config_file.write("""
@@ -978,7 +991,6 @@ class TestConfig(unittest.TestCase):
             config.general.exclude_patterns = "*.nfo,Sample/"
             config.general.api_token = "api-token-value"
             config.general.allowed_hostname = ""
-            config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
             config.general.browser_handover_recovery_version = "2026.04.03"
             config.general.breadcrumb_trace_enabled = False
             config.general.breadcrumb_trace_retention_depth = 128
@@ -1026,7 +1038,6 @@ class TestConfig(unittest.TestCase):
             exclude_patterns = *.nfo,Sample/
             api_token = api-token-value
             allowed_hostname =
-            trusted_browser_bootstrap_remote_addrs = 172.25.0.1/32
             browser_handover_recovery_version = 2026.04.03
             breadcrumb_trace_enabled = False
             breadcrumb_trace_retention_depth = 128

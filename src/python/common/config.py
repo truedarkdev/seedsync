@@ -457,9 +457,6 @@ class Config(Persist):
         exclude_patterns = PROP("exclude_patterns", Checkers.string_allow_empty, Converters.null)
         api_token = PROP("api_token", Checkers.null, Converters.null)
         allowed_hostname = PROP("allowed_hostname", Checkers.null, Converters.null)
-        trusted_browser_bootstrap_remote_addrs = PROP("trusted_browser_bootstrap_remote_addrs",
-                                                      Checkers.null,
-                                                      Converters.null)
         browser_handover_recovery_version = PROP("browser_handover_recovery_version",
                                                  Checkers.null,
                                                  Converters.null)
@@ -480,7 +477,6 @@ class Config(Persist):
             self.exclude_patterns = ""
             self.api_token = None
             self.allowed_hostname = None
-            self.trusted_browser_bootstrap_remote_addrs = None
             self.browser_handover_recovery_version = None
             self.breadcrumb_trace_enabled = False
             self.breadcrumb_trace_retention_depth = 128
@@ -488,6 +484,12 @@ class Config(Persist):
 
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
+            # This pre-0.9 compatibility key no longer controls access. Accept
+            # and discard it so existing installations upgrade without a
+            # manual settings.cfg edit; the next save removes it permanently.
+            if "trusted_browser_bootstrap_remote_addrs" in config_dict:
+                config_dict = dict(config_dict)
+                config_dict.pop("trusted_browser_bootstrap_remote_addrs", None)
             if "exclude_patterns" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["exclude_patterns"] = ""
@@ -497,9 +499,6 @@ class Config(Persist):
             if "allowed_hostname" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["allowed_hostname"] = ""
-            if "trusted_browser_bootstrap_remote_addrs" not in config_dict:
-                config_dict = dict(config_dict)
-                config_dict["trusted_browser_bootstrap_remote_addrs"] = ""
             if "browser_handover_recovery_version" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["browser_handover_recovery_version"] = ""

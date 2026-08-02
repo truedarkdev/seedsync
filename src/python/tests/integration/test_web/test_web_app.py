@@ -114,11 +114,11 @@ class TestWebApp(BaseTestWebApp):
             response.headers["Content-Security-Policy"]
         )
 
-    def test_index_html_is_served_directly(self):
+    def test_unauthenticated_index_html_redirects_to_browser_bootstrap(self):
         response = self.build_browser_test_app().get("/index.html")
 
-        self.assertEqual(200, response.status_int)
-        self.assertIn("<html></html>", response.text)
+        self.assertEqual(302, response.status_int)
+        self.assertEqual("http://localhost:8800/bootstrap", response.headers["Location"])
 
     def test_dashboard_path_pair_deep_link_serves_index_html(self):
         response = self.build_browser_test_app().get(
@@ -150,8 +150,7 @@ class TestWebApp(BaseTestWebApp):
         self.assertIn("Save this browser for next time", response.text)
         self.assertEqual({}, browser_app.cookies)
 
-    def test_trusted_docker_gateway_redirects_to_open_first_run_handover_without_granting_session(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+    def test_docker_gateway_redirects_to_open_first_run_handover_without_granting_session(self):
         self.auth_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "empty-api-keys.json"))
         self.web_app = WebAppBuilder(
             self.context,

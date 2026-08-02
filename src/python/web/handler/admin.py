@@ -32,6 +32,13 @@ class AdminHandler(IHandler):
         self.__auth_store = auth_store
 
     @staticmethod
+    def __secure_browser_cookie() -> bool:
+        forwarded_proto = bottle.request.headers.get("X-Forwarded-Proto", "").strip().lower()
+        if forwarded_proto in {"http", "https"}:
+            return forwarded_proto == "https"
+        return bottle.request.urlparts.scheme.lower() == "https"
+
+    @staticmethod
     def __json_response(payload: object, status: int = 200) -> HTTPResponse:
         return HTTPResponse(
             body=json.dumps(payload),
@@ -121,6 +128,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                secure=self.__secure_browser_cookie(),
                 max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
@@ -168,6 +176,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                secure=self.__secure_browser_cookie(),
                 max_age=ui_session.cookie_max_age_seconds(),
             )
             return response
@@ -208,6 +217,7 @@ class AdminHandler(IHandler):
                 path="/",
                 httponly=True,
                 samesite="strict",
+                secure=self.__secure_browser_cookie(),
                 max_age=ui_session.cookie_max_age_seconds(),
             )
             return response

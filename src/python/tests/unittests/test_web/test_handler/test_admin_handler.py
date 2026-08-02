@@ -215,7 +215,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(401, resp.status_int)
         self.assertIn("Invalid API token", str(resp.html))
 
-    def test_first_admin_bootstrap_requires_trusted_local_browser_and_same_origin_signal(self):
+    def test_first_admin_bootstrap_requires_same_origin_but_not_source_ip(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -237,19 +237,6 @@ class TestAdminHandler(unittest.TestCase):
         )
         self.assertEqual(401, rejected_host_only.status_int)
 
-        rejected_proxied = test_app.post_json(
-            "/server/admin/bootstrap/v1/first-api-key",
-            {"name": "proxied-loopback-admin"},
-            extra_environ={
-                "HTTP_HOST": "seed.example:8800",
-                "REMOTE_ADDR": "172.25.0.1",
-                "HTTP_ORIGIN": "https://seed.example:8800",
-                "HTTP_REFERER": "https://seed.example:8800/bootstrap",
-            },
-            expect_errors=True
-        )
-        self.assertEqual(401, rejected_proxied.status_int)
-
         rejected_cross_origin = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "cross-site-admin"},
@@ -265,31 +252,43 @@ class TestAdminHandler(unittest.TestCase):
         _assert_security_headers(self, rejected_cross_origin)
         self.assertEqual(0, empty_store.active_admin_key_count)
 
-        allowed = test_app.post_json(
+        allowed_remote = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
-            {"name": "first-admin"},
-            extra_environ=self._same_origin_headers()
+            {"name": "remote-admin"},
+            extra_environ={
+                "HTTP_HOST": "internal:8800",
+                "REMOTE_ADDR": "203.0.113.10",
+                "HTTP_X_FORWARDED_HOST": "seed.example",
+                "HTTP_X_FORWARDED_PROTO": "https",
+                "HTTP_ORIGIN": "https://seed.example",
+                "HTTP_REFERER": "https://seed.example/bootstrap",
+            },
         )
-        allowed_payload = json.loads(allowed.text)
-        self.assertEqual(201, allowed.status_int)
-        _assert_security_headers(self, allowed)
+        allowed_payload = json.loads(allowed_remote.text)
+        self.assertEqual(201, allowed_remote.status_int)
+        _assert_security_headers(self, allowed_remote)
         self.assertEqual(["admin"], allowed_payload["key"]["scopes"])
         self.assertIn("secret", allowed_payload)
+        self.assertIn("Secure", allowed_remote.headers.get("Set-Cookie", ""))
+        self.assertEqual(1, empty_store.active_admin_key_count)
 
-    def test_first_admin_bootstrap_rejects_loopback_transport_with_non_loopback_host(self):
+    def test_first_admin_bootstrap_accepts_loopback_transport_with_non_loopback_host(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-mismatch.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
         test_app = TestApp(web_app)
 
-        rejected = test_app.post_json(
+        allowed = test_app.post_json(
             "/server/admin/bootstrap/v1/first-api-key",
             {"name": "host-mismatch-admin"},
-            extra_environ={"HTTP_HOST": "seed.example:8800", "REMOTE_ADDR": "127.0.0.1"},
-            expect_errors=True
+            extra_environ={
+                "HTTP_HOST": "seed.example:8800",
+                "REMOTE_ADDR": "127.0.0.1",
+                "HTTP_ORIGIN": "http://seed.example:8800",
+            },
         )
 
-        self.assertEqual(401, rejected.status_int)
+        self.assertEqual(201, allowed.status_int)
 
     def test_prebootstrap_browser_can_bootstrap_first_admin_and_unlock_admin_routes(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-limited.json"))
@@ -352,8 +351,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(200, authorized_admin_list.status_int)
         self.assertEqual(1, len(authorized_payload["keys"]))
 
-    def test_trusted_bootstrap_remote_can_read_migration_state_and_bootstrap_first_admin(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
+    def test_remote_client_can_read_migration_state_and_bootstrap_first_admin(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-trusted-remote.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -401,7 +399,14 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(1, empty_store.active_admin_key_count)
 
     def test_remember_browser_session_route_issues_cookie_for_existing_api_key(self):
-        trusted_headers = self._same_origin_headers()
+        trusted_headers = {
+            "HTTP_HOST": "internal:8800",
+            "REMOTE_ADDR": "203.0.113.10",
+            "HTTP_X_FORWARDED_HOST": "seed.example",
+            "HTTP_X_FORWARDED_PROTO": "https",
+            "HTTP_ORIGIN": "https://seed.example",
+            "HTTP_REFERER": "https://seed.example/bootstrap",
+        }
 
         response = self.test_app.post_json(
             "/server/browser/v1/remember",
@@ -420,6 +425,7 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
         self.assertIn("Max-Age=315360000", response.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", response.headers.get("Set-Cookie", ""))
+        self.assertIn("Secure", response.headers.get("Set-Cookie", ""))
 
         cookie_secret = response.headers.get("Set-Cookie", "").split(";", 1)[0].split("=", 1)[1]
         remembered_session = self.auth_store.find_ui_session_by_secret(cookie_secret)
@@ -484,10 +490,12 @@ class TestAdminHandler(unittest.TestCase):
         proof = empty_store.ensure_bootstrap_proof()
         exchange = empty_store.ensure_bootstrap_exchange()
         same_origin_headers = {
-            "HTTP_HOST": "localhost:8800",
-            "REMOTE_ADDR": "127.0.0.1",
-            "HTTP_ORIGIN": "http://localhost:8800",
-            "HTTP_REFERER": "http://localhost:8800/bootstrap",
+            "HTTP_HOST": "internal:8800",
+            "REMOTE_ADDR": "203.0.113.10",
+            "HTTP_X_FORWARDED_HOST": "seed.example",
+            "HTTP_X_FORWARDED_PROTO": "https",
+            "HTTP_ORIGIN": "https://seed.example",
+            "HTTP_REFERER": "https://seed.example/bootstrap",
             "HTTP_COOKIE": "seedsync_bootstrap_exchange={}".format(exchange.secret),
         }
         bootstrap_page = test_app.get(
@@ -518,9 +526,10 @@ class TestAdminHandler(unittest.TestCase):
         self.assertIn("seedsync_ui_session=", first_exchange.headers.get("Set-Cookie", ""))
         self.assertIn("Max-Age=43200", first_exchange.headers.get("Set-Cookie", ""))
         self.assertIn("HttpOnly", first_exchange.headers.get("Set-Cookie", ""))
+        self.assertIn("Secure", first_exchange.headers.get("Set-Cookie", ""))
         self.assertNotIn("session_secret", json.loads(first_exchange.text))
 
-    def test_bootstrap_session_can_unlock_first_admin_without_trusted_remote_headers(self):
+    def test_bootstrap_session_can_unlock_first_admin_without_proxy_headers(self):
         empty_store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-untrusted-session.json"))
         web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
         AdminHandler(self.context.config, empty_store).add_routes(web_app)
@@ -566,7 +575,6 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(1, empty_store.active_admin_key_count)
 
     def test_migration_state_reports_non_admin_keys_without_exiting_bootstrap_mode(self):
-        self.context.config.general.trusted_browser_bootstrap_remote_addrs = "172.25.0.1/32"
         store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "bootstrap-api-keys-non-admin.json"))
         store.create_api_key("reader-writer", ["read", "write", "stream"])
         web_app = WebApp(self.context, MagicMock(), auth_store=store)

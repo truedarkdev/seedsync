@@ -266,17 +266,17 @@ class TestConfigHandler(BaseTestWebApp):
             str(resp.html)
         )
 
-    def test_set_trusted_browser_bootstrap_remote_addrs_via_body_is_forbidden(self):
-        self.assertEqual(None, self.context.config.general.trusted_browser_bootstrap_remote_addrs)
+    def test_obsolete_bootstrap_allowlist_is_not_a_config_option(self):
+        self.assertFalse(self.context.config.general.has_property("trusted_browser_bootstrap_remote_addrs"))
         resp = self.test_app.post_json(
             "/server/config/set/general/trusted_browser_bootstrap_remote_addrs",
             {"value": "172.25.0.1/32"},
             expect_errors=True
         )
-        self.assertEqual(403, resp.status_int)
-        self.assertEqual(None, self.context.config.general.trusted_browser_bootstrap_remote_addrs)
+        self.assertEqual(404, resp.status_int)
+        self.assertFalse(self.context.config.general.has_property("trusted_browser_bootstrap_remote_addrs"))
         self.assertEqual(
-            "Section 'general' option 'trusted_browser_bootstrap_remote_addrs' cannot be set via request body",
+            "Section 'general' in config has no option 'trusted_browser_bootstrap_remote_addrs'",
             str(resp.html)
         )
 
