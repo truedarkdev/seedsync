@@ -475,19 +475,22 @@ export class ViewFileService {
         if (remoteSize == null) {
             remoteSize = 0;
         }
+        const remotePresent: boolean = modelFile.remote_present === true;
+        const localPresent: boolean = modelFile.local_present === true;
+        const remoteHasTransferableContent: boolean =
+            modelFile.remote_has_transferable_content === true;
         let transferredSize: number = modelFile.transferred_size;
         if (transferredSize == null) {
             transferredSize = localSize;
         }
-        const isLocalOnly: boolean = [ModelFile.State.DEFAULT, ModelFile.State.DOWNLOADED].includes(modelFile.state)
-            && localSize > 0
-            && modelFile.remote_size == null;
+        const isLocalOnly: boolean = localPresent && !remoteHasTransferableContent;
         if (isLocalOnly) {
             transferredSize = localSize;
         }
         const displaySizeTotal: number = isLocalOnly ? localSize : remoteSize;
         const hasRetainedProgress: boolean = !isLocalOnly
-            && (modelFile.remote_size == null || remoteSize > 0)
+            && remoteHasTransferableContent
+            && remoteSize > 0
             && (
             transferredSize > 0 || (modelFile.download_progress != null && modelFile.download_progress > 0)
         );
@@ -501,6 +504,15 @@ export class ViewFileService {
             percentDownloaded = 100;
         } else if (remoteSize > 0) {
             percentDownloaded = Math.round(100.0 * transferredSize / remoteSize);
+        } else if (remoteHasTransferableContent && localPresent && [
+            ModelFile.State.DOWNLOADED,
+            ModelFile.State.EXTRACTING,
+            ModelFile.State.EXTRACTED,
+            ModelFile.State.VALIDATING,
+            ModelFile.State.VALIDATED,
+            ModelFile.State.CORRUPT
+        ].includes(modelFile.state)) {
+            percentDownloaded = 100;
         }
 
         // Translate the status
@@ -566,7 +578,7 @@ export class ViewFileService {
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DELETED,
                                     ViewFile.Status.CORRUPT].includes(status)
-                                    && remoteSize > 0;
+                                    && remoteHasTransferableContent;
         const isStoppable: boolean = [ViewFile.Status.QUEUED,
                                     ViewFile.Status.DOWNLOADING].includes(status)
                                     && modelFile.is_stoppable;
@@ -576,7 +588,7 @@ export class ViewFileService {
                                     ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED].includes(status)
-                                    && localSize > 0;
+                                    && localPresent;
         const isLocallyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
@@ -585,7 +597,7 @@ export class ViewFileService {
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT,
                                     ViewFile.Status.MOVE_FAILED].includes(status)
-                                    && localSize > 0;
+                                    && localPresent;
         const isRemotelyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,
@@ -594,13 +606,13 @@ export class ViewFileService {
                                     ViewFile.Status.DELETED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)
-                                    && remoteSize > 0;
+                                    && remotePresent;
         const isValidatable: boolean = [ViewFile.Status.DOWNLOADED,
                                     ViewFile.Status.MOVE_SUCCEEDED,
                                     ViewFile.Status.EXTRACTED,
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT].includes(status)
-                                    && localSize > 0 && remoteSize > 0;
+                                    && localPresent && remoteHasTransferableContent;
         const isMoveRetryable = status === ViewFile.Status.MOVE_FAILED;
 
         return new ViewFile({
@@ -611,6 +623,10 @@ export class ViewFileService {
             isDir: modelFile.is_dir,
             localSize: localSize,
             remoteSize: remoteSize,
+            remotePresent: remotePresent,
+            localPresent: localPresent,
+            remoteHasTransferableContent: remoteHasTransferableContent,
+            isLocalOnly: isLocalOnly,
             transferredSize: transferredSize,
             displaySizeTotal: displaySizeTotal,
             percentDownloaded: percentDownloaded,

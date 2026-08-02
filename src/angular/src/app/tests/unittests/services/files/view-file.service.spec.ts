@@ -337,6 +337,9 @@ describe("Testing view file service", () => {
         modelFile = new ModelFile(modelFile.set("state", ModelFile.State.DEFAULT));
         modelFile = new ModelFile(modelFile.set("local_size", 50));
         modelFile = new ModelFile(modelFile.set("remote_size", 50));
+        modelFile = new ModelFile(modelFile.set("remote_present", true));
+        modelFile = new ModelFile(modelFile.set("local_present", true));
+        modelFile = new ModelFile(modelFile.set("remote_has_transferable_content", true));
         model = model.set(modelFile.name, modelFile);
         mockModelService._files.next(model);
         tick();
@@ -481,14 +484,17 @@ describe("Testing view file service", () => {
         expect(latestFile.percentDownloaded).toBe(25);
     }));
 
-    it("should preserve stopped retained progress when remote size is missing", fakeAsync(() => {
+    it("should render explicit local presence as Local Only when remote content is missing", fakeAsync(() => {
         const model = Immutable.Map<string, ModelFile>().set("partial", new ModelFile({
             name: "partial",
             state: ModelFile.State.DEFAULT,
             local_size: 0,
             remote_size: null,
             transferred_size: 25,
-            download_progress: 25
+            download_progress: 25,
+            remote_present: false,
+            local_present: true,
+            remote_has_transferable_content: false,
         }));
         mockModelService._files.next(model);
         tick();
@@ -501,9 +507,9 @@ describe("Testing view file service", () => {
         });
         tick();
 
-        expect(latestFile.status).toBe(ViewFile.Status.STOPPED);
-        expect(latestFile.transferredSize).toBe(25);
-        expect(latestFile.percentDownloaded).toBe(25);
+        expect(latestFile.status).toBe(ViewFile.Status.DEFAULT);
+        expect(latestFile.transferredSize).toBe(0);
+        expect(latestFile.percentDownloaded).toBe(100);
         expect(latestFile.remoteSize).toBe(0);
     }));
 
@@ -563,6 +569,95 @@ describe("Testing view file service", () => {
         });
         tick();
         expect(count).toBe(1);
+    }));
+
+    it("should use explicit presence signals for zero-byte remote and local-only rows", fakeAsync(() => {
+        const model = Immutable.Map<string, ModelFile>()
+            .set("zero", new ModelFile({
+                name: "zero",
+                state: ModelFile.State.DEFAULT,
+                local_size: null,
+                remote_size: 0,
+                remote_present: true,
+                local_present: false,
+                remote_has_transferable_content: true,
+            }))
+            .set("local", new ModelFile({
+                name: "local",
+                state: ModelFile.State.DEFAULT,
+                local_size: 0,
+                remote_size: null,
+                remote_present: false,
+                local_present: true,
+                remote_has_transferable_content: false,
+            }))
+            // Empty remote directories remain manually deletable when they
+            // have a local counterpart, but are never queueable as content.
+            .set("empty-dir", new ModelFile({
+                name: "empty-dir",
+                is_dir: true,
+                state: ModelFile.State.DEFAULT,
+                local_size: 0,
+                remote_size: 0,
+                remote_present: true,
+                local_present: true,
+                remote_has_transferable_content: false,
+            }));
+        mockModelService._files.next(model);
+        tick();
+
+        let latestFiles: Immutable.List<ViewFile> = null;
+        viewService.files.subscribe(files => latestFiles = files);
+        tick();
+        const remoteZero = latestFiles.find(file => file.name === "zero");
+        const localOnly = latestFiles.find(file => file.name === "local");
+        expect(remoteZero.remotePresent).toBe(true);
+        expect(remoteZero.remoteHasTransferableContent).toBe(true);
+        expect(remoteZero.isLocalOnly).toBe(false);
+        expect(remoteZero.isQueueable).toBe(true);
+        expect(localOnly.localPresent).toBe(true);
+        expect(localOnly.isLocalOnly).toBe(true);
+        expect(localOnly.percentDownloaded).toBe(100);
+        expect(localOnly.displaySizeTotal).toBe(0);
+        expect(localOnly.isLocallyDeletable).toBe(true);
+        const emptyDir = latestFiles.find(file => file.name === "empty-dir");
+        expect(emptyDir.isQueueable).toBe(false);
+        expect(emptyDir.isRemotelyDeletable).toBe(true);
+    }));
+
+    it("should project explicit signals across an incremental model update", fakeAsync(() => {
+        const initial = new ModelFile({
+            name: "changing",
+            state: ModelFile.State.DEFAULT,
+            remote_size: null,
+            local_size: null,
+            remote_present: false,
+            local_present: false,
+            remote_has_transferable_content: false,
+        });
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("changing", initial));
+        tick();
+        const updated = new ModelFile({
+            name: "changing",
+            state: ModelFile.State.DEFAULT,
+            remote_size: 0,
+            local_size: null,
+            remote_present: true,
+            local_present: false,
+            remote_has_transferable_content: true,
+        });
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("changing", updated));
+        tick();
+
+        let latestFile: ViewFile = null;
+        viewService.files.subscribe(files => latestFile = files.get(0));
+        tick();
+
+        const file = latestFile;
+        expect(file.remotePresent).toBe(true);
+        expect(file.remoteHasTransferableContent).toBe(true);
+        expect(file.isLocalOnly).toBe(false);
+        expect(file.isQueueable).toBe(true);
     }));
 
     it("should should correctly set ViewFile isQueueable", fakeAsync(() => {

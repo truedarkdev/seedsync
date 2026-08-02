@@ -466,6 +466,52 @@ class TestAutoQueue(unittest.TestCase):
         self.assertEqual(set([Controller.Command.Action.QUEUE]*3), {c.action for c in commands})
         self.assertEqual({"File.One", "File.Two", "File.Three"}, {c.filename for c in commands})
 
+    def test_empty_remote_directory_is_not_auto_queued_but_zero_byte_file_is(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="empty"))
+        persist.add_pattern(AutoQueuePattern(pattern="zero"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        empty_dir = ModelFile("empty", True)
+        empty_dir.remote_size = 0
+        empty_dir.local_size = 0
+        self.model_listener.file_added(empty_dir)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        zero_file = ModelFile("zero", False)
+        zero_file.remote_size = 0
+        self.model_listener.file_added(zero_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("zero", command.filename)
+
+    def test_empty_remote_directory_becoming_transferable_at_same_size_is_auto_queued(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="empty"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_dir = ModelFile("empty", True)
+        old_dir.remote_present = True
+        old_dir.remote_size = 0
+        old_dir.remote_has_transferable_content = False
+
+        new_dir = ModelFile("empty", True)
+        new_dir.remote_present = True
+        new_dir.remote_size = 0
+        new_dir.remote_has_transferable_content = True
+
+        self.model_listener.file_updated(old_dir, new_dir)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
+        self.assertEqual("empty", command.filename)
+
     def test_process_records_auto_queue_breadcrumb_summary(self):
         persist = AutoQueuePersist()
         persist.add_pattern(AutoQueuePattern(pattern="File.One"))
@@ -1595,6 +1641,40 @@ class TestAutoQueue(unittest.TestCase):
         auto_queue.process()
 
         self.controller.queue_command.assert_not_called()
+
+    def test_empty_remote_directory_suppresses_auto_delete_but_zero_byte_file_deletes(self):
+        self.context.config.autoqueue.auto_delete_remote = True
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="archive"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_dir = ModelFile("archive-dir", True)
+        old_dir.state = ModelFile.State.EXTRACTING
+        old_dir.local_size = 0
+        old_dir.remote_size = 0
+        new_dir = ModelFile("archive-dir", True)
+        new_dir.state = ModelFile.State.EXTRACTED
+        new_dir.local_size = 0
+        new_dir.remote_size = 0
+        self.model_listener.file_updated(old_dir, new_dir)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        old_file = ModelFile("archive-zero", False)
+        old_file.state = ModelFile.State.EXTRACTING
+        old_file.local_size = 0
+        old_file.remote_size = 0
+        new_file = ModelFile("archive-zero", False)
+        new_file.state = ModelFile.State.EXTRACTED
+        new_file.local_size = 0
+        new_file.remote_size = 0
+        self.model_listener.file_updated(old_file, new_file)
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual("archive-zero", command.filename)
 
     def test_initial_completed_model_files_do_not_auto_delete_remote(self):
         self.context.config.autoqueue.auto_delete_remote = True

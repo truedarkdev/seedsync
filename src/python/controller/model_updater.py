@@ -9,6 +9,7 @@ delegates the model refresh boundary.
 
 from __future__ import annotations
 
+import json
 import re
 import logging
 from types import SimpleNamespace
@@ -192,6 +193,27 @@ class ModelUpdater(_ControllerCoreAccess):
 
         filtered: set[str] = set()
         for key in keys:
+            # A bare legacy name is ambiguous once path pairs are active:
+            # ModelBuilder also matches persisted markers by ``file.name``.
+            # Defer these markers until the path-pair canonicalization lane
+            # can prove their identity rather than applying them to every
+            # same-named pair.
+            if KEY_SEP not in key and not any(
+                ModelUpdater._is_legacy_pair_scoped_colon_key(key, path_pair_id)
+                for path_pair_id in path_pair_ids
+            ):
+                try:
+                    parsed = json.loads(key)
+                except (TypeError, ValueError):
+                    parsed = None
+                if not (
+                    isinstance(parsed, list)
+                    and len(parsed) == 2
+                    and isinstance(parsed[0], str)
+                    and isinstance(parsed[1], str)
+                    and key == ModelFile.build_file_id(parsed[1], parsed[0])
+                ):
+                    continue
             normalized_key = key
             for path_pair_id in path_pair_ids:
                 prefix = f"{path_pair_id}{KEY_SEP}"
@@ -209,6 +231,76 @@ class ModelUpdater(_ControllerCoreAccess):
         if _LEGACY_PAIR_ID_RE.match(path_pair_id) is None:
             return False
         return key.startswith(f"{path_pair_id}:")
+
+    @staticmethod
+    def _normalize_scoped_persist_key(key: str, path_pair_ids: set[str]) -> str | None:
+        """Map an exact persisted identity to the canonical model id.
+
+        Persisted keys currently use ``persist_key``'s unit-separator form;
+        UUID-like path pairs may also have the historical ``pair:name`` form.
+        Canonical JSON model ids are accepted as already-normalized. Bare
+        names intentionally return ``None`` and remain deferred to the
+        path-pair canonicalization task.
+        """
+        if not isinstance(key, str):
+            return None
+        try:
+            parsed = json.loads(key)
+        except (TypeError, ValueError):
+            parsed = None
+        if (
+            isinstance(parsed, list)
+            and len(parsed) == 2
+            and (parsed[0] is None or isinstance(parsed[0], str))
+            and isinstance(parsed[1], str)
+            and key == ModelFile.build_file_id(parsed[1], parsed[0])
+        ):
+            parsed_pair_id = parsed[0]
+            # The default/root identity remains authoritative only when no
+            # path-pair scope is active. Scoped JSON identities must belong to
+            # the current enabled set; unknown/disabled pairs are deferred.
+            if parsed_pair_id is None:
+                return key if not path_pair_ids else None
+            return key if parsed_pair_id in path_pair_ids else None
+
+        if KEY_SEP in key:
+            path_pair_id, name = key.split(KEY_SEP, 1)
+            if path_pair_id in path_pair_ids:
+                return ModelFile.build_file_id(name, path_pair_id)
+
+        # A colon is only treated as a scope delimiter for the historical
+        # UUID-shaped pair id; arbitrary pair names and filenames may contain
+        # colons.
+        if ":" in key:
+            path_pair_id, name = key.split(":", 1)
+            if path_pair_id in path_pair_ids and _LEGACY_PAIR_ID_RE.match(path_pair_id):
+                return ModelFile.build_file_id(name, path_pair_id)
+        return None
+
+    @classmethod
+    def _safe_stale_marker_ids(
+        cls,
+        markers: set[str],
+        active_model_ids: set[str],
+        active_model_names: set[str],
+        pending_ids: set[str],
+        path_pair_ids: set[str],
+    ) -> set[str]:
+        stale: set[str] = set()
+        for marker in markers:
+            normalized_marker = cls._normalize_scoped_persist_key(marker, path_pair_ids)
+            if normalized_marker is not None:
+                if normalized_marker not in active_model_ids and normalized_marker not in pending_ids:
+                    stale.add(marker)
+                continue
+            if marker in active_model_ids or marker in active_model_names or marker in pending_ids:
+                continue
+            if not path_pair_ids:
+                # With only the legacy/default root, a bare name is safe to
+                # prune. Once path pairs exist, defer ambiguous names to the
+                # canonicalization task rather than cross-applying a marker.
+                stale.add(marker)
+        return stale
 
     def _handle_lftp_completion_detection(
         self,
@@ -279,6 +371,10 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__move_attempt_reservations = set()
         if not hasattr(controller, "_Controller__move_attempt_lock"):
             controller._Controller__move_attempt_lock = Lock()
+        if not hasattr(controller, "_Controller__last_remote_reconciliation_healthy"):
+            controller._Controller__last_remote_reconciliation_healthy = False
+        if not hasattr(controller, "_Controller__last_local_reconciliation_healthy"):
+            controller._Controller__last_local_reconciliation_healthy = False
 
         # Grab the latest scan results.
         latest_remote_scan = controller._Controller__remote_scan_process.pop_latest_result()
@@ -429,33 +525,41 @@ class ModelUpdater(_ControllerCoreAccess):
         # Update model builder state.
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
+            remote_scan_failed = bool(getattr(latest_remote_scan, "failed", False))
             remote_files = filter_excluded_files(
                 latest_remote_scan.files,
                 self._get_exclude_patterns(controller),
             )
-            model_builder.set_remote_files(remote_files)
+            controller._Controller__last_remote_reconciliation_healthy = not remote_scan_failed
+            if not remote_scan_failed:
+                model_builder.set_remote_files(remote_files)
             controller._Controller__record_breadcrumb(
                 stage="scan",
                 message="remote_scan_result",
                 details={
                     "file_count": len(remote_files),
-                    "failed": latest_remote_scan.failed,
+                    "failed": remote_scan_failed,
                     "error_message": latest_remote_scan.error_message,
                 },
-                event_type="failure" if latest_remote_scan.failed else "state_transition",
+                event_type="failure" if remote_scan_failed else "state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
             )
         if latest_local_scan is not None:
-            model_builder.set_local_files(latest_local_scan.files)
-            raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
-            if isinstance(raw_recovered_ids, (list, tuple, set)):
-                recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
-                recovered_extracted_file_ids = [
-                    file_id for file_id in recovered_items if isinstance(file_id, str)
-                ]
-            else:
-                recovered_extracted_file_ids = []
-            persist.extracted_file_names.update(recovered_extracted_file_ids)
+            # A failed local scan may contain a partial/empty result. Keep the
+            # last authoritative local snapshot and its history until a
+            # healthy scan proves absence.
+            local_scan_failed = bool(getattr(latest_local_scan, "failed", False))
+            controller._Controller__last_local_reconciliation_healthy = not local_scan_failed
+            recovered_extracted_file_ids = []
+            if not local_scan_failed:
+                model_builder.set_local_files(latest_local_scan.files)
+                raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
+                if isinstance(raw_recovered_ids, (list, tuple, set)):
+                    recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
+                    recovered_extracted_file_ids = [
+                        file_id for file_id in recovered_items if isinstance(file_id, str)
+                    ]
+                persist.extracted_file_names.update(recovered_extracted_file_ids)
             controller._Controller__record_breadcrumb(
                 stage="scan",
                 message="local_scan_result",
@@ -600,7 +704,14 @@ class ModelUpdater(_ControllerCoreAccess):
 
         # Build the new model, if needed.
         auto_purge_candidate_ids: set[str] = set()
-        remote_reconciliation_established = latest_remote_scan is not None and not latest_remote_scan.failed
+        remote_reconciliation_established = (
+            latest_remote_scan is not None
+            and not bool(getattr(latest_remote_scan, "failed", False))
+        )
+        reconciliation_healthy = (
+            controller._Controller__last_remote_reconciliation_healthy
+            and controller._Controller__last_local_reconciliation_healthy
+        )
         if remote_reconciliation_established:
             remote_scan = latest_remote_scan
             if remote_scan is None:
@@ -929,21 +1040,22 @@ class ModelUpdater(_ControllerCoreAccess):
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded.
                 remove_extracted_file_names: set[str] = set()
                 existing_file_ids = model.get_file_ids()
-                for extracted_file_name in persist.extracted_file_names:
-                    if extracted_file_name in existing_file_ids:
-                        file = model.get_file(extracted_file_name)
-                        if file.state == ModelFile.State.DELETED:
-                            remove_extracted_file_names.add(extracted_file_name)
-                    elif extracted_file_name in model.get_file_names():
-                        try:
+                if reconciliation_healthy:
+                    for extracted_file_name in persist.extracted_file_names:
+                        if extracted_file_name in existing_file_ids:
                             file = model.get_file(extracted_file_name)
-                        except ModelError:
-                            continue
-                        if file.state == ModelFile.State.DELETED:
-                            remove_extracted_file_names.add(extracted_file_name)
-                    else:
-                        # Not in the model at all. This could be because local and remote scans are not yet available.
-                        pass
+                            if file.state == ModelFile.State.DELETED:
+                                remove_extracted_file_names.add(extracted_file_name)
+                        elif extracted_file_name in model.get_file_names():
+                            try:
+                                file = model.get_file(extracted_file_name)
+                            except ModelError:
+                                continue
+                            if file.state == ModelFile.State.DELETED:
+                                remove_extracted_file_names.add(extracted_file_name)
+                        else:
+                            # Not in the model at all. This could be because local and remote scans are not yet available.
+                            pass
                 if remove_extracted_file_names:
                     controller.logger.info("Removing from extracted list: {}".format(remove_extracted_file_names))
                     persist.extracted_file_names.difference_update(remove_extracted_file_names)
@@ -961,11 +1073,20 @@ class ModelUpdater(_ControllerCoreAccess):
 
                 active_model_names = set(model.get_file_names())
                 active_model_ids = set(model.get_file_ids())
-                if remote_reconciliation_established:
+                if reconciliation_healthy:
+                    enabled_path_pair_ids = set(
+                        getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
+                    )
                     pending_ids = pending_completion_file_ids()
                     stale_move_failure_ids = {
                         file_id for file_id in persist.move_failure_counts
-                        if file_id not in active_model_ids and file_id not in pending_ids
+                        if file_id in self._safe_stale_marker_ids(
+                            set(persist.move_failure_counts),
+                            active_model_ids,
+                            active_model_names,
+                            pending_ids,
+                            enabled_path_pair_ids,
+                        )
                     }
                     if stale_move_failure_ids:
                         for file_id in stale_move_failure_ids:
@@ -980,13 +1101,13 @@ class ModelUpdater(_ControllerCoreAccess):
                             file_id for file_id, failures in persist.move_failure_counts.items()
                             if failures >= controller._Controller__MAX_MOVE_FAILURES
                         })
-                    remove_downloaded_file_names = {
-                        downloaded_file_name
-                        for downloaded_file_name in persist.downloaded_file_names
-                        if downloaded_file_name not in active_model_names
-                        and downloaded_file_name not in active_model_ids
-                        and downloaded_file_name not in pending_completion_file_ids()
-                    }
+                    remove_downloaded_file_names = self._safe_stale_marker_ids(
+                        set(persist.downloaded_file_names),
+                        active_model_ids,
+                        active_model_names,
+                        pending_ids,
+                        enabled_path_pair_ids,
+                    )
                     if remove_downloaded_file_names:
                         controller.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                         persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
@@ -1005,6 +1126,40 @@ class ModelUpdater(_ControllerCoreAccess):
                                         "file_id": ModelFile.build_file_id(downloaded_file_name, None),
                                     })
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
+
+                    stale_extracted_file_names = self._safe_stale_marker_ids(
+                        set(persist.extracted_file_names),
+                        active_model_ids,
+                        active_model_names,
+                        pending_ids,
+                        enabled_path_pair_ids,
+                    )
+                    if stale_extracted_file_names:
+                        controller.logger.info(
+                            "Removing stale extracted markers: %s",
+                            stale_extracted_file_names,
+                        )
+                        persist.extracted_file_names.difference_update(stale_extracted_file_names)
+                        model_builder.set_extracted_files(persist.extracted_file_names)
+
+                    stale_final_move_succeeded_file_names = self._safe_stale_marker_ids(
+                        set(persist.final_move_succeeded_file_names),
+                        active_model_ids,
+                        active_model_names,
+                        pending_ids,
+                        enabled_path_pair_ids,
+                    )
+                    if stale_final_move_succeeded_file_names:
+                        controller.logger.info(
+                            "Removing stale final-move markers: %s",
+                            stale_final_move_succeeded_file_names,
+                        )
+                        persist.final_move_succeeded_file_names.difference_update(
+                            stale_final_move_succeeded_file_names
+                        )
+                        model_builder.set_final_move_succeeded_files(
+                            persist.final_move_succeeded_file_names
+                        )
 
         if remote_reconciliation_established and controller._Controller__pending_auto_purge_file_ids:
             pending_auto_purge_candidates: set[str] = set()
@@ -1027,10 +1182,11 @@ class ModelUpdater(_ControllerCoreAccess):
 
         # Update the controller status.
         if latest_remote_scan is not None:
+            remote_scan_failed = bool(getattr(latest_remote_scan, "failed", False))
             controller._Controller__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
-            controller._Controller__context.status.controller.latest_remote_scan_failed = latest_remote_scan.failed
+            controller._Controller__context.status.controller.latest_remote_scan_failed = remote_scan_failed
             controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
-            if not latest_remote_scan.failed and not controller._Controller__startup_recovery_done:
+            if not remote_scan_failed and not controller._Controller__startup_recovery_done:
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp

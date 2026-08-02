@@ -12,6 +12,10 @@ interface IViewFile {
     isDir: boolean;
     localSize: number;
     remoteSize: number;
+    remotePresent: boolean;
+    localPresent: boolean;
+    remoteHasTransferableContent: boolean;
+    isLocalOnly: boolean;
     transferredSize: number;
     displaySizeTotal: number;
     percentDownloaded: number;
@@ -48,6 +52,10 @@ const DefaultViewFile: IViewFile = {
     isDir: null,
     localSize: null,
     remoteSize: null,
+    remotePresent: false,
+    localPresent: false,
+    remoteHasTransferableContent: false,
+    isLocalOnly: false,
     transferredSize: null,
     displaySizeTotal: null,
     percentDownloaded: null,
@@ -85,6 +93,10 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     isDir: boolean;
     localSize: number;
     remoteSize: number;
+    remotePresent: boolean;
+    localPresent: boolean;
+    remoteHasTransferableContent: boolean;
+    isLocalOnly: boolean;
     transferredSize: number;
     displaySizeTotal: number;
     percentDownloaded: number;

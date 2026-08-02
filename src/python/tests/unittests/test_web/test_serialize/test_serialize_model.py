@@ -113,6 +113,37 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual(200, data["old_file"]["local_size"])
         self.assertEqual(None, data["new_file"])
 
+    def test_presence_signals_are_identical_in_init_and_update_payloads(self):
+        serialize = SerializeModel()
+        file = ModelFile("zero.bin", False)
+        file.remote_present = True
+        file.local_present = True
+        file.remote_has_transferable_content = True
+
+        init_data = json.loads(parse_stream(serialize.model([file]))["data"])[0]
+        update_data = json.loads(parse_stream(serialize.update_event(
+            SerializeModel.UpdateEvent(
+                SerializeModel.UpdateEvent.Change.UPDATED,
+                file,
+                file,
+            )
+        ))["data"])
+
+        expected = {
+            "remote_present": True,
+            "local_present": True,
+            "remote_has_transferable_content": True,
+        }
+        self.assertEqual(expected, {key: init_data[key] for key in expected})
+        self.assertEqual(expected, {
+            key: update_data["old_file"][key]
+            for key in expected
+        })
+        self.assertEqual(expected, {
+            key: update_data["new_file"][key]
+            for key in expected
+        })
+
     def test_file_name(self):
         serialize = SerializeModel()
         files = [ModelFile("a", True), ModelFile("b", False)]

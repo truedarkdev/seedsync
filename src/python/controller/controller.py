@@ -953,6 +953,11 @@ class Controller:
         )
 
     def __apply_path_pair_refresh(self):
+        # A path-pair refresh starts a new scan generation. Any prior scan
+        # health evidence belongs to the old roots and must not authorize
+        # marker pruning before both refreshed scanners report healthy.
+        self._Controller__last_remote_reconciliation_healthy = False
+        self._Controller__last_local_reconciliation_healthy = False
         active_files = list(
             getattr(self, "_Controller__active_downloading_file_names", []) +
             getattr(self, "_Controller__active_extracting_file_names", []) +
@@ -2586,6 +2591,14 @@ class Controller:
                     )
                 elif file.remote_size is None:
                     _notify_failure(command, "File '{}' does not exist remotely".format(command.filename), 404, file)
+                    continue
+                elif not file.remote_has_transferable_content:
+                    _notify_failure(
+                        command,
+                        "File '{}' has no transferable remote content".format(command.filename),
+                        409,
+                        file,
+                    )
                     continue
                 else:
                     try:
