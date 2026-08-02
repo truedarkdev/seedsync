@@ -24,10 +24,7 @@ from common import Localization, Status, ConfigError, Persist, PersistError
 from common import PathPairManager
 from common.json_formatter import JsonFormatter
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
-from web import (
-    MigrationWebRuntime, WebAppJob, WebAppBuilder, normalize_migration_allowed_origin,
-    validate_migration_allowed_origins,
-)
+from web import MigrationWebRuntime, WebAppJob, WebAppBuilder
 from controller.notifier import NotificationService
 from web.auth_store import ApiKeyStore, append_api_key_store_history
 from web.handler.historical_log import create_historical_log_handler
@@ -116,7 +113,6 @@ class Seedsync:
                 port=self.migration_coordinator.legacy_web_port(),
                 html_path=args.html,
                 coordinator=self.migration_coordinator,
-                allowed_origins=tuple(getattr(args, "migration_allowed_origin", ())),
             )
             signal.signal(signal.SIGTERM, self.signal)
             signal.signal(signal.SIGINT, self.signal)
@@ -560,26 +556,6 @@ class Seedsync:
                             default=None,
                             help=("Host/IP address for the web server to bind to; migration mode defaults "
                                   "to 127.0.0.1 unless this option is explicitly supplied"))
-        configured_migration_origins = os.environ.get(
-            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS", "",
-        )
-        try:
-            migration_origin_defaults = [
-                normalize_migration_allowed_origin(value)
-                for value in configured_migration_origins.split(",")
-            ] if configured_migration_origins else []
-        except ValueError as exc:
-            parser.error("invalid SEEDSYNC_MIGRATION_ALLOWED_ORIGINS: {}".format(exc))
-        parser.add_argument(
-            "--migration-allowed-origin",
-            action="append",
-            default=migration_origin_defaults,
-            type=normalize_migration_allowed_origin,
-            metavar="ORIGIN",
-            help=("Exact HTTP(S) origin allowed to use the migration checkpoint when its host is "
-                  "not localhost or a private/loopback/link-local IP literal; repeat as needed, or "
-                  "set comma-separated SEEDSYNC_MIGRATION_ALLOWED_ORIGINS"),
-        )
         parser.add_argument(
             "--restore-migration-backup",
             metavar="BACKUP_ID_OR_PATH",
@@ -595,12 +571,6 @@ class Seedsync:
         )
 
         parsed = parser.parse_args(args)
-        try:
-            parsed.migration_allowed_origin = list(validate_migration_allowed_origins(
-                tuple(parsed.migration_allowed_origin),
-            ))
-        except ValueError as exc:
-            parser.error(str(exc))
         if parsed.restore_migration_backup is None and (parsed.confirm_restore or parsed.confirm_stopped):
             parser.error("restore confirmation flags require --restore-migration-backup")
         return parsed

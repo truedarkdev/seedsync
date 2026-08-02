@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import ipaddress
 import logging
 import re
 import secrets
@@ -75,16 +74,16 @@ _MAX_APPLY_BODY_BYTES = 1024
 def _canonical_origin(value: str) -> tuple[str, str, int]:
     """Parse one exact HTTP(S) origin without accepting URL adornments."""
     if not isinstance(value, str) or not value or value != value.strip() or any(
-        character.isspace() or character == "," for character in value
+        character.isspace() or character in ",\\" for character in value
     ):
-        raise ValueError("migration allowed origins must be individual canonical origins")
+        raise ValueError("migration request origin must be one canonical origin")
     separator = value.find("://")
     if separator <= 0 or any(character in value[separator + 3:] for character in "/?#"):
-        raise ValueError("migration allowed origins must contain only scheme, host, and optional port")
+        raise ValueError("migration request origin must contain only scheme, host, and optional port")
     try:
         parsed = urlsplit(value)
     except ValueError as exc:
-        raise ValueError("migration allowed origin has an invalid host") from exc
+        raise ValueError("migration request origin has an invalid host") from exc
     if (
         parsed.scheme not in {"http", "https"}
         or parsed.hostname is None
@@ -94,28 +93,14 @@ def _canonical_origin(value: str) -> tuple[str, str, int]:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("migration allowed origins must contain only scheme, host, and optional port")
+        raise ValueError("migration request origin must contain only scheme, host, and optional port")
     try:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
     except ValueError as exc:
-        raise ValueError("migration allowed origin has an invalid port") from exc
+        raise ValueError("migration request origin has an invalid port") from exc
     if not 1 <= port <= 65535:
-        raise ValueError("migration allowed origin has an invalid port")
+        raise ValueError("migration request origin has an invalid port")
     return parsed.scheme, parsed.hostname.casefold(), port
-
-
-def normalize_migration_allowed_origin(value: str) -> str:
-    """Argparse/environment validator for an exact migration origin."""
-    _canonical_origin(value)
-    return value
-
-
-def validate_migration_allowed_origins(values: tuple[str, ...]) -> tuple[str, ...]:
-    """Reject duplicate normalized authorities while preserving operator text."""
-    canonical = [_canonical_origin(value) for value in values]
-    if len(canonical) != len(set(canonical)):
-        raise ValueError("migration allowed origins contain a duplicate normalized origin")
-    return values
 
 
 def _request_origin() -> tuple[str, str, int] | None:
@@ -127,7 +112,7 @@ def _request_origin() -> tuple[str, str, int] | None:
         or not isinstance(host_header, str)
         or not host_header
         or host_header != host_header.strip()
-        or any(character.isspace() or character in ",/@?#" for character in host_header)
+        or any(character.isspace() or character in ",/\\@?#" for character in host_header)
     ):
         return None
     try:
@@ -150,16 +135,6 @@ def _request_origin() -> tuple[str, str, int] | None:
     if not 1 <= port <= 65535:
         return None
     return scheme, parsed.hostname.casefold(), port
-
-
-def _default_admits_hostname(hostname: str) -> bool:
-    if hostname == "localhost" or hostname.endswith(".localhost"):
-        return True
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        return False
-    return address.is_loopback or address.is_private or address.is_link_local
 
 
 def _safe_display_text(value: object, *, maximum_length: int) -> str:
@@ -305,15 +280,12 @@ class MigrationWebApp(bottle.Bottle):
         coordinator: MigrationCoordinator,
         *,
         on_continue: Callable[[], None] | None = None,
-        allowed_origins: tuple[str, ...] = (),
     ) -> None:
         super().__init__()
         self._html_root = Path(html_path).resolve()
         self._coordinator = coordinator
         self._on_continue = on_continue or (lambda: None)
         self._csrf_token = secrets.token_urlsafe(32)
-        validated_origins = validate_migration_allowed_origins(allowed_origins)
-        self._allowed_origins = frozenset(_canonical_origin(value) for value in validated_origins)
         self._operation_lock = threading.Lock()
         self._execution = SimpleNamespace(status="idle", worker=None)
 
@@ -367,10 +339,7 @@ class MigrationWebApp(bottle.Bottle):
             bottle.abort(404)
 
     def _admit_request_authority(self) -> None:
-        authority = _request_origin()
-        if authority is None or not (
-            _default_admits_hostname(authority[1]) or authority in self._allowed_origins
-        ):
+        if _request_origin() is None:
             bottle.abort(403)
 
     @staticmethod
@@ -429,10 +398,6 @@ class MigrationWebApp(bottle.Bottle):
         return bool(
             request_origin is not None
             and parsed_origin == request_origin
-            and (
-                _default_admits_hostname(request_origin[1])
-                or request_origin in self._allowed_origins
-            )
         )
 
     @staticmethod
@@ -619,13 +584,11 @@ class MigrationWebRuntime:
         port: int,
         html_path: str,
         coordinator: MigrationCoordinator,
-        allowed_origins: tuple[str, ...] = (),
     ) -> None:
         self._restart_timer: threading.Timer | None = None
         self.app = MigrationWebApp(
             html_path, coordinator,
             on_continue=self._schedule_normal_startup,
-            allowed_origins=allowed_origins,
         )
         self._bind_host = bind_host
         self._port = port

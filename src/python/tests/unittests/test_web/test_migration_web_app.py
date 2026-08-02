@@ -227,21 +227,16 @@ class TestMigrationWebApp(unittest.TestCase):
         ).status_int)
         self.coordinator.apply_confirmed.assert_not_called()
 
-    def test_request_authority_rejects_dns_rebinding_before_status_or_apply(self) -> None:
-        payload = {
-            "confirmation": "MIGRATE original-v0.8.6-to-current-v1",
-            "retry": False,
-        }
-        self.assertEqual(403, self.client.get(
+    def test_request_authority_accepts_named_hosts(self) -> None:
+        self.assertEqual(200, self.client.get(
             "/server/migration/v1/status",
             headers={"Host": "attacker.example"},
-            expect_errors=True,
         ).status_int)
-        self.assertEqual(403, self.client.get(
-            "/migration", headers={"Host": "attacker.example"}, expect_errors=True,
+        self.assertEqual(200, self.client.get(
+            "/migration", headers={"Host": "seedsync-movie.local"},
         ).status_int)
-        self.assertEqual(403, self.client.post_json(
-            "/server/migration/v1/apply", payload,
+        self.assertEqual(409, self.client.post_json(
+            "/server/migration/v1/apply", {"confirmation": "wrong", "retry": False},
             headers={
                 "Host": "attacker.example",
                 "Origin": "http://attacker.example",
@@ -251,13 +246,16 @@ class TestMigrationWebApp(unittest.TestCase):
         ).status_int)
         self.coordinator.apply_confirmed.assert_not_called()
 
-    def test_request_authority_accepts_local_private_and_exact_allowlisted_origins(self) -> None:
-        for host in ("localhost", "127.0.0.1:8800", "192.168.50.20:8800", "[::1]:8800"):
+    def test_request_authority_accepts_all_well_formed_hosts(self) -> None:
+        for host in (
+            "localhost", "127.0.0.1:8800", "192.168.50.20:8800", "[::1]:8800",
+            "seedsync-movie.local", "seedbox.example:8800",
+        ):
             with self.subTest(host=host):
                 self.assertEqual(200, self.client.get(
                     "/server/migration/v1/status", headers={"Host": host},
                 ).status_int)
-        for host in ("127.0.0.1:8800", "192.168.50.20:8800"):
+        for host in ("127.0.0.1:8800", "192.168.50.20:8800", "seedsync-movie.local"):
             with self.subTest(apply_host=host):
                 response = self.client.post_json(
                     "/server/migration/v1/apply",
@@ -270,27 +268,10 @@ class TestMigrationWebApp(unittest.TestCase):
                 )
                 self.assertEqual(409, response.status_int)
 
-        allowed = TestApp(MigrationWebApp(
-            self.temp_dir.name, self.coordinator,
-            allowed_origins=("http://seedsync.example",),
-        ))
-        self.assertEqual(200, allowed.get(
-            "/server/migration/v1/status", headers={"Host": "seedsync.example"},
-        ).status_int)
-        response = allowed.post_json(
-            "/server/migration/v1/apply",
-            {"confirmation": "wrong", "retry": False},
-            headers={
-                "Host": "seedsync.example", "Origin": "http://seedsync.example",
-                "X-SeedSync-Migration-CSRF": allowed.app._csrf_token,
-            },
-            expect_errors=True,
-        )
-        self.assertEqual(409, response.status_int)
-
     def test_request_authority_and_origin_fail_closed_on_malformed_or_proxy_mismatch(self) -> None:
         for host in (
             "user@localhost", "localhost, attacker.example", "localhost:not-a-port", "[::1",
+            r"attacker\example",
         ):
             with self.subTest(host=host):
                 self.assertEqual(403, self.client.get(
@@ -302,6 +283,7 @@ class TestMigrationWebApp(unittest.TestCase):
         for origin in (
             "http://user:password@localhost", "http://localhost,http://attacker.example",
             "http://localhost/path", "http://localhost:not-a-port", "http://[::1",
+            r"http://attacker\example",
         ):
             with self.subTest(origin=origin):
                 self.assertEqual(403, self.client.post_json(
@@ -312,25 +294,16 @@ class TestMigrationWebApp(unittest.TestCase):
                     },
                     expect_errors=True,
                 ).status_int)
-        proxied = TestApp(MigrationWebApp(
-            self.temp_dir.name, self.coordinator,
-            allowed_origins=("https://seedsync.example",),
-        ))
-        self.assertEqual(403, proxied.get(
-            "/server/migration/v1/status",
+        self.assertEqual(403, self.client.post_json(
+            "/server/migration/v1/apply", payload,
             headers={
                 "Host": "seedsync.example",
+                "Origin": "https://seedsync.example",
                 "X-Forwarded-Proto": "https",
+                "X-SeedSync-Migration-CSRF": self.app._csrf_token,
             },
             expect_errors=True,
         ).status_int)
-
-    def test_duplicate_normalized_allowed_origins_are_rejected(self) -> None:
-        with self.assertRaisesRegex(ValueError, "duplicate normalized origin"):
-            MigrationWebApp(
-                self.temp_dir.name, self.coordinator,
-                allowed_origins=("http://seedsync.example", "http://SEEDSYNC.example:80"),
-            )
 
     def test_running_status_polls_skip_retained_backup_revalidation(self) -> None:
         self.app._execution.status = "running"
