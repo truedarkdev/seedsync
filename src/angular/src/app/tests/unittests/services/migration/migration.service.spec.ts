@@ -1,5 +1,5 @@
 import {HttpClientTestingModule, HttpTestingController} from "@angular/common/http/testing";
-import {TestBed} from "@angular/core/testing";
+import {fakeAsync, TestBed, tick} from "@angular/core/testing";
 
 import {MigrationService} from "../../../../services/migration/migration.service";
 
@@ -107,11 +107,22 @@ describe("MigrationService", () => {
         let completed = false;
         service.probeNormalStartup().subscribe(() => completed = true);
 
-        const request = http.expectOne("/bootstrap");
+        const request = http.expectOne("/bootstrap?seedsync_startup_probe=1");
         expect(request.request.method).toBe("GET");
         expect(request.request.responseType).toBe("text");
         request.flush("<html>bootstrap</html>");
 
         expect(completed).toBeTrue();
     });
+
+    it("times out a stalled normal bootstrap probe so the caller can retry", fakeAsync(() => {
+        let failed = false;
+        service.probeNormalStartup(7).subscribe({error: () => failed = true});
+
+        const request = http.expectOne("/bootstrap?seedsync_startup_probe=7");
+        tick(1000);
+
+        expect(failed).toBeTrue();
+        expect(request.cancelled).toBeTrue();
+    }));
 });
