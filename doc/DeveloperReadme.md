@@ -520,7 +520,9 @@ Docker platform string stays consistent across `make`, Compose, and CI.
 
 ## Continuous Integration
 
-This method uses GitHub Actions plus `gh release` on the hosted runner to post releases.
+GitHub Actions builds and tests tagged releases, then promotes the exact tested
+multi-architecture image to the versioned and `latest` Docker Hub tags. Deb
+packages remain build- and E2E-tested but are not currently published.
 
 1. Do all of these in one change
    1. Version update in `src/angular/package.json`
@@ -549,15 +551,24 @@ This manual method is deprecated in favour of the Github Actions based CI.
 3. Deploy documentation to github
 4. make clean && make
 5. Run all tests
-6. Upload deb file to github
-7. Tag and upload image to Dockerhub (see below)
+6. Keep the build- and E2E-tested deb artifact local; direct/deb publication is currently disabled
+7. Tag and upload the image to Docker Hub (see below)
 
-### Docker image upload to Dockerhub
+### Docker image upload to Docker Hub
 
 ```bash
-make docker-image-release RELEASE_VERSION=<version> RELEASE_REGISTRY=<registry namespace>
-make docker-image-release RELEASE_VERSION=latest RELEASE_REGISTRY=<registry namespace>
+make docker-image-release \
+  STAGING_REGISTRY=<tested registry namespace> \
+  STAGING_VERSION=<tested image tag> \
+  STAGING_DIGEST=sha256:<tested image digest> \
+  RELEASE_VERSION=<version> \
+  RELEASE_REGISTRY=<release registry namespace>
 ```
+
+This command does not rebuild the image. It verifies the staging tag still
+matches the supplied tested digest, promotes that exact multi-architecture
+manifest to both `<version>` and `latest`, and verifies both published tags
+resolve to the same digest.
 
 
 
