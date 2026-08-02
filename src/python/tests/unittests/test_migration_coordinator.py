@@ -459,6 +459,44 @@ class TestMigrationCoordinator(unittest.TestCase):
         self.assertEqual("seedsync-current-v1", receipt["current_schema"])
         self.assertEqual(["original-v0.8.6-to-current-v1"], receipt["applied_migrations"])
 
+    def test_apply_normalizes_only_legacy_docker_default_after_backup(self) -> None:
+        settings = LEGACY_SETTINGS.replace("local_path = /local/downloads", "local_path = downloads")
+        MigrationFixture(self.root).write(settings)
+        source_settings = (self.root / "settings.cfg").read_bytes()
+
+        with patch("migration.coordinator.is_running_in_docker", return_value=True):
+            decision = MigrationCoordinator(self.root).apply_confirmed()
+
+        self.assertEqual(MigrationState.COMPLETE, decision.state)
+        self.assertEqual("/downloads", Config.from_file(str(self.root / "settings.cfg")).lftp.local_path)
+        pairs = PathPairManager(str(self.root)).load().path_pairs
+        self.assertEqual(["/downloads"], [pair.local_path for pair in pairs])
+        backup = self._recorded_backup(self.root)
+        self.assertEqual(source_settings, (backup / "data" / "settings.cfg").read_bytes())
+
+    def test_repair_normalizes_released_preclaim_from_older_image_idempotently(self) -> None:
+        settings = LEGACY_SETTINGS.replace("local_path = /local/downloads", "local_path = downloads")
+        MigrationFixture(self.root).write(settings)
+        coordinator = MigrationCoordinator(self.root)
+        with patch("migration.coordinator.is_running_in_docker", return_value=False):
+            coordinator.apply_confirmed()
+        coordinator.release_normal_startup()
+        backup = self._recorded_backup(self.root)
+        backup_before = self._tree_bytes(backup)
+
+        self.assertEqual("downloads", Config.from_file(str(self.root / "settings.cfg")).lftp.local_path)
+        with patch("migration.coordinator.is_running_in_docker", return_value=True):
+            self.assertTrue(coordinator.repair_completed_v086_docker_paths())
+            self.assertFalse(coordinator.repair_completed_v086_docker_paths())
+
+        self.assertEqual("/downloads", Config.from_file(str(self.root / "settings.cfg")).lftp.local_path)
+        pairs = PathPairManager(str(self.root)).load().path_pairs
+        self.assertEqual(["/downloads"], [pair.local_path for pair in pairs])
+        self.assertEqual(backup_before, self._tree_bytes(backup))
+        restarted = MigrationCoordinator(self.root).preflight()
+        self.assertEqual(MigrationState.COMPLETE, restarted.state)
+        self.assertTrue(restarted.allows_normal_startup)
+
     def test_completed_lineage_allows_only_bootstrap_proof_history_created_after_migration(self) -> None:
         MigrationFixture(self.root).write()
         coordinator = MigrationCoordinator(self.root)

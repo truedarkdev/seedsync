@@ -114,6 +114,40 @@ ensure_ssh_host_key_config() {
     chmod 600 "${ssh_config}" 2>/dev/null || true
 }
 
+configure_legacy_nss_identity() {
+    if [ "$LEGACY_NONROOT_MODE" != "1" ] || getent passwd "$USER_ID" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local wrapper_library
+    local passwd_file="${USER_HOME}/passwd.nss-wrapper"
+    local group_file="${USER_HOME}/group.nss-wrapper"
+    local runtime_user="seedsync-runtime-${USER_ID}"
+    local runtime_group="seedsync-runtime-${GROUP_ID}"
+
+    wrapper_library="$(find /usr/lib -name libnss_wrapper.so -print -quit 2>/dev/null || true)"
+    if [ -z "$wrapper_library" ] || [ ! -r "$wrapper_library" ]; then
+        echo "ERROR: libnss-wrapper is required for Docker --user UID=$USER_ID" >&2
+        exit 1
+    fi
+
+    cp /etc/passwd "$passwd_file"
+    printf '%s:x:%s:%s:SeedSync runtime:%s:/bin/bash\n' \
+        "$runtime_user" "$USER_ID" "$GROUP_ID" "$USER_HOME" >> "$passwd_file"
+    cp /etc/group "$group_file"
+    if ! getent group "$GROUP_ID" >/dev/null 2>&1; then
+        printf '%s:x:%s:\n' "$runtime_group" "$GROUP_ID" >> "$group_file"
+        GROUP_NAME="$runtime_group"
+    fi
+    chmod 600 "$passwd_file" "$group_file"
+
+    export NSS_WRAPPER_PASSWD="$passwd_file"
+    export NSS_WRAPPER_GROUP="$group_file"
+    export LD_PRELOAD="${wrapper_library}${LD_PRELOAD:+:${LD_PRELOAD}}"
+    USER_NAME="$runtime_user"
+    echo "Configured runtime identity for legacy Docker --user UID=$USER_ID GID=$GROUP_ID" >&2
+}
+
 export CONFIG_DIR SETTINGS_FILE SCRIPT_PATH DEFAULT_LOCAL_PATH DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION
 
 if [ "${1:-}" = "--bootstrap-default-config" ]; then
@@ -655,6 +689,7 @@ safe_chown "mounts directory" "$MOUNTS_DIR"
 safe_chown "staging directory" /staging
 chmod 700 "$USER_HOME/.ssh" 2>/dev/null || true
 chmod 700 "$RUNTIME_TMP_DIR" 2>/dev/null || true
+configure_legacy_nss_identity
 ensure_ssh_host_key_config
 
 check_writable_path "$DOWNLOADS_DIR"
