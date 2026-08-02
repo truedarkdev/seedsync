@@ -370,9 +370,11 @@ _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
     "AutoQueue": frozenset(("enabled", "patterns_only", "auto_extract")),
 }
 
-# Docker/local runtime wrappers add these transport-policy values before the
-# coordinator can inspect an otherwise untouched v0.8.6 settings file. They do
-# not describe the persisted schema and must not erase truthful source identity.
+# Older Docker/local runtime wrappers may have added these values before the
+# coordinator inspected an otherwise untouched v0.8.6 settings file. They do
+# not describe the legacy schema and must not erase truthful source identity.
+# The obsolete browser-bootstrap key remains tolerated here solely so an
+# installation previously touched by such a wrapper still migrates cleanly.
 _PRE_MIGRATION_RUNTIME_GENERAL_KEYS = frozenset((
     "trusted_browser_bootstrap_remote_addrs",
     "config_api_redact_remote_details",

@@ -1728,7 +1728,7 @@ class TestLftp(unittest.TestCase):
         self.assertIn("ERROR: invalid UMASK value", entrypoint_contents)
         self.assertNotIn("setup_default_config.sh", compose_contents)
         self.assertIn("set_general_option config_api_redact_remote_details False", compose_contents)
-        self.assertIn("set_general_option trusted_browser_bootstrap_remote_addrs", compose_contents)
+        self.assertNotIn("trusted_browser_bootstrap_remote_addrs", compose_contents)
         self.assertIn("remote_python_path = python3", compose_contents)
 
 

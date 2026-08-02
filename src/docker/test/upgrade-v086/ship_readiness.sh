@@ -1965,52 +1965,19 @@ start_current() {
   capture_current_provenance "$id"
 }
 configure_current_browser_bootstrap_runtime() {
-  local id="$1" image="$2" proxy="seedsync-upgrade-v086-current-proxy-${1,,}" network="seedsync-upgrade-v086-lab-${1,,}" writer="seedsync-upgrade-v086-browser-bootstrap-config-${1,,}" cidr output
-  cidr="$(python - "$proxy" "$network" <<'PY'
-import ipaddress, json, subprocess, sys
-proxy, network = sys.argv[1:]
-item = json.loads(subprocess.check_output(["docker", "inspect", proxy], text=True))[0]
-details = (item.get("NetworkSettings") or {}).get("Networks") or {}
-address = details.get(network, {}).get("IPAddress")
-try:
-    parsed = ipaddress.ip_address(address)
-except ValueError as error:
-    raise SystemExit("current proxy lab address is invalid") from error
-if parsed.version != 4 or not parsed.is_private or parsed.is_loopback:
-    raise SystemExit("current proxy lab address is not an isolated IPv4 source")
-print("{}/32".format(parsed))
-PY
-)" || die "unable to determine the current proxy's isolated lab address"
+  local id="$1" image="$2" output
+  : "$image"
   output="$(evidence_dir "$id")/current-browser-bootstrap-runtime.json"
-  bounded_command "$id" migration-current-browser-bootstrap-config current-browser-bootstrap-config "$(timeout_seconds SEEDSYNC_SHIP_CONTAINER_TIMEOUT_SECONDS 90)" "$(evidence_dir "$id")/current-browser-bootstrap-config.log" \
-    docker run --rm --name "$writer" --network none --user 1000:1000 --read-only --security-opt no-new-privileges:true --cap-drop ALL --tmpfs /tmp:mode=1777 \
-    --mount "type=volume,src=$(config_volume "$id"),dst=/config" --entrypoint python "$image" -c '
-import configparser, ipaddress, os, sys
-cidr = sys.argv[1]
-network = ipaddress.ip_network(cidr, strict=True)
-if network.version != 4 or network.prefixlen != 32 or network.network_address.is_loopback or not network.network_address.is_private:
-    raise SystemExit("trusted bootstrap source must be an isolated IPv4 /32")
-path = "/config/settings.cfg"
-parser = configparser.RawConfigParser()
-parser.optionxform = str
-if not parser.read(path, encoding="utf-8") or not parser.has_section("General"):
-    raise SystemExit("current settings are unavailable for browser bootstrap runtime configuration")
-parser.set("General", "trusted_browser_bootstrap_remote_addrs", cidr)
-temporary = path + ".browser-bootstrap.tmp"
-with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-    parser.write(stream)
-os.chmod(temporary, 0o600)
-os.replace(temporary, path)
-' "$cidr"
   python - "$output" <<'PY'
 import json, os, sys
 output = sys.argv[1]
 temporary = output + ".tmp"
 with open(temporary, "w", encoding="utf-8") as stream:
     json.dump({
-        "schema": 1,
+        "schema": 2,
         "phase": "after-migration-before-first-claim",
-        "trusted_source": "current-proxy-isolated-lab-ipv4-32",
+        "access_policy": "open-until-first-admin-claim",
+        "manual_network_configuration": False,
         "recovery_version_input": "configured-at-current-start",
     }, stream, sort_keys=True)
     stream.write("\n")

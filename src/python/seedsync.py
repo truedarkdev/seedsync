@@ -634,7 +634,6 @@ class Seedsync:
         config.general.verbose = False
         config.general.api_token = ""
         config.general.allowed_hostname = ""
-        config.general.trusted_browser_bootstrap_remote_addrs = ""
         config.general.browser_handover_recovery_version = ""
         config.general.breadcrumb_trace_enabled = False
 

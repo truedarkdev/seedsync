@@ -19,89 +19,11 @@ api_token="$(require_nonblank_env SEEDSYNC_E2E_API_TOKEN "SEEDSYNC_E2E_API_TOKEN
 browser_api_token="$(require_nonblank_env SEEDSYNC_E2E_BROWSER_API_TOKEN "SEEDSYNC_E2E_BROWSER_API_TOKEN is required for e2e auth seeding")"
 browser_session_secret="$(require_nonblank_env SEEDSYNC_E2E_BROWSER_SESSION_SECRET "SEEDSYNC_E2E_BROWSER_SESSION_SECRET is required for remembered-session bootstrap")"
 
-if [[ -n "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}" ]]; then
-  echo "SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES is no longer supported; trusted browser sources are derived from chrome DNS" >&2
-  exit 1
-fi
-
 api_key_dir="${SEEDSYNC_API_KEY_DIR:-/config}"
 api_key_owner="${SEEDSYNC_API_KEY_OWNER:-}"
 api_key_path="${api_key_dir%/}/api-keys.json"
 api_key_log_dir="${api_key_dir%/}/log"
 settings_path="${api_key_dir%/}/settings.cfg"
-trusted_browser_bootstrap_sources_path="${api_key_dir%/}/trusted_browser_bootstrap_remote_addrs"
-
-resolve_trusted_browser_bootstrap_sources() {
-  python3 - <<'PY'
-import ipaddress
-import socket
-import time
-
-service_name = "chrome"
-deadline = time.time() + 30
-trusted_sources = []
-seen = set()
-
-while time.time() < deadline and not trusted_sources:
-    try:
-        resolved_addresses = socket.getaddrinfo(
-            service_name,
-            None,
-            socket.AF_UNSPEC,
-            socket.SOCK_STREAM,
-        )
-    except socket.gaierror:
-        resolved_addresses = []
-
-    for family, _socktype, _proto, _canonname, sockaddr in resolved_addresses:
-        try:
-            source_ip = ipaddress.ip_address(sockaddr[0])
-        except ValueError:
-            continue
-
-        if family == socket.AF_INET6 or source_ip.version == 6:
-            source = f"{source_ip}/128"
-        else:
-            source = f"{source_ip}/32"
-        if source not in seen:
-            seen.add(source)
-            trusted_sources.append(source)
-
-    if not trusted_sources:
-        time.sleep(0.5)
-
-if not trusted_sources:
-    raise SystemExit(
-        "Unable to determine trusted browser bootstrap sources for the Docker compose network"
-    )
-
-print(",".join(trusted_sources))
-PY
-}
-
-set_general_option() {
-  local key="$1"
-  local value="$2"
-
-  mkdir -p "${api_key_dir}"
-  if [[ ! -f "${settings_path}" ]]; then
-    write_default_settings_cfg "${value}"
-    return
-  fi
-
-  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${settings_path}"; then
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*$|${key} = ${value}|" "${settings_path}"
-  else
-    general_line="$(grep -n "^\[General\][[:space:]]*$" "${settings_path}" | head -n 1 | cut -d: -f1)"
-    if [[ -n "${general_line}" ]]; then
-      insert_line="$((general_line + 1))"
-      sed -i "${insert_line}i ${key} = ${value}" "${settings_path}"
-    else
-      printf "\n[General]\n%s = %s\n" "${key}" "${value}" >> "${settings_path}"
-    fi
-  fi
-}
-
 settings_cfg_has_required_sections() {
   [[ -f "${settings_path}" ]] || return 1
 
@@ -116,8 +38,6 @@ settings_cfg_has_required_sections() {
 }
 
 write_default_settings_cfg() {
-  local trusted_browser_bootstrap_sources="$1"
-
   cat > "${settings_path}" <<EOF
 [General]
 log_level = INFO
@@ -125,7 +45,6 @@ verbose = False
 exclude_patterns =
 api_token =
 allowed_hostname =
-trusted_browser_bootstrap_remote_addrs = ${trusted_browser_bootstrap_sources}
 browser_handover_recovery_version =
 breadcrumb_trace_enabled = False
 breadcrumb_trace_retention_depth = 128
@@ -180,16 +99,10 @@ log_format = standard
 EOF
 }
 
-trusted_browser_bootstrap_sources="$(resolve_trusted_browser_bootstrap_sources)"
-if [[ -z "${trusted_browser_bootstrap_sources//[[:space:]]/}" ]]; then
-  echo "Unable to determine trusted browser bootstrap sources for the Docker compose network" >&2
-  exit 1
-fi
-
 umask 077
 mkdir -p "${api_key_dir}" "${api_key_log_dir}"
 if ! settings_cfg_has_required_sections; then
-  write_default_settings_cfg "${trusted_browser_bootstrap_sources}"
+  write_default_settings_cfg
 fi
 SEEDSYNC_E2E_API_TOKEN="${api_token}" \
 SEEDSYNC_E2E_BROWSER_API_TOKEN="${browser_api_token}" \
@@ -264,9 +177,6 @@ with open(tmp_path, "w", encoding="utf-8") as handle:
 os.replace(tmp_path, output_path)
 print("Seeded e2e auth fixture into {}".format(output_path))
 PY
-
-set_general_option trusted_browser_bootstrap_remote_addrs "${trusted_browser_bootstrap_sources}"
-printf "%s\n" "${trusted_browser_bootstrap_sources}" > "${trusted_browser_bootstrap_sources_path}"
 
 if [[ -n "${api_key_owner}" ]]; then
   chown -R "${api_key_owner}" "${api_key_dir}"

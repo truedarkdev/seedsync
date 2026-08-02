@@ -44,7 +44,6 @@ class ConfigHandler(IHandler):
         "general": {
             "api_token",
             "config_api_redact_remote_details",
-            "trusted_browser_bootstrap_remote_addrs",
         },
         "notifications": {
             "enabled", "provider", "webhook_url", "hmac_secret", "apprise_url", "apprise_tag",

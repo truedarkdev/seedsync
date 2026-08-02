@@ -14,7 +14,6 @@ services:
       SEEDSYNC_STOP_RESUME_TRACE_FILE_ID: "${SEEDSYNC_STOP_RESUME_TRACE_FILE_ID:-}"
       SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID: "${SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID:-}"
       SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION: "${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"
-      SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES: "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}"
       SEEDSYNC_WEB_BIND_HOST: "${SEEDSYNC_WEB_BIND_HOST:-0.0.0.0}"
     security_opt:
       - no-new-privileges:true
@@ -47,15 +46,7 @@ services:
           fi;
         };
         if [ "$$SEEDSYNC_DEBUG" = "1" ]; then DEBUG_FLAG="-d"; fi;
-        TRUSTED_BOOTSTRAP_SOURCES="$$SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES";
-        if [ -z "$$TRUSTED_BOOTSTRAP_SOURCES" ]; then
-          gateway_hex=$$(awk '$$2 == "00000000" { print $$3; exit }' /proc/net/route);
-          if [ -n "$$gateway_hex" ]; then
-            TRUSTED_BOOTSTRAP_SOURCES=$$(printf "%d.%d.%d.%d" 0x$${gateway_hex:6:2} 0x$${gateway_hex:4:2} 0x$${gateway_hex:2:2} 0x$${gateway_hex:0:2});
-          fi;
-        fi;
         set_general_option config_api_redact_remote_details False &&
-        set_general_option trusted_browser_bootstrap_remote_addrs "$$TRUSTED_BOOTSTRAP_SOURCES" &&
         current_remote_python_path="$$(sed -n -E 's|^[[:space:]]*remote_python_path[[:space:]]*=[[:space:]]*||p' /config/settings.cfg | head -n 1 | tr -d '\r')";
         if [ -z "$$current_remote_python_path" ] || [ "$$current_remote_python_path" = "/usr/bin/env" ]; then
           sed -i -E "s|^[[:space:]]*remote_python_path[[:space:]]*=.*$$|remote_python_path = python3|" /config/settings.cfg;

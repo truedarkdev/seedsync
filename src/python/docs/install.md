@@ -111,9 +111,10 @@ contract. Use the tracked Windows Compose override below; it replaces only the
         :::powershell
         docker compose -f compose.local.yml -f compose.windows.yml up -d --build seedsync
 
-    This starts the repo-owned local Docker path, binds the web UI to
-    `http://localhost:8800`, and prepares the trusted local bootstrap source
-    used by the browser bootstrap flow.
+    This starts the repo-owned local Docker path and binds the web UI to
+    `http://localhost:8800`. First-run migration and browser claiming are
+    reachable from any client until the first administrator claim succeeds;
+    normal API-key and browser-session authentication applies afterward.
 
     Verify that the effective configuration uses the named volume before
     starting or migrating data:
@@ -129,17 +130,14 @@ contract. Use the tracked Windows Compose override below; it replaces only the
 
     If you need different container file permissions, set `UMASK` to an octal value such as `002` in the Compose environment before starting the container. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID. For the security-sensitive `/config` root, use the documented named volume; Windows shared folders and WSL DrvFS do not support the required owner-private `0700` contract.
 
-4. Read the one-time bootstrap proof from the running container:
+4. Open [http://localhost:8800](http://localhost:8800) in your browser. On a
+   fresh installation, SeedSync redirects to the temporary first-run claim
+   page. Claim the browser to create the first administrator key and continue
+   into the application. No proxy address or configuration-file edit is
+   required. Keep the unfinished setup on a trusted network because the first
+   client that submits the claim becomes the initial administrator.
 
-        :::powershell
-        docker compose -f compose.local.yml exec seedsync cat /tmp/seedsync-bootstrap/browser-bootstrap.json
-
-    Copy the `proof` value from the JSON output, then open the bootstrap page
-    in your browser at `http://localhost:8800/bootstrap?proof=<proof>` and
-    replace `<proof>` with the copied value. The bootstrap page redeems the
-    proof and redirects to the normal SeedSync UI.
-
-5. Access the application GUI to verify SeedSync is running by opening [http://localhost:8800](http://localhost:8800) in your browser if it is not already open.
+5. Verify that the normal SeedSync application loads after the claim.
 
 6. Go to the Settings page and fill out the required information.
    Under the Local Directory setting, enter `/downloads` for ordinary local storage.

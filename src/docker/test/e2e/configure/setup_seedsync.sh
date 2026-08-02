@@ -10,13 +10,7 @@ readonly AUTHORIZATION_HEADER_FILE="$(mktemp)"
 readonly api_key_dir="${SEEDSYNC_API_KEY_DIR:-/config}"
 readonly api_key_owner="${SEEDSYNC_API_KEY_OWNER:-}"
 readonly settings_path="${api_key_dir%/}/settings.cfg"
-readonly trusted_browser_bootstrap_sources_path="${api_key_dir%/}/trusted_browser_bootstrap_remote_addrs"
 readonly base_url="http://myapp:8800"
-
-if [[ -n "${SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES:-}" ]]; then
-  echo "SEEDSYNC_TRUSTED_BROWSER_BOOTSTRAP_SOURCES is no longer supported; trusted browser sources are written by auth_seed.sh" >&2
-  exit 1
-fi
 
 trap 'rm -f -- "${AUTHORIZATION_HEADER_FILE}"' EXIT
 printf 'Authorization: Bearer %s\n' "${API_TOKEN}" > "${AUTHORIZATION_HEADER_FILE}"
@@ -165,46 +159,6 @@ call_api_json() {
   rm -f "${response_body}" "${response_stderr}"
 }
 
-set_general_option() {
-  local key="$1"
-  local value="$2"
-
-  mkdir -p "${api_key_dir}"
-  if [[ ! -f "${settings_path}" ]]; then
-    printf "[General]\n%s = %s\n" "${key}" "${value}" > "${settings_path}"
-    return
-  fi
-
-  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "${settings_path}"; then
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*$|${key} = ${value}|" "${settings_path}"
-  else
-    general_line="$(grep -n "^\[General\][[:space:]]*$" "${settings_path}" | head -n 1 | cut -d: -f1)"
-    if [[ -n "${general_line}" ]]; then
-      insert_line="$((general_line + 1))"
-      sed -i "${insert_line}i ${key} = ${value}" "${settings_path}"
-    else
-      printf "\n[General]\n%s = %s\n" "${key}" "${value}" >> "${settings_path}"
-    fi
-  fi
-}
-
-load_trusted_browser_bootstrap_sources() {
-  local trusted_browser_bootstrap_sources
-
-  if [[ ! -r "${trusted_browser_bootstrap_sources_path}" ]]; then
-    echo "Unable to read trusted browser bootstrap sources from ${trusted_browser_bootstrap_sources_path}" >&2
-    exit 1
-  fi
-
-  trusted_browser_bootstrap_sources="$(<"${trusted_browser_bootstrap_sources_path}")"
-  if [[ -z "${trusted_browser_bootstrap_sources//[[:space:]]/}" ]]; then
-    echo "Unable to determine trusted browser bootstrap sources for the Docker compose network" >&2
-    exit 1
-  fi
-
-  printf "%s" "${trusted_browser_bootstrap_sources}"
-}
-
 wait_for_app_ready "Seedsync app is up (before configuring)"
 call_api_json "${base_url}/server/config/set/general/log_level" '{"value":"DEBUG"}'
 call_api_json "${base_url}/server/config/set/general/verbose" '{"value":true}'
@@ -217,7 +171,6 @@ call_api_json "${base_url}/server/config/set/lftp/remote_path" '{"value":"/home/
 call_api_json "${base_url}/server/config/set/autoqueue/patterns_only" '{"value":true}'
 
 wait_for_app_ready "Seedsync app is up (before restart)"
-set_general_option trusted_browser_bootstrap_remote_addrs "$(load_trusted_browser_bootstrap_sources)"
 if [[ -n "${api_key_owner}" ]]; then
   chown -R "${api_key_owner}" "${api_key_dir}"
 fi
