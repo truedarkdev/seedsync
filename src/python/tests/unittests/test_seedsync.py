@@ -89,7 +89,6 @@ class TestSeedsync(unittest.TestCase):
             port=9876,
             html_path="/html",
             coordinator=coordinator,
-            allowed_origins=(),
         )
         config_loader.assert_not_called()
         path_pair_manager.assert_not_called()
@@ -219,47 +218,21 @@ class TestSeedsync(unittest.TestCase):
         ])
         self.assertIsNone(args.web_bind_host)
 
-    def test_args_migration_allowed_origins_support_cli_and_environment(self):
+    def test_args_reject_removed_migration_allowed_origin_option(self):
         base = [
             "-c", "/path/to/config", "--html", "/path/to/html",
             "--scanfs", "/path/to/scanfs",
         ]
         with patch.dict(os.environ, {
-            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": "http://seed.local:8800,https://seed.example",
+            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": "http://obsolete.example",
         }, clear=False):
             args = Seedsync._parse_args(base)
-        self.assertEqual(
-            ["http://seed.local:8800", "https://seed.example"],
-            args.migration_allowed_origin,
-        )
-        with patch.dict(os.environ, {}, clear=True):
-            args = Seedsync._parse_args(base + [
-                "--migration-allowed-origin", "http://seedbox.example:8800",
-                "--migration-allowed-origin", "https://seedbox.example",
-            ])
-        self.assertEqual(
-            ["http://seedbox.example:8800", "https://seedbox.example"],
-            args.migration_allowed_origin,
-        )
-        with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
-            Seedsync._parse_args(base + [
-                "--migration-allowed-origin", "http://user@seedbox.example/path",
-            ])
-        with patch.dict(os.environ, {
-            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": "http://seedbox.example,,http://other.example",
-        }, clear=True), self.assertRaises(SystemExit):
-            Seedsync._parse_args(base)
+        self.assertFalse(hasattr(args, "migration_allowed_origin"))
+
         with patch.dict(os.environ, {}, clear=True), self.assertRaises(SystemExit):
             Seedsync._parse_args(base + [
                 "--migration-allowed-origin", "http://seedbox.example",
-                "--migration-allowed-origin", "http://SEEDBOX.example:80",
             ])
-        with patch.dict(os.environ, {
-            "SEEDSYNC_MIGRATION_ALLOWED_ORIGINS": (
-                "https://seedbox.example,https://SEEDBOX.example:443"
-            ),
-        }, clear=True), self.assertRaises(SystemExit):
-            Seedsync._parse_args(base)
 
     def test_blocking_migration_defaults_to_loopback_but_explicit_bind_is_preserved(self):
         decision = MigrationDecision(state=MigrationState.REQUIRED)
