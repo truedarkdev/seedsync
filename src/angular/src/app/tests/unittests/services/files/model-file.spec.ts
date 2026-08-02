@@ -104,6 +104,87 @@ describe("Testing model file initialization", () => {
         expect(baseModelFile.remote_size).toBeNull();
     });
 
+    it("should preserve explicit false presence/content signals despite contradictory sizes", () => {
+        const direct = new ModelFile({
+            name: "explicit-direct",
+            is_dir: false,
+            local_size: 0,
+            remote_size: 0,
+            remote_present: false,
+            local_present: false,
+            remote_has_transferable_content: false,
+        });
+        expect(direct.remote_present).toBe(false);
+        expect(direct.local_present).toBe(false);
+        expect(direct.remote_has_transferable_content).toBe(false);
+
+        const json = {
+            name: "explicit-json",
+            is_dir: false,
+            local_size: 0,
+            remote_size: 0,
+            remote_present: false,
+            local_present: false,
+            remote_has_transferable_content: false,
+            state: "default",
+            children: []
+        };
+        const parsed = ModelFile.fromJson(json);
+        expect(parsed.remote_present).toBe(false);
+        expect(parsed.local_present).toBe(false);
+        expect(parsed.remote_has_transferable_content).toBe(false);
+
+        const initialized = new ModelFile(parsed);
+        expect(initialized.remote_present).toBe(false);
+        expect(initialized.local_present).toBe(false);
+        expect(initialized.remote_has_transferable_content).toBe(false);
+    });
+
+    it("should recursively classify legacy remote children and zero-byte files", () => {
+        const empty = ModelFile.fromJson({
+            name: "empty",
+            is_dir: true,
+            remote_size: 0,
+            local_size: null,
+            state: "default",
+            children: [{
+                name: "nested-empty",
+                is_dir: true,
+                remote_size: 0,
+                local_size: null,
+                state: "default",
+                children: []
+            }]
+        });
+        expect(empty.remote_present).toBe(true);
+        expect(empty.remote_has_transferable_content).toBe(false);
+
+        const nestedZero = ModelFile.fromJson({
+            name: "nested-zero",
+            is_dir: true,
+            remote_size: 0,
+            local_size: null,
+            state: "default",
+            children: [{
+                name: "nested",
+                is_dir: true,
+                remote_size: 0,
+                local_size: null,
+                state: "default",
+                children: [{
+                    name: "zero.bin",
+                    is_dir: false,
+                    remote_size: 0,
+                    local_size: null,
+                    state: "default",
+                    children: []
+                }]
+            }]
+        });
+        expect(nestedZero.remote_has_transferable_content).toBe(true);
+        expect(nestedZero.children.first().children.first().remote_has_transferable_content).toBe(true);
+    });
+
     it("should correctly initialize children", () => {
         baseJson.children = [
             {

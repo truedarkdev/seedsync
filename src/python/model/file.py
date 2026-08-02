@@ -37,6 +37,14 @@ class ModelFile:
         self.__state = ModelFile.State.DEFAULT  # status
         self.__remote_size: Optional[int] = None  # remote size in bytes, None if file does not exist
         self.__local_size: Optional[int] = None  # local size in bytes, None if file does not exist
+        # Presence is intentionally independent from sizes: a zero-byte file is
+        # present, while a directory can exist without any transferable files.
+        self.__remote_present = False
+        self.__local_present = False
+        self.__remote_has_transferable_content = False
+        self.__remote_presence_explicit = False
+        self.__local_presence_explicit = False
+        self.__remote_content_explicit = False
         self.__transferred_size: Optional[int] = None  # transferred size in bytes, None if file does not exist
         self.__download_progress: Optional[int] = None  # active download progress percent, None if unavailable
         self.__downloading_speed: Optional[int] = None  # in bytes / sec, None if not downloading
@@ -69,12 +77,18 @@ class ModelFile:
         ka = set(self.__dict__).difference({
             "_ModelFile__update_timestamp",
             "_ModelFile__parent",
-            "_ModelFile__children"
+            "_ModelFile__children",
+            "_ModelFile__remote_presence_explicit",
+            "_ModelFile__local_presence_explicit",
+            "_ModelFile__remote_content_explicit",
         })
         kb = set(other.__dict__).difference({
             "_ModelFile__update_timestamp",
             "_ModelFile__parent",
-            "_ModelFile__children"
+            "_ModelFile__children",
+            "_ModelFile__remote_presence_explicit",
+            "_ModelFile__local_presence_explicit",
+            "_ModelFile__remote_content_explicit",
         })
         # Check self properties
         if ka != kb:
@@ -126,6 +140,47 @@ class ModelFile:
             self.__remote_size = remote_size
         else:
             raise TypeError
+        if not self.__remote_presence_explicit:
+            self.__remote_present = remote_size is not None
+        if not self.__remote_content_explicit:
+            # Directly assembled compatibility objects may only carry a
+            # positive directory size; treat that as content-bearing. The
+            # model builder sets an explicit recursive signal for scanned
+            # trees, including genuinely empty directories.
+            self.__remote_has_transferable_content = (
+                remote_size is not None and (not self.__is_dir or remote_size > 0)
+            )
+
+    @property
+    def remote_present(self) -> bool: return self.__remote_present
+
+    @remote_present.setter
+    def remote_present(self, remote_present: bool):
+        if type(remote_present) is not bool:
+            raise TypeError
+        self.__remote_presence_explicit = True
+        self.__remote_present = remote_present
+
+    @property
+    def local_present(self) -> bool: return self.__local_present
+
+    @local_present.setter
+    def local_present(self, local_present: bool):
+        if type(local_present) is not bool:
+            raise TypeError
+        self.__local_presence_explicit = True
+        self.__local_present = local_present
+
+    @property
+    def remote_has_transferable_content(self) -> bool:
+        return self.__remote_has_transferable_content
+
+    @remote_has_transferable_content.setter
+    def remote_has_transferable_content(self, value: bool):
+        if type(value) is not bool:
+            raise TypeError
+        self.__remote_content_explicit = True
+        self.__remote_has_transferable_content = value
 
     @property
     def local_size(self) -> Optional[int]: return self.__local_size
@@ -140,6 +195,8 @@ class ModelFile:
             self.__local_size = local_size
         else:
             raise TypeError
+        if not self.__local_presence_explicit:
+            self.__local_present = local_size is not None
 
     @property
     def transferred_size(self) -> Optional[int]: return self.__transferred_size

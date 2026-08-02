@@ -9,10 +9,10 @@
         </div>
         <div class="status">
             <img src="assets/icons/default-remote.svg" id="default-remote"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize > 0"
+                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteHasTransferableContent"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/default-local.svg" id="default-local"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize === 0 && file.localSize > 0"
+                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.isLocalOnly"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/queued.svg" id="queued"
                  *ngIf="file.status === ViewFile.Status.QUEUED"
@@ -53,13 +53,14 @@
             <!-- don't show text for default status unless the file is local-only -->
             <span *ngIf="file.status != ViewFile.Status.DEFAULT &&
                          file.status != ViewFile.Status.MOVE_FAILED &&
-                         file.status != ViewFile.Status.MOVE_SUCCEEDED"
+                         file.status != ViewFile.Status.MOVE_SUCCEEDED &&
+                         !file.isLocalOnly"
                   class="text">{{file.status | capitalize}}</span>
             <span *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
                   class="text move-failed-text">Final move failed</span>
             <span *ngIf="file.status === ViewFile.Status.MOVE_SUCCEEDED"
                   class="text">Move succeeded</span>
-            <span *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteSize === 0 && file.localSize > 0"
+            <span *ngIf="file.isLocalOnly"
                   class="text">Local Only</span>
         </div>
         <div class="name">

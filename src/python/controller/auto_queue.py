@@ -312,7 +312,7 @@ class AutoQueue:
                     candidates=self.__model_listener.new_files,
                     new_patterns=new_patterns,
                     accept=lambda f: (
-                        f.remote_size is not None and
+                        f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
                         (f.local_size is None or f.local_size == 0) and
                         self._is_auto_queue_enabled_for_file(f)
@@ -323,7 +323,19 @@ class AutoQueue:
                 modified_candidates_actual_update: list[ModelFile] = []
                 modified_candidates_remote_discovery: list[ModelFile] = []
                 for old_file, new_file in self.__model_listener.modified_files:
-                    if old_file.remote_size != new_file.remote_size:
+                    remote_discovery_changed = (
+                        old_file.remote_size != new_file.remote_size
+                        or (
+                            not old_file.remote_has_transferable_content
+                            and new_file.remote_has_transferable_content
+                        )
+                        or (
+                            not old_file.remote_present
+                            and new_file.remote_present
+                            and new_file.remote_has_transferable_content
+                        )
+                    )
+                    if remote_discovery_changed:
                         if old_file.remote_size is not None:
                             modified_candidates_actual_update.append(new_file)
                         else:
@@ -334,7 +346,7 @@ class AutoQueue:
                 modified_files_actual_update = self.__filter_candidates(
                     candidates=modified_candidates_actual_update,
                     new_patterns=new_patterns,
-                    accept=lambda f: f.remote_size is not None and
+                    accept=lambda f: f.remote_has_transferable_content and
                     f.state == ModelFile.State.DEFAULT and
                     self._is_auto_queue_enabled_for_file(f)
                 )
@@ -343,7 +355,7 @@ class AutoQueue:
                     candidates=modified_candidates_remote_discovery,
                     new_patterns=new_patterns,
                     accept=lambda f: (
-                        f.remote_size is not None and
+                        f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
                         (f.local_size is None or f.local_size == 0) and
                         self._is_auto_queue_enabled_for_file(f)
@@ -711,7 +723,7 @@ class AutoQueue:
 
     @staticmethod
     def __is_remote_delete_transition(old_file: ModelFile, new_file: ModelFile) -> bool:
-        if new_file.remote_size is None:
+        if not new_file.remote_has_transferable_content:
             return False
         if old_file.state == new_file.state:
             return False
@@ -730,6 +742,8 @@ class AutoQueue:
     def __queue_block_reason(self, file: ModelFile) -> str:
         if file.remote_size is None:
             return "missing_remote"
+        if not file.remote_has_transferable_content:
+            return "no_transferable_remote_content"
         if file.state != ModelFile.State.DEFAULT:
             return "state_not_default"
         if file.local_size is not None and file.local_size != 0:

@@ -8,6 +8,7 @@ import threading
 import time
 import tempfile
 import unittest
+from pathlib import Path
 from queue import Queue
 from threading import Lock
 from unittest.mock import MagicMock, patch
@@ -18,7 +19,7 @@ from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner
 from controller.controller import ControllerError, DownloadStartLifecycleEntry
-from controller.persist_keys import KEY_SEP
+from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, PathPairManager
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -1637,6 +1638,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__context.config.lftp.remote_path_to_scan_script = "/scanfs"
         self.controller._Controller__context.args.local_path_to_scanfs = "/local-scanfs"
         self.controller._Controller__started = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__last_local_reconciliation_healthy = True
         self.controller._Controller__active_downloading_file_names = [("dup", "movies", "Movies")]
         self.controller._Controller__active_extracting_file_names = []
         self.controller._Controller__set_active_scanner_files = MagicMock()
@@ -1695,6 +1698,8 @@ class TestController(unittest.TestCase):
             os.path.join("/local/movies", "incomplete"),
             self.controller._Controller__path_pair_staging_paths["movies"]
         )
+        self.assertFalse(self.controller._Controller__last_remote_reconciliation_healthy)
+        self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
 
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_skips_old_active_scanner_close_when_old_active_process_stays_alive(self, scanner_process_cls):
@@ -1905,13 +1910,40 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
-        self.controller._Controller__model_builder.set_remote_files.assert_called_once_with([partial_file])
+        self.controller._Controller__model_builder.set_remote_files.assert_not_called()
         self.assertIs(latest_remote_scan.timestamp, self.controller._Controller__context.status.controller.latest_remote_scan_time)
         self.assertTrue(self.controller._Controller__context.status.controller.latest_remote_scan_failed)
         self.assertEqual(
             "Failed to scan remote path for pair 'TV': temporary remote failure",
             self.controller._Controller__context.status.controller.latest_remote_scan_error
         )
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_failed_remote_scan_preserves_snapshot_and_next_healthy_scan_reconciles(self, _):
+        self.controller._Controller__persist.downloaded_file_names = {"existing"}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[ModelFile("partial", False)], failed=True, error_message="remote failed"
+        )
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_remote_files.assert_not_called()
+        self.assertEqual({"existing"}, self.controller._Controller__persist.downloaded_file_names)
+
+        healthy_file = ModelFile("healthy", False)
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[healthy_file], failed=False, error_message=None
+        )
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_remote_files.assert_called_once_with([healthy_file])
 
     def test_update_model_filters_only_malformed_status_only_active_entries(self):
         status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
@@ -2398,6 +2430,13 @@ class TestController(unittest.TestCase):
             failed=False,
             error_message=None
         )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            failed=False,
+            error_message=None,
+            managed_extract_file_ids=[],
+        )
         self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
 
@@ -2405,6 +2444,224 @@ class TestController(unittest.TestCase):
 
         self.assertEqual({"keep-id"}, self.controller._Controller__persist.downloaded_file_names)
         self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({"keep-id"})
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_prunes_stale_extracted_and_final_move_markers(self, _):
+        self.controller._Controller__persist.extracted_file_names = {"keep-id", "stale-id"}
+        self.controller._Controller__persist.final_move_succeeded_file_names = {"keep-id", "stale-id"}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            failed=False,
+            error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(),
+            files=[],
+            failed=False,
+            error_message=None,
+            managed_extract_file_ids=[],
+        )
+        self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
+        self.controller._Controller__model.get_file_names.return_value = {"keep"}
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({"keep-id"}, self.controller._Controller__persist.extracted_file_names)
+        self.assertEqual({"keep-id"}, self.controller._Controller__persist.final_move_succeeded_file_names)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_failed_local_scan_preserves_snapshot_and_history(self, _):
+        self.controller._Controller__persist.downloaded_file_names = {"existing"}
+        self.controller._Controller__persist.extracted_file_names = {"existing"}
+        self.controller._Controller__persist.final_move_succeeded_file_names = {"existing"}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=True, error_message="local scan failed"
+        )
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_local_files.assert_not_called()
+        self.assertEqual({"existing"}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({"existing"}, self.controller._Controller__persist.extracted_file_names)
+        self.assertEqual({"existing"}, self.controller._Controller__persist.final_move_succeeded_file_names)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_defers_ambiguous_legacy_markers_with_multiple_pairs(self, _):
+        self.controller._Controller__path_pairs_by_id = {"movies": MagicMock(), "tv": MagicMock()}
+        self.controller._Controller__persist.downloaded_file_names = {
+            "same.mkv",
+            ModelFile.build_file_id("same.mkv", "tv"),
+        }
+        self.controller._Controller__persist.extracted_file_names = {
+            "same.mkv",
+            ModelFile.build_file_id("same.mkv", "tv"),
+        }
+        self.controller._Controller__persist.final_move_succeeded_file_names = {
+            "same.mkv",
+            ModelFile.build_file_id("same.mkv", "tv"),
+        }
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        healthy_scan = SimpleNamespace(timestamp=object(), files=[], failed=False, error_message=None)
+        healthy_local = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = healthy_scan
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = healthy_local
+        self.controller._Controller__model.get_file_ids.return_value = {
+            ModelFile.build_file_id("same.mkv", "movies")
+        }
+        self.controller._Controller__model.get_file_names.return_value = {"same.mkv"}
+
+        self.controller._Controller__update_model()
+
+        self.assertIn("same.mkv", self.controller._Controller__persist.downloaded_file_names)
+        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.downloaded_file_names)
+        self.assertIn("same.mkv", self.controller._Controller__persist.extracted_file_names)
+        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.extracted_file_names)
+        self.assertIn("same.mkv", self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.final_move_succeeded_file_names)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_normalizes_scoped_persist_keys_for_safe_pruning(self, _):
+        uuid_pair = "12345678-1234-1234-1234-123456789abc"
+        self.controller._Controller__path_pairs_by_id = {"movies": MagicMock(), uuid_pair: MagicMock()}
+        active_movie_id = ModelFile.build_file_id("active.mkv", "movies")
+        active_uuid_id = ModelFile.build_file_id("active.mkv", uuid_pair)
+        pending_name = "pending.mkv"
+        pending_id = ModelFile.build_file_id(pending_name, "movies")
+        stale_movie_key = persist_key("movies", "stale.mkv")
+        stale_uuid_colon_key = f"{uuid_pair}:stale.mkv"
+        pending_key = persist_key("movies", pending_name)
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            setattr(self.controller._Controller__persist, attr, {
+                persist_key("movies", "active.mkv"),
+                f"{uuid_pair}:active.mkv",
+                stale_movie_key,
+                stale_uuid_colon_key,
+                pending_key,
+            })
+        self.controller._Controller__pending_completion_file_names = {(pending_name, "movies", "Movies")}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__model.get_file_ids.return_value = {active_movie_id, active_uuid_id}
+        self.controller._Controller__model.get_file_names.return_value = {"active.mkv"}
+
+        self.controller._Controller__update_model()
+
+        expected = {
+            persist_key("movies", "active.mkv"),
+            f"{uuid_pair}:active.mkv",
+            pending_key,
+        }
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            self.assertEqual(expected, getattr(self.controller._Controller__persist, attr))
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_preserves_unknown_scoped_markers_across_healthy_scans(self, _):
+        self.controller._Controller__path_pairs_by_id = {"movies": MagicMock()}
+        stale_movie_key = persist_key("movies", "stale.mkv")
+        unknown_pair = "87654321-4321-4321-4321-abcdefabcdef"
+        unknown_markers = {
+            persist_key("disabled", "orphan.mkv"),
+            ModelFile.build_file_id("orphan-json.mkv", unknown_pair),
+            f"{unknown_pair}:orphan-legacy.mkv",
+        }
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            setattr(self.controller._Controller__persist, attr, {stale_movie_key, *unknown_markers})
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        healthy_remote = SimpleNamespace(timestamp=object(), files=[], failed=False, error_message=None)
+        healthy_local = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = healthy_remote
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = healthy_local
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+
+        self.controller._Controller__update_model()
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            self.assertEqual(unknown_markers, getattr(self.controller._Controller__persist, attr))
+
+        # A subsequent healthy generation must continue deferring markers
+        # whose pair is disabled/unknown rather than pruning them.
+        self.controller._Controller__update_model()
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            self.assertEqual(unknown_markers, getattr(self.controller._Controller__persist, attr))
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_path_pair_refresh_invalidates_reconciliation_authority_until_healthy_scans(self, _):
+        stale_key = persist_key("movies", "stale.mkv")
+        self.controller._Controller__path_pairs_by_id = {"movies": MagicMock()}
+        for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
+            setattr(self.controller._Controller__persist, attr, {stale_key})
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__refresh_path_pair_runtime_state = MagicMock()
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        self.controller._Controller__lftp.status.return_value = []
+
+        self.controller._Controller__apply_path_pair_refresh()
+        self.assertFalse(self.controller._Controller__last_remote_reconciliation_healthy)
+        self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__update_model()
+        self.assertEqual({stale_key}, self.controller._Controller__persist.downloaded_file_names)
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__update_model()
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_update_model_reconciles_v086_fixture_markers_after_healthy_empty_scans(self, _):
+        fixture_path = Path(__file__).parents[2] / "fixtures" / "upgrade_v086_ff2a" / "controller.persist"
+        persisted = json.loads(fixture_path.read_text(encoding="utf-8"))
+        self.controller._Controller__persist.downloaded_file_names = set(persisted["downloaded"])
+        self.controller._Controller__persist.extracted_file_names = set(persisted["extracted"])
+        self.controller._Controller__persist.final_move_succeeded_file_names = set(persisted["downloaded"])
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
+        )
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.final_move_succeeded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_terminal_move_metadata_after_remote_reconciliation(self, _):
@@ -2416,6 +2673,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
             timestamp=object(), files=[], failed=False, error_message=None
+        )
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
+            timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
         )
         self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
@@ -3140,6 +3400,36 @@ class TestController(unittest.TestCase):
             exclude_patterns="*.nfo,Sample/"
         )
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
+
+    def test_process_commands_queue_rejects_empty_remote_directory_but_allows_zero_byte_file(self):
+        empty_dir = ModelFile("empty-dir", True)
+        empty_dir.remote_size = 0
+        empty_dir.local_size = 0
+        self.controller._Controller__model.get_file.return_value = empty_dir
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, empty_dir.file_id)
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_not_called()
+        callback.on_failure.assert_called_once()
+        self.assertEqual(409, callback.on_failure.call_args.args[1])
+
+        self.controller._Controller__model.get_file.reset_mock()
+        zero_file = ModelFile("zero-byte", False)
+        zero_file.remote_size = 0
+        self.controller._Controller__model.get_file.return_value = zero_file
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, zero_file.file_id))
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "zero-byte",
+            False,
+            remote_base_dir_path=None,
+            local_base_dir_path="/local/incomplete",
+        )
 
     def test_process_commands_queue_is_idempotent_for_queued_file(self):
         file = ModelFile("queued", False)

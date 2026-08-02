@@ -80,7 +80,7 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual(
             [
-                call.set_downloaded_files({"plain.txt", normalized_file_id}),
+                call.set_downloaded_files({normalized_file_id}),
                 call.set_extracted_files({normalized_file_id}),
                 call.set_stopped_files({normalized_file_id}),
             ],
@@ -102,9 +102,9 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual(
             [
-                call.set_downloaded_files({default_file_name}),
-                call.set_extracted_files({default_file_name}),
-                call.set_stopped_files({default_file_name}),
+                call.set_downloaded_files(set()),
+                call.set_extracted_files(set()),
+                call.set_stopped_files(set()),
             ],
             model_builder.mock_calls,
         )

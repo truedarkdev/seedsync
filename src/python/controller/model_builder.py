@@ -288,7 +288,14 @@ class ModelBuilder:
     def __model_file_matches_persisted_name(model_file: ModelFile, persisted_names: Optional[set[str]]) -> bool:
         if persisted_names is None:
             return False
-        return model_file.file_id in persisted_names or model_file.name in persisted_names
+        if model_file.file_id in persisted_names:
+            return True
+        # Scoped path-pair files must use their canonical identity. Falling
+        # back to the basename here would let a raw runtime marker setter
+        # reintroduce cross-pair state after the updater's initial filtering.
+        if model_file.path_pair_id is not None:
+            return False
+        return model_file.name in persisted_names
 
     @staticmethod
     def __extract_status_key(status: ExtractStatus) -> str:
@@ -602,6 +609,24 @@ class ModelBuilder:
                     (child_file.local_size is None or child_file.local_size < child_file.remote_size):
                 return True
         return False
+
+    @staticmethod
+    def __has_remote_transferable_content(remote_file: Optional[SystemFile]) -> bool:
+        """Return whether a remote node contains a transferable file.
+
+        Directory metadata alone is not transferable content. The remote scan
+        has already been filtered for exclusions before it reaches the builder,
+        so this recursive check also naturally ignores excluded descendants.
+        A file is content even when its size is zero.
+        """
+        if remote_file is None:
+            return False
+        if not remote_file.is_dir:
+            return True
+        return any(
+            ModelBuilder.__has_remote_transferable_content(child)
+            for child in remote_file.children
+        )
 
     @staticmethod
     def __normalize_download_progress(percent_local: Optional[int | float]) -> Optional[int]:
@@ -1263,6 +1288,16 @@ class ModelBuilder:
                 current_transfer_state,
             )
 
+            # Empty remote directory trees are metadata only. Keep a local
+            # counterpart visible as Local Only, but do not create a row for a
+            # remote-only tree with no transferable descendants.
+            if (
+                status is None
+                and local is None
+                and not model_file.remote_has_transferable_content
+            ):
+                continue
+
             if self.__is_stop_resume_trace_enabled():
                 self.__trace_target_arbitration(
                     model_file,
@@ -1298,7 +1333,9 @@ class ModelBuilder:
                     local,
                     path_pair_id,
                 ),
-                is_local_only=local is not None and remote is None and status is None,
+                is_local_only=local is not None
+                and not model_file.remote_has_transferable_content
+                and status is None,
                 seen_file_ids=root_seen_file_ids,
             ))
 
@@ -1602,6 +1639,9 @@ class ModelBuilder:
         live_transferred_file_ids: Set[str],
     ) -> None:
         # set local and remote sizes
+        model_file.remote_present = remote is not None
+        model_file.local_present = local is not None
+        model_file.remote_has_transferable_content = self.__has_remote_transferable_content(remote)
         if remote:
             model_file.remote_size = remote.size
         if local:

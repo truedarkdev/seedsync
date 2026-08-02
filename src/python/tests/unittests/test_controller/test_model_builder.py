@@ -5,6 +5,7 @@ import os
 import sys
 import unittest
 import json
+from pathlib import Path
 from unittest.mock import patch
 from datetime import datetime
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ from lftp import LftpJobStatus
 from model import ModelError, ModelFile, Model
 from controller import ModelBuilder
 from controller.model_builder import _RecentLiveTransferSnapshot
+from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 
@@ -68,6 +70,90 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(original_real_propagate, real_model_builder_propagate)
         self.assertFalse(any(record.name.startswith("dummy.Model") for record in captured_records))
 
+    def test_presence_signals_distinguish_zero_byte_files_and_empty_remote_trees(self):
+        remote_zero = SystemFile("zero.bin", 0, False)
+        self.model_builder.set_remote_files([remote_zero])
+        model = self.model_builder.build_model()
+        zero_file = model.get_file("zero.bin")
+        self.assertTrue(zero_file.remote_present)
+        self.assertFalse(zero_file.local_present)
+        self.assertTrue(zero_file.remote_has_transferable_content)
+
+        self.model_builder.clear()
+        empty_remote_dir = SystemFile("empty", 0, True)
+        self.model_builder.set_remote_files([empty_remote_dir])
+        empty_model = self.model_builder.build_model()
+        self.assertEqual(set(), empty_model.get_file_names())
+
+        self.model_builder.clear()
+        remote_tree = SystemFile("tree", 0, True)
+        remote_tree.add_child(SystemFile("zero.bin", 0, False))
+        self.model_builder.set_remote_files([remote_tree])
+        tree_model = self.model_builder.build_model()
+        tree = tree_model.get_file("tree")
+        self.assertTrue(tree.remote_present)
+        self.assertTrue(tree.remote_has_transferable_content)
+        self.assertTrue(tree.get_children()[0].remote_has_transferable_content)
+
+    def test_local_only_presence_includes_empty_local_files(self):
+        local_empty = SystemFile("empty.bin", 0, False)
+        self.model_builder.set_local_files([local_empty])
+        model = self.model_builder.build_model()
+        local_file = model.get_file("empty.bin")
+        self.assertFalse(local_file.remote_present)
+        self.assertTrue(local_file.local_present)
+        self.assertFalse(local_file.remote_has_transferable_content)
+
+    def test_local_only_presence_preserves_downloaded_and_extracted_history(self):
+        local_file = SystemFile("archive.zip", 24, False)
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_downloaded_files({"archive.zip"})
+        self.model_builder.set_extracted_files({"archive.zip"})
+
+        model = self.model_builder.build_model()
+        file = model.get_file("archive.zip")
+        self.assertEqual(ModelFile.State.EXTRACTED, file.state)
+        self.assertFalse(file.remote_present)
+        self.assertTrue(file.local_present)
+        self.assertFalse(file.remote_has_transferable_content)
+
+    def test_v086_fixture_markers_reconcile_remote_empty_local_matrix(self):
+        fixture_path = Path(__file__).parents[2] / "fixtures" / "upgrade_v086_ff2a" / "controller.persist"
+        persisted = json.loads(fixture_path.read_text(encoding="utf-8"))
+        downloaded = set(persisted["downloaded"])
+        extracted = set(persisted["extracted"])
+
+        # A migrated local file remains visible and retains its historical
+        # extracted state when the remote scan is empty.
+        local = SystemFile("nonarchive.txt", 0, False)
+        self.model_builder.set_remote_files([])
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_downloaded_files(downloaded)
+        self.model_builder.set_extracted_files(extracted)
+        model = self.model_builder.build_model()
+        local_file = model.get_file("nonarchive.txt")
+        self.assertTrue(local_file.local_present)
+        self.assertFalse(local_file.remote_present)
+        self.assertFalse(local_file.remote_has_transferable_content)
+        self.assertEqual(ModelFile.State.DOWNLOADED, local_file.state)
+
+        # With no local counterpart, an empty remote snapshot contributes no
+        # rows; stale marker pruning is performed by the healthy updater lane.
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([])
+        self.model_builder.set_local_files([])
+        self.model_builder.set_downloaded_files(downloaded)
+        self.model_builder.set_extracted_files(extracted)
+        self.assertEqual(set(), self.model_builder.build_model().get_file_names())
+
+        # A zero-byte remote file is still transferable content and remains
+        # visible after migration.
+        self.model_builder.clear()
+        self.model_builder.set_remote_files([SystemFile("zero-byte.bin", 0, False)])
+        zero_file = self.model_builder.build_model().get_file("zero-byte.bin")
+        self.assertTrue(zero_file.remote_present)
+        self.assertTrue(zero_file.remote_has_transferable_content)
+
     def test_move_failed_overlay_is_canonical_pair_scoped_and_last(self):
         movies = SystemFile("same.mkv", 100, False)
         movies.path_pair_id = "movies"
@@ -84,6 +170,63 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.MOVE_FAILED, model.get_file(movies_id).state)
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file(tv_id).state)
+
+    def test_bare_markers_are_deferred_for_duplicate_path_pair_names(self):
+        movies = SystemFile("same.mkv", 100, False)
+        movies.path_pair_id = "movies"
+        tv = SystemFile("same.mkv", 100, False)
+        tv.path_pair_id = "tv"
+        persisted_marker = {"same.mkv"}
+
+        # The updater must not pass an ambiguous bare name into ModelBuilder,
+        # where name-based matching would otherwise apply it to both pairs.
+        filtered_marker = ModelUpdater._filter_keys_for_model_builder(
+            persisted_marker,
+            {"movies", "tv"},
+        )
+        self.assertEqual(set(), filtered_marker)
+        self.assertEqual({"same.mkv"}, persisted_marker)
+
+        self.model_builder.set_remote_files([movies, tv])
+        self.model_builder.set_downloaded_files(filtered_marker)
+        self.model_builder.set_extracted_files(filtered_marker)
+        self.model_builder.set_final_move_succeeded_files(filtered_marker)
+        model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file(ModelFile.build_file_id("same.mkv", "movies")).state)
+        self.assertEqual(ModelFile.State.DEFAULT, model.get_file(ModelFile.build_file_id("same.mkv", "tv")).state)
+        self.assertFalse(model.get_file(ModelFile.build_file_id("same.mkv", "movies")).final_move_succeeded)
+        self.assertFalse(model.get_file(ModelFile.build_file_id("same.mkv", "tv")).final_move_succeeded)
+
+    def test_raw_runtime_markers_cannot_overlay_scoped_pairs_after_rebuild(self):
+        movies = SystemFile("same.mkv", 100, False)
+        movies.path_pair_id = "movies"
+        tv = SystemFile("same.mkv", 100, False)
+        tv.path_pair_id = "tv"
+        movies_id = ModelFile.build_file_id("same.mkv", "movies")
+        tv_id = ModelFile.build_file_id("same.mkv", "tv")
+
+        self.model_builder.set_remote_files([movies, tv])
+        self.model_builder.set_downloaded_files(set())
+        self.model_builder.set_extracted_files(set())
+        self.model_builder.set_final_move_succeeded_files(set())
+        self.model_builder.build_model()
+
+        # Simulate a runtime raw setter bypassing updater-side normalization.
+        raw_marker = {"same.mkv"}
+        self.model_builder.set_downloaded_files(raw_marker)
+        self.model_builder.set_extracted_files(raw_marker)
+        self.model_builder.set_final_move_succeeded_files(raw_marker)
+        self.model_builder.request_rebuild()
+        rebuilt = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DEFAULT, rebuilt.get_file(movies_id).state)
+        self.assertEqual(ModelFile.State.DEFAULT, rebuilt.get_file(tv_id).state)
+        self.assertFalse(rebuilt.get_file(movies_id).final_move_succeeded)
+        self.assertFalse(rebuilt.get_file(tv_id).final_move_succeeded)
+        self.assertEqual(raw_marker, self.model_builder._ModelBuilder__downloaded_files)
+        self.assertEqual(raw_marker, self.model_builder._ModelBuilder__extracted_files)
+        self.assertEqual(raw_marker, self.model_builder._ModelBuilder__final_move_succeeded_files)
 
     def test_move_failed_overlay_survives_remote_absence_and_rebuild(self):
         local = SystemFile("movie.mkv", 100, False)
@@ -170,7 +313,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 0, True)])
         model = self.model_builder.build_model()
-        self.assertEqual(True, model.get_file("a").is_dir)
+        self.assertEqual(set(), model.get_file_names())
 
         # local
         self.model_builder.clear()
@@ -506,7 +649,7 @@ class TestModelBuilder(unittest.TestCase):
             model.get_file(ModelFile.build_file_id("archive.zip", "tv")).state
         )
 
-    def test_build_state_promotes_legacy_extracted_marker_after_root_name_becomes_unique(self):
+    def test_build_state_keeps_legacy_extracted_marker_deferred_after_root_name_becomes_unique(self):
         local_movies = SystemFile("archive.zip", 100, False)
         local_movies.path_pair_id = "movies"
         local_tv = SystemFile("archive.zip", 100, False)
@@ -525,7 +668,9 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_movies])
         unique_model = self.model_builder.build_model()
 
-        self.assertEqual(ModelFile.State.EXTRACTED, unique_model.get_file(movies_id).state)
+        # Scoped files never fall back to a bare name, even after the other
+        # same-named pair disappears; canonicalization must establish identity.
+        self.assertEqual(ModelFile.State.DOWNLOADED, unique_model.get_file(movies_id).state)
 
     def test_build_state_does_not_promote_after_ambiguous_extracted_marker_is_removed(self):
         local_movies = SystemFile("archive.zip", 100, False)
@@ -3329,7 +3474,7 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.clear()
         self.model_builder.set_remote_files([SystemFile("a", 42, True)])
         model = self.model_builder.build_model()
-        self.assertEqual(None, model.get_file("a").transferred_size)
+        self.assertEqual(set(), model.get_file_names())
 
         # local only directory
         self.model_builder.clear()

@@ -344,6 +344,38 @@ describe("Testing model file service", () => {
         expect(Immutable.is(latestModel.get("File.One"), expectedModelFiles[0])).toBe(true);
     }));
 
+    it("should preserve explicit false signals through init and update events", fakeAsync(() => {
+        const explicitFalse = {
+            name: "empty-dir",
+            is_dir: true,
+            local_size: 0,
+            remote_size: 0,
+            remote_present: false,
+            local_present: false,
+            remote_has_transferable_content: false,
+            state: "default",
+            children: []
+        };
+        let latestModel: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(model => latestModel = model);
+        modelFileService.notifyEvent("model-init", JSON.stringify([explicitFalse]));
+        tick();
+        let file = latestModel.get("empty-dir");
+        expect(file.remote_present).toBe(false);
+        expect(file.local_present).toBe(false);
+        expect(file.remote_has_transferable_content).toBe(false);
+
+        modelFileService.notifyEvent("model-updated", JSON.stringify({
+            old_file: explicitFalse,
+            new_file: Object.assign({}, explicitFalse, {remote_size: 99, local_size: 99})
+        }));
+        tick();
+        file = latestModel.get("empty-dir");
+        expect(file.remote_present).toBe(false);
+        expect(file.local_present).toBe(false);
+        expect(file.remote_has_transferable_content).toBe(false);
+    }));
+
     it("should send empty model on disconnect", fakeAsync(() => {
         let count = 0;
         let latestModel: Immutable.Map<string, ModelFile> = null;

@@ -51,6 +51,8 @@ function createViewFile(props: any = {}): ViewFile {
         fileId: props.fileId || "file-1",
         name: props.name || "sample",
         status: props.status || ViewFile.Status.DEFAULT,
+        isLocalOnly: props.isLocalOnly || false,
+        remoteHasTransferableContent: props.remoteHasTransferableContent || false,
         isArchive: props.isArchive || false,
         isQueueable: props.isQueueable || false,
         isStoppable: props.isStoppable || false,
@@ -301,6 +303,20 @@ describe("Testing file component", () => {
         ).toBe(72);
         expect(style.marginTop).toBe("-16px");
         expect(style.marginBottom).toBe("-12px");
+    });
+
+    it("should render the Local Only label from explicit presence state", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isLocalOnly: true,
+            localPresent: true,
+        });
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.nativeElement.textContent).toContain("Local Only");
+        expect(status.nativeElement.textContent).not.toContain("downloaded");
     });
 
     it("should keep the progress percentage and byte totals in one composition", () => {
