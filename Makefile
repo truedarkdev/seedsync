@@ -85,29 +85,59 @@ docker-image: docker-buildx
 
 docker-image-release:
 	@if [[ -z "${STAGING_REGISTRY}" ]] ; then \
-		export STAGING_REGISTRY="${DEFAULT_STAGING_REGISTRY}"; \
-	fi;
-	echo "${green}STAGING_REGISTRY=$${STAGING_REGISTRY}${reset}";
+		echo "${red}ERROR: STAGING_REGISTRY is required${reset}"; exit 1; \
+	fi
+	@if [[ -z "${STAGING_VERSION}" ]] ; then \
+		echo "${red}ERROR: STAGING_VERSION is required${reset}"; exit 1; \
+	fi
+	@if [[ -z "${STAGING_DIGEST}" ]] ; then \
+		echo "${red}ERROR: STAGING_DIGEST is required${reset}"; exit 1; \
+	fi
 	@if [[ -z "${RELEASE_REGISTRY}" ]] ; then \
 		echo "${red}ERROR: RELEASE_REGISTRY is required${reset}"; exit 1; \
 	fi
 	@if [[ -z "${RELEASE_VERSION}" ]] ; then \
 		echo "${red}ERROR: RELEASE_VERSION is required${reset}"; exit 1; \
 	fi
-	echo "${green}RELEASE_REGISTRY=${RELEASE_REGISTRY}${reset}"
-	echo "${green}RELEASE_VERSION=${RELEASE_VERSION}${reset}"
+	source_repository="${STAGING_REGISTRY}/seedsync"
+	source_image="$${source_repository}:${STAGING_VERSION}"
+	version_image="${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION}"
+	latest_image="${RELEASE_REGISTRY}/seedsync:latest"
+	source_digest="${STAGING_DIGEST}"
+	if [[ ! "$${source_digest}" =~ ^sha256:[0-9a-f]{64}$$ ]] ; then \
+		echo "${red}ERROR: STAGING_DIGEST must be a sha256 digest${reset}"; exit 1; \
+	fi
+	resolved_source_digest="$$( $(DOCKER) buildx imagetools inspect \
+		"$${source_image}" --format '{{json .Manifest.Digest}}' | tr -d '"' )"
+	if [[ "$${resolved_source_digest}" != "$${source_digest}" ]] ; then \
+		echo "${red}ERROR: Staging tag digest changed or does not match the tested digest${reset}"; \
+		echo "expected=$${source_digest}"; \
+		echo "resolved=$${resolved_source_digest}"; \
+		exit 1; \
+	fi
+	echo "${green}STAGING_IMAGE=$${source_image}${reset}"
+	echo "${green}STAGING_DIGEST=$${source_digest}${reset}"
+	echo "${green}RELEASE_IMAGE=$${version_image}${reset}"
+	echo "${green}LATEST_IMAGE=$${latest_image}${reset}"
 
-	# final image
-	$(DOCKER) buildx build \
-		-f ${SOURCEDIR}/docker/build/docker-image/Dockerfile \
-		--build-arg SCANFS_PLATFORM=${SCANFS_PLATFORM} \
-		$(SEEDSYNC_ANGULAR_BUILD_CONTEXT_ARG) \
-		--target seedsync_run \
-		--tag ${RELEASE_REGISTRY}/seedsync:${RELEASE_VERSION} \
-		--cache-from=type=registry,ref=$${STAGING_REGISTRY}/seedsync:cache \
-		--platform ${DOCKER_IMAGE_PLATFORMS} \
-		--push \
-		${ROOTDIR}
+	# Copy the exact tested multi-architecture manifest without rebuilding it.
+	$(DOCKER) buildx imagetools create \
+		--tag "$${version_image}" \
+		--tag "$${latest_image}" \
+		"$${source_repository}@$${source_digest}"
+
+	version_digest="$$( $(DOCKER) buildx imagetools inspect \
+		"$${version_image}" --format '{{json .Manifest.Digest}}' | tr -d '"' )"
+	latest_digest="$$( $(DOCKER) buildx imagetools inspect \
+		"$${latest_image}" --format '{{json .Manifest.Digest}}' | tr -d '"' )"
+	if [[ "$${version_digest}" != "$${source_digest}" || "$${latest_digest}" != "$${source_digest}" ]] ; then \
+		echo "${red}ERROR: Published Docker Hub tags do not match the tested digest${reset}"; \
+		echo "source=$${source_digest}"; \
+		echo "version=$${version_digest}"; \
+		echo "latest=$${latest_digest}"; \
+		exit 1; \
+	fi
+	echo "${green}Published and verified $${version_image} and $${latest_image} at $${source_digest}${reset}"
 
 verify-deb-glibc:
 	@if ! compgen -G "${BUILDDIR}/*.deb" > /dev/null; then \

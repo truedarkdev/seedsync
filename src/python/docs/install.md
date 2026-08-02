@@ -41,7 +41,7 @@ Select the section for your platform:
            -v <downloads directory>:/downloads \
            [-v <mounts directory>:/mounts] \
            -v <config directory>:/config \
-           ipsingh06/seedsync
+           truedarkdev/seedsync:latest
 
     where
 

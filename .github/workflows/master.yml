@@ -24,7 +24,9 @@ jobs:
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Build package
       - name: Run Python unit tests
@@ -37,7 +39,9 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Build package
       - name: Run Angular unit tests
@@ -51,7 +55,9 @@ jobs:
     needs: [ unittests-python, unittests-angular ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Sets up build environment
       - name: Set up QEMU
@@ -60,8 +66,9 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
+          # moby/buildkit:master resolved to this immutable manifest on 2026-08-02.
           driver-opts: |
-            image=moby/buildkit:master
+            image=moby/buildkit@sha256:f4fdd943a0ad01a06ec52f424b5d387c169bcb20b14c0d38f242eb0b39423d0a
             network=host
       - name: Show buildx builder instance name
         run: echo ${{ steps.buildx.outputs.name }}
@@ -83,7 +90,7 @@ jobs:
 
       # Upload package
       - name: Publish artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ github.workspace }}/build/*.deb
           name: deb-${{ github.run_number }}
@@ -98,17 +105,23 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     needs: [ unittests-python, unittests-angular ]
+    outputs:
+      staging_image: ${{ steps.staging-image.outputs.image }}
+      staging_digest: ${{ steps.staging-image.outputs.digest }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
+          package-manager-cache: false
 
       - name: Install Angular dependencies
         working-directory: src/angular
@@ -125,8 +138,9 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
+          # moby/buildkit:master resolved to this immutable manifest on 2026-08-02.
           driver-opts: |
-            image=moby/buildkit:master
+            image=moby/buildkit@sha256:f4fdd943a0ad01a06ec52f424b5d387c169bcb20b14c0d38f242eb0b39423d0a
             network=host
       - name: Show buildx builder instance name
         run: echo ${{ steps.buildx.outputs.name }}
@@ -135,7 +149,9 @@ jobs:
 
       # Login using a PAT with write:packages scope
       - name: Log into GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | docker login https://ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
       # Set staging registry
       - name: Set staging registry env variable
         run: echo "staging_registry=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
@@ -147,6 +163,20 @@ jobs:
             STAGING_REGISTRY=${{ env.staging_registry }} \
             STAGING_VERSION=${{ github.run_number }} \
             SEEDSYNC_ANGULAR_BUILD_CONTEXT=/tmp/angular-output
+
+      - name: Record staging image digest
+        id: staging-image
+        run: |
+          staging_image="${{ env.staging_registry }}/seedsync:${{ github.run_number }}"
+          staging_digest="$(docker buildx imagetools inspect \
+            "${staging_image}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          if [[ ! "${staging_digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "ERROR: Could not resolve an immutable staging image digest" >&2
+            exit 1
+          fi
+          echo "image=${staging_image}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${staging_digest}" >> "${GITHUB_OUTPUT}"
+          echo "Recorded tested candidate ${staging_image}@${staging_digest}"
 
   e2etests-deb:
     name: End-to-end tests on Deb
@@ -162,10 +192,12 @@ jobs:
         oscode: [ ubu2004 ]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download deb package artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: deb-${{ github.run_number }}
           path: build/
@@ -203,7 +235,9 @@ jobs:
       packages: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Sets up build environment
       - name: Enable Docker experimental features
@@ -217,8 +251,9 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
+          # moby/buildkit:master resolved to this immutable manifest on 2026-08-02.
           driver-opts: |
-            image=moby/buildkit:master
+            image=moby/buildkit@sha256:f4fdd943a0ad01a06ec52f424b5d387c169bcb20b14c0d38f242eb0b39423d0a
             network=host
       - name: Show buildx builder instance name
         run: echo ${{ steps.buildx.outputs.name }}
@@ -227,7 +262,9 @@ jobs:
 
       # Login using a PAT with write:packages scope
       - name: Log into GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | docker login https://ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
       # Set staging registry
       - name: Set staging registry env variable
         run: echo "staging_registry=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
@@ -247,15 +284,24 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    needs: [ e2etests-deb, e2etests-docker-image ]
+    needs: [ build-docker-image, e2etests-deb, e2etests-docker-image ]
     permissions:
       contents: read
       packages: read
     steps:
       - name: Set release env variable
-        run: echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_ENV
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Release tag must be v<major>.<minor>.<patch>" >&2
+            exit 1
+          fi
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> "${GITHUB_ENV}"
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       # Sets up build environment
       - name: Set up QEMU
@@ -264,8 +310,9 @@ jobs:
         id: buildx
         uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
         with:
+          # moby/buildkit:master resolved to this immutable manifest on 2026-08-02.
           driver-opts: |
-            image=moby/buildkit:master
+            image=moby/buildkit@sha256:f4fdd943a0ad01a06ec52f424b5d387c169bcb20b14c0d38f242eb0b39423d0a
             network=host
       - name: Show buildx builder instance name
         run: echo ${{ steps.buildx.outputs.name }}
@@ -274,28 +321,30 @@ jobs:
 
       # Login to GHCR using a PAT with write:packages scope
       - name: Log into GitHub Container Registry
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login https://ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "${GHCR_TOKEN}" | docker login https://ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
       # Login to Dockerhub
       - name: Log into Dockerhub registry
-        run: echo "${{ secrets.DOCKER_PASSWORD }}" |
-          docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKER_PASSWORD }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+        run: printf '%s' "${DOCKERHUB_TOKEN}" |
+          docker login -u "${DOCKERHUB_USERNAME}" --password-stdin
       # Set staging registry
       - name: Set staging registry env variable
         run: echo "staging_registry=ghcr.io/${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
 
-      # Push image to dockerhub
-      - name: Push to Dockerhub (tag vX.X.X)
+      # Promote the exact multi-architecture image that passed E2E.
+      - name: Promote tested image to Dockerhub
+        env:
+          TESTED_STAGING_DIGEST: ${{ needs.build-docker-image.outputs.staging_digest }}
         run: make docker-image-release \
-          STAGING_REGISTRY=${{ env.staging_registry }} \
-          STAGING_VERSION=${{ github.run_number }} \
-          RELEASE_REGISTRY=docker.io/ipsingh06 \
-          RELEASE_VERSION=${{ env.RELEASE_VERSION }}
-      - name: Push to Dockerhub (tag latest)
-        run: make docker-image-release \
-          STAGING_REGISTRY=${{ env.staging_registry }} \
-          STAGING_VERSION=${{ github.run_number }} \
-          RELEASE_REGISTRY=docker.io/ipsingh06 \
-          RELEASE_VERSION=latest
+          STAGING_REGISTRY="${{ env.staging_registry }}" \
+          STAGING_VERSION="${{ github.run_number }}" \
+          STAGING_DIGEST="${TESTED_STAGING_DIGEST}" \
+          RELEASE_REGISTRY="docker.io/truedarkdev" \
+          RELEASE_VERSION="${RELEASE_VERSION}"
 
   # Deb packages remain build- and e2e-tested, but are not published until the
   # direct/deb upgrade path has its own certification evidence.
