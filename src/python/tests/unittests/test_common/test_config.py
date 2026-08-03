@@ -253,6 +253,7 @@ class TestConfig(unittest.TestCase):
             "allowed_hostname": "",
             "trusted_browser_bootstrap_remote_addrs": "172.25.0.1/32",
             "browser_handover_recovery_version": "2026.04.03",
+            "disable_browser_auth": "True",
             "breadcrumb_trace_enabled": "False",
             "breadcrumb_trace_retention_depth": "128",
             "config_api_redact_remote_details": "False",
@@ -265,6 +266,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual("", general.allowed_hostname)
         self.assertFalse(general.has_property("trusted_browser_bootstrap_remote_addrs"))
         self.assertEqual("2026.04.03", general.browser_handover_recovery_version)
+        self.assertTrue(general.disable_browser_auth)
         self.assertEqual(False, general.breadcrumb_trace_enabled)
         self.assertEqual(128, general.breadcrumb_trace_retention_depth)
         self.assertEqual(False, general.config_api_redact_remote_details)
@@ -280,6 +282,7 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "log_level", "-1")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "SomeString")
         self.check_bad_value_error(Config.General, good_dict, "verbose", "-1")
+        self.check_bad_value_error(Config.General, good_dict, "disable_browser_auth", "2")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "0")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "1025")
@@ -1060,6 +1063,7 @@ class TestConfig(unittest.TestCase):
             api_token = api-token-value
             allowed_hostname =
             browser_handover_recovery_version = 2026.04.03
+            disable_browser_auth = False
             breadcrumb_trace_enabled = False
             breadcrumb_trace_retention_depth = 128
             config_api_redact_remote_details = True

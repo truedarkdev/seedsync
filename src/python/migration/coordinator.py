@@ -378,6 +378,7 @@ _LEGACY_SETTINGS_KEYS: Mapping[str, frozenset[str]] = {
 _PRE_MIGRATION_RUNTIME_GENERAL_KEYS = frozenset((
     "trusted_browser_bootstrap_remote_addrs",
     "config_api_redact_remote_details",
+    "disable_browser_auth",
 ))
 
 

@@ -335,6 +335,192 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
         return response
 
+    def test_disable_browser_auth_opens_legacy_ui_scopes_without_mutating_auth_store(self):
+        self.context.config.general.disable_browser_auth = True
+
+        @self.web_app.route("/server/legacy-read", required_scope="read")
+        def _legacy_read():
+            return "read"
+
+        @self.web_app.route("/server/legacy-write", method="POST", required_scope="write")
+        def _legacy_write():
+            return "write"
+
+        @self.web_app.route("/server/legacy-admin", required_scope="admin")
+        def _legacy_admin():
+            return "admin"
+
+        cleanup_log = []
+        self.web_app.add_streaming_handler(
+            QueueStreamHandler,
+            values=["legacy-stream\n"],
+            cleanup_log=cleanup_log,
+        )
+        self.web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html>legacy-shell</html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            client = TestApp(self.web_app)
+            request_environ = {
+                "HTTP_HOST": "localhost:8800",
+                "REMOTE_ADDR": "203.0.113.10",
+            }
+            ui_session_count = len(self.auth_store._ApiKeyStore__ui_sessions)
+            handover_state = self.auth_store.get_browser_handover_state(self.context.config)
+
+            shell = client.get("/", extra_environ=request_environ)
+            read = client.get("/server/legacy-read", extra_environ=request_environ)
+            write = client.post("/server/legacy-write", extra_environ=request_environ)
+            Timer(0.1, self.web_app.stop).start()
+            stream = client.get("/server/stream", extra_environ=request_environ)
+            admin = client.get("/server/legacy-admin", extra_environ=request_environ, expect_errors=True)
+            invalid_bearer = client.get(
+                "/server/legacy-read",
+                extra_environ={**request_environ, "HTTP_AUTHORIZATION": "Bearer invalid"},
+                expect_errors=True,
+            )
+            non_bearer = client.get(
+                "/server/legacy-read",
+                extra_environ={**request_environ, "HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz"},
+                expect_errors=True,
+            )
+
+        self.assertEqual(200, shell.status_int)
+        self.assertIn("legacy-shell", shell.text)
+        self.assertEqual(200, read.status_int)
+        self.assertEqual("read", read.text)
+        self.assertEqual(200, write.status_int)
+        self.assertEqual("write", write.text)
+        self.assertEqual(200, stream.status_int)
+        self.assertIn("legacy-stream", stream.text)
+        self.assertEqual(403, admin.status_int)
+        self.assertEqual(401, invalid_bearer.status_int)
+        self.assertEqual(401, non_bearer.status_int)
+        self.assertEqual(ui_session_count, len(self.auth_store._ApiKeyStore__ui_sessions))
+        self.assertEqual(handover_state, self.auth_store.get_browser_handover_state(self.context.config))
+
+    def test_disable_browser_auth_preserves_remembered_admin_session_scope(self):
+        self.context.config.general.disable_browser_auth = True
+
+        @self.web_app.route("/server/legacy-admin", required_scope="admin")
+        def _legacy_admin():
+            return "admin"
+
+        cleanup_log = []
+        self.web_app.add_streaming_handler(
+            QueueStreamHandler,
+            required_scope="admin",
+            values=["admin-stream\n"],
+            cleanup_log=cleanup_log,
+        )
+        self.web_app.add_default_routes()
+
+        request_environ = {
+            "HTTP_HOST": "localhost:8800",
+            "REMOTE_ADDR": "203.0.113.10",
+        }
+        unauthenticated_client = TestApp(self.web_app)
+        unauthenticated_admin = unauthenticated_client.get(
+            "/server/legacy-admin",
+            extra_environ=request_environ,
+            expect_errors=True,
+        )
+        Timer(0.1, self.web_app.stop).start()
+        unauthenticated_stream = unauthenticated_client.get(
+            "/server/stream",
+            extra_environ=request_environ,
+        )
+
+        object.__setattr__(self.web_app, "_stop", False)
+        session = self.auth_store.create_browser_session_for_api_key(self.admin_key_id)
+        authenticated_client = TestApp(self.web_app)
+        authenticated_client.set_cookie(WebApp._UI_SESSION_COOKIE_NAME, session.secret)
+        authenticated_admin = authenticated_client.get(
+            "/server/legacy-admin",
+            extra_environ=self._same_origin_headers(),
+        )
+        Timer(0.1, self.web_app.stop).start()
+        authenticated_stream = authenticated_client.get(
+            "/server/stream",
+            extra_environ=self._same_origin_headers(),
+        )
+
+        self.assertEqual(403, unauthenticated_admin.status_int)
+        self.assertNotIn("admin-stream", unauthenticated_stream.text)
+        self.assertEqual(200, authenticated_admin.status_int)
+        self.assertEqual("admin", authenticated_admin.text)
+        self.assertIn("admin-stream", authenticated_stream.text)
+
+    def test_disable_browser_auth_preserves_first_admin_claim_exception(self):
+        self.context.config.general.disable_browser_auth = True
+        empty_store = ApiKeyStore()
+        web_app = WebApp(self.context, MagicMock(), auth_store=empty_store)
+        AdminHandler(self.context.config, empty_store).add_routes(web_app)
+        web_app.add_default_routes()
+        client = TestApp(web_app)
+
+        response = client.post_json(
+            "/server/admin/bootstrap/v1/first-api-key",
+            {},
+            extra_environ=self._same_origin_headers(),
+        )
+
+        self.assertEqual(201, response.status_int)
+        self.assertIn("seedsync_ui_session=", response.headers.get("Set-Cookie", ""))
+        self.assertEqual(1, empty_store.active_admin_key_count)
+
+    def test_disable_browser_auth_preserves_remember_exception_and_rejects_invalid_key(self):
+        self.context.config.general.disable_browser_auth = True
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        invalid_response = client.post_json(
+            "/server/browser/v1/remember",
+            {"secret": "invalid-secret"},
+            extra_environ=self._same_origin_headers(),
+            expect_errors=True,
+        )
+        valid_response = client.post_json(
+            "/server/browser/v1/remember",
+            {"secret": self.admin_secret},
+            extra_environ=self._same_origin_headers(),
+        )
+
+        self.assertEqual(401, invalid_response.status_int)
+        self.assertEqual(201, valid_response.status_int)
+        self.assertIn("seedsync_ui_session=", valid_response.headers.get("Set-Cookie", ""))
+
+    def test_disable_browser_auth_rejects_invalid_bootstrap_key_routes(self):
+        self.context.config.general.disable_browser_auth = True
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        response = client.post_json(
+            "/server/browser/v1/remember",
+            {"secret": "invalid-secret"},
+            extra_environ=self._same_origin_headers(),
+            expect_errors=True,
+        )
+
+        self.assertEqual(401, response.status_int)
+        self.assertEqual(0, len(self.auth_store._ApiKeyStore__ui_sessions))
+
+    def test_disable_browser_auth_keeps_migration_recovery_shell_protected(self):
+        self.context.config.general.disable_browser_auth = True
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        response = client.get(
+            "/migration/recovery",
+            extra_environ=self._same_origin_headers(),
+            expect_errors=True,
+        )
+
+        self.assertEqual(302, response.status_int)
+        self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
+
     def _issue_trusted_browser_session(
         self,
         client: TestApp,
