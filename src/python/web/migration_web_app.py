@@ -293,6 +293,8 @@ class MigrationWebApp(bottle.Bottle):
         self.hook("before_request")(self._deny_unregistered_server_routes)
         self.hook("after_request")(self._apply_security_headers)
         self.get("/")(self._redirect_to_migration)
+        self.get("/dashboard")(self._redirect_to_migration)
+        self.get("/dashboard/")(self._redirect_to_migration)
         self.get("/bootstrap")(self._normal_startup_not_ready)
         self.get("/server/migration/v1/status")(self._status)
         self.post("/server/migration/v1/apply")(self._apply)

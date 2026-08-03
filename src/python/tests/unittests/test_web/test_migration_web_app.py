@@ -158,6 +158,16 @@ class TestMigrationWebApp(unittest.TestCase):
         self.assertEqual(404, self.client.get("/assets/private.png", expect_errors=True).status_int)
         self.assertEqual(503, self.client.get("/bootstrap", expect_errors=True).status_int)
 
+    def test_dashboard_redirects_during_migration_and_migration_route_remains_available(self) -> None:
+        for path in ("/dashboard", "/dashboard/"):
+            with self.subTest(path=path):
+                redirect = self.client.get(path, status=302)
+                self.assertTrue(redirect.headers["Location"].endswith("/migration"))
+
+        migration_page = self.client.get("/migration")
+        self.assertEqual(200, migration_page.status_int)
+        self.assertIn("<app-root>", migration_page.text)
+
     def test_migration_entry_uses_index_from_configured_distribution_root(self) -> None:
         distribution_root = Path(self.temp_dir.name) / "app" / "html"
         distribution_root.mkdir(parents=True)
