@@ -51,9 +51,9 @@ export class FileListComponent implements OnInit, AfterViewInit, AfterViewChecke
     private _paginationSubscription: Subscription;
     public totalCount = 0;
     public currentPage = 0;
-    public pageSize = 50;
+    public pageSize = 0;
     public totalPages = 0;
-    public readonly PAGE_SIZES = [25, 50, 100, 1000, 0];
+    public readonly PAGE_SIZES = [25, 50, 100, 500, 1000, 0];
 
     // Natural-height rows cannot use a fixed CDK itemSize. Keep a deterministic
     // estimate until each rendered row has reported its actual height.

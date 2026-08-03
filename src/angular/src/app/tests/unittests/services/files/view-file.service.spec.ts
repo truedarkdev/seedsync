@@ -1776,6 +1776,18 @@ describe("Testing view file service", () => {
         expect(latestPageSize).toBe(0);
     }));
 
+    it("should default to All when no page size is stored", fakeAsync(() => {
+        spyOn(storageService, "get").and.returnValue(undefined);
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
+        expect(latestPageSize).toBe(0);
+    }));
+
     it("should ignore unsupported stored page sizes", fakeAsync(() => {
         spyOn(storageService, "get").and.callFake(key => {
             if (key === StorageKeys.FILES_PAGE_SIZE) {
@@ -1789,7 +1801,55 @@ describe("Testing view file service", () => {
         viewService.pageSize.subscribe(size => latestPageSize = size);
         tick();
 
+        expect(latestPageSize).toBe(0);
+    }));
+
+    it("should default to All for an invalid stored page size string", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.FILES_PAGE_SIZE) {
+                return "invalid";
+            }
+        });
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
+        expect(latestPageSize).toBe(0);
+    }));
+
+    it("should restore valid stored page sizes", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.FILES_PAGE_SIZE) {
+                return "50";
+            }
+        });
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
         expect(latestPageSize).toBe(50);
+    }));
+
+    it("should restore the 500 page size", fakeAsync(() => {
+        spyOn(storageService, "get").and.callFake(key => {
+            if (key === StorageKeys.FILES_PAGE_SIZE) {
+                return 500;
+            }
+        });
+
+        viewService = createViewService();
+
+        let latestPageSize = -1;
+        viewService.pageSize.subscribe(size => latestPageSize = size);
+        tick();
+
+        expect(latestPageSize).toBe(500);
     }));
 
     it("should save the page size to storage when it changes", () => {
@@ -1812,6 +1872,11 @@ describe("Testing view file service", () => {
         mockModelService._files.next(createModelFiles(600));
         tick();
 
+        expect(latestFiles.size).toBe(600);
+        expect(currentPage).toBe(0);
+
+        viewService.setPageSize(50);
+        tick();
         expect(latestFiles.size).toBe(50);
         expect(currentPage).toBe(0);
 
