@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from common import Config, PathPairManager, ServiceExit
 from controller import AutoQueuePersist, ControllerPersist
+from model import ModelFile
 from migration import (
     BackupRestoreError,
     MigrationBlockedError,
@@ -427,18 +428,21 @@ class TestMigrationCoordinator(unittest.TestCase):
             pairs[0].name, pairs[0].remote_path, pairs[0].local_path,
         ))
         controller = ControllerPersist.from_file(str(self.root / "controller.persist"))
-        self.assertEqual(set(fixture.downloaded), controller.downloaded_file_names)
-        self.assertEqual(set(fixture.extracted), controller.extracted_file_names)
+        expected_downloaded = {ModelFile.build_file_id(name, pairs[0].id) for name in fixture.downloaded}
+        expected_extracted = {ModelFile.build_file_id(name, pairs[0].id) for name in fixture.extracted}
+        self.assertEqual(expected_downloaded, controller.downloaded_file_names)
+        self.assertEqual(expected_extracted, controller.extracted_file_names)
         serialized_controller = json.loads((self.root / "controller.persist").read_text(encoding="utf-8"))
         self.assertEqual(
             {
                 "downloaded", "extracted", "stopped", "move_failure_counts",
-                "final_move_succeeded",
+                "final_move_succeeded", "marker_identity_migration",
             },
             set(serialized_controller),
         )
-        self.assertEqual(set(fixture.downloaded), set(serialized_controller["downloaded"]))
-        self.assertEqual(set(fixture.extracted), set(serialized_controller["extracted"]))
+        self.assertEqual(expected_downloaded, set(serialized_controller["downloaded"]))
+        self.assertEqual(expected_extracted, set(serialized_controller["extracted"]))
+        self.assertEqual(2, serialized_controller["marker_identity_migration"])
         self.assertEqual([], serialized_controller["stopped"])
         self.assertEqual({}, serialized_controller["move_failure_counts"])
         self.assertEqual([], serialized_controller["final_move_succeeded"])

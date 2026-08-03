@@ -40,7 +40,6 @@ from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
 from .controller_persist import ControllerPersist
-from .persist_keys import persist_key, strip_persist_key
 from .delete import DeleteLocalProcess, DeleteRemoteProcess
 from system import SystemFile
 
@@ -1559,29 +1558,17 @@ class Controller:
 
     @staticmethod
     def __persist_key_candidates(name: str, path_pair_id: Optional[str] = None) -> set[str]:
-        candidates = {
-            name,
-            ModelFile.build_file_id(name, path_pair_id),
-            persist_key(path_pair_id, name),
-        }
-        if path_pair_id:
-            candidates.add("{}:{}".format(path_pair_id, name))
-        return candidates
+        return {ModelFile.build_file_id(name, path_pair_id)}
 
     @staticmethod
     def __has_persist_key(keys: set[str], name: str, path_pair_id: Optional[str] = None) -> bool:
         if not keys:
             return False
-        if keys.intersection(Controller.__persist_key_candidates(name, path_pair_id)):
-            return True
-        return any(strip_persist_key(key, path_pair_id) == name for key in keys)
+        return bool(keys.intersection(Controller.__persist_key_candidates(name, path_pair_id)))
 
     @staticmethod
     def __clear_persist_key(keys: set[str], name: str, path_pair_id: Optional[str] = None) -> None:
         keys.difference_update(Controller.__persist_key_candidates(name, path_pair_id))
-        for key in list(keys):
-            if strip_persist_key(key, path_pair_id) == name:
-                keys.discard(key)
 
     def __is_previously_downloaded(self, name: str, path_pair_id: Optional[str] = None) -> bool:
         return Controller.__has_persist_key(self.__persist.downloaded_file_names, name, path_pair_id)
@@ -1916,27 +1903,6 @@ class Controller:
         self.__temp_diag_last_signature = signature
         print("TEMP_DIAG {}".format(signature), flush=True)
 
-    def __is_model_file_name_unambiguous(self, file_name: str) -> bool:
-        try:
-            file_ids = self.__model.get_file_ids()
-        except AttributeError:
-            return True
-
-        matching_file_ids = 0
-        try:
-            for file_id in file_ids:
-                try:
-                    file = self.__model.get_file(file_id)
-                except ModelError:
-                    continue
-                if file.name == file_name:
-                    matching_file_ids += 1
-                    if matching_file_ids > 1:
-                        return False
-        except TypeError:
-            return True
-        return matching_file_ids <= 1
-
     def clear_extracted_marker(self, file: ModelFile) -> None:
         with self.__persist.state_transaction():
             self.__clear_extracted_marker_in_state_transaction(file)
@@ -1945,8 +1911,6 @@ class Controller:
         stale_extracted_file_names: set[str] = set()
         if file.file_id in self.__persist.extracted_file_names:
             stale_extracted_file_names.add(file.file_id)
-        if file.name in self.__persist.extracted_file_names and self.__is_model_file_name_unambiguous(file.name):
-            stale_extracted_file_names.add(file.name)
         if not stale_extracted_file_names:
             return
 
@@ -2322,7 +2286,7 @@ class Controller:
         if self.__is_previously_downloaded(file.name, file.path_pair_id) or \
                 self.__is_explicitly_stopped(file.name, file.path_pair_id):
             return False
-        if file.file_id in self.__persist.extracted_file_names or file.name in self.__persist.extracted_file_names:
+        if file.file_id in self.__persist.extracted_file_names:
             return False
         return not self.__has_pending_delete_local_command(file.file_id)
 
@@ -2718,8 +2682,7 @@ class Controller:
                         assert file.path_pair_id is not None
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
                         local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
-                    stopped_marked = file.file_id in self.__persist.stopped_file_names or \
-                        file.name in self.__persist.stopped_file_names
+                    stopped_marked = file.file_id in self.__persist.stopped_file_names
                     self.__log_stop_resume_trace(
                         "stop",
                         file.file_id,

@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Callable, Mapping, Sequence, cast
 
-from common import Config, PathPair, PathPairManager
+from common import Config, PathPair, PathPairManager, legacy_default_path_pair_id
 from common.path_pair import is_running_in_docker
 from controller import AutoQueuePersist, ControllerPersist
 from .backup_restore import (
@@ -1265,7 +1265,7 @@ def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
     config.lftp.local_path = local_path
 
     pair = PathPair(
-        id=str(uuid.uuid5(uuid.NAMESPACE_URL, "seedsync:v086:{}\n{}".format(remote_path, local_path))),
+        id=legacy_default_path_pair_id(remote_path, local_path),
         name="Default", remote_path=remote_path, local_path=local_path, enabled=True, auto_queue=True,
     )
     pair.validate()
@@ -1277,6 +1277,10 @@ def _apply_v086(config_dir: Path, source: ValidatedBackupReader) -> None:
         }],
     }, indent=2)
     controller = ControllerPersist.from_str(source.read_text("controller.persist"))
+    # v0.8.6 creates this deterministic Default pair, making bare historical
+    # markers safe to convert immediately rather than carrying a legacy phase.
+    controller.canonicalize_file_identities(pair.id)
+    controller.canonicalize_file_identities(pair.id)
     autoqueue = AutoQueuePersist.from_str(source.read_text("autoqueue.persist"))
 
     _atomic_write(config_dir / "settings.cfg", config.to_str(), config_dir)

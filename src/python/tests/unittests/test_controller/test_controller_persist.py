@@ -3,6 +3,8 @@
 import threading
 import unittest
 import json
+import tempfile
+from pathlib import Path
 
 from common import PersistError
 from controller import ControllerPersist
@@ -228,19 +230,110 @@ class TestControllerPersist(unittest.TestCase):
             strip_persist_key("pair-id:plain-name", "pair-id")
         )
 
-    def test_from_str_migrates_legacy_colon_prefixed_keys(self):
+    def test_canonical_migration_is_two_phase_idempotent_and_covers_all_collections(self):
         legacy_key = "12345678-1234-1234-1234-123456789abc:archive.zip"
-        expected_key = "12345678-1234-1234-1234-123456789abc{}archive.zip".format(KEY_SEP)
+        default_pair_id = "default-pair"
+        expected_scoped = '["12345678-1234-1234-1234-123456789abc","archive.zip"]'
+        expected_default = '["default-pair","plain-name"]'
+        persist = ControllerPersist.from_str(json.dumps({
+            "downloaded": [legacy_key, "plain-name"],
+            "extracted": [legacy_key, "plain-name"],
+            "stopped": [legacy_key, "plain-name"],
+            "move_failure_counts": {legacy_key: 2, expected_scoped: 4, "plain-name": 1},
+            "final_move_succeeded": [legacy_key, "plain-name"],
+        }))
+
+        self.assertTrue(persist.canonicalize_file_identities(default_pair_id))
+        phase_one = json.loads(persist.to_str())
+        self.assertEqual(1, phase_one["marker_identity_migration"])
+        self.assertIn(legacy_key, persist.downloaded_file_names)
+        self.assertIn(expected_scoped, persist.downloaded_file_names)
+        self.assertIn(expected_default, persist.downloaded_file_names)
+        self.assertEqual(4, persist.move_failure_counts[expected_scoped])
+
+        restarted = ControllerPersist.from_str(json.dumps(phase_one))
+        self.assertTrue(restarted.canonicalize_file_identities(default_pair_id))
+        phase_two = json.loads(restarted.to_str())
+        self.assertEqual(2, phase_two["marker_identity_migration"])
+        for collection in ("downloaded", "extracted", "stopped", "final_move_succeeded"):
+            self.assertEqual({expected_scoped, expected_default}, set(phase_two[collection]))
+        self.assertEqual({expected_scoped: 4, expected_default: 1}, phase_two["move_failure_counts"])
+        self.assertFalse(restarted.canonicalize_file_identities(default_pair_id))
+
+    def test_canonical_migration_drops_ambiguous_bare_history_and_preserves_unknown_scopes(self):
+        unknown_pair_id = "unknown-pair"
+        scoped_key = "{}{}movie.mkv".format(unknown_pair_id, KEY_SEP)
+        persist = ControllerPersist.from_str(json.dumps({
+            "downloaded": ["bare.mkv", scoped_key],
+            "extracted": ["bare.mkv", scoped_key],
+            "stopped": ["bare.mkv", scoped_key],
+            "move_failure_counts": {"bare.mkv": 3, scoped_key: 2},
+            "final_move_succeeded": ["bare.mkv", scoped_key],
+        }))
+
+        self.assertTrue(persist.canonicalize_file_identities())
+        self.assertTrue(persist.canonicalize_file_identities())
+        expected = '["unknown-pair","movie.mkv"]'
+        self.assertEqual({expected}, persist.downloaded_file_names)
+        self.assertEqual({expected}, persist.extracted_file_names)
+        self.assertEqual({expected}, persist.stopped_file_names)
+        self.assertEqual({expected: 2}, persist.move_failure_counts)
+        self.assertEqual({expected}, persist.final_move_succeeded_file_names)
+
+    def test_canonical_migration_reloads_three_same_basename_pairs_for_all_collections(self):
+        movies_id = "movies"
+        tv_id = "tv"
+        anime_id = "12345678-1234-1234-1234-123456789abc"
+        name = "same.mkv"
+        canonical_movies = '["movies","same.mkv"]'
+        canonical_tv = '["tv","same.mkv"]'
+        canonical_anime = '["12345678-1234-1234-1234-123456789abc","same.mkv"]'
+        tv_legacy = "{}{}{}".format(tv_id, KEY_SEP, name)
+        anime_legacy = "{}:{}".format(anime_id, name)
+        payload = {
+            "downloaded": [canonical_movies, tv_legacy, anime_legacy],
+            "extracted": [anime_legacy, canonical_movies, tv_legacy],
+            "stopped": [tv_legacy, anime_legacy, canonical_movies],
+            "move_failure_counts": {canonical_tv: 1, tv_legacy: 4, anime_legacy: 2, canonical_movies: 3},
+            "final_move_succeeded": [canonical_movies, tv_legacy, anime_legacy],
+        }
+        expected_ids = {canonical_movies, canonical_tv, canonical_anime}
+        persist = ControllerPersist.from_str(json.dumps(payload))
+
+        self.assertTrue(persist.canonicalize_file_identities())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "controller.persist"
+            persist.to_file(str(path))
+            # Re-reading phase one simulates an interrupted startup after the
+            # canonical additions, before legacy cleanup.
+            reloaded = ControllerPersist.from_file(str(path))
+            self.assertTrue(reloaded.canonicalize_file_identities())
+            reloaded.to_file(str(path))
+            final = ControllerPersist.from_file(str(path))
+
+        self.assertEqual(expected_ids, final.downloaded_file_names)
+        self.assertEqual(expected_ids, final.extracted_file_names)
+        self.assertEqual(expected_ids, final.stopped_file_names)
+        self.assertEqual(expected_ids, final.final_move_succeeded_file_names)
+        self.assertEqual({canonical_movies: 3, canonical_tv: 4, canonical_anime: 2}, final.move_failure_counts)
+
+    def test_from_str_preserves_legacy_inputs_until_startup_migration(self):
+        legacy_key = "12345678-1234-1234-1234-123456789abc:archive.zip"
         persist = ControllerPersist.from_str(json.dumps({
             "downloaded": [legacy_key, "plain-name"],
             "extracted": [legacy_key],
             "stopped": [legacy_key],
         }))
-        self.assertIn(expected_key, persist.downloaded_file_names)
-        self.assertIn(expected_key, persist.extracted_file_names)
-        self.assertIn(expected_key, persist.stopped_file_names)
+        self.assertIn(legacy_key, persist.downloaded_file_names)
         self.assertIn("plain-name", persist.downloaded_file_names)
-        self.assertNotIn(legacy_key, persist.downloaded_file_names)
+
+    def test_from_str_rejects_non_integer_marker_migration_phase(self):
+        for phase in (True, 1.0, "1"):
+            with self.subTest(phase=phase):
+                with self.assertRaises(PersistError):
+                    ControllerPersist.from_str(json.dumps({
+                        "downloaded": [], "extracted": [], "marker_identity_migration": phase,
+                    }))
 
     def test_persist_read_error(self):
         # bad pattern

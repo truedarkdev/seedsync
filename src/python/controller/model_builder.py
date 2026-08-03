@@ -290,12 +290,7 @@ class ModelBuilder:
             return False
         if model_file.file_id in persisted_names:
             return True
-        # Scoped path-pair files must use their canonical identity. Falling
-        # back to the basename here would let a raw runtime marker setter
-        # reintroduce cross-pair state after the updater's initial filtering.
-        if model_file.path_pair_id is not None:
-            return False
-        return model_file.name in persisted_names
+        return False
 
     @staticmethod
     def __extract_status_key(status: ExtractStatus) -> str:

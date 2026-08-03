@@ -10,7 +10,6 @@ delegates the model refresh boundary.
 from __future__ import annotations
 
 import json
-import re
 import logging
 from types import SimpleNamespace
 from threading import Lock, RLock
@@ -28,7 +27,6 @@ from common.exclude_patterns import filter_excluded_files
 from .controller_persist import ControllerPersist
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
-from .persist_keys import KEY_SEP
 from .scan import ScannerProcess
 from .validate import ValidateProcess
 
@@ -125,12 +123,6 @@ class _ControllerCoreAccess:
     ) -> None: ...
 
 
-_LEGACY_PAIR_ID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-
-
 class ModelUpdater(_ControllerCoreAccess):
     """Runs the per-tick model update loop for a controller instance."""
 
@@ -157,10 +149,7 @@ class ModelUpdater(_ControllerCoreAccess):
         max_move_failures = getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4)
         path_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
         controller._Controller__model_builder.set_downloaded_files(
-            self._filter_keys_for_model_builder(
-                controller._Controller__persist.downloaded_file_names,
-                path_pair_ids,
-            )
+            self._filter_keys_for_model_builder(controller._Controller__persist.downloaded_file_names, path_pair_ids)
         )
         controller._Controller__model_builder.set_extracted_files(
             self._filter_keys_for_model_builder(
@@ -175,73 +164,29 @@ class ModelUpdater(_ControllerCoreAccess):
             )
         )
         if hasattr(persist, "move_failure_counts"):
+            canonical_move_failure_ids = self._filter_keys_for_model_builder(
+                set(move_failure_counts), path_pair_ids
+            )
             controller._Controller__model_builder.set_move_failed_files(
                 {
                     file_id for file_id, count in move_failure_counts.items()
-                    if count >= max_move_failures
+                    if file_id in canonical_move_failure_ids and count >= max_move_failures
                 }
             )
         if hasattr(persist, "final_move_succeeded_file_names"):
             controller._Controller__model_builder.set_final_move_succeeded_files(
-                persist.final_move_succeeded_file_names
+                self._filter_keys_for_model_builder(persist.final_move_succeeded_file_names, path_pair_ids)
             )
 
     @staticmethod
     def _filter_keys_for_model_builder(keys: set[str], path_pair_ids: set[str]) -> set[str]:
-        if not path_pair_ids:
-            return set(keys)
-
-        filtered: set[str] = set()
-        for key in keys:
-            # A bare legacy name is ambiguous once path pairs are active:
-            # ModelBuilder also matches persisted markers by ``file.name``.
-            # Defer these markers until the path-pair canonicalization lane
-            # can prove their identity rather than applying them to every
-            # same-named pair.
-            if KEY_SEP not in key and not any(
-                ModelUpdater._is_legacy_pair_scoped_colon_key(key, path_pair_id)
-                for path_pair_id in path_pair_ids
-            ):
-                try:
-                    parsed = json.loads(key)
-                except (TypeError, ValueError):
-                    parsed = None
-                if not (
-                    isinstance(parsed, list)
-                    and len(parsed) == 2
-                    and isinstance(parsed[0], str)
-                    and isinstance(parsed[1], str)
-                    and key == ModelFile.build_file_id(parsed[1], parsed[0])
-                ):
-                    continue
-            normalized_key = key
-            for path_pair_id in path_pair_ids:
-                prefix = f"{path_pair_id}{KEY_SEP}"
-                if key.startswith(prefix):
-                    normalized_key = ModelFile.build_file_id(key[len(prefix) :], path_pair_id)
-                    break
-                if ModelUpdater._is_legacy_pair_scoped_colon_key(key, path_pair_id):
-                    normalized_key = ModelFile.build_file_id(key[len(path_pair_id) + 1 :], path_pair_id)
-                    break
-            filtered.add(normalized_key)
-        return filtered
+        return {
+            key for key in keys
+            if ModelUpdater._normalize_scoped_persist_key(key, path_pair_ids) == key
+        }
 
     @staticmethod
-    def _is_legacy_pair_scoped_colon_key(key: str, path_pair_id: str) -> bool:
-        if _LEGACY_PAIR_ID_RE.match(path_pair_id) is None:
-            return False
-        return key.startswith(f"{path_pair_id}:")
-
-    @staticmethod
-    def _normalize_scoped_persist_key(key: str, path_pair_ids: set[str]) -> str | None:
-        """Map an exact persisted identity to the canonical model id.
-
-        Persisted keys currently use ``persist_key``'s unit-separator form;
-        UUID-like path pairs may also have the historical ``pair:name`` form.
-        Canonical JSON model ids are accepted as already-normalized. Bare
-        names intentionally return ``None`` and remain deferred to the
-        path-pair canonicalization task.
-        """
+    def _canonical_scoped_persist_key(key: str) -> str | None:
         if not isinstance(key, str):
             return None
         try:
@@ -251,30 +196,23 @@ class ModelUpdater(_ControllerCoreAccess):
         if (
             isinstance(parsed, list)
             and len(parsed) == 2
-            and (parsed[0] is None or isinstance(parsed[0], str))
+            and isinstance(parsed[0], str)
             and isinstance(parsed[1], str)
             and key == ModelFile.build_file_id(parsed[1], parsed[0])
         ):
-            parsed_pair_id = parsed[0]
-            # The default/root identity remains authoritative only when no
-            # path-pair scope is active. Scoped JSON identities must belong to
-            # the current enabled set; unknown/disabled pairs are deferred.
-            if parsed_pair_id is None:
-                return key if not path_pair_ids else None
-            return key if parsed_pair_id in path_pair_ids else None
+            return key
 
-        if KEY_SEP in key:
-            path_pair_id, name = key.split(KEY_SEP, 1)
-            if path_pair_id in path_pair_ids:
-                return ModelFile.build_file_id(name, path_pair_id)
+        return None
 
-        # A colon is only treated as a scope delimiter for the historical
-        # UUID-shaped pair id; arbitrary pair names and filenames may contain
-        # colons.
-        if ":" in key:
-            path_pair_id, name = key.split(":", 1)
-            if path_pair_id in path_pair_ids and _LEGACY_PAIR_ID_RE.match(path_pair_id):
-                return ModelFile.build_file_id(name, path_pair_id)
+    @classmethod
+    def _normalize_scoped_persist_key(cls, key: str, path_pair_ids: set[str]) -> str | None:
+        """Accept canonical active model identities at runtime, and nothing else."""
+        canonical = cls._canonical_scoped_persist_key(key)
+        if canonical is not None:
+            parsed_pair_id = json.loads(canonical)[0]
+            return canonical if parsed_pair_id in path_pair_ids else None
+        if not path_pair_ids and key == ModelFile.build_file_id(key, None):
+            return key
         return None
 
     @classmethod
@@ -293,13 +231,19 @@ class ModelUpdater(_ControllerCoreAccess):
                 if normalized_marker not in active_model_ids and normalized_marker not in pending_ids:
                     stale.add(marker)
                 continue
-            if marker in active_model_ids or marker in active_model_names or marker in pending_ids:
+            canonical_marker = cls._canonical_scoped_persist_key(marker)
+            if canonical_marker is not None:
+                path_pair_id = json.loads(canonical_marker)[0]
+                # Disabled/removed pairs are retained as canonical history so
+                # re-enabling the same pair restores only its own state.
+                if path_pair_id not in path_pair_ids:
+                    continue
+                if canonical_marker not in active_model_ids and canonical_marker not in pending_ids:
+                    stale.add(marker)
                 continue
-            if not path_pair_ids:
-                # With only the legacy/default root, a bare name is safe to
-                # prune. Once path pairs exist, defer ambiguous names to the
-                # canonicalization task rather than cross-applying a marker.
-                stale.add(marker)
+            # Legacy KEY_SEP/UUID-colon/bare forms cannot be matched after the
+            # persistence boundary, even when their basename appears live.
+            stale.add(marker)
         return stale
 
     def _handle_lftp_completion_detection(
@@ -557,7 +501,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 if isinstance(raw_recovered_ids, (list, tuple, set)):
                     recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
                     recovered_extracted_file_ids = [
-                        file_id for file_id in recovered_items if isinstance(file_id, str)
+                        file_id for file_id in recovered_items
+                        if isinstance(file_id, str)
+                        and self._normalize_scoped_persist_key(
+                            file_id,
+                            set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys()),
+                        ) == file_id
                     ]
                 persist.extracted_file_names.update(recovered_extracted_file_ids)
             controller._Controller__record_breadcrumb(
@@ -637,10 +586,13 @@ class ModelUpdater(_ControllerCoreAccess):
                 if not _is_known_extract_result_pair(result, "completion"):
                     continue
                 known_extracted_results.append(result)
-                extracted_file_ids = {result.name}
-                if result.file_id is not None:
-                    extracted_file_ids.add(result.file_id)
-                persist.extracted_file_names.update(extracted_file_ids)
+                extracted_file_id = result.file_id
+                if (
+                    extracted_file_id is None
+                    or ControllerPersist._canonical_file_id(extracted_file_id, None) != extracted_file_id
+                ):
+                    extracted_file_id = ModelFile.build_file_id(result.name, result.path_pair_id)
+                persist.extracted_file_names.add(extracted_file_id)
                 extracted_result_summaries.append({
                     "name": result.name,
                     "file_id": result.file_id,
@@ -689,7 +641,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     event_type="failure",
                     corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),
                 )
-        model_builder.set_stopped_files(persist.stopped_file_names)
+        model_builder.set_stopped_files(
+            self._filter_keys_for_model_builder(
+                persist.stopped_file_names,
+                set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys()),
+            )
+        )
 
         retry_now = datetime.now()
         if any(
@@ -1046,16 +1003,6 @@ class ModelUpdater(_ControllerCoreAccess):
                             file = model.get_file(extracted_file_name)
                             if file.state == ModelFile.State.DELETED:
                                 remove_extracted_file_names.add(extracted_file_name)
-                        elif extracted_file_name in model.get_file_names():
-                            try:
-                                file = model.get_file(extracted_file_name)
-                            except ModelError:
-                                continue
-                            if file.state == ModelFile.State.DELETED:
-                                remove_extracted_file_names.add(extracted_file_name)
-                        else:
-                            # Not in the model at all. This could be because local and remote scans are not yet available.
-                            pass
                 if remove_extracted_file_names:
                     controller.logger.info("Removing from extracted list: {}".format(remove_extracted_file_names))
                     persist.extracted_file_names.difference_update(remove_extracted_file_names)
