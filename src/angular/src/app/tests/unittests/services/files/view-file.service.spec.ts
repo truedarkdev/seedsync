@@ -120,6 +120,16 @@ describe("Testing view file service", () => {
         expect(count).toBe(1);
     }));
 
+    it("should log a view-model count without materializing the immutable collection", fakeAsync(() => {
+        const toJS = spyOn(Immutable.List.prototype, "toJS").and.callThrough();
+        const model = createModelFiles(2);
+
+        mockModelService._files.next(model);
+        tick();
+
+        expect(toJS).not.toHaveBeenCalled();
+    }));
+
     it("should correctly populate ViewFile props from a ModelFile", fakeAsync(() => {
         let model = Immutable.Map<string, ModelFile>();
         model = model.set("a", new ModelFile({
