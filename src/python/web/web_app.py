@@ -82,6 +82,7 @@ class WebApp(bottle.Bottle):
     Web app implementation
     """
     _AUTH_SCOPES = {"read", "write", "stream", "admin"}
+    _LEGACY_UNAUTHENTICATED_SCOPES = {"read", "write", "stream"}
     _STREAM_POLL_INTERVAL_IN_MS = 100
     _STREAM_EVENT_YIELD_INTERVAL_IN_MS = 10
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
@@ -325,6 +326,10 @@ class WebApp(bottle.Bottle):
             return ""
         return self.__auth_store.effective_browser_handover_version(self.__config)
 
+    def __is_browser_auth_disabled(self) -> bool:
+        general_config = getattr(self.__config, "general", None)
+        return getattr(general_config, "disable_browser_auth", False) is True
+
     def __is_browser_handover_open(self) -> bool:
         if self.__auth_store is None:
             return False
@@ -369,6 +374,10 @@ class WebApp(bottle.Bottle):
         auth_header = bottle.request.get_header("Authorization", "")
         auth_header = auth_header.strip()
         return auth_header == "Bearer" or auth_header.startswith("Bearer ")
+
+    @staticmethod
+    def __has_authorization_header() -> bool:
+        return bool(bottle.request.get_header("Authorization", "").strip())
 
     @staticmethod
     def __request_host() -> str:
@@ -612,7 +621,37 @@ class WebApp(bottle.Bottle):
     ) -> None:
         token = WebApp.__extract_bearer_token()
         if token is None:
-            if not WebApp.__has_bearer_authorization_header():
+            has_authorization_header = (
+                WebApp.__has_authorization_header()
+                if self.__is_browser_auth_disabled()
+                else WebApp.__has_bearer_authorization_header()
+            )
+            if not has_authorization_header:
+                if self.__is_browser_auth_disabled():
+                    if allow_bootstrap_proof_exchange and self.__allow_bootstrap_proof_exchange():
+                        return
+                    if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
+                        return
+                    if allow_browser_api_key_entry and self.__allow_browser_api_key_entry():
+                        return
+                    ui_session_scopes = self.__get_ui_session_scopes()
+                    if ui_session_scopes is not None:
+                        if required_scope in {"write", "admin"} and not self.__is_same_origin_browser_request():
+                            bottle.abort(403, "Browser-origin signal required for cookie-authenticated write requests")
+                        self.__authorize_scopes(required_scope, ui_session_scopes)
+                        return
+                    if (
+                        allow_first_admin_bootstrap
+                        or allow_bootstrap_proof_exchange
+                        or allow_browser_api_key_entry
+                    ):
+                        bottle.abort(401, "Missing API token")
+                    self.__authorize_scopes(
+                        required_scope,
+                        self._LEGACY_UNAUTHENTICATED_SCOPES,
+                        forbidden_message="Browser authentication is disabled for this scope",
+                    )
+                    return
                 if allow_bootstrap_proof_exchange and self.__allow_bootstrap_proof_exchange():
                     return
                 if allow_first_admin_bootstrap and self.__allow_first_admin_bootstrap():
@@ -670,6 +709,15 @@ class WebApp(bottle.Bottle):
         return None
 
     def __request_auth_scopes(self) -> set[str]:
+        if self.__is_browser_auth_disabled() and not WebApp.__has_authorization_header():
+            session_scopes = self.__get_ui_session_scopes()
+            if session_scopes is not None:
+                scopes = set(session_scopes)
+                if "admin" in scopes:
+                    scopes.update(self._AUTH_SCOPES)
+                return scopes
+            return set(self._LEGACY_UNAUTHENTICATED_SCOPES)
+
         token = WebApp.__extract_bearer_token()
         if token is not None and self.__auth_store is not None:
             auth_record = self.__auth_store.find_api_key_by_secret(token)
@@ -1156,7 +1204,10 @@ class WebApp(bottle.Bottle):
             primary_action_payload=primary_action_payload,
         )
 
-    def __authorize_browser_bootstrap(self) -> None:
+    def __authorize_browser_bootstrap(self, *, allow_disabled: bool = True) -> None:
+        if allow_disabled and self.__is_browser_auth_disabled():
+            return
+
         if self.__auth_store is None:
             return
 
@@ -1178,7 +1229,7 @@ class WebApp(bottle.Bottle):
         Serves the index.html static file
         :return:
         """
-        if self.__auth_store is not None:
+        if self.__auth_store is not None and not self.__is_browser_auth_disabled():
             self.__authorize_browser_bootstrap()
             current_session = self.__get_ui_session()
             if current_session is None:
@@ -1200,7 +1251,7 @@ class WebApp(bottle.Bottle):
         return self.__index()
 
     def __migration_recovery_index(self) -> bottle.HTTPResponse:
-        self.__authorize_browser_bootstrap()
+        self.__authorize_browser_bootstrap(allow_disabled=False)
         session_scopes = self.__get_ui_session_scopes()
         if session_scopes is None:
             bottle.redirect("/bootstrap")

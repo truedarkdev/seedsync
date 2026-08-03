@@ -11,9 +11,21 @@ SETTINGS_FILE="${CONFIG_DIR}/settings.cfg"
 SCRIPT_PATH="/app/python/seedsync.py"
 DEFAULT_LOCAL_PATH="/downloads/"
 DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION="${SEEDSYNC_BROWSER_HANDOVER_RECOVERY_VERSION:-}"
+DEFAULT_DISABLE_BROWSER_AUTH="${SEEDSYNC_DISABLE_BROWSER_AUTH-0}"
 DOWNLOADS_DIR=/downloads
 MOUNTS_DIR=/mounts
 USER_HOME="$APP_HOME_DIR"
+
+validate_disable_browser_auth() {
+    case "${DEFAULT_DISABLE_BROWSER_AUTH}" in
+        0|1)
+            ;;
+        *)
+            echo "ERROR: SEEDSYNC_DISABLE_BROWSER_AUTH must be 0 or 1" >&2
+            exit 1
+            ;;
+    esac
+}
 
 bootstrap_default_config() {
     if [ ! -f "${SETTINGS_FILE}" ]; then
@@ -50,6 +62,8 @@ bootstrap_default_config() {
             replace_browser_handover_recovery_version
         fi
     fi
+
+    replace_disable_browser_auth
 }
 
 generate_default_config() {
@@ -66,6 +80,25 @@ replace_local_path() {
 
 replace_browser_handover_recovery_version() {
     sed -i -E "s|^[[:space:]]*browser_handover_recovery_version[[:space:]]*=.*$|browser_handover_recovery_version = ${DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION}|" "${SETTINGS_FILE}"
+}
+
+replace_disable_browser_auth() {
+    local value="False"
+    if [ "${DEFAULT_DISABLE_BROWSER_AUTH}" = "1" ]; then
+        value="True"
+    fi
+    if grep -Eq '^[[:space:]]*disable_browser_auth[[:space:]]*=' "${SETTINGS_FILE}"; then
+        sed -i -E "s|^[[:space:]]*disable_browser_auth[[:space:]]*=.*$|disable_browser_auth = ${value}|" "${SETTINGS_FILE}"
+        return
+    fi
+    local general_line
+    general_line="$(grep -n '^\[General\][[:space:]]*$' "${SETTINGS_FILE}" | head -n 1 | cut -d: -f1)"
+    if [ -n "${general_line}" ]; then
+        local insert_line=$((general_line + 1))
+        sed -i "${insert_line}i disable_browser_auth = ${value}" "${SETTINGS_FILE}"
+    else
+        printf '[General]\ndisable_browser_auth = %s\n' "${value}" >> "${SETTINGS_FILE}"
+    fi
 }
 
 append_local_path_to_lftp_section() {
@@ -148,7 +181,9 @@ configure_legacy_nss_identity() {
     echo "Configured runtime identity for legacy Docker --user UID=$USER_ID GID=$GROUP_ID" >&2
 }
 
-export CONFIG_DIR SETTINGS_FILE SCRIPT_PATH DEFAULT_LOCAL_PATH DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION
+export CONFIG_DIR SETTINGS_FILE SCRIPT_PATH DEFAULT_LOCAL_PATH DEFAULT_BROWSER_HANDOVER_RECOVERY_VERSION DEFAULT_DISABLE_BROWSER_AUTH
+
+validate_disable_browser_auth
 
 if [ "${1:-}" = "--bootstrap-default-config" ]; then
     bootstrap_default_config
@@ -703,7 +738,7 @@ export HOME="$USER_HOME"
 export TMPDIR="$RUNTIME_TMP_DIR"
 echo "Running as: $USER_NAME:$GROUP_NAME (UID=$USER_ID, GID=$GROUP_ID, HOME=$HOME, TMPDIR=$TMPDIR)" >&2
 
-export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_local_path
+export -f append_local_path_to_lftp_section bootstrap_default_config generate_default_config replace_browser_handover_recovery_version replace_disable_browser_auth replace_local_path
 
 # Keep bootstrap and command/argument forwarding in the existing non-root
 # shell, but make tini the resulting PID 1 so it forwards signals and reaps

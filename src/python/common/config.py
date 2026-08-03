@@ -468,6 +468,9 @@ class Config(Persist):
         browser_handover_recovery_version = PROP("browser_handover_recovery_version",
                                                  Checkers.null,
                                                  Converters.null)
+        disable_browser_auth = PROP("disable_browser_auth",
+                                    Checkers.bool_value,
+                                    Converters.bool)
         breadcrumb_trace_enabled = PROP("breadcrumb_trace_enabled",
                                         Checkers.bool_value,
                                         Converters.bool)
@@ -486,6 +489,7 @@ class Config(Persist):
             self.api_token = None
             self.allowed_hostname = None
             self.browser_handover_recovery_version = None
+            self.disable_browser_auth = False
             self.breadcrumb_trace_enabled = False
             self.breadcrumb_trace_retention_depth = 128
             self.config_api_redact_remote_details = True
@@ -510,6 +514,9 @@ class Config(Persist):
             if "browser_handover_recovery_version" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["browser_handover_recovery_version"] = ""
+            if "disable_browser_auth" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["disable_browser_auth"] = False
             if "log_level" not in config_dict:
                 config_dict = dict(config_dict)
                 if "debug" in config_dict:
