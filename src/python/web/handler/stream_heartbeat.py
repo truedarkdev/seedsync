@@ -8,7 +8,9 @@ from ..web_app import IStreamHandler
 
 
 class HeartbeatStreamHandler(IStreamHandler):
-    _HEARTBEAT_INTERVAL_IN_MS = 15000
+    # A short, standards-safe SSE comment lets the server notice idle client
+    # disconnects and frees their bounded stream slot promptly.
+    _HEARTBEAT_INTERVAL_IN_MS = 5000
 
     def __init__(self):
         self.__next_heartbeat_at = None
