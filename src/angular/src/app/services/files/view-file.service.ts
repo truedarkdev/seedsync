@@ -237,7 +237,7 @@ export class ViewFileService {
         this._files = newViewFiles;
         this.pushViewFiles();
         this._prevModelFiles = modelFiles;
-        this._logger.debug("New view model: %O", this._files.toJS());
+        this._logger.debug("New view model", {fileCount: this._files.size});
     }
 
     get files(): Observable<Immutable.List<ViewFile>> {
