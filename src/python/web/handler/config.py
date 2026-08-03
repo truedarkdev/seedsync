@@ -50,6 +50,9 @@ class ConfigHandler(IHandler):
             "allow_private_networks",
             "download_start", "download_complete", "extraction_complete", "delete_complete",
         },
+        "lftp": {
+            "use_legacy_lftp_password_argv",
+        },
     }
     def __init__(
         self,

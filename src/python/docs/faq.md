@@ -28,6 +28,21 @@ Use hard links with a dedicated completion directory, then see the [Recommended 
 
 ## Security
 
+### Can I restore the legacy lftp password command-line behavior?
+
+SeedSync normally gives lftp the remote password only through its interactive
+password-prompt flow. This keeps it out of the lftp process arguments and environment.
+
+If a legacy lftp build cannot use that prompt flow, add this temporary config-file-only
+option under `[Lftp]`, then restart SeedSync:
+
+    use_legacy_lftp_password_argv = true
+
+This compatibility rollback exposes the remote password to other users or processes
+that can inspect local process arguments. It is deliberately unavailable in the web
+settings/API; remove the option (or set it back to `false`) once the compatibility
+issue is resolved.
+
 ### Does SeedSync collect any data?
 
 SeedSync does not collect remote telemetry by default.

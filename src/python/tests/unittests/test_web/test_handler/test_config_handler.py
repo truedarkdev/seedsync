@@ -281,6 +281,20 @@ class TestConfigHandlerSet(unittest.TestCase):
         )
         inner.set_property.assert_not_called()
 
+    def test_set_lftp_legacy_password_argv_via_body_is_forbidden(self):
+        self.config.has_section.return_value = True
+        inner = MagicMock()
+        inner.has_property.return_value = True
+        self.config.lftp = inner
+
+        response = self.handler._ConfigHandler__handle_set_config(
+            "lftp", "use_legacy_lftp_password_argv", True
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertIn("cannot be set via request body", response.body)
+        inner.set_property.assert_not_called()
+
     def test_generic_config_route_cannot_update_notification_settings(self):
         self.config.has_section.return_value = True
         inner = MagicMock()
@@ -520,6 +534,30 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual("**REDACTED**", out_dict["lftp"]["remote_password"])
         self.assertEqual("**REDACTED**", out_dict["general"]["api_token"])
 
+    def test_legacy_lftp_password_argv_option_is_file_only_in_config_api(self):
+        config = self._new_config()
+        config.lftp.use_legacy_lftp_password_argv = True
+        config.to_file()
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_get_route(
+            self.web_app, "/server/config/get", api_token=self.admin_api_token,
+        )
+        out_dict = json.loads(body)
+        self.assertEqual(200, status_code)
+        self.assertNotIn("use_legacy_lftp_password_argv", out_dict["lftp"])
+        self.assertNotIn("use_legacy_lftp_password_argv", out_dict["restart_required"]["lftp"])
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/lftp/use_legacy_lftp_password_argv",
+            {"value": False},
+            api_token=self.admin_api_token,
+        )
+        self.assertEqual(403, status_code)
+        self.assertTrue(config.lftp.use_legacy_lftp_password_argv)
+        self.assertIn("cannot be set via request body", body)
+
     def test_set_route_blocks_redaction_toggle_from_body(self):
         config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)
@@ -622,6 +660,24 @@ class TestConfigHandlerRoutes(unittest.TestCase):
         self.assertEqual(400, status_code)
         self.assertEqual("existing-password", config.lftp.remote_password)
         self.assertIn("Bad config: Lftp.remote_password is empty", body)
+
+    def test_set_route_rejects_control_character_remote_password_from_body(self):
+        for bad_password in ("line\nbreak", "carriage\rreturn", "tab\tvalue", "null\x00value", "delete\x7fvalue", "escape\x1bvalue"):
+            with self.subTest(bad_password=repr(bad_password)):
+                config = self._new_config()
+                config.lftp.remote_password = "existing-password"
+                ConfigHandler(config).add_routes(self.web_app)
+
+                status_code, body = _invoke_post_json_route(
+                    self.web_app,
+                    "/server/config/set/lftp/remote_password",
+                    {"value": bad_password},
+                    api_token=self.admin_api_token,
+                )
+
+                self.assertEqual(400, status_code)
+                self.assertEqual("existing-password", config.lftp.remote_password)
+                self.assertIn("contains control characters", body)
 
     def test_set_route_treats_literal_empty_sentinel_as_value(self):
         config = self._new_config()

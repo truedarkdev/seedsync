@@ -73,6 +73,10 @@ class Lftp:
     __SET_SSL_VERIFY_CERTIFICATE = "ssl:verify-certificate"
     __SET_FTP_SSL_AUTH = "ftp:ssl-auth"
     __SET_FTP_PASSIVE_MODE = "ftp:passive-mode"
+    __SET_CMD_SAVE_HISTORY = "cmd:save-rl-history"
+    __SET_CMD_SAVE_CWD = "cmd:save-cwd-history"
+    __INITIAL_PROMPT_PATTERN = r"lftp.*>[ \t]*"
+    __PASSWORD_RESPONSE_PATTERN = r"(?im)^(?:password:|\S+@\S+'s password:)[ \t]*\Z"
 
     @staticmethod
     def __has_valid_umask() -> bool:
@@ -97,6 +101,21 @@ class Lftp:
         escaped = value.replace("\\", "\\\\").replace("\"", "\\\"")
         return "\"{}\"".format(escaped)
 
+    @staticmethod
+    def __validate_password(password: Optional[str]) -> None:
+        if password is not None and any(ord(character) < 32 or ord(character) == 127 for character in password):
+            raise LftpError("LFTP password cannot contain control characters")
+
+    @staticmethod
+    def __endpoint_prompt_pattern(user: str, address: str) -> str:
+        return r"lftp {}@{}:.*>[ \t]*".format(re.escape(user), re.escape(address))
+
+    def __password_prompt_pattern(self, open_command: str) -> str:
+        return (
+            r"(?i)\A[ \t]*{}\r\n(?:(?:\x1b\[\?2004[hl])+\r)?"
+            r"(?:password:|\S+@\S+'s password:)[ \t]*\Z"
+        ).format(re.escape(open_command))
+
     def __init__(self,
                  address: str,
                  port: int,
@@ -104,7 +123,9 @@ class Lftp:
                  password: Optional[str],
                  protocol: str = "sftp",
                  remote_ftp_port: Optional[int] = None,
-                 ssl_verify_certificate: bool = False):
+                 ssl_verify_certificate: bool = False,
+                 use_legacy_lftp_password_argv: bool = False):
+        Lftp.__validate_password(password)
         self.__user = user
         self.__password = password
         self.__address = address
@@ -114,10 +135,11 @@ class Lftp:
         self.__scheme = "ftp" if self.__protocol == "ftps" else "sftp"
         self.__transfer_port = remote_ftp_port if self.__protocol == "ftps" and remote_ftp_port is not None else port
         self.__ssl_verify_certificate = ssl_verify_certificate
+        self.__use_legacy_lftp_password_argv = use_legacy_lftp_password_argv
         self.__base_remote_dir_path = ""
         self.__base_local_dir_path = ""
         self.logger = logging.getLogger("Lftp")
-        self.__expect_pattern = "lftp {}@{}:.*>".format(self.__user, self.__address)
+        self.__expect_pattern = Lftp.__endpoint_prompt_pattern(self.__user, self.__address)
         self.__job_status_parser = LftpJobStatusParser()
         self.__timeout = 30  # in seconds
         self.__consecutive_status_errors = 0
@@ -129,21 +151,122 @@ class Lftp:
         self.__log_command_output = False
         self.__pending_error = None
 
-        args = [
-            "-p", str(self.__transfer_port),
-            "-u", "{},{}".format(self.__user, self.__password if self.__password else ""),
-            "{}://{}".format(self.__scheme, self.__address)
-        ]
         spawn_env = os.environ.copy()
         spawn_env["COLUMNS"] = "10000"
+        # Do not allow an ambient lftp variable to become a second credential channel.
+        spawn_env.pop("LFTP_PASSWORD", None)
+        args: list[str] = []
+        password_in_argv = bool(self.__password) and self.__use_legacy_lftp_password_argv
+        if password_in_argv:
+            self.logger.warning(
+                "Using legacy lftp password argv mode; the remote password is visible to same-host "
+                "process inspection. Disable Lftp.use_legacy_lftp_password_argv after compatibility testing."
+            )
+            args = [
+                "-p", str(self.__transfer_port),
+                "-u", "{},{}".format(self.__user, self.__password if self.__password else ""),
+                "{}://{}".format(self.__scheme, self.__address)
+            ]
+        if not self.__password:
+            # Key/no-password auth must let lftp connect with its normal non-secret
+            # user argv; `open --user` otherwise prompts for a password on lftp 4.9.
+            args = [
+                "-p", str(self.__transfer_port),
+                "-u", "{},".format(self.__user),
+                "{}://{}".format(self.__scheme, self.__address),
+            ]
         self.__process = pexpect.spawn("/usr/bin/lftp", args, env=spawn_env, dimensions=(24, 10000))  # type: ignore[arg-type]
         try:
-            self.__process.expect(self.__expect_pattern)
+            if password_in_argv or not self.__password:
+                try:
+                    self.__process.expect(self.__expect_pattern)
+                except pexpect.exceptions.TIMEOUT:
+                    out = self.__decode_spawn_output(self.__process.before).strip()
+                    if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "startup"):
+                        raise
+                self.__setup()
+                self.__password = None
+            else:
+                self.__process.expect(Lftp.__INITIAL_PROMPT_PATTERN)
+                self.__expect_pattern = Lftp.__INITIAL_PROMPT_PATTERN
+                self.__setup()
+                self.__connect_with_native_password_prompt()
+        except Exception:
+            self.__cleanup_failed_initialization()
+            raise
+
+    def __cleanup_failed_initialization(self) -> None:
+        self.__password = None
+        try:
+            if self.__process.isalive():
+                self.__process.close(force=True)
+        except (OSError, pexpect.exceptions.ExceptionPexpect):
+            self.logger.warning("Unable to close lftp process after initialization failure")
+
+    def __connect_with_native_password_prompt(self):
+        """Open after protocol safeguards are set, answering a native password prompt without echo."""
+        open_command = "open -p {} --user {} {}".format(
+            self.__transfer_port,
+            Lftp.__quote_command_argument(self.__user),
+            Lftp.__quote_command_argument("{}://{}".format(self.__scheme, self.__address)),
+        )
+        self.__process.sendline(open_command)
+        self.__expect_pattern = Lftp.__endpoint_prompt_pattern(self.__user, self.__address)
+        try:
+            match = self.__process.expect(
+                [self.__password_prompt_pattern(open_command), self.__expect_pattern], timeout=self.__timeout
+            )
         except pexpect.exceptions.TIMEOUT:
-            out = self.__decode_spawn_output(self.__process.before).strip()
-            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "startup"):
-                raise
-        self.__setup()
+            out = self.__redact_password(self.__decode_spawn_output(self.__process.before).strip())
+            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "opening connection"):
+                raise LftpError("Lftp process did not connect: {}".format(out))
+            raise AssertionError("unreachable")
+        except pexpect.exceptions.EOF:
+            out = self.__redact_password(self.__decode_spawn_output(self.__process.before).strip())
+            raise LftpError("Lftp process terminated while opening connection: {}".format(out))
+
+        if match != 0:
+            self.__password = None
+            return
+        if not self.__password:
+            raise LftpError("Lftp requested a password but none is configured")
+
+        password = self.__password
+        try:
+            # The password is a prompt response, never an lftp command. Disable PTY echo
+            # first so it cannot enter pexpect output, readline history, or verbose logs.
+            self.__process.setecho(False)
+            self.__process.sendline(password)
+            match = self.__process.expect(
+                [Lftp.__PASSWORD_RESPONSE_PATTERN, self.__expect_pattern], timeout=self.__timeout
+            )
+            if match == 0:
+                raise LftpError("Lftp rejected the password")
+        except pexpect.exceptions.TIMEOUT:
+            out = self.__redact_password(self.__decode_spawn_output(self.__process.before).strip())
+            if not self.__raise_lftp_error_for_ssh_host_key_prompt(out, "submitting password"):
+                raise LftpError("Lftp process did not accept password: {}".format(out))
+            raise AssertionError("unreachable")
+        except pexpect.exceptions.EOF:
+            out = self.__redact_password(self.__decode_spawn_output(self.__process.before).strip())
+            raise LftpError("Lftp process terminated while submitting password: {}".format(out))
+        finally:
+            self.__password = None
+            try:
+                self.__process.setecho(True)
+            except (OSError, pexpect.exceptions.ExceptionPexpect):
+                try:
+                    if self.__process.isalive():
+                        self.__process.close(force=True)
+                except (OSError, pexpect.exceptions.ExceptionPexpect):
+                    pass
+                raise LftpError("Unable to restore lftp PTY echo after password prompt")
+
+    def __redact_password(self, value: str) -> str:
+        redacted = redact_credentials(value)
+        if self.__password:
+            return redacted.replace(self.__password, "**REDACTED**")
+        return redacted
 
     def set_verbose_logging(self, verbose: bool):
         self.__log_command_output = verbose
@@ -155,6 +278,10 @@ class Lftp:
         """
         # Set to kill on exit to prevent a zombie process
         self.__set(Lftp.__SET_COMMAND_AT_EXIT, "\"kill all\"")
+        # A prompt response is not a command, but disable lftp persistence before opening
+        # the connection so no interactive state is written while credentials are in use.
+        self.__set(Lftp.__SET_CMD_SAVE_HISTORY, "false")
+        self.__set(Lftp.__SET_CMD_SAVE_CWD, "false")
         if self.__protocol == "ftps":
             self.__setup_ftps()
         else:

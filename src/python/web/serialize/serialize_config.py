@@ -11,6 +11,7 @@ from ..config_restart import requires_restart
 _SENSITIVE_FIELDS = Config.SENSITIVE_FIELDS
 
 _REMOTE_DETAIL_FIELDS = ("remote_address", "remote_username", "remote_path", "remote_python_path")
+_CONFIG_FILE_ONLY_FIELDS = {"lftp": frozenset(("use_legacy_lftp_password_argv",))}
 
 _REDACTED = Config.REDACTED_SENTINEL
 
@@ -33,6 +34,11 @@ class SerializeConfig:
         config_dict_lowercase: collections.OrderedDict[str, dict[str, object]] = collections.OrderedDict()
         for key in keys:
             config_dict_lowercase[key.lower()] = config_dict[key]
+
+        for section, fields in _CONFIG_FILE_ONLY_FIELDS.items():
+            if section in config_dict_lowercase:
+                for field in fields:
+                    config_dict_lowercase[section].pop(field, None)
 
         for section, fields in _SENSITIVE_FIELDS.items():
             if section in config_dict_lowercase:

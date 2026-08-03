@@ -24,4 +24,5 @@ def create_transfer_backend(config: Any, transfer_password: Any, ssh_password: A
         protocol=config.protocol,
         remote_ftp_port=config.remote_ftp_port,
         ssl_verify_certificate=config.ftp_ssl_verify_certificate,
+        use_legacy_lftp_password_argv=getattr(config, "use_legacy_lftp_password_argv", False),
     )
