@@ -19,7 +19,7 @@ class MockViewFileService {
     private _filteredFiles = new BehaviorSubject(Immutable.List<ViewFile>());
     private _totalFilteredCount = new BehaviorSubject(0);
     private _currentPage = new BehaviorSubject(0);
-    private _pageSize = new BehaviorSubject(50);
+    private _pageSize = new BehaviorSubject(0);
     queue = jasmine.createSpy("queue").and.returnValue(of(new WebReaction(true, "ok", null)));
     stop = jasmine.createSpy("stop").and.returnValue(
         of(new WebReaction(false, null, "Operation timed out"))
@@ -241,10 +241,15 @@ describe("Testing file list component", () => {
     });
 
     it("should expose all page size choices including All", () => {
-        expect(component.PAGE_SIZES).toEqual([25, 50, 100, 1000, 0]);
+        expect(component.PAGE_SIZES).toEqual([25, 50, 100, 500, 1000, 0]);
     });
 
     it("should forward the selected page size and treat All as zero", () => {
+        component.onPageSizeChange("500");
+
+        expect(mockViewFileService.setPageSize).toHaveBeenCalledWith(500);
+        expect(component.pageSize).toBe(500);
+
         component.onPageSizeChange("1000");
 
         expect(mockViewFileService.setPageSize).toHaveBeenCalledWith(1000);

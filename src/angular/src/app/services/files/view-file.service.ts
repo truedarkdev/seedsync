@@ -83,7 +83,7 @@ export const VIEW_FILE_COALESCE_MS = new InjectionToken<number>("VIEW_FILE_COALE
  */
 @Injectable()
 export class ViewFileService {
-    private static readonly PAGE_SIZES = new Set<number>([25, 50, 100, 1000, 0]);
+    private static readonly PAGE_SIZES = new Set<number>([25, 50, 100, 500, 1000, 0]);
 
     private readonly USE_MOCK_MODEL = false;
 
@@ -93,7 +93,7 @@ export class ViewFileService {
     private _filesSubject: BehaviorSubject<Immutable.List<ViewFile>> = new BehaviorSubject(this._files);
     private _filteredFilesSubject: BehaviorSubject<Immutable.List<ViewFile>> = new BehaviorSubject(this._files);
     private _indices: Map<string, number> = new Map<string, number>();
-    private _pageSize = 50;
+    private _pageSize = 0;
     private _currentPage = 0;
     private _totalFilteredCountSubject: BehaviorSubject<number> = new BehaviorSubject(0);
     private _pageSizeSubject: BehaviorSubject<number> = new BehaviorSubject(this._pageSize);
