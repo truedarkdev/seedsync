@@ -100,6 +100,16 @@ class TestInnerConfig(unittest.TestCase):
 
 
 class TestConfig(unittest.TestCase):
+    def test_lftp_legacy_password_argv_defaults_false_and_backfills(self):
+        defaults = Config.Lftp()
+        legacy_dict = defaults.as_dict()
+        del legacy_dict["use_legacy_lftp_password_argv"]
+
+        loaded = Config.Lftp.from_dict(legacy_dict)
+
+        self.assertFalse(defaults.use_legacy_lftp_password_argv)
+        self.assertFalse(loaded.use_legacy_lftp_password_argv)
+
     def __check_unknown_error(self, cls, good_dict):
         """
         Helper method to check that a config class raises an error on
@@ -467,6 +477,9 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "num_max_total_connections", "33")
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_password", "   ")
+        for bad_password in ("line\nbreak", "carriage\rreturn", "tab\tvalue", "null\x00value", "delete\x7fvalue", "escape\x1bvalue"):
+            with self.subTest(bad_password=repr(bad_password)):
+                self.check_bad_value_error(Config.Lftp, good_dict, "remote_password", bad_password)
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "-1")
         self.check_bad_value_error(Config.Lftp, good_dict, "use_temp_file", "SomeString")
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_address", "remote.server.com\nhost = injected")
@@ -475,6 +488,14 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.Lftp, good_dict, "protocol", "ftp")
         self.check_bad_value_error(Config.Lftp, good_dict, "remote_ftp_port", "0")
         self.check_bad_value_error(Config.Lftp, good_dict, "ftp_ssl_verify_certificate", "SomeString")
+
+    def test_lftp_password_allows_ordinary_punctuation_and_unicode(self):
+        lftp = Config.Lftp()
+        password = 'spaces, punctuation: "quotes" and unicode ü'
+
+        lftp.remote_password = password
+
+        self.assertEqual(password, lftp.remote_password)
 
     def test_validate(self):
         good_dict = {
@@ -1066,6 +1087,7 @@ class TestConfig(unittest.TestCase):
             protocol = sftp
             remote_ftp_port = 21
             ftp_ssl_verify_certificate = True
+            use_legacy_lftp_password_argv = False
 
             [Validate]
             xfer_verify = True

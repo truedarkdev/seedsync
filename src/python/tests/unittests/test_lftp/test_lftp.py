@@ -1771,12 +1771,14 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual(
             [
                 call('set cmd:at-exit "kill all"'),
+                call("set cmd:save-rl-history false"),
+                call("set cmd:save-cwd-history false"),
                 call("set sftp:auto-confirm 1"),
                 call("set pget:save-status 2"),
             ],
             process.sendline.call_args_list
         )
-        self.assertEqual(4, process.expect.call_count)
+        self.assertEqual(6, process.expect.call_count)
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_preserves_env_while_forcing_wide_columns(self, spawn):
@@ -1809,13 +1811,15 @@ class TestLftpPromptClassification(unittest.TestCase):
         self.assertEqual(
             [
                 call('set cmd:at-exit "kill all"'),
+                call("set cmd:save-rl-history false"),
+                call("set cmd:save-cwd-history false"),
                 call("set sftp:auto-confirm 1"),
                 call("set sftp:set-permissions false"),
                 call("set pget:save-status 2"),
             ],
             process.sendline.call_args_list
         )
-        self.assertEqual(5, process.expect.call_count)
+        self.assertEqual(7, process.expect.call_count)
 
     @patch("lftp.lftp.pexpect.spawn", create=True)
     def test_init_skips_permissions_override_when_umask_is_invalid_or_whitespace(self, spawn):
@@ -1832,13 +1836,15 @@ class TestLftpPromptClassification(unittest.TestCase):
                 self.assertEqual(
                     [
                         call('set cmd:at-exit "kill all"'),
+                        call("set cmd:save-rl-history false"),
+                        call("set cmd:save-cwd-history false"),
                         call("set sftp:auto-confirm 1"),
                         call("set pget:save-status 2"),
                     ],
                     process.sendline.call_args_list
                 )
                 self.assertNotIn(call("set sftp:set-permissions false"), process.sendline.call_args_list)
-                self.assertEqual(4, process.expect.call_count)
+                self.assertEqual(6, process.expect.call_count)
 
     def test_set_skips_prompt_readiness_probe(self):
         lftp = Lftp.__new__(Lftp)

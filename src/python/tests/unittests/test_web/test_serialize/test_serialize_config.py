@@ -57,6 +57,15 @@ class TestSerializeConfig(unittest.TestCase):
         self.assertEqual(True, out_dict["restart_required"]["autoqueue"]["enabled"])
         self.assertEqual(True, out_dict["restart_required"]["logging"]["log_format"])
 
+    def test_lftp_legacy_password_argv_flag_is_not_exposed_in_config_api_or_restart_metadata(self):
+        config = Config()
+        config.lftp.use_legacy_lftp_password_argv = True
+
+        out_dict = json.loads(SerializeConfig.config(config))
+
+        self.assertNotIn("use_legacy_lftp_password_argv", out_dict["lftp"])
+        self.assertNotIn("use_legacy_lftp_password_argv", out_dict["restart_required"]["lftp"])
+
     def test_section_general(self):
         config = Config()
         config.general.log_level = "DEBUG"

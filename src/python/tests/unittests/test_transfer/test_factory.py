@@ -19,6 +19,7 @@ class TestTransferFactory(unittest.TestCase):
             protocol="sftp",
             remote_ftp_port=21,
             ftp_ssl_verify_certificate=True,
+            use_legacy_lftp_password_argv=False,
         )
         for key, value in overrides.items():
             setattr(config, key, value)
@@ -38,6 +39,7 @@ class TestTransferFactory(unittest.TestCase):
             protocol="sftp",
             remote_ftp_port=21,
             ssl_verify_certificate=True,
+            use_legacy_lftp_password_argv=False,
         )
 
     @patch("transfer.factory.Lftp")
@@ -54,7 +56,16 @@ class TestTransferFactory(unittest.TestCase):
             protocol="ftps",
             remote_ftp_port=2121,
             ssl_verify_certificate=True,
+            use_legacy_lftp_password_argv=False,
         )
+
+    @patch("transfer.factory.Lftp")
+    def test_create_transfer_backend_propagates_file_only_legacy_password_argv_flag(self, mock_lftp):
+        config = self._make_config(use_legacy_lftp_password_argv=True)
+
+        create_transfer_backend(config, "password", "password")
+
+        self.assertTrue(mock_lftp.call_args.kwargs["use_legacy_lftp_password_argv"])
 
     @patch("transfer.factory.RcloneTransferBackend")
     def test_create_transfer_backend_uses_rclone_backend_when_selected(self, mock_rclone_backend):

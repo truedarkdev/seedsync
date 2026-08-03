@@ -221,6 +221,14 @@ class Checkers:
         return value
 
     @staticmethod
+    def string_allow_empty_no_control_chars(config_cls: Any, name: str, value: str) -> str:
+        return _reject_control_characters(
+            config_cls,
+            name,
+            Checkers.string_allow_empty(config_cls, name, value)
+        )
+
+    @staticmethod
     def notification_provider(config_cls: Any, name: str, value: object) -> str:
         if not isinstance(value, str) or value.strip().lower() not in {"webhook", "apprise"}:
             raise ConfigError("Bad config: {}.{} must be webhook or apprise".format(
@@ -544,7 +552,7 @@ class Config(Persist):
         transfer_backend = PROP("transfer_backend", Checkers.transfer_backend, Converters.transfer_backend)
         remote_address = PROP("remote_address", Checkers.string_nonempty_no_control_chars, Converters.null)
         remote_username = PROP("remote_username", Checkers.string_nonempty_no_control_chars, Converters.null)
-        remote_password = PROP("remote_password", Checkers.string_allow_empty, Converters.null)
+        remote_password = PROP("remote_password", Checkers.string_allow_empty_no_control_chars, Converters.null)
         remote_port = PROP("remote_port", Checkers.int_positive, Converters.int)
         remote_path = PROP("remote_path", Checkers.string_nonempty, Converters.null)
         local_path = PROP("local_path", Checkers.string_nonempty, Converters.null)
@@ -571,6 +579,7 @@ class Config(Persist):
         protocol = PROP("protocol", Checkers.transfer_protocol, Converters.transfer_protocol)
         remote_ftp_port = PROP("remote_ftp_port", Checkers.int_positive, Converters.int)
         ftp_ssl_verify_certificate = PROP("ftp_ssl_verify_certificate", Checkers.bool_value, Converters.bool)
+        use_legacy_lftp_password_argv = PROP("use_legacy_lftp_password_argv", Checkers.bool_value, Converters.bool)
 
         def __init__(self):
             super().__init__()
@@ -596,6 +605,7 @@ class Config(Persist):
             self.protocol = "sftp"
             self.remote_ftp_port = 21
             self.ftp_ssl_verify_certificate = True
+            self.use_legacy_lftp_password_argv = False
 
         @classmethod
         def from_dict(cls: Type[T], config_dict: InnerConfigType) -> T:
@@ -616,6 +626,8 @@ class Config(Persist):
                 config_dict["remote_ftp_port"] = 21
             if "ftp_ssl_verify_certificate" not in config_dict:
                 config_dict["ftp_ssl_verify_certificate"] = True
+            if "use_legacy_lftp_password_argv" not in config_dict:
+                config_dict["use_legacy_lftp_password_argv"] = False
             config_dict["transfer_backend"] = _normalize_transfer_backend(config_dict.get("transfer_backend"))
             if config_dict["transfer_backend"] == "rclone":
                 config_dict["protocol"] = "sftp"
