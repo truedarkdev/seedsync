@@ -139,6 +139,7 @@ describe("Testing view file service", () => {
             local_modified_timestamp: new Date(1541828418943),
             remote_created_timestamp: null,
             remote_modified_timestamp: new Date(1541828418943),
+            downloaded_timestamp: new Date(1541828418000),
         }));
         mockModelService._files.next(model);
         tick();
@@ -165,6 +166,7 @@ describe("Testing view file service", () => {
                 expect(file.localModifiedTimestamp).toEqual(new Date(1541828418943));
                 expect(file.remoteCreatedTimestamp).toBeNull();
                 expect(file.remoteModifiedTimestamp).toEqual(new Date(1541828418943));
+                expect(file.downloadedTimestamp).toEqual(new Date(1541828418000));
                 count++;
             }
         });

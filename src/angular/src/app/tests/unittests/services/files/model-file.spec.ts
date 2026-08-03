@@ -96,6 +96,20 @@ describe("Testing model file initialization", () => {
         expect(baseModelFile.remote_modified_timestamp).toBeNull();
     });
 
+    it("should parse nullable downloaded timestamps and reject malformed values", () => {
+        baseJson.downloaded_timestamp = "1541828418.0";
+        baseModelFile = ModelFile.fromJson(baseJson);
+        expect(baseModelFile.downloaded_timestamp).toEqual(new Date(1541828418000));
+
+        baseJson.downloaded_timestamp = "not-a-time";
+        baseModelFile = ModelFile.fromJson(baseJson);
+        expect(baseModelFile.downloaded_timestamp).toBeNull();
+
+        delete baseJson.downloaded_timestamp;
+        baseModelFile = ModelFile.fromJson(baseJson);
+        expect(baseModelFile.downloaded_timestamp).toBeNull();
+    });
+
     it("should initialize null sizes correctly", () => {
         baseJson.local_size = null;
         baseJson.remote_size = null;

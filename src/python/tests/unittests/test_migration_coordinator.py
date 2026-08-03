@@ -428,6 +428,7 @@ class TestMigrationCoordinator(unittest.TestCase):
             pairs[0].name, pairs[0].remote_path, pairs[0].local_path,
         ))
         controller = ControllerPersist.from_file(str(self.root / "controller.persist"))
+        self.assertEqual({}, controller.downloaded_timestamps)
         expected_downloaded = {ModelFile.build_file_id(name, pairs[0].id) for name in fixture.downloaded}
         expected_extracted = {ModelFile.build_file_id(name, pairs[0].id) for name in fixture.extracted}
         self.assertEqual(expected_downloaded, controller.downloaded_file_names)

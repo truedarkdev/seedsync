@@ -67,6 +67,7 @@ class SerializeModel(Serialize):
     __KEY_FILE_LOCAL_MODIFIED_TIMESTAMP = "local_modified_timestamp"
     __KEY_FILE_REMOTE_CREATED_TIMESTAMP = "remote_created_timestamp"
     __KEY_FILE_REMOTE_MODIFIED_TIMESTAMP = "remote_modified_timestamp"
+    __KEY_FILE_DOWNLOADED_TIMESTAMP = "downloaded_timestamp"
     __KEY_FILE_FULL_PATH = "full_path"
     __KEY_FILE_ID = "file_id"
     __KEY_FILE_PATH_PAIR_ID = "path_pair_id"
@@ -103,6 +104,8 @@ class SerializeModel(Serialize):
             str(model_file.remote_created_timestamp.timestamp()) if model_file.remote_created_timestamp else None
         json_dict[SerializeModel.__KEY_FILE_REMOTE_MODIFIED_TIMESTAMP] = \
             str(model_file.remote_modified_timestamp.timestamp()) if model_file.remote_modified_timestamp else None
+        json_dict[SerializeModel.__KEY_FILE_DOWNLOADED_TIMESTAMP] = \
+            str(model_file.downloaded_timestamp.timestamp()) if model_file.downloaded_timestamp else None
         json_dict[SerializeModel.__KEY_FILE_FULL_PATH] = model_file.full_path
         json_dict[SerializeModel.__KEY_FILE_ID] = model_file.file_id
         json_dict[SerializeModel.__KEY_FILE_PATH_PAIR_ID] = model_file.path_pair_id

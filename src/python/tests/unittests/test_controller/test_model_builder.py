@@ -108,11 +108,13 @@ class TestModelBuilder(unittest.TestCase):
         local_file = SystemFile("archive.zip", 24, False)
         self.model_builder.set_local_files([local_file])
         self.model_builder.set_downloaded_files({"archive.zip"})
+        self.model_builder.set_downloaded_timestamps({"archive.zip": 1760000123.0})
         self.model_builder.set_extracted_files({"archive.zip"})
 
         model = self.model_builder.build_model()
         file = model.get_file("archive.zip")
         self.assertEqual(ModelFile.State.EXTRACTED, file.state)
+        self.assertEqual(1760000123.0, file.downloaded_timestamp.timestamp())
         self.assertFalse(file.remote_present)
         self.assertTrue(file.local_present)
         self.assertFalse(file.remote_has_transferable_content)
@@ -170,6 +172,34 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(ModelFile.State.MOVE_FAILED, model.get_file(movies_id).state)
         self.assertEqual(ModelFile.State.EXTRACTED, model.get_file(tv_id).state)
+
+    def test_downloaded_timestamps_are_exactly_path_pair_scoped(self):
+        files = []
+        timestamps = {}
+        for index, pair_id in enumerate(("movies", "tv", "anime"), start=1):
+            file = SystemFile("same.mkv", 100, False)
+            file.path_pair_id = pair_id
+            files.append(file)
+            timestamps[ModelFile.build_file_id("same.mkv", pair_id)] = 1760000000.0 + index * 100
+
+        self.model_builder.set_local_files(files)
+        self.model_builder.set_downloaded_files(set(timestamps))
+        self.model_builder.set_downloaded_timestamps(timestamps)
+        model = self.model_builder.build_model()
+
+        for index, pair_id in enumerate(("movies", "tv", "anime"), start=1):
+            file = model.get_file(ModelFile.build_file_id("same.mkv", pair_id))
+            self.assertEqual(1760000000.0 + index * 100, file.downloaded_timestamp.timestamp())
+
+    def test_unrepresentable_downloaded_timestamp_is_treated_as_unknown(self):
+        local = SystemFile("huge.mkv", 100, False)
+        self.model_builder.set_local_files([local])
+        self.model_builder.set_downloaded_files({"huge.mkv"})
+        self.model_builder.set_downloaded_timestamps({"huge.mkv": 1e20})
+
+        file = self.model_builder.build_model().get_file("huge.mkv")
+
+        self.assertIsNone(file.downloaded_timestamp)
 
     def test_bare_markers_are_deferred_for_duplicate_path_pair_names(self):
         movies = SystemFile("same.mkv", 100, False)

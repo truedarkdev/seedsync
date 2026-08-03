@@ -719,6 +719,7 @@ class Controller:
         self.__active_scan_process = active_scan_process
         self.__local_scan_process = local_scan_process
         self.__remote_scan_process = remote_scan_process
+        self.__sync_persist_to_model_builder_if_ready()
 
     def __build_lftp_path_pairs(self,
                                 path_pairs_by_id: Dict[str, PathPair],
@@ -940,6 +941,7 @@ class Controller:
         self.__active_scan_process = active_scan_process
         self.__local_scan_process = local_scan_process
         self.__remote_scan_process = remote_scan_process
+        self.__sync_persist_to_model_builder_if_ready()
         self.__record_breadcrumb(
             stage="path_pair_runtime",
             message="path_pair_runtime_refreshed",
@@ -950,6 +952,12 @@ class Controller:
             event_type="state_transition",
             corr_id="path_pair_runtime",
         )
+
+    def __sync_persist_to_model_builder_if_ready(self) -> None:
+        """Refresh marker/timestamp overlays after runtime pair identity changes."""
+        updater = getattr(self, "_Controller__updater", None)
+        if updater is not None:
+            updater.sync_persist_to_all_builders()
 
     def __apply_path_pair_refresh(self):
         # A path-pair refresh starts a new scan generation. Any prior scan
@@ -1293,6 +1301,19 @@ class Controller:
             entry = self.__download_start_state.get(file_id)
             if entry is not None and entry.state in ("notified", "suppressed"):
                 self.__download_start_state.pop(file_id, None)
+
+    @staticmethod
+    def _download_completion_clock() -> datetime:
+        """Single clock source for persisted completion timestamps."""
+        return datetime.now()
+
+    def _record_download_completion(self, file: ModelFile) -> None:
+        """Record a proven completion using the canonical path-pair identity."""
+        timestamp = self._download_completion_clock().timestamp()
+        if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
+            self.__persist.downloaded_timestamps = {}
+        self.__persist.downloaded_timestamps[file.file_id] = timestamp
+        self.__model_builder.set_downloaded_timestamps(self.__persist.downloaded_timestamps)
 
     def __reset_download_start_after_local_delete(
         self, file_id: str, path_pair_id: Optional[str]
@@ -2943,6 +2964,7 @@ class Controller:
                         self.__persist.move_failure_counts.pop(file.file_id, None)
                         self.__deferred_move_file_ids.discard(file.file_id)
                         self.__move_retry_due.pop(file.file_id, None)
+                        self._record_download_completion(file)
                         self.__persist.downloaded_file_names.add(file.file_id)
                         if result == Controller.MoveFromStagingResult.COMPLETED:
                             self.__persist.final_move_succeeded_file_names.add(file.file_id)
@@ -3303,6 +3325,12 @@ class Controller:
                             if command_process.command.action == Controller.Command.Action.DELETE_REMOTE:
                                 self._clear_download_start_lifecycle(command_process.file_id)
                                 event_file = command_process.event_file
+                                if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
+                                    self.__persist.downloaded_timestamps = {}
+                                self.__persist.downloaded_timestamps.pop(command_process.file_id, None)
+                                self.__model_builder.set_downloaded_timestamps(
+                                    self.__persist.downloaded_timestamps
+                                )
                                 if event_file is not None:
                                     Controller.__clear_persist_key(
                                         self.__persist.downloaded_file_names,

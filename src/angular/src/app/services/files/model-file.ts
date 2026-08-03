@@ -26,6 +26,7 @@ interface IModelFile {
     local_modified_timestamp: Date;
     remote_created_timestamp: Date;
     remote_modified_timestamp: Date;
+    downloaded_timestamp: Date;
     children: Set<ModelFile>;
     validation_progress: number;
     validation_error: string;
@@ -57,6 +58,7 @@ const DefaultModelFile: IModelFile = {
     local_modified_timestamp: null,
     remote_created_timestamp: null,
     remote_modified_timestamp: null,
+    downloaded_timestamp: null,
     children: null,
     validation_progress: null,
     validation_error: null,
@@ -94,6 +96,7 @@ export class ModelFile extends ModelFileRecord implements IModelFile {
     local_modified_timestamp: Date;
     remote_created_timestamp: Date;
     remote_modified_timestamp: Date;
+    downloaded_timestamp: Date;
     children: Set<ModelFile>;
     validation_progress: number;
     validation_error: string;
@@ -144,6 +147,12 @@ export module ModelFile {
         }
         if (json.remote_modified_timestamp != null) {
             json.remote_modified_timestamp = new Date(1000 * +json.remote_modified_timestamp);
+        }
+        if (json.downloaded_timestamp != null) {
+            const timestamp = Number(json.downloaded_timestamp);
+            json.downloaded_timestamp = Number.isFinite(timestamp) && timestamp >= 0
+                ? new Date(1000 * timestamp)
+                : null;
         }
 
         return new ModelFile(json);

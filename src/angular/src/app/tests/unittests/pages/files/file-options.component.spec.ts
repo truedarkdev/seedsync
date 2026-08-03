@@ -195,6 +195,14 @@ describe("Testing file options component", () => {
         expect(setPinFilterSpy).toHaveBeenCalledWith(false);
     });
 
+    it("should render downloaded timestamp sort options", () => {
+        const sortItems = Array.from(
+            fixture.nativeElement.querySelectorAll("#sort-status .dropdown-menu .dropdown-item")
+        ) as HTMLButtonElement[];
+        expect(sortItems.some(item => (item.textContent || "").includes("Downloaded Newest"))).toBe(true);
+        expect(sortItems.some(item => (item.textContent || "").includes("Downloaded Oldest"))).toBe(true);
+    });
+
     it("should ignore disabled status filter selections", () => {
         const setSelectedStatusFilterSpy = spyOn(viewFileOptionsService, "setSelectedStatusFilter");
 

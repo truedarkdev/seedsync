@@ -536,6 +536,39 @@ describe("Testing view file sort service", () => {
         )).toBeGreaterThan(0);
     }));
 
+    it("sorts downloaded timestamps newest-first with unknowns last and canonical ties", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.DOWNLOADED_NEWEST
+        }));
+        tick();
+
+        const newest = new ViewFile({name: "same.mkv", fileId: '["new","same.mkv"]', downloadedTimestamp: new Date(3000)});
+        const oldest = new ViewFile({name: "same.mkv", fileId: '["old","same.mkv"]', downloadedTimestamp: new Date(1000)});
+        const unknown = new ViewFile({name: "same.mkv", fileId: '["unknown","same.mkv"]'});
+        expect(sortComparator(newest, oldest)).toBeLessThan(0);
+        expect(sortComparator(oldest, unknown)).toBeLessThan(0);
+        expect(sortComparator(unknown, oldest)).toBeGreaterThan(0);
+        expect(sortComparator(oldest, newest)).toBeGreaterThan(0);
+        expect(sortComparator(
+            new ViewFile({name: "same.mkv", fileId: '["b","same.mkv"]'}),
+            new ViewFile({name: "same.mkv", fileId: '["a","same.mkv"]'})
+        )).toBeGreaterThan(0);
+    }));
+
+    it("sorts downloaded timestamps oldest-first while keeping unknowns last", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            sortMethod: ViewFileOptions.SortMethod.DOWNLOADED_OLDEST
+        }));
+        tick();
+
+        const oldest = new ViewFile({name: "old", downloadedTimestamp: new Date(1000)});
+        const newest = new ViewFile({name: "new", downloadedTimestamp: new Date(3000)});
+        const unknown = new ViewFile({name: "unknown"});
+        expect(sortComparator(oldest, newest)).toBeLessThan(0);
+        expect(sortComparator(newest, unknown)).toBeLessThan(0);
+        expect(sortComparator(unknown, oldest)).toBeGreaterThan(0);
+    }));
+
     it("puts move failed first in smart status without disturbing ordinary ties", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS

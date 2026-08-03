@@ -27,6 +27,16 @@ class TestSerializeModel(unittest.TestCase):
 
         self.assertEqual("downloaded", data[0]["state"])
         self.assertIs(True, data[0]["final_move_succeeded"])
+
+    def test_downloaded_timestamp_serializes_as_epoch_string_or_null(self):
+        first = ModelFile("first.mkv", False)
+        second = ModelFile("second.mkv", False)
+        second.downloaded_timestamp = datetime(2018, 11, 9, 21, 40, 18, tzinfo=timezone.utc)
+
+        data = json.loads(parse_stream(SerializeModel().model([first, second]))["data"])
+
+        self.assertIsNone(data[0]["downloaded_timestamp"])
+        self.assertEqual("1541799618.0", data[1]["downloaded_timestamp"])
     def test_event_names(self):
         serialize = SerializeModel()
         out = parse_stream(serialize.model([]))

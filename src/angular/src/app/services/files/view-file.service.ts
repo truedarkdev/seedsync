@@ -647,6 +647,7 @@ export class ViewFileService {
             localModifiedTimestamp: modelFile.local_modified_timestamp,
             remoteCreatedTimestamp: modelFile.remote_created_timestamp,
             remoteModifiedTimestamp: modelFile.remote_modified_timestamp,
+            downloadedTimestamp: modelFile.downloaded_timestamp,
             validationProgress: modelFile.validation_progress,
             validationError: modelFile.validation_error,
             corruptChunks: modelFile.corrupt_chunks

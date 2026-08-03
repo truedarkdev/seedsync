@@ -2,6 +2,7 @@
 
 import os
 import logging
+from datetime import datetime
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -66,6 +67,7 @@ class ModelBuilder:
         self.__recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot] = {}
         self.__downloaded_files: Optional[set[str]] = None
+        self.__downloaded_timestamps: dict[str, float] = {}
         self.__extract_statuses: dict[str, ExtractStatus] = {}
         self.__extracted_files: set[str] = set()
         self.__stopped_files: set[str] = set()
@@ -1095,6 +1097,12 @@ class ModelBuilder:
         if self.__downloaded_files != prev_downloaded_files:
             self.__cached_model = None
 
+    def set_downloaded_timestamps(self, downloaded_timestamps: Dict[str, float]) -> None:
+        previous = self.__downloaded_timestamps
+        self.__downloaded_timestamps = dict(downloaded_timestamps)
+        if self.__downloaded_timestamps != previous:
+            self.__cached_model = None
+
     def set_extract_statuses(self, extract_statuses: List[ExtractStatus]) -> None:
         prev_extract_statuses = self.__extract_statuses
         self.__extract_statuses = {
@@ -1146,6 +1154,7 @@ class ModelBuilder:
         self.__recent_live_transfer_snapshots.clear()
         self.__retained_stopped_transfer_snapshots.clear()
         self.__downloaded_files = None
+        self.__downloaded_timestamps.clear()
         self.__extract_statuses.clear()
         self.__extracted_files.clear()
         self.__stopped_files.clear()
@@ -1671,6 +1680,16 @@ class ModelBuilder:
 
         # set the timestamps
         self.__update_timestamps(model_file, remote, local)
+        downloaded_timestamp = self.__downloaded_timestamps.get(model_file.file_id)
+        if downloaded_timestamp is not None:
+            try:
+                model_file.downloaded_timestamp = datetime.fromtimestamp(downloaded_timestamp)
+            except (OverflowError, OSError, ValueError):
+                # Persisted values are schema-validated as finite/nonnegative,
+                # but platform datetime ranges are narrower than float epochs.
+                # Treat an unrepresentable value as unknown rather than
+                # breaking model refresh.
+                model_file.downloaded_timestamp = None
 
     @staticmethod
     def __update_transferred_size(
