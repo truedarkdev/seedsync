@@ -23,5 +23,6 @@ from .path_pair import (
     PathPairConflictError as PathPairConflictError,
     PathPairError as PathPairError,
     PathPairManager as PathPairManager,
+    legacy_default_path_pair_id as legacy_default_path_pair_id,
 )
 from .remote_path_utils import escape_remote_path_for_shell as escape_remote_path_for_shell

@@ -1418,6 +1418,12 @@ class TestController(unittest.TestCase):
         self.assertEqual("pair-1", message_to_corr_ids["local_scan_result"])
         self.assertEqual("pair-1", message_to_corr_ids["extract_completed"])
         self.assertEqual("extract:aggregate", message_to_corr_ids["extract_status_result"])
+        self.assertIn(
+            ModelFile.build_file_id("archive.zip", "pair-1"),
+            self.controller._Controller__persist.extracted_file_names,
+        )
+        self.assertNotIn("archive.zip", self.controller._Controller__persist.extracted_file_names)
+        self.assertNotIn("managed-one", self.controller._Controller__persist.extracted_file_names)
 
     def test_update_model_records_extract_failed_breadcrumb_without_marking_extracted(self):
         failed_results = [
@@ -2496,7 +2502,7 @@ class TestController(unittest.TestCase):
         self.assertEqual({"existing"}, self.controller._Controller__persist.final_move_succeeded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
-    def test_update_model_defers_ambiguous_legacy_markers_with_multiple_pairs(self, _):
+    def test_update_model_prunes_ambiguous_and_stale_markers_with_multiple_pairs(self, _):
         self.controller._Controller__path_pairs_by_id = {"movies": MagicMock(), "tv": MagicMock()}
         self.controller._Controller__persist.downloaded_file_names = {
             "same.mkv",
@@ -2525,15 +2531,12 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
-        self.assertIn("same.mkv", self.controller._Controller__persist.downloaded_file_names)
-        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.downloaded_file_names)
-        self.assertIn("same.mkv", self.controller._Controller__persist.extracted_file_names)
-        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.extracted_file_names)
-        self.assertIn("same.mkv", self.controller._Controller__persist.final_move_succeeded_file_names)
-        self.assertNotIn(ModelFile.build_file_id("same.mkv", "tv"), self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
+        self.assertEqual(set(), self.controller._Controller__persist.final_move_succeeded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
-    def test_update_model_normalizes_scoped_persist_keys_for_safe_pruning(self, _):
+    def test_update_model_prunes_preboundary_scoped_persist_keys(self, _):
         uuid_pair = "12345678-1234-1234-1234-123456789abc"
         self.controller._Controller__path_pairs_by_id = {"movies": MagicMock(), uuid_pair: MagicMock()}
         active_movie_id = ModelFile.build_file_id("active.mkv", "movies")
@@ -2565,22 +2568,18 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
 
-        expected = {
-            persist_key("movies", "active.mkv"),
-            f"{uuid_pair}:active.mkv",
-            pending_key,
-        }
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
-            self.assertEqual(expected, getattr(self.controller._Controller__persist, attr))
+            self.assertEqual(set(), getattr(self.controller._Controller__persist, attr))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
-    def test_update_model_preserves_unknown_scoped_markers_across_healthy_scans(self, _):
+    def test_update_model_preserves_disabled_canonical_markers_and_prunes_preboundary_forms(self, _):
         self.controller._Controller__path_pairs_by_id = {"movies": MagicMock()}
         stale_movie_key = persist_key("movies", "stale.mkv")
         unknown_pair = "87654321-4321-4321-4321-abcdefabcdef"
+        unknown_canonical = ModelFile.build_file_id("orphan-json.mkv", unknown_pair)
         unknown_markers = {
             persist_key("disabled", "orphan.mkv"),
-            ModelFile.build_file_id("orphan-json.mkv", unknown_pair),
+            unknown_canonical,
             f"{unknown_pair}:orphan-legacy.mkv",
         }
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
@@ -2598,13 +2597,15 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__update_model()
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
-            self.assertEqual(unknown_markers, getattr(self.controller._Controller__persist, attr))
+            self.assertEqual({unknown_canonical}, getattr(self.controller._Controller__persist, attr))
 
-        # A subsequent healthy generation must continue deferring markers
-        # whose pair is disabled/unknown rather than pruning them.
+        # Re-enabling the pair restores only its own retained canonical state.
+        self.controller._Controller__path_pairs_by_id[unknown_pair] = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = {unknown_canonical}
+        self.controller._Controller__model.get_file_names.return_value = {"orphan-json.mkv"}
         self.controller._Controller__update_model()
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
-            self.assertEqual(unknown_markers, getattr(self.controller._Controller__persist, attr))
+            self.assertEqual({unknown_canonical}, getattr(self.controller._Controller__persist, attr))
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_path_pair_refresh_invalidates_reconciliation_authority_until_healthy_scans(self, _):
@@ -2734,7 +2735,7 @@ class TestController(unittest.TestCase):
         added_file.state = ModelFile.State.DOWNLOADED
 
         self.controller._Controller__persist.downloaded_file_names = set()
-        self.controller._Controller__persist.extracted_file_names = {"archive.zip"}
+        self.controller._Controller__persist.extracted_file_names = {added_file.file_id}
         self.controller._Controller__model = Model()
         self.controller._Controller__model.set_base_logger(self.controller.logger)
         self.controller._Controller__model_builder.has_changes.return_value = True
@@ -3935,7 +3936,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
         self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
 
-    def test_process_commands_queue_clears_legacy_stopped_name_identity(self):
+    def test_process_commands_queue_does_not_match_or_clear_legacy_stopped_name_identity(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.remote_size = 10
@@ -3950,18 +3951,15 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__process_commands()
 
-        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual({file.name}, self.controller._Controller__persist.stopped_file_names)
 
-    def test_process_commands_queue_clears_path_pair_stopped_key_encodings(self):
+    def test_process_commands_queue_clears_canonical_path_pair_stopped_key(self):
         pair_id = "12345678-1234-1234-1234-123456789abc"
         file = ModelFile("dup", False)
         file.path_pair_id = pair_id
         file.remote_size = 10
         self.controller._Controller__persist.stopped_file_names = {
             file.file_id,
-            file.name,
-            "{}:{}".format(pair_id, file.name),
-            "{}{}{}".format(pair_id, KEY_SEP, file.name),
         }
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__path_pairs_by_id = {
@@ -3975,7 +3973,7 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
-    def test_process_commands_queue_clears_migrated_legacy_stopped_key(self):
+    def test_process_commands_queue_clears_startup_migrated_stopped_key(self):
         pair_id = "12345678-1234-1234-1234-123456789abc"
         file = ModelFile("dup", False)
         file.path_pair_id = pair_id
@@ -3985,10 +3983,9 @@ class TestController(unittest.TestCase):
             "extracted": [],
             "stopped": ["{}:{}".format(pair_id, file.name)],
         }))
-        self.assertEqual(
-            {"{}{}{}".format(pair_id, KEY_SEP, file.name)},
-            self.controller._Controller__persist.stopped_file_names
-        )
+        self.controller._Controller__persist.canonicalize_file_identities()
+        self.controller._Controller__persist.canonicalize_file_identities()
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
         self.controller._Controller__model.get_file.return_value = file
         self.controller._Controller__path_pairs_by_id = {
             pair_id: SimpleNamespace(remote_path="/remote/movies", local_path="/local/movies")
@@ -4001,18 +3998,22 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
-    def test_persist_key_helpers_accept_legacy_and_unit_separator_keys(self):
+    def test_persist_key_helpers_require_canonical_keys(self):
         pair_id = "12345678-1234-1234-1234-123456789abc"
         file_name = "dup"
 
         self.controller._Controller__persist.downloaded_file_names = {f"{pair_id}:{file_name}"}
-        self.assertTrue(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
+        self.assertFalse(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
         self.controller._Controller__persist.downloaded_file_names = {f"{pair_id}{KEY_SEP}{file_name}"}
+        self.assertFalse(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
+        self.controller._Controller__persist.downloaded_file_names = {ModelFile.build_file_id(file_name, pair_id)}
         self.assertTrue(self.controller._Controller__is_previously_downloaded(file_name, pair_id))
 
         self.controller._Controller__persist.stopped_file_names = {f"{pair_id}:{file_name}"}
-        self.assertTrue(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
+        self.assertFalse(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
         self.controller._Controller__persist.stopped_file_names = {f"{pair_id}{KEY_SEP}{file_name}"}
+        self.assertFalse(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
+        self.controller._Controller__persist.stopped_file_names = {ModelFile.build_file_id(file_name, pair_id)}
         self.assertTrue(self.controller._Controller__is_explicitly_stopped(file_name, pair_id))
 
     def test_process_commands_delete_local_tracks_stopped_file_identity(self):

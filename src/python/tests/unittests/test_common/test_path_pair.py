@@ -7,7 +7,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from common import PathPair, PathPairConflictError, PathPairError, PathPairManager, PersistError
+from common import (
+    PathPair, PathPairConflictError, PathPairError, PathPairManager, PersistError,
+    legacy_default_path_pair_id,
+)
 
 
 class TestPathPairManager(unittest.TestCase):
@@ -162,7 +165,18 @@ class TestPathPairManager(unittest.TestCase):
 
         self.assertEqual(1, len(self.manager.get_all_pairs()))
         self.assertEqual("Default", self.manager.get_all_pairs()[0].name)
+        self.assertEqual(
+            legacy_default_path_pair_id("/remote/downloads", "/downloads"),
+            self.manager.get_all_pairs()[0].id,
+        )
         self.assertTrue(os.path.isfile(self.manager.file_path))
+
+    def test_legacy_default_id_is_deterministic_across_manager_restart(self):
+        expected = legacy_default_path_pair_id("/remote/downloads", "/downloads")
+        self.assertTrue(self.manager.migrate_from_config("/remote/downloads", "/downloads"))
+
+        restarted = PathPairManager(self.temp_dir)
+        self.assertEqual(expected, restarted.load().path_pairs[0].id)
 
     def test_migrate_from_config_preserves_persisted_empty_collection_after_restart(self):
         pair = PathPair(name="Downloads", remote_path="/remote/downloads", local_path="/downloads")

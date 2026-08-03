@@ -33,6 +33,17 @@ DOCKER_MOUNTS_BASE = "/mounts"
 _MutationResult = TypeVar("_MutationResult")
 
 
+def legacy_default_path_pair_id(remote_path: str, local_path: str) -> str:
+    """Stable owner for legacy bare controller history.
+
+    Keep the v0.8.6 UUID5 namespace/name unchanged so a restart after the
+    path-pair file is written can still identify the same Default pair.
+    """
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_URL, "seedsync:v086:{}\n{}".format(remote_path, local_path)
+    ))
+
+
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return dict(pairs)
 
@@ -372,6 +383,7 @@ class PathPairManager:
                 return False
 
             pair = PathPair(
+                id=legacy_default_path_pair_id(remote_path, local_path),
                 name="Default",
                 remote_path=remote_path,
                 local_path=local_path,

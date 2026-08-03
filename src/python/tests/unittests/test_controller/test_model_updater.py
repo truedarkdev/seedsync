@@ -58,7 +58,7 @@ class TestModelUpdater(unittest.TestCase):
             model_builder.mock_calls,
         )
 
-    def test_sync_persist_to_all_builders_normalizes_pair_separator_keys(self):
+    def test_sync_persist_to_all_builders_drops_preboundary_separator_keys(self):
         pair_id = "movies"
         normalized_file_id = ModelFile.build_file_id("legacy.mkv", pair_id)
         controller, model_builder = self._make_controller(
@@ -80,9 +80,9 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual(
             [
-                call.set_downloaded_files({normalized_file_id}),
-                call.set_extracted_files({normalized_file_id}),
-                call.set_stopped_files({normalized_file_id}),
+                call.set_downloaded_files(set()),
+                call.set_extracted_files(set()),
+                call.set_stopped_files(set()),
             ],
             model_builder.mock_calls,
         )
@@ -109,7 +109,7 @@ class TestModelUpdater(unittest.TestCase):
             model_builder.mock_calls,
         )
 
-    def test_sync_persist_to_all_builders_normalizes_uuid_legacy_colon_keys(self):
+    def test_sync_persist_to_all_builders_drops_preboundary_uuid_colon_keys(self):
         pair_id = "12345678-1234-1234-1234-123456789abc"
         legacy_key = f"{pair_id}:legacy.mkv"
         normalized_file_id = ModelFile.build_file_id("legacy.mkv", pair_id)
@@ -125,11 +125,22 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertEqual(
             [
-                call.set_downloaded_files({normalized_file_id}),
-                call.set_extracted_files({normalized_file_id}),
-                call.set_stopped_files({normalized_file_id}),
+                call.set_downloaded_files(set()),
+                call.set_extracted_files(set()),
+                call.set_stopped_files(set()),
             ],
             model_builder.mock_calls,
+        )
+
+    def test_safe_stale_markers_keeps_active_unscoped_id_without_path_pairs(self):
+        active = "active.mkv"
+        stale = "stale.mkv"
+
+        self.assertEqual(
+            {stale},
+            ModelUpdater._safe_stale_marker_ids(
+                {active, stale}, {active}, set(), set(), set(),
+            ),
         )
 
     def test_update_filters_remote_scan_files_before_publishing(self):

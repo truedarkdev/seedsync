@@ -21,7 +21,7 @@ from typing import Callable, NoReturn, Sequence
 from common import ServiceExit, Context, Constants, Config, Args
 from common import ServiceRestart
 from common import Localization, Status, ConfigError, Persist, PersistError
-from common import PathPairManager
+from common import PathPairManager, legacy_default_path_pair_id
 from common.json_formatter import JsonFormatter
 from controller import Controller, ControllerJob, ControllerPersist, AutoQueue, AutoQueuePersist
 from web import MigrationWebRuntime, WebAppJob, WebAppBuilder
@@ -183,9 +183,10 @@ class Seedsync:
         # Initialize path pairs for later multi-path support.
         path_pair_manager = PathPairManager(args.config_dir)
         path_pair_manager.load()
-        if path_pair_manager.migrate_from_config(
+        migrated_legacy_config = path_pair_manager.migrate_from_config(
                 remote_path=cast(str, config.lftp.remote_path),
-                local_path=cast(str, config.lftp.local_path)):
+                local_path=cast(str, config.lftp.local_path))
+        if migrated_legacy_config:
             logger.info("Migrated legacy path config to path pairs")
 
         # Create context
@@ -208,6 +209,20 @@ class Seedsync:
         # Load the persists
         self.controller_persist_path: str = os.path.join(args.config_dir, Seedsync.__FILE_CONTROLLER_PERSIST)
         self.controller_persist: ControllerPersist = self._load_persist(ControllerPersist, self.controller_persist_path)
+        default_path_pair_id = None
+        path_pairs = path_pair_manager.get_all_pairs()
+        if migrated_legacy_config and len(path_pairs) == 1:
+            default_path_pair_id = path_pairs[0].id
+        else:
+            for pair in path_pairs:
+                deterministic_v086_id = legacy_default_path_pair_id(pair.remote_path, pair.local_path)
+                if pair.id == deterministic_v086_id:
+                    default_path_pair_id = pair.id
+                    break
+        while self.controller_persist.canonicalize_file_identities(default_path_pair_id):
+            # Persist each phase before runtime matching. Persist.to_file uses
+            # atomic replacement and leaves its retained backups untouched.
+            self.controller_persist.to_file(self.controller_persist_path)
 
         self.auto_queue_persist_path: str = os.path.join(args.config_dir, Seedsync.__FILE_AUTO_QUEUE_PERSIST)
         self.auto_queue_persist: AutoQueuePersist = self._load_persist(AutoQueuePersist, self.auto_queue_persist_path)
