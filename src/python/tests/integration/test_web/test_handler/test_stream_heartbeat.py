@@ -15,5 +15,5 @@ class TestHeartbeatStreamHandler(unittest.TestCase):
         handler.setup()
         self.assertIsNone(handler.get_value())
 
-        mock_monotonic.return_value = 16.0
+        mock_monotonic.return_value = 5.0
         self.assertEqual(": heartbeat\n\n", handler.get_value())

@@ -6,7 +6,7 @@ import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler
 from queue import Empty, Full, Queue
-from threading import Event, Thread
+from threading import BoundedSemaphore, Event, Lock, Thread
 from types import TracebackType
 from typing import Protocol, TypeAlias, runtime_checkable
 from urllib.parse import unquote, urlsplit
@@ -92,13 +92,29 @@ class WebAppJob(Job):
 
 class _BoundedWSGIServer(WSGIServer):
     normal_worker_count = 8
-    stream_worker_count = 2
+    # SSE responses are long-lived. Twelve fixed slots cover a household or
+    # small LAN's normal browser usage without allowing unbounded threads.
+    stream_capacity = 12
+    stream_worker_count = stream_capacity
     worker_count = normal_worker_count + stream_worker_count
     normal_queue_size = 5
-    stream_queue_size = 5
+    # This queue only absorbs worker scheduling races. Admission below bounds
+    # its queued and active requests together, so it cannot become a waiting
+    # room for indefinitely long SSE connections.
+    stream_queue_size = stream_capacity
     request_queue_size = 5
     stream_request_path = "/server/stream"
     request_line_peek_size = 4096
+    request_line_peek_timeout_seconds = 0.05
+    stream_retry_after_seconds = 1
+    stream_over_capacity_response = (
+        b"HTTP/1.1 503 Service Unavailable\r\n"
+        b"Content-Length: 0\r\n"
+        b"Connection: close\r\n"
+        + b"Retry-After: "
+        + str(stream_retry_after_seconds).encode("ascii")
+        + b"\r\n\r\n"
+    )
     allow_reuse_address = True
 
     def __init__(
@@ -108,30 +124,42 @@ class _BoundedWSGIServer(WSGIServer):
         bind_and_activate: bool = True,
     ) -> None:
         self._worker_shutdown = Event()
+        self._request_admission_lock = Lock()
         self._normal_request_queue: Queue[QueuedRequest] = Queue(maxsize=self.normal_queue_size)
         self._stream_request_queue: Queue[QueuedRequest] = Queue(maxsize=self.stream_queue_size)
+        self._stream_admission = BoundedSemaphore(self.stream_capacity)
         self._workers: list[Thread] = []
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
         self._start_workers("SeedSyncWebWorker", self._normal_request_queue, self.normal_worker_count)
-        self._start_workers("SeedSyncStreamWorker", self._stream_request_queue, self.stream_worker_count)
+        self._start_workers(
+            "SeedSyncStreamWorker",
+            self._stream_request_queue,
+            self.stream_worker_count,
+            releases_stream_slot=True,
+        )
 
     def _start_workers(
         self,
         name_prefix: str,
         request_queue: Queue[QueuedRequest],
         worker_count: int,
+        releases_stream_slot: bool = False,
     ) -> None:
         for index in range(worker_count):
             worker = Thread(
                 target=self._worker_loop,
-                args=(request_queue,),
+                args=(request_queue, releases_stream_slot),
                 name="{}-{}".format(name_prefix, index + 1),
                 daemon=True
             )
             worker.start()
             self._workers.append(worker)
 
-    def _worker_loop(self, request_queue: Queue[QueuedRequest]) -> None:
+    def _worker_loop(
+        self,
+        request_queue: Queue[QueuedRequest],
+        releases_stream_slot: bool = False,
+    ) -> None:
         while not self._worker_shutdown.is_set() or not request_queue.empty():
             try:
                 request, client_address = request_queue.get(timeout=0.1)
@@ -142,6 +170,8 @@ class _BoundedWSGIServer(WSGIServer):
                 self._process_request_from_worker(request, client_address)
             finally:
                 request_queue.task_done()
+                if releases_stream_slot:
+                    self._stream_admission.release()
 
     def _process_request_from_worker(
         self, request: object, client_address: ClientAddress
@@ -159,20 +189,48 @@ class _BoundedWSGIServer(WSGIServer):
         request: object,
         client_address: ClientAddress,
     ) -> None:
-        if self._worker_shutdown.is_set():
-            _call_request_lifecycle(self.shutdown_request, request)
-            return
+        # Keep admission atomic with shutdown. A request admitted immediately
+        # before shutdown is drained by workers; one arriving afterward closes
+        # without consuming a stream slot.
+        with self._request_admission_lock:
+            if self._worker_shutdown.is_set():
+                _call_request_lifecycle(self.shutdown_request, request)
+                return
 
-        request_queue = self._queue_for_request(request)
+            is_stream_request = self._is_stream_request(request)
+            if is_stream_request and not self._stream_admission.acquire(blocking=False):
+                self._reject_stream_request(request)
+                return
+
+            request_queue = (
+                self._stream_request_queue if is_stream_request else self._normal_request_queue
+            )
+            try:
+                request_queue.put_nowait((request, client_address))
+            except Full:
+                if is_stream_request:
+                    self._stream_admission.release()
+                    self._reject_stream_request(request)
+                else:
+                    _call_request_lifecycle(self.shutdown_request, request)
+
+    def _reject_stream_request(self, request: object) -> None:
+        sendall = getattr(request, "sendall", None)
         try:
-            request_queue.put_nowait((request, client_address))
-        except Full:
+            # The socket closes immediately afterward, so bound this write
+            # instead of restoring the normal request timeout.
+            if isinstance(request, _PeekableRequest):
+                try:
+                    request.settimeout(0)
+                except (OSError, TimeoutError):
+                    sendall = None
+            if callable(sendall):
+                try:
+                    sendall(self.stream_over_capacity_response)
+                except (BlockingIOError, OSError, TimeoutError):
+                    pass
+        finally:
             _call_request_lifecycle(self.shutdown_request, request)
-
-    def _queue_for_request(self, request: object) -> Queue[QueuedRequest]:
-        if self._is_stream_request(request):
-            return self._stream_request_queue
-        return self._normal_request_queue
 
     def _is_stream_request(self, request: object) -> bool:
         request_path = self._peek_request_path(request)
@@ -186,7 +244,11 @@ class _BoundedWSGIServer(WSGIServer):
             return None
         try:
             previous_timeout = request.gettimeout()
-            request.settimeout(0)
+            # A browser can send the request line just after accept(). Give
+            # that first read a small, fixed window so a valid SSE request is
+            # classified before it can occupy a normal worker. Anything still
+            # incomplete or unreadable remains intentionally ambiguous.
+            request.settimeout(self.request_line_peek_timeout_seconds)
             try:
                 data = request.recv(self.request_line_peek_size, socket.MSG_PEEK)
             finally:
@@ -209,10 +271,11 @@ class _BoundedWSGIServer(WSGIServer):
         return unquote(urlsplit(parts[1]).path, "iso-8859-1")
 
     def stop_accepting(self) -> None:
-        self._worker_shutdown.set()
+        with self._request_admission_lock:
+            self._worker_shutdown.set()
 
     def server_close(self) -> None:
-        self._worker_shutdown.set()
+        self.stop_accepting()
         super().server_close()
         for worker in self._workers:
             worker.join(timeout=1)
