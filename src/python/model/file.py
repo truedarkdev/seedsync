@@ -55,6 +55,7 @@ class ModelFile:
         self.__local_modified_timestamp: Optional[datetime] = None
         self.__remote_created_timestamp: Optional[datetime] = None
         self.__remote_modified_timestamp: Optional[datetime] = None
+        self.__downloaded_timestamp: Optional[datetime] = None
         self.__validation_progress: Optional[int] = None
         self.__validation_error: Optional[str] = None
         self.__corrupt_chunks: Optional[List[int]] = None
@@ -312,6 +313,15 @@ class ModelFile:
         if type(remote_modified_timestamp) != datetime:
             raise TypeError
         self.__remote_modified_timestamp = remote_modified_timestamp
+
+    @property
+    def downloaded_timestamp(self) -> datetime | None: return self.__downloaded_timestamp
+
+    @downloaded_timestamp.setter
+    def downloaded_timestamp(self, downloaded_timestamp: datetime | None):
+        if downloaded_timestamp is not None and type(downloaded_timestamp) != datetime:
+            raise TypeError
+        self.__downloaded_timestamp = downloaded_timestamp
 
     @property
     def validation_progress(self) -> Optional[int]:

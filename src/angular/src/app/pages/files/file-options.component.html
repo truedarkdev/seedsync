@@ -219,6 +219,16 @@
                         <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
                         <span class="text">ETA Long&#8594;Short</span>
                     </div>
+                    <div class="sel-item"
+                         *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.DOWNLOADED_NEWEST">
+                        <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" alt="Sort newest first" /></div>
+                        <span class="text">Downloaded Newest</span>
+                    </div>
+                    <div class="sel-item"
+                         *ngIf="(options | async)?.sortMethod === ViewFileOptions.SortMethod.DOWNLOADED_OLDEST">
+                        <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" alt="Sort oldest first" /></div>
+                        <span class="text">Downloaded Oldest</span>
+                    </div>
                 </div>
             </button>
             <div class="dropdown-menu dropdown-menu-end" data-bs-theme="dark">
@@ -287,6 +297,18 @@
                         (click)="onSort(ViewFileOptions.SortMethod.ETA_DESC)">
                     <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" /></div>
                     <span class="text">ETA Long&#8594;Short</span>
+                </button>
+                <button type="button" class="dropdown-item"
+                        [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.DOWNLOADED_NEWEST"
+                        (click)="onSort(ViewFileOptions.SortMethod.DOWNLOADED_NEWEST)">
+                    <div class="icon"><img src="assets/icons/sort-desc.svg" class="sort-desc" alt="Sort newest first" /></div>
+                    <span class="text">Downloaded Newest</span>
+                </button>
+                <button type="button" class="dropdown-item"
+                        [class.active]="(options | async)?.sortMethod === ViewFileOptions.SortMethod.DOWNLOADED_OLDEST"
+                        (click)="onSort(ViewFileOptions.SortMethod.DOWNLOADED_OLDEST)">
+                    <div class="icon"><img src="assets/icons/sort-asc.svg" class="sort-asc" alt="Sort oldest first" /></div>
+                    <span class="text">Downloaded Oldest</span>
                 </button>
             </div>
         </div>

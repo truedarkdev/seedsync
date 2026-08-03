@@ -169,6 +169,17 @@ class TestModelFile(unittest.TestCase):
         with self.assertRaises(TypeError):
             file.remote_modified_timestamp = 100
 
+    def test_downloaded_timestamp_accepts_datetime_and_null(self):
+        file = ModelFile("test", False)
+        self.assertIsNone(file.downloaded_timestamp)
+        now = datetime.now()
+        file.downloaded_timestamp = now
+        self.assertEqual(now, file.downloaded_timestamp)
+        file.downloaded_timestamp = None
+        self.assertIsNone(file.downloaded_timestamp)
+        with self.assertRaises(TypeError):
+            file.downloaded_timestamp = 100
+
     def test_equality_operator(self):
         # check that timestamp does not affect equality
         now = datetime.now()

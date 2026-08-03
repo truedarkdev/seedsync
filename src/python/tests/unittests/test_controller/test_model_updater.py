@@ -52,6 +52,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             [
                 call.set_downloaded_files(downloaded_file_names),
+                call.set_downloaded_timestamps({}),
                 call.set_extracted_files(extracted_file_names),
                 call.set_stopped_files(stopped_file_names),
             ],
@@ -81,6 +82,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             [
                 call.set_downloaded_files(set()),
+                call.set_downloaded_timestamps({}),
                 call.set_extracted_files(set()),
                 call.set_stopped_files(set()),
             ],
@@ -103,6 +105,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             [
                 call.set_downloaded_files(set()),
+                call.set_downloaded_timestamps({}),
                 call.set_extracted_files(set()),
                 call.set_stopped_files(set()),
             ],
@@ -126,6 +129,7 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(
             [
                 call.set_downloaded_files(set()),
+                call.set_downloaded_timestamps({}),
                 call.set_extracted_files(set()),
                 call.set_stopped_files(set()),
             ],

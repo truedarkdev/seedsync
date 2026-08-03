@@ -38,6 +38,7 @@ interface IViewFile {
     localModifiedTimestamp: Date;
     remoteCreatedTimestamp: Date;
     remoteModifiedTimestamp: Date;
+    downloadedTimestamp: Date;
     validationProgress: number;
     validationError: string;
     corruptChunks: number[];
@@ -76,6 +77,7 @@ const DefaultViewFile: IViewFile = {
     localModifiedTimestamp: null,
     remoteCreatedTimestamp: null,
     remoteModifiedTimestamp: null,
+    downloadedTimestamp: null,
     validationProgress: null,
     validationError: null,
     corruptChunks: null
@@ -118,6 +120,7 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     localModifiedTimestamp: Date;
     remoteCreatedTimestamp: Date;
     remoteModifiedTimestamp: Date;
+    downloadedTimestamp: Date;
     validationProgress: number;
     validationError: string;
     corruptChunks: number[];

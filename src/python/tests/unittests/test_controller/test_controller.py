@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from controller import Controller, ControllerPersist, ModelBuilder
+from controller.model_updater import ModelUpdater
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner
@@ -58,6 +59,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__legacy_remote_path = "/remote"
         self.controller._Controller__persist = MagicMock()
         self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__persist.downloaded_timestamps = {}
         self.controller._Controller__persist.extracted_file_names = set()
         self.controller._Controller__persist.stopped_file_names = set()
         self.controller._Controller__persist.move_failure_counts = {}
@@ -117,6 +119,24 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def test_record_download_completion_overwrites_timestamp_by_canonical_id(self):
+        self.controller._Controller__persist.downloaded_timestamps = {}
+        file = ModelFile("same.mkv", False)
+        file.path_pair_id = "movies"
+        first = datetime(2026, 1, 1, 0, 0, 1)
+        second = datetime(2026, 1, 1, 0, 0, 2)
+
+        with patch.object(Controller, "_download_completion_clock", side_effect=[first, second]):
+            self.controller._record_download_completion(file)
+            first_timestamp = self.controller._Controller__persist.downloaded_timestamps[file.file_id]
+            self.controller._record_download_completion(file)
+
+        self.assertEqual(first.timestamp(), first_timestamp)
+        self.assertEqual(second.timestamp(), self.controller._Controller__persist.downloaded_timestamps[file.file_id])
+        self.controller._Controller__model_builder.set_downloaded_timestamps.assert_called_with(
+            self.controller._Controller__persist.downloaded_timestamps
+        )
 
     def test_download_start_lifecycle_confirms_running_once(self):
         file = ModelFile("release", True)
@@ -1708,6 +1728,47 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
 
     @patch("controller.controller.ScannerProcess")
+    def test_refresh_path_pairs_resyncs_pair_scoped_download_timestamps(self, scanner_process_cls):
+        movies_pair = PathPair(
+            id="movies", name="Movies", remote_path="/remote/movies",
+            local_path="/local/movies", enabled=True, auto_queue=False,
+        )
+        tv_pair = PathPair(
+            id="tv", name="TV", remote_path="/remote/tv",
+            local_path="/local/tv", enabled=True, auto_queue=False,
+        )
+        config = self.controller._Controller__context.config
+        config.lftp.staging_path = None
+        config.lftp.use_temp_file = False
+        config.controller.managed_extract_folders_enabled = False
+        config.controller.interval_ms_downloading_scan = 100
+        config.controller.interval_ms_local_scan = 200
+        config.controller.interval_ms_remote_scan = 300
+        config.lftp.remote_address = "host"
+        config.lftp.remote_port = 22
+        config.lftp.remote_username = "user"
+        config.lftp.remote_path_to_scan_script = "/scanfs"
+        self.controller._Controller__context.args.local_path_to_scanfs = "/local-scanfs"
+        self.controller._Controller__updater = ModelUpdater(self.controller)
+        movies_id = ModelFile.build_file_id("same.mkv", "movies")
+        tv_id = ModelFile.build_file_id("same.mkv", "tv")
+        self.controller._Controller__persist.downloaded_file_names = {movies_id, tv_id}
+        self.controller._Controller__persist.downloaded_timestamps = {
+            movies_id: 1760000100.0,
+            tv_id: 1760000200.0,
+        }
+        scanner_process_cls.side_effect = [MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock()]
+
+        self.controller._Controller__refresh_path_pair_runtime_state([movies_pair])
+        self.controller._Controller__model_builder.set_downloaded_timestamps.assert_called_with({
+            movies_id: 1760000100.0,
+        })
+        self.controller._Controller__refresh_path_pair_runtime_state([tv_pair])
+        self.controller._Controller__model_builder.set_downloaded_timestamps.assert_called_with({
+            tv_id: 1760000200.0,
+        })
+
+    @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_skips_old_active_scanner_close_when_old_active_process_stays_alive(self, scanner_process_cls):
         movies_pair = PathPair(
             id="movies",
@@ -2428,6 +2489,10 @@ class TestController(unittest.TestCase):
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_downloaded_file_names(self, _):
         self.controller._Controller__persist.downloaded_file_names = {"keep-id", "stale-id"}
+        self.controller._Controller__persist.downloaded_timestamps = {
+            "keep-id": 10.0,
+            "stale-id": 20.0,
+        }
         self.controller._Controller__model_builder.has_changes.return_value = True
         self.controller._Controller__model_builder.build_model.return_value = MagicMock()
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
@@ -2449,6 +2514,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.assertEqual({"keep-id"}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({"keep-id": 10.0}, self.controller._Controller__persist.downloaded_timestamps)
         self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({"keep-id"})
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
@@ -2694,6 +2760,65 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.controller._Controller__model_builder.set_stopped_files.assert_called_once_with({"stopped-id"})
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_update_model_does_not_fabricate_startup_timestamp_for_persisted_download(self, diff_models):
+        persisted_file = ModelFile("restart.mkv", False)
+        persisted_file.path_pair_id = "movies"
+        persisted_file.state = ModelFile.State.DOWNLOADED
+
+        self.controller._Controller__persist.downloaded_file_names = {persisted_file.file_id}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = {persisted_file.file_id}
+        self.controller._Controller__model.get_file_names.return_value = {persisted_file.name}
+        diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=persisted_file)]
+
+        for existing_timestamp in (None, 123.0):
+            with self.subTest(existing_timestamp=existing_timestamp):
+                self.controller._Controller__persist.downloaded_timestamps = (
+                    {} if existing_timestamp is None else {persisted_file.file_id: existing_timestamp}
+                )
+
+                self.controller._Controller__update_model()
+
+                expected_timestamps = (
+                    {} if existing_timestamp is None else {persisted_file.file_id: existing_timestamp}
+                )
+                self.assertEqual(
+                    expected_timestamps,
+                    self.controller._Controller__persist.downloaded_timestamps,
+                )
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_update_model_stamps_updated_redownload_even_with_existing_marker(self, diff_models):
+        old_file = ModelFile("redownload.mkv", False)
+        old_file.path_pair_id = "movies"
+        old_file.state = ModelFile.State.DOWNLOADING
+        new_file = ModelFile("redownload.mkv", False)
+        new_file.path_pair_id = "movies"
+        new_file.state = ModelFile.State.DOWNLOADED
+
+        self.controller._Controller__persist.downloaded_file_names = {new_file.file_id}
+        self.controller._Controller__persist.downloaded_timestamps = {new_file.file_id: 100.0}
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model.get_file_ids.return_value = {new_file.file_id}
+        self.controller._Controller__model.get_file_names.return_value = {new_file.name}
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED
+        )
+        diff_models.return_value = [
+            MagicMock(change=ModelDiff.Change.UPDATED, old_file=old_file, new_file=new_file)
+        ]
+
+        with patch.object(Controller, "_download_completion_clock", return_value=datetime(2026, 1, 1, 0, 0, 2)):
+            self.controller._Controller__update_model()
+
+        self.assertEqual(
+            {new_file.file_id: datetime(2026, 1, 1, 0, 0, 2).timestamp()},
+            self.controller._Controller__persist.downloaded_timestamps,
+        )
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_keeps_downloaded_file_ids_when_new_download_completes(self, diff_models):
@@ -4429,6 +4554,7 @@ class TestController(unittest.TestCase):
             "notified", file.path_pair_id, datetime.now()
         )
         self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 123.0}
         self.controller._Controller__persist.move_failure_counts = {file.file_id: 4}
         self.controller._Controller__active_command_processes = [
             Controller.CommandProcessWrapper(
@@ -4513,6 +4639,7 @@ class TestController(unittest.TestCase):
         remote_delete_listener.assert_called_once()
         self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
         self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({}, self.controller._Controller__persist.downloaded_timestamps)
         self.assertEqual(
             {file.file_id: 4},
             self.controller._Controller__persist.move_failure_counts,
@@ -5357,6 +5484,7 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__persist.move_failure_counts)
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
 
     def test_manual_retry_already_completed_does_not_earn_success_marker(self):
         file, command, callback = self._prepare_terminal_move_command()
@@ -5370,6 +5498,7 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_called_once_with()
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
 
     def test_new_queue_clears_terminal_move_lifecycle(self):
         file, _, _ = self._prepare_terminal_move_command()
@@ -5413,6 +5542,7 @@ class TestController(unittest.TestCase):
                 callback.on_failure.assert_called_once()
                 self.assertEqual(expected_code, callback.on_failure.call_args.args[1])
                 callback.on_success.assert_not_called()
+                self.assertEqual({}, self.controller._Controller__persist.downloaded_timestamps)
 
     def test_manual_retry_move_rejects_nonterminal_and_reserved_identity(self):
         file, command, callback = self._prepare_terminal_move_command()

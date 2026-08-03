@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import json
+import math
 import uuid
 from contextlib import contextmanager
 from threading import RLock
@@ -16,6 +17,7 @@ class ControllerPersist(Persist):
     """Persisted controller state, with a one-time canonical ID boundary."""
 
     __KEY_DOWNLOADED_FILE_NAMES = "downloaded"
+    __KEY_DOWNLOADED_TIMESTAMPS = "downloaded_timestamps"
     __KEY_EXTRACTED_FILE_NAMES = "extracted"
     __KEY_STOPPED_FILE_NAMES = "stopped"
     __KEY_MOVE_FAILURE_COUNTS = "move_failure_counts"
@@ -27,6 +29,7 @@ class ControllerPersist(Persist):
     def __init__(self):
         self.__lock = RLock()
         self.downloaded_file_names: set[str] = set()
+        self.downloaded_timestamps: dict[str, float] = {}
         self.extracted_file_names: set[str] = set()
         self.stopped_file_names: set[str] = set()
         self.move_failure_counts: dict[str, int] = {}
@@ -97,6 +100,20 @@ class ControllerPersist(Persist):
                 canonical[normalized] = max(canonical.get(normalized, 0), count)
         return canonical
 
+    @classmethod
+    def _canonicalize_timestamps(
+            cls, timestamps: dict[str, float], default_path_pair_id: str | None
+    ) -> dict[str, float]:
+        canonical: dict[str, float] = {}
+        for key, value in timestamps.items():
+            normalized = cls._canonical_file_id(key, default_path_pair_id)
+            if normalized is not None:
+                # An explicitly canonical key wins over an ambiguous legacy
+                # spelling regardless of input order.
+                if normalized not in canonical or key == normalized:
+                    canonical[normalized] = value
+        return canonical
+
     def canonicalize_file_identities(self, default_path_pair_id: str | None = None) -> bool:
         """Perform one phase of the restart-safe canonical marker migration.
 
@@ -117,8 +134,12 @@ class ControllerPersist(Persist):
                 )
             )
             canonical_counts = self._canonicalize_counts(self.move_failure_counts, default_path_pair_id)
+            canonical_timestamps = self._canonicalize_timestamps(
+                self.downloaded_timestamps, default_path_pair_id
+            )
             if self.__marker_identity_migration == 0:
                 self.downloaded_file_names.update(canonical_sets[0])
+                self.downloaded_timestamps.update(canonical_timestamps)
                 self.extracted_file_names.update(canonical_sets[1])
                 self.stopped_file_names.update(canonical_sets[2])
                 self.final_move_succeeded_file_names.update(canonical_sets[3])
@@ -127,6 +148,7 @@ class ControllerPersist(Persist):
                 self.__marker_identity_migration = self.__MARKER_IDENTITY_PHASE_ONE
                 return True
             self.downloaded_file_names = canonical_sets[0]
+            self.downloaded_timestamps = canonical_timestamps
             self.extracted_file_names = canonical_sets[1]
             self.stopped_file_names = canonical_sets[2]
             self.final_move_succeeded_file_names = canonical_sets[3]
@@ -144,6 +166,17 @@ class ControllerPersist(Persist):
                 raise TypeError("controller persist must be an object")
             dct = cast(dict[str, object], raw_persist)
             persist.downloaded_file_names = cls._read_string_set(dct[cls.__KEY_DOWNLOADED_FILE_NAMES], "downloaded")
+            raw_timestamps = dct.get(cls.__KEY_DOWNLOADED_TIMESTAMPS, {})
+            if not isinstance(raw_timestamps, dict):
+                raise TypeError("downloaded_timestamps must be an object")
+            persist.downloaded_timestamps = {
+                key: float(value)
+                for key, value in cast(dict[object, object], raw_timestamps).items()
+                if isinstance(key, str)
+                and type(value) in (int, float)
+                and math.isfinite(float(value))
+                and float(value) >= 0
+            }
             persist.extracted_file_names = cls._read_string_set(dct[cls.__KEY_EXTRACTED_FILE_NAMES], "extracted")
             persist.stopped_file_names = cls._read_string_set(dct.get(cls.__KEY_STOPPED_FILE_NAMES, []), "stopped")
             raw_counts = dct.get(cls.__KEY_MOVE_FAILURE_COUNTS, {})
@@ -175,4 +208,8 @@ class ControllerPersist(Persist):
                 self.__KEY_FINAL_MOVE_SUCCEEDED: list(self.final_move_succeeded_file_names),
                 self.__KEY_MARKER_IDENTITY_MIGRATION: self.__marker_identity_migration,
             }
+            # Keep old/v0.8.6 files byte-compatible when no completion times
+            # have ever been recorded; the field remains optional on disk.
+            if self.downloaded_timestamps:
+                dct[self.__KEY_DOWNLOADED_TIMESTAMPS] = dict(self.downloaded_timestamps)
         return json.dumps(dct, indent=Constants.JSON_PRETTY_PRINT_INDENT)

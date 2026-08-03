@@ -62,6 +62,8 @@ export module ViewFileOptions {
         SPEED_ASC = 6,
         SPEED_DESC = 7,
         ETA_ASC = 8,
-        ETA_DESC = 9
+        ETA_DESC = 9,
+        DOWNLOADED_NEWEST = 11,
+        DOWNLOADED_OLDEST = 12
     }
 }

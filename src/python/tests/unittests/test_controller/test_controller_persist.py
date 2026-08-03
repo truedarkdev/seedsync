@@ -12,6 +12,37 @@ from controller.persist_keys import KEY_SEP, persist_key, strip_persist_key
 
 
 class TestControllerPersist(unittest.TestCase):
+    def test_downloaded_timestamps_are_optional_and_drop_invalid_values(self):
+        legacy = ControllerPersist.from_str('{"downloaded": [], "extracted": []}')
+        self.assertEqual({}, legacy.downloaded_timestamps)
+
+        first = ' ["pair-a","same.mkv"] '
+        second = '["pair-b","same.mkv"]'
+        third = '["pair-c","same.mkv"]'
+        persist = ControllerPersist.from_str(json.dumps({
+            "downloaded": [first.strip(), second, third],
+            "extracted": [],
+            "downloaded_timestamps": {
+                first.strip(): 10,
+                second: 20.5,
+                third: 30,
+                "huge": 1e20,
+                "negative": -1,
+                "infinite": float("inf"),
+                "boolean": True,
+                "text": "40",
+            },
+        }))
+
+        self.assertEqual({
+            first.strip(): 10.0,
+            second: 20.5,
+            third: 30.0,
+            "huge": 1e20,
+        }, persist.downloaded_timestamps)
+        restored = ControllerPersist.from_str(persist.to_str())
+        self.assertEqual(persist.downloaded_timestamps, restored.downloaded_timestamps)
+
     def test_move_failure_counts_round_trip_and_missing_key_is_backward_compatible(self):
         file_id = '["movies","movie.mkv"]'
         persist = ControllerPersist()

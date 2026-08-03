@@ -73,6 +73,7 @@ class _ControllerCoreAccess:
     def _reconcile_pending_queue_dispatches_from_fresh_status(self, active_file_ids: set[str]) -> None: ...
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
+    def _record_download_completion(self, file: ModelFile) -> None: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
     def _reserve_move_attempt(self, file_id: str) -> bool: ...
     def _release_move_attempt(self, file_id: str) -> None: ...
@@ -151,6 +152,12 @@ class ModelUpdater(_ControllerCoreAccess):
         controller._Controller__model_builder.set_downloaded_files(
             self._filter_keys_for_model_builder(controller._Controller__persist.downloaded_file_names, path_pair_ids)
         )
+        downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
+        controller._Controller__model_builder.set_downloaded_timestamps({
+            file_id: timestamp
+            for file_id, timestamp in downloaded_timestamps.items()
+            if self._normalize_scoped_persist_key(file_id, path_pair_ids) == file_id
+        })
         controller._Controller__model_builder.set_extracted_files(
             self._filter_keys_for_model_builder(
                 controller._Controller__persist.extracted_file_names,
@@ -283,6 +290,8 @@ class ModelUpdater(_ControllerCoreAccess):
             persist.move_failure_counts = {}
         if not isinstance(getattr(persist, "final_move_succeeded_file_names", None), set):
             persist.final_move_succeeded_file_names = set()
+        if not isinstance(getattr(persist, "downloaded_timestamps", None), dict):
+            persist.downloaded_timestamps = {}
 
         if not hasattr(controller, "_Controller__malformed_status_only_file_ids"):
             controller._Controller__malformed_status_only_file_ids = set()
@@ -761,6 +770,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller._Controller__local_scan_process.force_scan(file.path_pair_id)
 
                 def publish_completed_download(file: ModelFile, final_move_succeeded: bool):
+                    controller._record_download_completion(file)
                     persist.move_failure_counts.pop(file.file_id, None)
                     controller._Controller__deferred_move_file_ids.discard(file.file_id)
                     controller._Controller__move_retry_due.pop(file.file_id, None)
@@ -910,7 +920,11 @@ class ModelUpdater(_ControllerCoreAccess):
                         and not completion_proved
                         and new_file.file_id not in pending_completion_file_ids()
                     ):
-                        if diff.change == ModelDiff.Change.ADDED and new_file.state == ModelFile.State.DOWNLOADED:
+                        if (
+                            diff.change == ModelDiff.Change.ADDED
+                            and new_file.state == ModelFile.State.DOWNLOADED
+                            and new_file.file_id not in persist.downloaded_file_names
+                        ):
                             downloaded = True
                         elif (
                             diff.change == ModelDiff.Change.UPDATED
@@ -1058,6 +1072,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     if remove_downloaded_file_names:
                         controller.logger.info("Removing from downloaded list: {}".format(remove_downloaded_file_names))
                         persist.downloaded_file_names.difference_update(remove_downloaded_file_names)
+                        downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
+                        for file_id in remove_downloaded_file_names:
+                            downloaded_timestamps.pop(file_id, None)
                         persist.final_move_succeeded_file_names.difference_update(remove_downloaded_file_names)
                         model_builder.set_final_move_succeeded_files(
                             persist.final_move_succeeded_file_names
@@ -1073,6 +1090,28 @@ class ModelUpdater(_ControllerCoreAccess):
                                         "file_id": ModelFile.build_file_id(downloaded_file_name, None),
                                     })
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
+                        model_builder.set_downloaded_timestamps({
+                            file_id: timestamp
+                            for file_id, timestamp in downloaded_timestamps.items()
+                            if self._normalize_scoped_persist_key(file_id, enabled_path_pair_ids) == file_id
+                        })
+
+                    downloaded_timestamps = getattr(persist, "downloaded_timestamps", {})
+                    stale_downloaded_timestamp_ids = self._safe_stale_marker_ids(
+                        set(downloaded_timestamps),
+                        active_model_ids,
+                        active_model_names,
+                        pending_ids,
+                        enabled_path_pair_ids,
+                    )
+                    if stale_downloaded_timestamp_ids:
+                        for file_id in stale_downloaded_timestamp_ids:
+                            downloaded_timestamps.pop(file_id, None)
+                        model_builder.set_downloaded_timestamps({
+                            file_id: timestamp
+                            for file_id, timestamp in downloaded_timestamps.items()
+                            if self._normalize_scoped_persist_key(file_id, enabled_path_pair_ids) == file_id
+                        })
 
                     stale_extracted_file_names = self._safe_stale_marker_ids(
                         set(persist.extracted_file_names),

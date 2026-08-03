@@ -183,8 +183,40 @@ const EtaDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): 
     return compareByName(a, b);
 };
 
+/** Sort by proven completion time, keeping files without a valid timestamp last. */
+const DownloadedNewestComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
+    const timestampComparison = compareNullableNumbersDescending(
+        getDownloadedTimestampValue(a),
+        getDownloadedTimestampValue(b),
+    );
+    if (timestampComparison !== 0) {
+        return timestampComparison;
+    }
+    return compareByNameThenFileId(a, b);
+};
+
+/** Sort by proven completion time, keeping files without a valid timestamp last. */
+const DownloadedOldestComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
+    const timestampComparison = compareNullableNumbers(
+        getDownloadedTimestampValue(a),
+        getDownloadedTimestampValue(b),
+    );
+    if (timestampComparison !== 0) {
+        return timestampComparison;
+    }
+    return compareByNameThenFileId(a, b);
+};
+
 const compareByName = (a: ViewFile, b: ViewFile): number => {
-    return a.name.localeCompare(b.name);
+    return String(a.name || "").localeCompare(String(b.name || ""));
+};
+
+const compareByNameThenFileId = (a: ViewFile, b: ViewFile): number => {
+    const nameComparison = compareByName(a, b);
+    if (nameComparison !== 0) {
+        return nameComparison;
+    }
+    return String(a.fileId || "").localeCompare(String(b.fileId || ""));
 };
 
 const compareRemoteTimestamp = (a: ViewFile, b: ViewFile): number => {
@@ -252,6 +284,17 @@ const getRemoteCreatedTimestampValue = (file: ViewFile): number => {
     const time = file.remoteCreatedTimestamp.getTime();
     if (typeof time !== "number" || !isFinite(time)) {
         return 0;
+    }
+    return time;
+};
+
+const getDownloadedTimestampValue = (file: ViewFile): number | null => {
+    if (file.downloadedTimestamp == null || typeof file.downloadedTimestamp.getTime !== "function") {
+        return null;
+    }
+    const time = file.downloadedTimestamp.getTime();
+    if (typeof time !== "number" || !isFinite(time) || time < 0) {
+        return null;
     }
     return time;
 };
@@ -358,6 +401,14 @@ export class ViewFileSortService {
         [ViewFileOptions.SortMethod.ETA_DESC]: {
             comparator: EtaDescendingComparator,
             label: "ETA Desc"
+        },
+        [ViewFileOptions.SortMethod.DOWNLOADED_NEWEST]: {
+            comparator: DownloadedNewestComparator,
+            label: "Downloaded Newest"
+        },
+        [ViewFileOptions.SortMethod.DOWNLOADED_OLDEST]: {
+            comparator: DownloadedOldestComparator,
+            label: "Downloaded Oldest"
         }
     };
 
