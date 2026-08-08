@@ -49,6 +49,7 @@ class MockEtaPipe implements PipeTransform {
 function createViewFile(props: any = {}): ViewFile {
     return new ViewFile({
         fileId: props.fileId || "file-1",
+        pathPairName: props.pathPairName !== undefined ? props.pathPairName : null,
         name: props.name || "sample",
         status: props.status || ViewFile.Status.DEFAULT,
         isLocalOnly: props.isLocalOnly || false,
@@ -305,7 +306,7 @@ describe("Testing file component", () => {
         expect(style.marginBottom).toBe("-12px");
     });
 
-    it("should render the Local Only label from explicit presence state", () => {
+    it("should render only the local icon for a downloaded local-only row", () => {
         fixture.componentInstance.file = createViewFile({
             status: ViewFile.Status.DOWNLOADED,
             isLocalOnly: true,
@@ -315,8 +316,71 @@ describe("Testing file component", () => {
         fixture.detectChanges();
 
         const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.queryAll(By.css("img")).map(icon => icon.attributes["src"])).toEqual([
+            "assets/icons/default-local.svg"
+        ]);
+        expect(status.query(By.css("img#downloaded"))).toBeNull();
         expect(status.nativeElement.textContent).toContain("Local Only");
         expect(status.nativeElement.textContent).not.toContain("downloaded");
+    });
+
+    it("should render the local icon for a default local-only row", () => {
+        fixture.componentInstance.file = createViewFile({
+            status: ViewFile.Status.DEFAULT,
+            isLocalOnly: true
+        });
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.queryAll(By.css("img")).map(icon => icon.attributes["src"])).toEqual([
+            "assets/icons/default-local.svg"
+        ]);
+        expect(status.nativeElement.textContent).toContain("Local Only");
+    });
+
+    it("should replace historical local-only status icons and text with Local Only", () => {
+        [
+            ViewFile.Status.MOVE_FAILED,
+            ViewFile.Status.MOVE_SUCCEEDED,
+            ViewFile.Status.DELETED,
+            ViewFile.Status.EXTRACTED
+        ].forEach(statusValue => {
+            fixture.componentInstance.file = createViewFile({
+                status: statusValue,
+                isLocalOnly: true
+            });
+            fixture.componentInstance.options = of(null) as any;
+            fixture.detectChanges();
+
+            const status = fixture.debugElement.query(By.css(".status"));
+            expect(status.queryAll(By.css("img")).map(icon => icon.attributes["src"])).toEqual([
+                "assets/icons/default-local.svg"
+            ]);
+            expect(status.queryAll(By.css(".text")).map(text => text.nativeElement.textContent.trim())).toEqual([
+                "Local Only"
+            ]);
+        });
+    });
+
+    it("should keep the downloaded icon for a non-local row", () => {
+        fixture.componentInstance.file = createViewFile({status: ViewFile.Status.DOWNLOADED});
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        const status = fixture.debugElement.query(By.css(".status"));
+        expect(status.queryAll(By.css("img")).map(icon => icon.attributes["src"])).toEqual([
+            "assets/icons/downloaded.svg"
+        ]);
+        expect(status.query(By.css("img#default-local"))).toBeNull();
+    });
+
+    it("should not render a path pair label in the file row", () => {
+        fixture.componentInstance.file = createViewFile({pathPairName: "Movies"});
+        fixture.componentInstance.options = of(null) as any;
+        fixture.detectChanges();
+
+        expect(fixture.debugElement.query(By.css(".path-pair-label"))).toBeNull();
     });
 
     it("should keep the progress percentage and byte totals in one composition", () => {

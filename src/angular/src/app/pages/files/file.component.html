@@ -9,46 +9,46 @@
         </div>
         <div class="status">
             <img src="assets/icons/default-remote.svg" id="default-remote"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.remoteHasTransferableContent"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.DEFAULT && file.remoteHasTransferableContent"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/default-local.svg" id="default-local"
-                 *ngIf="file.status === ViewFile.Status.DEFAULT && file.isLocalOnly"
+                 *ngIf="file.isLocalOnly"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/queued.svg" id="queued"
-                 *ngIf="file.status === ViewFile.Status.QUEUED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.QUEUED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/downloading.svg" id="downloading"
-                 *ngIf="file.status === ViewFile.Status.DOWNLOADING"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.DOWNLOADING"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/downloaded.svg" id="downloaded"
-                 *ngIf="file.status === ViewFile.Status.DOWNLOADED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.DOWNLOADED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/move-succeeded.png" id="move-succeeded"
-                 *ngIf="file.status === ViewFile.Status.MOVE_SUCCEEDED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.MOVE_SUCCEEDED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/stopped.svg" id="stopped"
-                 *ngIf="file.status === ViewFile.Status.STOPPED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.STOPPED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/deleted.svg" id="deleted"
-                 *ngIf="file.status === ViewFile.Status.DELETED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.DELETED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/extracting.svg" id="extracting"
-                 *ngIf="file.status === ViewFile.Status.EXTRACTING"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.EXTRACTING"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/extracted.svg" id="extracted"
-                 *ngIf="file.status === ViewFile.Status.EXTRACTED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.EXTRACTED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/validating.svg" id="validating"
-                 *ngIf="file.status === ViewFile.Status.VALIDATING"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.VALIDATING"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/validated.svg" id="validated"
-                 *ngIf="file.status === ViewFile.Status.VALIDATED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.VALIDATED"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/corrupt.svg" id="corrupt"
-                 *ngIf="file.status === ViewFile.Status.CORRUPT"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.CORRUPT"
                  alt="" aria-hidden="true" />
             <img src="assets/icons/move-failed.png" id="move-failed"
-                 *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
+                 *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.MOVE_FAILED"
                  alt="" aria-hidden="true" />
             <!-- don't show text for default status unless the file is local-only -->
             <span *ngIf="file.status != ViewFile.Status.DEFAULT &&
@@ -56,9 +56,9 @@
                          file.status != ViewFile.Status.MOVE_SUCCEEDED &&
                          !file.isLocalOnly"
                   class="text">{{file.status | capitalize}}</span>
-            <span *ngIf="file.status === ViewFile.Status.MOVE_FAILED"
+            <span *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.MOVE_FAILED"
                   class="text move-failed-text">Final move failed</span>
-            <span *ngIf="file.status === ViewFile.Status.MOVE_SUCCEEDED"
+            <span *ngIf="!file.isLocalOnly && file.status === ViewFile.Status.MOVE_SUCCEEDED"
                   class="text">Move succeeded</span>
             <span *ngIf="file.isLocalOnly"
                   class="text">Local Only</span>
@@ -71,7 +71,6 @@
             <div class="text">
                 <div class="title">
                     {{file.name}}
-                    <span class="path-pair-label" *ngIf="file.pathPairName">{{file.pathPairName}}</span>
                 </div>
                 <div class="details" *ngIf="(options | async)?.showDetails">
                     <div class="details-text">
