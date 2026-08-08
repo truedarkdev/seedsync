@@ -92,8 +92,6 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process = MagicMock()
         self.controller._Controller__mp_logger = MagicMock()
         self.controller._Controller__updater = MagicMock()
-        self.controller._Controller__stop_resume_trace_logger = MagicMock()
-        self.controller._Controller__stop_resume_trace_file_id = None
         self.controller._Controller__target_archive_trace_logger = MagicMock()
         self.controller._Controller__target_archive_trace_file_id = None
         self.controller._Controller__target_archive_trace_last_signature = None
@@ -6398,7 +6396,7 @@ class TestController(unittest.TestCase):
             exclude_patterns="*.nfo,Sample/"
         )
 
-    def test_process_commands_queue_logs_fresh_and_resume_like_trace_details(self):
+    def test_process_commands_queue_records_sanitized_boundary_breadcrumb(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.remote_size = 10
@@ -6409,8 +6407,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {
             "movies": "/local/movies/incomplete"
         }
-        self.controller._Controller__stop_resume_trace_file_id = file.file_id
-        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        breadcrumb_trace = self.controller._Controller__context.breadcrumb_trace
+        breadcrumb_trace.is_enabled.return_value = True
         temp_path = os.path.join("/local/movies/incomplete", "dup.lftp")
         sidecar_path = temp_path + ".lftp-pget-status"
 
@@ -6421,42 +6419,35 @@ class TestController(unittest.TestCase):
                 return SimpleNamespace(st_size=64, st_mtime=222)
             raise OSError(path)
 
-        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
-                patch.object(trace_logger, "info") as trace_info:
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect):
             self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
             self.controller._Controller__process_commands()
 
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
+        boundary_calls = [call for call in breadcrumb_trace.record.call_args_list if call.args[1] == "stop_resume_boundary"]
+        payload = boundary_calls[-1].args[2]
         self.assertEqual("queue_fresh", payload["reason"])
         self.assertEqual(file.file_id, payload["file_id"])
-        self.assertEqual("dup", payload["filename"])
         self.assertEqual("DEFAULT", payload["current_state"])
-        self.assertEqual("/local/movies/incomplete", payload["local_base_dir_path"])
-        self.assertEqual(temp_path, payload["temp_path"])
-        self.assertTrue(payload["temp_exists"])
-        self.assertEqual(250, payload["temp_apparent_size"])
-        self.assertEqual(4096, payload["temp_allocated_size"])
-        self.assertEqual(sidecar_path, payload["sidecar_path"])
-        self.assertTrue(payload["sidecar_exists"])
-        self.assertEqual(64, payload["sidecar_size"])
-        self.assertEqual(222, payload["sidecar_mtime"])
+        self.assertEqual(250, payload["temp"]["size"])
+        self.assertEqual(4096, payload["temp"]["allocated_size"])
+        self.assertEqual(64, payload["sidecar"]["size"])
+        self.assertEqual(222, payload["sidecar"]["mtime"])
+        self.assertNotIn("local_base_dir_path", str(payload))
+        self.assertNotIn("temp_path", str(payload))
         self.assertFalse(payload["stopped_marked"])
 
         self.controller._Controller__persist.stopped_file_names = {file.file_id}
-        trace_logger.reset_mock()
-        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
-                patch.object(trace_logger, "info") as trace_info:
+        breadcrumb_trace.record.reset_mock()
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect):
             self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
             self.controller._Controller__process_commands()
 
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
+        boundary_calls = [call for call in breadcrumb_trace.record.call_args_list if call.args[1] == "stop_resume_boundary"]
+        payload = boundary_calls[-1].args[2]
         self.assertEqual("queue_after_stop", payload["reason"])
         self.assertTrue(payload["stopped_marked"])
-        self.assertEqual(temp_path, payload["temp_path"])
 
-    def test_process_commands_queue_logs_trace_for_bare_filename_selector(self):
+    def test_process_commands_queue_captures_without_per_file_selector(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.remote_size = 10
@@ -6467,19 +6458,17 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {
             "movies": "/local/movies/incomplete"
         }
-        self.controller._Controller__stop_resume_trace_file_id = file.name
-        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        breadcrumb_trace = self.controller._Controller__context.breadcrumb_trace
+        breadcrumb_trace.is_enabled.return_value = True
 
-        with patch.object(trace_logger, "info") as trace_info:
-            self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
-            self.controller._Controller__process_commands()
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
 
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
+        boundary_calls = [call for call in breadcrumb_trace.record.call_args_list if call.args[1] == "stop_resume_boundary"]
+        payload = boundary_calls[-1].args[2]
         self.assertEqual(file.file_id, payload["file_id"])
-        self.assertEqual("dup", payload["filename"])
 
-    def test_process_commands_queue_does_not_match_unrelated_trace_selector(self):
+    def test_process_commands_queue_trace_is_globally_gated(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.remote_size = 10
@@ -6490,16 +6479,20 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {
             "movies": "/local/movies/incomplete"
         }
-        self.controller._Controller__stop_resume_trace_file_id = "other-name"
-        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        breadcrumb_trace = self.controller._Controller__context.breadcrumb_trace
+        breadcrumb_trace.is_enabled.return_value = False
 
-        with patch.object(trace_logger, "info") as trace_info:
+        with patch("controller.controller.os.stat") as stat_mock:
             self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
             self.controller._Controller__process_commands()
+        stat_mock.assert_not_called()
 
-        trace_info.assert_not_called()
+        self.assertFalse(any(
+            call.args[1] == "stop_resume_boundary"
+            for call in breadcrumb_trace.record.call_args_list
+        ))
 
-    def test_process_commands_stop_logs_trace_details(self):
+    def test_process_commands_stop_records_boundary_breadcrumb(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
         file.remote_size = 10
@@ -6512,8 +6505,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {
             "movies": "/local/movies/incomplete"
         }
-        self.controller._Controller__stop_resume_trace_file_id = file.file_id
-        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        breadcrumb_trace = self.controller._Controller__context.breadcrumb_trace
+        breadcrumb_trace.is_enabled.return_value = True
         temp_path = os.path.join("/local/movies/incomplete", "dup.lftp")
         sidecar_path = temp_path + ".lftp-pget-status"
 
@@ -6525,30 +6518,26 @@ class TestController(unittest.TestCase):
             raise OSError(path)
 
         self.controller._Controller__lftp.kill.return_value = True
-        with patch("controller.controller.os.stat", side_effect=stat_side_effect), \
-                patch.object(trace_logger, "info") as trace_info:
+        with patch("controller.controller.os.stat", side_effect=stat_side_effect):
             self.controller.queue_command(Controller.Command(Controller.Command.Action.STOP, file.file_id))
             self.controller._Controller__process_commands()
 
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
+        boundary_calls = [call for call in breadcrumb_trace.record.call_args_list if call.args[1] == "stop_resume_boundary"]
+        payload = boundary_calls[-1].args[2]
         self.assertEqual("stop", payload["reason"])
         self.assertEqual(file.file_id, payload["file_id"])
-        self.assertEqual("dup", payload["filename"])
         self.assertEqual("DOWNLOADING", payload["current_state"])
-        self.assertEqual("/local/movies/incomplete", payload["local_base_dir_path"])
-        self.assertEqual(temp_path, payload["temp_path"])
-        self.assertTrue(payload["temp_exists"])
-        self.assertEqual(250, payload["temp_apparent_size"])
-        self.assertEqual(4096, payload["temp_allocated_size"])
-        self.assertEqual(sidecar_path, payload["sidecar_path"])
-        self.assertTrue(payload["sidecar_exists"])
-        self.assertEqual(64, payload["sidecar_size"])
+        self.assertEqual(250, payload["temp"]["size"])
+        self.assertEqual(4096, payload["temp"]["allocated_size"])
+        self.assertEqual(64, payload["sidecar"]["size"])
+        self.assertEqual(222, payload["sidecar"]["mtime"])
+        self.assertNotIn("local_base_dir_path", str(payload))
+        self.assertNotIn("remote_base_dir_path", str(payload))
 
-    def test_recover_interrupted_downloads_logs_trace_details(self):
+    def test_recover_interrupted_downloads_records_boundary_breadcrumb(self):
         self.controller._Controller__persist.downloaded_file_names = set()
-        self.controller._Controller__stop_resume_trace_file_id = "movie.mkv"
-        trace_logger = self.controller._Controller__stop_resume_trace_logger
+        breadcrumb_trace = self.controller._Controller__context.breadcrumb_trace
+        breadcrumb_trace.is_enabled.return_value = True
         temp_path = os.path.join("/local/incomplete", "movie.mkv.lftp")
         sidecar_path = temp_path + ".lftp-pget-status"
 
@@ -6562,20 +6551,15 @@ class TestController(unittest.TestCase):
         remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
         with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
                 patch("controller.controller.os.path.isdir", return_value=False), \
-                patch("controller.controller.os.stat", side_effect=stat_side_effect), \
-                patch.object(trace_logger, "info") as trace_info:
+                patch("controller.controller.os.stat", side_effect=stat_side_effect):
             self.controller._Controller__recover_interrupted_downloads([remote_file])
 
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
+        boundary_calls = [call for call in breadcrumb_trace.record.call_args_list if call.args[1] == "stop_resume_boundary"]
+        payload = boundary_calls[-1].args[2]
         self.assertEqual("recover_interrupted_download", payload["reason"])
         self.assertEqual("movie.mkv", payload["file_id"])
-        self.assertEqual("movie.mkv", payload["filename"])
-        self.assertEqual("/local/incomplete", payload["local_base_dir_path"])
-        self.assertEqual(temp_path, payload["temp_path"])
-        self.assertTrue(payload["temp_exists"])
-        self.assertEqual(250, payload["temp_apparent_size"])
-        self.assertEqual(4096, payload["temp_allocated_size"])
-        self.assertEqual(sidecar_path, payload["sidecar_path"])
-        self.assertTrue(payload["sidecar_exists"])
-        self.assertEqual(64, payload["sidecar_size"])
+        self.assertEqual(250, payload["temp"]["size"])
+        self.assertEqual(4096, payload["temp"]["allocated_size"])
+        self.assertEqual(64, payload["sidecar"]["size"])
+        self.assertNotIn("local_base_dir_path", str(payload))
+        self.assertNotIn("remote_base_dir_path", str(payload))

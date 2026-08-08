@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import time
 import unittest
 import json
 from pathlib import Path
@@ -18,6 +19,7 @@ from controller.model_builder import _RecentLiveTransferSnapshot
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 
 
 class TestModelBuilder(unittest.TestCase):
@@ -31,6 +33,20 @@ class TestModelBuilder(unittest.TestCase):
         handler.setFormatter(formatter)
         self.model_builder = ModelBuilder()
         self.model_builder.set_base_logger(logger)
+
+    def __enable_trace(self, enabled: bool = True) -> BreadcrumbTraceCollector:
+        self.__trace_enabled = [enabled]
+        collector = BreadcrumbTraceCollector(lambda: self.__trace_enabled[0], max_entries=128)
+        self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
+        return collector
+
+    @staticmethod
+    def __trace_entries(collector: BreadcrumbTraceCollector) -> list[dict[str, object]]:
+        # Breadcrumb emitters use a multiprocessing.Queue so worker processes
+        # never block model work. Give its feeder a bounded moment to publish a
+        # same-cycle burst before asserting the complete retained window.
+        time.sleep(0.05)
+        return collector.snapshot()["entries"]
 
     def __set_transfer_sources(self, file_name: str, path_pair_id: str, local_size: int = 650) -> str:
         remote_file = SystemFile(file_name, 1000, False)
@@ -4019,31 +4035,22 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.VALIDATING, model.get_file("a").state)
         self.assertEqual(35, model.get_file("a").validation_progress)
 
-    def test_stop_resume_trace_is_target_specific(self):
+    def test_trace_disabled_is_noop_and_sse_metadata_absent(self):
+        collector = self.__enable_trace(False)
         remote_file = SystemFile("a", 1000, False)
         local_file = SystemFile("a", 250, False)
-        running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
-        running_status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
-
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
         self.model_builder.set_remote_files([remote_file])
         self.model_builder.set_local_files([local_file])
-        self.model_builder.set_lftp_statuses([running_status])
-        self.model_builder.set_stop_resume_trace_file_id("b")
+        self.model_builder.set_lftp_statuses([status])
         self.model_builder.begin_stop_resume_trace_cycle(1)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        self.assertEqual([], self.__trace_entries(collector))
+        self.assertIsNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("a")))
 
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info:
-            model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual("target_not_rendered", payload["event"])
-        self.assertEqual("rebuilt", payload["model_source"])
-        self.assertEqual("b", payload["target_file_id"])
-        self.assertIsNone(payload["final_model"])
-
-    def test_stop_resume_trace_logs_arbitration_for_selected_file(self):
+    def test_trace_captures_all_active_files_with_canonical_ids(self):
         file_name = "verifier-stop-regression-1g.bin"
         remote_file = SystemFile(file_name, 1073741824, False)
         local_file = SystemFile(file_name, 1067800592, False)
@@ -4055,43 +4062,35 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_file])
         self.model_builder.set_active_files([active_file])
         self.model_builder.set_lftp_statuses([running_status])
-        self.model_builder.set_stop_resume_trace_file_id(file_name)
+        collector = self.__enable_trace()
         self.model_builder.begin_stop_resume_trace_cycle(3)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        entries = self.__trace_entries(collector)
+        self.assertEqual({file_name}, {entry["file_id"] for entry in entries})
+        self.assertTrue(entries[0]["corr_id"].startswith("stop-resume:" + file_name + ":3"))
+        details = entries[0]["details"]
+        for key in (
+            "model_source",
+            "update_context",
+            "recent_snapshot_present",
+            "retained_snapshot_present",
+            "raw_lftp_status",
+            "matched_local",
+            "local_data_role",
+            "local_size_apparent",
+            "local_size_allocated",
+            "presence",
+            "arbitration_source",
+            "final_model",
+            "context",
+        ):
+            self.assertIn(key, details)
+        self.assertEqual({"present": True, "is_staging": False}, details["matched_local"])
+        self.assertNotIn("C:\\seedsync", str(details))
+        self.assertNotIn("command", str(details).lower())
 
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info:
-            model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        self.assertEqual("stop_resume_trace %s", trace_info.call_args[0][0])
-        payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual(3, payload["cycle"])
-        self.assertEqual("arbitration", payload["event"])
-        self.assertEqual("rebuilt", payload["model_source"])
-        self.assertEqual("none", payload["snapshot_source"])
-        self.assertEqual("authoritative", payload["local_freshness"])
-        self.assertFalse(payload["recent_snapshot_present"])
-        self.assertFalse(payload["retained_snapshot_present"])
-        self.assertEqual(file_name, payload["resolved_identity"]["file_id"])
-        self.assertEqual(file_name, payload["resolved_identity"]["root_file_id"])
-        self.assertEqual("RUNNING", payload["raw_lftp_status"]["state"])
-        self.assertEqual(7, payload["raw_lftp_status"]["job_id"])
-        self.assertEqual(1044601281, payload["raw_lftp_status"]["transfer"]["size_local"])
-        self.assertEqual(97, payload["raw_lftp_status"]["transfer"]["percent_local"])
-        self.assertEqual(1067800592, payload["local_size_apparent"])
-        self.assertIsNone(payload["local_size_allocated"])
-        self.assertEqual({
-            "remote": True,
-            "local": True,
-            "active": True,
-        }, payload["presence"])
-        self.assertEqual("live_status", payload["arbitration_source"])
-        self.assertEqual("DOWNLOADING", payload["final_model"]["state"])
-        self.assertEqual(1044601281, payload["final_model"]["transferred_size"])
-        self.assertEqual(97, payload["final_model"]["download_progress"])
-
-    def test_stop_resume_trace_reports_allocated_size_for_selected_staging_file(self):
+    def test_trace_boundary_details_omit_local_paths(self):
         file_name = "verifier-stop-regression-allocated.bin"
         remote_file = SystemFile(file_name, 1000, False)
         local_file = SystemFile(file_name, 250, False, is_staging=True)
@@ -4108,23 +4107,16 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_remote_files([remote_file])
         self.model_builder.set_local_files([local_file])
         self.model_builder.set_lftp_statuses([running_status])
-        self.model_builder.set_stop_resume_trace_file_id(file_name)
+        collector = self.__enable_trace()
         self.model_builder.begin_stop_resume_trace_cycle(4)
-
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info, \
-             patch("controller.model_builder.os.path.exists", side_effect=lambda path: path == selected_local_path), \
-             patch("controller.model_builder.os.stat", return_value=SimpleNamespace(st_blocks=8)):
-            model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual(4096, payload["local_size_allocated"])
-        self.assertEqual(250, payload["local_size_apparent"])
-        self.assertEqual("staging", payload["local_freshness"])
-        self.assertEqual({"name": file_name, "path": selected_local_path}, payload["matched_local"])
-        self.assertEqual("presence", payload["local_data_role"])
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        entries = self.__trace_entries(collector)
+        self.assertEqual(1, len(entries))
+        details = entries[0]["details"]
+        self.assertNotIn("C:\\seedsync", str(details))
+        self.assertNotIn("local_base_dir_path", str(details))
+        self.assertNotIn("remote_base_dir_path", str(details))
 
     def test_set_local_root_paths_invalidates_cached_model_when_paths_change(self):
         remote_file = SystemFile("a", 1000, False)
@@ -4141,7 +4133,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertTrue(self.model_builder.has_changes())
 
-    def test_stop_resume_trace_logs_arbitration_for_qualified_root_file_id_selected_by_root_name(self):
+    def test_trace_duplicate_basenames_remain_path_pair_isolated(self):
         remote_file = SystemFile("backup.zip", 1000, False)
         remote_file.path_pair_id = "homeserver"
         remote_file.path_pair_name = "Home Server"
@@ -4156,30 +4148,32 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_remote_files([remote_file])
         self.model_builder.set_local_files([local_file])
         self.model_builder.set_lftp_statuses([running_status])
-        self.model_builder.set_stop_resume_trace_file_id("backup.zip")
+        second_remote = SystemFile("backup.zip", 900, False)
+        second_remote.path_pair_id = "laptop"
+        second_status = LftpJobStatus(8, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "backup.zip", "")
+        second_status.path_pair_id = "laptop"
+        second_status.total_transfer_state = LftpJobStatus.TransferState(100, 900, 11, 20, 40)
+        collector = self.__enable_trace()
+        self.model_builder.set_remote_files([remote_file, second_remote])
+        self.model_builder.set_lftp_statuses([running_status, second_status])
         self.model_builder.begin_stop_resume_trace_cycle(4)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        entries = self.__trace_entries(collector)
+        expected_ids = {
+            ModelFile.build_file_id("backup.zip", "homeserver"),
+            ModelFile.build_file_id("backup.zip", "laptop"),
+        }
+        self.assertEqual(expected_ids, {entry["file_id"] for entry in entries})
+        self.assertEqual(expected_ids, set(model.get_file_ids()))
 
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info:
-            model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual("arbitration", payload["event"])
-        self.assertEqual(ModelFile.build_file_id("backup.zip", "homeserver"), payload["resolved_identity"]["file_id"])
-        self.assertEqual("homeserver", payload["resolved_identity"]["path_pair_id"])
-        self.assertEqual({"name": "backup.zip", "path": None}, payload["matched_local"])
-        self.assertEqual("presence", payload["local_data_role"])
-
-    def test_stop_resume_trace_logs_snapshot_sources_for_selected_file(self):
+    def test_trace_changed_context_is_retained_and_unchanged_cycles_coalesce(self):
         remote_file = SystemFile("a", 1000, False)
         local_file = SystemFile("a", 100, False, is_staging=True)
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
+        collector = self.__enable_trace()
 
         self.model_builder.set_remote_files([remote_file])
         self.model_builder.set_local_files([local_file])
-        self.model_builder.set_stop_resume_trace_file_id("a")
         self.model_builder._ModelBuilder__recent_live_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
             root_file_id="a",
             size_local=250,
@@ -4189,46 +4183,68 @@ class TestModelBuilder(unittest.TestCase):
         )
         self.model_builder.begin_stop_resume_trace_cycle(6)
 
-        with patch.object(trace_logger, "info") as trace_info:
-            recent_model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(recent_model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        recent_payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual("rebuilt", recent_payload["model_source"])
-        self.assertEqual("recent_live_snapshot", recent_payload["snapshot_source"])
-        self.assertEqual("staging", recent_payload["local_freshness"])
-        self.assertTrue(recent_payload["recent_snapshot_present"])
-        self.assertFalse(recent_payload["retained_snapshot_present"])
-
-        self.model_builder.clear()
-        authoritative_local_file = SystemFile("a", 250, False)
-        self.model_builder.set_remote_files([remote_file])
-        self.model_builder.set_local_files([authoritative_local_file])
-        self.model_builder.set_stopped_files({"a"})
-        self.model_builder.set_stop_resume_trace_file_id("a")
-        self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots["a"] = _RecentLiveTransferSnapshot(
-            root_file_id="a",
-            size_local=250,
-            percent_local=25,
-            speed=50,
-            eta=15
-        )
+        recent_model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(recent_model, True)
+        first_count = len(self.__trace_entries(collector))
+        self.assertEqual(1, first_count)
         self.model_builder.begin_stop_resume_trace_cycle(7)
+        self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
+        self.assertEqual(first_count + 1, len(self.__trace_entries(collector)))
+        self.model_builder.begin_stop_resume_trace_cycle(8)
+        self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
+        self.assertEqual(first_count + 1, len(self.__trace_entries(collector)))
+        self.model_builder.begin_stop_resume_trace_cycle(9)
+        self.model_builder.set_stop_resume_trace_cycle_context({"lftp_status_source": "fresh_healthy"})
+        self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
+        self.assertEqual(first_count + 2, len(self.__trace_entries(collector)))
 
-        with patch.object(trace_logger, "info") as trace_info:
-            retained_model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(retained_model, True)
+    def test_trace_alternating_events_keep_unchanged_arbitration_coalesced(self):
+        remote_file = SystemFile("interleave.bin", 1000, False)
+        local_file = SystemFile("interleave.bin", 100, False)
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "interleave.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(100, 1000, 10, 25, 30)
+        collector = self.__enable_trace()
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_lftp_statuses([status])
 
-        self.assertEqual(1, trace_info.call_count)
-        retained_payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual("rebuilt", retained_payload["model_source"])
-        self.assertEqual("retained_stopped_snapshot", retained_payload["snapshot_source"])
-        self.assertEqual("authoritative", retained_payload["local_freshness"])
-        self.assertFalse(retained_payload["recent_snapshot_present"])
-        self.assertTrue(retained_payload["retained_snapshot_present"])
+        self.model_builder.begin_stop_resume_trace_cycle(20)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        self.assertEqual(1, len(self.__trace_entries(collector)))
 
-    def test_stop_resume_trace_logs_arbitration_for_exact_qualified_file_id_selector(self):
+        self.model_builder.begin_stop_resume_trace_cycle(21)
+        self.model_builder.finish_stop_resume_trace_cycle(model, False)
+        self.assertEqual(2, len(self.__trace_entries(collector)))
+
+        self.model_builder.begin_stop_resume_trace_cycle(22)
+        self.model_builder.request_rebuild()
+        rebuilt_model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(rebuilt_model, True)
+        self.assertEqual(2, len(self.__trace_entries(collector)))
+
+    def test_trace_signature_cache_is_bounded_and_clearable(self):
+        collector = self.__enable_trace()
+        self.model_builder.begin_stop_resume_trace_cycle(30)
+        cache_limit = self.model_builder._ModelBuilder__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE
+        for index in range(cache_limit + 32):
+            self.model_builder._ModelBuilder__trace_cycle_event(
+                "arbitration",
+                {
+                    "file_id": "churn-{}".format(index),
+                    "model_source": "rebuilt",
+                },
+            )
+
+        cache = self.model_builder._ModelBuilder__stop_resume_trace_last_signatures
+        self.assertEqual(cache_limit, len(cache))
+        self.assertNotIn(("churn-0", "arbitration"), cache)
+        self.assertIn(("churn-{}".format(cache_limit + 31), "arbitration"), cache)
+        self.assertTrue(self.__trace_entries(collector))
+        self.model_builder.clear()
+        self.assertEqual(0, len(self.model_builder._ModelBuilder__stop_resume_trace_last_signatures))
+
+    def test_trace_metadata_uses_canonical_path_pair_identity(self):
         remote_file = SystemFile("backup.zip", 1000, False)
         remote_file.path_pair_id = "homeserver"
         running_status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "backup.zip", "")
@@ -4238,18 +4254,14 @@ class TestModelBuilder(unittest.TestCase):
 
         self.model_builder.set_remote_files([remote_file])
         self.model_builder.set_lftp_statuses([running_status])
-        self.model_builder.set_stop_resume_trace_file_id(qualified_file_id)
+        collector = self.__enable_trace()
         self.model_builder.begin_stop_resume_trace_cycle(5)
-
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info:
-            model = self.model_builder.build_model()
-            self.model_builder.finish_stop_resume_trace_cycle(model, True)
-
-        self.assertEqual(1, trace_info.call_count)
-        payload = json.loads(trace_info.call_args[0][1])
-        self.assertEqual("arbitration", payload["event"])
-        self.assertEqual(qualified_file_id, payload["resolved_identity"]["file_id"])
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        metadata = self.model_builder.stop_resume_trace_metadata_for_file(model.get_file(qualified_file_id))
+        self.assertEqual(qualified_file_id, metadata["file_id"])
+        self.assertIn(qualified_file_id, metadata["corr_id"])
+        self.assertTrue(self.__trace_entries(collector))
 
     def test_target_archive_trace_logs_selected_file_arbitration(self):
         file_name = "archive.zip"
@@ -4274,26 +4286,57 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual("live_transfer", payload["source_kind"])
         self.assertFalse(payload["markers"]["downloaded"])
 
-    def test_stop_resume_trace_throttles_repeated_idle_cycle_events(self):
-        self.model_builder.set_stop_resume_trace_file_id("missing-file")
-        self.model_builder.begin_stop_resume_trace_cycle(1)
+    def test_inactive_unrelated_files_are_not_traced(self):
+        collector = self.__enable_trace()
+        self.model_builder.set_remote_files([
+            SystemFile("active.bin", 1000, False),
+            SystemFile("idle.bin", 1000, False),
+        ])
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.begin_stop_resume_trace_cycle(10)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        self.assertEqual({"active.bin"}, {entry["file_id"] for entry in self.__trace_entries(collector)})
 
-        trace_logger = self.model_builder._ModelBuilder__stop_resume_trace_logger
-        with patch.object(trace_logger, "info") as trace_info:
-            empty_model = Model()
-            self.model_builder.finish_stop_resume_trace_cycle(empty_model, True)
-            self.model_builder.begin_stop_resume_trace_cycle(2)
-            self.model_builder.finish_stop_resume_trace_cycle(empty_model, True)
-            self.model_builder.begin_stop_resume_trace_cycle(3)
-            self.model_builder.finish_stop_resume_trace_cycle(empty_model, False)
+    def test_live_status_remains_relevant_after_terminal_reconciliation(self):
+        remote_file = SystemFile("done.bin", 100, False)
+        local_file = SystemFile("done.bin", 100, False)
+        idle_active_scan_file = SystemFile("idle.bin", 100, False)
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "done.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(100, 100, 100, 0, 0)
+        collector = self.__enable_trace()
+        self.model_builder.set_remote_files([remote_file, idle_active_scan_file])
+        self.model_builder.set_local_files([local_file])
+        self.model_builder.set_active_files([idle_active_scan_file])
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.begin_stop_resume_trace_cycle(13)
+        model = self.model_builder.build_model()
 
-        self.assertEqual(2, trace_info.call_count)
-        first_payload = json.loads(trace_info.call_args_list[0][0][1])
-        second_payload = json.loads(trace_info.call_args_list[1][0][1])
-        self.assertEqual("target_not_rendered", first_payload["event"])
-        self.assertEqual("rebuilt", first_payload["model_source"])
-        self.assertEqual("no_rebuild", second_payload["event"])
-        self.assertEqual("cached", second_payload["model_source"])
+        self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("done.bin").state)
+        self.assertIsNotNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("done.bin")))
+        self.assertIsNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("idle.bin")))
+        self.assertEqual({"done.bin"}, {entry["file_id"] for entry in self.__trace_entries(collector)})
+
+    def test_disabled_to_enabled_hot_toggle_captures_without_restart(self):
+        collector = self.__enable_trace(False)
+        remote_file = SystemFile("hot.bin", 1000, False)
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "hot.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.begin_stop_resume_trace_cycle(11)
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        self.assertEqual([], self.__trace_entries(collector))
+        self.__trace_enabled[0] = True
+        collector.sync_enabled_state()
+        self.model_builder.begin_stop_resume_trace_cycle(12)
+        self.model_builder.request_rebuild()
+        model = self.model_builder.build_model()
+        self.model_builder.finish_stop_resume_trace_cycle(model, True)
+        self.assertTrue(self.__trace_entries(collector))
 
     def test_build_model_preserves_validation_status_across_rebuilds(self):
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])

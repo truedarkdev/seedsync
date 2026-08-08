@@ -41,6 +41,7 @@ class _ControllerCoreAccess:
     _Controller__persist: ControllerPersist
     _Controller__model: Model
     _Controller__model_builder: ModelBuilder
+    _Controller__stop_resume_trace_cycle_id: int
     _Controller__path_pairs_by_id: dict[str, PathPair]
     _Controller__active_scan_process: ScannerProcess
     _Controller__local_scan_process: ScannerProcess
@@ -463,6 +464,27 @@ class ModelUpdater(_ControllerCoreAccess):
         )
 
     def update(self) -> None:
+        """Run one model refresh bracketed by the optional trace cycle."""
+        controller = self._controller
+        cycle_id = getattr(controller, "_Controller__stop_resume_trace_cycle_id", 0) + 1
+        controller._Controller__stop_resume_trace_cycle_id = cycle_id
+        model_builder = controller._Controller__model_builder
+        model_builder.begin_stop_resume_trace_cycle(cycle_id)
+        build_triggered = False
+        try:
+            build_triggered = self._update_once()
+        finally:
+            # Keep the no-rebuild case observable and finish only after all
+            # model listeners have seen the applied diff.
+            try:
+                model_builder.finish_stop_resume_trace_cycle(
+                    controller._Controller__model,
+                    build_triggered,
+                )
+            except Exception:
+                controller.logger.debug("Ignoring stop/resume trace finalization failure", exc_info=True)
+
+    def _update_once(self) -> bool:
         controller = self._controller
         model_builder = controller._Controller__model_builder
         persist = controller._Controller__persist
@@ -681,6 +703,16 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__active_downloading_file_names,
             latest_active_scan,
         )
+
+        model_builder.set_stop_resume_trace_cycle_context({
+            "lftp_status_source": lftp_status_source,
+            "lftp_status_healthy": lftp_status_poll_healthy,
+            "lftp_status_fresh": lftp_status_snapshot_fresh,
+            "lftp_status_count": len(lftp_statuses) if lftp_statuses is not None else None,
+            "active_scan_arrived": latest_active_scan is not None,
+            "local_scan_arrived": latest_local_scan is not None,
+            "remote_scan_arrived": latest_remote_scan is not None,
+        })
 
         # Update model builder state.
         remote_files: list[SystemFile] = []
@@ -947,7 +979,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     remote_file_ids,
                     protected_file_ids,
                 )
-        if model_builder.has_changes():
+        build_triggered = model_builder.has_changes()
+        if build_triggered:
             new_model = model_builder.build_model()
 
             with controller._Controller__model_lock:
@@ -1444,3 +1477,4 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
+        return build_triggered

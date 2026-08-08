@@ -376,6 +376,40 @@ describe("Testing model file service", () => {
         expect(file.remote_has_transferable_content).toBe(false);
     }));
 
+    it("should apply target trace metadata without changing model semantics", fakeAsync(() => {
+        let latestModel: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(model => latestModel = model);
+        modelFileService.notifyEvent("model-init", JSON.stringify([{
+            file_id: "target",
+            name: "target.bin",
+            is_dir: false,
+            state: "downloading",
+            download_progress: 12,
+            transferred_size: 100,
+            children: []
+        }]));
+        modelFileService.notifyEvent("model-updated", JSON.stringify({
+            trace: {
+                cycle: 3,
+                corr_id: "stop-resume:target:3",
+                stream_emit_sequence: 1
+            },
+            old_file: {file_id: "target", name: "target.bin", state: "downloading", children: []},
+            new_file: {
+                file_id: "target",
+                name: "target.bin",
+                state: "downloading",
+                download_progress: 25,
+                transferred_size: 200,
+                children: []
+            }
+        }));
+        tick();
+
+        expect(latestModel.get("target").download_progress).toBe(25);
+        expect(latestModel.get("target").transferred_size).toBe(200);
+    }));
+
     it("should send empty model on disconnect", fakeAsync(() => {
         let count = 0;
         let latestModel: Immutable.Map<string, ModelFile> = null;

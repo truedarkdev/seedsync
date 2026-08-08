@@ -668,6 +668,24 @@ started through the Compose helper above. Use that host address with the
 manual helper; `host.docker.internal` is not needed for this loopback-only
 bind.
 
+## Stop/Resume Progress Trace
+
+Enable **Enable breadcrumb trace recorder** under
+`Settings > Other Settings > Diagnostics` before reproducing a pause or
+stop/resume issue. Capture starts dynamically for all active, queued, stopped,
+and recently retained transfers; no restart, environment variable, or per-file
+setup is required. The bounded in-memory records correlate canonical file ids
+through model arbitration/no-rebuild, LFTP/scan context, SSE enqueue/emit, and
+Angular receipt/application timing.
+
+Read retained entries after reproduction with
+`GET /server/breadcrumbs/get?file_id=<encoded>&order=asc` (or omit `file_id` to
+inspect the bounded window). Entries are state-change driven and deduplicated,
+and later activity can evict older records when the retention limit is reached.
+Use the stream correlation fields to distinguish model arbitration from server
+queue pressure or browser-side lag; normal transfer commands, model delivery,
+and UI behavior are unchanged when tracing is disabled.
+
 
 
 ## Run Docker Image

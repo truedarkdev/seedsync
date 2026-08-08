@@ -3,17 +3,19 @@
 import os
 import logging
 from datetime import datetime
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, List, NamedTuple, Optional, Set, Tuple, cast
 import math
 import json
+import time
 
 # my libs
 from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
+from common.breadcrumb_trace import BreadcrumbTraceEmitter
 from .extract import ExtractStatus, Extract
 from .validate import ValidateStatus
 
@@ -52,9 +54,13 @@ class ModelBuilder:
       * remote file system as a Dict[name, SystemFile]
       * lftp status as Dict[name, LftpJobStatus]
     """
+    # Keep diagnostic dedupe state bounded independently from the breadcrumb
+    # window.  A transfer workload can churn through many canonical file ids;
+    # the oldest signatures are evicted deterministically once this cap is hit.
+    __STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE = 256
+
     def __init__(self):
         self.logger = logging.getLogger("ModelBuilder")
-        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
@@ -78,15 +84,15 @@ class ModelBuilder:
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
         self.__cached_model: Optional[Model] = None
-        self.__stop_resume_trace_file_id: Optional[str] = None
         self.__stop_resume_trace_cycle_id: Optional[int] = None
-        self.__stop_resume_trace_emitted = False
-        self.__stop_resume_trace_last_idle_signature: Optional[str] = None
+        self.__stop_resume_trace_cycle_context: dict[str, object] = {}
+        self.__stop_resume_trace_breadcrumb: Optional[BreadcrumbTraceEmitter] = None
+        self.__stop_resume_trace_last_signatures: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self.__stop_resume_trace_last_enabled = False
         self.__target_archive_trace_last_signature: Optional[str] = None
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("ModelBuilder")
-        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
 
     @staticmethod
@@ -96,26 +102,46 @@ class ModelBuilder:
         logger.propagate = False
         return logger
 
-    def set_stop_resume_trace_file_id(self, file_id: Optional[str]) -> None:
-        self.__stop_resume_trace_file_id = file_id.strip() if file_id is not None and file_id.strip() else None
-        self.__stop_resume_trace_last_idle_signature = None
+    def set_stop_resume_trace_breadcrumb(self, emitter: Optional[BreadcrumbTraceEmitter]) -> None:
+        """Attach the shared opt-in bounded breadcrumb emitter."""
+        self.__stop_resume_trace_breadcrumb = emitter
+
+    def is_stop_resume_trace_enabled(self) -> bool:
+        """Expose the current fail-closed diagnostic gate to stream emitters."""
+        return self.__is_stop_resume_trace_enabled()
+
+    def set_stop_resume_trace_cycle_context(self, context: Optional[dict[str, object]]) -> None:
+        self.__stop_resume_trace_cycle_context = dict(context or {})
+
+    def stop_resume_trace_metadata_for_file(self, model_file: Optional[ModelFile]) -> Optional[dict[str, object]]:
+        """Return metadata for active/recent transfer SSE correlation."""
+        if model_file is None or not self.__is_stop_resume_trace_enabled() or \
+                not self.__is_relevant_trace_file(model_file):
+            return None
+        cycle = self.__stop_resume_trace_cycle_id
+        if cycle is None:
+            return None
+        return {
+            "cycle": cycle,
+            "corr_id": "stop-resume:{}:{}".format(model_file.file_id, cycle),
+            "file_id": model_file.file_id,
+            "context": dict(self.__stop_resume_trace_cycle_context),
+            "backend_timestamp_ms": int(time.time_ns() / 1_000_000),
+        }
 
     def __is_stop_resume_trace_enabled(self) -> bool:
-        return self.__stop_resume_trace_file_id is not None
-
-    @staticmethod
-    def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
-        if identifier is None:
-            return None
+        emitter = self.__stop_resume_trace_breadcrumb
+        if emitter is None:
+            self.__stop_resume_trace_last_enabled = False
+            return False
         try:
-            parsed_identifier = json.loads(identifier)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return identifier
-        if isinstance(parsed_identifier, list):
-            parsed_items = cast(list[object], parsed_identifier)
-            if len(parsed_items) == 2 and isinstance(parsed_items[1], str):
-                return parsed_items[1]
-        return identifier
+            enabled = bool(emitter.is_enabled())
+        except Exception:
+            enabled = False
+        if enabled and not self.__stop_resume_trace_last_enabled:
+            self.__stop_resume_trace_last_signatures.clear()
+        self.__stop_resume_trace_last_enabled = enabled
+        return enabled
 
     def __is_target_archive_trace_enabled(self) -> bool:
         return self.__target_archive_trace_file_id is not None
@@ -130,15 +156,21 @@ class ModelBuilder:
         selector_name = self.__extract_trace_selector_name(self.__target_archive_trace_file_id)
         return selector_name == model_file.name
 
-    def __trace_selector_matches_model_file(self, model_file: ModelFile, root_file_id: str) -> bool:
-        if not self.__is_stop_resume_trace_enabled():
-            return False
-        if self.__stop_resume_trace_file_id == model_file.file_id:
+    def __is_relevant_trace_file(self, model_file: ModelFile, is_stopped: Optional[bool] = None) -> bool:
+        """Keep tracing focused on transfer state, not every scanned file."""
+        if model_file.file_id in self.__recent_live_transfer_snapshots or \
+                model_file.file_id in self.__retained_stopped_transfer_snapshots:
             return True
-        if model_file.file_id != root_file_id:
-            return False
-        selector_name = self.__extract_trace_selector_name(self.__stop_resume_trace_file_id)
-        return selector_name == model_file.name
+        # A live LFTP root can reconcile to a terminal model state before its
+        # transfer snapshot is evicted.  Keep that canonical status membership
+        # traceable without treating every active-scan child as a transfer.
+        if model_file.file_id in self.__lftp_statuses:
+            return True
+        if is_stopped is None:
+            is_stopped = self.__is_stopped_file(model_file.file_id)
+        if is_stopped:
+            return True
+        return model_file.state in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING)
 
     @staticmethod
     def __summarize_target_archive_source(arbitration_source: str,
@@ -251,36 +283,24 @@ class ModelBuilder:
 
     def begin_stop_resume_trace_cycle(self, cycle_id: int) -> None:
         self.__stop_resume_trace_cycle_id = cycle_id
-        self.__stop_resume_trace_emitted = False
+        self.__stop_resume_trace_cycle_context = {}
 
     def finish_stop_resume_trace_cycle(self, model: Model, build_triggered: bool) -> None:
-        if not self.__is_stop_resume_trace_enabled() or self.__stop_resume_trace_emitted:
+        if not self.__is_stop_resume_trace_enabled() or build_triggered:
             return
-        target_file = None
-        try:
-            assert self.__stop_resume_trace_file_id is not None
-            target_file = model.get_file(self.__stop_resume_trace_file_id)
-        except ModelError:
-            for file_id in model.get_file_ids():
-                candidate_file = model.get_file(file_id)
-                if self.__trace_selector_matches_model_file(candidate_file, candidate_file.file_id):
-                    target_file = candidate_file
-                    break
-
-        event = "target_not_rendered" if build_triggered else "no_rebuild"
-        payload: dict[str, object] = {
-            "model_source": "rebuilt" if build_triggered else "cached",
-            "target_file_id": self.__stop_resume_trace_file_id,
-            "final_model": self.__summarize_rendered_model(target_file),
-        }
-        idle_signature = json.dumps({
-            "event": event,
-            "payload": payload,
-        }, sort_keys=True)
-        if idle_signature == self.__stop_resume_trace_last_idle_signature:
-            return
-        self.__stop_resume_trace_last_idle_signature = idle_signature
-        self.__trace_cycle_event(event, payload)
+        for file_id in model.get_file_ids():
+            try:
+                model_file = model.get_file(file_id)
+            except ModelError:
+                continue
+            if not self.__is_relevant_trace_file(model_file):
+                continue
+            self.__trace_cycle_event("no_rebuild", {
+                "model_source": "cached",
+                "file_id": model_file.file_id,
+                "final_model": self.__summarize_rendered_model(model_file),
+                "update_context": dict(self.__stop_resume_trace_cycle_context),
+            })
 
     @staticmethod
     def __root_file_id(name: str, path_pair_id: Optional[str]) -> str:
@@ -500,12 +520,94 @@ class ModelBuilder:
     def __trace_cycle_event(self, event: str, payload: dict[str, object]) -> None:
         if not self.__is_stop_resume_trace_enabled():
             return
+        resolved_identity = payload.get("resolved_identity")
+        resolved_identity_dict = cast(Dict[object, object], resolved_identity) \
+            if isinstance(resolved_identity, dict) else None
+        file_id_value = payload.get("file_id")
+        if not isinstance(file_id_value, str) and resolved_identity_dict is not None:
+            file_id_value = resolved_identity_dict.get("file_id")
+        file_id = file_id_value if isinstance(file_id_value, str) else None
+        if file_id is None:
+            return
         trace_payload: dict[str, object] = {
             "cycle": self.__stop_resume_trace_cycle_id,
             "event": event,
+            "context": dict(self.__stop_resume_trace_cycle_context),
         }
         trace_payload.update(payload)
-        self.__stop_resume_trace_logger.info("stop_resume_trace %s", json.dumps(trace_payload, sort_keys=True))
+        signature_payload = dict(trace_payload)
+        signature_payload.pop("cycle", None)
+        try:
+            signature = json.dumps(signature_payload, sort_keys=True, default=str)
+        except Exception:
+            signature = repr(signature_payload)
+        signature_key = (file_id, event)
+        previous_signature = self.__stop_resume_trace_last_signatures.get(signature_key)
+        if previous_signature == signature:
+            # Keep recently used keys near the tail while preserving one
+            # signature per canonical file/event pair.
+            self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+            return
+        self.__stop_resume_trace_last_signatures[signature_key] = signature
+        self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+        while len(self.__stop_resume_trace_last_signatures) > self.__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE:
+            self.__stop_resume_trace_last_signatures.popitem(last=False)
+        breadcrumb = self.__stop_resume_trace_breadcrumb
+        if breadcrumb is not None:
+            final_model = payload.get("final_model")
+            details: dict[str, object] = {
+                "event": event,
+                "cycle": self.__stop_resume_trace_cycle_id,
+                "file_id": file_id,
+                "context": dict(self.__stop_resume_trace_cycle_context),
+                "update_context": payload.get(
+                    "update_context",
+                    dict(self.__stop_resume_trace_cycle_context),
+                ),
+            }
+            safe_detail_keys = (
+                "model_source",
+                "update_context",
+                "snapshot_source",
+                "recent_snapshot_present",
+                "retained_snapshot_present",
+                "resolved_identity",
+                "raw_lftp_status",
+                "matched_local",
+                "local_freshness",
+                "local_data_role",
+                "local_size_apparent",
+                "local_size_allocated",
+                "presence",
+                "arbitration_source",
+                "stopped",
+            )
+            for key in safe_detail_keys:
+                if key in payload:
+                    details[key] = payload[key]
+            if isinstance(final_model, dict):
+                details["final_model"] = final_model
+            try:
+                breadcrumb_stage = {
+                    "arbitration": "model_arbitration",
+                    "no_rebuild": "model_no_rebuild",
+                    "target_not_rendered": "model_target_not_rendered",
+                }.get(event, "model_trace")
+                breadcrumb.record(
+                    "model_builder",
+                    "stop_resume_trace",
+                    details,
+                    stage=breadcrumb_stage,
+                    event_type="diagnostic",
+                    corr_id="stop-resume:{}:{}".format(
+                        file_id,
+                        self.__stop_resume_trace_cycle_id,
+                    ),
+                    file_id=file_id,
+                    trace_scope="flow",
+                )
+            except Exception:
+                self.logger.debug("Ignoring stop/resume breadcrumb emission failure", exc_info=True)
 
     def __trace_target_arbitration(self,
                                    model_file: ModelFile,
@@ -521,10 +623,8 @@ class ModelBuilder:
                                    arbitration_source: str) -> None:
         if not self.__is_stop_resume_trace_enabled():
             return
-        if not self.__trace_selector_matches_model_file(model_file, root_file_id):
+        if not self.__is_relevant_trace_file(model_file, is_stopped):
             return
-        self.__stop_resume_trace_emitted = True
-        self.__stop_resume_trace_last_idle_signature = None
         self.__trace_cycle_event("arbitration", {
             "model_source": "rebuilt",
             "snapshot_source": ModelBuilder.__summarize_snapshot_source(arbitration_source),
@@ -551,8 +651,8 @@ class ModelBuilder:
                 "transfer": ModelBuilder.__summarize_transfer_state(transfer_state),
             },
             "matched_local": {
-                "name": local.name if local is not None else None,
-                "path": self.__resolve_local_disk_path(model_file, local),
+                "present": local is not None,
+                "is_staging": bool(getattr(local, "is_staging", False)) if local is not None else None,
             },
             "local_data_role": ModelBuilder.__summarize_local_data_role(
                 model_file,
@@ -1194,6 +1294,7 @@ class ModelBuilder:
         self.__move_failed_files.clear()
         self.__final_move_succeeded_files.clear()
         self.__suppressed_ambiguous_extracted_file_names.clear()
+        self.__stop_resume_trace_last_signatures.clear()
         self.__cached_model = None
 
     def has_changes(self) -> bool:

@@ -24,6 +24,61 @@ class TestWebResponseModelListener(unittest.TestCase):
 
         self.assertIsNone(listener.get_next_event())
 
+    def test_target_trace_metadata_is_attached_only_when_provider_matches(self):
+        listener = WebResponseModelListener(
+            lambda file: {"cycle": 7, "corr_id": "stop-resume:a:7", "file_id": file.file_id}
+        )
+        file = ModelFile("a", False)
+        listener.file_updated(file, file)
+
+        event = listener.get_next_event()
+
+        self.assertEqual(7, event.trace_metadata["cycle"])
+        self.assertIsNotNone(event.enqueue_timestamp_ms)
+        self.assertIsNotNone(event.queue_size_before_enqueue)
+
+    def test_trace_metadata_provider_failure_does_not_interrupt_delivery(self):
+        def fail_provider(file):
+            raise RuntimeError("diagnostic provider unavailable")
+
+        listener = WebResponseModelListener(fail_provider)
+        file = ModelFile("a", False)
+        listener.file_updated(file, file)
+
+        event = listener.get_next_event()
+
+        self.assertIsNotNone(event)
+        self.assertIsNone(event.trace_metadata)
+
+    def test_emit_breadcrumb_keeps_original_cycle_when_provider_advances(self):
+        controller = MagicMock(spec=Controller)
+        current_metadata = {
+            "cycle": 1,
+            "corr_id": "stop-resume:target:1",
+            "file_id": "target",
+        }
+        controller.get_stop_resume_trace_metadata.side_effect = lambda file: dict(current_metadata)
+        emitted = []
+        controller.record_stop_resume_trace_breadcrumb.side_effect = (
+            lambda stage, file, details: emitted.append((stage, details))
+        )
+        handler = ModelStreamHandler(controller)
+        handler.first_run = False
+        file = ModelFile("target", False)
+        handler.model_listener.file_updated(file, file)
+        current_metadata.update({
+            "cycle": 2,
+            "corr_id": "stop-resume:target:2",
+            "file_id": "target",
+        })
+
+        handler.get_value()
+
+        emit_details = [details for stage, details in emitted if stage == "emit"][-1]
+        self.assertEqual(1, emit_details["cycle"])
+        self.assertEqual("stop-resume:target:1", emit_details["corr_id"])
+        self.assertEqual("target", emit_details["file_id"])
+
 
 class TestModelStreamHandler(unittest.TestCase):
     def setUp(self):
@@ -64,6 +119,27 @@ class TestModelStreamHandler(unittest.TestCase):
         result = self.handler.get_value()
 
         self.assertIn("event: model-removed", result)
+
+    def test_enabled_enqueue_then_disable_before_emit_strips_trace_metadata(self):
+        self.controller.is_stop_resume_trace_enabled.return_value = True
+        self.controller.get_stop_resume_trace_metadata.return_value = {
+            "cycle": 4,
+            "corr_id": "stop-resume:active:4",
+            "file_id": "active",
+        }
+        self.handler.first_run = False
+        file = ModelFile("active", False)
+        self.handler.model_listener.file_updated(file, file)
+
+        self.controller.is_stop_resume_trace_enabled.return_value = False
+        result = self.handler.get_value()
+
+        self.assertIn("event: model-updated", result)
+        self.assertNotIn('"trace"', result)
+        self.assertFalse(any(
+            call.args[0] == "emit"
+            for call in self.controller.record_stop_resume_trace_breadcrumb.call_args_list
+        ))
 
     def test_cleanup_removes_listener(self):
         self.handler.cleanup()

@@ -2,6 +2,7 @@
 
 from enum import Enum
 import json
+import time
 from typing import List, Optional
 
 from .serialize import Serialize
@@ -20,10 +21,56 @@ class SerializeModel(Serialize):
             REMOVED = 1
             UPDATED = 2
 
-        def __init__(self, change: Change, old_file: Optional[ModelFile], new_file: Optional[ModelFile]) -> None:
+        def __init__(
+            self,
+            change: Change,
+            old_file: Optional[ModelFile],
+            new_file: Optional[ModelFile],
+            trace_metadata: Optional[dict[str, object]] = None,
+        ) -> None:
             self.change = change
             self.old_file = old_file
             self.new_file = new_file
+            self.trace_metadata = trace_metadata
+            self.enqueue_timestamp_ms: Optional[int] = None
+            self.queue_size_before_enqueue: Optional[int] = None
+            self.queue_dropped_count_before_enqueue: Optional[int] = None
+            self.__enqueue_monotonic_ns: Optional[int] = None
+
+        def mark_enqueued(
+            self,
+            timestamp_ms: int,
+            queue_size: Optional[int],
+            dropped_count: Optional[int],
+        ) -> None:
+            self.enqueue_timestamp_ms = timestamp_ms
+            self.queue_size_before_enqueue = queue_size
+            self.queue_dropped_count_before_enqueue = dropped_count
+            self.__enqueue_monotonic_ns = time.monotonic_ns()
+
+        def mark_stream_emitted(
+            self,
+            sequence: int,
+            queue_size: Optional[int] = None,
+            dropped_count: Optional[int] = None,
+        ) -> None:
+            if self.trace_metadata is None:
+                return
+            emitted_at_ms = int(time.time_ns() / 1_000_000)
+            emitted_monotonic_ns = time.monotonic_ns()
+            metadata = dict(self.trace_metadata)
+            metadata["enqueue_timestamp_ms"] = self.enqueue_timestamp_ms
+            metadata["stream_emit_sequence"] = sequence
+            metadata["stream_emit_timestamp_ms"] = emitted_at_ms
+            metadata["queue_wait_ms"] = (
+                max(0, emitted_monotonic_ns - self.__enqueue_monotonic_ns) // 1_000_000
+                if self.__enqueue_monotonic_ns is not None else None
+            )
+            metadata["queue_size_before_enqueue"] = self.queue_size_before_enqueue
+            metadata["queue_dropped_count_before_enqueue"] = self.queue_dropped_count_before_enqueue
+            metadata["queue_size"] = queue_size
+            metadata["queue_dropped_count"] = dropped_count
+            self.trace_metadata = metadata
 
     # Event keys
     __EVENT_INIT = "model-init"
@@ -34,6 +81,7 @@ class SerializeModel(Serialize):
     }
     __KEY_UPDATE_OLD_FILE = "old_file"
     __KEY_UPDATE_NEW_FILE = "new_file"
+    __KEY_UPDATE_TRACE = "trace"
 
     # Model file keys
     __KEY_FILE_NAME = "name"
@@ -137,6 +185,8 @@ class SerializeModel(Serialize):
             SerializeModel.__KEY_UPDATE_NEW_FILE:
                 SerializeModel.__model_file_to_json_dict(event.new_file) if event.new_file else None
         }
+        if event.trace_metadata is not None:
+            model_file_json_dict[SerializeModel.__KEY_UPDATE_TRACE] = event.trace_metadata
         model_file_json = json.dumps(model_file_json_dict)
         return self._sse_pack(event=SerializeModel.__EVENT_UPDATE[event.change],
                               data=model_file_json)

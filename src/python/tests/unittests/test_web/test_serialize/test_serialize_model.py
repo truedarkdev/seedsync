@@ -3,6 +3,7 @@
 import unittest
 import json
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from .test_serialize import parse_stream
 from web.serialize import SerializeModel
@@ -84,6 +85,44 @@ class TestSerializeModel(unittest.TestCase):
         self.assertEqual(dict, type(data))
         self.assertEqual(None, data["old_file"])
         self.assertEqual(None, data["new_file"])
+        self.assertNotIn("trace", data)
+
+    def test_target_trace_metadata_is_optional_and_stream_fields_are_correlated(self):
+        event = SerializeModel.UpdateEvent(
+            SerializeModel.UpdateEvent.Change.UPDATED,
+            ModelFile("a", False),
+            ModelFile("a", False),
+            trace_metadata={"cycle": 4, "corr_id": "stop-resume:a:4", "file_id": "a"},
+        )
+        event.enqueue_timestamp_ms = 100
+        event.queue_size_before_enqueue = 2
+        event.queue_dropped_count_before_enqueue = 1
+        event.mark_stream_emitted(9, queue_size=3, dropped_count=1)
+
+        data = json.loads(parse_stream(SerializeModel().update_event(event))["data"])
+
+        self.assertEqual(4, data["trace"]["cycle"])
+        self.assertEqual("stop-resume:a:4", data["trace"]["corr_id"])
+        self.assertEqual(9, data["trace"]["stream_emit_sequence"])
+        self.assertEqual(3, data["trace"]["queue_size"])
+        self.assertEqual(1, data["trace"]["queue_dropped_count"])
+        self.assertEqual(2, data["trace"]["queue_size_before_enqueue"])
+
+    def test_trace_queue_wait_uses_nonnegative_monotonic_duration(self):
+        event = SerializeModel.UpdateEvent(
+            SerializeModel.UpdateEvent.Change.UPDATED,
+            ModelFile("a", False),
+            ModelFile("a", False),
+            trace_metadata={"cycle": 4},
+        )
+        event.mark_enqueued(200, queue_size=0, dropped_count=0)
+        with patch("web.serialize.serialize_model.time.time_ns", return_value=100_000_000):
+            event.mark_stream_emitted(1, queue_size=0, dropped_count=0)
+
+        data = json.loads(parse_stream(SerializeModel().update_event(event))["data"])
+
+        self.assertGreaterEqual(data["trace"]["queue_wait_ms"], 0)
+        self.assertNotIn("monotonic", json.dumps(data["trace"]))
 
     def test_update_event_files(self):
         serialize = SerializeModel()

@@ -27,12 +27,20 @@ class BreadcrumbTraceEmitter:
         self.__record_queue = record_queue
         self.__enabled_gate = enabled_gate
 
-    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
+    def is_enabled(self) -> bool:
+        """Return the shared opt-in state without allocating a breadcrumb.
+
+        Transfer/model hot paths use this cheap gate before doing any diagnostic
+        work (for example, filesystem stats).  The gate is shared with the
+        collector so a settings change takes effect without restarting workers.
+        """
         try:
-            enabled = bool(self.__enabled_gate.value)
+            return bool(self.__enabled_gate.value)
         except Exception:
-            enabled = False
-        if not enabled:
+            return False
+
+    def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
+        if not self.is_enabled():
             return
 
         created_ns = time.time_ns()
@@ -50,6 +58,9 @@ class BreadcrumbTraceEmitter:
 
 
 class BreadcrumbTraceNoopEmitter:
+    def is_enabled(self) -> bool:
+        return False
+
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
         pass
 

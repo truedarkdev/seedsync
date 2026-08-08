@@ -125,7 +125,7 @@ class Controller:
     __deferred_delete_command_refs: list[Controller.Command]
     __startup_validation_error: Optional[str]
     __path_pair_runtime_error: Optional[str]
-    __stop_resume_trace_file_id: Optional[str]
+    __stop_resume_trace_cycle_id: int
     __target_archive_trace_file_id: Optional[str]
     __target_archive_trace_last_signature: Optional[str]
     __temp_diag_file_id: Optional[str]
@@ -448,8 +448,6 @@ class Controller:
         self.__context = context
         self.__persist = persist
         self.logger = context.logger.getChild("Controller")
-        self.__stop_resume_trace_logger = self.logger.getChild("StopResumeTrace")
-        self.__stop_resume_trace_file_id = os.environ.get("SEEDSYNC_STOP_RESUME_TRACE_FILE_ID")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
@@ -488,6 +486,13 @@ class Controller:
         # Model builder
         self.__model_builder = ModelBuilder()
         self.__model_builder.set_base_logger(self.logger)
+        # Keep one shared emitter wired at all times; its process-safe gate
+        # makes disabled tracing effectively free and enables hot settings
+        # changes without restarting workers or selecting a file.
+        self.__model_builder.set_stop_resume_trace_breadcrumb(
+            self.__context.breadcrumb_trace.create_emitter()
+        )
+        self.__stop_resume_trace_cycle_id = 0
 
         self.__path_pairs_by_id: Dict[str, PathPair] = {}
         self.__path_pair_staging_paths: Dict[str, str] = {}
@@ -1253,6 +1258,58 @@ class Controller:
     def is_file_stopped(self, filename: str) -> bool:
         return filename in self.__persist.stopped_file_names
 
+    def get_stop_resume_trace_metadata(self, file: Optional[ModelFile]) -> Optional[dict[str, object]]:
+        """Return active-transfer model stream metadata for this refresh cycle."""
+        return self.__model_builder.stop_resume_trace_metadata_for_file(file)
+
+    def is_stop_resume_trace_enabled(self) -> bool:
+        """Return the current breadcrumb gate for late SSE emission checks."""
+        try:
+            return bool(self.__model_builder.is_stop_resume_trace_enabled())
+        except Exception:
+            return False
+
+    def record_stop_resume_trace_breadcrumb(
+        self,
+        stage: str,
+        file: Optional[ModelFile],
+        details: Optional[dict[str, object]] = None,
+    ) -> None:
+        """Record stream breadcrumbs without exposing local/remote paths."""
+        metadata = self.get_stop_resume_trace_metadata(file)
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if not isinstance(metadata, dict) or breadcrumb_trace is None:
+            return
+        supplied_details = details if isinstance(details, dict) else {}
+        supplied_corr_id = supplied_details.get("corr_id")
+        supplied_file_id = supplied_details.get("file_id")
+        corr_id = supplied_corr_id if isinstance(supplied_corr_id, str) else (
+            metadata.get("corr_id") if isinstance(metadata.get("corr_id"), str) else None
+        )
+        file_id = supplied_file_id if isinstance(supplied_file_id, str) else (
+            metadata.get("file_id") if isinstance(metadata.get("file_id"), str) else None
+        )
+        safe_details: dict[str, object] = {
+            "cycle": supplied_details.get("cycle", metadata.get("cycle")),
+            "corr_id": corr_id,
+            "file_id": file_id,
+        }
+        safe_details.update(supplied_details)
+        try:
+            breadcrumb_trace.record(
+                "model_stream",
+                "stop_resume_trace_{}".format(stage),
+                safe_details,
+                stage="model_stream_{}".format(stage),
+                event_type="diagnostic",
+                corr_id=corr_id,
+                file_id=file_id,
+                trace_scope="flow",
+            )
+        except Exception:
+            # Diagnostics must never affect SSE/model delivery.
+            self.logger.debug("Ignoring model stream breadcrumb failure", exc_info=True)
+
     def add_model_listener(self, listener: IModelListener):
         """
         Adds a listener to the controller's model
@@ -1708,7 +1765,7 @@ class Controller:
 
         try:
             stat_result = os.stat(path)
-        except OSError:
+        except (OSError, TypeError, ValueError):
             return {
                 "exists": False,
                 "size": None,
@@ -1741,41 +1798,55 @@ class Controller:
                                 remote_base_dir_path: Optional[str] = None,
                                 local_base_dir_path: Optional[str] = None,
                                 stopped_marked: bool = False):
-        trace_file_id = getattr(self, "_Controller__stop_resume_trace_file_id", None)
-        if trace_file_id is None or (trace_file_id != file_id and trace_file_id != file_name):
+        breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+        if breadcrumb_trace is None:
+            return
+        try:
+            if not breadcrumb_trace.is_enabled():
+                return
+        except Exception:
             return
 
         temp_path = None
         sidecar_path = None
-        if local_base_dir_path is not None and not is_dir:
-            temp_path = os.path.join(local_base_dir_path, file_name + Constants.LFTP_TEMP_FILE_SUFFIX)
-            sidecar_path = temp_path + ".lftp-pget-status"
-
-        temp_details = self.__get_stop_resume_trace_file_details(temp_path, include_allocated_size=True)
-        sidecar_details = self.__get_stop_resume_trace_file_details(sidecar_path)
-        logger = getattr(self, "_Controller__stop_resume_trace_logger", self.logger.getChild("StopResumeTrace"))
-        logger.info(
-            "stop_resume_trace %s",
-            json.dumps({
-                "reason": reason,
-                "file_id": file_id,
-                "filename": file_name,
-                "path_pair_id": path_pair_id,
-                "current_state": current_state,
-                "remote_base_dir_path": remote_base_dir_path,
-                "local_base_dir_path": local_base_dir_path,
-                "stopped_marked": stopped_marked,
-                "temp_path": temp_path,
-                "temp_exists": temp_details["exists"],
-                "temp_apparent_size": temp_details["size"],
-                "temp_allocated_size": temp_details["allocated_size"],
-                "temp_mtime": temp_details["mtime"],
-                "sidecar_path": sidecar_path,
-                "sidecar_exists": sidecar_details["exists"],
-                "sidecar_size": sidecar_details["size"],
-                "sidecar_mtime": sidecar_details["mtime"]
-            }, sort_keys=True)
-        )
+        try:
+            if local_base_dir_path is not None and not is_dir:
+                temp_path = os.path.join(local_base_dir_path, file_name + Constants.LFTP_TEMP_FILE_SUFFIX)
+                sidecar_path = temp_path + ".lftp-pget-status"
+            temp_details = self.__get_stop_resume_trace_file_details(temp_path, include_allocated_size=True)
+            sidecar_details = self.__get_stop_resume_trace_file_details(sidecar_path)
+        except Exception:
+            # A diagnostic probe must never interfere with the command path.
+            return
+        # Keep boundary records safe for post-hoc diagnostics: canonical file
+        # identity and scalar filesystem facts are useful, while local/remote
+        # paths, command data, and credentials are intentionally omitted.
+        try:
+            breadcrumb_trace.record(
+                "controller",
+                "stop_resume_boundary",
+                {
+                    "reason": reason,
+                    "file_id": file_id,
+                    "path_pair_id": path_pair_id,
+                    "current_state": current_state,
+                    "is_dir": is_dir,
+                    "stopped_marked": stopped_marked,
+                    "temp": temp_details,
+                    "sidecar": sidecar_details,
+                },
+                stage="controller_boundary_{}".format(reason),
+                event_type="diagnostic",
+                corr_id="stop-resume:{}:{}".format(
+                    file_id,
+                    getattr(self, "_Controller__stop_resume_trace_cycle_id", 0),
+                ),
+                file_id=file_id,
+                trace_scope="flow",
+            )
+        except Exception:
+            # Diagnostics must never alter transfer commands or model delivery.
+            self.logger.debug("Ignoring stop/resume boundary breadcrumb failure", exc_info=True)
 
     @staticmethod
     def __extract_target_archive_trace_selector_name(identifier: Optional[str]) -> Optional[str]:

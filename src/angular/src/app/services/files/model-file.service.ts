@@ -149,6 +149,33 @@ export class ModelFileService extends BaseStreamService {
         }
     }
 
+    private logTraceReceipt(eventName: string, trace: any, rawFile: any) {
+        if (trace == null || typeof trace !== "object") {
+            return;
+        }
+        this._logger.debug("Stop/resume model trace received", {
+            event: eventName,
+            browser_received_timestamp_ms: Date.now(),
+            trace: trace,
+            published_progress: rawFile && rawFile.download_progress,
+            published_transferred_size: rawFile && rawFile.transferred_size,
+            published_state: rawFile && rawFile.state
+        });
+    }
+
+    private logTraceApplied(trace: any, file: ModelFile) {
+        if (trace == null || typeof trace !== "object") {
+            return;
+        }
+        this._logger.debug("Stop/resume model trace applied", {
+            browser_applied_timestamp_ms: Date.now(),
+            trace: trace,
+            published_progress: file.download_progress,
+            published_transferred_size: file.transferred_size,
+            published_state: file.state
+        });
+    }
+
     /**
      * Parse an event and update the file model
      * @param {string} name
@@ -194,11 +221,12 @@ export class ModelFileService extends BaseStreamService {
         } else if (name === this.EVENT_ADDED) {
             // Added event receives old and new ModelFiles
             // Only new file is relevant
-            const parsed: {new_file: any} = this.parseJsonSafe(data);
+            const parsed: any = this.parseJsonSafe(data);
             if (parsed === null || !parsed.new_file) {
                 this._logger.error("Invalid model-added payload");
                 return;
             }
+            this.logTraceReceipt(name, parsed.trace, parsed.new_file);
             try {
                 const file = ModelFile.fromJson(parsed.new_file);
                 const fileKey = ModelFileService.getFileKey(file);
@@ -207,6 +235,7 @@ export class ModelFileService extends BaseStreamService {
                 } else {
                     this._files.next(this._files.getValue().set(fileKey, file));
                     this._logger.debug("Added file: %O", file.toJS());
+                    this.logTraceApplied(parsed.trace, file);
                 }
             } catch (error) {
                 this._logger.error("Failed to handle model-added payload: %O", error);
@@ -214,17 +243,19 @@ export class ModelFileService extends BaseStreamService {
         } else if (name === this.EVENT_REMOVED) {
             // Removed event receives old and new ModelFiles
             // Only old file is relevant
-            const parsed: {old_file: any} = this.parseJsonSafe(data);
+            const parsed: any = this.parseJsonSafe(data);
             if (parsed === null || !parsed.old_file) {
                 this._logger.error("Invalid model-removed payload");
                 return;
             }
+            this.logTraceReceipt(name, parsed.trace, parsed.old_file);
             try {
                 const file = ModelFile.fromJson(parsed.old_file);
                 const fileKey = ModelFileService.getFileKey(file);
                 if (this._files.getValue().has(fileKey)) {
                     this._files.next(this._files.getValue().remove(fileKey));
                     this._logger.debug("Removed file: %O", file.toJS());
+                    this.logTraceApplied(parsed.trace, file);
                 } else {
                     this._logger.error("Failed to find ModelFile identity " + fileKey);
                 }
@@ -234,17 +265,19 @@ export class ModelFileService extends BaseStreamService {
         } else if (name === this.EVENT_UPDATED) {
             // Updated event received old and new ModelFiles
             // We will only use the new one here
-            const parsed: {new_file: any} = this.parseJsonSafe(data);
+            const parsed: any = this.parseJsonSafe(data);
             if (parsed === null || !parsed.new_file) {
                 this._logger.error("Invalid model-updated payload");
                 return;
             }
+            this.logTraceReceipt(name, parsed.trace, parsed.new_file);
             try {
                 const file = ModelFile.fromJson(parsed.new_file);
                 const fileKey = ModelFileService.getFileKey(file);
                 if (this._files.getValue().has(fileKey)) {
                     this._files.next(this._files.getValue().set(fileKey, file));
                     this._logger.debug("Updated file: %O", file.toJS());
+                    this.logTraceApplied(parsed.trace, file);
                 } else {
                     this._logger.error("Failed to find ModelFile identity " + fileKey);
                 }
