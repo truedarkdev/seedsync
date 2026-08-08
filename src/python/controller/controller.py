@@ -9,6 +9,7 @@ from queue import Queue
 from enum import Enum
 from datetime import datetime
 import copy
+import hashlib
 import json
 import os
 import ntpath
@@ -93,6 +94,7 @@ class Controller:
     __updater: ModelUpdater
     __path_pairs_by_id: dict[str, PathPair]
     __path_pair_staging_paths: dict[str, str]
+    __explicit_staging_path_configured: bool
     __active_scanner: ActiveScannerRuntime
     __local_scanner: LocalScannerRuntime
     __remote_scanner: RemoteScannerRuntime
@@ -392,6 +394,7 @@ class Controller:
         self.__ssh_password = None
         self.__transfer_password = None
         self.__staging_path = ""
+        self.__explicit_staging_path_configured = False
         # These attributes are unavailable only in the explicit failed-startup
         # state. Keep that exceptional runtime representation out of their
         # normal operational types; public lifecycle methods gate this state.
@@ -525,6 +528,9 @@ class Controller:
         self.__legacy_local_path = Controller.__require_runtime_path(legacy_local_path, "Lftp.local_path")
         self.__legacy_remote_path = Controller.__require_runtime_path(legacy_remote_path, "Lftp.remote_path")
 
+        self.__explicit_staging_path_configured = bool(
+            isinstance(lftp_cfg.staging_path, str) and lftp_cfg.staging_path.strip()
+        )
         self.__staging_path = self.__build_staging_path(
             self.__legacy_local_path,
             lftp_cfg.staging_path
@@ -675,7 +681,7 @@ class Controller:
         controller_cfg = config.controller
         path_pairs_by_id: Dict[str, PathPair] = {pair.id: pair for pair in enabled_path_pairs}
         path_pair_staging_paths: Dict[str, str] = {
-            pair.id: self.__build_staging_path(pair.local_path)
+            pair.id: self.__build_path_pair_staging_path(pair)
             for pair in enabled_path_pairs
         }
         lftp_path_pairs: List[PathPair] = [
@@ -1351,6 +1357,17 @@ class Controller:
             evict_active_file_ids({file_id})
         self.__active_scan_process.force_scan()
 
+    def _final_move_succeeded_files_for_model(self) -> set[str]:
+        """Return move markers that represent a user-selected staging workflow."""
+        if not self.__explicit_staging_path_configured:
+            return set()
+        return set(self.__persist.final_move_succeeded_file_names)
+
+    def _sync_final_move_succeeded_files_to_model(self) -> None:
+        self.__model_builder.set_final_move_succeeded_files(
+            self._final_move_succeeded_files_for_model()
+        )
+
     def __reset_download_start_after_local_delete(
         self, file_id: str, path_pair_id: Optional[str]
     ) -> None:
@@ -1613,6 +1630,14 @@ class Controller:
     @staticmethod
     def __build_staging_path(local_path: str, staging_path: Optional[str] = None) -> str:
         return staging_path or os.path.join(local_path, "incomplete")
+
+    def __build_path_pair_staging_path(self, pair: PathPair) -> str:
+        if not self.__explicit_staging_path_configured:
+            return self.__build_staging_path(pair.local_path)
+        # Keep pair staging roots stable across display-name changes and safely
+        # contained even if an imported pair id contains path separators.
+        pair_directory = hashlib.sha256(pair.id.encode("utf-8")).hexdigest()[:16]
+        return os.path.join(self.__staging_path, pair_directory)
 
     @staticmethod
     def __persist_key_candidates(name: str, path_pair_id: Optional[str] = None) -> set[str]:
@@ -2693,9 +2718,7 @@ class Controller:
                             # A genuinely new queue invalidates all final-move
                             # identity from the prior transfer lifecycle.
                             self.__persist.final_move_succeeded_file_names.discard(file.file_id)
-                            self.__model_builder.set_final_move_succeeded_files(
-                                self.__persist.final_move_succeeded_file_names
-                            )
+                            self._sync_final_move_succeeded_files_to_model()
                         self.__record_command_breadcrumb(
                             command=command,
                             message="command_dispatched",
@@ -3013,9 +3036,7 @@ class Controller:
                             if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
                         }
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
-                        self.__model_builder.set_final_move_succeeded_files(
-                            self.__persist.final_move_succeeded_file_names
-                        )
+                        self._sync_final_move_succeeded_files_to_model()
                         self.__model_builder.set_move_failed_files({
                             file_id for file_id, count in self.__persist.move_failure_counts.items()
                             if count >= Controller.__MAX_MOVE_FAILURES
@@ -3308,9 +3329,7 @@ class Controller:
                                 self.__deferred_move_file_ids.discard(command_process.file_id)
                                 self.__move_retry_due.pop(command_process.file_id, None)
                                 self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
-                                self.__model_builder.set_final_move_succeeded_files(
-                                    self.__persist.final_move_succeeded_file_names
-                                )
+                                self._sync_final_move_succeeded_files_to_model()
                                 self.__model_builder.set_move_failed_files({
                                     file_id for file_id, count in self.__persist.move_failure_counts.items()
                                     if count >= Controller.__MAX_MOVE_FAILURES
@@ -3383,9 +3402,7 @@ class Controller:
                                     self.__persist.final_move_succeeded_file_names.discard(
                                         command_process.file_id
                                     )
-                                    self.__model_builder.set_final_move_succeeded_files(
-                                        self.__persist.final_move_succeeded_file_names
-                                    )
+                                    self._sync_final_move_succeeded_files_to_model()
                                 self.__notify_remote_delete_success(command_process.event_file)
                             for callback in command_process.command.callbacks:
                                 callback.on_success()

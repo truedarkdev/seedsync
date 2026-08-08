@@ -291,8 +291,8 @@ describe("Testing file component", () => {
         expect(fixture.debugElement.query(By.css("img#move-succeeded")).attributes["src"])
             .toBe("assets/icons/move-succeeded.png");
         const status = fixture.debugElement.query(By.css(".status"));
-        expect(status.nativeElement.textContent).toContain("Move succeeded");
-        expect(status.nativeElement.textContent).not.toContain("Final move succeeded");
+        expect(status.nativeElement.textContent).toContain("Moved to destination");
+        expect(status.nativeElement.textContent).not.toContain("Move succeeded");
         const style = getComputedStyle(
             fixture.debugElement.query(By.css("img#move-succeeded")).nativeElement
         );

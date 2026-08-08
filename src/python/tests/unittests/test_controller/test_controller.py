@@ -100,6 +100,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__temp_diag_file_id = None
         self.controller._Controller__temp_diag_last_signature = None
         self.controller._Controller__staging_path = "/local/incomplete"
+        self.controller._Controller__explicit_staging_path_configured = False
         self.controller._Controller__reported_dead_workers = set()
         self.controller._Controller__path_pairs_by_id = {}
         self.controller._Controller__path_pair_staging_paths = {}
@@ -5688,6 +5689,26 @@ class TestController(unittest.TestCase):
             self.controller._Controller__build_staging_path("/local", "/custom/staging")
         )
 
+    def test_build_path_pair_staging_path_uses_explicit_root_and_stable_safe_subdir(self):
+        pair = PathPair(
+            id="../movies",
+            name="Renamable movies",
+            remote_path="/remote/movies",
+            local_path="/local/movies",
+        )
+        self.controller._Controller__explicit_staging_path_configured = True
+        self.controller._Controller__staging_path = "/custom/staging"
+
+        staging_path = self.controller._Controller__build_path_pair_staging_path(pair)
+        pair.name = "A different display name"
+
+        self.assertEqual("/custom/staging", os.path.dirname(staging_path))
+        self.assertRegex(os.path.basename(staging_path), r"^[0-9a-f]{16}$")
+        self.assertEqual(
+            staging_path,
+            self.controller._Controller__build_path_pair_staging_path(pair),
+        )
+
     @patch("controller.controller.shutil.move")
     @patch("controller.controller.os.path.exists", return_value=True)
     def test_move_from_staging_uses_single_path_roots(self, _, move):
@@ -6082,6 +6103,33 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__successful_final_move_handoff_file_ids)
         self.controller._Controller__model_builder.evict_active_file_ids.assert_called_once_with({file.file_id})
         self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
+
+    def test_implicit_staging_hides_successful_move_from_model(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        self.controller._Controller__persist.final_move_succeeded_file_names = {file_id}
+
+        self.controller._sync_final_move_succeeded_files_to_model()
+
+        self.controller._Controller__model_builder.set_final_move_succeeded_files.assert_called_once_with(set())
+
+    def test_explicit_single_path_staging_exposes_successful_move_to_model(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        self.controller._Controller__explicit_staging_path_configured = True
+        self.controller._Controller__persist.final_move_succeeded_file_names = {file_id}
+
+        self.controller._sync_final_move_succeeded_files_to_model()
+
+        self.controller._Controller__model_builder.set_final_move_succeeded_files.assert_called_once_with({file_id})
+
+    def test_explicit_path_pair_staging_exposes_successful_move_to_model(self):
+        file_id = ModelFile.build_file_id("movie.mkv", "movies")
+        self.controller._Controller__explicit_staging_path_configured = True
+        self.controller._Controller__path_pairs_by_id = {"movies": MagicMock()}
+        self.controller._Controller__persist.final_move_succeeded_file_names = {file_id}
+
+        self.controller._sync_final_move_succeeded_files_to_model()
+
+        self.controller._Controller__model_builder.set_final_move_succeeded_files.assert_called_once_with({file_id})
 
     def test_manual_retry_already_completed_does_not_earn_success_marker(self):
         file, command, callback = self._prepare_terminal_move_command()

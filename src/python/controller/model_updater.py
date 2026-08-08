@@ -80,6 +80,8 @@ class _ControllerCoreAccess:
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
     def _record_download_completion(self, file: ModelFile) -> None: ...
     def _mark_successful_final_move_handoff(self, file_id: str) -> None: ...
+    def _final_move_succeeded_files_for_model(self) -> set[str]: ...
+    def _sync_final_move_succeeded_files_to_model(self) -> None: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
     def _reserve_move_attempt(self, file_id: str) -> bool: ...
     def _release_move_attempt(self, file_id: str) -> None: ...
@@ -254,7 +256,10 @@ class ModelUpdater(_ControllerCoreAccess):
             )
         if hasattr(persist, "final_move_succeeded_file_names"):
             controller._Controller__model_builder.set_final_move_succeeded_files(
-                self._filter_keys_for_model_builder(persist.final_move_succeeded_file_names, path_pair_ids)
+                self._filter_keys_for_model_builder(
+                    controller._final_move_succeeded_files_for_model(),
+                    path_pair_ids,
+                )
             )
 
     @staticmethod
@@ -980,7 +985,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
                     persist.final_move_succeeded_file_names.discard(file.file_id)
                     controller._Controller__successful_final_move_handoff_file_ids.discard(file.file_id)
-                    model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
+                    controller._sync_final_move_succeeded_files_to_model()
                     path_pair_name = file.path_pair_name
                     if path_pair_name is None:
                         path_pair = controller._Controller__get_path_pair(file.path_pair_id)
@@ -1031,7 +1036,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         persist.final_move_succeeded_file_names.add(file.file_id)
                     else:
                         persist.final_move_succeeded_file_names.discard(file.file_id)
-                    model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
+                    controller._sync_final_move_succeeded_files_to_model()
                     if final_move_succeeded:
                         controller._mark_successful_final_move_handoff(file.file_id)
                     if file.file_id not in persist.downloaded_file_names:
@@ -1343,9 +1348,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_id in remove_downloaded_file_names:
                             downloaded_timestamps.pop(file_id, None)
                         persist.final_move_succeeded_file_names.difference_update(remove_downloaded_file_names)
-                        model_builder.set_final_move_succeeded_files(
-                            persist.final_move_succeeded_file_names
-                        )
+                        controller._sync_final_move_succeeded_files_to_model()
                         if controller._Controller__is_target_archive_trace_enabled():
                             for downloaded_file_name in remove_downloaded_file_names:
                                 if controller._Controller__target_archive_trace_selector_matches_file(
@@ -1410,9 +1413,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         persist.final_move_succeeded_file_names.difference_update(
                             stale_final_move_succeeded_file_names
                         )
-                        model_builder.set_final_move_succeeded_files(
-                            persist.final_move_succeeded_file_names
-                        )
+                        controller._sync_final_move_succeeded_files_to_model()
 
         if remote_reconciliation_established and controller._Controller__pending_auto_purge_file_ids:
             pending_auto_purge_candidates: set[str] = set()
