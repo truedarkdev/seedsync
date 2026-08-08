@@ -165,6 +165,7 @@ class AdminHandler(IHandler):
             if completed_migration_transaction_started:
                 self.__auth_store.finish_completed_migration_claim_transaction()
                 completed_migration_transaction_started = False
+                self.__auth_store.finalize_browser_handover_claim(handover_version)
             response = self.__json_response({
                 "key": result["record"].to_public_dict(),
                 "secret": result["secret"],

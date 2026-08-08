@@ -28,6 +28,10 @@ _UI_SESSION_TTL = timedelta(hours=12)
 _REMEMBERED_UI_SESSION_COOKIE_MAX_AGE = timedelta(days=3650)
 _BOOTSTRAP_PROOF_TTL = timedelta(minutes=10)
 _BOOTSTRAP_EXCHANGE_TTL = timedelta(minutes=5)
+_INITIAL_BROWSER_HANDOVER_TTL = timedelta(hours=8)
+_RECOVERY_BROWSER_HANDOVER_TTL = timedelta(hours=2)
+_BROWSER_HANDOVER_STATE_MAX_BYTES = 16 * 1024
+_BROWSER_HANDOVER_SEEN_RECOVERY_VERSION_LIMIT = 128
 _COMPLETED_MIGRATION_AUTH_MAX_BYTES = 64 * 1024
 _COMPLETED_MIGRATION_HISTORY_MAX_BYTES = 1024 * 1024
 _COMPLETED_MIGRATION_STORE_NAME = "api-keys.json"
@@ -73,6 +77,11 @@ def _required_string_field(record: Dict[str, object], field_name: str) -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _current_time() -> datetime:
+    """Indirection keeps browser-handover boundary tests deterministic."""
+    return datetime.now(timezone.utc)
 
 
 def _history_file_path(file_path: Optional[str]) -> Optional[str]:
@@ -847,12 +856,17 @@ class ApiKeyStore(Persist):
     __KEY_API_KEYS = "api_keys"
     __KEY_UI_SESSIONS = "ui_sessions"
     __KEY_BROWSER_HANDOVER_CLAIMED_VERSION = "browser_handover_claimed_version"
+    __BROWSER_HANDOVER_DEADLINE_NAME = "browser-handover-deadline.json"
 
     def __init__(self, file_path: Optional[str] = None):
         self.__file_path = file_path
         self.__api_keys: List[ApiKeyRecord] = []
         self.__ui_sessions: Dict[str, UiSessionRecord] = {}
         self.__browser_handover_claimed_version = ""
+        self.__browser_handover_deadline: Optional[Dict[str, object]] = None
+        self.__browser_handover_deadline_loaded = False
+        self.__browser_handover_deadline_invalid = False
+        self.__browser_handover_activated = False
         self.__state_lock = threading.RLock()
         self.__bootstrap_proof_path: Optional[str] = None
         self.__bootstrap_proof: Optional[BootstrapProofRecord] = None
@@ -1188,11 +1202,15 @@ class ApiKeyStore(Persist):
 
         return record
 
-    def can_claim_initial_admin(self, browser_handover_version: object) -> bool:
+    def can_claim_initial_admin(self, browser_handover_version: object, config: object = None) -> bool:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
-        if self.active_admin_key_count == 0:
-            return True
-        return self.__browser_handover_claimed_version != version
+        state = self.__browser_handover_state(version, config, activate=False)
+        if self.__browser_handover_activated or state["state_invalid"] or state["expires_at"] is not None:
+            return bool(state["open"])
+        # Legacy/direct callers that have not brought up the normal WebApp
+        # retain their old atomic claim primitive.  They deliberately do not
+        # create a deadline; normal startup is the sole deadline origin.
+        return self.active_admin_key_count == 0 or self.__browser_handover_claimed_version != version
 
     def claim_initial_admin_if_available(self, browser_handover_version: object) -> bool:
         version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
@@ -1201,6 +1219,8 @@ class ApiKeyStore(Persist):
                 return False
             self.__browser_handover_claimed_version = version
             self.save()
+            if self.__completed_migration_claim_transaction is None:
+                self.finalize_browser_handover_claim(version)
             self.__record_history_event(
                 "browser_handover_claimed",
                 "initial_admin_claimed",
@@ -1223,6 +1243,8 @@ class ApiKeyStore(Persist):
             self.clear_bootstrap_proof(reason="admin_api_key_created")
             self.clear_bootstrap_exchange(reason="admin_api_key_created")
             self.save()
+            if self.__completed_migration_claim_transaction is None:
+                self.finalize_browser_handover_claim(version)
             self.__record_history_event(
                 "api_key_created",
                 "initial_admin_created",
@@ -1238,11 +1260,256 @@ class ApiKeyStore(Persist):
 
     def get_browser_handover_state(self, config: object) -> Dict[str, object]:
         version = self.effective_browser_handover_version(config)
+        return self.__browser_handover_state(version, config, activate=False)
+
+    def activate_browser_handover(self, config: object) -> Dict[str, object]:
+        """Open/preserve the claim window once the normal WebApp is available.
+
+        The deadline is deliberately a sidecar, rather than another auth-store
+        field: completed v0.8.6 migration validation has a strict auth-store
+        grammar which must remain readable by older completed installations.
+        """
+        version = self.effective_browser_handover_version(config)
+        fresh_activation = not self.__browser_handover_activated
+        self.__browser_handover_activated = True
+        return self.__browser_handover_state(
+            version, config, activate=True, reopen_initial=fresh_activation,
+        )
+
+    def __browser_handover_state(
+        self, version: str, config: object, *, activate: bool, reopen_initial: bool = False,
+    ) -> Dict[str, object]:
+        with self.__state_lock:
+            now = _current_time()
+            configured = self.__configured_browser_handover_version(config)
+            active_admin_exists = self.active_admin_key_count > 0
+            recovery = bool(
+                active_admin_exists and version != self.__browser_handover_claimed_version
+                and (configured or config is None)
+            )
+            desired_kind = "recovery" if recovery else "initial"
+            desired_version = self.__browser_handover_version_digest(version) if recovery else ""
+            state = self.__load_browser_handover_deadline()
+            invalid = self.__browser_handover_deadline_invalid
+
+            if not recovery and active_admin_exists:
+                if activate:
+                    self.finalize_browser_handover_claim(version)
+                return self.__handover_payload(version, None, now, False, False, invalid)
+
+            deadline = state.get("active") if state is not None else None
+            matching = (
+                deadline is not None
+                and deadline["kind"] == desired_kind
+                and deadline["version_sha256"] == desired_version
+            )
+            expired = matching and self.__deadline_expired(deadline, now)
+            seen_recovery_version = bool(
+                recovery and state is not None and desired_version in state["seen_recovery_versions"]
+            )
+            recovery_history_full = bool(
+                recovery and state is not None and not matching and not seen_recovery_version
+                and len(state["seen_recovery_versions"]) >= _BROWSER_HANDOVER_SEEN_RECOVERY_VERSION_LIMIT
+            )
+            # A normal app restart may deliberately offer a fresh first-admin
+            # window, but never extends a live one.  Recovery windows are
+            # version-bound; an expired version stays closed until it changes.
+            should_open = False
+            if not invalid and (
+                (not matching and not seen_recovery_version and not recovery_history_full)
+                or (desired_kind == "initial" and expired and reopen_initial)
+            ):
+                # get_browser_handover_state is observational; only normal
+                # WebApp activation (or a newly configured recovery while that
+                # app is live) starts it.
+                should_open = activate or (
+                    desired_kind == "recovery" and self.__browser_handover_activated
+                )
+            if should_open:
+                ttl = _RECOVERY_BROWSER_HANDOVER_TTL if desired_kind == "recovery" else _INITIAL_BROWSER_HANDOVER_TTL
+                deadline = {
+                    "kind": desired_kind,
+                    "version_sha256": desired_version,
+                    "opened_at": now.isoformat(timespec="seconds"),
+                    "expires_at": (now + ttl).isoformat(timespec="seconds"),
+                }
+                state = state or {"active": None, "seen_recovery_versions": []}
+                state["active"] = deadline
+                if desired_kind == "recovery":
+                    state["seen_recovery_versions"].append(desired_version)
+                self.__browser_handover_deadline_invalid = False
+                self.__browser_handover_deadline = state
+                self.__write_browser_handover_deadline(state)
+                matching, expired = True, False
+
+            open_window = bool(matching and not expired and not invalid)
+            return self.__handover_payload(version, deadline if matching else None, now, open_window, expired, invalid,
+                                           recovery_seen=seen_recovery_version, recovery_history_full=recovery_history_full)
+
+    def __handover_payload(
+        self, version: str, deadline: Optional[Dict[str, str]], now: datetime,
+        open_window: bool, expired: bool, invalid: bool, *, recovery_seen: bool = False,
+        recovery_history_full: bool = False,
+    ) -> Dict[str, object]:
+        expires_at = deadline.get("expires_at") if deadline is not None else None
+        remaining_seconds = 0
+        if open_window and deadline is not None:
+            try:
+                remaining_seconds = max(0, int((datetime.fromisoformat(deadline["expires_at"]) - now).total_seconds()))
+            except ValueError:
+                open_window = False
         return {
             "configured_version": version,
             "claimed_version": self.__browser_handover_claimed_version,
-            "open": self.can_claim_initial_admin(version),
+            "open": open_window,
+            "window_type": deadline.get("kind") if deadline is not None else None,
+            "opened_at": deadline.get("opened_at") if deadline is not None else None,
+            "expires_at": expires_at,
+            "remaining_seconds": remaining_seconds,
+            "expired": bool(expired),
+            "state_invalid": invalid,
+            "recovery_version_closed": recovery_seen,
+            "recovery_history_full": recovery_history_full,
         }
+
+    @staticmethod
+    def __deadline_expired(deadline: Dict[str, str], now: datetime) -> bool:
+        try:
+            return datetime.fromisoformat(deadline["expires_at"]) <= now
+        except ValueError:
+            return True
+
+    def __browser_handover_deadline_path(self) -> Optional[Path]:
+        if not self.__file_path:
+            return None
+        path = Path(self.__file_path)
+        return path.with_name(self.__BROWSER_HANDOVER_DEADLINE_NAME)
+
+    @staticmethod
+    def __browser_handover_version_digest(version: str) -> str:
+        return hashlib.sha256(version.encode("utf-8")).hexdigest()
+
+    def __load_browser_handover_deadline(self) -> Optional[Dict[str, object]]:
+        if self.__browser_handover_deadline_loaded:
+            return self.__browser_handover_deadline
+        self.__browser_handover_deadline_loaded = True
+        path = self.__browser_handover_deadline_path()
+        if path is None or not os.path.lexists(path):
+            return None
+        try:
+            raw = json.loads(self.__read_browser_handover_deadline_bytes(path).decode("utf-8"))
+            if not isinstance(raw, dict):
+                raise ValueError("deadline state is invalid")
+            if raw.get("schema") == 1:
+                # Preserve in-progress first implementation windows while
+                # migrating them in memory; a recovery entry counts as seen.
+                if set(raw) != {"schema", "kind", "version", "opened_at", "expires_at"}:
+                    raise ValueError("legacy deadline fields are invalid")
+                kind, legacy_version = raw.get("kind"), raw.get("version")
+                if kind not in {"initial", "recovery"} or not isinstance(legacy_version, str):
+                    raise ValueError("legacy deadline state is invalid")
+                digest = self.__browser_handover_version_digest(legacy_version) if kind == "recovery" else ""
+                active = {"kind": kind, "version_sha256": digest, "opened_at": raw.get("opened_at"), "expires_at": raw.get("expires_at")}
+                self.__validate_browser_handover_deadline(active)
+                self.__browser_handover_deadline = {
+                    "active": active,
+                    "seen_recovery_versions": [digest] if kind == "recovery" else [],
+                }
+                return self.__browser_handover_deadline
+            if set(raw) != {"schema", "active", "seen_recovery_versions"} or raw.get("schema") != 2:
+                raise ValueError("deadline state fields are invalid")
+            active = raw.get("active")
+            if active is not None:
+                if not isinstance(active, dict):
+                    raise ValueError("active deadline is invalid")
+                self.__validate_browser_handover_deadline(active)
+            seen = raw.get("seen_recovery_versions")
+            if (
+                not isinstance(seen, list) or len(seen) > _BROWSER_HANDOVER_SEEN_RECOVERY_VERSION_LIMIT
+                or len(set(seen)) != len(seen)
+                or any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in seen)
+            ):
+                raise ValueError("recovery version history is invalid")
+            self.__browser_handover_deadline = {"active": active, "seen_recovery_versions": seen}
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            self.__browser_handover_deadline_invalid = True
+        return self.__browser_handover_deadline
+
+    @staticmethod
+    def __validate_browser_handover_deadline(deadline: object) -> None:
+        if not isinstance(deadline, dict) or set(deadline) != {"kind", "version_sha256", "opened_at", "expires_at"}:
+            raise ValueError("deadline fields are invalid")
+        if deadline.get("kind") not in {"initial", "recovery"}:
+            raise ValueError("deadline kind is invalid")
+        version_digest = deadline.get("version_sha256")
+        if not isinstance(version_digest, str) or (deadline["kind"] == "initial" and version_digest != ""):
+            raise ValueError("deadline version is invalid")
+        if deadline["kind"] == "recovery" and re.fullmatch(r"[0-9a-f]{64}", version_digest) is None:
+            raise ValueError("deadline version is invalid")
+        opened_at, expires_at = datetime.fromisoformat(deadline.get("opened_at")), datetime.fromisoformat(deadline.get("expires_at"))
+        if opened_at.tzinfo is None or expires_at.tzinfo is None or expires_at <= opened_at:
+            raise ValueError("deadline timestamps are invalid")
+
+    @staticmethod
+    def __read_browser_handover_deadline_bytes(path: Path) -> bytes:
+        before = path.lstat()
+        if path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("deadline file is unsafe")
+        if os.name == "posix":
+            if stat.S_IMODE(before.st_mode) != 0o600 or before.st_uid != os.geteuid() or before.st_gid != os.getegid():
+                raise ValueError("deadline file is unsafe")
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or opened.st_size > _BROWSER_HANDOVER_STATE_MAX_BYTES
+            ):
+                raise ValueError("deadline file is unsafe")
+            content = os.read(descriptor, _BROWSER_HANDOVER_STATE_MAX_BYTES + 1)
+            if len(content) > _BROWSER_HANDOVER_STATE_MAX_BYTES:
+                raise ValueError("deadline file is too large")
+            return content
+        finally:
+            os.close(descriptor)
+
+    def __write_browser_handover_deadline(self, state: Dict[str, object]) -> None:
+        path = self.__browser_handover_deadline_path()
+        if path is None:
+            return
+        payload = (json.dumps({"schema": 2, **state}, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > _BROWSER_HANDOVER_STATE_MAX_BYTES:
+            raise ValueError("browser handover state is too large")
+        _write_completed_migration_private_file(path.parent, path.name, payload)
+
+    def __mark_browser_handover_claimed(self, version: str) -> None:
+        if not self.__browser_handover_deadline_loaded or self.__browser_handover_deadline_invalid:
+            return
+        state = self.__browser_handover_deadline
+        if state is None:
+            return
+        active = state.get("active")
+        if not isinstance(active, dict):
+            return
+        expected = self.__browser_handover_version_digest(version) if active.get("kind") == "recovery" else ""
+        if active.get("version_sha256") != expected:
+            return
+        state["active"] = None
+        self.__write_browser_handover_deadline(state)
+
+    def finalize_browser_handover_claim(self, browser_handover_version: object) -> bool:
+        """Best-effort post-commit cleanup of an already-closed claim window."""
+        version = browser_handover_version.strip() if isinstance(browser_handover_version, str) else ""
+        with self.__state_lock:
+            try:
+                self.__mark_browser_handover_claimed(version)
+            except (OSError, ValueError):
+                # The authoritative API-key claim is already durable.  Keep
+                # the in-memory state closed and retry sidecar cleanup on a
+                # later normal-app activation rather than losing the secret.
+                return False
+            return True
 
     def ensure_bootstrap_proof(self) -> Optional[BootstrapProofRecord]:
         now = datetime.now(timezone.utc)

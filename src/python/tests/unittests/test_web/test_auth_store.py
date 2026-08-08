@@ -3,6 +3,8 @@ import tempfile
 import unittest
 import json
 import threading
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from common import Config, PersistError
 from web.auth_store import (
@@ -73,13 +75,13 @@ class TestApiKeyStore(unittest.TestCase):
             )
             self.assertFalse(restarted.get_browser_handover_state(Config())["open"])
 
-    def test_blank_config_reopens_ordinary_claim_but_not_explicit_claimed_migration(self):
+    def test_blank_config_does_not_reopen_claimed_browser_handover(self):
         config = Config()
         ordinary = ApiKeyStore()
         self.assertIsNotNone(ordinary.create_initial_admin_api_key_if_available("r1", "admin"))
         ordinary_state = ordinary.get_browser_handover_state(config)
         self.assertEqual("", ordinary_state["configured_version"])
-        self.assertTrue(ordinary_state["open"])
+        self.assertFalse(ordinary_state["open"])
 
         claimed_migration = ApiKeyStore()
         self.assertIsNotNone(claimed_migration.create_initial_admin_api_key_if_available("migration-claim-v1", "admin"))
@@ -439,6 +441,154 @@ class TestApiKeyStore(unittest.TestCase):
         self.assertEqual(1, results.count(True))
         self.assertEqual(1, results.count(False))
         self.assertFalse(store.can_claim_initial_admin("2026.04.04"))
+
+    def test_initial_claim_window_is_eight_hours_preserved_then_reopened_by_restart(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        config = Config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            store.save()
+            with patch("web.auth_store._current_time", return_value=started):
+                opened = store.activate_browser_handover(config)
+            self.assertTrue(opened["open"])
+            self.assertEqual("initial", opened["window_type"])
+            self.assertEqual((started + timedelta(hours=8)).isoformat(timespec="seconds"), opened["expires_at"])
+
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=4)):
+                self.assertEqual(opened["expires_at"], store.get_browser_handover_state(config)["expires_at"])
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=8)):
+                self.assertFalse(store.get_browser_handover_state(config)["open"])
+
+            restarted = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=8)):
+                reopened = restarted.activate_browser_handover(config)
+            self.assertTrue(reopened["open"])
+            self.assertEqual(
+                (started + timedelta(hours=16)).isoformat(timespec="seconds"), reopened["expires_at"],
+            )
+
+    def test_recovery_window_is_two_hours_version_bound_and_deadline_enforced(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        config = Config()
+        config.general.browser_handover_recovery_version = "recovery-1"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            with patch("web.auth_store._current_time", return_value=started):
+                self.assertIsNotNone(store.create_initial_admin_api_key_if_available("claimed", "admin"))
+                opened = store.activate_browser_handover(config)
+            self.assertTrue(opened["open"])
+            self.assertEqual("recovery", opened["window_type"])
+            self.assertEqual((started + timedelta(hours=2)).isoformat(timespec="seconds"), opened["expires_at"])
+
+            restarted = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=1)):
+                preserved = restarted.activate_browser_handover(config)
+            self.assertTrue(preserved["open"])
+            self.assertEqual(opened["expires_at"], preserved["expires_at"])
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=2)):
+                self.assertFalse(restarted.get_browser_handover_state(config)["open"])
+                self.assertIsNone(restarted.create_initial_admin_api_key_if_available("recovery-1", "late"))
+
+            same_version_restart = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=2)):
+                self.assertFalse(same_version_restart.activate_browser_handover(config)["open"])
+            config.general.browser_handover_recovery_version = "recovery-2"
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=2)):
+                next_version = same_version_restart.get_browser_handover_state(config)
+            self.assertTrue(next_version["open"])
+            self.assertEqual("recovery", next_version["window_type"])
+            self.assertEqual((started + timedelta(hours=4)).isoformat(timespec="seconds"), next_version["expires_at"])
+
+    def test_expired_recovery_claim_is_atomic_and_corrupt_deadline_fails_closed(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        config = Config()
+        config.general.browser_handover_recovery_version = "recovery-1"
+        store = ApiKeyStore()
+        with patch("web.auth_store._current_time", return_value=started):
+            self.assertIsNotNone(store.create_initial_admin_api_key_if_available("claimed", "admin"))
+            store.activate_browser_handover(config)
+        with patch("web.auth_store._current_time", return_value=started + timedelta(hours=2)):
+            self.assertFalse(store.claim_initial_admin_if_available("recovery-1"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            ApiKeyStore(file_path=store_path).save()
+            with open(os.path.join(temp_dir, "browser-handover-deadline.json"), "w", encoding="utf-8") as handle:
+                handle.write("not-json")
+            corrupt = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started):
+                state = corrupt.activate_browser_handover(Config())
+            self.assertFalse(state["open"])
+            self.assertTrue(state["state_invalid"])
+
+    def test_recovery_version_history_prevents_a_to_b_to_a_reopen_across_reload(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        config = Config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            store = ApiKeyStore(file_path=store_path)
+            with patch("web.auth_store._current_time", return_value=started):
+                self.assertIsNotNone(store.create_initial_admin_api_key_if_available("claimed", "admin"))
+                config.general.browser_handover_recovery_version = "recovery-a"
+                self.assertTrue(store.activate_browser_handover(config)["open"])
+                config.general.browser_handover_recovery_version = "recovery-b"
+                self.assertTrue(store.get_browser_handover_state(config)["open"])
+                config.general.browser_handover_recovery_version = "recovery-a"
+                returned_a = store.get_browser_handover_state(config)
+            self.assertFalse(returned_a["open"])
+            self.assertTrue(returned_a["recovery_version_closed"])
+
+            reloaded = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started + timedelta(minutes=1)):
+                self.assertFalse(reloaded.activate_browser_handover(config)["open"])
+                self.assertTrue(reloaded.get_browser_handover_state(config)["recovery_version_closed"])
+
+    def test_unsafe_or_oversize_deadline_sidecar_fails_closed(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            sidecar_path = os.path.join(temp_dir, "browser-handover-deadline.json")
+            store = ApiKeyStore(file_path=store_path)
+            store.save()
+            with patch("web.auth_store._current_time", return_value=started):
+                self.assertTrue(store.activate_browser_handover(Config())["open"])
+            with open(sidecar_path, "wb") as handle:
+                handle.write(b"x" * (16 * 1024 + 1))
+            oversize = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started):
+                state = oversize.activate_browser_handover(Config())
+            self.assertFalse(state["open"])
+            self.assertTrue(state["state_invalid"])
+
+            if os.name == "posix":
+                os.unlink(sidecar_path)
+                os.symlink(store_path, sidecar_path)
+                unsafe = ApiKeyStore.from_file(store_path)
+                with patch("web.auth_store._current_time", return_value=started):
+                    state = unsafe.activate_browser_handover(Config())
+                self.assertFalse(state["open"])
+                self.assertTrue(state["state_invalid"])
+
+    def test_activation_retries_stale_claim_window_finalization(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        config = Config()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = os.path.join(temp_dir, "api-keys.json")
+            sidecar_path = os.path.join(temp_dir, "browser-handover-deadline.json")
+            store = ApiKeyStore(file_path=store_path)
+            store.save()
+            with patch("web.auth_store._current_time", return_value=started):
+                store.activate_browser_handover(config)
+                with patch.object(store, "_ApiKeyStore__write_browser_handover_deadline", side_effect=OSError("disk full")):
+                    self.assertIsNotNone(store.create_initial_admin_api_key_if_available("", "admin"))
+            self.assertFalse(store.get_browser_handover_state(config)["open"])
+
+            reloaded = ApiKeyStore.from_file(store_path)
+            with patch("web.auth_store._current_time", return_value=started):
+                self.assertFalse(reloaded.activate_browser_handover(config)["open"])
+            self.assertIsNone(json.loads(open(sidecar_path, encoding="utf-8").read())["active"])
 
     def test_version_1_payload_without_browser_handover_state_still_loads(self):
         payload = {
