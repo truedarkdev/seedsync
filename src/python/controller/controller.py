@@ -413,6 +413,9 @@ class Controller:
             object.__setattr__(self, "_Controller{}".format(attribute_name), None)
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
+        self.__active_scan_force_file_ids = set()
+        self.__active_scan_ready_file_ids = set()
+        self.__next_active_scan_force_at = None
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
         self.__move_retry_due = {}
@@ -588,6 +591,9 @@ class Controller:
         # Keep track of active files
         self.__active_downloading_file_names = []
         self.__active_extracting_file_names = []
+        self.__active_scan_force_file_ids = set()
+        self.__active_scan_ready_file_ids = set()
+        self.__next_active_scan_force_at = None
         # Path-pair aware completion tracking so a finished download stays
         # visible until the model reaches a terminal state.
         self.__prev_downloading_file_names = set()
@@ -970,6 +976,18 @@ class Controller:
             getattr(self, "_Controller__active_extracting_file_names", []) +
             list(getattr(self, "_Controller__pending_completion_file_names", []))
         )
+        # The replacement scanner starts with a new root set; readiness from
+        # the previous process must not authorize STOP before it reports a
+        # fresh checkpoint for the active transfer.
+        self.__active_scan_force_file_ids = set(
+            getattr(self, "_Controller__active_scan_force_file_ids", set())
+        )
+        self.__active_scan_ready_file_ids = set(
+            getattr(self, "_Controller__active_scan_ready_file_ids", set())
+        )
+        self.__active_scan_force_file_ids.clear()
+        self.__active_scan_ready_file_ids.clear()
+        self.__next_active_scan_force_at = None
         was_started = self.__started
         old_active_scan_process = self.__active_scan_process
         old_local_scan_process = self.__local_scan_process

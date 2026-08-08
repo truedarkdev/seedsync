@@ -50,6 +50,9 @@ class _ControllerCoreAccess:
     _Controller__lftp: Lftp | RcloneTransferBackend
     _Controller__active_downloading_file_names: list[tuple[str, Optional[str], Optional[str]]]
     _Controller__active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
+    _Controller__active_scan_force_file_ids: set[str]
+    _Controller__active_scan_ready_file_ids: set[str]
+    _Controller__next_active_scan_force_at: Optional[datetime]
     _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__move_retry_due: dict[str, datetime]
@@ -126,6 +129,11 @@ class _ControllerCoreAccess:
 
 class ModelUpdater(_ControllerCoreAccess):
     """Runs the per-tick model update loop for a controller instance."""
+
+    # LFTP persists pget checkpoints every two seconds. Keep the active
+    # scanner responsive to that cadence without changing the user's normal
+    # scan interval or waking it on every controller tick.
+    _ACTIVE_SCAN_FORCE_INTERVAL = timedelta(seconds=2)
 
     def __init__(self, controller: object) -> None:
         from .controller import Controller as ControllerType
@@ -281,6 +289,110 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__local_scan_process.force_scan()
         controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
 
+    def _force_active_scan_for_stoppability(
+        self,
+        active_file_names: list[tuple[str, Optional[str], Optional[str]]],
+        latest_active_scan: object = None,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Wake the active scanner while a running transfer lacks its stop sidecar.
+
+        The configured active-scan interval can be deliberately large. A
+        newly running regular file still needs a bounded opportunity to expose
+        its pget checkpoint, so retry at the same cadence as lftp's
+        ``pget:save-status`` snapshots. Once the scan reports readiness (or the
+        transfer is no longer active), the retry state is discarded.
+        """
+        controller = self._controller
+        transfer_backend = getattr(controller, "_Controller__lftp", None)
+        if getattr(transfer_backend, "backend_name", "lftp") == "rclone":
+            # Rclone has no lftp pget status sidecar; checkpoint wakeups are
+            # inapplicable and would otherwise become an endless retry loop.
+            controller._Controller__active_scan_force_file_ids = set()
+            controller._Controller__active_scan_ready_file_ids = set()
+            controller._Controller__next_active_scan_force_at = None
+            return
+        active_ids = {
+            ModelFile.build_file_id(name, path_pair_id)
+            for name, path_pair_id, _ in active_file_names
+        }
+        pending_ids = getattr(controller, "_Controller__active_scan_force_file_ids", None)
+        if not isinstance(pending_ids, set):
+            pending_ids = set()
+            controller._Controller__active_scan_force_file_ids = pending_ids
+
+        ready_ids = getattr(controller, "_Controller__active_scan_ready_file_ids", None)
+        if not isinstance(ready_ids, set):
+            ready_ids = set()
+            controller._Controller__active_scan_ready_file_ids = ready_ids
+        ready_ids.intersection_update(active_ids)
+
+        active_scan_failed = latest_active_scan is not None and bool(
+            getattr(latest_active_scan, "failed", False)
+        )
+        healthy_observed_ids: set[str] = set()
+        if active_scan_failed:
+            # Recoverable/partial scans are not authoritative evidence for a
+            # checkpoint. Invalidate current active readiness and retry after
+            # the bounded cadence instead of trusting stale sidecar state.
+            ready_ids.difference_update(active_ids)
+        elif latest_active_scan is not None:
+            observed_ids = {
+                ModelFile.build_file_id(
+                    scanned_file.name,
+                    getattr(scanned_file, "path_pair_id", None),
+                )
+                for scanned_file in getattr(latest_active_scan, "files", []) or []
+            } & active_ids
+            healthy_observed_ids = observed_ids
+            # A missing active scan result means the sidecar/path is not
+            # currently observable; do not retain a stale stop-ready gate.
+            ready_ids.intersection_update(observed_ids)
+            for scanned_file in getattr(latest_active_scan, "files", []) or []:
+                file_id = ModelFile.build_file_id(
+                    scanned_file.name,
+                    getattr(scanned_file, "path_pair_id", None),
+                )
+                if file_id not in active_ids:
+                    continue
+                if getattr(scanned_file, "is_dir", False) or getattr(
+                    scanned_file, "status_sidecar_ready", False
+                ):
+                    ready_ids.add(file_id)
+                else:
+                    ready_ids.discard(file_id)
+
+        # Directory transfers are stoppable without a pget sidecar. Apply
+        # this invariant after scan-result invalidation so failed scans do not
+        # turn directories into pointless checkpoint retries.
+        current_model = getattr(controller, "_Controller__model", None)
+        if current_model is not None:
+            for file_id in active_ids:
+                if file_id in healthy_observed_ids:
+                    continue
+                try:
+                    model_file = current_model.get_file(file_id)
+                except (AttributeError, ModelError):
+                    continue
+                if isinstance(model_file, ModelFile) and model_file.is_dir:
+                    ready_ids.add(file_id)
+
+        pending_ids.clear()
+        pending_ids.update(active_ids - ready_ids)
+        if not pending_ids:
+            controller._Controller__next_active_scan_force_at = None
+            return
+
+        current_time = now if now is not None else datetime.now()
+        next_force_at = getattr(controller, "_Controller__next_active_scan_force_at", None)
+        if next_force_at is not None and current_time < next_force_at:
+            return
+
+        controller._Controller__active_scan_process.force_scan()
+        controller._Controller__next_active_scan_force_at = (
+            current_time + self._ACTIVE_SCAN_FORCE_INTERVAL
+        )
+
     def update(self) -> None:
         controller = self._controller
         model_builder = controller._Controller__model_builder
@@ -316,6 +428,12 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__prev_downloading_file_names = set()
         if not hasattr(controller, "_Controller__pending_completion_file_names"):
             controller._Controller__pending_completion_file_names = set()
+        if not hasattr(controller, "_Controller__active_scan_force_file_ids"):
+            controller._Controller__active_scan_force_file_ids = set()
+        if not hasattr(controller, "_Controller__active_scan_ready_file_ids"):
+            controller._Controller__active_scan_ready_file_ids = set()
+        if not hasattr(controller, "_Controller__next_active_scan_force_at"):
+            controller._Controller__next_active_scan_force_at = None
         if not hasattr(controller, "_Controller__move_retry_due"):
             controller._Controller__move_retry_due = {}
         if not hasattr(controller, "_Controller__deferred_move_file_ids"):
@@ -473,6 +591,10 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__active_downloading_file_names
             + controller._Controller__active_extracting_file_names
             + list(controller._Controller__pending_completion_file_names)
+        )
+        self._force_active_scan_for_stoppability(
+            controller._Controller__active_downloading_file_names,
+            latest_active_scan,
         )
 
         # Update model builder state.

@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -291,3 +292,235 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__local_scan_process.force_scan.assert_not_called()
         controller._Controller__is_explicitly_stopped.assert_not_called()
         controller.logger.info.assert_not_called()
+
+    def test_active_scan_force_retries_at_checkpoint_cadence_with_long_scan_interval(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+            _Controller__context=SimpleNamespace(
+                config=SimpleNamespace(
+                    controller=SimpleNamespace(interval_ms_downloading_scan=60000),
+                ),
+            ),
+        )
+        updater = ModelUpdater(controller)
+        start = datetime(2026, 1, 1)
+        active_file = [("movie.mkv", None, None)]
+
+        updater._force_active_scan_for_stoppability(active_file, now=start)
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            now=start + timedelta(seconds=1.9),
+        )
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            now=start + timedelta(seconds=2),
+        )
+
+        self.assertEqual(2, controller._Controller__active_scan_process.force_scan.call_count)
+
+    def test_active_scan_force_stops_after_sidecar_readiness_without_new_scan_result(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids={"movie.mkv"},
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        start = datetime(2026, 1, 1)
+        ready_file = SystemFile("movie.mkv", 100)
+        ready_file.status_sidecar_ready = True
+        latest_scan = SimpleNamespace(files=[ready_file])
+        active_file = [("movie.mkv", None, None)]
+
+        updater._force_active_scan_for_stoppability(active_file, latest_scan, now=start)
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            latest_active_scan=None,
+            now=start + timedelta(seconds=10),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_not_called()
+        self.assertEqual(set(), controller._Controller__active_scan_force_file_ids)
+        self.assertIsNone(controller._Controller__next_active_scan_force_at)
+
+    def test_failed_active_scan_invalidates_cached_readiness_for_still_active_job(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        start = datetime(2026, 1, 1)
+        active_file = [("movie.mkv", None, None)]
+        ready_file = SystemFile("movie.mkv", 100)
+        ready_file.status_sidecar_ready = True
+
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            SimpleNamespace(files=[ready_file], failed=False),
+            now=start,
+        )
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            SimpleNamespace(files=[], failed=True),
+            now=start + timedelta(seconds=1),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual({"movie.mkv"}, controller._Controller__active_scan_force_file_ids)
+        self.assertEqual(set(), controller._Controller__active_scan_ready_file_ids)
+
+    def test_failed_directory_scan_does_not_force_checkpoint_retry(self):
+        directory = ModelFile("movie-folder", True)
+        model = MagicMock()
+        model.get_file.return_value = directory
+        controller = SimpleNamespace(
+            _Controller__model=model,
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        active_file = [("movie-folder", None, None)]
+
+        updater._force_active_scan_for_stoppability(active_file, now=datetime(2026, 1, 1))
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            SimpleNamespace(files=[], failed=True),
+            now=datetime(2026, 1, 1, 0, 0, 1),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_not_called()
+        self.assertEqual(set(), controller._Controller__active_scan_force_file_ids)
+
+    def test_fresh_regular_scan_overrides_stale_model_directory_fallback(self):
+        stale_directory = ModelFile("movie.mkv", True)
+        model = MagicMock()
+        model.get_file.return_value = stale_directory
+        controller = SimpleNamespace(
+            _Controller__model=model,
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        regular_file = SystemFile("movie.mkv", 100)
+        active_file = [("movie.mkv", None, None)]
+
+        updater._force_active_scan_for_stoppability(
+            active_file,
+            SimpleNamespace(files=[regular_file], failed=False),
+            now=datetime(2026, 1, 1),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual({"movie.mkv"}, controller._Controller__active_scan_force_file_ids)
+
+    def test_rclone_active_download_does_not_force_lftp_checkpoint_scan(self):
+        controller = SimpleNamespace(
+            _Controller__lftp=SimpleNamespace(backend_name="rclone"),
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids={"movie.mkv"},
+            _Controller__active_scan_ready_file_ids={"movie.mkv"},
+            _Controller__next_active_scan_force_at=datetime(2026, 1, 1),
+        )
+        updater = ModelUpdater(controller)
+
+        updater._force_active_scan_for_stoppability(
+            [("movie.mkv", None, None)],
+            now=datetime(2026, 1, 1),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_not_called()
+        self.assertEqual(set(), controller._Controller__active_scan_force_file_ids)
+        self.assertEqual(set(), controller._Controller__active_scan_ready_file_ids)
+        self.assertIsNone(controller._Controller__next_active_scan_force_at)
+
+    def test_delayed_ready_scan_does_not_suppress_same_identity_restart_wake(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        start = datetime(2026, 1, 1)
+        ready_file = SystemFile("movie.mkv", 100)
+        ready_file.status_sidecar_ready = True
+        delayed_scan = SimpleNamespace(files=[ready_file])
+
+        # The result arrived after the prior job ended, so it must not cache
+        # readiness for a future transfer with the same identity.
+        updater._force_active_scan_for_stoppability([], delayed_scan, now=start)
+        updater._force_active_scan_for_stoppability(
+            [("movie.mkv", None, None)],
+            latest_active_scan=None,
+            now=start + timedelta(seconds=10),
+        )
+
+        controller._Controller__active_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual({"movie.mkv"}, controller._Controller__active_scan_force_file_ids)
+
+    def test_failed_active_scan_does_not_certify_checkpoint_across_path_pairs(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids=set(),
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+        start = datetime(2026, 1, 1)
+        active_files = [
+            ("movie.mkv", "movies", "Movies"),
+            ("movie.mkv", "tv", "TV"),
+        ]
+        movies_file = SystemFile("movie.mkv", 100)
+        movies_file.path_pair_id = "movies"
+        movies_file.status_sidecar_ready = True
+        tv_file = SystemFile("movie.mkv", 100)
+        tv_file.path_pair_id = "tv"
+        tv_file.status_sidecar_ready = True
+
+        updater._force_active_scan_for_stoppability(
+            active_files,
+            SimpleNamespace(files=[movies_file, tv_file], failed=True),
+            now=start,
+        )
+
+        expected_pending = {
+            ModelFile.build_file_id("movie.mkv", "movies"),
+            ModelFile.build_file_id("movie.mkv", "tv"),
+        }
+        self.assertEqual(expected_pending, controller._Controller__active_scan_force_file_ids)
+
+        updater._force_active_scan_for_stoppability(
+            active_files,
+            SimpleNamespace(files=[movies_file], failed=False),
+            now=start + timedelta(seconds=2),
+        )
+
+        self.assertEqual(
+            {ModelFile.build_file_id("movie.mkv", "tv")},
+            controller._Controller__active_scan_force_file_ids,
+        )
+
+    def test_active_scan_force_state_clears_when_no_jobs_remain(self):
+        controller = SimpleNamespace(
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__active_scan_force_file_ids={"movie.mkv"},
+            _Controller__active_scan_ready_file_ids=set(),
+            _Controller__next_active_scan_force_at=None,
+        )
+        updater = ModelUpdater(controller)
+
+        updater._force_active_scan_for_stoppability([], now=datetime(2026, 1, 1))
+
+        controller._Controller__active_scan_process.force_scan.assert_not_called()
+        self.assertEqual(set(), controller._Controller__active_scan_force_file_ids)
+        self.assertEqual(set(), controller._Controller__active_scan_ready_file_ids)
