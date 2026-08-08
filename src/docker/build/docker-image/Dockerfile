@@ -1,5 +1,7 @@
-# Creates environment for angular
-FROM node:24-bookworm-slim AS seedsync_build_angular_env
+# Angular emits architecture-independent static assets. Build it once on the
+# BuildKit host platform so multi-architecture releases do not require Node.js
+# images for every runtime target (Node 24 does not publish linux/arm/v7).
+FROM --platform=$BUILDPLATFORM node:24-bookworm-slim AS seedsync_build_angular_env
 RUN apt-get update && apt-get install -y \
     build-essential \
     python3 \
