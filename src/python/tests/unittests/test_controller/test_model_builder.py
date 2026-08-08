@@ -32,6 +32,15 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder = ModelBuilder()
         self.model_builder.set_base_logger(logger)
 
+    def __set_transfer_sources(self, file_name: str, path_pair_id: str, local_size: int = 650) -> str:
+        remote_file = SystemFile(file_name, 1000, False)
+        remote_file.path_pair_id = path_pair_id
+        local_file = SystemFile(file_name, local_size, False)
+        local_file.path_pair_id = path_pair_id
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+        return ModelFile.build_file_id(file_name, path_pair_id)
+
     def test_build_model_suppresses_temp_model_logs_without_mutating_shared_dummy_logger(self):
         root_logger = logging.getLogger()
         root_level = root_logger.level
@@ -1599,6 +1608,225 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(rebuilt_file.downloading_speed)
         self.assertIsNone(rebuilt_file.eta)
         self.assertFalse(self.model_builder.has_changes())
+
+    def test_build_stopped_file_promotes_recent_live_floor_after_stop_status_disappears(self):
+        self.model_builder.clear()
+        file_name = "same.mkv"
+        path_pair_id = "movies"
+        qualified_file_id = ModelFile.build_file_id(file_name, path_pair_id)
+        remote_file = SystemFile(file_name, 1000, False)
+        remote_file.path_pair_id = path_pair_id
+        local_file = SystemFile(file_name, 650, False)
+        local_file.path_pair_id = path_pair_id
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([local_file])
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        running_status.path_pair_id = path_pair_id
+        running_status.total_transfer_state = LftpJobStatus.TransferState(770, 1000, 77, 2000, 4)
+        self.model_builder.set_lftp_statuses([running_status])
+
+        running_model = self.model_builder.build_model()
+        running_file = running_model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, running_file.state)
+        self.assertEqual(770, running_file.transferred_size)
+        self.assertEqual(77, running_file.download_progress)
+
+        # A legacy status/root alias must be canonicalized when the stopped
+        # row promotes its recent-live snapshot.
+        recent_snapshot = self.model_builder._ModelBuilder__recent_live_transfer_snapshots.pop(
+            qualified_file_id
+        )
+        recent_snapshot.root_file_id = file_name
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots[file_name] = recent_snapshot
+
+        # The real stop path clears LFTP status after setting the stop marker.
+        self.model_builder.set_stopped_files({qualified_file_id})
+        self.model_builder.set_lftp_statuses([])
+
+        stopped_model = self.model_builder.build_model()
+        stopped_file = stopped_model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, stopped_file.state)
+        self.assertEqual(770, stopped_file.transferred_size)
+        self.assertEqual(77, stopped_file.download_progress)
+        self.assertIn(qualified_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertNotIn(file_name, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertIn(qualified_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+        self.assertNotIn(file_name, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+        self.model_builder.set_stopped_files(set())
+        queued_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file_name, "")
+        queued_status.path_pair_id = path_pair_id
+        self.model_builder.set_lftp_statuses([queued_status])
+
+        queued_model = self.model_builder.build_model()
+        queued_file = queued_model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.QUEUED, queued_file.state)
+        self.assertEqual(770, queued_file.transferred_size)
+        self.assertEqual(77, queued_file.download_progress)
+        self.assertNotIn(qualified_file_id, self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
+
+        lower_resume_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        lower_resume_status.path_pair_id = path_pair_id
+        lower_resume_status.total_transfer_state = LftpJobStatus.TransferState(730, 1000, 73, 1800, 5)
+        self.model_builder.set_lftp_statuses([lower_resume_status])
+
+        resumed_model = self.model_builder.build_model()
+        resumed_file = resumed_model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, resumed_file.state)
+        self.assertEqual(770, resumed_file.transferred_size)
+        self.assertEqual(77, resumed_file.download_progress)
+        self.assertEqual(1800, resumed_file.downloading_speed)
+        self.assertEqual(5, resumed_file.eta)
+
+        caught_up_status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, "")
+        caught_up_status.path_pair_id = path_pair_id
+        caught_up_status.total_transfer_state = LftpJobStatus.TransferState(780, 1000, 78, 1800, 5)
+        self.model_builder.set_lftp_statuses([caught_up_status])
+
+        caught_up_model = self.model_builder.build_model()
+        caught_up_file = caught_up_model.get_file(qualified_file_id)
+        self.assertEqual(780, caught_up_file.transferred_size)
+        self.assertEqual(78, caught_up_file.download_progress)
+        self.assertNotIn(qualified_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+    def test_build_stopped_promotion_isolated_for_duplicate_path_pairs(self):
+        self.model_builder.clear()
+        file_name = "same.mkv"
+        movies_file_id = ModelFile.build_file_id(file_name, "movies")
+        tv_file_id = ModelFile.build_file_id(file_name, "tv")
+        remote_files = []
+        local_files = []
+        running_statuses = []
+        for path_pair_id, local_size, transferred_size, percent in (
+            ("movies", 650, 770, 77),
+            ("tv", 750, 880, 88),
+        ):
+            remote_file = SystemFile(file_name, 1000, False)
+            remote_file.path_pair_id = path_pair_id
+            local_file = SystemFile(file_name, local_size, False)
+            local_file.path_pair_id = path_pair_id
+            remote_files.append(remote_file)
+            local_files.append(local_file)
+            running_status = LftpJobStatus(
+                0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, ""
+            )
+            running_status.path_pair_id = path_pair_id
+            running_status.total_transfer_state = LftpJobStatus.TransferState(
+                transferred_size, 1000, percent, 1800, 5
+            )
+            running_statuses.append(running_status)
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+        self.model_builder.set_lftp_statuses(running_statuses)
+        self.model_builder.build_model()
+
+        self.model_builder.set_stopped_files({movies_file_id})
+        self.model_builder.set_lftp_statuses([])
+
+        stopped_model = self.model_builder.build_model()
+        stopped_movies = stopped_model.get_file(movies_file_id)
+        stopped_tv = stopped_model.get_file(tv_file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, stopped_movies.state)
+        self.assertEqual(770, stopped_movies.transferred_size)
+        self.assertEqual(77, stopped_movies.download_progress)
+        self.assertEqual(ModelFile.State.DOWNLOADING, stopped_tv.state)
+        self.assertEqual(880, stopped_tv.transferred_size)
+        self.assertEqual(88, stopped_tv.download_progress)
+        self.assertEqual(
+            {movies_file_id},
+            set(self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        )
+        self.assertNotIn(tv_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        self.model_builder.set_stopped_files(set())
+        queued_movies = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file_name, ""
+        )
+        queued_movies.path_pair_id = "movies"
+        self.model_builder.set_lftp_statuses([queued_movies])
+        queued_model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.QUEUED, queued_model.get_file(movies_file_id).state)
+        self.assertEqual(770, queued_model.get_file(movies_file_id).transferred_size)
+        self.assertEqual(77, queued_model.get_file(movies_file_id).download_progress)
+        self.assertIn(movies_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertNotIn(tv_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        lower_movies = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, ""
+        )
+        lower_movies.path_pair_id = "movies"
+        lower_movies.total_transfer_state = LftpJobStatus.TransferState(730, 1000, 73, 1700, 6)
+        self.model_builder.set_lftp_statuses([lower_movies])
+        resumed_model = self.model_builder.build_model()
+        resumed_movies = resumed_model.get_file(movies_file_id)
+        self.assertEqual(770, resumed_movies.transferred_size)
+        self.assertEqual(77, resumed_movies.download_progress)
+        self.assertIn(movies_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertNotIn(tv_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        caught_up_movies = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, ""
+        )
+        caught_up_movies.path_pair_id = "movies"
+        caught_up_movies.total_transfer_state = LftpJobStatus.TransferState(780, 1000, 78, 1700, 6)
+        self.model_builder.set_lftp_statuses([caught_up_movies])
+        caught_up_model = self.model_builder.build_model()
+        self.assertEqual(780, caught_up_model.get_file(movies_file_id).transferred_size)
+        self.assertEqual(78, caught_up_model.get_file(movies_file_id).download_progress)
+        self.assertNotIn(movies_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+        self.assertNotIn(tv_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+    def test_build_resumed_running_state_allows_zero_reset_after_promoted_stop_floor(self):
+        self.model_builder.clear()
+        file_name = "reset-after-stop.bin"
+        path_pair_id = "movies"
+        qualified_file_id = self.__set_transfer_sources(file_name, path_pair_id)
+
+        running_status = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, ""
+        )
+        running_status.path_pair_id = path_pair_id
+        running_status.total_transfer_state = LftpJobStatus.TransferState(770, 1000, 77, 1800, 5)
+        self.model_builder.set_lftp_statuses([running_status])
+        self.model_builder.build_model()
+
+        self.model_builder.set_stopped_files({qualified_file_id})
+        self.model_builder.set_lftp_statuses([])
+        stopped_model = self.model_builder.build_model()
+        self.assertEqual(770, stopped_model.get_file(qualified_file_id).transferred_size)
+        self.assertEqual(77, stopped_model.get_file(qualified_file_id).download_progress)
+        self.assertIn(qualified_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
+
+        self.model_builder.set_stopped_files(set())
+        queued_status = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file_name, ""
+        )
+        queued_status.path_pair_id = path_pair_id
+        self.model_builder.set_lftp_statuses([queued_status])
+        queued_model = self.model_builder.build_model()
+        self.assertEqual(ModelFile.State.QUEUED, queued_model.get_file(qualified_file_id).state)
+        self.assertEqual(770, queued_model.get_file(qualified_file_id).transferred_size)
+        self.assertEqual(77, queued_model.get_file(qualified_file_id).download_progress)
+
+        zero_local_file = SystemFile(file_name, 0, False)
+        zero_local_file.path_pair_id = path_pair_id
+        self.model_builder.set_local_files([zero_local_file])
+        reset_status = LftpJobStatus(
+            0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file_name, ""
+        )
+        reset_status.path_pair_id = path_pair_id
+        reset_status.total_transfer_state = LftpJobStatus.TransferState(0, 1000, 0, 1800, 5)
+        self.model_builder.set_lftp_statuses([reset_status])
+
+        reset_model = self.model_builder.build_model()
+        reset_file = reset_model.get_file(qualified_file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, reset_file.state)
+        self.assertEqual(0, reset_file.transferred_size)
+        self.assertEqual(0, reset_file.download_progress)
+        self.assertEqual(1800, reset_file.downloading_speed)
+        self.assertEqual(5, reset_file.eta)
+        self.assertNotIn(qualified_file_id, self.model_builder._ModelBuilder__retained_stopped_transfer_snapshots)
 
     def test_build_resumed_running_state_keeps_retained_stopped_snapshot_until_progress_catches_up(self):
         self.model_builder.clear()

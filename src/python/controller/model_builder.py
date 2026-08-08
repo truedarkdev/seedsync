@@ -1022,6 +1022,21 @@ class ModelBuilder:
             return self.__build_retained_transfer_state(snapshot.size_local, None, snapshot.percent_local)
         return self.__build_retained_transfer_state(snapshot.size_local, remote.size, snapshot.percent_local)
 
+    def __promote_recent_live_transfer_snapshot_to_stopped_floor(
+            self,
+            file_id: str,
+            root_file_id: Optional[str]) -> None:
+        _, snapshot = self.__resolve_recent_live_transfer_snapshot(
+            file_id,
+            root_file_id
+        )
+        if snapshot is None:
+            return
+        # Keep the recent-live copy available for the existing no-status
+        # resume window; the retained copy provides the stopped floor once a
+        # queued or running status returns.
+        self.__retained_stopped_transfer_snapshots[file_id] = snapshot
+
     def set_active_files(self, active_files: List[SystemFile]) -> None:
         had_active_files = bool(self.__active_files)
         self.__active_file_ids = set()
@@ -1492,6 +1507,10 @@ class ModelBuilder:
         if retained_transfer_state is None and status is None and is_stopped:
             retained_transfer_state = self.__get_retained_recent_transfer_state(file_id, remote, local, remote, local)
             if retained_transfer_state is not None:
+                self.__promote_recent_live_transfer_snapshot_to_stopped_floor(
+                    file_id,
+                    model_file.file_id
+                )
                 arbitration_source = "retained_recent_live_snapshot"
         if status and not is_stopped:
             model_file.state = ModelFile.State.QUEUED if status.state == LftpJobStatus.State.QUEUED \
