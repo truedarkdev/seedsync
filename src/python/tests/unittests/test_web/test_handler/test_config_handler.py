@@ -594,6 +594,24 @@ class TestConfigHandlerRoutes(unittest.TestCase):
             body
         )
 
+    def test_open_browser_auth_does_not_allow_remote_compatibility_toggle(self):
+        self.context.config.general.disable_browser_auth = True
+        config = self._new_config()
+        ConfigHandler(config).add_routes(self.web_app)
+
+        status_code, body = _invoke_post_json_route(
+            self.web_app,
+            "/server/config/set/general/disable_browser_auth",
+            {"value": False},
+        )
+
+        self.assertEqual(403, status_code)
+        self.assertFalse(config.general.disable_browser_auth)
+        self.assertIn(
+            "Section 'general' option 'disable_browser_auth' cannot be set via request body",
+            body,
+        )
+
     def test_set_route_rejects_obsolete_bootstrap_allowlist_option(self):
         config = self._new_config()
         ConfigHandler(config).add_routes(self.web_app)

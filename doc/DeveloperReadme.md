@@ -637,6 +637,16 @@ The intended browser-access UX is:
 - deleting or revoking the API key clears any remembered-browser state tied
   to that key
 - bootstrap and recovery sessions remain short-lived
+- setting `general.disable_browser_auth = True` (or Docker
+  `SEEDSYNC_DISABLE_BROWSER_AUTH=1`) intentionally restores the original fully
+  open SeedSync surface. Anyone with network reach can use every UI and
+  `/server` route, including API-key administration, history/diagnostics,
+  notifications, admin streams, and migration recovery. Treat network or
+  reverse-proxy isolation as mandatory; normal endpoint validation and
+  destructive/migration confirmations still apply, but browser credentials do
+  not provide a boundary in this mode. Unsafe requests with explicit
+  cross-origin browser signals remain blocked; direct clients that omit those
+  signals remain supported.
 
 When investigating or changing this area, do not treat a persistent cookie by
 itself as sufficient proof that the remembered-browser behavior is correct.
