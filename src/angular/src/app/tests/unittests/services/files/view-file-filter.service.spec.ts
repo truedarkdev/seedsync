@@ -249,6 +249,22 @@ describe("Testing view file filter service", () => {
             new ViewFile({status: ViewFile.Status.EXTRACTED}))).toBe(true);
     }));
 
+    it("filters by the visible status rather than hidden completion lineage", fakeAsync(() => {
+        viewFileOptionsService._options.next(new ViewFileOptions({
+            selectedStatusFilter: ViewFile.Status.DOWNLOADED,
+        }));
+        tick();
+
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isLocalOnly: false,
+        }))).toBe(true);
+        expect(filterCriteria.meetsCriteria(new ViewFile({
+            status: ViewFile.Status.DOWNLOADED,
+            isLocalOnly: true,
+        }))).toBe(false);
+    }));
+
     it("correctly filters by name AND status", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             selectedStatusFilter: ViewFile.Status.DEFAULT,

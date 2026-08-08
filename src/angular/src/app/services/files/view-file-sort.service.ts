@@ -311,8 +311,9 @@ const getDownloadedTimestampValue = (file: ViewFile): number | null => {
 };
 
 const isSmartStatusInactive = (file: ViewFile): boolean => {
-    switch (file.status) {
+    switch (file.visibleStatus) {
         case ViewFile.Status.DEFAULT:
+        case ViewFile.Status.LOCAL_ONLY:
         case ViewFile.Status.DELETED:
         case ViewFile.Status.EXTRACTED:
         case ViewFile.Status.VALIDATED:
@@ -325,7 +326,13 @@ const isSmartStatusInactive = (file: ViewFile): boolean => {
 };
 
 const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
-    if (a.status !== b.status) {
+    // The row presentation deliberately labels every local-only item as
+    // "Local Only", regardless of its persisted completion lineage. Keep
+    // legacy Status sorting aligned with that visible category while leaving
+    // the underlying state available for actions and Smart Status recency.
+    const aStatus = a.visibleStatus;
+    const bStatus = b.visibleStatus;
+    if (aStatus !== bStatus) {
         const statusPriorities = {
             [ViewFile.Status.MOVE_FAILED]: -1,
             [ViewFile.Status.MOVE_SUCCEEDED]: 7,
@@ -339,17 +346,20 @@ const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.DOWNLOADED]: 7,
             [ViewFile.Status.STOPPED]: 8,
             [ViewFile.Status.DEFAULT]: 9,
+            [ViewFile.Status.LOCAL_ONLY]: 9,
             [ViewFile.Status.DELETED]: 9  // intermix deleted and default
         };
-        if (statusPriorities[a.status] !== statusPriorities[b.status]) {
-            return statusPriorities[a.status] - statusPriorities[b.status];
+        if (statusPriorities[aStatus] !== statusPriorities[bStatus]) {
+            return statusPriorities[aStatus] - statusPriorities[bStatus];
         }
     }
     return 0;
 };
 
 const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
-    if (a.status !== b.status) {
+    const aStatus = a.visibleStatus;
+    const bStatus = b.visibleStatus;
+    if (aStatus !== bStatus) {
         const statusPriorities = {
             [ViewFile.Status.MOVE_FAILED]: -1,
             [ViewFile.Status.MOVE_SUCCEEDED]: 7,
@@ -360,13 +370,14 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.QUEUED]: 4,
             [ViewFile.Status.STOPPED]: 5,
             [ViewFile.Status.DEFAULT]: 7,
+            [ViewFile.Status.LOCAL_ONLY]: 7,
             [ViewFile.Status.DELETED]: 7,
             [ViewFile.Status.EXTRACTED]: 7,
             [ViewFile.Status.VALIDATED]: 7,
             [ViewFile.Status.DOWNLOADED]: 7
         };
-        if (statusPriorities[a.status] !== statusPriorities[b.status]) {
-            return statusPriorities[a.status] - statusPriorities[b.status];
+        if (statusPriorities[aStatus] !== statusPriorities[bStatus]) {
+            return statusPriorities[aStatus] - statusPriorities[bStatus];
         }
     }
     return 0;

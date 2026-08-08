@@ -153,6 +153,6 @@ export class FileOptionsComponent implements OnInit, OnDestroy {
     }
 
     private static getStatusCount(files: Immutable.List<ViewFile>, status: ViewFile.Status) {
-        return files.count(file => file.status === status);
+        return files.count(file => file.visibleStatus === status);
     }
 }

@@ -192,6 +192,17 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.DELETED, name: ""})
         )).toBe(0);
 
+        // Sort by the status users see: persisted completion lineage must not
+        // make a visibly Local Only row tie with genuine Downloaded rows.
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: false, name: "downloaded"}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true, name: "local-only"})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT, isLocalOnly: true, name: "alpha"}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true, name: "beta"})
+        )).toBeLessThan(0);
+
         // Inactive/completed entries should be ordered by newest genuine download across statuses.
         expect(sortComparator(
             new ViewFile({
@@ -311,6 +322,10 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.VALIDATED}),
             new ViewFile({status: ViewFile.Status.EXTRACTED})
+        )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: true, name: "local-only"}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, isLocalOnly: false, name: "downloaded"})
         )).toBeLessThan(0);
     }));
 
@@ -558,8 +573,16 @@ describe("Testing view file sort service", () => {
         const downloadedA = new ViewFile({name: "a", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(1000)});
         const downloadedB = new ViewFile({name: "b", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(2000)});
         const moved = new ViewFile({name: "moved", status: ViewFile.Status.MOVE_SUCCEEDED, downloadedTimestamp: new Date(3000)});
+        const visiblyLocal = new ViewFile({
+            name: "local",
+            status: ViewFile.Status.MOVE_FAILED,
+            isLocalOnly: true,
+            downloadedTimestamp: new Date(4000)
+        });
 
         expect(sortComparator(failed, corrupt)).toBeLessThan(0);
+        expect(sortComparator(corrupt, visiblyLocal)).toBeLessThan(0);
+        expect(sortComparator(visiblyLocal, moved)).toBeLessThan(0);
         expect(sortComparator(downloadedB, downloadedA)).toBeLessThan(0);
         expect(sortComparator(moved, downloadedB)).toBeLessThan(0);
     }));

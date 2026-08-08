@@ -128,6 +128,11 @@ export class ViewFile extends ViewFileRecord implements IViewFile {
     constructor(props) {
         super(props);
     }
+
+    /** Status represented by the row label/icon rather than persisted lineage. */
+    get visibleStatus(): ViewFile.Status {
+        return this.isLocalOnly ? ViewFile.Status.LOCAL_ONLY : this.status;
+    }
 }
 
 export module ViewFile {
@@ -144,6 +149,7 @@ export module ViewFile {
         VALIDATED       = <any> "validated",
         CORRUPT         = <any> "corrupt",
         MOVE_FAILED     = <any> "move_failed",
-        MOVE_SUCCEEDED  = <any> "move_succeeded"
+        MOVE_SUCCEEDED  = <any> "move_succeeded",
+        LOCAL_ONLY      = <any> "local_only"
     }
 }
