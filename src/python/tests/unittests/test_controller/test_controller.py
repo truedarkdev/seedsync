@@ -120,22 +120,36 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
 
-    def test_record_download_completion_overwrites_timestamp_by_canonical_id(self):
+    def test_record_download_completion_backfills_without_replacing_start_timestamp(self):
         self.controller._Controller__persist.downloaded_timestamps = {}
         file = ModelFile("same.mkv", False)
         file.path_pair_id = "movies"
         first = datetime(2026, 1, 1, 0, 0, 1)
-        second = datetime(2026, 1, 1, 0, 0, 2)
 
-        with patch.object(Controller, "_download_completion_clock", side_effect=[first, second]):
+        with patch.object(Controller, "_download_timestamp_clock", return_value=first) as clock:
             self.controller._record_download_completion(file)
             first_timestamp = self.controller._Controller__persist.downloaded_timestamps[file.file_id]
             self.controller._record_download_completion(file)
 
         self.assertEqual(first.timestamp(), first_timestamp)
-        self.assertEqual(second.timestamp(), self.controller._Controller__persist.downloaded_timestamps[file.file_id])
+        self.assertEqual(first.timestamp(), self.controller._Controller__persist.downloaded_timestamps[file.file_id])
         self.controller._Controller__model_builder.set_downloaded_timestamps.assert_called_with(
             self.controller._Controller__persist.downloaded_timestamps
+        )
+        clock.assert_called_once_with()
+
+    def test_record_download_start_replaces_prior_timestamp_by_canonical_id(self):
+        file = ModelFile("same.mkv", False)
+        file.path_pair_id = "movies"
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 100.0}
+        started_at = datetime(2026, 1, 1, 0, 0, 2)
+
+        with patch.object(Controller, "_download_timestamp_clock", return_value=started_at):
+            self.controller._record_download_start(file)
+
+        self.assertEqual(
+            {file.file_id: started_at.timestamp()},
+            self.controller._Controller__persist.downloaded_timestamps,
         )
 
     def test_download_start_lifecycle_confirms_running_once(self):
@@ -147,17 +161,24 @@ class TestController(unittest.TestCase):
         queued = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, file.name, "")
         running = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, file.name, "")
 
-        self.controller._confirm_fresh_healthy_download_starts([queued])
-        self.controller._confirm_fresh_healthy_download_starts([running])
-        self.controller._confirm_fresh_healthy_download_starts([running])
+        started_at = datetime(2026, 1, 1, 0, 0, 2)
+        with patch.object(Controller, "_download_timestamp_clock", return_value=started_at):
+            self.controller._confirm_fresh_healthy_download_starts([queued])
+            self.controller._confirm_fresh_healthy_download_starts([running])
+            self.controller._confirm_fresh_healthy_download_starts([running])
 
         listener.assert_called_once()
         self.assertEqual("notified", self.controller._Controller__download_start_state[file.file_id].state)
+        self.assertEqual(
+            {file.file_id: started_at.timestamp()},
+            self.controller._Controller__persist.downloaded_timestamps,
+        )
 
     def test_download_start_lifecycle_stop_suppresses_resume(self):
         file = ModelFile("release", False)
         listener = MagicMock()
         self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 100.0}
         self.controller.add_download_start_listener(listener)
         self.controller._Controller__arm_download_start_lifecycle(file.file_id)
         self.controller._Controller__suppress_download_start_lifecycle(file.file_id)
@@ -168,6 +189,9 @@ class TestController(unittest.TestCase):
 
         listener.assert_not_called()
         self.assertEqual("suppressed", self.controller._Controller__download_start_state[file.file_id].state)
+        self.assertEqual(
+            {file.file_id: 100.0}, self.controller._Controller__persist.downloaded_timestamps
+        )
 
     def test_download_start_lifecycle_clear_allows_new_lifecycle(self):
         file = ModelFile("release", False)
@@ -2824,7 +2848,7 @@ class TestController(unittest.TestCase):
                 )
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
-    def test_update_model_stamps_updated_redownload_even_with_existing_marker(self, diff_models):
+    def test_update_model_keeps_observed_start_timestamp_when_redownload_completes(self, diff_models):
         old_file = ModelFile("redownload.mkv", False)
         old_file.path_pair_id = "movies"
         old_file.state = ModelFile.State.DOWNLOADING
@@ -2845,11 +2869,11 @@ class TestController(unittest.TestCase):
             MagicMock(change=ModelDiff.Change.UPDATED, old_file=old_file, new_file=new_file)
         ]
 
-        with patch.object(Controller, "_download_completion_clock", return_value=datetime(2026, 1, 1, 0, 0, 2)):
+        with patch.object(Controller, "_download_timestamp_clock", return_value=datetime(2026, 1, 1, 0, 0, 2)):
             self.controller._Controller__update_model()
 
         self.assertEqual(
-            {new_file.file_id: datetime(2026, 1, 1, 0, 0, 2).timestamp()},
+            {new_file.file_id: 100.0},
             self.controller._Controller__persist.downloaded_timestamps,
         )
 

@@ -1321,16 +1321,24 @@ class Controller:
                 self.__download_start_state.pop(file_id, None)
 
     @staticmethod
-    def _download_completion_clock() -> datetime:
-        """Single clock source for persisted completion timestamps."""
+    def _download_timestamp_clock() -> datetime:
+        """Single clock source for persisted download-recency timestamps."""
         return datetime.now()
 
-    def _record_download_completion(self, file: ModelFile) -> None:
-        """Record a proven completion using the canonical path-pair identity."""
-        timestamp = self._download_completion_clock().timestamp()
+    def _record_download_start(self, file: ModelFile) -> None:
+        """Record a confirmed fresh start using the canonical path-pair identity."""
+        timestamp = self._download_timestamp_clock().timestamp()
         if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
             self.__persist.downloaded_timestamps = {}
         self.__persist.downloaded_timestamps[file.file_id] = timestamp
+        self.__model_builder.set_downloaded_timestamps(self.__persist.downloaded_timestamps)
+
+    def _record_download_completion(self, file: ModelFile) -> None:
+        """Backfill recency when a start was not observed before completion."""
+        if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
+            self.__persist.downloaded_timestamps = {}
+        if file.file_id not in self.__persist.downloaded_timestamps:
+            self.__persist.downloaded_timestamps[file.file_id] = self._download_timestamp_clock().timestamp()
         self.__model_builder.set_downloaded_timestamps(self.__persist.downloaded_timestamps)
 
     def _mark_successful_final_move_handoff(self, file_id: str) -> None:
@@ -1409,6 +1417,7 @@ class Controller:
                 self.__download_start_state[status.file_id] = DownloadStartLifecycleEntry(
                     "notified", entry.path_pair_id, datetime.now()
                 )
+                self._record_download_start(file)
                 notifications.append(file)
         for file in notifications:
             for listener in listeners:
