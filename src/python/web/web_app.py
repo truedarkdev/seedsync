@@ -160,8 +160,9 @@ class WebApp(bottle.Bottle):
         self.route("/logs")(self.__index)
         self.route("/about")(self.__index)
         # This standalone recovery checkpoint intentionally has no normal
-        # router/nav entry.  It still serves the shared Angular shell, but the
-        # page itself requires an authenticated admin browser session.
+        # router/nav entry.  It still serves the shared Angular shell.  In
+        # secure mode the page requires an authenticated admin browser session;
+        # fully open compatibility mode intentionally serves it openly.
         self.route("/migration/recovery")(self.__migration_recovery_index)
         # For static files
         self.route("/<file_path:path>")(self.__static)
@@ -526,6 +527,63 @@ class WebApp(bottle.Bottle):
         return False
 
     @staticmethod
+    def __is_unsafe_request() -> bool:
+        return bottle.request.method.upper() not in {"GET", "HEAD", "OPTIONS"}
+
+    def __has_hostile_browser_origin_signal(self) -> bool:
+        """Return whether explicit browser-origin signals conflict with this request.
+
+        Direct API clients commonly omit Origin/Referer/Sec-Fetch-Site entirely;
+        that remains valid in the network-trusted compatibility mode.  When a
+        client does send browser signals, however, unsafe requests must either
+        be same-origin or be rejected before auth is bypassed.
+        """
+        sec_fetch_site = bottle.request.get_header("Sec-Fetch-Site", "").strip().lower()
+        if sec_fetch_site and sec_fetch_site not in {"same-origin", "none"}:
+            return True
+
+        request_origin = self.__effective_request_origin()
+        for header_name in ("Origin", "Referer"):
+            raw_value = bottle.request.get_header(header_name, "")
+            if not isinstance(raw_value, str) or not raw_value.strip():
+                continue
+            if raw_value.strip().lower() == "null":
+                return True
+            parsed_origin = (
+                WebApp.__parse_browser_origin_header(raw_value)
+                if header_name == "Origin"
+                else WebApp.__parse_origin(raw_value)
+            )
+            if request_origin is None or parsed_origin is None or parsed_origin != request_origin:
+                return True
+
+        return False
+
+    @staticmethod
+    def __parse_browser_origin_header(raw_value: object) -> Optional[Tuple[str, str, int]]:
+        """Parse an Origin header without accepting path/query/userinfo data."""
+        if not isinstance(raw_value, str) or raw_value.strip() == "":
+            return None
+        if raw_value != raw_value.strip():
+            return None
+
+        candidate = raw_value
+        parsed = urlparse(candidate)
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+            or "?" in candidate
+            or "#" in candidate
+        ):
+            return None
+
+        return WebApp.__parse_origin(candidate)
+
+    @staticmethod
     def __request_origin() -> Optional[Tuple[str, str, int]]:
         raw_url = bottle.request.url
         if raw_url.strip() == "":
@@ -625,6 +683,16 @@ class WebApp(bottle.Bottle):
         allow_bootstrap_proof_exchange: bool,
         allow_browser_api_key_entry: bool
     ) -> None:
+        # The explicit legacy compatibility switch restores the original
+        # network-trusted SeedSync surface.  Host filtering and route/schema
+        # validation still run before this gate, but credentials must not
+        # narrow access once the mode is enabled (including malformed,
+        # revoked, or insufficient-scope Authorization headers/cookies).
+        if self.__is_browser_auth_disabled():
+            if self.__is_unsafe_request() and self.__has_hostile_browser_origin_signal():
+                bottle.abort(403, "Cross-origin browser requests are not allowed")
+            return
+
         token = WebApp.__extract_bearer_token()
         if token is None:
             has_authorization_header = (
@@ -715,14 +783,10 @@ class WebApp(bottle.Bottle):
         return None
 
     def __request_auth_scopes(self) -> set[str]:
-        if self.__is_browser_auth_disabled() and not WebApp.__has_authorization_header():
-            session_scopes = self.__get_ui_session_scopes()
-            if session_scopes is not None:
-                scopes = set(session_scopes)
-                if "admin" in scopes:
-                    scopes.update(self._AUTH_SCOPES)
-                return scopes
-            return set(self._LEGACY_UNAUTHENTICATED_SCOPES)
+        if self.__is_browser_auth_disabled():
+            # Every registered stream handler is available in the fully open
+            # compatibility mode, regardless of supplied credentials/cookies.
+            return set(self._AUTH_SCOPES)
 
         token = WebApp.__extract_bearer_token()
         if token is not None and self.__auth_store is not None:
@@ -1309,6 +1373,9 @@ class WebApp(bottle.Bottle):
         return self.__index()
 
     def __migration_recovery_index(self) -> bottle.HTTPResponse:
+        if self.__is_browser_auth_disabled():
+            return self.__static("index.html")
+
         self.__authorize_browser_bootstrap(allow_disabled=False)
         session_scopes = self.__get_ui_session_scopes()
         if session_scopes is None:

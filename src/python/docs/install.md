@@ -158,6 +158,22 @@ Or in case of docker, whatever host port you specified in the `-p <port>:8800` o
 
 You may also access it from another device by replacing 'localhost' with the IP address or hostname of the machine where it is installed.
 
+### Fully open browser-auth compatibility mode
+
+For a legacy deployment that already relies on a trusted network or reverse
+proxy, set General `disable_browser_auth = True` or Docker
+`SEEDSYNC_DISABLE_BROWSER_AUTH=1` (only `0` and `1` are accepted). This removes
+browser/API-key authentication from the ordinary UI and every `/server` route:
+anyone with network reach can administer API keys, read historical logs and
+diagnostics, consume notifications and admin streams, and request migration
+recovery. Invalid or revoked credentials do not restrict access in this mode.
+Use network/proxy isolation as the access control boundary. Endpoint input
+validation, destructive confirmations/attestations, and migration eligibility
+guards still apply. Unsafe requests that include browser-origin signals also
+retain the existing cross-origin guard; direct clients without those signals
+remain supported. Omit the variable or set it to `0` to restore browser
+authentication.
+
 ### <a name="key-auth"></a> Password-less/Key-based Authentication Setup
 
 Password-based access to your remote server is highly unsecure.

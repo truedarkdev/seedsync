@@ -336,7 +336,7 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
         return response
 
-    def test_disable_browser_auth_opens_legacy_ui_scopes_without_mutating_auth_store(self):
+    def test_disable_browser_auth_opens_every_scope_without_mutating_auth_store(self):
         self.context.config.general.disable_browser_auth = True
 
         @self.web_app.route("/server/legacy-read", required_scope="read")
@@ -359,6 +359,10 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         )
         self.web_app.add_default_routes()
 
+        low_scope = self.auth_store.create_api_key("unit-read-only", ["read"])
+        revoked = self.auth_store.create_api_key("unit-revoked", ["read"])
+        self.auth_store.revoke_api_key(revoked["record"].id)
+
         with tempfile.TemporaryDirectory() as html_path:
             with open(os.path.join(html_path, "index.html"), "w") as html_file:
                 html_file.write("<html>legacy-shell</html>")
@@ -376,17 +380,19 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             write = client.post("/server/legacy-write", extra_environ=request_environ)
             Timer(0.1, self.web_app.stop).start()
             stream = client.get("/server/stream", extra_environ=request_environ)
-            admin = client.get("/server/legacy-admin", extra_environ=request_environ, expect_errors=True)
-            invalid_bearer = client.get(
-                "/server/legacy-read",
-                extra_environ={**request_environ, "HTTP_AUTHORIZATION": "Bearer invalid"},
-                expect_errors=True,
-            )
-            non_bearer = client.get(
-                "/server/legacy-read",
-                extra_environ={**request_environ, "HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz"},
-                expect_errors=True,
-            )
+            admin = client.get("/server/legacy-admin", extra_environ=request_environ)
+            supplied_credentials = [
+                {"HTTP_AUTHORIZATION": "Bearer invalid"},
+                {"HTTP_AUTHORIZATION": "Basic dXNlcjpwYXNz"},
+                {"HTTP_AUTHORIZATION": "Bearer {}".format(revoked["secret"])},
+                {"HTTP_AUTHORIZATION": "Bearer {}".format(low_scope["secret"])},
+                {"HTTP_COOKIE": "seedsync_ui_session=invalid-session"},
+            ]
+            for credentials in supplied_credentials:
+                credential_environ = {**request_environ, **credentials}
+                self.assertEqual(200, client.get("/server/legacy-read", extra_environ=credential_environ).status_int)
+                self.assertEqual(200, client.post("/server/legacy-write", extra_environ=credential_environ).status_int)
+                self.assertEqual(200, client.get("/server/legacy-admin", extra_environ=credential_environ).status_int)
 
         self.assertEqual(200, shell.status_int)
         self.assertIn("legacy-shell", shell.text)
@@ -396,13 +402,135 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual("write", write.text)
         self.assertEqual(200, stream.status_int)
         self.assertIn("legacy-stream", stream.text)
-        self.assertEqual(403, admin.status_int)
-        self.assertEqual(401, invalid_bearer.status_int)
-        self.assertEqual(401, non_bearer.status_int)
+        self.assertEqual(200, admin.status_int)
         self.assertEqual(ui_session_count, len(self.auth_store._ApiKeyStore__ui_sessions))
         self.assertEqual(handover_state, self.auth_store.get_browser_handover_state(self.context.config))
 
-    def test_disable_browser_auth_preserves_remembered_admin_session_scope(self):
+    def test_disable_browser_auth_keeps_direct_and_same_origin_writes_but_blocks_cross_origin(self):
+        self.context.config.general.disable_browser_auth = True
+
+        @self.web_app.route("/server/unsafe-command", method="POST", required_scope="write")
+        def _unsafe_command():
+            return "accepted"
+
+        @self.web_app.route("/server/safe-read", required_scope="read")
+        def _safe_read():
+            return "read"
+
+        client = TestApp(self.web_app)
+        direct = client.post(
+            "/server/unsafe-command",
+            extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "203.0.113.10"},
+        )
+        same_origin = client.post(
+            "/server/unsafe-command",
+            extra_environ=self._same_origin_headers(),
+        )
+        cross_origin = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "HTTP_ORIGIN": "https://evil.example",
+                "HTTP_REFERER": "https://evil.example/dashboard",
+                "REMOTE_ADDR": "203.0.113.10",
+            },
+            expect_errors=True,
+        )
+        null_origin = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "HTTP_ORIGIN": "null",
+                "REMOTE_ADDR": "203.0.113.10",
+            },
+            expect_errors=True,
+        )
+        same_site = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                **self._same_origin_headers(),
+                "HTTP_SEC_FETCH_SITE": "same-site",
+            },
+            expect_errors=True,
+        )
+        cross_site = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                **self._same_origin_headers(),
+                "HTTP_SEC_FETCH_SITE": "cross-site",
+            },
+            expect_errors=True,
+        )
+        unknown_fetch_site = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                **self._same_origin_headers(),
+                "HTTP_SEC_FETCH_SITE": "browser-ish",
+            },
+            expect_errors=True,
+        )
+        mismatched_referer = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                **self._same_origin_headers(),
+                "HTTP_REFERER": "https://evil.example/dashboard",
+            },
+            expect_errors=True,
+        )
+        malformed_origins = [
+            "http://localhost:8800/evil",
+            "http://localhost:8800/",
+            "http://user@localhost:8800",
+            "http://localhost:8800?query=1",
+            "http://localhost:8800#fragment",
+            " http://localhost:8800",
+            "http://localhost:8800 ",
+            "not-an-origin",
+            "data:text/plain,opaque",
+        ]
+        malformed_origin_responses = [
+            client.post(
+                "/server/unsafe-command",
+                extra_environ={
+                    "HTTP_HOST": "localhost:8800",
+                    "HTTP_ORIGIN": origin,
+                    "REMOTE_ADDR": "203.0.113.10",
+                },
+                expect_errors=True,
+            )
+            for origin in malformed_origins
+        ]
+        valid_origin = client.post(
+            "/server/unsafe-command",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "HTTP_ORIGIN": "http://localhost:8800",
+                "REMOTE_ADDR": "203.0.113.10",
+            },
+        )
+        safe_cross_origin = client.get(
+            "/server/safe-read",
+            extra_environ={
+                "HTTP_HOST": "localhost:8800",
+                "HTTP_ORIGIN": "https://evil.example",
+                "REMOTE_ADDR": "203.0.113.10",
+            },
+        )
+
+        self.assertEqual(200, direct.status_int)
+        self.assertEqual(200, same_origin.status_int)
+        self.assertEqual(403, cross_origin.status_int)
+        self.assertEqual(403, null_origin.status_int)
+        self.assertEqual(403, same_site.status_int)
+        self.assertEqual(403, cross_site.status_int)
+        self.assertEqual(403, unknown_fetch_site.status_int)
+        self.assertEqual(403, mismatched_referer.status_int)
+        for origin, response in zip(malformed_origins, malformed_origin_responses):
+            self.assertEqual(403, response.status_int, origin)
+        self.assertEqual(200, valid_origin.status_int)
+        self.assertEqual(200, safe_cross_origin.status_int)
+
+    def test_disable_browser_auth_opens_admin_scope_for_sessions_and_guests(self):
         self.context.config.general.disable_browser_auth = True
 
         @self.web_app.route("/server/legacy-admin", required_scope="admin")
@@ -448,8 +576,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
             extra_environ=self._same_origin_headers(),
         )
 
-        self.assertEqual(403, unauthenticated_admin.status_int)
-        self.assertNotIn("admin-stream", unauthenticated_stream.text)
+        self.assertEqual(200, unauthenticated_admin.status_int)
+        self.assertIn("admin-stream", unauthenticated_stream.text)
         self.assertEqual(200, authenticated_admin.status_int)
         self.assertEqual("admin", authenticated_admin.text)
         self.assertIn("admin-stream", authenticated_stream.text)
@@ -508,19 +636,54 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(401, response.status_int)
         self.assertEqual(0, len(self.auth_store._ApiKeyStore__ui_sessions))
 
-    def test_disable_browser_auth_keeps_migration_recovery_shell_protected(self):
+    def test_disable_browser_auth_opens_migration_recovery_shell(self):
         self.context.config.general.disable_browser_auth = True
         self.web_app.add_default_routes()
         client = TestApp(self.web_app)
 
-        response = client.get(
-            "/migration/recovery",
-            extra_environ=self._same_origin_headers(),
-            expect_errors=True,
-        )
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html>recovery-shell</html>")
+            object.__setattr__(self.web_app, "_WebApp__html_path", html_path)
+            response = client.get(
+                "/migration/recovery",
+                extra_environ={
+                    **self._same_origin_headers(),
+                    "HTTP_AUTHORIZATION": "Bearer invalid",
+                    "HTTP_COOKIE": "seedsync_ui_session=invalid-session",
+                },
+            )
 
-        self.assertEqual(302, response.status_int)
-        self.assertTrue(response.headers.get("Location", "").endswith("/bootstrap"))
+        self.assertEqual(200, response.status_int)
+        self.assertIn("recovery-shell", response.text)
+
+    def test_disable_browser_auth_opens_cookie_free_admin_api_key_lifecycle(self):
+        self.context.config.general.disable_browser_auth = True
+        self.web_app.add_default_routes()
+        client = TestApp(self.web_app)
+
+        list_response = client.get("/server/admin/api-keys/v1")
+        self.assertEqual(200, list_response.status_int)
+
+        created = client.post_json(
+            "/server/admin/api-keys/v1",
+            {"name": "open-lifecycle", "scopes": ["read"]},
+        )
+        self.assertEqual(201, created.status_int)
+        key_id = created.json["key"]["id"]
+
+        updated = client.put_json(
+            "/server/admin/api-keys/v1/{}".format(key_id),
+            {"name": "open-lifecycle-updated", "scopes": ["write"]},
+        )
+        self.assertEqual(200, updated.status_int)
+        self.assertEqual("open-lifecycle-updated", updated.json["key"]["name"])
+
+        revoked = client.post("/server/admin/api-keys/v1/{}/revoke".format(key_id))
+        self.assertEqual(200, revoked.status_int)
+
+        deleted = client.delete("/server/admin/api-keys/v1/{}".format(key_id))
+        self.assertEqual(204, deleted.status_int)
 
     def _issue_trusted_browser_session(
         self,
