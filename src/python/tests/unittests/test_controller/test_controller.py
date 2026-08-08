@@ -2027,6 +2027,39 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with(["b"])
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([status_b])
 
+    def test_successful_final_move_handoff_quarantines_stale_active_root_until_absent(self):
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        completion_file_id = active_file.file_id
+        self.controller._Controller__persist.final_move_succeeded_file_names = {completion_file_id}
+        self.controller._Controller__successful_final_move_handoff_file_ids = {completion_file_id}
+        self.controller._Controller__active_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                files=[active_file],
+                malformed_status_only_file_ids=set(),
+                failed=False,
+            ),
+            SimpleNamespace(
+                files=[],
+                malformed_status_only_file_ids=set(),
+                failed=False,
+            ),
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_active_files.assert_called_once_with([])
+        self.assertEqual(
+            {completion_file_id},
+            self.controller._Controller__successful_final_move_handoff_file_ids,
+        )
+
+        self.controller._Controller__model_builder.set_active_files.reset_mock()
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.set_active_files.assert_called_once_with([])
+        self.assertEqual(set(), self.controller._Controller__successful_final_move_handoff_file_ids)
+
     def test_update_model_keeps_malformed_status_only_suppression_across_missing_active_scan_cycle(self):
         status_a = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         status_b = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "b", "")
@@ -2997,6 +3030,539 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
         self.assertEqual({completion_file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_pending_completion_listener_keeps_progress_floor_through_terminal_move_state(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        partial_file = ModelFile("movie.mkv", False)
+        partial_file.path_pair_id = "movies"
+        partial_file.remote_size = 1000
+        partial_file.local_size = 990
+        partial_file.transferred_size = 0
+        partial_file.download_progress = 0
+        partial_file.state = ModelFile.State.DOWNLOADING
+        partial_model = Model()
+        partial_model.set_base_logger(self.controller.logger)
+        partial_model.add_file(partial_file)
+
+        move_failed_file = ModelFile("movie.mkv", False)
+        move_failed_file.path_pair_id = "movies"
+        move_failed_file.remote_size = 1000
+        move_failed_file.local_size = 1000
+        move_failed_file.transferred_size = 0
+        move_failed_file.download_progress = 0
+        move_failed_file.state = ModelFile.State.MOVE_FAILED
+        move_failed_model = Model()
+        move_failed_model.set_base_logger(self.controller.logger)
+        move_failed_model.add_file(move_failed_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            partial_model,
+            move_failed_model,
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = {completion_entry}
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.FAILED
+        )
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=active_file,
+                    new_file=partial_file,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=partial_file,
+                    new_file=move_failed_file,
+                )
+            ],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, listener.file_updated.call_count)
+        first_update = listener.file_updated.call_args_list[0].args[1]
+        second_update = listener.file_updated.call_args_list[1].args[1]
+        self.assertEqual(completion_file_id, first_update.file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADING, first_update.state)
+        self.assertEqual(99, first_update.download_progress)
+        self.assertEqual(990, first_update.transferred_size)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, second_update.state)
+        self.assertEqual(99, second_update.download_progress)
+        self.assertEqual(990, second_update.transferred_size)
+        self.assertEqual(
+            {completion_file_id},
+            {
+                ModelFile.build_file_id(file_name, path_pair_id)
+                for file_name, path_pair_id, _ in self.controller._Controller__pending_completion_file_names
+            },
+        )
+        other_pair_file = ModelFile("movie.mkv", False)
+        other_pair_file.path_pair_id = "tv"
+        other_pair_file.download_progress = 0
+        ModelUpdater._preserve_pending_completion_progress_floor(
+            active_file,
+            other_pair_file,
+            {completion_file_id},
+        )
+        self.assertEqual(0, other_pair_file.download_progress)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_pending_completion_reset_does_not_retain_stale_progress(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        reset_file = ModelFile("movie.mkv", False)
+        reset_file.path_pair_id = "movies"
+        reset_file.remote_size = 1000
+        reset_file.local_size = None
+        reset_file.transferred_size = None
+        reset_file.download_progress = None
+        reset_file.state = ModelFile.State.DEFAULT
+        reset_model = Model()
+        reset_model.set_base_logger(self.controller.logger)
+        reset_model.add_file(reset_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = reset_model
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = {completion_entry}
+        diff_models.return_value = [
+            SimpleNamespace(
+                change=ModelDiff.Change.UPDATED,
+                old_file=active_file,
+                new_file=reset_file,
+            )
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual(1, listener.file_updated.call_count)
+        reset_update = listener.file_updated.call_args.args[1]
+        self.assertEqual(completion_file_id, reset_update.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, reset_update.state)
+        self.assertIsNone(reset_update.download_progress)
+        self.assertIsNone(reset_update.transferred_size)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+
+    def test_pending_completion_floor_caps_transferred_size_after_remote_shrink(self):
+        old_file = ModelFile("movie.mkv", False)
+        old_file.path_pair_id = "movies"
+        old_file.remote_size = 1000
+        old_file.transferred_size = 990
+        old_file.download_progress = 99
+
+        new_file = ModelFile("movie.mkv", False)
+        new_file.path_pair_id = "movies"
+        new_file.remote_size = 500
+        new_file.local_size = 100
+        new_file.transferred_size = 0
+        new_file.download_progress = 0
+        new_file.state = ModelFile.State.DOWNLOADING
+
+        ModelUpdater._preserve_pending_completion_progress_floor(
+            old_file,
+            new_file,
+            {old_file.file_id},
+        )
+
+        self.assertEqual(500, new_file.transferred_size)
+        self.assertLessEqual(new_file.transferred_size, new_file.remote_size)
+        self.assertGreaterEqual(new_file.download_progress, 0)
+        self.assertLessEqual(new_file.download_progress, 100)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_pending_completion_reappearance_keeps_floor_after_transient_model_removal(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        removed_model = Model()
+        removed_model.set_base_logger(self.controller.logger)
+
+        reappeared_file = ModelFile("movie.mkv", False)
+        reappeared_file.path_pair_id = "movies"
+        reappeared_file.remote_size = 1000
+        reappeared_file.local_size = 990
+        reappeared_file.transferred_size = 0
+        reappeared_file.download_progress = 0
+        reappeared_file.state = ModelFile.State.DOWNLOADING
+        reappeared_model = Model()
+        reappeared_model.set_base_logger(self.controller.logger)
+        reappeared_model.add_file(reappeared_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            removed_model,
+            reappeared_model,
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = {completion_entry}
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.REMOVED,
+                    old_file=active_file,
+                    new_file=None,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.ADDED,
+                    old_file=None,
+                    new_file=reappeared_file,
+                )
+            ],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(1, listener.file_removed.call_count)
+        self.assertEqual(1, listener.file_added.call_count)
+        added_file = listener.file_added.call_args.args[0]
+        self.assertEqual(completion_file_id, added_file.file_id)
+        self.assertEqual(99, added_file.download_progress)
+        self.assertEqual(990, added_file.transferred_size)
+
+    def test_update_model_prunes_floor_cache_after_pending_identity_is_removed(self):
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+        self.controller._Controller__pending_completion_file_names = set()
+        self.controller._Controller__pending_completion_progress_floors = {
+            completion_file_id: (99, 990),
+        }
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__model_builder.has_changes.return_value = False
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({}, self.controller._Controller__pending_completion_progress_floors)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_direct_download_move_failure_seeds_floor_for_next_move_failed_update(self, diff_models):
+        completion_entry = ("movie.mkv", "movies", "Movies")
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        terminal_file = ModelFile("movie.mkv", False)
+        terminal_file.path_pair_id = "movies"
+        terminal_file.path_pair_name = "Movies"
+        terminal_file.remote_size = 1000
+        terminal_file.local_size = 1000
+        terminal_file.transferred_size = 990
+        terminal_file.download_progress = 99
+        terminal_file.state = ModelFile.State.DOWNLOADED
+        terminal_model = Model()
+        terminal_model.set_base_logger(self.controller.logger)
+        terminal_model.add_file(terminal_file)
+
+        move_failed_file = ModelFile("movie.mkv", False)
+        move_failed_file.path_pair_id = "movies"
+        move_failed_file.path_pair_name = "Movies"
+        move_failed_file.remote_size = 1000
+        move_failed_file.local_size = 1000
+        move_failed_file.transferred_size = 0
+        move_failed_file.download_progress = 0
+        move_failed_file.state = ModelFile.State.MOVE_FAILED
+        move_failed_model = Model()
+        move_failed_model.set_base_logger(self.controller.logger)
+        move_failed_model.add_file(move_failed_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            terminal_model,
+            move_failed_model,
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = set()
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.FAILED
+        )
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=active_file,
+                    new_file=terminal_file,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=terminal_file,
+                    new_file=move_failed_file,
+                )
+            ],
+        ]
+
+        self.controller._Controller__update_model()
+        self.assertEqual(
+            (99, 990),
+            self.controller._Controller__pending_completion_progress_floors[completion_file_id],
+        )
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, listener.file_updated.call_count)
+        first_update = listener.file_updated.call_args_list[0].args[1]
+        second_update = listener.file_updated.call_args_list[1].args[1]
+        self.assertEqual(completion_file_id, first_update.file_id)
+        self.assertEqual(ModelFile.State.DOWNLOADED, first_update.state)
+        self.assertEqual(99, first_update.download_progress)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, second_update.state)
+        self.assertEqual(99, second_update.download_progress)
+        self.assertEqual(990, second_update.transferred_size)
+        self.assertEqual(
+            {completion_file_id},
+            {
+                ModelFile.build_file_id(file_name, path_pair_id)
+                for file_name, path_pair_id, _ in self.controller._Controller__pending_completion_file_names
+            },
+        )
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_successful_final_move_does_not_mask_stale_destination_truncation(self, diff_models):
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        terminal_file = ModelFile("movie.mkv", False)
+        terminal_file.path_pair_id = "movies"
+        terminal_file.remote_size = 1000
+        terminal_file.local_size = 1000
+        terminal_file.transferred_size = 990
+        terminal_file.download_progress = 99
+        terminal_file.state = ModelFile.State.DOWNLOADED
+        terminal_model = Model()
+        terminal_model.set_base_logger(self.controller.logger)
+        terminal_model.add_file(terminal_file)
+
+        stale_file = ModelFile("movie.mkv", False)
+        stale_file.path_pair_id = "movies"
+        stale_file.remote_size = 1000
+        stale_file.local_size = 960
+        stale_file.transferred_size = 960
+        stale_file.download_progress = None
+        stale_file.final_move_succeeded = True
+        stale_file.state = ModelFile.State.DEFAULT
+        stale_model = Model()
+        stale_model.set_base_logger(self.controller.logger)
+        stale_model.add_file(stale_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            terminal_model,
+            stale_model,
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = set()
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED
+        )
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=active_file,
+                    new_file=terminal_file,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=terminal_file,
+                    new_file=stale_file,
+                )
+            ],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__model_builder.evict_active_file_ids.assert_called_once_with(
+            {completion_file_id}
+        )
+        self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
+        self.assertEqual(2, listener.file_updated.call_count)
+        stale_update = listener.file_updated.call_args_list[1].args[1]
+        self.assertEqual(completion_file_id, stale_update.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, stale_update.state)
+        self.assertIsNone(stale_update.download_progress)
+        self.assertEqual(960, stale_update.local_size)
+        self.assertEqual(960, stale_update.transferred_size)
+        self.assertTrue(stale_update.final_move_succeeded)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_successful_final_move_does_not_mask_remote_size_change(self, diff_models):
+        completion_file_id = ModelFile.build_file_id("movie.mkv", "movies")
+
+        current_model = Model()
+        current_model.set_base_logger(self.controller.logger)
+        active_file = ModelFile("movie.mkv", False)
+        active_file.path_pair_id = "movies"
+        active_file.remote_size = 1000
+        active_file.local_size = 990
+        active_file.transferred_size = 990
+        active_file.download_progress = 99
+        active_file.state = ModelFile.State.DOWNLOADING
+        current_model.add_file(active_file)
+
+        terminal_file = ModelFile("movie.mkv", False)
+        terminal_file.path_pair_id = "movies"
+        terminal_file.remote_size = 1000
+        terminal_file.local_size = 1000
+        terminal_file.transferred_size = 990
+        terminal_file.download_progress = 99
+        terminal_file.state = ModelFile.State.DOWNLOADED
+        terminal_model = Model()
+        terminal_model.set_base_logger(self.controller.logger)
+        terminal_model.add_file(terminal_file)
+
+        changed_file = ModelFile("movie.mkv", False)
+        changed_file.path_pair_id = "movies"
+        changed_file.remote_size = 1200
+        changed_file.local_size = 1000
+        changed_file.transferred_size = 1000
+        changed_file.download_progress = None
+        changed_file.final_move_succeeded = True
+        changed_file.state = ModelFile.State.DEFAULT
+        changed_model = Model()
+        changed_model.set_base_logger(self.controller.logger)
+        changed_model.add_file(changed_file)
+
+        listener = MagicMock()
+        current_model.add_listener(listener)
+        self.controller._Controller__model = current_model
+        self.controller._Controller__model_builder.has_changes.side_effect = [True, True]
+        self.controller._Controller__model_builder.build_model.side_effect = [
+            terminal_model,
+            changed_model,
+        ]
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__pending_completion_file_names = set()
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED
+        )
+        diff_models.side_effect = [
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=active_file,
+                    new_file=terminal_file,
+                )
+            ],
+            [
+                SimpleNamespace(
+                    change=ModelDiff.Change.UPDATED,
+                    old_file=terminal_file,
+                    new_file=changed_file,
+                )
+            ],
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(2, listener.file_updated.call_count)
+        changed_update = listener.file_updated.call_args_list[1].args[1]
+        self.assertEqual(completion_file_id, changed_update.file_id)
+        self.assertEqual(ModelFile.State.DEFAULT, changed_update.state)
+        self.assertIsNone(changed_update.download_progress)
+        self.assertEqual(1200, changed_update.remote_size)
+        self.assertEqual(1000, changed_update.local_size)
+        self.assertEqual(1000, changed_update.transferred_size)
+        self.assertTrue(changed_update.final_move_succeeded)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_update_model_applies_pending_completion_side_effects_once_for_terminal_update(self, diff_models):
@@ -5443,10 +6009,11 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    def _prepare_terminal_move_command(self, file_id="movie.mkv"):
+    def _prepare_terminal_move_command(self, file_id=None, path_pair_id=None):
         model = Model()
         model.set_base_logger(self.controller.logger)
         file = ModelFile("movie.mkv", False)
+        file.path_pair_id = path_pair_id
         file.local_size = 100
         file.remote_size = 100
         file.state = ModelFile.State.MOVE_FAILED
@@ -5454,7 +6021,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model = model
         self.controller._Controller__persist.move_failure_counts = {file.file_id: 4}
         callback = MagicMock()
-        command = Controller.Command(Controller.Command.Action.RETRY_MOVE, file_id)
+        command = Controller.Command(
+            Controller.Command.Action.RETRY_MOVE,
+            file.file_id if file_id is None else file_id,
+        )
         command.add_callback(callback)
         return file, command, callback
 
@@ -5472,7 +6042,7 @@ class TestController(unittest.TestCase):
         self.controller._release_move_attempt(movies_id)
 
     def test_manual_retry_move_success_clears_terminal_marker(self):
-        file, command, callback = self._prepare_terminal_move_command()
+        file, command, callback = self._prepare_terminal_move_command(path_pair_id="movies")
         self.controller._Controller__move_from_staging = MagicMock(
             return_value=Controller.MoveFromStagingResult.COMPLETED
         )
@@ -5485,6 +6055,9 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
+        self.assertIn(file.file_id, self.controller._Controller__successful_final_move_handoff_file_ids)
+        self.controller._Controller__model_builder.evict_active_file_ids.assert_called_once_with({file.file_id})
+        self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
 
     def test_manual_retry_already_completed_does_not_earn_success_marker(self):
         file, command, callback = self._prepare_terminal_move_command()
@@ -5499,6 +6072,7 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_file_names)
         self.assertNotIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
+        self.controller._Controller__active_scan_process.force_scan.assert_not_called()
 
     def test_new_queue_clears_terminal_move_lifecycle(self):
         file, _, _ = self._prepare_terminal_move_command()

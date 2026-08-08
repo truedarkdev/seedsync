@@ -55,6 +55,8 @@ class _ControllerCoreAccess:
     _Controller__next_active_scan_force_at: Optional[datetime]
     _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
+    _Controller__successful_final_move_handoff_file_ids: set[str]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
     _Controller__move_attempt_reservations: set[str]
@@ -77,6 +79,7 @@ class _ControllerCoreAccess:
     def _confirm_fresh_healthy_download_starts(self, statuses: list[LftpJobStatus]) -> None: ...
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
     def _record_download_completion(self, file: ModelFile) -> None: ...
+    def _mark_successful_final_move_handoff(self, file_id: str) -> None: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
     def _reserve_move_attempt(self, file_id: str) -> bool: ...
     def _release_move_attempt(self, file_id: str) -> None: ...
@@ -140,6 +143,67 @@ class ModelUpdater(_ControllerCoreAccess):
         if not isinstance(controller, (ControllerType, SimpleNamespace)):
             raise TypeError("ModelUpdater requires the controller core runtime boundary")
         self._controller = cast(_ControllerCoreAccess, controller)
+
+    @staticmethod
+    def _preserve_pending_completion_progress_floor(
+        old_file: ModelFile,
+        new_file: ModelFile,
+        pending_completion_file_ids: set[str],
+    ) -> None:
+        """Keep a pending completion row from publishing a lower checkpoint.
+
+        The LFTP job can disappear before the local scan observes the final
+        staging file.  During that handoff the rebuilt model may briefly carry
+        zero/unknown progress, which would make listener/SSE consumers regress
+        the row even though the transfer has not been reset.  Keep the prior
+        model checkpoint for the canonical pending identity while leaving the
+        newly-built state and all other flags untouched.
+        """
+        ModelUpdater._apply_pending_completion_progress_floor(
+            new_file,
+            pending_completion_file_ids,
+            old_file.download_progress,
+            old_file.transferred_size,
+        )
+
+    @staticmethod
+    def _apply_pending_completion_progress_floor(
+        new_file: ModelFile,
+        pending_completion_file_ids: set[str],
+        previous_download_progress: Optional[int],
+        previous_transferred_size: Optional[int],
+    ) -> None:
+        """Apply a stored pending-completion checkpoint to a rebuilt file."""
+        if new_file.file_id not in pending_completion_file_ids:
+            return
+
+        # A pending completion can be invalidated when a healthy local scan
+        # proves that the file reset/disappeared.  Keep that genuine reset
+        # visible instead of copying the prior transfer checkpoint into the
+        # model that will be retained after the pending identity is cleared.
+        if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
+            return
+
+        if previous_download_progress is not None and (
+            new_file.download_progress is None
+            or new_file.download_progress < previous_download_progress
+        ):
+            new_file.download_progress = previous_download_progress
+
+        if previous_transferred_size is not None:
+            transferred_floor = previous_transferred_size
+            if new_file.remote_size is not None:
+                transferred_floor = min(transferred_floor, new_file.remote_size)
+                if (
+                    new_file.transferred_size is not None
+                    and new_file.transferred_size > new_file.remote_size
+                ):
+                    new_file.transferred_size = new_file.remote_size
+            if (
+                new_file.transferred_size is None
+                or new_file.transferred_size < transferred_floor
+            ):
+                new_file.transferred_size = transferred_floor
 
     @staticmethod
     def _get_exclude_patterns(controller: _ControllerCoreAccess) -> str:
@@ -428,6 +492,22 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__prev_downloading_file_names = set()
         if not hasattr(controller, "_Controller__pending_completion_file_names"):
             controller._Controller__pending_completion_file_names = set()
+        if not hasattr(controller, "_Controller__pending_completion_progress_floors"):
+            controller._Controller__pending_completion_progress_floors = {}
+        if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
+            controller._Controller__successful_final_move_handoff_file_ids = set()
+        controller._Controller__successful_final_move_handoff_file_ids.intersection_update(
+            persist.final_move_succeeded_file_names
+        )
+        pending_completion_ids = {
+            ModelFile.build_file_id(file_name, path_pair_id)
+            for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
+        }
+        controller._Controller__pending_completion_progress_floors = {
+            file_id: floor
+            for file_id, floor in controller._Controller__pending_completion_progress_floors.items()
+            if file_id in pending_completion_ids
+        }
         if not hasattr(controller, "_Controller__active_scan_force_file_ids"):
             controller._Controller__active_scan_force_file_ids = set()
         if not hasattr(controller, "_Controller__active_scan_ready_file_ids"):
@@ -651,7 +731,27 @@ class ModelUpdater(_ControllerCoreAccess):
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
             )
         if latest_active_scan is not None:
-            model_builder.set_active_files(latest_active_scan.files)
+            active_scan_files = list(latest_active_scan.files)
+            handoff_file_ids = controller._Controller__successful_final_move_handoff_file_ids
+            if handoff_file_ids:
+                active_scan_root_ids = {
+                    ModelFile.build_file_id(
+                        active_file.name,
+                        getattr(active_file, "path_pair_id", None),
+                    )
+                    for active_file in active_scan_files
+                }
+                if not bool(getattr(latest_active_scan, "failed", False)):
+                    handoff_file_ids.intersection_update(active_scan_root_ids)
+                active_scan_files = [
+                    active_file
+                    for active_file in active_scan_files
+                    if ModelFile.build_file_id(
+                        active_file.name,
+                        getattr(active_file, "path_pair_id", None),
+                    ) not in handoff_file_ids
+                ]
+            model_builder.set_active_files(active_scan_files)
             controller._Controller__record_breadcrumb(
                 stage="scan",
                 message="active_scan_result",
@@ -852,8 +952,34 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names
                     }
 
+                def discard_pending_completion_file(file_id: str) -> None:
+                    controller._Controller__pending_completion_file_names = {
+                        file_name
+                        for file_name in controller._Controller__pending_completion_file_names
+                        if ModelFile.build_file_id(file_name[0], file_name[1]) != file_id
+                    }
+                    controller._Controller__pending_completion_progress_floors.pop(file_id, None)
+
+                def remember_pending_completion_floor(file: ModelFile) -> None:
+                    if file.file_id not in pending_completion_file_ids():
+                        return
+                    previous = controller._Controller__pending_completion_progress_floors.get(file.file_id)
+                    current = (file.download_progress, file.transferred_size)
+                    if previous is None:
+                        controller._Controller__pending_completion_progress_floors[file.file_id] = current
+                        return
+                    previous_progress, previous_transferred = previous
+                    current_progress, current_transferred = current
+                    controller._Controller__pending_completion_progress_floors[file.file_id] = (
+                        max(value for value in (previous_progress, current_progress) if value is not None)
+                        if previous_progress is not None or current_progress is not None else None,
+                        max(value for value in (previous_transferred, current_transferred) if value is not None)
+                        if previous_transferred is not None or current_transferred is not None else None,
+                    )
+
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
                     persist.final_move_succeeded_file_names.discard(file.file_id)
+                    controller._Controller__successful_final_move_handoff_file_ids.discard(file.file_id)
                     model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
                     path_pair_name = file.path_pair_name
                     if path_pair_name is None:
@@ -864,6 +990,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         file.path_pair_id,
                         path_pair_name,
                     ))
+                    remember_pending_completion_floor(file)
                     if consume_budget:
                         controller._Controller__deferred_move_file_ids.discard(file.file_id)
                         count = min(
@@ -905,6 +1032,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     else:
                         persist.final_move_succeeded_file_names.discard(file.file_id)
                     model_builder.set_final_move_succeeded_files(persist.final_move_succeeded_file_names)
+                    if final_move_succeeded:
+                        controller._mark_successful_final_move_handoff(file.file_id)
                     if file.file_id not in persist.downloaded_file_names:
                         persist.downloaded_file_names.add(file.file_id)
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
@@ -922,6 +1051,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         for file_name in controller._Controller__pending_completion_file_names
                         if ModelFile.build_file_id(file_name[0], file_name[1]) != file.file_id
                     }
+                    controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
 
                 def run_reserved_automatic_move(file: ModelFile):
                     if not controller._reserve_move_attempt(file.file_id):
@@ -956,6 +1086,29 @@ class ModelUpdater(_ControllerCoreAccess):
                     old_file = getattr(diff, "old_file", None)
                     new_file = getattr(diff, "new_file", None)
 
+                    if (
+                        diff.change == ModelDiff.Change.UPDATED
+                        and old_file is not None
+                        and new_file is not None
+                    ):
+                        remember_pending_completion_floor(old_file)
+                        self._preserve_pending_completion_progress_floor(
+                            old_file,
+                            new_file,
+                            pending_completion_file_ids(),
+                        )
+                    elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
+                        remember_pending_completion_floor(old_file)
+                    elif diff.change == ModelDiff.Change.ADDED and new_file is not None:
+                        floor = controller._Controller__pending_completion_progress_floors.get(new_file.file_id)
+                        if floor is not None:
+                            self._apply_pending_completion_progress_floor(
+                                new_file,
+                                pending_completion_file_ids(),
+                                floor[0],
+                                floor[1],
+                            )
+
                     if diff.change == ModelDiff.Change.ADDED:
                         assert new_file is not None
                         model.add_file(new_file)
@@ -972,11 +1125,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         and latest_local_scan is not None
                         and old_file.file_id in pending_completion_file_ids()
                     ):
-                        controller._Controller__pending_completion_file_names = {
-                            file_name
-                            for file_name in controller._Controller__pending_completion_file_names
-                            if ModelFile.build_file_id(file_name[0], file_name[1]) != old_file.file_id
-                        }
+                        discard_pending_completion_file(old_file.file_id)
 
                     completion_proved = False
                     if (
@@ -989,11 +1138,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                     ):
                         if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
-                            controller._Controller__pending_completion_file_names = {
-                                file_name
-                                for file_name in controller._Controller__pending_completion_file_names
-                                if ModelFile.build_file_id(file_name[0], file_name[1]) != new_file.file_id
-                            }
+                            discard_pending_completion_file(new_file.file_id)
                         if new_file.state in (
                             ModelFile.State.DOWNLOADED,
                             ModelFile.State.EXTRACTED,

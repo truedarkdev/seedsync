@@ -1033,6 +1033,23 @@ class ModelBuilder:
         if had_active_files or len(active_files) > 0:
             self.__cached_model = None
 
+    def evict_active_file_ids(self, file_ids: Set[str]) -> None:
+        """Drop exact active-scan roots during a completed move handoff."""
+        if not file_ids:
+            return
+        retained_active_files = {
+            root_file_id: active_file
+            for root_file_id, active_file in self.__active_files.items()
+            if root_file_id not in file_ids
+        }
+        if len(retained_active_files) == len(self.__active_files):
+            return
+        self.__active_files = retained_active_files
+        self.__active_file_ids = set()
+        for active_file in retained_active_files.values():
+            self.__collect_active_file_ids(active_file, self.__active_file_ids)
+        self.__cached_model = None
+
     def __build_effective_local_files(self) -> Dict[str, SystemFile]:
         if not self.__active_files:
             return dict(self.__local_files)

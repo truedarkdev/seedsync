@@ -2566,6 +2566,16 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(42, model.get_file("a").local_size)
 
+    def test_evict_active_file_ids_falls_back_to_persistent_local_state(self):
+        self.model_builder.set_local_files([SystemFile("a", 42, False)])
+        self.model_builder.set_active_files([SystemFile("a", 99, False)])
+        model = self.model_builder.build_model()
+        self.assertEqual(99, model.get_file("a").local_size)
+
+        self.model_builder.evict_active_file_ids({"a"})
+        model = self.model_builder.build_model()
+        self.assertEqual(42, model.get_file("a").local_size)
+
     def test_build_running_state_merges_active_files_without_mutating_local_state(self):
         self.model_builder.set_remote_files([SystemFile("a", 1000, False)])
         self.model_builder.set_local_files([SystemFile("a", 42, False)])

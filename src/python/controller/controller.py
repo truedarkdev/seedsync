@@ -1333,6 +1333,16 @@ class Controller:
         self.__persist.downloaded_timestamps[file.file_id] = timestamp
         self.__model_builder.set_downloaded_timestamps(self.__persist.downloaded_timestamps)
 
+    def _mark_successful_final_move_handoff(self, file_id: str) -> None:
+        """Quarantine a stale active-scan root while a completed move settles."""
+        if not hasattr(self, "_Controller__successful_final_move_handoff_file_ids"):
+            self.__successful_final_move_handoff_file_ids = set()
+        self.__successful_final_move_handoff_file_ids.add(file_id)
+        evict_active_file_ids = getattr(self.__model_builder, "evict_active_file_ids", None)
+        if callable(evict_active_file_ids):
+            evict_active_file_ids({file_id})
+        self.__active_scan_process.force_scan()
+
     def __reset_download_start_after_local_delete(
         self, file_id: str, path_pair_id: Optional[str]
     ) -> None:
@@ -2986,6 +2996,7 @@ class Controller:
                         self.__persist.downloaded_file_names.add(file.file_id)
                         if result == Controller.MoveFromStagingResult.COMPLETED:
                             self.__persist.final_move_succeeded_file_names.add(file.file_id)
+                            self._mark_successful_final_move_handoff(file.file_id)
                         self._complete_download_start_lifecycle(file.file_id)
                         self.clear_extracted_marker(file)
                         self.__pending_completion_file_names = {
