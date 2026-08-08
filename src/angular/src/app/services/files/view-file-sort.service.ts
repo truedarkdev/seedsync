@@ -27,8 +27,9 @@ const LegacyStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): n
 /**
  * Comparator used to sort the ViewFiles
  * First, sorts by smart status buckets.
- * Second, sorts same-status files by older remote timestamps.
- * Third, sorts by name.
+ * Second, sorts inactive/completed files by newest download start.
+ * Third, preserves the existing remote-age order for active/actionable ties.
+ * Finally, sorts by canonical name and identity.
  * @param {ViewFile} a
  * @param {ViewFile} b
  * @returns {number}
@@ -38,6 +39,16 @@ const SmartStatusComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): nu
     const statusComparison = compareStatusImproved(a, b);
     if (statusComparison !== 0) {
         return statusComparison;
+    }
+    if (isSmartStatusInactive(a) && isSmartStatusInactive(b)) {
+        const downloadedComparison = compareNullableNumbersDescending(
+            getDownloadedTimestampValue(a),
+            getDownloadedTimestampValue(b),
+        );
+        if (downloadedComparison !== 0) {
+            return downloadedComparison;
+        }
+        return compareByNameThenFileId(a, b);
     }
     const timestampComparison = compareRemoteTimestamp(a, b);
     if (timestampComparison !== 0) {
@@ -183,7 +194,7 @@ const EtaDescendingComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): 
     return compareByName(a, b);
 };
 
-/** Sort by proven completion time, keeping files without a valid timestamp last. */
+/** Sort by download recency newest-first, keeping files without a valid timestamp last. */
 const DownloadedNewestComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
     const timestampComparison = compareNullableNumbersDescending(
         getDownloadedTimestampValue(a),
@@ -195,7 +206,7 @@ const DownloadedNewestComparator: ViewFileComparator = (a: ViewFile, b: ViewFile
     return compareByNameThenFileId(a, b);
 };
 
-/** Sort by proven completion time, keeping files without a valid timestamp last. */
+/** Sort by download recency oldest-first, keeping files without a valid timestamp last. */
 const DownloadedOldestComparator: ViewFileComparator = (a: ViewFile, b: ViewFile): number => {
     const timestampComparison = compareNullableNumbers(
         getDownloadedTimestampValue(a),
@@ -299,6 +310,20 @@ const getDownloadedTimestampValue = (file: ViewFile): number | null => {
     return time;
 };
 
+const isSmartStatusInactive = (file: ViewFile): boolean => {
+    switch (file.status) {
+        case ViewFile.Status.DEFAULT:
+        case ViewFile.Status.DELETED:
+        case ViewFile.Status.EXTRACTED:
+        case ViewFile.Status.VALIDATED:
+        case ViewFile.Status.DOWNLOADED:
+        case ViewFile.Status.MOVE_SUCCEEDED:
+            return true;
+        default:
+            return false;
+    }
+};
+
 const compareStatusLegacy = (a: ViewFile, b: ViewFile): number => {
     if (a.status !== b.status) {
         const statusPriorities = {
@@ -334,8 +359,8 @@ const compareStatusImproved = (a: ViewFile, b: ViewFile): number => {
             [ViewFile.Status.DOWNLOADING]: 3,
             [ViewFile.Status.QUEUED]: 4,
             [ViewFile.Status.STOPPED]: 5,
-            [ViewFile.Status.DEFAULT]: 6,
-            [ViewFile.Status.DELETED]: 6,
+            [ViewFile.Status.DEFAULT]: 7,
+            [ViewFile.Status.DELETED]: 7,
             [ViewFile.Status.EXTRACTED]: 7,
             [ViewFile.Status.VALIDATED]: 7,
             [ViewFile.Status.DOWNLOADED]: 7

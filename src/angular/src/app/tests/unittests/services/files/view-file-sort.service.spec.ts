@@ -186,83 +186,61 @@ describe("Testing view file sort service", () => {
             new ViewFile({status: ViewFile.Status.STOPPED}),
             new ViewFile({status: ViewFile.Status.DELETED})
         )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DEFAULT}),
-            new ViewFile({status: ViewFile.Status.EXTRACTED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DEFAULT}),
-            new ViewFile({status: ViewFile.Status.VALIDATED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DEFAULT}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DELETED}),
-            new ViewFile({status: ViewFile.Status.EXTRACTED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DELETED}),
-            new ViewFile({status: ViewFile.Status.VALIDATED})
-        )).toBeLessThan(0);
-        expect(sortComparator(
-            new ViewFile({status: ViewFile.Status.DELETED}),
-            new ViewFile({status: ViewFile.Status.DOWNLOADED})
-        )).toBeLessThan(0);
-
-        // Default and Deleted should be intermixed
+        // All inactive availability/completion statuses should be intermixed.
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.DEFAULT, name: ""}),
             new ViewFile({status: ViewFile.Status.DELETED, name: ""})
         )).toBe(0);
 
-        // Completed bucket entries should be ordered by age across statuses.
+        // Inactive/completed entries should be ordered by newest genuine download across statuses.
         expect(sortComparator(
             new ViewFile({
                 status: ViewFile.Status.EXTRACTED,
                 name: "zeta",
-                remoteCreatedTimestamp: new Date(1000)
+                downloadedTimestamp: new Date(3000)
             }),
             new ViewFile({
                 status: ViewFile.Status.VALIDATED,
                 name: "alpha",
-                remoteCreatedTimestamp: new Date(2000)
+                downloadedTimestamp: new Date(2000)
             })
         )).toBeLessThan(0);
 
         expect(sortComparator(
             new ViewFile({
-                status: ViewFile.Status.VALIDATED,
+                status: ViewFile.Status.DEFAULT,
                 name: "beta",
-                remoteCreatedTimestamp: new Date(1000)
+                downloadedTimestamp: new Date(4000)
             }),
             new ViewFile({
                 status: ViewFile.Status.DOWNLOADED,
                 name: "gamma",
-                remoteCreatedTimestamp: new Date(2000)
+                downloadedTimestamp: new Date(2000)
             })
         )).toBeLessThan(0);
 
-        // Given the same status, older remote files should come first.
+        // Active/actionable buckets keep their existing priority.
         expect(sortComparator(
             new ViewFile({status: ViewFile.Status.EXTRACTED}),
             new ViewFile({status: ViewFile.Status.STOPPED})
         )).toBeGreaterThan(0);
 
-        // If same-status timestamps match, the name fallback still applies.
+        // Unknown inactive recency is last, and canonical name/identity breaks ties.
         expect(sortComparator(
             new ViewFile({
-                status: ViewFile.Status.EXTRACTED,
-                name: "alpha",
-                remoteCreatedTimestamp: new Date(1000)
+                status: ViewFile.Status.MOVE_SUCCEEDED,
+                name: "known",
+                downloadedTimestamp: new Date(1000)
             }),
             new ViewFile({
-                status: ViewFile.Status.EXTRACTED,
-                name: "beta",
-                remoteCreatedTimestamp: new Date(1000)
+                status: ViewFile.Status.DEFAULT,
+                name: "unknown"
             })
         )).toBeLessThan(0);
+        expect(sortComparator(
+            new ViewFile({status: ViewFile.Status.DEFAULT, name: "same", fileId: '["b","same"]'}),
+            new ViewFile({status: ViewFile.Status.DOWNLOADED, name: "same", fileId: '["a","same"]'})
+        )).toBeGreaterThan(0);
     }));
 
     it("correctly sorts by legacy status", fakeAsync(() => {
@@ -569,7 +547,7 @@ describe("Testing view file sort service", () => {
         expect(sortComparator(unknown, oldest)).toBeGreaterThan(0);
     }));
 
-    it("puts move failed first in smart status without disturbing ordinary ties", fakeAsync(() => {
+    it("puts move failed first and orders inactive statuses by download recency", fakeAsync(() => {
         viewFileOptionsService._options.next(new ViewFileOptions({
             sortMethod: ViewFileOptions.SortMethod.SMART_STATUS
         }));
@@ -577,12 +555,12 @@ describe("Testing view file sort service", () => {
 
         const failed = new ViewFile({name: "failed", status: ViewFile.Status.MOVE_FAILED});
         const corrupt = new ViewFile({name: "corrupt", status: ViewFile.Status.CORRUPT});
-        const downloadedA = new ViewFile({name: "a", status: ViewFile.Status.DOWNLOADED});
-        const downloadedB = new ViewFile({name: "b", status: ViewFile.Status.DOWNLOADED});
-        const moved = new ViewFile({name: "moved", status: ViewFile.Status.MOVE_SUCCEEDED});
+        const downloadedA = new ViewFile({name: "a", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(1000)});
+        const downloadedB = new ViewFile({name: "b", status: ViewFile.Status.DOWNLOADED, downloadedTimestamp: new Date(2000)});
+        const moved = new ViewFile({name: "moved", status: ViewFile.Status.MOVE_SUCCEEDED, downloadedTimestamp: new Date(3000)});
 
         expect(sortComparator(failed, corrupt)).toBeLessThan(0);
-        expect(sortComparator(downloadedA, downloadedB)).toBeLessThan(0);
-        expect(sortComparator(moved, downloadedA)).toBeGreaterThan(0);
+        expect(sortComparator(downloadedB, downloadedA)).toBeLessThan(0);
+        expect(sortComparator(moved, downloadedB)).toBeLessThan(0);
     }));
 });
