@@ -618,6 +618,22 @@ The intended browser-access UX is:
 - normal return visits should reopen the app without sending the user back
   through `/bootstrap`
 - `/bootstrap` should mainly appear for first claim or explicit recovery
+- normal WebApp availability opens an 8-hour first-admin claim window; an
+  unclaimed expired first-admin window is renewed only by a deliberate normal
+  app restart
+- setting a new non-empty `browser_handover_recovery_version` after an admin
+  exists opens one 2-hour recovery window. The same expired value stays closed;
+  use a new value to request another recovery window. A value that has opened
+  a recovery window remains closed even if configuration later switches away
+  and back to it.
+- claim deadlines use the host wall clock. A forward clock correction can end
+  a window early; invalid/unsafe retained state fails closed. Host clock and
+  config-root control are privileged in this deployment.
+- the config root is a single-writer application state directory. SeedSync
+  does not support multiple processes concurrently writing the same root.
+  Deliberately restoring or deleting its full retained state is an operator
+  recovery action, equivalent to requesting fresh browser-recovery state; it
+  is outside the unprivileged browser threat boundary.
 - deleting or revoking the API key clears any remembered-browser state tied
   to that key
 - bootstrap and recovery sessions remain short-lived

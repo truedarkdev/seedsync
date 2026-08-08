@@ -109,6 +109,10 @@ class WebApp(bottle.Bottle):
         self.__status = context.status
         self.__config = getattr(context, "config", None)
         self.__auth_store = auth_store
+        # A migration-only runtime never constructs WebApp.  Starting the
+        # deadline here therefore measures only the claim-capable normal app.
+        if self.__auth_store is not None:
+            self.__auth_store.activate_browser_handover(self.__config)
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
         self.__streaming_handlers: list[
@@ -575,7 +579,9 @@ class WebApp(bottle.Bottle):
         if self.__auth_store is None:
             return False
 
-        if not self.__auth_store.can_claim_initial_admin(self.__get_browser_handover_version()):
+        if not self.__auth_store.can_claim_initial_admin(
+            self.__get_browser_handover_version(), self.__config,
+        ):
             return False
 
         return self.__is_same_origin_browser_request()
@@ -785,16 +791,23 @@ class WebApp(bottle.Bottle):
 
         page_title = "SeedSync browser access"
         can_claim_initial_admin = bool(browser_handover_state.get("open", False))
+        window_type = browser_handover_state.get("window_type")
+        expires_at = browser_handover_state.get("expires_at")
+        remaining_seconds = browser_handover_state.get("remaining_seconds", 0)
+        window_status_html = ""
         form_fields_html = """
     <label for="browser-secret">API key secret</label>
     <input id="browser-secret" type="password" autocomplete="off" placeholder="Paste an API key secret">
 """
 
         if can_claim_initial_admin:
-            eyebrow_label = "First-run browser access"
-            page_heading = "Claim the first local session"
+            recovery_window = window_type == "recovery"
+            eyebrow_label = "Recovery browser access" if recovery_window else "First-run browser access"
+            page_heading = "Claim the recovery session" if recovery_window else "Claim the first local session"
             page_description = (
-                "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. "
+                "This trusted browser can take SeedSync's {} admin handoff and keep the setup inside the local runtime. ".format(
+                    "recovery" if recovery_window else "initial"
+                ) +
                 "After that, any other browser will need an API key once to become remembered."
             )
             brand_copy = (
@@ -806,6 +819,12 @@ class WebApp(bottle.Bottle):
             primary_action_payload = ""
             form_fields_html = ""
             form_variant_class = "form-panel form-panel-initial"
+            window_status_html = (
+                '<p class="hint">{} claim window: expires at <time>{}</time>; {} remaining.</p>'.format(
+                    "Recovery" if recovery_window else "Initial 8-hour", expires_at or "unknown expiry",
+                    WebApp.__format_remaining_seconds(remaining_seconds),
+                )
+            )
         else:
             eyebrow_label = "Remembered browser"
             page_heading = "Save this browser for next time"
@@ -820,6 +839,36 @@ class WebApp(bottle.Bottle):
             primary_action_url = "/server/browser/v1/remember"
             primary_action_payload = 'secret: document.getElementById("browser-secret").value'
             form_variant_class = "form-panel"
+            if browser_handover_state.get("state_invalid", False):
+                window_status_html = (
+                    '<p class="hint">The browser claim window state is invalid and is closed for safety. '
+                    'Inspect the local configuration before reopening browser access.</p>'
+                )
+            elif browser_handover_state.get("expired", False):
+                if window_type == "recovery":
+                    window_status_html = (
+                        '<p class="hint">The recovery claim window expired at <time>{}</time>. '
+                        'Set a new browser_handover_recovery_version value and restart SeedSync to open another recovery window.</p>'.format(
+                            expires_at or "the recorded deadline"
+                        )
+                    )
+                else:
+                    window_status_html = (
+                        '<p class="hint">The initial 8-hour claim window expired at <time>{}</time>. '
+                        'Restart the normal SeedSync app deliberately to open a fresh initial claim window.</p>'.format(
+                            expires_at or "the recorded deadline"
+                        )
+                    )
+            elif browser_handover_state.get("recovery_version_closed", False):
+                window_status_html = (
+                    '<p class="hint">This recovery version has already opened a claim window and remains closed. '
+                    'Set a new browser_handover_recovery_version value and restart SeedSync to request another recovery window.</p>'
+                )
+            elif browser_handover_state.get("recovery_history_full", False):
+                window_status_html = (
+                    '<p class="hint">The retained recovery-window history is full, so this request is closed for safety. '
+                    'Inspect the local configuration before requesting further browser recovery.</p>'
+                )
 
         bottle.response.content_type = "text/html; charset=utf-8"
         bottle.response.cache_control = "no-store"
@@ -1142,6 +1191,7 @@ class WebApp(bottle.Bottle):
   <div class="eyebrow">{eyebrow_label}</div>
   <h1>{page_heading}</h1>
   <p class="lede">{page_description}</p>
+  {window_status_html}
   <form id="bootstrap-form">
 {form_fields_html}
     <button type="submit">{primary_action_label}</button>
@@ -1202,7 +1252,15 @@ class WebApp(bottle.Bottle):
             primary_action_label=primary_action_label,
             primary_action_url=primary_action_url,
             primary_action_payload=primary_action_payload,
+            window_status_html=window_status_html,
         )
+
+    @staticmethod
+    def __format_remaining_seconds(value: object) -> str:
+        seconds = value if isinstance(value, int) and value >= 0 else 0
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return "{}h {}m {}s".format(hours, minutes, seconds)
 
     def __authorize_browser_bootstrap(self, *, allow_disabled: bool = True) -> None:
         if allow_disabled and self.__is_browser_auth_disabled():

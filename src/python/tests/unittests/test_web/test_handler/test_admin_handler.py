@@ -7,7 +7,11 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from common import Config
-from web.auth_store import ApiKeyStore, validate_completed_migration_claimed_auth_state
+from web.auth_store import (
+    ApiKeyStore,
+    completed_migration_claimed_browser_handover_version,
+    validate_completed_migration_claimed_auth_state,
+)
 from web.handler.admin import AdminHandler
 from web.web_app import WebApp
 from webtest import TestApp
@@ -169,6 +173,69 @@ class TestAdminHandler(unittest.TestCase):
         self.assertEqual(before_store, open(store_path, "rb").read())
         self.assertEqual(before_history, open(history_path, "rb").read())
         self.assertFalse(os.path.exists(os.path.join(migration_root, "migration-claimed-auth.json")))
+
+    def test_initial_claim_delivers_secret_when_sidecar_finalization_write_fails(self):
+        store = ApiKeyStore(file_path=os.path.join(self.temp_dir, "finalization-initial.json"))
+        app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(app)
+        client = TestApp(app)
+
+        with patch.object(store, "_ApiKeyStore__write_browser_handover_deadline", side_effect=OSError("disk full")):
+            response = client.post_json(
+                "/server/admin/bootstrap/v1/first-api-key", {"name": "initial-admin"},
+                extra_environ=self._same_origin_headers(),
+            )
+
+        payload = json.loads(response.text)
+        self.assertEqual(201, response.status_int)
+        self.assertIn("secret", payload)
+        self.assertEqual(1, store.active_admin_key_count)
+        self.assertFalse(store.get_browser_handover_state(self.context.config)["open"])
+        reloaded = ApiKeyStore.from_file(store.file_path)
+        self.assertFalse(reloaded.get_browser_handover_state(self.context.config)["open"])
+
+    def test_recovery_claim_delivers_secret_when_sidecar_finalization_write_fails(self):
+        self.context.config.general.browser_handover_recovery_version = "recovery-finalize"
+        app = WebApp(self.context, MagicMock(), auth_store=self.auth_store)
+        AdminHandler(self.context.config, self.auth_store).add_routes(app)
+        client = TestApp(app)
+
+        with patch.object(self.auth_store, "_ApiKeyStore__write_browser_handover_deadline", side_effect=OSError("disk full")):
+            response = client.post_json(
+                "/server/admin/bootstrap/v1/first-api-key", {"name": "recovery-admin"},
+                extra_environ=self._same_origin_headers(),
+            )
+
+        payload = json.loads(response.text)
+        self.assertEqual(201, response.status_int)
+        self.assertIn("secret", payload)
+        self.assertEqual(2, self.auth_store.active_admin_key_count)
+        self.assertFalse(self.auth_store.get_browser_handover_state(self.context.config)["open"])
+        reloaded = ApiKeyStore.from_file(self.store_path)
+        self.assertFalse(reloaded.get_browser_handover_state(self.context.config)["open"])
+
+    def test_completed_migration_claim_delivers_secret_when_sidecar_finalization_write_fails(self):
+        migration_root = os.path.join(self.temp_dir, "migration-finalization-failure")
+        os.makedirs(migration_root)
+        store = ApiKeyStore(file_path=os.path.join(migration_root, "api-keys.json"))
+        app = self._migration_claim_app(store)
+
+        with patch.object(store, "_ApiKeyStore__write_browser_handover_deadline", side_effect=OSError("disk full")):
+            response = app.post_json(
+                "/server/admin/bootstrap/v1/first-api-key", {"name": "migration-admin"},
+                extra_environ=self._same_origin_headers(),
+            )
+
+        payload = json.loads(response.text)
+        self.assertEqual(201, response.status_int)
+        self.assertIn("secret", payload)
+        self.assertEqual(1, store.active_admin_key_count)
+        validate_completed_migration_claimed_auth_state(migration_root, self._completed_migration_binding())
+        reloaded = ApiKeyStore.from_file(os.path.join(migration_root, "api-keys.json"))
+        reloaded.bind_completed_migration_claimed_handover_version(
+            completed_migration_claimed_browser_handover_version(migration_root)
+        )
+        self.assertFalse(reloaded.get_browser_handover_state(self.context.config)["open"])
 
     def test_completed_migration_each_required_history_write_failure_aborts_claim(self):
         migration_root = os.path.join(self.temp_dir, "migration-history-failure")

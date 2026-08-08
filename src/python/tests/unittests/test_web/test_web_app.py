@@ -3,6 +3,7 @@ import unittest
 import os
 import tempfile
 from threading import Timer
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
@@ -1071,12 +1072,46 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(302, read_response.status_int)
         self.assertTrue(read_response.headers.get("Location", "").endswith("/bootstrap"))
         self.assertEqual(200, bootstrap_response.status_int)
-        self.assertIn("Claim the first local session", bootstrap_response.text)
+        self.assertIn("Claim the recovery session", bootstrap_response.text)
         self.assertNotIn("Save this browser for next time", bootstrap_response.text)
         self.assertEqual(201, bootstrap_claim_response.status_int)
         self.assertIn("seedsync_ui_session=", bootstrap_claim_response.headers.get("Set-Cookie", ""))
         self.assertEqual(200, shell_after_claim_response.status_int)
         self.assertIn("<html></html>", shell_after_claim_response.text)
+
+    def test_recovery_window_diverts_remembered_browser_then_expires_without_consuming_claim(self):
+        started = datetime(2026, 8, 8, 8, 0, tzinfo=timezone.utc)
+        store = ApiKeyStore()
+        with patch("web.auth_store._current_time", return_value=started):
+            created = store.create_initial_admin_api_key_if_available("claimed", "admin")
+            self.assertIsNotNone(created)
+            assert created is not None
+            remembered = store.create_remembered_browser_session_for_api_key(created["record"].id)
+            self.context.config.general.browser_handover_recovery_version = "recover-1"
+            web_app = WebApp(self.context, MagicMock(), auth_store=store)
+        AdminHandler(self.context.config, store).add_routes(web_app)
+        web_app.add_default_routes()
+
+        with tempfile.TemporaryDirectory() as html_path:
+            with open(os.path.join(html_path, "index.html"), "w") as html_file:
+                html_file.write("<html></html>")
+            object.__setattr__(web_app, "_WebApp__html_path", html_path)
+            client = TestApp(web_app)
+            client.set_cookie(WebApp._UI_SESSION_COOKIE_NAME, remembered.secret)
+            with patch("web.auth_store._current_time", return_value=started):
+                diverted = client.get("/", expect_errors=True)
+                bootstrap = client.get("/bootstrap")
+            with patch("web.auth_store._current_time", return_value=started + timedelta(hours=2)):
+                resumed = client.get("/")
+
+        self.assertEqual(302, diverted.status_int)
+        self.assertTrue(diverted.headers["Location"].endswith("/bootstrap"))
+        self.assertEqual(200, bootstrap.status_int)
+        self.assertIn("Recovery browser access", bootstrap.text)
+        self.assertIn("expires at <time>2026-08-08T10:00:00+00:00</time>", bootstrap.text)
+        self.assertEqual(1, store.active_admin_key_count)
+        self.assertEqual(200, resumed.status_int)
+        self.assertIn("<html></html>", resumed.text)
 
     def test_loopback_remembered_browser_session_allows_bootstrap_static_assets_while_handover_is_open(self):
         store = ApiKeyStore()
@@ -1284,6 +1319,10 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                     "HTTP_REFERER": "http://localhost:8800/dashboard",
                 },
             )
+            second_browser_bootstrap = TestApp(web_app).get(
+                "/bootstrap",
+                extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"},
+            )
 
         self.assertEqual(200, response.status_int)
         self.assertIn("Claim the first local session", response.text)
@@ -1302,6 +1341,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual(200, admin_response.status_int)
         self.assertEqual(1, len(json.loads(admin_response.text)["keys"]))
         self.assertFalse(empty_store.get_browser_handover_state(self.context.config)["open"])
+        self.assertIn("Save this browser for next time", second_browser_bootstrap.text)
+        self.assertNotIn("claim window", second_browser_bootstrap.text)
 
     def test_bootstrap_page_reopens_first_admin_access_after_handover_version_changes(self):
         store = ApiKeyStore()
@@ -1351,12 +1392,16 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
                     "HTTP_REFERER": "http://localhost:8800/dashboard",
                 },
             )
+            second_browser_bootstrap = TestApp(web_app).get(
+                "/bootstrap",
+                extra_environ={"HTTP_HOST": "localhost:8800", "REMOTE_ADDR": "127.0.0.1"},
+            )
 
         self.assertEqual(200, response.status_int)
-        self.assertIn("Claim the first local session", response.text)
+        self.assertIn("Claim the recovery session", response.text)
         self.assertIn("/server/admin/bootstrap/v1/first-api-key", response.text)
         self.assertIn(
-            "This trusted browser can take SeedSync's initial admin handoff and keep the setup inside the local runtime. After that, any other browser will need an API key once to become remembered.",
+            "This trusted browser can take SeedSync's recovery admin handoff and keep the setup inside the local runtime. After that, any other browser will need an API key once to become remembered.",
             response.text,
         )
         self.assertNotIn("submitBootstrapRequest();", response.text)
@@ -1373,6 +1418,8 @@ class TestWebAppAuthCompatibility(unittest.TestCase):
         self.assertEqual("1", browser_handover["configured_version"])
         self.assertEqual("1", browser_handover["claimed_version"])
         self.assertFalse(browser_handover["open"])
+        self.assertIn("Save this browser for next time", second_browser_bootstrap.text)
+        self.assertNotIn("claim window", second_browser_bootstrap.text)
 
     def test_bootstrap_page_is_open_to_remote_client_before_first_admin_exists(self):
         empty_store = ApiKeyStore()

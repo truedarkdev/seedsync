@@ -112,9 +112,12 @@ contract. Use the tracked Windows Compose override below; it replaces only the
         docker compose -f compose.local.yml -f compose.windows.yml up -d --build seedsync
 
     This starts the repo-owned local Docker path and binds the web UI to
-    `http://localhost:8800`. First-run migration and browser claiming are
-    reachable from any client until the first administrator claim succeeds;
+    `http://localhost:8800`. The normal app opens an eight-hour first-run
+    browser claim window; first-run migration time does not use that window.
+    Browser claiming is reachable from any client while that window is open;
     normal API-key and browser-session authentication applies afterward.
+    The deadline uses the host clock, so keep the host time correct; an
+    invalid retained claim-window record closes browser claiming safely.
 
     Verify that the effective configuration uses the named volume before
     starting or migrating data:
@@ -132,7 +135,7 @@ contract. Use the tracked Windows Compose override below; it replaces only the
 
 4. Open [http://localhost:8800](http://localhost:8800) in your browser. On a
    fresh installation, SeedSync redirects to the temporary first-run claim
-   page. Claim the browser to create the first administrator key and continue
+   page. Claim the browser within the displayed eight-hour window to create the first administrator key and continue
    into the application. No proxy address or configuration-file edit is
    required. Keep the unfinished setup on a trusted network because the first
    client that submits the claim becomes the initial administrator.
