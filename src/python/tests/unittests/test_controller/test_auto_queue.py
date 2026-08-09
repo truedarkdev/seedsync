@@ -420,6 +420,96 @@ class TestAutoQueue(unittest.TestCase):
         self.controller.is_file_stopped.return_value = False
         self.controller.has_current_process_final_publication.return_value = False
 
+    def test_idle_process_does_not_snapshot_model(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+        self.controller.get_model_files.reset_mock()
+
+        auto_queue.process()
+        auto_queue.process()
+
+        self.controller.get_model_files.assert_not_called()
+
+    def test_idle_process_keeps_deferred_lineage_without_snapshot(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+        deferred_file_id = "deferred-file"
+        initial_file_id = "initial-file"
+        auto_queue._AutoQueue__deferred_remote_delete_file_ids.add(deferred_file_id)
+        auto_queue._AutoQueue__initial_reconciliation_file_ids.add(initial_file_id)
+        self.controller.get_model_files.reset_mock()
+
+        auto_queue.process()
+
+        self.controller.get_model_files.assert_not_called()
+        self.assertEqual(
+            {deferred_file_id},
+            auto_queue._AutoQueue__deferred_remote_delete_file_ids,
+        )
+        self.assertEqual(
+            {initial_file_id},
+            auto_queue._AutoQueue__initial_reconciliation_file_ids,
+        )
+
+    def test_removed_file_clears_lineage_without_snapshot(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+        removed_file = ModelFile("Removed", False)
+        auto_queue._AutoQueue__deferred_remote_delete_file_ids.add(removed_file.file_id)
+        auto_queue._AutoQueue__initial_reconciliation_file_ids.add(removed_file.file_id)
+        self.model_listener.file_removed(removed_file)
+        self.controller.get_model_files.reset_mock()
+
+        auto_queue.process()
+
+        self.controller.get_model_files.assert_not_called()
+        self.assertNotIn(
+            removed_file.file_id,
+            auto_queue._AutoQueue__deferred_remote_delete_file_ids,
+        )
+        self.assertNotIn(
+            removed_file.file_id,
+            auto_queue._AutoQueue__initial_reconciliation_file_ids,
+        )
+
+    def test_reintroduced_file_does_not_inherit_removed_lineage(self):
+        self.context.config.autoqueue.patterns_only = False
+        self.context.config.autoqueue.auto_delete_remote = True
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+
+        removed_file = ModelFile("Release", False)
+        auto_queue._AutoQueue__deferred_remote_delete_file_ids.add(removed_file.file_id)
+        auto_queue._AutoQueue__initial_reconciliation_file_ids.add(removed_file.file_id)
+        self.model_listener.file_removed(removed_file)
+        auto_queue.process()
+
+        old_file = ModelFile("Release", False)
+        old_file.state = ModelFile.State.DEFAULT
+        old_file.remote_size = 100
+        new_file = ModelFile("Release", False)
+        new_file.state = ModelFile.State.DOWNLOADED
+        new_file.local_size = 100
+        new_file.remote_size = 100
+        self.model_listener.file_updated(old_file, new_file)
+
+        auto_queue.process()
+
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+        command = self.controller.queue_command.call_args[0][0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual(new_file.file_id, command.filename)
+
+    def test_active_process_reuses_one_model_snapshot(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="File.One"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        file_one = ModelFile("File.One", True)
+        file_one.remote_size = 100
+        self.model_listener.file_added(file_one)
+        self.controller.get_model_files.reset_mock()
+
+        auto_queue.process()
+
+        self.assertEqual(1, self.controller.get_model_files.call_count)
+
     def _set_enabled_path_pairs(self, *pairs):
         path_pair_manager = MagicMock()
         path_pair_manager.get_enabled_pairs.return_value = list(pairs)

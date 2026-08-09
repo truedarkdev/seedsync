@@ -157,6 +157,7 @@ class AutoQueueModelListener(IModelListener):
     def __init__(self):
         self.new_files: list[ModelFile] = []
         self.modified_files: list[tuple[ModelFile, ModelFile]] = []
+        self.removed_file_ids: set[str] = set()
 
     @overrides(IModelListener)
     def file_added(self, file: ModelFile) -> None:
@@ -168,7 +169,7 @@ class AutoQueueModelListener(IModelListener):
 
     @overrides(IModelListener)
     def file_removed(self, file: ModelFile) -> None:
-        pass
+        self.removed_file_ids.add(file.file_id)
 
 
 class AutoQueuePersistListener(IAutoQueuePersistListener):
@@ -300,13 +301,45 @@ class AutoQueue:
         :return:
         """
         self.__refresh_queue_state()
+        removed_file_ids = self.__model_listener.removed_file_ids
+        if removed_file_ids:
+            self.__deferred_remote_delete_file_ids.difference_update(removed_file_ids)
+            self.__initial_reconciliation_file_ids.difference_update(removed_file_ids)
+            removed_file_ids.clear()
         if not self.__enabled and not self.__queue_enabled:
             self.__discard_inactive_buffers()
             return
         self.__cycle_sequence += 1
         new_patterns = self.__persist_listener.drain_new_patterns()
 
+        # Nothing changed since the previous cycle.  Deferred reconciliation
+        # and delete sets are retained lineage memory; they are only acted on
+        # alongside a new/modified listener event.  Avoid taking a deep-copied
+        # model snapshot for the common idle tick.
+        if not (
+                new_patterns
+                or self.__model_listener.new_files
+                or self.__model_listener.modified_files
+        ):
+            self.__record_breadcrumb(
+                "auto_queue_cycle",
+                {
+                    "cycle": self.__cycle_sequence,
+                    "new_queue_candidates": 0,
+                    "modified_queue_candidates": 0,
+                    "queue_count": 0,
+                    "extract_count": 0,
+                    "patterns_only": self.__patterns_only,
+                    "auto_extract_enabled": self.__auto_extract_enabled,
+                    "queue_blocked_reason_counts": {},
+                    "extract_blocked_reason_counts": {},
+                    "blocked_samples": [],
+                }
+            )
+            return
+
         try:
+            current_files = self.__current_model_by_id()
             ###
             # Queue
             ###
@@ -321,6 +354,7 @@ class AutoQueue:
                 new_files_to_queue = self.__filter_candidates(
                     candidates=self.__model_listener.new_files,
                     new_patterns=new_patterns,
+                    current_files=current_files,
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
@@ -356,6 +390,7 @@ class AutoQueue:
                 modified_files_actual_update = self.__filter_candidates(
                     candidates=modified_candidates_actual_update,
                     new_patterns=new_patterns,
+                    current_files=current_files,
                     accept=lambda f: f.remote_has_transferable_content and
                     f.state == ModelFile.State.DEFAULT and
                     not f.local_present and
@@ -365,6 +400,7 @@ class AutoQueue:
                 modified_files_remote_discovery = self.__filter_candidates(
                     candidates=modified_candidates_remote_discovery,
                     new_patterns=new_patterns,
+                    current_files=current_files,
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
@@ -411,6 +447,7 @@ class AutoQueue:
                 files_to_extract = self.__filter_candidates(
                     candidates=extract_candidate_files,
                     new_patterns=new_patterns,
+                    current_files=current_files,
                     accept=lambda f:
                         f.state == ModelFile.State.DOWNLOADED and
                         f.local_size is not None and
@@ -426,7 +463,7 @@ class AutoQueue:
 
             trace_target_file = None
             if self.__is_target_archive_trace_enabled():
-                model_files = self.__controller.get_model_files()
+                model_files = current_files.values()
                 trace_target_file = next(
                     (file for file in model_files if self.__target_archive_trace_selector_matches_file(file)),
                     None
@@ -527,7 +564,7 @@ class AutoQueue:
             ###
             # Delete Remote
             ###
-            files_to_delete_remote = self.__filter_delete_remote_candidates() if self.__enabled else []
+            files_to_delete_remote = self.__filter_delete_remote_candidates(current_files) if self.__enabled else []
 
             self.__record_breadcrumb(
                 "auto_queue_cycle",
@@ -598,7 +635,7 @@ class AutoQueue:
             # path-pair refresh. Keep that candidate until both roots have
             # reconciled, then evaluate the current model rather than its
             # stale remote-first snapshot.
-            current_file_ids = set(self.__current_model_by_id())
+            current_file_ids = set(current_files)
             self.__deferred_remote_delete_file_ids.intersection_update(current_file_ids)
             self.__initial_reconciliation_file_ids.intersection_update(current_file_ids)
             self.__model_listener.new_files[:] = [
@@ -665,6 +702,7 @@ class AutoQueue:
     def __filter_candidates(self,
                             candidates: list[ModelFile],
                             new_patterns: set[AutoQueuePattern],
+                            current_files: dict[str, ModelFile],
                             accept: Callable[[ModelFile], bool]) -> list[CandidateMatch]:
         """
         Given a list of candidate files, filter out those that match the accept criteria
@@ -681,7 +719,6 @@ class AutoQueue:
 
         # Step 1: run candidates through all the patterns if they are enabled
         #         otherwise accept all files
-        current_files = self.__current_model_by_id()
         for candidate in candidates:
             file = current_files.get(candidate.file_id)
             if file is None:
@@ -698,9 +735,8 @@ class AutoQueue:
 
         # Step 2: run new pattern through all the files
         if new_patterns:
-            model_files = self.__controller.get_model_files()
             for new_pattern in new_patterns:
-                for file in model_files:
+                for file in current_files.values():
                     if self.__is_reconciliation_ready(file) and accept(file) and self.__match(new_pattern, file):
                         files_matched[file.file_id] = (file, new_pattern)
 
@@ -738,7 +774,7 @@ class AutoQueue:
 
         return reason_counts, samples
 
-    def __filter_delete_remote_candidates(self) -> list[CandidateMatch]:
+    def __filter_delete_remote_candidates(self, current_files: dict[str, ModelFile]) -> list[CandidateMatch]:
         """
         Select remote-delete candidates from true completion transitions only.
         This intentionally avoids startup seeding and new-pattern backfill.
@@ -747,7 +783,6 @@ class AutoQueue:
             return []
 
         files_matched: dict[str, CandidateMatch] = {}
-        current_files = self.__current_model_by_id()
         for new_file in self.__model_listener.new_files:
             current_file = current_files.get(new_file.file_id)
             if current_file is not None and not self.__is_reconciliation_ready(current_file):
