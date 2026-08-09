@@ -9,6 +9,9 @@ import {AppComponent} from "../../../../pages/main/app.component";
 import {DomService} from "../../../../services/utils/dom.service";
 import {PathPair, PathPairService} from "../../../../services/settings/path-pair.service";
 
+declare function require(moduleName: string): any;
+const {version: appVersion} = require("../../../../../../package.json");
+
 
 class MockRouter {
     public url = "/dashboard";
@@ -91,6 +94,20 @@ describe("Testing app component", () => {
 
         expect(component.activeTitle).toBe("Movies");
         expect(fixture.nativeElement.querySelector("#title").textContent).toContain("Movies");
+    });
+
+    it("should render the authoritative build version in the sidebar footer", () => {
+        detectSettledChanges();
+
+        const version = fixture.nativeElement.querySelector("#sidebar-version");
+        expect(version).not.toBeNull();
+        expect(version.textContent).toContain("CURRENT VERSION");
+        expect(version.textContent).toContain(`v${appVersion}`);
+        expect(version.getAttribute("aria-label")).toBe(`SeedSync current version ${appVersion}`);
+        expect(version.querySelector(".version-label").textContent.trim()).toBe("CURRENT VERSION");
+        expect(version.querySelector(".version-value").textContent.trim()).toBe(`v${appVersion}`);
+        expect(version.querySelector(".signature-mark")).toBeNull();
+        expect(version.querySelector(".signature-brand")).toBeNull();
     });
 
     it("should resolve the dashboard detail title from the path-pair ID", () => {

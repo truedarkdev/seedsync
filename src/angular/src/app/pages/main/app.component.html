@@ -2,19 +2,26 @@
      [class.top-sidebar-open]="showSidebar"
      [class.top-sidebar-closed]="!showSidebar">
 
-    <div id="logo">
-        <span class="image">
-            <!--suppress HtmlUnknownTarget -->
-            <img src="assets/logo.png" />
-        </span>
-        <span class="text"><b>Seed</b>Sync</span>
+    <div class="sidebar-layout">
+        <div id="logo">
+            <span class="image">
+                <!--suppress HtmlUnknownTarget -->
+                <img src="assets/logo.png" />
+            </span>
+            <span class="text"><b>Seed</b>Sync</span>
 
-        <button id="sidebar-btn-close" class="sidebar-btn" (click)="showSidebar=false">
-            <span>&#10006;</span>
-        </button>
+            <button id="sidebar-btn-close" class="sidebar-btn" (click)="showSidebar=false">
+                <span>&#10006;</span>
+            </button>
+        </div>
+
+        <app-sidebar></app-sidebar>
+
+        <footer id="sidebar-version" [attr.aria-label]="'SeedSync current version ' + version">
+            <span class="version-label">CURRENT VERSION</span>
+            <span class="version-value">v{{version}}</span>
+        </footer>
     </div>
-
-    <app-sidebar></app-sidebar>
 </div>
 
 <!-- Used for sidebar closing -->

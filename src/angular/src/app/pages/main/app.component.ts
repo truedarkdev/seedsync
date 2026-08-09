@@ -12,6 +12,9 @@ import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-rou
 import {HeaderComponent} from "./header.component";
 import {SidebarComponent} from "./sidebar.component";
 
+declare function require(moduleName: string): any;
+const {version: appVersion} = require("../../../../package.json");
+
 @Component({
     selector: "app-root",
     standalone: true,
@@ -22,6 +25,7 @@ import {SidebarComponent} from "./sidebar.component";
 export class AppComponent implements OnInit, AfterViewInit, OnDestroy {
     @ViewChild("topHeader") topHeader: ElementRef;
 
+    public version = appVersion;
     showSidebar = false;
     private _destroy$: Subject<void> = new Subject<void>();
     private _resizeObserver: any = null;
