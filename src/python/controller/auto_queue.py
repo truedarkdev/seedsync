@@ -21,6 +21,10 @@ class _AutoQueueController(Protocol):
     def is_file_stopped(self, filename: str) -> bool: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
     def queue_command(self, command: Controller.Command) -> None: ...
+    def is_path_pair_reconciled(self, path_pair_id: Optional[str]) -> bool: ...
+    def remote_delete_lifecycle_token(self, file: ModelFile) -> tuple[int, int]: ...
+    def is_remote_delete_eligible(self, file: ModelFile) -> bool: ...
+    def has_current_process_final_publication(self, file: ModelFile) -> bool: ...
 
 
 def _config_bool(value: object, name: str) -> bool:
@@ -226,6 +230,12 @@ class AutoQueue:
         self.__pair_auto_queue: dict[str, bool] = {}
         self.__queue_enabled = self.__enabled
         self.__cycle_sequence = 0
+        self.__deferred_remote_delete_file_ids: set[str] = set()
+        # Files first observed while one root is still unreconciled may later
+        # appear as DEFAULT -> DOWNLOADED solely because the other root caught
+        # up.  Preserve that initial-generation lineage so it cannot become a
+        # remote-delete command.
+        self.__initial_reconciliation_file_ids: set[str] = set()
 
         self.__refresh_queue_state()
 
@@ -314,7 +324,7 @@ class AutoQueue:
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
-                        (f.local_size is None or f.local_size == 0) and
+                        not f.local_present and
                         self._is_auto_queue_enabled_for_file(f)
                     )
                 )
@@ -348,6 +358,7 @@ class AutoQueue:
                     new_patterns=new_patterns,
                     accept=lambda f: f.remote_has_transferable_content and
                     f.state == ModelFile.State.DEFAULT and
+                    not f.local_present and
                     self._is_auto_queue_enabled_for_file(f)
                 )
 
@@ -357,7 +368,7 @@ class AutoQueue:
                     accept=lambda f: (
                         f.remote_has_transferable_content and
                         f.state == ModelFile.State.DEFAULT and
-                        (f.local_size is None or f.local_size == 0) and
+                        not f.local_present and
                         self._is_auto_queue_enabled_for_file(f)
                     )
                 )
@@ -578,11 +589,26 @@ class AutoQueue:
                     flow_id="autoq:{}:DELETE_REMOTE:{}".format(self.__cycle_sequence, file.file_id),
                     origin="auto_queue",
                 )
+                token_factory = getattr(self.__controller, "remote_delete_lifecycle_token", None)
+                if callable(token_factory):
+                    command.lifecycle_token = token_factory(file)
                 self.__controller.queue_command(command)
 
-            # Clear the processed files
-            self.__model_listener.new_files.clear()
-            self.__model_listener.modified_files.clear()
+            # A remote result can precede the local result after startup or a
+            # path-pair refresh. Keep that candidate until both roots have
+            # reconciled, then evaluate the current model rather than its
+            # stale remote-first snapshot.
+            current_file_ids = set(self.__current_model_by_id())
+            self.__deferred_remote_delete_file_ids.intersection_update(current_file_ids)
+            self.__initial_reconciliation_file_ids.intersection_update(current_file_ids)
+            self.__model_listener.new_files[:] = [
+                file for file in self.__model_listener.new_files
+                if file.file_id in current_file_ids and not self.__is_reconciliation_ready(file)
+            ]
+            self.__model_listener.modified_files[:] = [
+                (old_file, new_file) for old_file, new_file in self.__model_listener.modified_files
+                if new_file.file_id in current_file_ids and not self.__is_reconciliation_ready(new_file)
+            ]
 
         except Exception:
             current_patterns = self.__persist.patterns
@@ -629,6 +655,13 @@ class AutoQueue:
             return self.__pair_auto_queue.get(file.path_pair_id, False)
         return True
 
+    def __is_reconciliation_ready(self, file: ModelFile) -> bool:
+        checker = getattr(self.__controller, "is_path_pair_reconciled", None)
+        return not callable(checker) or bool(checker(file.path_pair_id))
+
+    def __current_model_by_id(self) -> dict[str, ModelFile]:
+        return {file.file_id: file for file in self.__controller.get_model_files()}
+
     def __filter_candidates(self,
                             candidates: list[ModelFile],
                             new_patterns: set[AutoQueuePattern],
@@ -648,7 +681,13 @@ class AutoQueue:
 
         # Step 1: run candidates through all the patterns if they are enabled
         #         otherwise accept all files
-        for file in candidates:
+        current_files = self.__current_model_by_id()
+        for candidate in candidates:
+            file = current_files.get(candidate.file_id)
+            if file is None:
+                continue
+            if not self.__is_reconciliation_ready(file):
+                continue
             if self.__patterns_only:
                 for pattern in self.__persist.patterns:
                     if accept(file) and self.__match(pattern, file):
@@ -662,7 +701,7 @@ class AutoQueue:
             model_files = self.__controller.get_model_files()
             for new_pattern in new_patterns:
                 for file in model_files:
-                    if accept(file) and self.__match(new_pattern, file):
+                    if self.__is_reconciliation_ready(file) and accept(file) and self.__match(new_pattern, file):
                         files_matched[file.file_id] = (file, new_pattern)
 
         return list(files_matched.values())
@@ -708,16 +747,56 @@ class AutoQueue:
             return []
 
         files_matched: dict[str, CandidateMatch] = {}
+        current_files = self.__current_model_by_id()
+        for new_file in self.__model_listener.new_files:
+            current_file = current_files.get(new_file.file_id)
+            if current_file is not None and not self.__is_reconciliation_ready(current_file):
+                self.__initial_reconciliation_file_ids.add(current_file.file_id)
         for old_file, new_file in self.__model_listener.modified_files:
-            if not self.__is_remote_delete_transition(old_file, new_file):
+            current_file = current_files.get(new_file.file_id)
+            if current_file is None:
+                continue
+            if not self.__is_reconciliation_ready(current_file):
+                # A completion-looking state produced during initial
+                # reconciliation is not proof that this process completed the
+                # transfer. Never turn it into a remote delete later.
+                self.__deferred_remote_delete_file_ids.add(current_file.file_id)
+                continue
+            if current_file.file_id in self.__deferred_remote_delete_file_ids:
+                current_publication = getattr(self.__controller, "has_current_process_final_publication", None)
+                published_this_process = callable(current_publication) and bool(current_publication(current_file))
+                if (
+                        old_file.state not in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING)
+                        and not published_this_process
+                ):
+                    continue
+                self.__deferred_remote_delete_file_ids.discard(current_file.file_id)
+            if current_file.file_id in self.__initial_reconciliation_file_ids:
+                # A later real transfer completion is authoritative and may
+                # delete remotely; DEFAULT -> DOWNLOADED after first
+                # reconciliation is not such evidence.
+                current_publication = getattr(self.__controller, "has_current_process_final_publication", None)
+                published_this_process = callable(current_publication) and bool(current_publication(current_file))
+                if (
+                        old_file.state not in (ModelFile.State.QUEUED, ModelFile.State.DOWNLOADING)
+                        and not published_this_process
+                ):
+                    continue
+                self.__initial_reconciliation_file_ids.discard(current_file.file_id)
+            if not self._is_auto_queue_enabled_for_file(current_file):
+                continue
+            eligible = getattr(self.__controller, "is_remote_delete_eligible", None)
+            if callable(eligible) and not eligible(current_file):
+                continue
+            if not self.__is_remote_delete_transition(old_file, current_file):
                 continue
             if self.__patterns_only:
                 for pattern in self.__persist.patterns:
-                    if self.__match(pattern, new_file):
-                        files_matched[new_file.file_id] = (new_file, pattern)
+                    if self.__match(pattern, current_file):
+                        files_matched[current_file.file_id] = (current_file, pattern)
                         break
             else:
-                files_matched[new_file.file_id] = (new_file, None)
+                files_matched[current_file.file_id] = (current_file, None)
 
         return list(files_matched.values())
 

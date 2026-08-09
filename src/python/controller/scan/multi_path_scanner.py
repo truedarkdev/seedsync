@@ -30,8 +30,15 @@ class MultiPathLocalScanner(IScanner):
         self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
 
     @overrides(IScanner)
+    def scanned_path_pair_ids(self) -> set[str | None]:
+        if self.__scan_target_path_pair_ids is not None:
+            return set(self.__scan_target_path_pair_ids)
+        return {scanner.path_pair_id for scanner in self.__scanners}
+
+    @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         all_files: List[SystemFile] = []
+        recoverable_errors: List[str] = []
         for scanner in self.__scanners:
             if (
                 self.__scan_target_path_pair_ids is not None
@@ -45,11 +52,17 @@ class MultiPathLocalScanner(IScanner):
                     system_file.path_pair_name = scanner.path_pair_name
                 all_files.extend(files)
             except ScannerError as err:
-                self.logger.warning(
-                    "Failed to scan local path for pair '{}': {}".format(scanner.path_pair_name, str(err))
-                )
+                error_message = "Failed to scan local path for pair '{}': {}".format(scanner.path_pair_name, str(err))
+                self.logger.warning(error_message)
                 if not err.recoverable:
                     raise
+                recoverable_errors.append(error_message)
+        if recoverable_errors:
+            raise ScannerError(
+                "Local scan completed with recoverable errors: {}".format("; ".join(recoverable_errors)),
+                recoverable=True,
+                files=all_files,
+            )
         return all_files
 
     def pop_managed_extract_file_ids(self) -> List[str]:
@@ -73,6 +86,10 @@ class MultiPathRemoteScanner(IScanner):
         self.logger = base_logger.getChild("MultiPathRemoteScanner")
         for scanner in self.__scanners:
             scanner.set_base_logger(self.logger)
+
+    @overrides(IScanner)
+    def scanned_path_pair_ids(self) -> set[str | None]:
+        return {scanner.path_pair_id for scanner in self.__scanners}
 
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:

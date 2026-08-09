@@ -53,6 +53,10 @@ class IScanner(ABC):
     def pop_managed_extract_file_ids(self) -> List[str]:
         return []
 
+    def scanned_path_pair_ids(self) -> set[str | None]:
+        """Roots covered by a successful scan; empty roots still count."""
+        return {None}
+
 
 class ScannerResult:
     """
@@ -63,12 +67,14 @@ class ScannerResult:
                  files: List[SystemFile],
                  malformed_status_only_file_ids: Optional[List[str]] = None,
                  managed_extract_file_ids: Optional[List[str]] = None,
+                 scanned_path_pair_ids: Optional[set[str | None]] = None,
                  failed: bool = False,
                  error_message: str | None = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
         self.managed_extract_file_ids = [] if managed_extract_file_ids is None else managed_extract_file_ids
+        self.scanned_path_pair_ids = {None} if scanned_path_pair_ids is None else scanned_path_pair_ids
         self.failed = failed
         self.error_message = error_message
 
@@ -131,7 +137,8 @@ class ScannerProcess(AppProcess):
             result = ScannerResult(timestamp=timestamp_start,
                                    files=files,
                                    malformed_status_only_file_ids=malformed_status_only_file_ids,
-                                   managed_extract_file_ids=managed_extract_file_ids)
+                                   managed_extract_file_ids=managed_extract_file_ids,
+                                   scanned_path_pair_ids=self.__scanner.scanned_path_pair_ids())
             self.__record_breadcrumb(
                 "scan_completed",
                 {

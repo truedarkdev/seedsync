@@ -81,6 +81,7 @@ class _ControllerCoreAccess:
     def _complete_download_start_lifecycle(self, file_id: str) -> None: ...
     def _record_download_completion(self, file: ModelFile) -> None: ...
     def _mark_successful_final_move_handoff(self, file_id: str) -> None: ...
+    def _mark_current_process_final_publication(self, file_id: str) -> None: ...
     def _final_move_succeeded_files_for_model(self) -> set[str]: ...
     def _sync_final_move_succeeded_files_to_model(self) -> None: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
@@ -471,8 +472,16 @@ class ModelUpdater(_ControllerCoreAccess):
         model_builder = controller._Controller__model_builder
         model_builder.begin_stop_resume_trace_cycle(cycle_id)
         build_triggered = False
+        work_state_lock = getattr(controller, "_Controller__work_state_lock", None)
         try:
-            build_triggered = self._update_once()
+            # Relocation snapshots treat these runtime collections as one
+            # coherent unit.  Hold the same outer lock across this update so
+            # an alias switch cannot observe a halfway scan/status transition.
+            if work_state_lock is None:
+                build_triggered = self._update_once()
+            else:
+                with work_state_lock:
+                    build_triggered = self._update_once()
         finally:
             # Keep the no-rebuild case observable and finish only after all
             # model listeners have seen the applied diff.
@@ -523,6 +532,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__pending_completion_progress_floors = {}
         if not hasattr(controller, "_Controller__successful_final_move_handoff_file_ids"):
             controller._Controller__successful_final_move_handoff_file_ids = set()
+        if not hasattr(controller, "_Controller__current_process_final_publication_file_ids"):
+            controller._Controller__current_process_final_publication_file_ids = set()
         controller._Controller__successful_final_move_handoff_file_ids.intersection_update(
             persist.final_move_succeeded_file_names
         )
@@ -767,6 +778,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 event_type="state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
             )
+        healthy_local_ids: set[str | None] = set()
+        healthy_remote_ids: set[str | None] = set()
+        if latest_local_scan is not None and not bool(getattr(latest_local_scan, "failed", False)):
+            raw_ids = getattr(latest_local_scan, "scanned_path_pair_ids", {None})
+            if isinstance(raw_ids, set):
+                healthy_local_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
+        if latest_remote_scan is not None and not bool(getattr(latest_remote_scan, "failed", False)):
+            raw_ids = getattr(latest_remote_scan, "scanned_path_pair_ids", {None})
+            if isinstance(raw_ids, set):
+                healthy_remote_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
+        if healthy_local_ids or healthy_remote_ids:
+            recorder = getattr(controller, "_record_path_pair_reconciliation", None)
+            if callable(recorder):
+                recorder(healthy_local_ids, healthy_remote_ids)
         if latest_active_scan is not None:
             active_scan_files = list(latest_active_scan.files)
             handoff_file_ids = controller._Controller__successful_final_move_handoff_file_ids
@@ -831,6 +856,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
         if latest_validation_statuses is not None:
             model_builder.set_validation_statuses(latest_validation_statuses.statuses)
+            terminal_validation_ids = {
+                status.file_id for status in latest_validation_statuses.statuses
+                if status.state in (ModelFile.State.VALIDATED, ModelFile.State.CORRUPT)
+            }
+            recorder = getattr(controller, "_record_worker_terminal_ids", None)
+            if callable(recorder) and terminal_validation_ids:
+                recorder(set(), terminal_validation_ids)
         def _is_known_extract_result_pair(
             result: ExtractCompletedResult | ExtractFailedResult, result_kind: str
         ) -> bool:
@@ -909,6 +941,14 @@ class ModelUpdater(_ControllerCoreAccess):
                     event_type="failure",
                     corr_id=controller._Controller__trace_corr_id_from_files(known_failed_results, "extract"),
                 )
+        terminal_extract_ids = {
+            result.file_id if isinstance(getattr(result, "file_id", None), str)
+            else ModelFile.build_file_id(result.name, result.path_pair_id)
+            for result in latest_extracted_results + latest_failed_results
+        }
+        recorder = getattr(controller, "_record_worker_terminal_ids", None)
+        if callable(recorder) and terminal_extract_ids:
+            recorder(terminal_extract_ids, set())
         model_builder.set_stopped_files(
             self._filter_keys_for_model_builder(
                 persist.stopped_file_names,
@@ -1018,6 +1058,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 def keep_completion_pending_after_failed_staging_move(file: ModelFile, consume_budget: bool):
                     persist.final_move_succeeded_file_names.discard(file.file_id)
                     controller._Controller__successful_final_move_handoff_file_ids.discard(file.file_id)
+                    controller._Controller__current_process_final_publication_file_ids.discard(file.file_id)
                     controller._sync_final_move_succeeded_files_to_model()
                     path_pair_name = file.path_pair_name
                     if path_pair_name is None:
@@ -1056,7 +1097,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     else:
                         controller._Controller__local_scan_process.force_scan(file.path_pair_id)
 
-                def publish_completed_download(file: ModelFile, final_move_succeeded: bool):
+                def publish_completed_download(
+                        file: ModelFile, final_move_succeeded: bool,
+                        current_process_publication: bool = False):
                     controller._record_download_completion(file)
                     persist.move_failure_counts.pop(file.file_id, None)
                     controller._Controller__deferred_move_file_ids.discard(file.file_id)
@@ -1072,6 +1115,8 @@ class ModelUpdater(_ControllerCoreAccess):
                     controller._sync_final_move_succeeded_files_to_model()
                     if final_move_succeeded:
                         controller._mark_successful_final_move_handoff(file.file_id)
+                    if current_process_publication:
+                        controller._mark_current_process_final_publication(file.file_id)
                     if file.file_id not in persist.downloaded_file_names:
                         persist.downloaded_file_names.add(file.file_id)
                         model_builder.set_downloaded_files(persist.downloaded_file_names)
@@ -1203,17 +1248,22 @@ class ModelUpdater(_ControllerCoreAccess):
                         attempted_move_file_ids.add(new_file.file_id)
                         if move_result in (
                             controller.MoveFromStagingResult.FAILED,
+                            controller.MoveFromStagingResult.CONFLICT,
                             controller.MoveFromStagingResult.DEFERRED,
                         ):
                             keep_completion_pending_after_failed_staging_move(
                                 new_file,
-                                move_result == controller.MoveFromStagingResult.FAILED,
+                                move_result in (
+                                    controller.MoveFromStagingResult.FAILED,
+                                    controller.MoveFromStagingResult.CONFLICT,
+                                ),
                             )
                         else:
                             publish_completed_download(
                                 new_file,
                                 move_result == controller.MoveFromStagingResult.COMPLETED or
                                 new_file.file_id in persist.final_move_succeeded_file_names,
+                                move_result == controller.MoveFromStagingResult.COMPLETED,
                             )
 
                     # Detect if a file was just downloaded through a direct state transition.
@@ -1246,17 +1296,22 @@ class ModelUpdater(_ControllerCoreAccess):
                         attempted_move_file_ids.add(new_file.file_id)
                         if move_result in (
                             controller.MoveFromStagingResult.FAILED,
+                            controller.MoveFromStagingResult.CONFLICT,
                             controller.MoveFromStagingResult.DEFERRED,
                         ):
                             keep_completion_pending_after_failed_staging_move(
                                 new_file,
-                                move_result == controller.MoveFromStagingResult.FAILED,
+                                move_result in (
+                                    controller.MoveFromStagingResult.FAILED,
+                                    controller.MoveFromStagingResult.CONFLICT,
+                                ),
                             )
                         else:
                             publish_completed_download(
                                 new_file,
                                 move_result == controller.MoveFromStagingResult.COMPLETED or
                                 new_file.file_id in persist.final_move_succeeded_file_names,
+                                move_result == controller.MoveFromStagingResult.COMPLETED,
                             )
 
                 # A pending file often has no subsequent model diff. Drive its
@@ -1290,10 +1345,14 @@ class ModelUpdater(_ControllerCoreAccess):
                             pending_file,
                             move_result == controller.MoveFromStagingResult.COMPLETED or
                             pending_file.file_id in persist.final_move_succeeded_file_names,
+                            move_result == controller.MoveFromStagingResult.COMPLETED,
                         )
                     elif move_result == controller.MoveFromStagingResult.NO_MOVE_APPLICABLE:
                         publish_completed_download(pending_file, False)
-                    elif move_result == controller.MoveFromStagingResult.FAILED:
+                    elif move_result in (
+                        controller.MoveFromStagingResult.FAILED,
+                        controller.MoveFromStagingResult.CONFLICT,
+                    ):
                         keep_completion_pending_after_failed_staging_move(pending_file, True)
                     else:
                         keep_completion_pending_after_failed_staging_move(pending_file, False)

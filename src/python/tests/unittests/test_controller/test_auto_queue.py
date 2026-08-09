@@ -404,9 +404,12 @@ class TestAutoQueue(unittest.TestCase):
         self.controller.queue_command = MagicMock()
         self.model_listener = None
         self.initial_model = []
+        self._include_listener_events_in_model = True
 
         def get_model():
-            return self.initial_model
+            if self.initial_model or not self._include_listener_events_in_model or self.model_listener is None:
+                return self.initial_model
+            return self.model_listener.new_files + [new_file for _, new_file in self.model_listener.modified_files]
 
         def get_model_and_capture_listener(listener: IModelListener):
             self.model_listener = listener
@@ -415,6 +418,7 @@ class TestAutoQueue(unittest.TestCase):
         self.controller.get_model_files.side_effect = get_model
         self.controller.get_model_files_and_add_listener.side_effect = get_model_and_capture_listener
         self.controller.is_file_stopped.return_value = False
+        self.controller.has_current_process_final_publication.return_value = False
 
     def _set_enabled_path_pairs(self, *pairs):
         path_pair_manager = MagicMock()
@@ -488,6 +492,21 @@ class TestAutoQueue(unittest.TestCase):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("zero", command.filename)
+
+    def test_present_zero_byte_local_file_is_not_auto_queued_against_nonzero_remote(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="zero-local"))
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        file = ModelFile("zero-local", False)
+        file.local_size = 0
+        file.remote_size = 10
+        self.model_listener.file_added(file)
+
+        auto_queue.process()
+
+        self.assertTrue(file.local_present)
+        self.controller.queue_command.assert_not_called()
 
     def test_empty_remote_directory_becoming_transferable_at_same_size_is_auto_queued(self):
         persist = AutoQueuePersist()
@@ -963,7 +982,7 @@ class TestAutoQueue(unittest.TestCase):
         auto_queue.process()
         self.controller.queue_command.assert_not_called()
 
-    def test_partial_file_is_auto_queued_after_actual_remote_update(self):
+    def test_partial_file_is_not_auto_queued_after_actual_remote_update(self):
         persist = AutoQueuePersist()
         persist.add_pattern(AutoQueuePattern(pattern="File.One"))
         # noinspection PyTypeChecker
@@ -981,10 +1000,7 @@ class TestAutoQueue(unittest.TestCase):
         file_one_new.remote_size = 200
         self.model_listener.file_updated(file_one, file_one_new)
         auto_queue.process()
-        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
-        command = self.controller.queue_command.call_args[0][0]
-        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
-        self.assertEqual("File.One", command.filename)
+        self.controller.queue_command.assert_not_called()
 
     def test_duplicate_names_from_different_path_pairs_are_queued_separately(self):
         persist = AutoQueuePersist()
@@ -1009,6 +1025,155 @@ class TestAutoQueue(unittest.TestCase):
         commands = [calls[i][0][0] for i in range(2)]
         self.assertEqual(set([Controller.Command.Action.QUEUE] * 2), {c.action for c in commands})
         self.assertEqual({file_one.file_id, file_two.file_id}, {c.filename for c in commands})
+
+    def test_remote_first_candidate_waits_for_reconciliation_and_uses_current_model(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path="/local")
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: False
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        remote_first = ModelFile("Release", True)
+        remote_first.path_pair_id = pair.id
+        remote_first.remote_size = 100
+        self.model_listener.file_added(remote_first)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        complete = ModelFile("Release", True)
+        complete.path_pair_id = pair.id
+        complete.remote_size = 100
+        complete.local_size = 100
+        complete.state = ModelFile.State.DOWNLOADED
+        self.initial_model = [complete]
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_remote_only_candidate_queues_after_reconciliation(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path="/local")
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: False
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        remote_only = ModelFile("Release", True)
+        remote_only.path_pair_id = pair.id
+        remote_only.remote_size = 100
+        self.initial_model = [remote_only]
+        self.model_listener.file_added(remote_only)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        auto_queue.process()
+        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
+
+    def test_removed_before_reconciliation_never_queues_or_extracts(self):
+        persist = AutoQueuePersist()
+        persist.add_pattern(AutoQueuePattern(pattern="Release"))
+        pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path="/local")
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: False
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        stale = ModelFile("Release", False)
+        stale.path_pair_id = pair.id
+        stale.remote_size = 100
+        stale.local_size = 100
+        stale.state = ModelFile.State.DOWNLOADED
+        self.model_listener.file_added(stale)
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+        self.initial_model = []
+        self._include_listener_events_in_model = False
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+        self.assertEqual([], self.model_listener.new_files)
+
+    def test_remote_first_completion_never_replays_as_remote_delete(self):
+        persist = AutoQueuePersist()
+        self.context.config.autoqueue.patterns_only = False
+        self.context.config.autoqueue.auto_delete_remote = True
+        pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path="/local")
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: False
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("Release", False)
+        old_file.path_pair_id = pair.id
+        old_file.remote_size = 100
+        old_file.local_size = 100
+        old_file.state = ModelFile.State.DEFAULT
+        completed = ModelFile("Release", False)
+        completed.path_pair_id = pair.id
+        completed.remote_size = 100
+        completed.local_size = 100
+        completed.state = ModelFile.State.DOWNLOADED
+        self.initial_model = [completed]
+        self.model_listener.file_updated(old_file, completed)
+
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
+
+    def test_remote_delete_follows_later_authoritative_transfer_completion(self):
+        persist = AutoQueuePersist()
+        self.context.config.autoqueue.patterns_only = False
+        self.context.config.autoqueue.auto_delete_remote = True
+        pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path="/local")
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        self.controller.remote_delete_lifecycle_token.return_value = (3, 7)
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+        old_file = ModelFile("Release", False)
+        old_file.path_pair_id = pair.id
+        old_file.remote_size = 100
+        old_file.state = ModelFile.State.DOWNLOADING
+        completed = ModelFile("Release", False)
+        completed.path_pair_id = pair.id
+        completed.remote_size = 100
+        completed.local_size = 100
+        completed.state = ModelFile.State.DOWNLOADED
+        self.initial_model = [completed]
+        self.model_listener.file_updated(old_file, completed)
+        auto_queue.process()
+        command = self.controller.queue_command.call_args.args[0]
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, command.action)
+        self.assertEqual((3, 7), command.lifecycle_token)
+
+    def test_remote_delete_respects_pair_auto_queue_opt_out(self):
+        persist = AutoQueuePersist()
+        self.context.config.autoqueue.patterns_only = False
+        self.context.config.autoqueue.auto_delete_remote = True
+        pair = PathPair(
+            id="movies", name="Movies", remote_path="/remote", local_path="/local", auto_queue=False,
+        )
+        self._set_enabled_path_pairs(pair)
+        self.controller.is_path_pair_reconciled.side_effect = lambda pair_id: True
+        auto_queue = AutoQueue(self.context, persist, self.controller)
+
+        old_file = ModelFile("Release", False)
+        old_file.path_pair_id = pair.id
+        old_file.remote_size = 100
+        old_file.local_size = 100
+        old_file.state = ModelFile.State.DEFAULT
+        completed = ModelFile("Release", False)
+        completed.path_pair_id = pair.id
+        completed.remote_size = 100
+        completed.local_size = 100
+        completed.state = ModelFile.State.DOWNLOADED
+        self.initial_model = [completed]
+        self.model_listener.file_updated(old_file, completed)
+
+        auto_queue.process()
+        self.controller.queue_command.assert_not_called()
 
     def test_explicitly_stopped_file_is_not_auto_queued(self):
         persist = AutoQueuePersist()
@@ -1153,7 +1318,7 @@ class TestAutoQueue(unittest.TestCase):
         auto_queue.process()
         self.controller.queue_command.assert_not_called()
 
-    def test_downloaded_file_with_changed_remote_size_is_queued(self):
+    def test_downloaded_file_with_changed_remote_size_is_not_auto_queued(self):
         # Disable auto-extract
         self.context.config.autoqueue.auto_extract = False
 
@@ -1175,10 +1340,7 @@ class TestAutoQueue(unittest.TestCase):
         file_one_updated.state = ModelFile.State.DEFAULT
         self.model_listener.file_updated(file_one, file_one_updated)
         auto_queue.process()
-        self.controller.queue_command.assert_called_once_with(unittest.mock.ANY)
-        command = self.controller.queue_command.call_args[0][0]
-        self.assertEqual(Controller.Command.Action.QUEUE, command.action)
-        self.assertEqual("File.One", command.filename)
+        self.controller.queue_command.assert_not_called()
 
     def test_no_files_are_queued_when_disabled(self):
         self.context.config.autoqueue.enabled = False

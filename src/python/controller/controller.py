@@ -16,6 +16,8 @@ import ntpath
 import stat
 import time
 import shutil
+import errno
+import tempfile
 from dataclasses import dataclass
 
 # my libs
@@ -35,7 +37,7 @@ from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
 from common import (
     AppError, AppOneShotProcess, AppProcess, Args, Config, Constants, Context,
-    Localization, MultiprocessingLogger, PathPair, PathPairManager,
+    Localization, MultiprocessingLogger, PathPair, PathPairManager, PathPairError,
 )
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -82,6 +84,7 @@ class Controller:
         DEFERRED = 2
         FAILED = 3
         NO_MOVE_APPLICABLE = 4
+        CONFLICT = 5
 
     __MAX_MOVE_FAILURES = 4
     __MOVE_RETRY_DELAYS = (2, 10, 30)
@@ -207,6 +210,7 @@ class Controller:
             self.callbacks: List[Controller.Command.ICallback] = []
             self.duplicate_waiter_count = 0
             self.delete_identity = filename
+            self.lifecycle_token: Optional[tuple[int, int]] = None
 
         def add_callback(self, callback: ICallback) -> None:
             self.callbacks.append(callback)
@@ -463,6 +467,15 @@ class Controller:
         self.__command_flow_sequence = 0
         self.__command_flow_lock = Lock()
         self.__pending_queue_dispatches: Dict[str, PendingQueueDispatch] = {}
+        # A dequeued QUEUE command is briefly tracked here while its transport
+        # handoff is being decided.  This closes the gap between checking a
+        # relocation reservation and registering the durable queue dispatch.
+        self.__pending_command_dispatch_file_ids: set[str] = set()
+        self.__pending_extract_file_ids: set[str] = set()
+        self.__pending_validation_file_ids: set[str] = set()
+        self.__work_state_lock = RLock()
+        self.__path_pair_relocation_reservations: set[str] = set()
+        self.__path_pair_relocation_identities: Dict[str, tuple[str, str, tuple[int, int]]] = {}
 
         # The model
         self.__model = Model()
@@ -479,6 +492,8 @@ class Controller:
         self.__path_pair_refresh_requested = False
         self.__path_pair_refresh_generation = 0
         self.__path_pair_refresh_completed_generation = 0
+        self.__reconciled_local_path_pair_ids: set[str | None] = set()
+        self.__reconciled_remote_path_pair_ids: set[str | None] = set()
         self.__path_pair_runtime_error = None
         self.__lftp_reconfigure_lock = Lock()
         self.__lftp_reconfigure_requested = False
@@ -726,17 +741,63 @@ class Controller:
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
         )
 
-        self.__set_transfer_path_pairs(lftp_path_pairs)
-        self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
-        self.__path_pairs_by_id = path_pairs_by_id
-        self.__path_pair_staging_paths = path_pair_staging_paths
-        self.__active_scanner = active_scanner
-        self.__local_scanner = local_scanner
-        self.__remote_scanner = remote_scanner
-        self.__active_scan_process = active_scan_process
-        self.__local_scan_process = local_scan_process
-        self.__remote_scan_process = remote_scan_process
-        self.__sync_persist_to_model_builder_if_ready()
+        old_path_pairs_by_id = self.__path_pairs_by_id
+        old_path_pair_staging_paths = self.__path_pair_staging_paths
+        old_runtime = (
+            getattr(self, "_Controller__active_scanner", None),
+            getattr(self, "_Controller__local_scanner", None),
+            getattr(self, "_Controller__remote_scanner", None),
+            getattr(self, "_Controller__active_scan_process", None),
+            getattr(self, "_Controller__local_scan_process", None),
+            getattr(self, "_Controller__remote_scan_process", None),
+        )
+        try:
+            # A path alias can be repointed after API preflight but before
+            # asynchronous activation. Re-bind both configured paths to the
+            # reserved directory identity immediately before collaborators see
+            # the new roots.
+            self.__validate_reserved_relocation_identities(path_pairs_by_id)
+            self.__set_transfer_path_pairs(lftp_path_pairs)
+            self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
+            self.__path_pairs_by_id = path_pairs_by_id
+            self.__path_pair_staging_paths = path_pair_staging_paths
+            self.__active_scanner = active_scanner
+            self.__local_scanner = local_scanner
+            self.__remote_scanner = remote_scanner
+            self.__active_scan_process = active_scan_process
+            self.__local_scan_process = local_scan_process
+            self.__remote_scan_process = remote_scan_process
+            self.__sync_persist_to_model_builder_if_ready()
+        except Exception as activation_exc:
+            # Some builders mutate transfer/model configuration before they
+            # fail. Restore every parent-owned reference and configuration so
+            # activation is all-or-old rather than a partial new runtime.
+            try:
+                self.__set_transfer_path_pairs(self.__build_lftp_path_pairs(
+                    old_path_pairs_by_id, old_path_pair_staging_paths
+                ))
+                self.__refresh_model_builder_local_paths(old_path_pairs_by_id, old_path_pair_staging_paths)
+                self.__sync_persist_to_model_builder_if_ready()
+            except Exception as restore_exc:
+                # Even a collaborator rollback can fail.  Restore the parent
+                # references unconditionally and fail closed; callers must
+                # not clear this more-specific consistency error.
+                self.__path_pairs_by_id = old_path_pairs_by_id
+                self.__path_pair_staging_paths = old_path_pair_staging_paths
+                (
+                    self.__active_scanner, self.__local_scanner, self.__remote_scanner,
+                    self.__active_scan_process, self.__local_scan_process, self.__remote_scan_process,
+                ) = old_runtime
+                message = "Path pair runtime consistency restore failed: {}".format(restore_exc)
+                self.__record_path_pair_runtime_error(message)
+                raise ControllerError(message) from restore_exc
+            self.__path_pairs_by_id = old_path_pairs_by_id
+            self.__path_pair_staging_paths = old_path_pair_staging_paths
+            (
+                self.__active_scanner, self.__local_scanner, self.__remote_scanner,
+                self.__active_scan_process, self.__local_scan_process, self.__remote_scan_process,
+            ) = old_runtime
+            raise activation_exc
 
     def __build_lftp_path_pairs(self,
                                 path_pairs_by_id: Dict[str, PathPair],
@@ -880,6 +941,220 @@ class Controller:
                 generation
             )
 
+    def is_path_pair_reconciled(self, path_pair_id: Optional[str]) -> bool:
+        """True only after local and remote scans covered this runtime root."""
+        return path_pair_id in getattr(self, "_Controller__reconciled_local_path_pair_ids", set()) and \
+            path_pair_id in getattr(self, "_Controller__reconciled_remote_path_pair_ids", set())
+
+    def is_remote_delete_eligible(self, file: ModelFile) -> bool:
+        """Require final publication proof before deleting staged remote data."""
+        if file.path_pair_id is None:
+            staging_root = self.__staging_path
+            final_root = self.__legacy_local_path
+        else:
+            path_pair = self.__get_path_pair(file.path_pair_id)
+            staging_root = self.__get_staging_path(file.path_pair_id)
+            final_root = path_pair.local_path if path_pair is not None else None
+        try:
+            requires_final_move = (
+                not isinstance(staging_root, str) or not isinstance(final_root, str)
+                or os.path.normcase(os.path.realpath(staging_root)) != os.path.normcase(os.path.realpath(final_root))
+            )
+        except OSError:
+            requires_final_move = True
+        return not requires_final_move or file.file_id in self.__persist.final_move_succeeded_file_names
+
+    def has_current_process_final_publication(self, file: ModelFile) -> bool:
+        return file.file_id in getattr(self, "_Controller__current_process_final_publication_file_ids", set())
+
+    def remote_delete_lifecycle_token(self, file: ModelFile) -> tuple[int, int]:
+        return (
+            getattr(self, "_Controller__path_pair_refresh_generation", 0),
+            getattr(self, "_Controller__transfer_lifecycle_epochs", {}).get(file.file_id, 0),
+        )
+
+    def __advance_transfer_lifecycle(self, file_id: str) -> None:
+        if not hasattr(self, "_Controller__transfer_lifecycle_epochs"):
+            self.__transfer_lifecycle_epochs = {}
+        self.__transfer_lifecycle_epochs[file_id] = self.__transfer_lifecycle_epochs.get(file_id, 0) + 1
+
+    def _record_path_pair_reconciliation(
+            self, local_path_pair_ids: set[str | None], remote_path_pair_ids: set[str | None]) -> None:
+        if not hasattr(self, "_Controller__reconciled_local_path_pair_ids"):
+            self.__reconciled_local_path_pair_ids = set()
+            self.__reconciled_remote_path_pair_ids = set()
+        self.__reconciled_local_path_pair_ids.update(local_path_pair_ids)
+        self.__reconciled_remote_path_pair_ids.update(remote_path_pair_ids)
+
+    def validate_path_pair_relocation(self, existing: PathPair, updated: PathPair) -> None:
+        """Preflight an enabled-pair alias switch without moving user data."""
+        if not existing.enabled or existing.local_path == updated.local_path:
+            return
+        try:
+            same_directory = os.path.isdir(existing.local_path) and os.path.isdir(updated.local_path) and \
+                os.path.samefile(existing.local_path, updated.local_path)
+        except OSError:
+            same_directory = False
+        if not same_directory:
+            raise PathPairError(
+                "Enabled path pair local-path relocation requires existing old and new directories that resolve to the same directory"
+            )
+        if self.__path_pair_busy_file_ids(existing.id):
+            raise PathPairError("Path pair '{}' is busy; wait for active work to finish before relocating".format(existing.name))
+
+    def reserve_path_pair_relocation(self, existing: PathPair, updated: PathPair) -> None:
+        """Atomically turn an idle alias-switch preflight into a work barrier."""
+        if not existing.enabled or existing.local_path == updated.local_path:
+            return
+        self.validate_path_pair_relocation(existing, updated)
+        with self.__work_state_lock:
+            try:
+                old_stat = os.stat(existing.local_path)
+                new_stat = os.stat(updated.local_path)
+                identity = (old_stat.st_dev, old_stat.st_ino)
+                if identity != (new_stat.st_dev, new_stat.st_ino):
+                    raise PathPairError("Enabled path pair relocation directory identity changed during preflight")
+            except OSError as exc:
+                raise PathPairError("Enabled path pair relocation directory identity could not be verified: {}".format(exc))
+            if self.__path_pair_busy_file_ids_locked(existing.id):
+                raise PathPairError("Path pair '{}' became busy during relocation preflight".format(existing.name))
+            if existing.id in self.__path_pair_relocation_reservations:
+                raise PathPairError("Path pair '{}' is already being relocated".format(existing.name))
+            self.__path_pair_relocation_reservations.add(existing.id)
+            self.__path_pair_relocation_identities[existing.id] = (
+                existing.local_path, updated.local_path, identity,
+            )
+
+    def release_path_pair_relocation(self, pair_id: str) -> None:
+        with self.__work_state_lock:
+            self.__path_pair_relocation_reservations.discard(pair_id)
+            getattr(self, "_Controller__path_pair_relocation_identities", {}).pop(pair_id, None)
+
+    def __validate_reserved_relocation_identities(self, path_pairs_by_id: Dict[str, PathPair]) -> None:
+        with self.__work_state_lock:
+            reservations = dict(getattr(self, "_Controller__path_pair_relocation_identities", {}))
+        for pair_id, (old_path, new_path, identity) in reservations.items():
+            pair = path_pairs_by_id.get(pair_id)
+            # The handler retains the reservation while it compensates a
+            # failed activation by persisting the old pair again. Accept only
+            # that exact old path (never an arbitrary third path), and still
+            # re-bind both aliases below before any runtime collaborator sees
+            # them.
+            if pair is None or pair.local_path not in (new_path, old_path):
+                raise PathPairError("Path pair relocation activation no longer matches its reserved path")
+            try:
+                old_stat = os.stat(old_path)
+            except OSError as exc:
+                raise PathPairError("Path pair relocation directory identity could not be re-verified: {}".format(exc))
+            if (old_stat.st_dev, old_stat.st_ino) != identity:
+                raise PathPairError("Path pair relocation directory identity changed before activation")
+            if pair.local_path == new_path:
+                try:
+                    new_stat = os.stat(new_path)
+                except OSError as exc:
+                    raise PathPairError("Path pair relocation directory identity could not be re-verified: {}".format(exc))
+                if (new_stat.st_dev, new_stat.st_ino) != identity:
+                    raise PathPairError("Path pair relocation directory identity changed before activation")
+
+    def __path_pair_relocation_reserved(self, path_pair_id: Optional[str]) -> bool:
+        with self.__work_state_lock:
+            return path_pair_id is not None and path_pair_id in self.__path_pair_relocation_reservations
+
+    def __path_pair_busy_file_ids(self, pair_id: str) -> set[str]:
+        """Snapshot controller-owned work before changing a pair root.
+
+        Worker queues are intentionally not inspected: multiprocessing queue
+        internals do not provide a parent-side atomic snapshot. Dispatches are
+        registered here before handoff and cleared from worker result/status
+        observations, making unknown/in-flight work fail closed.
+        """
+        with self.__work_state_lock:
+            return self.__path_pair_busy_file_ids_locked(pair_id)
+
+    def __path_pair_busy_file_ids_locked(self, pair_id: str) -> set[str]:
+        file_ids: set[str] = set()
+        for name, entry_pair_id, _ in (
+            list(self.__active_downloading_file_names) +
+            list(self.__active_extracting_file_names) +
+            list(self.__pending_completion_file_names)
+        ):
+            if entry_pair_id == pair_id:
+                file_ids.add(ModelFile.build_file_id(name, entry_pair_id))
+        file_ids.update(file_id for file_id in self.__queue_dispatch_pending() if self.__file_id_targets_path_pair(file_id, pair_id))
+        file_ids.update(
+            file_id for file_id in getattr(self, "_Controller__pending_command_dispatch_file_ids", set())
+            if self.__file_id_targets_path_pair(file_id, pair_id)
+        )
+        file_ids.update(file_id for file_id in getattr(self, "_Controller__pending_extract_file_ids", set()) if self.__file_id_targets_path_pair(file_id, pair_id))
+        file_ids.update(file_id for file_id in getattr(self, "_Controller__pending_validation_file_ids", set()) if self.__file_id_targets_path_pair(file_id, pair_id))
+        with self.__move_attempt_lock:
+            pending_ids = set(self.__move_attempt_reservations) | set(self.__deferred_move_file_ids) | set(self.__pending_auto_purge_file_ids)
+        file_ids.update(file_id for file_id in pending_ids if self.__file_id_targets_path_pair(file_id, pair_id))
+        for status in self.__last_lftp_statuses or []:
+            if getattr(status, "path_pair_id", None) == pair_id and getattr(status, "state", None) in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+                file_ids.add(status.file_id)
+        with self.__command_state_lock():
+            for wrapper in list(self.__active_command_processes):
+                if getattr(wrapper.event_file, "path_pair_id", None) == pair_id or self.__file_id_targets_path_pair(wrapper.file_id, pair_id):
+                    file_ids.add(wrapper.file_id)
+            with self.__command_queue.mutex:
+                queued_commands = list(self.__command_queue.queue)
+            for command in queued_commands:
+                if self.__command_targets_path_pair(command, pair_id):
+                    file_ids.add(command.filename)
+            for command in self.__deferred_delete_commands():
+                if self.__command_targets_path_pair(command, pair_id):
+                    file_ids.add(command.filename)
+        return file_ids
+
+    def _record_worker_dispatch(self, kind: str, file_id: str) -> None:
+        with self.__work_state_lock:
+            if kind == "extract":
+                self.__pending_extract_file_ids.add(file_id)
+            elif kind == "validate":
+                self.__pending_validation_file_ids.add(file_id)
+
+    def _record_worker_terminal_ids(self, extract_ids: set[str], validation_ids: set[str]) -> None:
+        with self.__work_state_lock:
+            self.__pending_extract_file_ids.difference_update(extract_ids)
+            self.__pending_validation_file_ids.difference_update(validation_ids)
+
+    def __begin_command_dispatch(self, file_id: str, path_pair_id: Optional[str]) -> bool:
+        """Atomically admit a dequeued command against a relocation barrier."""
+        with self.__work_state_lock:
+            if path_pair_id is not None and path_pair_id in self.__path_pair_relocation_reservations:
+                return False
+            if not hasattr(self, "_Controller__pending_command_dispatch_file_ids"):
+                self.__pending_command_dispatch_file_ids = set()
+            self.__pending_command_dispatch_file_ids.add(file_id)
+            drain_ids = getattr(self, "_Controller__command_dispatch_drain_file_ids", None)
+            if isinstance(drain_ids, set):
+                drain_ids.add(file_id)
+            return True
+
+    def __end_command_dispatch(self, file_id: str) -> None:
+        with self.__work_state_lock:
+            getattr(self, "_Controller__pending_command_dispatch_file_ids", set()).discard(file_id)
+
+    def __command_targets_path_pair(self, command: "Controller.Command", pair_id: str) -> bool:
+        if self.__file_id_targets_path_pair(command.filename, pair_id):
+            return True
+        try:
+            file = self.__model.get_file(command.filename)
+        except Exception:
+            return False
+        return getattr(file, "path_pair_id", None) == pair_id
+
+    @staticmethod
+    def __file_id_targets_path_pair(file_id: object, pair_id: str) -> bool:
+        if not isinstance(file_id, str):
+            return False
+        try:
+            decoded = json.loads(file_id)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(decoded, list) and len(decoded) == 2 and decoded[0] == pair_id
+
     def refresh_path_pairs(self, wait: bool = False, timeout_secs: Optional[float] = None):
         startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
         if startup_validation_error is not None:
@@ -977,16 +1252,21 @@ class Controller:
             updater.sync_persist_to_all_builders()
 
     def __apply_path_pair_refresh(self):
+        runtime_error_before_refresh = self.__path_pair_runtime_error
         # A path-pair refresh starts a new scan generation. Any prior scan
         # health evidence belongs to the old roots and must not authorize
         # marker pruning before both refreshed scanners report healthy.
         self._Controller__last_remote_reconciliation_healthy = False
         self._Controller__last_local_reconciliation_healthy = False
-        active_files = list(
-            getattr(self, "_Controller__active_downloading_file_names", []) +
-            getattr(self, "_Controller__active_extracting_file_names", []) +
-            list(getattr(self, "_Controller__pending_completion_file_names", []))
-        )
+        self.__reconciled_local_path_pair_ids = set()
+        self.__reconciled_remote_path_pair_ids = set()
+        self.__current_process_final_publication_file_ids = set()
+        with self.__work_state_lock:
+            active_files = list(
+                getattr(self, "_Controller__active_downloading_file_names", []) +
+                getattr(self, "_Controller__active_extracting_file_names", []) +
+                list(getattr(self, "_Controller__pending_completion_file_names", []))
+            )
         # The replacement scanner starts with a new root set; readiness from
         # the previous process must not authorize STOP before it reports a
         # fresh checkpoint for the active transfer.
@@ -1049,22 +1329,42 @@ class Controller:
                     close_active_scanner("old active scanner close", old_active_scanner)
             self.__clear_path_pair_runtime_error()
         except Exception as exc:
+            if (
+                    self.__path_pair_runtime_error is not None
+                    and self.__path_pair_runtime_error != runtime_error_before_refresh
+            ):
+                # The inner activation rollback recorded a more precise,
+                # fail-closed consistency failure.  Do not overwrite it.
+                return
             if new_state_applied:
                 new_active_scan_process_stopped = stop_process(self.__active_scan_process)
                 stop_process(self.__local_scan_process)
                 stop_process(self.__remote_scan_process)
                 if new_active_scan_process_stopped:
                     close_active_scanner("new active scanner close", self.__active_scanner)
-                self.__restore_path_pair_runtime_state(
-                    old_path_pairs_by_id,
-                    old_path_pair_staging_paths,
-                    old_active_scanner,
-                    old_local_scanner,
-                    old_remote_scanner,
-                    old_active_scan_process,
-                    old_local_scan_process,
-                    old_remote_scan_process
-                )
+                try:
+                    self.__restore_path_pair_runtime_state(
+                        old_path_pairs_by_id, old_path_pair_staging_paths,
+                        old_active_scanner, old_local_scanner, old_remote_scanner,
+                        old_active_scan_process, old_local_scan_process, old_remote_scan_process
+                    )
+                except Exception as restore_exc:
+                    # Keep the old parent references even if a collaborator
+                    # cannot be restored.  The server remains down rather
+                    # than continuing against an uncertain root mapping.
+                    self.__path_pairs_by_id = old_path_pairs_by_id
+                    self.__path_pair_staging_paths = old_path_pair_staging_paths
+                    self.__active_scanner = old_active_scanner
+                    self.__local_scanner = old_local_scanner
+                    self.__remote_scanner = old_remote_scanner
+                    self.__active_scan_process = old_active_scan_process
+                    self.__local_scan_process = old_local_scan_process
+                    self.__remote_scan_process = old_remote_scan_process
+                    self.__record_path_pair_runtime_error(
+                        "Path pair runtime consistency restore failed: {}".format(restore_exc)
+                    )
+                    self.logger.exception("Path pair runtime restoration failed")
+                    return
             self.logger.exception("Path pair runtime activation failed")
             self.__record_path_pair_runtime_error("Path pair runtime activation failed: {}".format(exc))
 
@@ -1078,6 +1378,11 @@ class Controller:
         if startup_validation_error is not None:
             raise ControllerError(startup_validation_error)
         self.logger.debug("Starting controller")
+        # A restarted controller must not reuse scan authority from an earlier
+        # process generation.
+        self.__reconciled_local_path_pair_ids = set()
+        self.__reconciled_remote_path_pair_ids = set()
+        self.__current_process_final_publication_file_ids = set()
         os.makedirs(self.__staging_path, exist_ok=True)
         for staging_path in self.__path_pair_staging_paths.values():
             os.makedirs(staging_path, exist_ok=True)
@@ -1409,6 +1714,11 @@ class Controller:
         if not hasattr(self, "_Controller__successful_final_move_handoff_file_ids"):
             self.__successful_final_move_handoff_file_ids = set()
         self.__successful_final_move_handoff_file_ids.add(file_id)
+
+    def _mark_current_process_final_publication(self, file_id: str) -> None:
+        if not hasattr(self, "_Controller__current_process_final_publication_file_ids"):
+            self.__current_process_final_publication_file_ids = set()
+        self.__current_process_final_publication_file_ids.add(file_id)
         evict_active_file_ids = getattr(self.__model_builder, "evict_active_file_ids", None)
         if callable(evict_active_file_ids):
             evict_active_file_ids({file_id})
@@ -1542,8 +1852,24 @@ class Controller:
             for callback in command.callbacks:
                 callback.on_failure(startup_validation_error, 400)
             return
+        if self.__path_pair_runtime_error is not None:
+            for callback in command.callbacks:
+                callback.on_failure(self.__path_pair_runtime_error, 503)
+            return
         if getattr(command, "flow_id", None) is None:
             command.flow_id = self.__next_command_flow_id(command)
+        path_pair_id: Optional[str] = None
+        if isinstance(command.filename, str):
+            try:
+                decoded = json.loads(command.filename)
+                if isinstance(decoded, list) and len(decoded) == 2 and isinstance(decoded[0], str):
+                    path_pair_id = decoded[0]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        if self.__path_pair_relocation_reserved(path_pair_id):
+            for callback in command.callbacks:
+                callback.on_failure("Path pair relocation is in progress", 409)
+            return
         is_delete_command = self.__is_delete_command_action(command.action)
         duplicate_delete_command: Optional[Controller.Command] = None
         delete_backpressure = False
@@ -1573,6 +1899,19 @@ class Controller:
                         Controller._MAX_DUPLICATE_DELETE_WAITERS
                     )
                     if not duplicate_waiter_backpressure:
+                        # A user-initiated delete must not inherit an
+                        # auto-queue command's lifecycle-only authority when
+                        # the requests coalesce.  The pending command remains
+                        # the queue representative, but its authority becomes
+                        # manual.  An auto-queue request behind a manual one
+                        # deliberately leaves that manual authority intact.
+                        if (
+                                command.action == Controller.Command.Action.DELETE_REMOTE
+                                and getattr(command, "origin", "manual") != "auto_queue"
+                                and getattr(duplicate_delete_command, "origin", "manual") == "auto_queue"
+                        ):
+                            duplicate_delete_command.origin = command.origin
+                            duplicate_delete_command.lifecycle_token = None
                         duplicate_delete_command.callbacks.extend(command.callbacks)
                         duplicate_delete_command.duplicate_waiter_count = \
                             duplicate_waiter_count + requested_waiters
@@ -2197,7 +2536,7 @@ class Controller:
             current = self.__resolve_safe_final_move_paths(name, path_pair_id)
             if current is None or current[2:] != (src, dst):
                 return Controller.MoveFromStagingResult.FAILED
-            shutil.move(src, dst)
+            self.__publish_staging_no_replace(src, dst)
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
@@ -2210,6 +2549,20 @@ class Controller:
             else:
                 self.__local_scan_process.force_scan(path_pair_id)
             return Controller.MoveFromStagingResult.COMPLETED
+        except FileExistsError as error:
+            self.logger.warning(
+                "Refusing to overwrite existing final target for '%s': %s",
+                name,
+                error,
+            )
+            if should_trace:
+                self.__trace_target_archive_event("move_from_staging_result", {
+                    "file_id": trace_file_id,
+                    "file_name": name,
+                    "result": "destination_conflict",
+                    "error": str(error),
+                })
+            return Controller.MoveFromStagingResult.CONFLICT
         except OSError as error:
             self.logger.warning(
                 "Failed to move '%s' from staging '%s' to '%s': %s",
@@ -2226,6 +2579,71 @@ class Controller:
                     "error": str(error),
                 })
             return Controller.MoveFromStagingResult.FAILED
+
+    @staticmethod
+    def __rename_no_replace(src: str, dst: str) -> None:
+        """Atomically publish src at dst without replacing an existing target."""
+        if os.name == "nt":
+            # Windows rename fails when dst exists.  Its operation is the
+            # no-clobber primitive; any unsupported filesystem fails closed.
+            os.rename(src, dst)
+            return
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "destination already exists", dst)
+        try:
+            import ctypes
+            libc = ctypes.CDLL(None, use_errno=True)
+            renameat2 = libc.renameat2
+        except (AttributeError, OSError):
+            raise OSError(errno.ENOTSUP, "atomic no-replace rename is unavailable")
+        renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        renameat2.restype = ctypes.c_int
+        if renameat2(-100, os.fsencode(src), -100, os.fsencode(dst), 1) != 0:
+            error_no = ctypes.get_errno()
+            raise OSError(error_no, os.strerror(error_no), dst)
+
+    @classmethod
+    def __publish_staging_no_replace(cls, src: str, dst: str) -> None:
+        """Publish staging content once; preserve src on collision or failure."""
+        try:
+            cls.__rename_no_replace(src, dst)
+            return
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+
+        destination_parent = os.path.dirname(dst)
+        temporary_path: Optional[str] = None
+        temporary_root: Optional[str] = None
+        try:
+            if os.path.isdir(src) and not os.path.islink(src):
+                temporary_root = tempfile.mkdtemp(prefix=".seedsync-publish-", dir=destination_parent)
+                temporary_path = os.path.join(temporary_root, "payload")
+                shutil.copytree(src, temporary_path, symlinks=True)
+            else:
+                fd, temporary_path = tempfile.mkstemp(prefix=".seedsync-publish-", dir=destination_parent)
+                os.close(fd)
+                shutil.copy2(src, temporary_path, follow_symlinks=False)
+            cls.__rename_no_replace(temporary_path, dst)
+            temporary_path = None
+            if os.path.isdir(src) and not os.path.islink(src):
+                shutil.rmtree(src)
+            else:
+                os.unlink(src)
+        finally:
+            if temporary_path is not None:
+                if os.path.isdir(temporary_path) and not os.path.islink(temporary_path):
+                    shutil.rmtree(temporary_path, ignore_errors=True)
+                else:
+                    try:
+                        os.unlink(temporary_path)
+                    except FileNotFoundError:
+                        pass
+            if temporary_root is not None:
+                try:
+                    os.rmdir(temporary_root)
+                except OSError:
+                    pass
 
     def _reserve_move_attempt(self, file_id: str) -> bool:
         # Lock order is model_lock -> move_attempt_lock. This helper never
@@ -2472,9 +2890,9 @@ class Controller:
     def __recover_interrupted_downloads(self, remote_files: list[SystemFile]) -> None:
         self.__startup_recovery_done = True
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
-        remote_names_by_pair: dict[Optional[str], set[str]] = {}
+        remote_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         for remote_file in remote_files:
-            remote_names_by_pair.setdefault(getattr(remote_file, "path_pair_id", None), set()).add(remote_file.name)
+            remote_files_by_pair.setdefault(getattr(remote_file, "path_pair_id", None), {})[remote_file.name] = remote_file
 
         staging_roots = self.__path_pair_staging_paths or {None: self.__staging_path}
         for path_pair_id, staging_path in staging_roots.items():
@@ -2484,7 +2902,7 @@ class Controller:
                 self.logger.warning("Failed to inspect staging path '%s': %s", staging_path, error)
                 continue
 
-            remote_names = remote_names_by_pair.get(path_pair_id, set())
+            remote_files_for_pair = remote_files_by_pair.get(path_pair_id, {})
             for entry in staging_entries:
                 entry_path = os.path.join(staging_path, entry)
                 if entry.endswith(suffix):
@@ -2505,12 +2923,22 @@ class Controller:
                 else:
                     continue
 
-                if file_name not in remote_names or \
+                remote_file = remote_files_for_pair.get(file_name)
+                if remote_file is None or \
                         self.__is_previously_downloaded(file_name, path_pair_id) or \
                         self.__is_explicitly_stopped(file_name, path_pair_id):
                     continue
 
                 path_pair = self.__get_path_pair(path_pair_id)
+                final_root = path_pair.local_path if path_pair is not None else self.__legacy_local_path
+                final_path = os.path.join(final_root, file_name)
+                try:
+                    if not is_dir and os.path.isfile(final_path) and os.path.getsize(final_path) == remote_file.size:
+                        # A completed final target wins over stale staging
+                        # artifacts left by an interrupted previous process.
+                        continue
+                except OSError:
+                    pass
                 try:
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
                     self.__log_stop_resume_trace(
@@ -2545,18 +2973,19 @@ class Controller:
                     )
 
     def __queue_dispatch_pending(self) -> Dict[str, PendingQueueDispatch]:
-        pending = getattr(self, "_Controller__pending_queue_dispatches", None)
-        if not isinstance(pending, dict):
-            pending = {}
-            self.__pending_queue_dispatches = pending
-        pending_items = cast(dict[object, object], pending)
-        if not all(
-            isinstance(file_id, str) and isinstance(dispatch, PendingQueueDispatch)
-            for file_id, dispatch in pending_items.items()
-        ):
-            self.__pending_queue_dispatches = {}
-            return self.__pending_queue_dispatches
-        return cast(dict[str, PendingQueueDispatch], pending_items)
+        with self.__work_state_lock:
+            pending = getattr(self, "_Controller__pending_queue_dispatches", None)
+            if not isinstance(pending, dict):
+                pending = {}
+                self.__pending_queue_dispatches = pending
+            pending_items = cast(dict[object, object], pending)
+            if not all(
+                isinstance(file_id, str) and isinstance(dispatch, PendingQueueDispatch)
+                for file_id, dispatch in pending_items.items()
+            ):
+                self.__pending_queue_dispatches = {}
+                return self.__pending_queue_dispatches
+            return cast(dict[str, PendingQueueDispatch], pending_items)
 
     def __reconcile_queue_dispatch_pending(self) -> None:
         pending = self.__queue_dispatch_pending()
@@ -2594,6 +3023,22 @@ class Controller:
     __update_model = _update_model_compat
 
     def __process_commands(self):
+        """Fence every dequeued command until this drain has finished."""
+        drain_file_ids: set[str] = set()
+        self.__command_dispatch_drain_file_ids = drain_file_ids
+        try:
+            # The same outer lock protects the relocation busy snapshot and
+            # all command-side lifecycle mutations in this drain.
+            with self.__work_state_lock:
+                self.__process_commands_impl()
+        finally:
+            with self.__work_state_lock:
+                getattr(self, "_Controller__pending_command_dispatch_file_ids", set()).difference_update(
+                    drain_file_ids
+                )
+            self.__command_dispatch_drain_file_ids = None
+
+    def __process_commands_impl(self):
         def _notify_failure(_command: Controller.Command,
                             _msg: str,
                             _error_code: int = 400,
@@ -2650,6 +3095,12 @@ class Controller:
                 },
                 file=file,
             )
+            if self.__path_pair_runtime_error is not None:
+                _notify_failure(command, self.__path_pair_runtime_error, 503, file)
+                continue
+            if not self.__begin_command_dispatch(file.file_id, file.path_pair_id):
+                _notify_failure(command, "Path pair relocation is in progress", 409, file)
+                continue
             self.__temp_diag(
                 "command_received",
                 file_id=file.file_id,
@@ -2789,6 +3240,8 @@ class Controller:
                             # A genuinely new queue invalidates all final-move
                             # identity from the prior transfer lifecycle.
                             self.__persist.final_move_succeeded_file_names.discard(file.file_id)
+                            self.__advance_transfer_lifecycle(file.file_id)
+                            getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file.file_id)
                             self._sync_final_move_succeeded_files_to_model()
                         self.__record_command_breadcrumb(
                             command=command,
@@ -2953,8 +3406,10 @@ class Controller:
                                 file
                             )
                             continue
+                        self._record_worker_dispatch("extract", file.file_id)
                         self.__extract_process.extract(extract_request, flow_id=command.flow_id)
                     except Exception:
+                        self._record_worker_terminal_ids({file.file_id}, set())
                         self.logger.warning(
                             "Extract worker dispatch failed for %s",
                             file.file_id,
@@ -3007,8 +3462,10 @@ class Controller:
                     continue
                 else:
                     try:
+                        self._record_worker_dispatch("validate", file.file_id)
                         self.__validate_process.validate(file)
                     except Exception:
+                        self._record_worker_terminal_ids(set(), {file.file_id})
                         self.logger.warning(
                             "Validate worker dispatch failed for %s",
                             file.file_id,
@@ -3060,6 +3517,10 @@ class Controller:
                             len(self.__active_command_processes)
                         )
                         continue
+                    # Deletion changes the transfer lifecycle as soon as it
+                    # is admitted. A later auto-delete in this same drain
+                    # cannot retain authority captured before local deletion.
+                    self.__advance_transfer_lifecycle(file.file_id)
                     self.__queue_delete_local_process(
                         file,
                         self.__local_scan_process.force_scan,
@@ -3100,6 +3561,7 @@ class Controller:
                         if result == Controller.MoveFromStagingResult.COMPLETED:
                             self.__persist.final_move_succeeded_file_names.add(file.file_id)
                             self._mark_successful_final_move_handoff(file.file_id)
+                            self._mark_current_process_final_publication(file.file_id)
                         self._complete_download_start_lifecycle(file.file_id)
                         self.clear_extracted_marker(file)
                         self.__pending_completion_file_names = {
@@ -3126,6 +3588,17 @@ class Controller:
                     self._release_move_attempt(file.file_id)
 
             elif command.action == Controller.Command.Action.DELETE_REMOTE:
+                if getattr(command, "origin", "manual") == "auto_queue" and (
+                        getattr(command, "lifecycle_token", None) != self.remote_delete_lifecycle_token(file)
+                        or not self.is_remote_delete_eligible(file)
+                ):
+                    _notify_failure(
+                        command,
+                        "Auto-queue remote delete no longer has current lifecycle authority",
+                        409,
+                        file,
+                    )
+                    continue
                 if file.state not in (
                     ModelFile.State.DEFAULT,
                     ModelFile.State.DOWNLOADED,
@@ -3154,6 +3627,10 @@ class Controller:
                             len(self.__active_command_processes)
                         )
                         continue
+                    # This consumes an auto-queue token that passed the
+                    # check above, invalidating subsequent stale commands
+                    # while remote deletion is active.
+                    self.__advance_transfer_lifecycle(file.file_id)
                     config = self.__context.config
                     process = DeleteRemoteProcess(
                         remote_address=Controller.__runtime_str_or_default(
@@ -3396,10 +3873,14 @@ class Controller:
                         else:
                             command_process.post_callback()
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
+                                self.__advance_transfer_lifecycle(command_process.file_id)
                                 self.__persist.move_failure_counts.pop(command_process.file_id, None)
                                 self.__deferred_move_file_ids.discard(command_process.file_id)
                                 self.__move_retry_due.pop(command_process.file_id, None)
                                 self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
+                                getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(
+                                    command_process.file_id
+                                )
                                 self._sync_final_move_succeeded_files_to_model()
                                 self.__model_builder.set_move_failed_files({
                                     file_id for file_id, count in self.__persist.move_failure_counts.items()
@@ -3451,6 +3932,7 @@ class Controller:
                                 )
                         else:
                             if command_process.command.action == Controller.Command.Action.DELETE_REMOTE:
+                                self.__advance_transfer_lifecycle(command_process.file_id)
                                 self._clear_download_start_lifecycle(command_process.file_id)
                                 event_file = command_process.event_file
                                 if not isinstance(getattr(self.__persist, "downloaded_timestamps", None), dict):
@@ -3471,6 +3953,9 @@ class Controller:
                                     # Remote deletion clears the existing
                                     # completion identity, matching downloaded.
                                     self.__persist.final_move_succeeded_file_names.discard(
+                                        command_process.file_id
+                                    )
+                                    getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(
                                         command_process.file_id
                                     )
                                     self._sync_final_move_succeeded_files_to_model()

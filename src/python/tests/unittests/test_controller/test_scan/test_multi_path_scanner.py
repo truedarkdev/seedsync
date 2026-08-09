@@ -8,6 +8,15 @@ from system import SystemFile
 
 
 class TestMultiPathRemoteScanner(unittest.TestCase):
+    def test_empty_remote_pair_roots_are_reported_for_reconciliation(self):
+        movie_scanner = MagicMock()
+        movie_scanner.path_pair_id = "movies"
+        tv_scanner = MagicMock()
+        tv_scanner.path_pair_id = "tv"
+        scanner = MultiPathRemoteScanner([movie_scanner, tv_scanner])
+
+        self.assertEqual({"movies", "tv"}, scanner.scanned_path_pair_ids())
+
     def test_reports_partial_files_and_aggregate_recoverable_error(self):
         partial_success_file = SystemFile("movie.mkv", 1234, False)
         partial_failure_file = SystemFile("episode.mkv", 2222, False)
@@ -42,6 +51,25 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
 
 
 class TestMultiPathLocalScanner(unittest.TestCase):
+    def test_reports_recoverable_error_so_partial_local_scan_cannot_be_authoritative(self):
+        successful_file = SystemFile("movie.mkv", 1234, False)
+        successful_scanner = MagicMock()
+        successful_scanner.path_pair_id = "movies"
+        successful_scanner.path_pair_name = "Movies"
+        successful_scanner.scan.return_value = [successful_file]
+
+        failing_scanner = MagicMock()
+        failing_scanner.path_pair_id = "tv"
+        failing_scanner.path_pair_name = "TV"
+        failing_scanner.scan.side_effect = ScannerError("temporary local failure", recoverable=True)
+
+        scanner = MultiPathLocalScanner([successful_scanner, failing_scanner])
+        with self.assertRaises(ScannerError) as ctx:
+            scanner.scan()
+
+        self.assertTrue(ctx.exception.recoverable)
+        self.assertEqual([successful_file], ctx.exception.files)
+
     def test_aggregates_recovered_managed_extract_file_ids(self):
         scanner_one = MagicMock()
         scanner_one.pop_managed_extract_file_ids.return_value = ["movie.zip", "series.zip"]
@@ -78,6 +106,17 @@ class TestMultiPathLocalScanner(unittest.TestCase):
         episode_scanner.scan.assert_called_once_with()
         self.assertEqual("tv", results[0].path_pair_id)
         self.assertEqual("TV", results[0].path_pair_name)
+
+    def test_empty_pair_roots_are_reported_for_reconciliation(self):
+        movie_scanner = MagicMock()
+        movie_scanner.path_pair_id = "movies"
+        tv_scanner = MagicMock()
+        tv_scanner.path_pair_id = "tv"
+        scanner = MultiPathLocalScanner([movie_scanner, tv_scanner])
+
+        self.assertEqual({"movies", "tv"}, scanner.scanned_path_pair_ids())
+        scanner.set_scan_target_path_pair_ids({"tv"})
+        self.assertEqual({"tv"}, scanner.scanned_path_pair_ids())
 
 
 if __name__ == "__main__":

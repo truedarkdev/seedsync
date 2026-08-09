@@ -52,6 +52,19 @@ On the Files page, each file can show a source label with its path-pair name so 
 When multiple enabled path pairs are active, the Files page also shows a path-pair statistics card for per-source totals and activity.
 `Enabled` controls whether a path pair is active, and `Auto-queue` is applied per path pair.
 
+To relocate an enabled local path without losing its path-pair identity or history, first expose the same
+data under both the old and new container paths (for example, keep `/downloads/movies` and add
+`/mounts/movies` as aliases for the same Unraid share). Wait until the pair has no queued or active
+work, then change the local path in Settings. SeedSync checks that both paths exist and resolve to the
+same directory; it does not copy or move data. A new container without the retained `/config` directory
+also loses `path_pairs.json`, settings, controller and AutoQueue persistence, and API-key/browser-claim
+state: reconfigure the instance and reclaim the browser before use. Historical timestamps and completion
+markers are only part of that lost state. The new instance then performs normal fresh reconciliation. During
+that reconciliation, a complete size-matched local file (including a zero-byte file) is recognized and is
+not downloaded or deleted. Remote-only content queues only when that path pair has `Auto-queue` enabled;
+otherwise it remains unqueued for manual action. Local-only content is left untouched, and partial or
+conflicting local content is never silently overwritten.
+
 ## AutoQueue
 
 AutoQueue queues all newly discovered files on the remote server.

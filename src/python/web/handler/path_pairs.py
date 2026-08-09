@@ -15,6 +15,8 @@ from ..web_app import IHandler, WebApp
 
 logger = logging.getLogger(__name__)
 PATH_PAIR_REFRESH_FAILURE_MESSAGE = "Failed to apply path pair changes"
+PATH_PAIR_ROLLBACK_FAILURE_MESSAGE = "Path pair activation failed and the saved configuration could not be restored"
+PATH_PAIR_RUNTIME_CONSISTENCY_FAILURE_MESSAGE = "Path pair configuration was restored but runtime activation is inconsistent"
 
 
 def _is_object_dict(value: object) -> TypeGuard[dict[str, object]]:
@@ -171,6 +173,7 @@ class PathPairsHandler(IHandler):
             return self.__json_response({"success": False, "error": "Failed to save: {}".format(exc)}, status=500)
 
     def __handle_update(self, pair_id: str) -> HTTPResponse:
+        relocation_reservation_pair_id: str | None = None
         try:
             existing = self.__path_pair_manager.get_pair_by_id(pair_id)
             if existing is None:
@@ -187,10 +190,31 @@ class PathPairsHandler(IHandler):
                 enabled=_bool_value(data, "enabled", existing.enabled),
                 auto_queue=_bool_value(data, "auto_queue", existing.auto_queue)
             )
+            if self.__controller is not None and existing.enabled and existing.local_path != pair.local_path:
+                self.__controller.reserve_path_pair_relocation(existing, pair)
+                relocation_reservation_pair_id = existing.id
             warnings = self.__path_pair_manager.update_pair(pair)
             if self.__controller is not None and self.__update_affects_runtime(existing, pair):
                 refresh_error = self.__refresh_path_pairs_or_error("updating path pair '{}'".format(pair.id))
                 if refresh_error is not None:
+                    try:
+                        self.__path_pair_manager.update_pair(existing)
+                    except (PathPairError, PersistError) as exc:
+                        logger.exception("Failed to restore persisted path pair '%s' after activation failure", pair.id)
+                        return self.__json_response(
+                            {"success": False, "error": PATH_PAIR_ROLLBACK_FAILURE_MESSAGE}, status=500
+                        )
+                    # A timeout can leave the original refresh generation in
+                    # flight. Queue and wait for a later generation based on
+                    # the restored file so an eventual activation converges on
+                    # the persisted configuration rather than the rejected one.
+                    rollback_refresh = self.__refresh_path_pairs_or_error(
+                        "restoring path pair '{}' after activation failure".format(pair.id)
+                    )
+                    if rollback_refresh is not None:
+                        return self.__json_response(
+                            {"success": False, "error": PATH_PAIR_RUNTIME_CONSISTENCY_FAILURE_MESSAGE}, status=500
+                        )
                     return refresh_error
             return self.__json_response({"success": True, "data": asdict(pair), "warnings": warnings})
         except ValueError as exc:
@@ -201,6 +225,9 @@ class PathPairsHandler(IHandler):
             return self.__json_response({"success": False, "error": str(exc)}, status=400)
         except PersistError as exc:
             return self.__json_response({"success": False, "error": "Failed to save: {}".format(exc)}, status=500)
+        finally:
+            if relocation_reservation_pair_id is not None and self.__controller is not None:
+                self.__controller.release_path_pair_relocation(relocation_reservation_pair_id)
 
     def __handle_delete(self, pair_id: str) -> HTTPResponse:
         try:

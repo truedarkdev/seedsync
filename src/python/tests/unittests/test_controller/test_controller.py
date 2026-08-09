@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import copy
+import errno
 import os
 import json
 import shutil
@@ -14,14 +15,14 @@ from threading import Lock
 from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
-from controller import Controller, ControllerPersist, ModelBuilder
+from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
-from controller.scan import MultiPathActiveScanner
+from controller.scan import MultiPathActiveScanner, ScannerResult
 from controller.controller import ControllerError, DownloadStartLifecycleEntry
 from controller.persist_keys import KEY_SEP, persist_key
-from common import AppError, PathPairManager
+from common import AppError, Config, PathPairError, PathPairManager
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
@@ -77,6 +78,16 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_refresh_requested = False
         self.controller._Controller__path_pair_refresh_generation = 0
         self.controller._Controller__path_pair_refresh_completed_generation = 0
+        self.controller._Controller__transfer_lifecycle_epochs = {}
+        self.controller._Controller__pending_extract_file_ids = set()
+        self.controller._Controller__pending_validation_file_ids = set()
+        self.controller._Controller__pending_command_dispatch_file_ids = set()
+        self.controller._Controller__work_state_lock = threading.RLock()
+        self.controller._Controller__path_pair_relocation_reservations = set()
+        self.controller._Controller__path_pair_relocation_identities = {}
+        self.controller._Controller__current_process_final_publication_file_ids = set()
+        self.controller._Controller__reconciled_local_path_pair_ids = set()
+        self.controller._Controller__reconciled_remote_path_pair_ids = set()
         self.controller._Controller__path_pair_runtime_error = None
         self.controller._Controller__lftp_reconfigure_lock = Lock()
         self.controller._Controller__lftp_reconfigure_requested = False
@@ -118,6 +129,39 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def _configure_real_model_autoqueue_pipeline(self, pair: PathPair, auto_delete_remote: bool = False):
+        """Use production ModelUpdater/AutoQueue wiring, not listener mocks."""
+        config = Config()
+        config.autoqueue.enabled = True
+        config.autoqueue.patterns_only = False
+        config.autoqueue.auto_extract = False
+        config.autoqueue.auto_delete_remote = auto_delete_remote
+        self.controller._Controller__context.config = config
+        self.controller._Controller__context.path_pair_manager = MagicMock()
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [pair]
+        self.controller._Controller__path_pairs_by_id = {pair.id: pair}
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model.set_base_logger(self.controller.logger)
+        self.controller._Controller__model_builder = ModelBuilder()
+        self.controller._Controller__model_builder.set_base_logger(self.controller.logger)
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__updater = ModelUpdater(self.controller)
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        auto_queue = AutoQueue(self.controller._Controller__context, AutoQueuePersist(), self.controller)
+        return self.controller._Controller__updater, auto_queue
+
+    @staticmethod
+    def _scan_result(files: list[SystemFile], pair_id: str, failed: bool = False) -> ScannerResult:
+        return ScannerResult(datetime.now(), files, scanned_path_pair_ids={pair_id}, failed=failed)
+
+    @staticmethod
+    def _pair_system_file(name: str, size: int, pair_id: str) -> SystemFile:
+        system_file = SystemFile(name, size, False)
+        system_file.path_pair_id = pair_id
+        return system_file
 
     def test_record_download_completion_backfills_without_replacing_start_timestamp(self):
         self.controller._Controller__persist.downloaded_timestamps = {}
@@ -745,6 +789,52 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
         self.assertEqual([callback], first_command.callbacks)
         self.assertEqual(1, first_command.duplicate_waiter_count)
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+
+    def test_queue_command_manual_remote_delete_upgrades_pending_auto_authority(self):
+        file = ModelFile("dup", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        auto_command = Controller.Command(
+            Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue"
+        )
+        auto_command.lifecycle_token = (3, 7)
+        manual_command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        manual_callback = MagicMock()
+        manual_command.add_callback(manual_callback)
+        self.controller.queue_command(auto_command)
+
+        self.controller.queue_command(manual_command)
+
+        self.assertEqual("manual", auto_command.origin)
+        self.assertIsNone(auto_command.lifecycle_token)
+        self.assertEqual([manual_callback], auto_command.callbacks)
+        self.assertEqual(1, auto_command.duplicate_waiter_count)
+        self.assertEqual(1, self.controller._Controller__command_queue.qsize())
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            process = MagicMock()
+            delete_remote_process.return_value = process
+            self.controller._Controller__process_commands()
+        process.start.assert_called_once_with()
+
+    def test_queue_command_auto_remote_delete_keeps_pending_manual_authority(self):
+        manual_command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, "dup")
+        auto_command = Controller.Command(
+            Controller.Command.Action.DELETE_REMOTE, "dup", origin="auto_queue"
+        )
+        auto_command.lifecycle_token = (3, 7)
+        auto_callback = MagicMock()
+        auto_command.add_callback(auto_callback)
+        self.controller.queue_command(manual_command)
+
+        self.controller.queue_command(auto_command)
+
+        self.assertEqual("manual", manual_command.origin)
+        self.assertIsNone(manual_command.lifecycle_token)
+        self.assertEqual([auto_callback], manual_command.callbacks)
+        self.assertEqual(1, manual_command.duplicate_waiter_count)
         self.assertEqual(1, self.controller._Controller__command_queue.qsize())
 
     def test_queue_command_rejects_duplicate_delete_when_waiter_cap_is_full(self):
@@ -1689,6 +1779,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__started = True
         self.controller._Controller__last_remote_reconciliation_healthy = True
         self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__reconciled_local_path_pair_ids = {"movies"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"movies"}
         self.controller._Controller__active_downloading_file_names = [("dup", "movies", "Movies")]
         self.controller._Controller__active_extracting_file_names = []
         self.controller._Controller__set_active_scanner_files = MagicMock()
@@ -1749,6 +1841,7 @@ class TestController(unittest.TestCase):
         )
         self.assertFalse(self.controller._Controller__last_remote_reconciliation_healthy)
         self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
+        self.assertFalse(self.controller.is_path_pair_reconciled("movies"))
 
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_resyncs_pair_scoped_download_timestamps(self, scanner_process_cls):
@@ -5229,6 +5322,7 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
         self.assertEqual(set(), self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual({}, self.controller._Controller__persist.downloaded_timestamps)
+        self.assertEqual((0, 1), self.controller.remote_delete_lifecycle_token(file))
         self.assertEqual(
             {file.file_id: 4},
             self.controller._Controller__persist.move_failure_counts,
@@ -5707,7 +5801,7 @@ class TestController(unittest.TestCase):
             self.controller._Controller__build_path_pair_staging_path(pair),
         )
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     @patch("controller.controller.os.path.exists", return_value=True)
     def test_move_from_staging_uses_single_path_roots(self, _, move):
         result = self.controller._Controller__move_from_staging("movie.mkv")
@@ -5719,7 +5813,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     @patch("controller.controller.os.path.exists", return_value=True)
     def test_move_from_staging_uses_path_pair_roots(self, _, move):
         self.controller._Controller__path_pairs_by_id = {
@@ -5740,7 +5834,7 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_moves_single_file_named_lftp(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5761,7 +5855,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_ignores_unrelated_lftp_sibling_for_single_file_source(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5784,7 +5878,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_same_path_wins_over_lftp_temp_deferral(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             source_tree = os.path.join(temp_dir, "movie.mkv")
@@ -5804,7 +5898,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_moves_directory_with_legitimate_lftp_child_name(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5825,7 +5919,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_moves_directory_with_legitimate_lftp_child_pair(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5848,7 +5942,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_defers_when_lftp_temp_artifact_matches_path_pair_source(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             final_root = os.path.join(temp_dir, "movies")
@@ -5879,7 +5973,7 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_does_not_walk_symlink_source_tree(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5913,7 +6007,7 @@ class TestController(unittest.TestCase):
         self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_rejects_absolute_and_parent_traversal(self, move):
         for unsafe_name in ("/etc/passwd", "C:\\Windows\\system.ini", "\\\\server\\share\\file", "../escape", "nested/../../escape"):
             with self.subTest(name=unsafe_name):
@@ -5921,7 +6015,7 @@ class TestController(unittest.TestCase):
                 self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
         move.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_accepts_contained_nested_relative_path(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5938,7 +6032,7 @@ class TestController(unittest.TestCase):
         move.assert_called_once_with(source, destination)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_rejects_source_destination_and_parent_symlinks(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -5971,7 +6065,7 @@ class TestController(unittest.TestCase):
 
         move.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_logs_target_archive_trace(self, move):
         self.controller._Controller__target_archive_trace_file_id = "movie.mkv"
         trace_logger = self.controller._Controller__target_archive_trace_logger
@@ -5990,7 +6084,7 @@ class TestController(unittest.TestCase):
         self.assertEqual("move_from_staging_attempt", attempt_payload["event"])
         self.assertEqual("moved", result_payload["result"])
 
-    @patch("controller.controller.shutil.move", side_effect=OSError("permission denied"))
+    @patch.object(Controller, "_Controller__publish_staging_no_replace", side_effect=OSError("permission denied"))
     @patch("controller.controller.os.path.exists", return_value=True)
     def test_move_from_staging_reports_move_failure_without_forcing_scan(self, _, move):
         result = self.controller._Controller__move_from_staging("movie.mkv")
@@ -6009,7 +6103,7 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     @patch("controller.controller.os.path.exists", side_effect=[False, False])
     def test_move_from_staging_reports_missing_source_without_destination_as_failure(self, _, move):
         result = self.controller._Controller__move_from_staging("movie.mkv")
@@ -6024,7 +6118,7 @@ class TestController(unittest.TestCase):
         )
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     @patch("controller.controller.os.path.exists", side_effect=[False, True])
     def test_move_from_staging_treats_missing_source_with_destination_as_settled(self, _, move):
         result = self.controller._Controller__move_from_staging("movie.mkv")
@@ -6034,7 +6128,7 @@ class TestController(unittest.TestCase):
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
-    @patch("controller.controller.shutil.move")
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_reports_missing_move_root_as_failure(self, move):
         self.controller._Controller__staging_path = ""
 
@@ -6265,6 +6359,41 @@ class TestController(unittest.TestCase):
         self.assertNotIn(terminal.file_id, self.controller._Controller__move_retry_due)
         self.controller._Controller__update_model()
         self.assertEqual(5, self.controller._Controller__move_from_staging.call_count)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_automatic_move_conflict_stays_pending_and_consumes_failure_budget(self, diff_models):
+        completion_entry = ("movie.mkv", None, None)
+        active = ModelFile("movie.mkv", False)
+        active.remote_size = 100; active.local_size = 90; active.state = ModelFile.State.DOWNLOADING
+        terminal = ModelFile("movie.mkv", False)
+        terminal.remote_size = 100; terminal.local_size = 100; terminal.state = ModelFile.State.DOWNLOADED
+        current = Model(); current.set_base_logger(self.controller.logger); current.add_file(active)
+        rebuilt = Model(); rebuilt.set_base_logger(self.controller.logger); rebuilt.add_file(terminal)
+        self.controller._Controller__model = current
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = rebuilt
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.CONFLICT
+        )
+        diff_models.side_effect = [
+            [SimpleNamespace(change=ModelDiff.Change.UPDATED, old_file=active, new_file=terminal)],
+            [],
+        ]
+
+        self.controller._Controller__update_model()
+        self.assertEqual(1, self.controller._Controller__persist.move_failure_counts[terminal.file_id])
+        self.assertNotIn(terminal.file_id, self.controller._Controller__persist.downloaded_file_names)
+        self.assertIn(completion_entry, self.controller._Controller__pending_completion_file_names)
+
+        self.controller._Controller__move_retry_due[terminal.file_id] = datetime.now() - timedelta(seconds=1)
+        self.controller._Controller__update_model()
+        self.assertEqual(2, self.controller._Controller__persist.move_failure_counts[terminal.file_id])
+        self.assertNotIn(terminal.file_id, self.controller._Controller__persist.downloaded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_automatic_already_completed_does_not_earn_success_marker(self, diff_models):
@@ -6563,3 +6692,599 @@ class TestController(unittest.TestCase):
         self.assertEqual(64, payload["sidecar"]["size"])
         self.assertNotIn("local_base_dir_path", str(payload))
         self.assertNotIn("remote_base_dir_path", str(payload))
+
+    def test_enabled_path_pair_relocation_accepts_same_directory_alias_when_idle(self):
+        with tempfile.TemporaryDirectory() as local_path:
+            existing = PathPair(
+                id="movies", name="Movies", remote_path="/remote/movies", local_path=local_path,
+            )
+            updated = PathPair(
+                id="movies", name="Movies", remote_path="/remote/movies", local_path=local_path + os.sep + ".",
+            )
+            self.controller.validate_path_pair_relocation(existing, updated)
+
+    def test_reserved_relocation_rejects_alias_repoint_before_activation(self):
+        with tempfile.TemporaryDirectory() as root:
+            original = os.path.join(root, "original")
+            replacement = os.path.join(root, "replacement")
+            alias = os.path.join(root, "alias")
+            os.mkdir(original); os.mkdir(replacement)
+            try:
+                os.symlink(original, alias, target_is_directory=True)
+            except (NotImplementedError, OSError) as exc:
+                self.skipTest("symlink test unavailable: {}".format(exc))
+            existing = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=original)
+            updated = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=alias)
+            self.controller.reserve_path_pair_relocation(existing, updated)
+            # Compensation persists the old pair while retaining the fence.
+            self.controller._Controller__validate_reserved_relocation_identities({"movies": existing})
+            # A broken new alias must not prevent rollback to the unchanged
+            # old root while the reservation remains held.
+            os.unlink(alias)
+            os.symlink(replacement, alias, target_is_directory=True)
+            self.controller._Controller__validate_reserved_relocation_identities({"movies": existing})
+            # Swap the old configured path after reservation; a compensating
+            # old-path activation must reject it rather than restoring onto a
+            # replacement directory.
+            os.rename(original, os.path.join(root, "moved-original"))
+            os.mkdir(original)
+            with self.assertRaises(PathPairError):
+                self.controller._Controller__validate_reserved_relocation_identities({"movies": existing})
+            self.controller.release_path_pair_relocation("movies")
+
+    def test_enabled_path_pair_relocation_rejects_active_work(self):
+        with tempfile.TemporaryDirectory() as local_path:
+            existing = PathPair(
+                id="movies", name="Movies", remote_path="/remote/movies", local_path=local_path,
+            )
+            updated = PathPair(
+                id="movies", name="Movies", remote_path="/remote/movies", local_path=local_path + os.sep + ".",
+            )
+            self.controller._Controller__active_downloading_file_names = [("Release", "movies", "Movies")]
+            with self.assertRaises(PathPairError):
+                self.controller.validate_path_pair_relocation(existing, updated)
+
+    def test_enabled_path_pair_relocation_rejects_parent_owned_worker_dispatches(self):
+        with tempfile.TemporaryDirectory() as local_path:
+            existing = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path)
+            updated = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path + os.sep + ".")
+            file_id = ModelFile.build_file_id("Release", "movies")
+            self.controller._Controller__pending_extract_file_ids = {file_id}
+            with self.assertRaises(PathPairError):
+                self.controller.validate_path_pair_relocation(existing, updated)
+
+    def test_relocation_and_dequeued_queue_dispatch_have_an_atomic_busy_boundary(self):
+        with tempfile.TemporaryDirectory() as local_path:
+            existing = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path)
+            updated = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path + os.sep + ".")
+            file_id = ModelFile.build_file_id("Release", "movies")
+
+            self.assertTrue(self.controller._Controller__begin_command_dispatch(file_id, "movies"))
+            with self.assertRaises(PathPairError):
+                self.controller.reserve_path_pair_relocation(existing, updated)
+            self.controller._Controller__end_command_dispatch(file_id)
+
+            self.controller.reserve_path_pair_relocation(existing, updated)
+            self.assertFalse(self.controller._Controller__begin_command_dispatch(file_id, "movies"))
+            self.controller.release_path_pair_relocation("movies")
+
+    def test_dequeued_delete_local_and_queue_are_fenced_against_relocation_in_both_orders(self):
+        with tempfile.TemporaryDirectory() as local_path:
+            existing = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path)
+            updated = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=local_path + os.sep + ".")
+            file = ModelFile("Release", False)
+            file.path_pair_id = "movies"
+            file.local_size = 10
+            file.remote_size = 10
+            self.controller._Controller__model.get_file.return_value = file
+            self.controller._Controller__path_pairs_by_id = {"movies": existing}
+
+            def delete_side_effect(*_args, **_kwargs):
+                with self.assertRaises(PathPairError):
+                    self.controller.reserve_path_pair_relocation(existing, updated)
+
+            with patch.object(
+                self.controller, "_Controller__queue_delete_local_process", side_effect=delete_side_effect
+            ):
+                self.controller._Controller__command_queue.put(
+                    Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+                )
+                self.controller._Controller__process_commands()
+            self.controller.reserve_path_pair_relocation(existing, updated)
+            self.controller.release_path_pair_relocation("movies")
+
+            callback = MagicMock()
+            queue_command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+            queue_command.add_callback(callback)
+            self.controller.reserve_path_pair_relocation(existing, updated)
+            self.controller._Controller__command_queue.put(queue_command)
+            self.controller._Controller__process_commands()
+            callback.on_failure.assert_called_once_with("Path pair relocation is in progress", 409)
+            self.controller._Controller__lftp.queue.assert_not_called()
+            self.controller.release_path_pair_relocation("movies")
+
+    def test_model_updater_and_autoqueue_wait_for_pair_reconciliation_before_queueing(self):
+        """Exercise scan -> real model -> real listener sequencing for one pair."""
+        pair = PathPair(
+            id="movies", name="Movies", remote_path="/remote/movies", local_path="/local/movies",
+            enabled=True, auto_queue=True,
+        )
+        updater, auto_queue = self._configure_real_model_autoqueue_pipeline(pair, auto_delete_remote=True)
+        remote = self._pair_system_file("Release", 10, pair.id)
+        complete_local = self._pair_system_file("Release", 10, pair.id)
+
+        # Remote-first must not queue until a healthy local root scan arrives;
+        # when it does, the same-size local file is already complete.
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = self._scan_result([remote], pair.id)
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = self._scan_result([complete_local], pair.id)
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        # Local-first likewise remains quiet until remote reconciliation, and
+        # the matching complete remote result must not queue or delete it.
+        self.setUp()
+        updater, auto_queue = self._configure_real_model_autoqueue_pipeline(pair, auto_delete_remote=True)
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = self._scan_result([complete_local], pair.id)
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = self._scan_result([remote], pair.id)
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        # Presence, not a non-zero byte count, blocks auto-queue when a
+        # conflicting local file is discovered before its remote counterpart.
+        self.setUp()
+        updater, auto_queue = self._configure_real_model_autoqueue_pipeline(pair, auto_delete_remote=True)
+        zero_local = self._pair_system_file("ZeroConflict", 0, pair.id)
+        remote_conflict = self._pair_system_file("ZeroConflict", 10, pair.id)
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = self._scan_result([zero_local], pair.id)
+        updater.update()
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = self._scan_result([remote_conflict], pair.id)
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        # Remote-only content queues only after the authoritative empty local
+        # scan for the same pair; a failed local scan remains non-authoritative.
+        self.setUp()
+        updater, auto_queue = self._configure_real_model_autoqueue_pipeline(pair, auto_delete_remote=True)
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = self._scan_result([remote], pair.id)
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = self._scan_result([], pair.id, failed=True)
+        updater.update()
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = self._scan_result([], pair.id)
+        updater.update()
+        auto_queue.process()
+        queued = self.controller._Controller__command_queue.get_nowait()
+        self.assertEqual(Controller.Command.Action.QUEUE, queued.action)
+        self.assertEqual(ModelFile.build_file_id("Release", pair.id), queued.filename)
+
+        # A persisted marker alone is historical startup state, not proof that
+        # this process published a fast DEFAULT -> DOWNLOADED transfer.
+        completed = ModelFile("Release", False)
+        completed.path_pair_id = pair.id
+        completed.remote_size = 10
+        completed.local_size = 10
+        completed.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__persist.final_move_succeeded_file_names.add(completed.file_id)
+        self.controller._Controller__model.update_file(completed)
+        auto_queue.process()
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+        fast_default = ModelFile("Release", False)
+        fast_default.path_pair_id = pair.id
+        fast_default.remote_size = 10
+        self.controller._Controller__model.update_file(fast_default)
+        auto_queue.process()
+        # This marker is set only after a real COMPLETED final publication in
+        # the current controller process, so it authorizes the skipped-status
+        # completion without weakening initial reconciliation safety.
+        self.controller._Controller__current_process_final_publication_file_ids.add(completed.file_id)
+        self.controller._Controller__model.update_file(completed)
+        auto_queue.process()
+        delete_command = self.controller._Controller__command_queue.get_nowait()
+        self.assertEqual(Controller.Command.Action.DELETE_REMOTE, delete_command.action)
+        self.assertEqual(completed.file_id, delete_command.filename)
+
+    def test_path_pair_refresh_nested_restore_failure_records_consistency_error_and_restores_parent_references(self):
+        self.controller._Controller__started = True
+        old_pairs = {"old": PathPair(id="old", name="Old", remote_path="/remote", local_path="/local")}
+        old_staging = {"old": "/local/incomplete"}
+        self.controller._Controller__path_pairs_by_id = old_pairs
+        self.controller._Controller__path_pair_staging_paths = old_staging
+        old_runtime = (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        )
+        new_process = MagicMock()
+        new_process.set_mp_log_queue.side_effect = RuntimeError("late activation failure")
+
+        def apply_new_runtime():
+            self.controller._Controller__path_pairs_by_id = {"new": MagicMock()}
+            self.controller._Controller__path_pair_staging_paths = {"new": "/new/incomplete"}
+            self.controller._Controller__active_scanner = MagicMock()
+            self.controller._Controller__local_scanner = MagicMock()
+            self.controller._Controller__remote_scanner = MagicMock()
+            self.controller._Controller__active_scan_process = new_process
+            self.controller._Controller__local_scan_process = MagicMock()
+            self.controller._Controller__remote_scan_process = MagicMock()
+
+        with patch.object(self.controller, "_Controller__refresh_path_pair_runtime_state", side_effect=apply_new_runtime), \
+                patch.object(self.controller, "_Controller__restore_path_pair_runtime_state", side_effect=RuntimeError("restore failure")):
+            self.controller._Controller__apply_path_pair_refresh()
+
+        self.assertIn("consistency restore failed", self.controller._Controller__path_pair_runtime_error)
+        self.assertFalse(self.controller._Controller__context.status.server.up)
+        self.assertEqual(old_pairs, self.controller._Controller__path_pairs_by_id)
+        self.assertEqual(old_staging, self.controller._Controller__path_pair_staging_paths)
+        self.assertEqual(old_runtime, (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        ))
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, ModelFile.build_file_id("Release", "old"))
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        callback.on_failure.assert_called_once_with(
+            self.controller._Controller__path_pair_runtime_error,
+            503,
+        )
+        self.assertTrue(self.controller._Controller__command_queue.empty())
+
+    def test_path_pair_refresh_rolls_back_new_runtime_despite_preexisting_error(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__path_pair_runtime_error = "old runtime error"
+        old_pairs = {"old": PathPair(id="old", name="Old", remote_path="/remote", local_path="/local")}
+        old_staging = {"old": "/local/incomplete"}
+        self.controller._Controller__path_pairs_by_id = old_pairs
+        self.controller._Controller__path_pair_staging_paths = old_staging
+        old_runtime = (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        )
+        new_active_process = MagicMock()
+        new_active_process.set_mp_log_queue.side_effect = RuntimeError("post-activation failure")
+        new_local_process = MagicMock()
+        new_remote_process = MagicMock()
+
+        def apply_new_runtime():
+            self.controller._Controller__path_pairs_by_id = {"new": MagicMock()}
+            self.controller._Controller__path_pair_staging_paths = {"new": "/new/incomplete"}
+            self.controller._Controller__active_scanner = MagicMock()
+            self.controller._Controller__local_scanner = MagicMock()
+            self.controller._Controller__remote_scanner = MagicMock()
+            self.controller._Controller__active_scan_process = new_active_process
+            self.controller._Controller__local_scan_process = new_local_process
+            self.controller._Controller__remote_scan_process = new_remote_process
+
+        with patch.object(self.controller, "_Controller__refresh_path_pair_runtime_state", side_effect=apply_new_runtime):
+            self.controller._Controller__apply_path_pair_refresh()
+
+        new_active_process.terminate.assert_called_once()
+        new_local_process.terminate.assert_called_once()
+        new_remote_process.terminate.assert_called_once()
+        self.assertEqual(old_pairs, self.controller._Controller__path_pairs_by_id)
+        self.assertEqual(old_staging, self.controller._Controller__path_pair_staging_paths)
+        self.assertEqual(old_runtime, (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        ))
+        self.assertIn("activation failed", self.controller._Controller__path_pair_runtime_error)
+
+    def test_path_pair_runtime_inner_restore_failure_fails_closed_without_overwrite(self):
+        self.controller._Controller__started = False
+        old_pairs = {"old": PathPair(id="old", name="Old", remote_path="/remote", local_path="/local")}
+        old_staging = {"old": "/local/incomplete"}
+        self.controller._Controller__path_pairs_by_id = old_pairs
+        self.controller._Controller__path_pair_staging_paths = old_staging
+        old_runtime = (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        )
+        pair = PathPair(id="new", name="New", remote_path="/remote/new", local_path="/local/new")
+        self.controller._Controller__context.path_pair_manager = MagicMock()
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [pair]
+        self.controller._Controller__context.config.controller = SimpleNamespace(
+            interval_ms_downloading_scan=100, interval_ms_local_scan=100, interval_ms_remote_scan=100,
+        )
+        self.controller._Controller__set_transfer_path_pairs = MagicMock(side_effect=[
+            RuntimeError("activation mutation failed"), RuntimeError("old transfer restore failed"),
+        ])
+        with patch.object(self.controller, "_Controller__build_active_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_local_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_remote_scanner", return_value=MagicMock()):
+            self.controller._Controller__apply_path_pair_refresh()
+
+        error = self.controller._Controller__path_pair_runtime_error
+        self.assertIn("consistency restore failed", error)
+        self.assertIn("old transfer restore failed", error)
+        self.assertFalse(self.controller._Controller__context.status.server.up)
+        self.assertEqual(old_pairs, self.controller._Controller__path_pairs_by_id)
+        self.assertEqual(old_staging, self.controller._Controller__path_pair_staging_paths)
+        self.assertEqual(old_runtime, (
+            self.controller._Controller__active_scanner, self.controller._Controller__local_scanner,
+            self.controller._Controller__remote_scanner, self.controller._Controller__active_scan_process,
+            self.controller._Controller__local_scan_process, self.controller._Controller__remote_scan_process,
+        ))
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.QUEUE, ModelFile.build_file_id("Release", "old"))
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+        callback.on_failure.assert_called_once_with(error, 503)
+    def test_interrupted_recovery_skips_stale_staging_when_final_target_is_complete(self):
+        with tempfile.TemporaryDirectory() as root:
+            final_root = os.path.join(root, "final")
+            staging_root = os.path.join(root, "staging")
+            os.mkdir(final_root)
+            os.mkdir(staging_root)
+            Path(os.path.join(final_root, "movie.mkv")).write_bytes(b"complete")
+            Path(os.path.join(staging_root, "movie.mkv.lftp")).write_bytes(b"stale")
+            pair = PathPair(id="movies", name="Movies", remote_path="/remote", local_path=final_root)
+            self.controller._Controller__path_pairs_by_id = {pair.id: pair}
+            self.controller._Controller__path_pair_staging_paths = {pair.id: staging_root}
+            remote = SystemFile("movie.mkv", len(b"complete"), False)
+            remote.path_pair_id = pair.id
+
+            self.controller._Controller__recover_interrupted_downloads([remote])
+
+            self.controller._Controller__lftp.queue.assert_not_called()
+
+    def test_final_move_never_clobbers_existing_file_even_at_same_size(self):
+        with tempfile.TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            final = os.path.join(root, "final")
+            os.mkdir(staging); os.mkdir(final)
+            Path(os.path.join(staging, "movie.mkv")).write_bytes(b"source")
+            Path(os.path.join(final, "movie.mkv")).write_bytes(b"target")
+            self.controller._Controller__staging_path = staging
+            self.controller._Controller__legacy_local_path = final
+            result = self.controller._Controller__move_from_staging("movie.mkv")
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(b"source", Path(os.path.join(staging, "movie.mkv")).read_bytes())
+            self.assertEqual(b"target", Path(os.path.join(final, "movie.mkv")).read_bytes())
+
+    def test_legacy_staging_conflict_is_not_remote_delete_eligible_until_published(self):
+        file = ModelFile("movie.mkv", False)
+        self.controller._Controller__legacy_local_path = "/local"
+        self.controller._Controller__staging_path = "/local/incomplete"
+        self.controller._Controller__persist.final_move_succeeded_file_names = set()
+        self.assertFalse(self.controller.is_remote_delete_eligible(file))
+        self.controller._Controller__persist.final_move_succeeded_file_names.add(file.file_id)
+        self.assertTrue(self.controller.is_remote_delete_eligible(file))
+
+    def test_current_publication_proof_clears_on_path_pair_refresh(self):
+        self.controller._Controller__current_process_final_publication_file_ids = {"old-proof"}
+        with patch.object(self.controller, "_Controller__refresh_path_pair_runtime_state"):
+            self.controller._Controller__apply_path_pair_refresh()
+        self.assertEqual(set(), self.controller._Controller__current_process_final_publication_file_ids)
+
+    def test_current_publication_proof_clears_on_new_queue_lifecycle(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__current_process_final_publication_file_ids = {file.file_id}
+        self.controller._Controller__command_queue.put(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__process_commands()
+        self.assertNotIn(file.file_id, self.controller._Controller__current_process_final_publication_file_ids)
+
+    def test_new_queue_rejects_stale_auto_queue_remote_delete_in_same_drain(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__persist.final_move_succeeded_file_names = {file.file_id}
+        self.controller._Controller__current_process_final_publication_file_ids = {file.file_id}
+        callback = MagicMock()
+        stale_delete = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue")
+        stale_delete.lifecycle_token = self.controller.remote_delete_lifecycle_token(file)
+        stale_delete.add_callback(callback)
+        self.controller._Controller__command_queue.put(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
+        self.controller._Controller__command_queue.put(stale_delete)
+        self.controller._Controller__process_commands()
+        callback.on_failure.assert_called_once()
+        self.assertEqual(409, callback.on_failure.call_args.args[1])
+        self.assertEqual([], self.controller._Controller__active_command_processes)
+
+    def test_delete_local_admission_rejects_stale_same_path_auto_remote_delete_in_same_drain(self):
+        file = ModelFile("movie.mkv", False)
+        file.local_size = 10
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        stale_delete = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue")
+        stale_delete.lifecycle_token = self.controller.remote_delete_lifecycle_token(file)
+        callback = MagicMock()
+        stale_delete.add_callback(callback)
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id))
+        self.controller.queue_command(stale_delete)
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process, \
+                patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            delete_local_process.return_value = MagicMock()
+            self.controller._Controller__process_commands()
+
+        delete_local_process.return_value.start.assert_called_once_with()
+        delete_remote_process.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Auto-queue remote delete no longer has current lifecycle authority", 409
+        )
+
+    def test_auto_queue_remote_delete_without_lifecycle_token_is_rejected(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue")
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            self.controller._Controller__process_commands()
+
+        delete_remote_process.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Auto-queue remote delete no longer has current lifecycle authority", 409
+        )
+
+    def test_auto_queue_remote_delete_with_mismatched_lifecycle_token_is_rejected(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue")
+        command.lifecycle_token = (1, 1)
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            self.controller._Controller__process_commands()
+
+        delete_remote_process.assert_not_called()
+        callback.on_failure.assert_called_once_with(
+            "Auto-queue remote delete no longer has current lifecycle authority", 409
+        )
+
+    def test_auto_queue_remote_delete_with_current_token_allows_same_path_without_publication(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id, origin="auto_queue")
+        command.lifecycle_token = self.controller.remote_delete_lifecycle_token(file)
+        self.controller.queue_command(command)
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            process = MagicMock()
+            delete_remote_process.return_value = process
+            self.controller._Controller__process_commands()
+
+        process.start.assert_called_once_with()
+        self.assertEqual(1, len(self.controller._Controller__active_command_processes))
+
+    def test_manual_remote_delete_allows_same_path_without_lifecycle_token(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        self.controller._Controller__staging_path = self.controller._Controller__legacy_local_path
+        self.controller._Controller__model.get_file.return_value = file
+        command = Controller.Command(Controller.Command.Action.DELETE_REMOTE, file.file_id)
+        self.controller.queue_command(command)
+
+        with patch("controller.controller.DeleteRemoteProcess") as delete_remote_process:
+            process = MagicMock()
+            delete_remote_process.return_value = process
+            self.controller._Controller__process_commands()
+
+        process.start.assert_called_once_with()
+        self.assertEqual(1, len(self.controller._Controller__active_command_processes))
+
+    def test_cross_device_file_publish_copies_then_removes_source_after_atomic_publish(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+            original = Controller._Controller__rename_no_replace
+            calls = []
+
+            def rename_side_effect(src, dst):
+                calls.append((src, dst))
+                if len(calls) == 1:
+                    raise OSError(errno.EXDEV, "cross-device")
+                return original(src, dst)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            self.assertEqual(2, len(calls))
+
+    def test_cross_device_publish_collision_preserves_source_and_destination(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            Path(destination).write_bytes(b"existing")
+            calls = 0
+
+            def rename_side_effect(_src, _dst):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(errno.EXDEV, "cross-device")
+                raise FileExistsError(errno.EEXIST, "exists", destination)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect):
+                with self.assertRaises(FileExistsError):
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+            self.assertEqual(b"source", Path(source).read_bytes())
+            self.assertEqual(b"existing", Path(destination).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_final_move_never_clobbers_existing_directory(self):
+        with tempfile.TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            final = os.path.join(root, "final")
+            os.mkdir(staging); os.mkdir(final)
+            os.mkdir(os.path.join(staging, "release"))
+            os.mkdir(os.path.join(final, "release"))
+            Path(os.path.join(staging, "release", "movie.mkv")).write_bytes(b"source")
+            Path(os.path.join(final, "release", "movie.mkv")).write_bytes(b"target")
+            self.controller._Controller__staging_path = staging
+            self.controller._Controller__legacy_local_path = final
+            result = self.controller._Controller__move_from_staging("release")
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertTrue(os.path.isdir(os.path.join(staging, "release")))
+            self.assertEqual(b"target", Path(os.path.join(final, "release", "movie.mkv")).read_bytes())
+
+    def test_final_move_race_created_target_preserves_staging_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            staging = os.path.join(root, "staging")
+            final = os.path.join(root, "final")
+            os.mkdir(staging); os.mkdir(final)
+            src = os.path.join(staging, "movie.mkv")
+            dst = os.path.join(final, "movie.mkv")
+            Path(src).write_bytes(b"source")
+            self.controller._Controller__staging_path = staging
+            self.controller._Controller__legacy_local_path = final
+            original = Controller._Controller__rename_no_replace
+
+            def create_destination_then_publish(source, destination):
+                Path(destination).write_bytes(b"racer")
+                return original(source, destination)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=create_destination_then_publish):
+                result = self.controller._Controller__move_from_staging("movie.mkv")
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(b"source", Path(src).read_bytes())
+            self.assertEqual(b"racer", Path(dst).read_bytes())
