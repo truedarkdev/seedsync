@@ -141,6 +141,15 @@ class ExtractDispatch:
         with self.__listeners_lock:
             self.__listeners.append(listener)
 
+    def set_base_paths(self,
+                       out_dir_path: str,
+                       local_path: str,
+                       local_path_fallback: str | None) -> None:
+        """Update the legacy (no path-pair) request defaults in-place."""
+        self.__out_dir_path = out_dir_path
+        self.__local_path = local_path
+        self.__local_path_fallback = local_path_fallback
+
     def status(self) -> List[ExtractStatus]:
         with self.__task_queue.mutex:
             tasks = list(self.__task_queue.queue)

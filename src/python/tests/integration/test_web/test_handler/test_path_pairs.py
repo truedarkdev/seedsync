@@ -139,18 +139,17 @@ class TestPathPairsHandler(BaseTestWebApp):
         self.assertEqual(200, response.status_int)
         self.controller.refresh_path_pairs.assert_not_called()
 
-    def test_create_returns_validation_warnings(self):
+    def test_create_allows_arbitrary_docker_local_path_without_warning(self):
         with patch("common.path_pair.is_running_in_docker", return_value=True):
             response = self.test_app.post_json("/server/path-pairs", {
-                "name": "Movies",
-                "remote_path": "/remote/movies",
-                "local_path": "/media/movies"
+                "name": "Pair Alpha",
+                "remote_path": "/remote/source-a",
+                "local_path": "/data/root-a"
             })
 
         self.assertEqual(200, response.status_int)
         payload = json.loads(response.text)
-        self.assertEqual(1, len(payload["warnings"]))
-        self.assertIn("/media/movies", payload["warnings"][0])
+        self.assertEqual([], payload["warnings"])
 
     def test_delete_existing_pair(self):
         created = json.loads(self.test_app.post_json("/server/path-pairs", {

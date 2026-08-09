@@ -125,6 +125,28 @@ class TestExtractProcess(unittest.TestCase):
             pass
         self.assertEqual("/test/local/fallback", self.local_path_fallback.value.decode())
 
+    def test_set_base_paths_updates_parent_and_child_dispatch_defaults(self):
+        process = ExtractProcess(
+            out_dir_path="/data/root-a",
+            local_path="/data/root-a",
+            local_path_fallback="/data/root-a/incomplete",
+        )
+        process.run_init()
+
+        process.set_base_paths(
+            out_dir_path="/data/root-b",
+            local_path="/data/root-b",
+            local_path_fallback="/data/root-b/incomplete",
+        )
+        process.run_loop()
+
+        self.assertEqual("/data/root-b", process._ExtractProcess__out_dir_path)
+        self.assertEqual("/data/root-b", process._ExtractProcess__local_path)
+        self.assertEqual("/data/root-b/incomplete", process._ExtractProcess__local_path_fallback)
+        self.mock_dispatch.set_base_paths.assert_called_once_with(
+            "/data/root-b", "/data/root-b", "/data/root-b/incomplete"
+        )
+
     def test_calls_start_dispatch(self):
         self.start_called = multiprocessing.Value('i', 0)
 

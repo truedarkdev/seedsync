@@ -703,6 +703,126 @@ class TestController(unittest.TestCase):
         finally:
             shutil.rmtree(manager._config_dir)
 
+    def test_constructor_ignores_stale_legacy_paths_when_enabled_path_pairs_exist(self):
+        manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
+        try:
+            manager.load()
+            manager.add_pair(
+                PathPair(
+                    name="Pair Alpha",
+                    remote_path="/remote/source-a",
+                    local_path="/data/root-a",
+                    enabled=True,
+                )
+            )
+            context = self._make_startup_context(
+                local_path="/data/stale-legacy-root",
+                remote_path="/remote/legacy-source",
+                path_pair_manager=manager,
+            )
+
+            with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+                mock_create_transfer_backend.return_value = MagicMock()
+                controller = Controller(context, ControllerPersist())
+
+            self.assertIsNone(controller._Controller__startup_validation_error)
+            self.assertEqual("/data/root-a", controller._Controller__legacy_local_path)
+            self.assertEqual("/remote/source-a", controller._Controller__legacy_remote_path)
+            self.assertEqual("/data/root-a/incomplete", controller._Controller__staging_path)
+        finally:
+            shutil.rmtree(manager._config_dir)
+
+    def _refresh_runtime_fallback(self, path_pairs):
+        self.controller._Controller__context.config = SimpleNamespace(
+            lftp=SimpleNamespace(staging_path=None),
+            controller=SimpleNamespace(
+                interval_ms_downloading_scan=100,
+                interval_ms_local_scan=100,
+                interval_ms_remote_scan=100,
+                use_local_path_as_extract_path=True,
+            ),
+        )
+        with patch("controller.controller.ScannerProcess"), \
+                patch.object(self.controller, "_Controller__build_active_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_local_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_remote_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__validate_reserved_relocation_identities"):
+            self.controller._Controller__refresh_path_pair_runtime_state(path_pairs)
+
+    def _set_configured_runtime_fallback(self):
+        self.controller._Controller__configured_legacy_local_path = "/data/legacy-root"
+        self.controller._Controller__configured_legacy_remote_path = "/remote/legacy-source"
+        self.controller._Controller__legacy_local_path = "/data/legacy-root"
+        self.controller._Controller__legacy_remote_path = "/remote/legacy-source"
+        self.controller._Controller__staging_path = "/data/legacy-root/incomplete"
+
+    def test_refresh_runtime_fallback_returns_to_configured_legacy_roots_when_no_pairs_remain(self):
+        pair_a = PathPair("/remote/source-a", "/data/root-a", "Pair Alpha", "pair-a")
+        self._set_configured_runtime_fallback()
+
+        self._refresh_runtime_fallback([pair_a])
+        self._refresh_runtime_fallback([])
+
+        self.assertEqual("/data/legacy-root", self.controller._Controller__legacy_local_path)
+        self.assertEqual("/remote/legacy-source", self.controller._Controller__legacy_remote_path)
+        self.assertEqual("/data/legacy-root/incomplete", self.controller._Controller__staging_path)
+        self.controller._Controller__lftp.set_base_remote_dir_path.assert_called_with("/remote/legacy-source")
+        self.controller._Controller__lftp.set_base_local_dir_path.assert_called_with("/data/legacy-root/incomplete")
+        self.controller._Controller__extract_process.set_base_paths.assert_called_with(
+            out_dir_path="/data/legacy-root",
+            local_path="/data/legacy-root",
+            local_path_fallback="/data/legacy-root/incomplete",
+        )
+        self.controller._Controller__validate_process.set_base_paths.assert_called_with(
+            "/data/legacy-root", "/remote/legacy-source"
+        )
+
+    def test_refresh_runtime_fallback_moves_from_first_enabled_pair_to_next_pair(self):
+        pair_a = PathPair("/remote/source-a", "/data/root-a", "Pair Alpha", "pair-a")
+        pair_b = PathPair("/remote/source-b", "/data/root-b", "Pair Beta", "pair-b")
+        self._set_configured_runtime_fallback()
+
+        self._refresh_runtime_fallback([pair_a])
+        self._refresh_runtime_fallback([pair_b])
+
+        self.assertEqual("/data/root-b", self.controller._Controller__legacy_local_path)
+        self.assertEqual("/remote/source-b", self.controller._Controller__legacy_remote_path)
+        self.assertEqual("/data/root-b/incomplete", self.controller._Controller__staging_path)
+
+    def test_refresh_runtime_fallback_uses_next_pair_after_first_pair_is_disabled(self):
+        pair_a = PathPair("/remote/source-a", "/data/root-a", "Pair Alpha", "pair-a")
+        pair_b = PathPair("/remote/source-b", "/data/root-b", "Pair Beta", "pair-b")
+        self._set_configured_runtime_fallback()
+
+        self._refresh_runtime_fallback([pair_a, pair_b])
+        self._refresh_runtime_fallback([pair_b])
+
+        self.assertEqual("/data/root-b", self.controller._Controller__legacy_local_path)
+        self.assertEqual("/remote/source-b", self.controller._Controller__legacy_remote_path)
+
+    def test_refresh_runtime_fallback_restores_prior_roots_when_activation_fails(self):
+        pair_a = PathPair("/remote/source-a", "/data/root-a", "Pair Alpha", "pair-a")
+        pair_b = PathPair("/remote/source-b", "/data/root-b", "Pair Beta", "pair-b")
+        self._set_configured_runtime_fallback()
+        self._refresh_runtime_fallback([pair_a])
+
+        with patch("controller.controller.ScannerProcess"), \
+                patch.object(self.controller, "_Controller__build_active_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_local_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__build_remote_scanner", return_value=MagicMock()), \
+                patch.object(self.controller, "_Controller__validate_reserved_relocation_identities"), \
+                patch.object(
+                    self.controller,
+                    "_Controller__set_transfer_path_pairs",
+                    side_effect=[RuntimeError("activation failed"), None],
+                ):
+            with self.assertRaisesRegex(RuntimeError, "activation failed"):
+                self.controller._Controller__refresh_path_pair_runtime_state([pair_b])
+
+        self.assertEqual("/data/root-a", self.controller._Controller__legacy_local_path)
+        self.assertEqual("/remote/source-a", self.controller._Controller__legacy_remote_path)
+        self.assertEqual("/data/root-a/incomplete", self.controller._Controller__staging_path)
+
     def test_constructor_reports_missing_legacy_paths_when_only_disabled_path_pairs_exist(self):
         manager = PathPairManager(tempfile.mkdtemp(prefix="controller_path_pairs"))
         try:
@@ -1261,8 +1381,8 @@ class TestController(unittest.TestCase):
         process.join.assert_not_called()
         process.close_queues.assert_called_once_with()
 
-    @patch("controller.controller.os.makedirs")
-    def test_start_records_breadcrumb_when_enabled(self, _mock_makedirs):
+    @patch.object(Controller, "_Controller__preflight_runtime_storage_roots")
+    def test_start_records_breadcrumb_when_enabled(self, preflight):
         self.controller._Controller__context.breadcrumb_trace = MagicMock()
 
         self.controller.start()
@@ -1289,10 +1409,11 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.start.assert_called_once_with()
         self.controller._Controller__validate_process.start.assert_called_once_with()
         self.controller._Controller__mp_logger.start.assert_called_once_with()
+        preflight.assert_called_once_with([], {})
         self.assertTrue(self.controller._Controller__started)
 
-    @patch("controller.controller.os.makedirs")
-    def test_start_leaves_started_false_if_child_start_fails(self, _mock_makedirs):
+    @patch.object(Controller, "_Controller__preflight_runtime_storage_roots")
+    def test_start_leaves_started_false_if_child_start_fails(self, _preflight):
         self.controller._Controller__extract_process.start.side_effect = RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
@@ -1325,8 +1446,102 @@ class TestController(unittest.TestCase):
         self.controller.exit()
         self._assert_exit_teardown()
 
-    @patch("controller.controller.os.makedirs")
-    def test_process_rejects_partial_start_failure_before_exit(self, _mock_makedirs):
+    def test_preflight_enabled_pair_uses_pair_roots_not_stale_legacy_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            pair_local = os.path.join(root, "root-a")
+            pair_staging = os.path.join(pair_local, "incomplete")
+            disabled_root = os.path.join(root, "disabled")
+            pair = PathPair(id="pair-a", name="Pair Alpha", remote_path="/remote/source-a", local_path=pair_local)
+            self.controller._Controller__legacy_local_path = "/data/stale-legacy-root"
+            self.controller._Controller__staging_path = "/data/stale-legacy-root/incomplete"
+            self.controller._Controller__context.config = SimpleNamespace(
+                controller=SimpleNamespace(use_local_path_as_extract_path=True, extract_path=None)
+            )
+
+            self.controller._Controller__preflight_runtime_storage_roots([pair], {pair.id: pair_staging})
+
+            self.assertTrue(os.path.isdir(pair_local))
+            self.assertTrue(os.path.isdir(pair_staging))
+            self.assertFalse(os.path.exists(disabled_root))
+
+    def test_preflight_legacy_root_preserves_writable_legacy_root_behavior(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_root = os.path.join(root, "legacy-root")
+            staging_root = os.path.join(local_root, "incomplete")
+            self.controller._Controller__legacy_local_path = local_root
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__context.config = SimpleNamespace(
+                controller=SimpleNamespace(use_local_path_as_extract_path=True, extract_path=None)
+            )
+
+            self.controller._Controller__preflight_runtime_storage_roots([], {})
+
+            self.assertTrue(os.path.isdir(local_root))
+            self.assertTrue(os.path.isdir(staging_root))
+
+    def test_preflight_creates_and_probes_explicit_extraction_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            local_root = os.path.join(root, "local")
+            staging_root = os.path.join(local_root, "incomplete")
+            extract_root = os.path.join(root, "extract")
+            self.controller._Controller__legacy_local_path = local_root
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__context.config = SimpleNamespace(
+                controller=SimpleNamespace(use_local_path_as_extract_path=False, extract_path=extract_root)
+            )
+
+            self.controller._Controller__preflight_runtime_storage_roots([], {})
+
+            self.assertTrue(os.path.isdir(extract_root))
+
+    def test_preflight_fails_closed_for_unwritable_active_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            pair_local = os.path.join(root, "root-a")
+            pair_staging = os.path.join(pair_local, "incomplete")
+            pair = PathPair(id="pair-a", name="Pair Alpha", remote_path="/remote/source-a", local_path=pair_local)
+            self.controller._Controller__context.config = SimpleNamespace(
+                controller=SimpleNamespace(use_local_path_as_extract_path=True, extract_path=None)
+            )
+
+            with patch("controller.controller.tempfile.mkstemp", side_effect=PermissionError("read-only")):
+                with self.assertRaises(ControllerError) as error:
+                    self.controller._Controller__preflight_runtime_storage_roots([pair], {pair.id: pair_staging})
+
+            self.assertIn(pair_local, str(error.exception))
+            self.assertIn("not writable", str(error.exception))
+
+    @patch("controller.controller.ScannerProcess")
+    def test_refresh_records_storage_preflight_failure_without_replacing_active_roots(self, scanner_process):
+        old_pair = PathPair(id="pair-old", name="Pair Old", remote_path="/remote/source-old", local_path="/data/root-old")
+        new_pair = PathPair(id="pair-new", name="Pair New", remote_path="/remote/source-new", local_path="/data/root-new")
+        self.controller._Controller__started = True
+        self.controller._Controller__path_pairs_by_id = {old_pair.id: old_pair}
+        self.controller._Controller__path_pair_staging_paths = {old_pair.id: "/data/root-old/incomplete"}
+        self.controller._Controller__context.path_pair_manager = MagicMock()
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [new_pair]
+        self.controller._Controller__context.config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                staging_path=None, use_temp_file=False, remote_address="host", remote_port=22,
+                remote_username="user", remote_path_to_scan_script="/scanfs", remote_python_path=None,
+            ),
+            controller=SimpleNamespace(
+                managed_extract_folders_enabled=False, interval_ms_downloading_scan=100,
+                interval_ms_local_scan=100, interval_ms_remote_scan=100,
+                use_local_path_as_extract_path=True, extract_path=None,
+            ),
+        )
+        self.controller._Controller__context.args = SimpleNamespace(local_path_to_scanfs="/scanfs")
+
+        with patch.object(self.controller, "_Controller__preflight_runtime_storage_roots", side_effect=ControllerError("root is not writable")):
+            self.controller._Controller__apply_path_pair_refresh()
+
+        self.assertEqual({old_pair.id: old_pair}, self.controller._Controller__path_pairs_by_id)
+        self.assertEqual({old_pair.id: "/data/root-old/incomplete"}, self.controller._Controller__path_pair_staging_paths)
+        self.assertIn("root is not writable", self.controller._Controller__path_pair_runtime_error)
+        self.assertFalse(self.controller._Controller__context.status.server.up)
+
+    @patch.object(Controller, "_Controller__preflight_runtime_storage_roots")
+    def test_process_rejects_partial_start_failure_before_exit(self, _preflight):
         self.controller._Controller__validate_process.start.side_effect = RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
@@ -1748,11 +1963,11 @@ class TestController(unittest.TestCase):
 
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
-        movies_pair = PathPair(
-            id="movies",
-            name="Movies",
-            remote_path="/remote/movies",
-            local_path="/local/movies",
+        pair_a = PathPair(
+            id="pair-a",
+            name="Pair Alpha",
+            remote_path="/remote/source-a",
+            local_path="/data/root-a",
             enabled=True,
             auto_queue=False,
         )
@@ -1764,7 +1979,7 @@ class TestController(unittest.TestCase):
         model_builder = self.controller._Controller__model_builder
 
         self.controller._Controller__context.path_pair_manager = MagicMock()
-        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [movies_pair]
+        self.controller._Controller__context.path_pair_manager.get_enabled_pairs.return_value = [pair_a]
         self.controller._Controller__context.config.lftp.staging_path = None
         self.controller._Controller__context.config.lftp.use_temp_file = False
         self.controller._Controller__context.config.controller.managed_extract_folders_enabled = False
@@ -1779,9 +1994,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__started = True
         self.controller._Controller__last_remote_reconciliation_healthy = True
         self.controller._Controller__last_local_reconciliation_healthy = True
-        self.controller._Controller__reconciled_local_path_pair_ids = {"movies"}
-        self.controller._Controller__reconciled_remote_path_pair_ids = {"movies"}
-        self.controller._Controller__active_downloading_file_names = [("dup", "movies", "Movies")]
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__active_downloading_file_names = [("sample-a.bin", "pair-a", "Pair Alpha")]
         self.controller._Controller__active_extracting_file_names = []
         self.controller._Controller__set_active_scanner_files = MagicMock()
         old_active_process.is_alive.return_value = False
@@ -1792,10 +2007,15 @@ class TestController(unittest.TestCase):
         new_remote_process = MagicMock()
         scanner_process_cls.side_effect = [new_active_process, new_local_process, new_remote_process]
 
-        with patch("controller.controller.os.makedirs") as makedirs_mock:
+        with patch.object(self.controller, "_Controller__preflight_runtime_storage_roots") as preflight:
             self.controller._Controller__apply_path_pair_refresh()
 
-        makedirs_mock.assert_called_once_with(os.path.join("/local/movies", "incomplete"), exist_ok=True)
+        preflight.assert_called_once_with(
+            [pair_a],
+            {"pair-a": os.path.join("/data/root-a", "incomplete")},
+            "/data/root-a",
+            os.path.join("/data/root-a", "incomplete"),
+        )
         old_active_process.terminate.assert_called_once_with()
         old_local_process.terminate.assert_called_once_with()
         old_remote_process.terminate.assert_called_once_with()
@@ -1814,34 +2034,34 @@ class TestController(unittest.TestCase):
         new_local_process.force_scan.assert_called_once_with()
         new_remote_process.force_scan.assert_called_once_with()
         self.controller._Controller__set_active_scanner_files.assert_called_once_with(
-            [("dup", "movies", "Movies")]
+            [("sample-a.bin", "pair-a", "Pair Alpha")]
         )
 
         validate_process.set_path_pairs_by_id.assert_called_once()
         refreshed_pairs = validate_process.set_path_pairs_by_id.call_args.args[0]
-        self.assertEqual(["movies"], list(refreshed_pairs.keys()))
-        self.assertIs(movies_pair, refreshed_pairs["movies"])
+        self.assertEqual(["pair-a"], list(refreshed_pairs.keys()))
+        self.assertIs(pair_a, refreshed_pairs["pair-a"])
 
         self.controller._Controller__lftp.set_path_pairs.assert_called_once()
         lftp_pairs = self.controller._Controller__lftp.set_path_pairs.call_args.args[0]
         self.assertEqual(1, len(lftp_pairs))
-        self.assertEqual(os.path.join("/local/movies", "incomplete"), lftp_pairs[0].local_path)
+        self.assertEqual(os.path.join("/data/root-a", "incomplete"), lftp_pairs[0].local_path)
 
         model_builder.set_local_root_paths.assert_called_once_with(
-            {None: "/local", "movies": "/local/movies"},
+            {None: "/data/root-a", "pair-a": "/data/root-a"},
             {
-                None: "/local/incomplete",
-                "movies": os.path.join("/local/movies", "incomplete")
+                None: "/data/root-a/incomplete",
+                "pair-a": os.path.join("/data/root-a", "incomplete")
             }
         )
-        self.assertEqual({"movies"}, set(self.controller._Controller__path_pairs_by_id.keys()))
+        self.assertEqual({"pair-a"}, set(self.controller._Controller__path_pairs_by_id.keys()))
         self.assertEqual(
-            os.path.join("/local/movies", "incomplete"),
-            self.controller._Controller__path_pair_staging_paths["movies"]
+            os.path.join("/data/root-a", "incomplete"),
+            self.controller._Controller__path_pair_staging_paths["pair-a"]
         )
         self.assertFalse(self.controller._Controller__last_remote_reconciliation_healthy)
         self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
-        self.assertFalse(self.controller.is_path_pair_reconciled("movies"))
+        self.assertFalse(self.controller.is_path_pair_reconciled("pair-a"))
 
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_resyncs_pair_scoped_download_timestamps(self, scanner_process_cls):
@@ -1923,7 +2143,7 @@ class TestController(unittest.TestCase):
         new_remote_process = MagicMock()
         scanner_process_cls.side_effect = [new_active_process, new_local_process, new_remote_process]
 
-        with patch("controller.controller.os.makedirs"):
+        with patch.object(self.controller, "_Controller__preflight_runtime_storage_roots"):
             self.controller._Controller__apply_path_pair_refresh()
 
         old_active_process.terminate.assert_called_once_with()

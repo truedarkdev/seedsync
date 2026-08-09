@@ -28,8 +28,6 @@ class PathPairConflictError(PathPairError):
     pass
 
 
-DOCKER_DOWNLOADS_BASE = "/downloads"
-DOCKER_MOUNTS_BASE = "/mounts"
 _MutationResult = TypeVar("_MutationResult")
 
 
@@ -95,27 +93,7 @@ class PathPair:
             raise PathPairError("Path pair '{}': enabled must be a boolean".format(self.name))
         if type(self.auto_queue) != bool:
             raise PathPairError("Path pair '{}': auto_queue must be a boolean".format(self.name))
-        warnings: List[str] = []
-        if is_running_in_docker():
-            local_path = os.path.normpath(self.local_path)
-            downloads_base = os.path.normpath(DOCKER_DOWNLOADS_BASE)
-            mounts_base = os.path.normpath(DOCKER_MOUNTS_BASE)
-            is_under_downloads = local_path == downloads_base or local_path.startswith(downloads_base + os.sep)
-            is_under_mounts = local_path == mounts_base or local_path.startswith(mounts_base + os.sep)
-            if not is_under_downloads and not is_under_mounts:
-                warnings.append(
-                    "Path pair '{}': Local path '{}' is not under '{}' or '{}'. In Docker, local "
-                    "paths should be subdirectories of '{}' for ordinary local storage or '{}' "
-                    "for additional mounted or network-backed paths.".format(
-                        self.name,
-                        self.local_path,
-                        DOCKER_DOWNLOADS_BASE,
-                        DOCKER_MOUNTS_BASE,
-                        DOCKER_DOWNLOADS_BASE,
-                        DOCKER_MOUNTS_BASE,
-                    )
-                )
-        return warnings
+        return []
 
 
 @dataclass

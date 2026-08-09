@@ -727,11 +727,6 @@ chmod 700 "$RUNTIME_TMP_DIR" 2>/dev/null || true
 configure_legacy_nss_identity
 ensure_ssh_host_key_config
 
-check_writable_path "$DOWNLOADS_DIR"
-if mountpoint -q /staging 2>/dev/null; then
-    check_writable_path /staging
-fi
-
 unset BASH_ENV ENV
 
 export HOME="$USER_HOME"

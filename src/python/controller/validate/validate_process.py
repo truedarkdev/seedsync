@@ -78,6 +78,13 @@ class ValidateProcess(AppProcess):
         assert self.__command_queue is not None
         self.__command_queue.put(("set_path_pairs_by_id", self.__path_pairs_by_id))
 
+    def set_base_paths(self, local_path: str, remote_path: str) -> None:
+        """Refresh the legacy (no path-pair) roots in the worker process."""
+        self.__local_path = local_path
+        self.__remote_path = remote_path
+        assert self.__command_queue is not None
+        self.__command_queue.put(("set_base_paths", (local_path, remote_path)))
+
     def pop_latest_statuses(self) -> Optional[ValidateStatusResult]:
         latest_result: Optional[ValidateStatusResult] = None
         try:
@@ -110,6 +117,14 @@ class ValidateProcess(AppProcess):
         if command == "set_path_pairs_by_id":
             if isinstance(payload, dict):
                 self.__path_pairs_by_id = cast(dict[str, dict[str, str | None]], payload)
+            return
+
+        if command == "set_base_paths":
+            if isinstance(payload, tuple) and len(payload) == 2:
+                local_path, remote_path = payload
+                if isinstance(local_path, str) and isinstance(remote_path, str):
+                    self.__local_path = local_path
+                    self.__remote_path = remote_path
             return
 
         if command != "validate":

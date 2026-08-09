@@ -27,6 +27,16 @@ ExtractItem = ExtractRequest | ModelFile
 ExtractCommand = tuple[ExtractItem, Optional[str]]
 
 
+class ExtractBasePathsCommand:
+    def __init__(self,
+                 out_dir_path: str,
+                 local_path: str,
+                 local_path_fallback: Optional[str]):
+        self.out_dir_path = out_dir_path
+        self.local_path = local_path
+        self.local_path_fallback = local_path_fallback
+
+
 class ExtractStatusResult:
     def __init__(self, timestamp: datetime, statuses: list[ExtractStatus]):
         self.timestamp = timestamp
@@ -170,6 +180,21 @@ class ExtractProcess(AppProcess):
         # Child-only synchronization must not cross the spawn pickle boundary.
         self.__inflight_flow_ids_lock: Optional[LockType] = None
 
+    def set_base_paths(self,
+                       out_dir_path: str,
+                       local_path: str,
+                       local_path_fallback: Optional[str]) -> None:
+        """Refresh the no-path-pair defaults in the parent and child process."""
+        self.__out_dir_path = out_dir_path
+        self.__local_path = local_path
+        self.__local_path_fallback = local_path_fallback
+        assert self.__command_queue is not None
+        self.__command_queue.put(ExtractBasePathsCommand(
+            out_dir_path,
+            local_path,
+            local_path_fallback,
+        ))
+
     @staticmethod
     def __extract_trace_selector_name(identifier: Optional[str]) -> Optional[str]:
         if identifier is None:
@@ -276,6 +301,16 @@ class ExtractProcess(AppProcess):
                     first_queue_read = False
                 else:
                     queue_item = self.__command_queue.get(block=False)
+                if isinstance(queue_item, ExtractBasePathsCommand):
+                    self.__out_dir_path = queue_item.out_dir_path
+                    self.__local_path = queue_item.local_path
+                    self.__local_path_fallback = queue_item.local_path_fallback
+                    self.__dispatch.set_base_paths(
+                        queue_item.out_dir_path,
+                        queue_item.local_path,
+                        queue_item.local_path_fallback,
+                    )
+                    continue
                 file, flow_id = self.__parse_extract_command(queue_item)
                 model_file = getattr(file, "model_file", file)
                 assert isinstance(model_file, ModelFile)

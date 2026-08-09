@@ -45,6 +45,13 @@ class TestValidateProcess(unittest.TestCase):
             self.process.close_queues()
             mp_logger.stop()
 
+    def test_set_base_paths_updates_parent_and_worker_paths(self):
+        self.process.set_base_paths("/data/root-a", "/remote/source-a")
+        self.process.run_loop()
+
+        self.assertEqual("/data/root-a", self.process._ValidateProcess__local_path)
+        self.assertEqual("/remote/source-a", self.process._ValidateProcess__remote_path)
+
     def test_validate_file_marks_validated_for_matching_checksum(self):
         file = ModelFile("movie.mkv", False)
         file.local_size = 3

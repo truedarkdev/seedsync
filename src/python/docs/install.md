@@ -38,15 +38,15 @@ Select the section for your platform:
         :::bash
         docker run \
            -p 127.0.0.1:8800:8800 \
-           -v <downloads directory>:/downloads \
-           [-v <mounts directory>:/mounts] \
+           [-v <downloads directory>:/downloads] \
+           [-v <additional directory>:/data/root-a] \
            -v <config directory>:/config \
            truedarkdev/seedsync:latest
 
     where
 
-    * `<downloads directory>` refers to the location on host machine where downloaded files will be placed
-    * `<mounts directory>` is optional and refers to an additional mounted or network-backed host location you want to expose inside the container
+    * `<downloads directory>` is the backward-compatible single-root location used by the default `/downloads` setting
+    * `<additional directory>` is any additional local or network-backed host location exposed at an absolute container path of your choice; add one bind for each distinct root
     * `<config directory>` refers to the location on host machine where config files will be placed
     * any host directories you mount must already exist
 
@@ -66,7 +66,7 @@ Select the section for your platform:
     startup. This compatibility path is intended for image-only upgrades; use
     the root-start `PUID`/`PGID` model for new deployments.
 
-    If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID.
+    If you need different container file permissions, set `UMASK` to an octal value such as `002` before starting Docker. Invalid values abort startup. The container runs with the configured primary `PUID`/`PGID` only, so it does not retain supplementary groups; mounted paths should be writable by that UID/GID. Container-path prefixes are not special: SeedSync validates the roots actually used by enabled path pairs and active staging/extraction settings. You may omit an explicit `/downloads` bind after enabled path pairs use other mounted roots; disabled historical pairs do not require their old roots. Original deployments can keep `/downloads` unchanged.
 
     If you receive errors related to locale when connecting to the remote server, then also include
     the following options.
@@ -79,8 +79,7 @@ Select the section for your platform:
 2. Access application GUI by going to [http://localhost:8800](http://localhost:8800) in your browser.
 
 3. Go to the Settings page and fill out the required information.
-   Under the Local Directory setting, enter `/downloads` for ordinary local storage.
-   If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
+   Under the Local Directory setting, enter `/downloads` for the backward-compatible single-root setup, or configure enabled path pairs with the exact absolute container paths you mounted (for example, `/data/root-a`).
    SFTP is the default transfer protocol. To opt in to FTPS for bulk transfers, keep SSH configured for file discovery, then set the Transfer Protocol and Remote FTP Port for your server. FTPS certificate verification is enabled by default; disable it only for self-signed or legacy servers.
 
 4. **While password-based login is supported, key-based authentication is highly recommended!**
@@ -143,8 +142,7 @@ contract. Use the tracked Windows Compose override below; it replaces only the
 5. Verify that the normal SeedSync application loads after the claim.
 
 6. Go to the Settings page and fill out the required information.
-   Under the Local Directory setting, enter `/downloads` for ordinary local storage.
-   If you mounted an additional network-backed location into the container, you can instead use a subdirectory under `/mounts`.
+   Under the Local Directory setting, enter `/downloads` for the backward-compatible single-root setup, or configure enabled path pairs with the exact absolute container paths you mounted (for example, `/data/root-a`). Container-path prefixes are not special.
    SFTP is the default transfer protocol. To opt in to FTPS for bulk transfers, keep SSH configured for file discovery, then set the Transfer Protocol and Remote FTP Port for your server. FTPS certificate verification is enabled by default; disable it only for self-signed or legacy servers.
 
 7. **While password-based login is supported, key-based authentication is highly recommended!**

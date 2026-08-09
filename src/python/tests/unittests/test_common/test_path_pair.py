@@ -279,24 +279,11 @@ class TestPathPairManager(unittest.TestCase):
         self.assertTrue(os.path.isfile(self.manager.file_path + ".1.bak"))
 
     @patch("common.path_pair.is_running_in_docker", return_value=True)
-    def test_validate_returns_docker_warning_for_non_downloads_path(self, _):
+    def test_validate_allows_arbitrary_path_in_docker(self, _):
         warnings = PathPair(
-            name="Movies",
-            remote_path="/remote/movies",
-            local_path="/media/movies"
-        ).validate()
-
-        self.assertEqual(1, len(warnings))
-        self.assertIn("/media/movies", warnings[0])
-        self.assertIn("/downloads", warnings[0])
-        self.assertIn("/mounts", warnings[0])
-
-    @patch("common.path_pair.is_running_in_docker", return_value=True)
-    def test_validate_allows_mounts_path_in_docker(self, _):
-        warnings = PathPair(
-            name="Movies",
-            remote_path="/remote/movies",
-            local_path="/mounts/nas/movies"
+            name="Pair Alpha",
+            remote_path="/remote/source-a",
+            local_path="/data/root-a"
         ).validate()
 
         self.assertEqual([], warnings)

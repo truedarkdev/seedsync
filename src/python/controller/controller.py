@@ -537,16 +537,14 @@ class Controller:
         )
         self.__password = self.__ssh_password
 
+        # Preserve the configured legacy roots independently from the runtime
+        # fallback. The latter follows the first enabled pair and must return
+        # to these configured values when no pairs remain enabled.
+        self.__configured_legacy_local_path = lftp_cfg.local_path
+        self.__configured_legacy_remote_path = lftp_cfg.remote_path
         enabled_path_pairs = self.__get_enabled_path_pairs()
-        first_path_pair = enabled_path_pairs[0] if enabled_path_pairs else None
-        legacy_local_path = lftp_cfg.local_path
-        if Controller._is_missing_startup_value(legacy_local_path) and first_path_pair is not None:
-            legacy_local_path = first_path_pair.local_path
-        legacy_remote_path = lftp_cfg.remote_path
-        if Controller._is_missing_startup_value(legacy_remote_path) and first_path_pair is not None:
-            legacy_remote_path = first_path_pair.remote_path
-        self.__legacy_local_path = Controller.__require_runtime_path(legacy_local_path, "Lftp.local_path")
-        self.__legacy_remote_path = Controller.__require_runtime_path(legacy_remote_path, "Lftp.remote_path")
+        self.__legacy_local_path, self.__legacy_remote_path = \
+            self.__resolve_runtime_fallback_paths(enabled_path_pairs)
 
         self.__explicit_staging_path_configured = bool(
             isinstance(lftp_cfg.staging_path, str) and lftp_cfg.staging_path.strip()
@@ -693,12 +691,125 @@ class Controller:
             return []
         return self.__context.path_pair_manager.get_enabled_pairs()
 
+    def __resolve_runtime_fallback_paths(self, enabled_path_pairs: Sequence[PathPair]) -> tuple[str, str]:
+        first_path_pair = enabled_path_pairs[0] if enabled_path_pairs else None
+        local_path = first_path_pair.local_path if first_path_pair is not None else self.__configured_legacy_local_path
+        remote_path = first_path_pair.remote_path if first_path_pair is not None else self.__configured_legacy_remote_path
+        return (
+            Controller.__require_runtime_path(local_path, "Lftp.local_path"),
+            Controller.__require_runtime_path(remote_path, "Lftp.remote_path"),
+        )
+
+    def __apply_runtime_fallback_paths(self,
+                                       local_path: str,
+                                       remote_path: str,
+                                       staging_path: str) -> None:
+        """Apply the no-path-pair fallback consistently across collaborators."""
+        self.__legacy_local_path = local_path
+        self.__legacy_remote_path = remote_path
+        self.__staging_path = staging_path
+        self.__lftp.set_base_remote_dir_path(remote_path)
+        self.__lftp.set_base_local_dir_path(staging_path)
+
+        extract_process = getattr(self, "_Controller__extract_process", None)
+        if extract_process is not None:
+            controller_cfg = self.__context.config.controller
+            extract_out_dir = local_path if getattr(controller_cfg, "use_local_path_as_extract_path", True) else \
+                Controller.__require_runtime_path(controller_cfg.extract_path, "Controller.extract_path")
+            extract_process.set_base_paths(
+                out_dir_path=extract_out_dir,
+                local_path=local_path,
+                local_path_fallback=staging_path,
+            )
+
+        validate_process = getattr(self, "_Controller__validate_process", None)
+        if validate_process is not None:
+            validate_process.set_base_paths(local_path, remote_path)
+
+    def __preflight_runtime_storage_roots(
+            self,
+            enabled_path_pairs: Sequence[PathPair],
+            path_pair_staging_paths: Dict[str, str],
+            fallback_local_path: Optional[str] = None,
+            fallback_staging_path: Optional[str] = None) -> None:
+        """Fail before workers use configured storage roots.
+
+        Staging and explicit extraction directories retain the existing
+        controller/extractor creation behavior. Final roots are probed after
+        those creation steps so a new pair's staging child can establish its
+        previously-created parent root.
+        """
+        config = self.__context.config
+        controller_cfg = config.controller
+        roots: list[tuple[str, str, bool]] = []
+        if enabled_path_pairs:
+            for pair in enabled_path_pairs:
+                roots.append((pair.local_path, "path pair '{}' local root".format(pair.name), False))
+                roots.append((
+                    path_pair_staging_paths[pair.id],
+                    "path pair '{}' staging root".format(pair.name),
+                    True,
+                ))
+        else:
+            roots.extend((
+                (fallback_local_path or self.__legacy_local_path, "legacy local root", False),
+                (fallback_staging_path or self.__staging_path, "legacy staging root", True),
+            ))
+
+        if controller_cfg.use_local_path_as_extract_path is False:
+            extract_path = Controller.__require_runtime_path(
+                controller_cfg.extract_path,
+                "Controller.extract_path",
+            )
+            roots.append((extract_path, "explicit extraction root", True))
+
+        deduplicated_roots: dict[str, tuple[str, str, bool]] = {}
+        for root, label, create_if_staging in roots:
+            root_key = os.path.normcase(os.path.abspath(root))
+            if root_key in deduplicated_roots:
+                previous_root, previous_label, previous_create = deduplicated_roots[root_key]
+                deduplicated_roots[root_key] = (previous_root, previous_label, previous_create or create_if_staging)
+            else:
+                deduplicated_roots[root_key] = (root, label, create_if_staging)
+
+        for root, _, create_if_staging in deduplicated_roots.values():
+            if create_if_staging:
+                try:
+                    os.makedirs(root, exist_ok=True)
+                except OSError as exc:
+                    raise ControllerError(
+                        "Required runtime storage root '{}' is not creatable: {}".format(root, exc)
+                    ) from exc
+
+        for root, label, _ in deduplicated_roots.values():
+            probe_path = None
+            try:
+                descriptor, probe_path = tempfile.mkstemp(prefix=".seedsync_write_test.", dir=root)
+                os.close(descriptor)
+                os.unlink(probe_path)
+                probe_path = None
+            except OSError as exc:
+                raise ControllerError(
+                    "Required runtime storage root '{}' ({}) is not writable: {}".format(root, label, exc)
+                ) from exc
+            finally:
+                if probe_path is not None:
+                    try:
+                        os.unlink(probe_path)
+                    except OSError:
+                        pass
+
     def __refresh_path_pair_runtime_state(self, enabled_path_pairs: Optional[List[PathPair]] = None):
         if enabled_path_pairs is None:
             enabled_path_pairs = self.__get_enabled_path_pairs()
 
         config = self.__context.config
         controller_cfg = config.controller
+        fallback_local_path, fallback_remote_path = self.__resolve_runtime_fallback_paths(enabled_path_pairs)
+        fallback_staging_path = self.__build_staging_path(
+            fallback_local_path,
+            config.lftp.staging_path,
+        )
         path_pairs_by_id: Dict[str, PathPair] = {pair.id: pair for pair in enabled_path_pairs}
         path_pair_staging_paths: Dict[str, str] = {
             pair.id: self.__build_path_pair_staging_path(pair)
@@ -715,9 +826,13 @@ class Controller:
             )
             for pair in enabled_path_pairs
         ]
-        active_scanner = self.__build_active_scanner(enabled_path_pairs, path_pair_staging_paths)
-        local_scanner = self.__build_local_scanner(enabled_path_pairs, path_pair_staging_paths)
-        remote_scanner = self.__build_remote_scanner(enabled_path_pairs)
+        active_scanner = self.__build_active_scanner(
+            enabled_path_pairs, path_pair_staging_paths, fallback_staging_path
+        )
+        local_scanner = self.__build_local_scanner(
+            enabled_path_pairs, path_pair_staging_paths, fallback_local_path, fallback_staging_path
+        )
+        remote_scanner = self.__build_remote_scanner(enabled_path_pairs, fallback_remote_path)
         active_scan_process = ScannerProcess(
             scanner=active_scanner,
             interval_in_ms=Controller.__require_runtime_int(
@@ -743,6 +858,11 @@ class Controller:
 
         old_path_pairs_by_id = self.__path_pairs_by_id
         old_path_pair_staging_paths = self.__path_pair_staging_paths
+        old_fallback_paths = (
+            self.__legacy_local_path,
+            self.__legacy_remote_path,
+            self.__staging_path,
+        )
         old_runtime = (
             getattr(self, "_Controller__active_scanner", None),
             getattr(self, "_Controller__local_scanner", None),
@@ -752,11 +872,23 @@ class Controller:
             getattr(self, "_Controller__remote_scan_process", None),
         )
         try:
+            if getattr(self, "_Controller__started", False):
+                self.__preflight_runtime_storage_roots(
+                    enabled_path_pairs,
+                    path_pair_staging_paths,
+                    fallback_local_path,
+                    fallback_staging_path,
+                )
             # A path alias can be repointed after API preflight but before
             # asynchronous activation. Re-bind both configured paths to the
             # reserved directory identity immediately before collaborators see
             # the new roots.
             self.__validate_reserved_relocation_identities(path_pairs_by_id)
+            self.__apply_runtime_fallback_paths(
+                fallback_local_path,
+                fallback_remote_path,
+                fallback_staging_path,
+            )
             self.__set_transfer_path_pairs(lftp_path_pairs)
             self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
             self.__path_pairs_by_id = path_pairs_by_id
@@ -776,6 +908,7 @@ class Controller:
                 self.__set_transfer_path_pairs(self.__build_lftp_path_pairs(
                     old_path_pairs_by_id, old_path_pair_staging_paths
                 ))
+                self.__apply_runtime_fallback_paths(*old_fallback_paths)
                 self.__refresh_model_builder_local_paths(old_path_pairs_by_id, old_path_pair_staging_paths)
                 self.__sync_persist_to_model_builder_if_ready()
             except Exception as restore_exc:
@@ -817,17 +950,21 @@ class Controller:
     def __refresh_model_builder_local_paths(
             self,
             path_pairs_by_id: Optional[Dict[str, PathPair]] = None,
-            path_pair_staging_paths: Optional[Dict[str, str]] = None):
+            path_pair_staging_paths: Optional[Dict[str, str]] = None,
+            fallback_local_path: Optional[str] = None,
+            fallback_staging_path: Optional[str] = None):
         if path_pairs_by_id is None:
             path_pairs_by_id = self.__path_pairs_by_id
         if path_pair_staging_paths is None:
             path_pair_staging_paths = self.__path_pair_staging_paths
 
-        local_root_paths: Dict[Optional[str], str] = {None: self.__legacy_local_path}
-        local_staging_paths: Dict[Optional[str], str] = {None: self.__staging_path}
+        local_root_paths: Dict[Optional[str], str] = {None: fallback_local_path or self.__legacy_local_path}
+        local_staging_paths: Dict[Optional[str], str] = {None: fallback_staging_path or self.__staging_path}
         for pair_id, pair in path_pairs_by_id.items():
             local_root_paths[pair_id] = pair.local_path
-            local_staging_paths[pair_id] = path_pair_staging_paths.get(pair_id, self.__staging_path)
+            local_staging_paths[pair_id] = path_pair_staging_paths.get(
+                pair_id, fallback_staging_path or self.__staging_path
+            )
         self.__model_builder.set_local_root_paths(local_root_paths, local_staging_paths)
 
     def __record_path_pair_runtime_error(self, error_msg: str):
@@ -853,7 +990,10 @@ class Controller:
         self.__path_pair_runtime_error = None
 
     def __build_active_scanner(
-        self, enabled_path_pairs: List[PathPair], path_pair_staging_paths: dict[str, str]
+        self,
+        enabled_path_pairs: List[PathPair],
+        path_pair_staging_paths: dict[str, str],
+        fallback_staging_path: Optional[str] = None,
     ) -> ActiveScannerRuntime:
         config = self.__context.config
         if enabled_path_pairs:
@@ -861,12 +1001,16 @@ class Controller:
                 pair.id: path_pair_staging_paths[pair.id] for pair in enabled_path_pairs
             }, use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"))
         return ActiveScanner(
-            self.__staging_path,
+            fallback_staging_path or self.__staging_path,
             use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file")
         )
 
     def __build_local_scanner(
-        self, enabled_path_pairs: List[PathPair], path_pair_staging_paths: dict[str, str]
+        self,
+        enabled_path_pairs: List[PathPair],
+        path_pair_staging_paths: dict[str, str],
+        fallback_local_path: Optional[str] = None,
+        fallback_staging_path: Optional[str] = None,
     ) -> LocalScannerRuntime:
         config = self.__context.config
         if enabled_path_pairs:
@@ -884,16 +1028,19 @@ class Controller:
                 ) for pair in enabled_path_pairs
             ])
         return LocalScanner(
-            local_path=self.__legacy_local_path,
+            local_path=fallback_local_path or self.__legacy_local_path,
             use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"),
-            staging_path=self.__staging_path,
+            staging_path=fallback_staging_path or self.__staging_path,
             managed_extract_folders_enabled=Controller.__require_runtime_bool(
                 config.controller.managed_extract_folders_enabled,
                 "Controller.managed_extract_folders_enabled",
             )
         )
 
-    def __build_remote_scanner(self, enabled_path_pairs: List[PathPair]) -> RemoteScannerRuntime:
+    def __build_remote_scanner(
+            self,
+            enabled_path_pairs: List[PathPair],
+            fallback_remote_path: Optional[str] = None) -> RemoteScannerRuntime:
         config = self.__context.config
         remote_python_path = getattr(config.lftp, "remote_python_path", None)
         if not isinstance(remote_python_path, str):
@@ -922,7 +1069,7 @@ class Controller:
             remote_username=Controller.__require_runtime_path(config.lftp.remote_username, "Lftp.remote_username"),
             remote_password=self.__ssh_password,
             remote_port=Controller.__require_runtime_int(config.lftp.remote_port, "Lftp.remote_port"),
-            remote_path_to_scan=self.__legacy_remote_path,
+            remote_path_to_scan=fallback_remote_path or self.__legacy_remote_path,
             local_path_to_scan_script=Controller.__require_runtime_path(
                 self.__context.args.local_path_to_scanfs, "Args.local_path_to_scanfs"
             ),
@@ -1215,12 +1362,14 @@ class Controller:
             self,
             path_pairs_by_id: Dict[str, PathPair],
             path_pair_staging_paths: Dict[str, str],
+            fallback_paths: tuple[str, str, str],
             active_scanner: ActiveScannerRuntime,
             local_scanner: LocalScannerRuntime,
             remote_scanner: RemoteScannerRuntime,
             active_scan_process: ScannerProcess,
             local_scan_process: ScannerProcess,
             remote_scan_process: ScannerProcess) -> None:
+        self.__apply_runtime_fallback_paths(*fallback_paths)
         self.__set_transfer_path_pairs(self.__build_lftp_path_pairs(path_pairs_by_id, path_pair_staging_paths))
         self.__refresh_model_builder_local_paths(path_pairs_by_id, path_pair_staging_paths)
         validation_path_pairs: dict[str, object] = dict(path_pairs_by_id)
@@ -1285,6 +1434,11 @@ class Controller:
         old_remote_scan_process = self.__remote_scan_process
         old_path_pairs_by_id = self.__path_pairs_by_id
         old_path_pair_staging_paths = self.__path_pair_staging_paths
+        old_fallback_paths = (
+            self.__legacy_local_path,
+            self.__legacy_remote_path,
+            self.__staging_path,
+        )
         old_active_scanner = self.__active_scanner
         old_local_scanner = self.__local_scanner
         old_remote_scanner = self.__remote_scanner
@@ -1312,8 +1466,6 @@ class Controller:
                 self.__validate_process.set_path_pairs_by_id(refreshed_validation_pairs)
 
             if was_started:
-                for staging_path in self.__path_pair_staging_paths.values():
-                    os.makedirs(staging_path, exist_ok=True)
                 self.__active_scan_process.start()
                 self.__local_scan_process.start()
                 self.__remote_scan_process.start()
@@ -1345,6 +1497,7 @@ class Controller:
                 try:
                     self.__restore_path_pair_runtime_state(
                         old_path_pairs_by_id, old_path_pair_staging_paths,
+                        old_fallback_paths,
                         old_active_scanner, old_local_scanner, old_remote_scanner,
                         old_active_scan_process, old_local_scan_process, old_remote_scan_process
                     )
@@ -1383,9 +1536,10 @@ class Controller:
         self.__reconciled_local_path_pair_ids = set()
         self.__reconciled_remote_path_pair_ids = set()
         self.__current_process_final_publication_file_ids = set()
-        os.makedirs(self.__staging_path, exist_ok=True)
-        for staging_path in self.__path_pair_staging_paths.values():
-            os.makedirs(staging_path, exist_ok=True)
+        self.__preflight_runtime_storage_roots(
+            list(self.__path_pairs_by_id.values()),
+            self.__path_pair_staging_paths,
+        )
         # Keep partial startup failure separate so exit() can clean up already
         # started workers without making process() look fully live.
         self.__startup_failed = False

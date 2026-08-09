@@ -53,8 +53,8 @@ When multiple enabled path pairs are active, the Files page also shows a path-pa
 `Enabled` controls whether a path pair is active, and `Auto-queue` is applied per path pair.
 
 To relocate an enabled local path without losing its path-pair identity or history, first expose the same
-data under both the old and new container paths (for example, keep `/downloads/movies` and add
-`/mounts/movies` as aliases for the same Unraid share). Wait until the pair has no queued or active
+data under both the old and new container paths (for example, keep `/downloads/root-a` and add
+`/data/root-a` as aliases for the same host directory). Wait until the pair has no queued or active
 work, then change the local path in Settings. SeedSync checks that both paths exist and resolve to the
 same directory; it does not copy or move data. A new container without the retained `/config` directory
 also loses `path_pairs.json`, settings, controller and AutoQueue persistence, and API-key/browser-claim
@@ -64,6 +64,11 @@ that reconciliation, a complete size-matched local file (including a zero-byte f
 not downloaded or deleted. Remote-only content queues only when that path pair has `Auto-queue` enabled;
 otherwise it remains unqueued for manual action. Local-only content is left untouched, and partial or
 conflicting local content is never silently overwritten.
+
+Container-path prefixes do not change these rules. SeedSync requires write access only to roots currently
+used by enabled path pairs and active staging/extraction settings. A disabled historical pair does not make
+its old root mandatory, and `/downloads` remains the backward-compatible default rather than a universal
+requirement.
 
 ## AutoQueue
 
