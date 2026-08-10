@@ -166,6 +166,17 @@ class RemoteScanner(IScanner):
     def path_pair_name(self) -> Optional[str]:
         return self.__path_pair_name
 
+    def export_recycled_state(self) -> tuple[bool, str]:
+        """Return the small mutable state that must survive one-shot workers."""
+        return self.__first_run, self.__remote_path_to_scan_script
+
+    def apply_recycled_state(self, state: object) -> None:
+        if not isinstance(state, tuple) or len(state) != 2 or \
+                type(state[0]) is not bool or not isinstance(state[1], str):
+            raise TypeError("Invalid recycled remote scanner state")
+        self.__first_run = state[0]
+        self.__remote_path_to_scan_script = state[1]
+
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("RemoteScanner")

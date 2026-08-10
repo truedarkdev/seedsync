@@ -57,7 +57,7 @@ def _clone_system_file(system_file: SystemFile, children: Sequence[SystemFile] |
     cloned.path_pair_id = system_file.path_pair_id
     cloned.path_pair_name = system_file.path_pair_name
     cloned.status_sidecar_ready = system_file.status_sidecar_ready
-    for child in children if children is not None else system_file.children:
+    for child in children if children is not None else system_file.iter_children():
         cloned.add_child(child)
     return cloned
 
@@ -80,7 +80,7 @@ def _filter_excluded_tree(
         return _clone_system_file(system_file)
 
     filtered_children: List[SystemFile] = []
-    for child in system_file.children:
+    for child in system_file.iter_children():
         filtered_child = _filter_excluded_tree(
             child,
             _child_relative_path(relative_path, child.name),

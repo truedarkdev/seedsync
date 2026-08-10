@@ -102,6 +102,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__remote_scanner = MagicMock()
         self.controller._Controller__extract_process = MagicMock()
         self.controller._Controller__validate_process = MagicMock()
+        self.controller._Controller__extract_process.pid = None
+        self.controller._Controller__validate_process.pid = None
+        self.controller._Controller__extract_idle_deadline_monotonic = None
+        self.controller._Controller__validate_idle_deadline_monotonic = None
         self.controller._Controller__mp_logger = MagicMock()
         self.controller._Controller__updater = MagicMock()
         self.controller._Controller__target_archive_trace_logger = MagicMock()
@@ -392,6 +396,11 @@ class TestController(unittest.TestCase):
             self.controller._Controller__extract_process,
             self.controller._Controller__validate_process,
         ):
+            if process.pid is None:
+                process.terminate.assert_not_called()
+                process.join.assert_not_called()
+                process.close_queues.assert_called_once_with()
+                continue
             process.terminate.assert_called_once_with()
             process.join.assert_called_once_with(join_timeout)
             if process in still_alive_processes:
@@ -1283,6 +1292,7 @@ class TestController(unittest.TestCase):
 
     def test_exit_continues_shutdown_when_process_join_fails(self):
         self.controller._Controller__started = True
+        self.controller._Controller__extract_process.pid = 123
         self.controller._Controller__extract_process.join.side_effect = RuntimeError("join failed")
         self._set_exit_worker_processes_not_alive()
 
@@ -1296,6 +1306,7 @@ class TestController(unittest.TestCase):
 
     def test_exit_continues_when_worker_join_times_out(self):
         self.controller._Controller__started = True
+        self.controller._Controller__extract_process.pid = 123
         self._set_exit_worker_processes_not_alive()
         stuck_process = self.controller._Controller__extract_process
         stuck_process.is_alive.return_value = True
@@ -1407,15 +1418,15 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.start.assert_called_once_with()
         self.controller._Controller__local_scan_process.start.assert_called_once_with()
         self.controller._Controller__remote_scan_process.start.assert_called_once_with()
-        self.controller._Controller__extract_process.start.assert_called_once_with()
-        self.controller._Controller__validate_process.start.assert_called_once_with()
+        self.controller._Controller__extract_process.start.assert_not_called()
+        self.controller._Controller__validate_process.start.assert_not_called()
         self.controller._Controller__mp_logger.start.assert_called_once_with()
         preflight.assert_called_once_with([], {})
         self.assertTrue(self.controller._Controller__started)
 
     @patch.object(Controller, "_Controller__preflight_runtime_storage_roots")
     def test_start_leaves_started_false_if_child_start_fails(self, _preflight):
-        self.controller._Controller__extract_process.start.side_effect = RuntimeError("boom")
+        self.controller._Controller__mp_logger.start.side_effect = RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
             self.controller.start()
@@ -1425,9 +1436,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__active_scan_process.start.assert_called_once_with()
         self.controller._Controller__local_scan_process.start.assert_called_once_with()
         self.controller._Controller__remote_scan_process.start.assert_called_once_with()
-        self.controller._Controller__extract_process.start.assert_called_once_with()
+        self.controller._Controller__extract_process.start.assert_not_called()
         self.controller._Controller__validate_process.start.assert_not_called()
-        self.controller._Controller__mp_logger.start.assert_not_called()
+        self.controller._Controller__mp_logger.start.assert_called_once_with()
         self.controller._Controller__propagate_exceptions = MagicMock()
         self.controller._Controller__cleanup_commands = MagicMock()
         self.controller._Controller__process_commands = MagicMock()
@@ -1543,7 +1554,7 @@ class TestController(unittest.TestCase):
 
     @patch.object(Controller, "_Controller__preflight_runtime_storage_roots")
     def test_process_rejects_partial_start_failure_before_exit(self, _preflight):
-        self.controller._Controller__validate_process.start.side_effect = RuntimeError("boom")
+        self.controller._Controller__mp_logger.start.side_effect = RuntimeError("boom")
 
         with self.assertRaises(RuntimeError):
             self.controller.start()
@@ -2516,6 +2527,11 @@ class TestController(unittest.TestCase):
             scanner_process_cls.side_effect = [MagicMock(), MagicMock(), MagicMock()]
             controller = Controller(context, ControllerPersist())
 
+        self.assertEqual(
+            [False, False, True],
+            [call.kwargs["recycle_scan_worker"] for call in scanner_process_cls.call_args_list],
+        )
+
         controller._Controller__lftp.status.return_value = []
         controller._Controller__lftp.last_status_poll_healthy = True
         controller._Controller__active_scan_process.pop_latest_result.return_value = None
@@ -2658,6 +2674,8 @@ class TestController(unittest.TestCase):
         callback.on_success.assert_not_called()
 
     def test_propagate_exceptions_ignores_pending_transfer_backend_errors(self):
+        self.controller._Controller__extract_process.pid = 123
+        self.controller._Controller__validate_process.pid = 456
         self.controller._Controller__lftp.raise_pending_error.side_effect = LftpError("pending failure")
 
         self.controller._Controller__propagate_exceptions()
@@ -2671,6 +2689,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
 
     def test_propagate_exceptions_ignores_extract_and_validate_worker_failures(self):
+        self.controller._Controller__extract_process.pid = 123
+        self.controller._Controller__validate_process.pid = 456
         self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
         self.controller._Controller__local_scan_process.propagate_exception.return_value = None
         self.controller._Controller__active_scan_process.propagate_exception.return_value = None
@@ -2692,6 +2712,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.propagate_exception.assert_called_once_with()
 
     def test_propagate_exceptions_reports_dead_extract_and_validate_workers_once(self):
+        self.controller._Controller__extract_process.pid = 123
+        self.controller._Controller__validate_process.pid = 456
         self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
         self.controller._Controller__local_scan_process.propagate_exception.return_value = None
         self.controller._Controller__active_scan_process.propagate_exception.return_value = None
@@ -2731,6 +2753,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__mp_logger.propagate_exception.return_value = None
         self.controller._Controller__extract_process.propagate_exception.return_value = None
         self.controller._Controller__validate_process.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.pid = 1
+        self.controller._Controller__validate_process.pid = 1
         self.controller._Controller__extract_process.is_alive.return_value = True
         self.controller._Controller__validate_process.is_alive.return_value = True
 
@@ -2740,6 +2764,20 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.is_alive.assert_called_once_with()
         self.controller._Controller__validate_process.is_alive.assert_called_once_with()
 
+    def test_propagate_exceptions_skips_dormant_auxiliary_workers(self):
+        self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__local_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__active_scan_process.propagate_exception.return_value = None
+        self.controller._Controller__mp_logger.propagate_exception.return_value = None
+
+        self.controller._Controller__propagate_exceptions()
+
+        self.controller._Controller__extract_process.propagate_exception.assert_not_called()
+        self.controller._Controller__validate_process.propagate_exception.assert_not_called()
+        self.controller._Controller__extract_process.is_alive.assert_not_called()
+        self.controller._Controller__validate_process.is_alive.assert_not_called()
+        self.controller.logger.error.assert_not_called()
+
     def test_propagate_exceptions_reports_workers_dead_once_when_is_alive_raises(self):
         self.controller._Controller__remote_scan_process.propagate_exception.return_value = None
         self.controller._Controller__local_scan_process.propagate_exception.return_value = None
@@ -2747,6 +2785,8 @@ class TestController(unittest.TestCase):
         self.controller._Controller__mp_logger.propagate_exception.return_value = None
         self.controller._Controller__extract_process.propagate_exception.return_value = None
         self.controller._Controller__validate_process.propagate_exception.return_value = None
+        self.controller._Controller__extract_process.pid = 1
+        self.controller._Controller__validate_process.pid = 1
         self.controller._Controller__extract_process.is_alive.side_effect = AssertionError("not started")
         self.controller._Controller__validate_process.is_alive.side_effect = ValueError("already closed")
 
@@ -5789,6 +5829,90 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands()
 
         self.controller._Controller__validate_process.validate.assert_called_once_with(file)
+
+    def test_first_auxiliary_dispatch_starts_worker_once(self):
+        file = ModelFile("dup", False)
+        file.local_size = 10
+        file.remote_size = 10
+        file.state = ModelFile.State.DOWNLOADED
+        validate_process = self.controller._Controller__validate_process
+        validate_process.start.side_effect = lambda: setattr(validate_process, "pid", 123)
+        self.controller._Controller__model.get_file.return_value = file
+
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.VALIDATE, "dup"))
+        self.controller.queue_command(Controller.Command(Controller.Command.Action.VALIDATE, "dup"))
+        self.controller._Controller__process_commands()
+
+        validate_process.start.assert_called_once_with()
+        self.assertEqual(2, validate_process.validate.call_count)
+        self.assertEqual({file.file_id}, self.controller._Controller__pending_validation_file_ids)
+
+    def test_auxiliary_worker_reap_waits_for_all_inflight_dispatches(self):
+        extract_process = self.controller._Controller__extract_process
+        extract_process.pid = 123
+        self.controller._Controller__pending_extract_file_ids = {"first", "second"}
+        self.controller._Controller__extract_idle_deadline_monotonic = 0
+
+        self.controller._Controller__reap_idle_auxiliary_workers()
+
+        extract_process.terminate.assert_not_called()
+        self.assertIsNone(self.controller._Controller__extract_idle_deadline_monotonic)
+
+    def test_terminal_observation_reaps_and_replaces_idle_auxiliary_worker(self):
+        extract_process = self.controller._Controller__extract_process
+        extract_process.pid = 123
+        self.controller._Controller__pending_extract_file_ids = {"done"}
+        self.controller._record_worker_terminal_ids({"done"}, set())
+        self.controller._Controller__extract_idle_deadline_monotonic = 0
+
+        with patch.object(self.controller, "_Controller__teardown_process", return_value=True) as teardown, \
+                patch.object(self.controller, "_Controller__replace_extract_process") as replace:
+            self.controller._Controller__reap_idle_auxiliary_workers()
+
+        teardown.assert_called_once_with("idle extract process", extract_process)
+        replace.assert_called_once_with()
+
+    def test_next_extract_dispatch_starts_replacement_worker(self):
+        replacement = MagicMock()
+        replacement.pid = None
+        replacement.start.side_effect = lambda: setattr(replacement, "pid", 456)
+        self.controller._Controller__extract_process = replacement
+
+        self.controller._Controller__ensure_extract_worker_started()
+
+        replacement.start.assert_called_once_with()
+
+    def test_dormant_auxiliary_workers_accept_clear_and_path_refresh_without_start(self):
+        self.controller._Controller__context.config.controller = SimpleNamespace(
+            use_local_path_as_extract_path=True,
+            extract_path=None,
+        )
+
+        self.controller._Controller__validate_process.clear("stale")
+        self.controller._Controller__apply_runtime_fallback_paths("/new-local", "/new-remote", "/new-local/incomplete")
+
+        self.controller._Controller__extract_process.start.assert_not_called()
+        self.controller._Controller__validate_process.start.assert_not_called()
+        self.controller._Controller__validate_process.clear.assert_called_once_with("stale")
+        self.controller._Controller__extract_process.set_base_paths.assert_called_once_with(
+            out_dir_path="/new-local",
+            local_path="/new-local",
+            local_path_fallback="/new-local/incomplete",
+        )
+        self.controller._Controller__validate_process.set_base_paths.assert_called_once_with("/new-local", "/new-remote")
+
+    def test_exit_before_first_auxiliary_dispatch_closes_dormant_workers(self):
+        self.controller._Controller__started = True
+        self._set_exit_worker_processes_not_alive()
+
+        self.controller.exit()
+
+        self.controller._Controller__extract_process.start.assert_not_called()
+        self.controller._Controller__validate_process.start.assert_not_called()
+        self.controller._Controller__extract_process.terminate.assert_not_called()
+        self.controller._Controller__validate_process.terminate.assert_not_called()
+        self.controller._Controller__extract_process.close_queues.assert_called_once_with()
+        self.controller._Controller__validate_process.close_queues.assert_called_once_with()
 
     def test_process_commands_extract_passes_flow_id_to_extract_process(self):
         file = ModelFile("dup", False)

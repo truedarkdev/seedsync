@@ -91,6 +91,15 @@ class MultiPathRemoteScanner(IScanner):
     def scanned_path_pair_ids(self) -> set[str | None]:
         return {scanner.path_pair_id for scanner in self.__scanners}
 
+    def export_recycled_state(self) -> tuple[object, ...]:
+        return tuple(scanner.export_recycled_state() for scanner in self.__scanners)
+
+    def apply_recycled_state(self, state: object) -> None:
+        if not isinstance(state, tuple) or len(state) != len(self.__scanners):
+            raise TypeError("Invalid recycled multi-path remote scanner state")
+        for scanner, scanner_state in zip(self.__scanners, state):
+            scanner.apply_recycled_state(scanner_state)
+
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         all_files: List[SystemFile] = []

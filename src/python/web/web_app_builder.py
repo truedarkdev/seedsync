@@ -73,7 +73,7 @@ class WebAppBuilder:
             self.__controller, getattr(context, "performance_diagnostics", None)
         )
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
-        self.performance_diagnostics_handler = PerformanceDiagnosticsHandler(context)
+        self.performance_diagnostics_handler = PerformanceDiagnosticsHandler(context, self.__controller)
         history_path = getattr(context.args, "history_log_path", None)
         self.historical_log_handler = HistoricalLogHandler(
             HistoricalLogStore(history_path, 10), context.logger

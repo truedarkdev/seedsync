@@ -17,7 +17,7 @@ CandidateMatch = tuple[ModelFile, Optional["AutoQueuePattern"]]
 
 
 class _AutoQueueController(Protocol):
-    def get_model_files(self) -> list[ModelFile]: ...
+    def _get_model_root_references(self) -> list[ModelFile]: ...
     def get_model_files_and_add_listener(self, listener: IModelListener) -> list[ModelFile]: ...
     def is_file_stopped(self, filename: str) -> bool: ...
     def clear_extracted_marker(self, file: ModelFile) -> None: ...
@@ -714,7 +714,10 @@ class AutoQueue:
         return not callable(checker) or bool(checker(file.path_pair_id))
 
     def __current_model_by_id(self) -> dict[str, ModelFile]:
-        return {file.file_id: file for file in self.__controller.get_model_files()}
+        return {
+            file.file_id: file
+            for file in self.__controller._get_model_root_references()
+        }
 
     def __filter_candidates(self,
                             candidates: list[ModelFile],

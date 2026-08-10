@@ -50,6 +50,7 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
         reader = TestApp(self.web_app, extra_environ={"HTTP_AUTHORIZATION": "Bearer {}".format(reader_secret)})
         for method, path in (
             (reader.get, "/server/admin/performance-diagnostics/v1"),
+            (reader.get, "/server/admin/performance-diagnostics/v1/ownership"),
             (reader.get, "/server/admin/performance-diagnostics/v1/export"),
             (reader.post, "/server/admin/performance-diagnostics/v1/reset"),
         ):
@@ -59,6 +60,24 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
         self.assertEqual(400, bad_limit.status_int)
         bad_since = self.test_app.get("/server/admin/performance-diagnostics/v1?since_sequence=-1", expect_errors=True)
         self.assertEqual(400, bad_since.status_int)
+
+    def test_admin_can_request_numeric_ownership_census(self):
+        self.controller.get_memory_ownership_census.return_value = {
+            "schema": "seedsync.memory-ownership-census.v1",
+            "enabled": True,
+            "truncated": False,
+            "visited_object_count": 3,
+            "total_shallow_bytes": 120,
+            "owners": {"live_model_graph": {"object_count": 3, "shallow_bytes": 120}},
+        }
+
+        response = self.test_app.get("/server/admin/performance-diagnostics/v1/ownership")
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual("seedsync.memory-ownership-census.v1", payload["schema"])
+        self.assertEqual(120, payload["total_shallow_bytes"])
+        self.assertNotIn("sensitive-test-string", response.text)
+        self.controller.get_memory_ownership_census.assert_called_once_with()
 
     def test_export_has_fixed_bounds_without_request_paths(self):
         response = self.test_app.get("/server/admin/performance-diagnostics/v1/export?path=/etc/passwd")

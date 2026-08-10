@@ -393,6 +393,22 @@ class TestSshcp(unittest.TestCase):
             "echo hi",
         ])
 
+    def test_posix_spawn_uses_bounded_bulk_output_reads(self):
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        spawn = MagicMock()
+
+        with patch("ssh.sshcp.pexpect.spawn", return_value=spawn, create=True) as pexpect_spawn:
+            created, using_fallback = sshcp._Sshcp__spawn_process("ssh", ["host", "echo hi"])
+
+        self.assertIs(spawn, created)
+        self.assertFalse(using_fallback)
+        pexpect_spawn.assert_called_once_with(
+            "ssh",
+            ["host", "echo hi"],
+            maxread=64 * 1024,
+            searchwindowsize=1024,
+        )
+
     @parameterized.expand(_PARAMS)
     @requires_live_ssh
     def test_shell_error_bad_host(self, _, password):

@@ -101,6 +101,21 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertEqual("my remote user", self.ssh_args["user"])
         self.assertEqual("my password", self.ssh_args["password"])
 
+    def test_recycled_state_preserves_first_run_and_fallback_script_path(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/files",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/tmp/scanfs",
+        )
+
+        scanner.apply_recycled_state((False, "~/scanfs"))
+
+        self.assertEqual((False, "~/scanfs"), scanner.export_recycled_state())
+
     def test_installs_scan_script_on_first_scan(self):
         scanner = RemoteScanner(
             remote_address="my remote address",

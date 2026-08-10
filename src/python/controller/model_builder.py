@@ -382,7 +382,7 @@ class ModelBuilder:
         current_path = system_file.name if parent_path is None else os.path.join(parent_path, system_file.name)
         effective_path_pair_id = system_file.path_pair_id if system_file.path_pair_id is not None else path_pair_id
         file_ids.add(ModelFile.build_file_id(current_path, effective_path_pair_id))
-        for child in system_file.children:
+        for child in system_file.iter_children():
             ModelBuilder.__collect_active_file_ids(child, file_ids, current_path, effective_path_pair_id)
 
     @staticmethod
@@ -722,7 +722,7 @@ class ModelBuilder:
             return True
         return any(
             ModelBuilder.__has_remote_transferable_content(child)
-            for child in remote_file.children
+            for child in remote_file.iter_children()
         )
 
     @staticmethod
@@ -1186,20 +1186,22 @@ class ModelBuilder:
 
     def set_local_files(self, local_files: List[SystemFile]) -> None:
         prev_local_files = self.__local_files
-        self.__local_files = {
+        next_local_files = {
             self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
         }
         # Invalidate the cache
-        if self.__local_files != prev_local_files:
+        if next_local_files != prev_local_files:
+            self.__local_files = next_local_files
             self.__cached_model = None
 
     def set_remote_files(self, remote_files: List[SystemFile]) -> None:
         prev_remote_files = self.__remote_files
-        self.__remote_files = {
+        next_remote_files = {
             self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
         }
         # Invalidate the cache
-        if self.__remote_files != prev_remote_files:
+        if next_remote_files != prev_remote_files:
+            self.__remote_files = next_remote_files
             self.__cached_model = None
 
     def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]) -> None:
@@ -1306,6 +1308,17 @@ class ModelBuilder:
 
     def request_rebuild(self) -> None:
         self.__cached_model = None
+
+    def adopt_applied_model(self, built_model: Model, applied_model: Model) -> None:
+        """Alias the cache to the controller's live model after a successful diff.
+
+        Source setters may invalidate the cache while the updater is applying
+        side effects from a build.  Only the exact model returned by this
+        build may be replaced; otherwise an intervening invalidation must be
+        preserved for the next update cycle.
+        """
+        if self.__cached_model is built_model:
+            self.__cached_model = applied_model
 
     def build_model(self) -> Model:
         if self.__cached_model is not None and not self.__has_pending_recent_live_transfer_snapshots():
@@ -1655,8 +1668,8 @@ class ModelBuilder:
             frontier.append((remote, local, status, root_model_file, remote, local))
         while frontier:
             _remote, _local, _status, _model_file, _root_remote, _root_local = frontier.popleft()
-            _remote_children: dict[str, SystemFile] = {sf.name: sf for sf in _remote.children} if _remote else {}
-            _local_children: dict[str, SystemFile] = {sf.name: sf for sf in _local.children} if _local else {}
+            _remote_children: dict[str, SystemFile] = {sf.name: sf for sf in _remote.iter_children()} if _remote else {}
+            _local_children: dict[str, SystemFile] = {sf.name: sf for sf in _local.iter_children()} if _local else {}
             _all_children_names: set[str] = set(_remote_children).union(_local_children)
             for _child_name in _all_children_names:
                 _remote_child = _remote_children.get(_child_name, None)

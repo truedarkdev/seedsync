@@ -121,7 +121,7 @@ class LocalScanner(IScanner):
     @staticmethod
     def __mark_staging_file_tree(system_file: SystemFile) -> None:
         system_file.is_staging = True
-        for child in system_file.children:
+        for child in system_file.iter_children():
             LocalScanner.__mark_staging_file_tree(child)
 
     def __prune_managed_extract_entries(self, system_files: List[SystemFile], root_path: str) -> List[SystemFile]:
@@ -147,7 +147,7 @@ class LocalScanner(IScanner):
             return self.__clone_system_file(system_file)
 
         marker_child = None
-        for child in system_file.children:
+        for child in system_file.iter_children():
             if is_managed_extract_marker_name(child.name):
                 marker_child = child
                 break
@@ -160,7 +160,7 @@ class LocalScanner(IScanner):
                 return None
 
         pruned_children: List[SystemFile] = []
-        for child in system_file.children:
+        for child in system_file.iter_children():
             if marker_child is not None and child.name == marker_child.name:
                 continue
             pruned_child = self.__prune_managed_extract_tree(
@@ -184,7 +184,7 @@ class LocalScanner(IScanner):
         cloned.path_pair_id = system_file.path_pair_id
         cloned.path_pair_name = system_file.path_pair_name
         cloned.status_sidecar_ready = system_file.status_sidecar_ready
-        for child in children if children is not None else system_file.children:
+        for child in children if children is not None else system_file.iter_children():
             cloned.add_child(child)
         return cloned
 
@@ -198,10 +198,10 @@ class LocalScanner(IScanner):
     @staticmethod
     def __build_merged_directory(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
         merged_children: List[SystemFile] = []
-        staging_children_by_name = {child.name: child for child in staging_file.children}
+        staging_children_by_name = {child.name: child for child in staging_file.iter_children()}
         consumed_staging_names: set[str] = set()
 
-        for existing_child in existing_file.children:
+        for existing_child in existing_file.iter_children():
             staging_child = staging_children_by_name.get(existing_child.name)
             if staging_child is None:
                 merged_children.append(existing_child)
@@ -211,7 +211,7 @@ class LocalScanner(IScanner):
                 LocalScanner.__merge_duplicate_local_entries(existing_child, staging_child)
             )
 
-        for staging_child in staging_file.children:
+        for staging_child in staging_file.iter_children():
             if staging_child.name in consumed_staging_names:
                 continue
             merged_children.append(staging_child)

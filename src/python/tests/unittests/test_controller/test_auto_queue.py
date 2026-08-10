@@ -416,6 +416,7 @@ class TestAutoQueue(unittest.TestCase):
             return get_model()
 
         self.controller.get_model_files.side_effect = get_model
+        self.controller._get_model_root_references.side_effect = get_model
         self.controller.get_model_files_and_add_listener.side_effect = get_model_and_capture_listener
         self.controller.is_file_stopped.return_value = False
         self.controller.has_current_process_final_publication.return_value = False
@@ -505,10 +506,12 @@ class TestAutoQueue(unittest.TestCase):
         file_one.remote_size = 100
         self.model_listener.file_added(file_one)
         self.controller.get_model_files.reset_mock()
+        self.controller._get_model_root_references.reset_mock()
 
         auto_queue.process()
 
-        self.assertEqual(1, self.controller.get_model_files.call_count)
+        self.controller.get_model_files.assert_not_called()
+        self.controller._get_model_root_references.assert_called_once_with()
 
     def _set_enabled_path_pairs(self, *pairs):
         path_pair_manager = MagicMock()

@@ -121,6 +121,58 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(tree.get_children()[0].remote_has_transferable_content)
         self.assertEqual(2, tree_model.tree_file_count)
 
+    def test_adopt_applied_model_reuses_live_model_for_unchanged_partial_roots(self):
+        self.model_builder.set_remote_files([
+            SystemFile("updated-root", 10, False),
+            SystemFile("unchanged-root", 20, False),
+        ])
+        built_model = self.model_builder.build_model()
+        live_model = Model()
+
+        self.model_builder.adopt_applied_model(built_model, live_model)
+
+        self.assertIs(live_model, self.model_builder.build_model())
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_adopt_applied_model_does_not_mask_post_build_invalidation(self):
+        self.model_builder.set_remote_files([SystemFile("root", 10, False)])
+        built_model = self.model_builder.build_model()
+        self.model_builder.set_remote_files([SystemFile("root", 11, False)])
+        live_model = Model()
+
+        self.model_builder.adopt_applied_model(built_model, live_model)
+
+        rebuilt_model = self.model_builder.build_model()
+        self.assertIsNot(live_model, rebuilt_model)
+        self.assertEqual(11, rebuilt_model.get_file("root").remote_size)
+
+    def test_equal_remote_scan_preserves_shared_system_tree_and_cached_model(self):
+        retained_root = SystemFile("root", 10, True)
+        retained_root.add_child(SystemFile("child.bin", 10, False))
+        self.model_builder.set_remote_files([retained_root])
+        built_model = self.model_builder.build_model()
+        live_model = Model()
+        self.model_builder.adopt_applied_model(built_model, live_model)
+
+        equal_root = SystemFile("root", 10, True)
+        equal_root.add_child(SystemFile("child.bin", 10, False))
+        self.model_builder.set_remote_files([equal_root])
+
+        self.assertIs(retained_root, self.model_builder._ModelBuilder__remote_files["root"])
+        self.assertIs(live_model, self.model_builder.build_model())
+
+    def test_equal_local_scan_preserves_shared_system_tree_and_cached_model(self):
+        retained_file = SystemFile("local.bin", 10, False)
+        self.model_builder.set_local_files([retained_file])
+        built_model = self.model_builder.build_model()
+        live_model = Model()
+        self.model_builder.adopt_applied_model(built_model, live_model)
+
+        self.model_builder.set_local_files([SystemFile("local.bin", 10, False)])
+
+        self.assertIs(retained_file, self.model_builder._ModelBuilder__local_files["local.bin"])
+        self.assertIs(live_model, self.model_builder.build_model())
+
     def test_local_only_presence_includes_empty_local_files(self):
         local_empty = SystemFile("empty.bin", 0, False)
         self.model_builder.set_local_files([local_empty])

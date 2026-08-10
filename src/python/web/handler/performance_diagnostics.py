@@ -6,6 +6,7 @@ import bottle
 from bottle import HTTPResponse
 
 from common import Context, overrides
+from controller import Controller
 from ..web_app import IHandler, WebApp
 
 
@@ -15,12 +16,14 @@ class PerformanceDiagnosticsHandler(IHandler):
     _PATH = "/server/admin/performance-diagnostics/v1"
     _JSON_HEADERS = {"Content-Type": "application/json", "X-Content-Type-Options": "nosniff"}
 
-    def __init__(self, context: Context) -> None:
+    def __init__(self, context: Context, controller: Controller) -> None:
         self.__context = context
+        self.__controller = controller
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp) -> None:
         web_app.add_handler(self._PATH, self.__get, required_scope="admin")
+        web_app.add_handler(self._PATH + "/ownership", self.__ownership, required_scope="admin")
         web_app.add_post_handler(self._PATH + "/reset", self.__reset, required_scope="admin")
         web_app.add_handler(self._PATH + "/export", self.__export, required_scope="admin")
 
@@ -50,6 +53,9 @@ class PerformanceDiagnosticsHandler(IHandler):
     def __reset(self) -> HTTPResponse:
         self.__context.performance_diagnostics.reset()
         return self.__json_response({"status": "reset"})
+
+    def __ownership(self) -> HTTPResponse:
+        return self.__json_response(self.__controller.get_memory_ownership_census())
 
     def __export(self) -> HTTPResponse:
         # Export has no caller-supplied selectors and therefore cannot cause

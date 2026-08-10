@@ -1552,4 +1552,5 @@ class ModelUpdater(_ControllerCoreAccess):
         if build_triggered:
             with controller._Controller__model_lock:
                 controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
+                model_builder.adopt_applied_model(new_model, controller._Controller__model)
         return build_triggered

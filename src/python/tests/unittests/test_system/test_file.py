@@ -1,12 +1,34 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
+import copy
 from datetime import datetime
+import pickle
+import sys
 
 from system import SystemFile
 
 
 class TestSystemFile(unittest.TestCase):
+    def test_default_instance_is_compacted(self):
+        self.assertLessEqual(sys.getsizeof(SystemFile("test", 0, False)), 112)
+
+    def test_leaf_children_storage_is_lazy_but_public_list_remains_mutable(self):
+        leaf = SystemFile("leaf", 0, False)
+        self.assertIsNone(leaf._SystemFile__children)
+        self.assertEqual([], list(leaf.iter_children()))
+        self.assertIsNone(leaf._SystemFile__children)
+
+        leaf.children.append(SystemFile("compat", 0))
+        self.assertEqual(["compat"], [child.name for child in leaf.children])
+
+    def test_compact_flags_serialize_without_removed_slot_names(self):
+        file = SystemFile("dir", 0, True, is_staging=True)
+        data = file.to_dict()
+
+        self.assertTrue(data["is_dir"])
+        self.assertTrue(data["is_staging"])
+
     def test_name(self):
         sf = SystemFile("test", 0, False)
         self.assertEqual("test", sf.name)
@@ -90,3 +112,19 @@ class TestSystemFile(unittest.TestCase):
         self.assertTrue(a1 == a2)
         self.assertFalse(a1 == a3)
         self.assertFalse(a1 == a4)
+
+    def test_compact_storage_preserves_recursive_copy_pickle_and_diagnostics(self):
+        root = SystemFile("root", 10, is_dir=True)
+        root.path_pair_id = "pair"
+        root.path_pair_name = "Pair"
+        root.status_sidecar_ready = True
+        root.add_child(SystemFile("child", 10))
+
+        copied = copy.deepcopy(root)
+        restored = pickle.loads(pickle.dumps(root))
+
+        self.assertEqual(root, copied)
+        self.assertEqual(root, restored)
+        self.assertEqual("child", restored.children[0].name)
+        self.assertIn("_SystemFile__status_sidecar_ready", repr(root))
+        self.assertFalse(hasattr(root, "__dict__"))

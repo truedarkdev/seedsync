@@ -8,6 +8,20 @@ from system import SystemFile
 
 
 class TestMultiPathRemoteScanner(unittest.TestCase):
+    def test_recycled_state_round_trips_each_remote_scanner_in_order(self):
+        movie_scanner = MagicMock()
+        movie_scanner.export_recycled_state.return_value = (False, "~/movie-scanfs")
+        tv_scanner = MagicMock()
+        tv_scanner.export_recycled_state.return_value = (True, "/tmp/tv-scanfs")
+        scanner = MultiPathRemoteScanner([movie_scanner, tv_scanner])
+
+        state = scanner.export_recycled_state()
+        scanner.apply_recycled_state(state)
+
+        self.assertEqual(((False, "~/movie-scanfs"), (True, "/tmp/tv-scanfs")), state)
+        movie_scanner.apply_recycled_state.assert_called_once_with((False, "~/movie-scanfs"))
+        tv_scanner.apply_recycled_state.assert_called_once_with((True, "/tmp/tv-scanfs"))
+
     def test_empty_remote_pair_roots_are_reported_for_reconciliation(self):
         movie_scanner = MagicMock()
         movie_scanner.path_pair_id = "movies"

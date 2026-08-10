@@ -1,12 +1,45 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
+import copy
 from datetime import datetime
+import multiprocessing
+import pickle
+import sys
 
 from model import ModelFile
 
 
+def _send_model_file(connection, file: ModelFile) -> None:
+    try:
+        connection.send(file)
+    finally:
+        connection.close()
+
+
 class TestModelFile(unittest.TestCase):
+    def test_default_instance_is_compacted_and_runtime_sidecar_is_lazy(self):
+        file = ModelFile("test", False)
+        self.assertLessEqual(sys.getsizeof(file), 176)
+        self.assertIsNone(file._ModelFile__runtime)
+        self.assertIsNone(file._ModelFile__children)
+        self.assertEqual([], file.get_children())
+        self.assertIsNone(file._ModelFile__children)
+        file.transferred_size = 1
+        self.assertIsNotNone(file._ModelFile__runtime)
+        file.transferred_size = None
+        self.assertIsNone(file._ModelFile__runtime)
+
+    def test_sparse_runtime_preserves_legacy_unchecked_extractable_values(self):
+        file = ModelFile("test", False)
+        file.is_extractable = 0
+        file.is_stoppable = []
+
+        self.assertIs(type(file.is_extractable), int)
+        self.assertEqual(0, file.is_extractable)
+        self.assertEqual([], file.is_stoppable)
+        self.assertIsNotNone(file._ModelFile__runtime)
+
     def test_name(self):
         file = ModelFile("test", False)
         self.assertEqual("test", file.name)
@@ -298,3 +331,53 @@ class TestModelFile(unittest.TestCase):
         self.assertIsNone(a.parent)
         self.assertEqual(a, aa.parent)
         self.assertEqual(aa, aaa.parent)
+
+    def test_compact_storage_preserves_compatibility_equality_and_recursive_copy_pickle(self):
+        root = ModelFile("root", True)
+        child = ModelFile("child", False)
+        root.add_child(child)
+        root.remote_size = 10
+        root.local_size = 10
+
+        equivalent = ModelFile("root", True)
+        equivalent_child = ModelFile("child", False)
+        equivalent.add_child(equivalent_child)
+        equivalent.remote_size = 10
+        equivalent.local_size = 10
+        equivalent.remote_present = True
+        equivalent.local_present = True
+        equivalent.remote_has_transferable_content = True
+        equivalent.update_timestamp = datetime(2000, 1, 1)
+
+        copied = copy.deepcopy(root)
+        restored = pickle.loads(pickle.dumps(root))
+
+        self.assertEqual(root, equivalent)
+        self.assertEqual(root, copied)
+        self.assertEqual(root, restored)
+        self.assertIs(restored.get_children()[0].parent, restored)
+        self.assertIn("_ModelFile__update_timestamp", repr(root))
+        self.assertFalse(hasattr(root, "__dict__"))
+
+    def test_compact_storage_preserves_parent_child_graph_across_process_boundary(self):
+        root = ModelFile("root", True)
+        root.add_child(ModelFile("child", False))
+        receive_connection, send_connection = multiprocessing.Pipe(duplex=False)
+        process = multiprocessing.get_context("spawn").Process(
+            target=_send_model_file,
+            args=(send_connection, root),
+        )
+        process.start()
+        send_connection.close()
+        try:
+            received = receive_connection.recv()
+        finally:
+            receive_connection.close()
+            process.join(timeout=5)
+            if process.is_alive():
+                process.terminate()
+                process.join()
+
+        self.assertEqual(0, process.exitcode)
+        self.assertEqual(root, received)
+        self.assertIs(received, received.get_children()[0].parent)

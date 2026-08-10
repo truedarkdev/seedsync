@@ -1,13 +1,17 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
+import logging
 from datetime import datetime, timedelta
+from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
+from controller import ModelBuilder
+from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
 from controller.model_updater import ModelUpdater
-from model import ModelFile
+from model import Model, ModelFile
 from system import SystemFile
 
 
@@ -239,6 +243,92 @@ class TestModelUpdater(unittest.TestCase):
             event_type="state_transition",
             corr_id="remote-scan-corr",
         )
+
+    def test_update_adopts_live_model_cache_without_masking_later_invalidation(self):
+        builder = ModelBuilder()
+        builder.set_base_logger(logging.getLogger("model-updater-cache-test"))
+        live_model = Model()
+        live_model.set_base_logger(logging.getLogger("model-updater-cache-test"))
+        remote_root = SystemFile("root", 10, False)
+        remote_scan = SimpleNamespace(
+            timestamp=datetime.now(),
+            failed=False,
+            error_message=None,
+            files=[remote_root],
+            scanned_path_pair_ids={None},
+        )
+        pending_extract_ids = {"root"}
+
+        def record_terminal_ids(extract_ids, validation_ids):
+            pending_extract_ids.difference_update(extract_ids)
+            self.assertEqual(set(), validation_ids)
+
+        controller = SimpleNamespace(
+            _Controller__persist=SimpleNamespace(
+                downloaded_file_names=set(),
+                extracted_file_names=set(),
+                stopped_file_names=set(),
+            ),
+            _Controller__model_builder=builder,
+            _Controller__model=live_model,
+            _Controller__model_lock=RLock(),
+            _Controller__remote_scan_process=MagicMock(),
+            _Controller__local_scan_process=MagicMock(),
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__extract_process=MagicMock(),
+            _Controller__validate_process=MagicMock(),
+            _Controller__lftp=MagicMock(),
+            _Controller__context=SimpleNamespace(
+                config=SimpleNamespace(general=SimpleNamespace(exclude_patterns="")),
+                status=SimpleNamespace(controller=SimpleNamespace(), server=SimpleNamespace()),
+            ),
+            logger=logging.getLogger("model-updater-cache-test"),
+            _Controller__temp_diag=MagicMock(),
+            _Controller__set_active_scanner_files=MagicMock(),
+            _Controller__record_breadcrumb=MagicMock(),
+            _Controller__trace_corr_id_from_files=MagicMock(return_value="cache-test"),
+            _Controller__should_auto_purge_local_file=MagicMock(return_value=False),
+            _Controller__find_target_archive_model_file=MagicMock(return_value=None),
+            _Controller__startup_recovery_done=True,
+            _Controller__pending_completion_file_names=set(),
+            _Controller__prev_downloading_file_names=set(),
+            _Controller__malformed_status_only_file_ids=set(),
+            _Controller__pending_auto_purge_file_ids=set(),
+            _Controller__last_lftp_statuses=[],
+            _Controller__active_downloading_file_names=[],
+            _Controller__active_extracting_file_names=[],
+            _Controller__next_lftp_status_poll_at=None,
+            _Controller__lftp_status_poll_retry_seconds=1,
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_cache_max_age_seconds=3,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__exclude_patterns="",
+            _Controller__last_remote_reconciliation_healthy=True,
+            _Controller__last_local_reconciliation_healthy=True,
+            _Controller__path_pairs_by_id={},
+            _record_worker_terminal_ids=record_terminal_ids,
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = remote_scan
+        controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        controller._Controller__extract_process.pop_completed.return_value = [
+            ExtractCompletedResult(datetime.now(), "root", False, file_id="root"),
+        ]
+        controller._Controller__extract_process.pop_failed.return_value = []
+        controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+
+        updater = ModelUpdater(controller)
+        updater.update()
+
+        self.assertEqual(10, live_model.get_file("root").remote_size)
+        self.assertIs(live_model, builder._ModelBuilder__cached_model)
+        self.assertEqual(set(), pending_extract_ids)
+        builder.set_remote_files([SystemFile("root", 11, False)])
+        self.assertTrue(builder.has_changes())
+        self.assertIsNot(live_model, builder.build_model())
 
     def test_handle_lftp_completion_detection_records_completed_downloads_and_forces_rescan(self):
         completion_entry = ("movie.mkv", "movies", "Movies")

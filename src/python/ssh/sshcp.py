@@ -31,6 +31,13 @@ class Sshcp:
     Scp command utility
     """
     __TIMEOUT_SECS = 180
+    # Filesystem scans can return many megabytes of JSON.  Pexpect's 2 KiB
+    # default turns that stream into thousands of small reads and repeatedly
+    # searches the accumulated buffer for terminal SSH errors.  Keep enough
+    # history for every fixed prompt/error pattern while reading bulk output
+    # in efficient chunks.
+    __PEXPECT_MAX_READ_BYTES = 64 * 1024
+    __PEXPECT_SEARCH_WINDOW_BYTES = 1024
     SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
     __SCP_DESTINATION_PERMISSION_DENIED = re.compile(
         r"^scp:\s+(?:dest open\s+)?(?P<path>.+):\s+(?:-\s+)?permission denied$",
@@ -347,7 +354,12 @@ class Sshcp:
             resolver_modified = True
         if callable(spawn_factory):
             try:
-                return spawn_factory(command, command_args), False
+                return spawn_factory(
+                    command,
+                    command_args,
+                    maxread=self.__PEXPECT_MAX_READ_BYTES,
+                    searchwindowsize=self.__PEXPECT_SEARCH_WINDOW_BYTES,
+                ), False
             finally:
                 if resolver_modified:
                     if resolver_options is None:

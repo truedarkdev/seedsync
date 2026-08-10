@@ -36,6 +36,11 @@ from .validate import ValidateProcess
 from .model_updater import ModelUpdater
 from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
+from .ownership_census import (
+    OwnershipRoot, build_ownership_census, disabled_ownership_census,
+    release_ownership_census_working_memory, snapshot_container,
+    unavailable_ownership_census,
+)
 from common import (
     AppError, AppOneShotProcess, AppProcess, Args, Config, Constants, Context,
     Localization, MultiprocessingLogger, PathPair, PathPairManager, PathPairError,
@@ -109,6 +114,7 @@ class Controller:
 
     __MAX_MOVE_FAILURES = 4
     __MOVE_RETRY_DELAYS = (2, 10, 30)
+    __AUXILIARY_WORKER_IDLE_GRACE_IN_SECS = 2.0
 
     __context: Context
     __persist: ControllerPersist
@@ -143,6 +149,8 @@ class Controller:
     __lftp_status_cache_expires_at: Optional[datetime]
     __active_command_processes: list[Controller.CommandProcessWrapper]
     __reported_dead_workers: set[int]
+    __extract_idle_deadline_monotonic: Optional[float]
+    __validate_idle_deadline_monotonic: Optional[float]
     __remote_delete_success_listeners: list[Callable[[ModelFile], None]]
     __download_start_listeners: list[Callable[[ModelFile], None]]
     __download_start_state: dict[str, DownloadStartLifecycleEntry]
@@ -600,32 +608,9 @@ class Controller:
             )
             self.__refresh_path_pair_runtime_state([])
 
-        # Setup extract process
-        if controller_cfg.use_local_path_as_extract_path:
-            out_dir_path = self.__legacy_local_path
-        else:
-            out_dir_path = Controller.__require_runtime_path(
-                controller_cfg.extract_path, "Controller.extract_path"
-            )
-        # Keep the final local root primary, but allow archive lookup to fall
-        # back to staging so extraction can survive the move boundary.
-        self.__extract_process = ExtractProcess(
-            out_dir_path=out_dir_path,
-            local_path=self.__legacy_local_path,
-            local_path_fallback=self.__staging_path,
-            managed_extract_folders_enabled=controller_cfg.managed_extract_folders_enabled,
-            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
-        )
-        path_pairs_for_validation: dict[str, object] = dict(self.__path_pairs_by_id)
-        self.__validate_process = ValidateProcess(
-            remote_address=Controller.__require_runtime_path(lftp_cfg.remote_address, "Lftp.remote_address"),
-            remote_username=Controller.__require_runtime_path(lftp_cfg.remote_username, "Lftp.remote_username"),
-            remote_password=self.__ssh_password,
-            remote_port=Controller.__require_runtime_int(lftp_cfg.remote_port, "Lftp.remote_port"),
-            local_path=self.__legacy_local_path,
-            remote_path=self.__legacy_remote_path,
-            path_pairs_by_id=path_pairs_for_validation
-        )
+        # Auxiliary workers remain unstarted until their first real command.
+        self.__extract_process = self.__build_extract_process()
+        self.__validate_process = self.__build_validate_process()
 
         # Setup multiprocess logging
         self.__mp_logger = MultiprocessingLogger(self.logger)
@@ -666,12 +651,87 @@ class Controller:
         self.__active_command_processes = []
         self.__startup_recovery_done = False
         self.__reported_dead_workers = set()
+        self.__extract_idle_deadline_monotonic = None
+        self.__validate_idle_deadline_monotonic = None
         self.__memory_monitor = ControllerMemoryMonitor(self.logger.getChild("MemoryMonitor"))
         self.__updater = ModelUpdater(self)
         self.__updater.sync_persist_to_all_builders()
 
         self.__started = False
         self.__startup_failed = False
+
+    def __build_extract_process(self) -> ExtractProcess:
+        controller_cfg = self.__context.config.controller
+        out_dir_path = self.__legacy_local_path if controller_cfg.use_local_path_as_extract_path else \
+            Controller.__require_runtime_path(controller_cfg.extract_path, "Controller.extract_path")
+        return ExtractProcess(
+            out_dir_path=out_dir_path,
+            local_path=self.__legacy_local_path,
+            local_path_fallback=self.__staging_path,
+            managed_extract_folders_enabled=controller_cfg.managed_extract_folders_enabled,
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
+        )
+
+    def __build_validate_process(self) -> ValidateProcess:
+        lftp_cfg = self.__context.config.lftp
+        return ValidateProcess(
+            remote_address=Controller.__require_runtime_path(lftp_cfg.remote_address, "Lftp.remote_address"),
+            remote_username=Controller.__require_runtime_path(lftp_cfg.remote_username, "Lftp.remote_username"),
+            remote_password=self.__ssh_password,
+            remote_port=Controller.__require_runtime_int(lftp_cfg.remote_port, "Lftp.remote_port"),
+            local_path=self.__legacy_local_path,
+            remote_path=self.__legacy_remote_path,
+            path_pairs_by_id=dict(self.__path_pairs_by_id),
+        )
+
+    def __configure_auxiliary_worker_logging(self, worker: AppProcess) -> None:
+        worker.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
+
+    def __ensure_extract_worker_started(self) -> None:
+        if self.__extract_process.pid is not None:
+            return
+        self.__configure_auxiliary_worker_logging(self.__extract_process)
+        self.__extract_process.start()
+        self.__extract_idle_deadline_monotonic = None
+
+    def __ensure_validate_worker_started(self) -> None:
+        if self.__validate_process.pid is not None:
+            return
+        self.__configure_auxiliary_worker_logging(self.__validate_process)
+        self.__validate_process.start()
+        self.__validate_idle_deadline_monotonic = None
+
+    def __replace_extract_process(self) -> None:
+        self.__extract_process = self.__build_extract_process()
+        self.__configure_auxiliary_worker_logging(self.__extract_process)
+
+    def __replace_validate_process(self) -> None:
+        self.__validate_process = self.__build_validate_process()
+        self.__configure_auxiliary_worker_logging(self.__validate_process)
+
+    def __reap_idle_auxiliary_workers(self) -> None:
+        now = time.monotonic()
+        with self.__work_state_lock:
+            extract_pending = bool(self.__pending_extract_file_ids)
+            validate_pending = bool(self.__pending_validation_file_ids)
+
+        if extract_pending or self.__extract_process.pid is None:
+            self.__extract_idle_deadline_monotonic = None
+        elif self.__extract_idle_deadline_monotonic is None:
+            self.__extract_idle_deadline_monotonic = now + self.__AUXILIARY_WORKER_IDLE_GRACE_IN_SECS
+        elif now >= self.__extract_idle_deadline_monotonic:
+            if self.__teardown_process("idle extract process", self.__extract_process):
+                self.__replace_extract_process()
+            self.__extract_idle_deadline_monotonic = None
+
+        if validate_pending or self.__validate_process.pid is None:
+            self.__validate_idle_deadline_monotonic = None
+        elif self.__validate_idle_deadline_monotonic is None:
+            self.__validate_idle_deadline_monotonic = now + self.__AUXILIARY_WORKER_IDLE_GRACE_IN_SECS
+        elif now >= self.__validate_idle_deadline_monotonic:
+            if self.__teardown_process("idle validate process", self.__validate_process):
+                self.__replace_validate_process()
+            self.__validate_idle_deadline_monotonic = None
 
     def __configure_lftp(self):
         # Configure the active transfer backend while preserving the legacy lftp
@@ -862,21 +922,27 @@ class Controller:
                 controller_cfg.interval_ms_downloading_scan, "Controller.interval_ms_downloading_scan"
             ),
             verbose=False,
-            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
+            recycle_scan_worker=False,
         )
         local_scan_process = ScannerProcess(
             scanner=local_scanner,
             interval_in_ms=Controller.__require_runtime_int(
                 controller_cfg.interval_ms_local_scan, "Controller.interval_ms_local_scan"
             ),
-            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
+            # Local scanning builds its retained SystemFile graph directly and
+            # has no large serialized scanfs response to discard.  Keeping it
+            # inline avoids spawning/importing Python every ten seconds.
+            recycle_scan_worker=False,
         )
         remote_scan_process = ScannerProcess(
             scanner=remote_scanner,
             interval_in_ms=Controller.__require_runtime_int(
                 controller_cfg.interval_ms_remote_scan, "Controller.interval_ms_remote_scan"
             ),
-            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter()
+            breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
+            recycle_scan_worker=True,
         )
 
         old_path_pairs_by_id = self.__path_pairs_by_id
@@ -1481,12 +1547,12 @@ class Controller:
         try:
             self.__refresh_path_pair_runtime_state()
             new_state_applied = True
+            refreshed_validation_pairs: dict[str, object] = dict(self.__path_pairs_by_id)
+            self.__validate_process.set_path_pairs_by_id(refreshed_validation_pairs)
             if was_started:
                 self.__active_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                 self.__local_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
                 self.__remote_scan_process.set_mp_log_queue(self.__mp_logger.queue, self.__mp_logger.log_level)
-                refreshed_validation_pairs: dict[str, object] = dict(self.__path_pairs_by_id)
-                self.__validate_process.set_path_pairs_by_id(refreshed_validation_pairs)
 
             if was_started:
                 self.__active_scan_process.start()
@@ -1570,8 +1636,6 @@ class Controller:
             self.__active_scan_process.start()
             self.__local_scan_process.start()
             self.__remote_scan_process.start()
-            self.__extract_process.start()
-            self.__validate_process.start()
             self.__mp_logger.start()
         except Exception:
             self.__startup_failed = True
@@ -1649,6 +1713,7 @@ class Controller:
                     diagnostics.finish_duration(DURATION_MODEL_UPDATE, started_at)
                 except Exception:
                     pass
+        self.__reap_idle_auxiliary_workers()
         self.__log_memory_usage()
 
     def __best_effort_teardown(self, label: str, teardown: Callable[[], object]):
@@ -1710,7 +1775,7 @@ class Controller:
             self.__active_command_processes = []
 
     def __report_dead_worker_once(self, worker: AppProcess | None, worker_name: str) -> None:
-        if worker is None:
+        if worker is None or worker.pid is None:
             return
         worker_id = id(worker)
         if worker_id in self.__reported_dead_workers:
@@ -1760,6 +1825,15 @@ class Controller:
         with self.__model_lock:
             model_files = self.__get_model_files()
         return model_files
+
+    def _get_model_root_references(self) -> List[ModelFile]:
+        """Shallow, controller-internal root snapshot for same-process consumers.
+
+        Callers must treat returned files as read-only.  Public model APIs
+        continue to return deep copies for isolation across their boundary.
+        """
+        with self.__model_lock:
+            return list(self.__model.iter_files_by_id())
 
     @staticmethod
     def _model_scope_id(path_pair_id: Optional[str]) -> str:
@@ -3991,6 +4065,7 @@ class Controller:
                                 file
                             )
                             continue
+                        self.__ensure_extract_worker_started()
                         self._record_worker_dispatch("extract", file.file_id)
                         self.__extract_process.extract(extract_request, flow_id=command.flow_id)
                     except Exception:
@@ -4047,6 +4122,7 @@ class Controller:
                     continue
                 else:
                     try:
+                        self.__ensure_validate_worker_started()
                         self._record_worker_dispatch("validate", file.file_id)
                         self.__validate_process.validate(file)
                     except Exception:
@@ -4315,6 +4391,59 @@ class Controller:
             "active_command_count": len(self.__active_command_processes),
         }
 
+    def get_memory_ownership_census(self) -> dict[str, object]:
+        """Return an on-demand, bounded, privacy-safe ownership census."""
+        general = getattr(getattr(self.__context, "config", None), "general", None)
+        if type(getattr(general, "performance_diagnostics_enabled", None)) is not bool or \
+                not general.performance_diagnostics_enabled:
+            return disabled_ownership_census()
+        roots: tuple[OwnershipRoot, ...] | None = None
+        try:
+            roots = self.__capture_memory_ownership_roots()
+            return build_ownership_census(roots)
+        except Exception:
+            # A diagnostic request must never change normal controller behavior.
+            return unavailable_ownership_census()
+        finally:
+            roots = None
+            release_ownership_census_working_memory()
+
+    def __capture_memory_ownership_roots(self) -> tuple[OwnershipRoot, ...]:
+        """Capture only shallow references while honoring updater lock ordering."""
+        # ModelUpdater holds work-state before model lock while it switches
+        # scan/status state and applies a new model; preserve that ordering.
+        with self.__work_state_lock:
+            with self.__model_lock:
+                live_model = self.__model
+                live_files = tuple(live_model.iter_files())
+                builder = self.__model_builder
+                cached_model = getattr(builder, "_ModelBuilder__cached_model", None)
+                cached_files = () if cached_model is None or cached_model is live_model else tuple(cached_model.iter_files())
+                roots: list[OwnershipRoot] = [
+                    OwnershipRoot("live_model_graph", live_files),
+                    OwnershipRoot("builder_cached_model_graph", cached_files,
+                                  aliases_live_model=cached_model is live_model),
+                    snapshot_container("builder_local_system_file_graph", getattr(builder, "_ModelBuilder__local_files", None)),
+                    snapshot_container("builder_active_system_file_graph", getattr(builder, "_ModelBuilder__active_files", None)),
+                    snapshot_container("builder_remote_system_file_graph", getattr(builder, "_ModelBuilder__remote_files", None)),
+                    snapshot_container("builder_active_file_ids", getattr(builder, "_ModelBuilder__active_file_ids", None)),
+                    snapshot_container("builder_lftp_statuses", getattr(builder, "_ModelBuilder__lftp_statuses", None)),
+                    snapshot_container("builder_extract_statuses", getattr(builder, "_ModelBuilder__extract_statuses", None)),
+                    snapshot_container("builder_validation_statuses", getattr(builder, "_ModelBuilder__validation_statuses", None)),
+                    snapshot_container("builder_recent_transfer_snapshots", getattr(builder, "_ModelBuilder__recent_live_transfer_snapshots", None)),
+                    snapshot_container("builder_retained_transfer_snapshots", getattr(builder, "_ModelBuilder__retained_stopped_transfer_snapshots", None)),
+                    snapshot_container("controller_active_downloads", getattr(self, "_Controller__active_downloading_file_names", None)),
+                    snapshot_container("controller_active_extracts", getattr(self, "_Controller__active_extracting_file_names", None)),
+                    snapshot_container("controller_pending_completion", getattr(self, "_Controller__pending_completion_file_names", None)),
+                    snapshot_container("controller_pending_extract", getattr(self, "_Controller__pending_extract_file_ids", None)),
+                    snapshot_container("controller_pending_validation", getattr(self, "_Controller__pending_validation_file_ids", None)),
+                    snapshot_container("controller_move_retries", getattr(self, "_Controller__move_retry_due", None)),
+                    snapshot_container("controller_deferred_moves", getattr(self, "_Controller__deferred_move_file_ids", None)),
+                    snapshot_container("controller_malformed_status_only", getattr(self, "_Controller__malformed_status_only_file_ids", None)),
+                    snapshot_container("controller_pending_auto_purge", getattr(self, "_Controller__pending_auto_purge_file_ids", None)),
+                ]
+        return tuple(roots)
+
     def __propagate_exceptions(self):
         """
         Propagate any exceptions from child processes/threads to this thread
@@ -4332,22 +4461,24 @@ class Controller:
             self.__record_first_remote_scan_failure(str(error))
             raise
         self.__mp_logger.propagate_exception()
-        try:
-            self.__extract_process.propagate_exception()
-        except Exception as exc:
-            self.logger.warning(
-                "Ignoring extract worker failure during controller loop: {}".format(str(exc)),
-                exc_info=True
-            )
-        self.__report_dead_worker_once(self.__extract_process, "extract")
-        try:
-            self.__validate_process.propagate_exception()
-        except Exception as exc:
-            self.logger.warning(
-                "Ignoring validate worker failure during controller loop: {}".format(str(exc)),
-                exc_info=True
-            )
-        self.__report_dead_worker_once(self.__validate_process, "validate")
+        if self.__extract_process.pid is not None:
+            try:
+                self.__extract_process.propagate_exception()
+            except Exception as exc:
+                self.logger.warning(
+                    "Ignoring extract worker failure during controller loop: {}".format(str(exc)),
+                    exc_info=True
+                )
+            self.__report_dead_worker_once(self.__extract_process, "extract")
+        if self.__validate_process.pid is not None:
+            try:
+                self.__validate_process.propagate_exception()
+            except Exception as exc:
+                self.logger.warning(
+                    "Ignoring validate worker failure during controller loop: {}".format(str(exc)),
+                    exc_info=True
+                )
+            self.__report_dead_worker_once(self.__validate_process, "validate")
 
     def __record_first_remote_scan_failure(self, error_message: str):
         self.logger.warning("Fatal remote scan failure recorded: {}".format(error_message))
