@@ -1,13 +1,11 @@
 import {ChangeDetectionStrategy, ChangeDetectorRef, Component, OnDestroy, OnInit} from "@angular/core";
 import {CommonModule} from "@angular/common";
-import * as Immutable from "immutable";
 import {Subject} from "rxjs";
 import {takeUntil} from "rxjs/operators";
 
-import {ViewFileService} from "../../services/files/view-file.service";
-import {ViewFile} from "../../services/files/view-file";
 import {PathPairService, PathPair} from "../../services/settings/path-pair.service";
 import {FileSizePipe} from "../../common/file-size.pipe";
+import {ModelFileService} from "../../services/files/model-file.service";
 
 export interface PathPairStat {
     pathPairId: string;
@@ -36,10 +34,10 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
 
     private readonly _destroy$ = new Subject<void>();
     private _pathPairs: PathPair[] = [];
-    private _files: Immutable.List<ViewFile> = Immutable.List<ViewFile>();
+    private _summaries: any[] = [];
 
-    constructor(private _viewFileService: ViewFileService,
-                private _pathPairService: PathPairService,
+    constructor(private _pathPairService: PathPairService,
+                private _modelFileService: ModelFileService,
                 private _changeDetector: ChangeDetectorRef) {
     }
 
@@ -53,17 +51,22 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
                 }
             });
 
-        this._viewFileService.files
+        this._modelFileService.summaries
             .pipe(takeUntil(this._destroy$))
             .subscribe({
-                next: (files: Immutable.List<ViewFile>) => {
-                    this._files = files || Immutable.List<ViewFile>();
+                next: summaries => {
+                    // Keep the last successful aggregate through a transient
+                    // request failure; an empty response is only accepted as
+                    // an explicit successful server answer.
+                    this._summaries = summaries || [];
                     this._updateStats();
                 }
             });
+        this._modelFileService.startSummaryStream();
     }
 
     ngOnDestroy(): void {
+        this._modelFileService.stopSummaryStream();
         this._destroy$.next();
         this._destroy$.complete();
     }
@@ -105,67 +108,29 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
             return;
         }
 
-        const filesByPathPair: {[key: string]: ViewFile[]} = {};
-        enabledPairs.forEach(pair => {
-            filesByPathPair[pair.id] = [];
-        });
-
-        this._files.forEach((file: ViewFile) => {
-            if (file.pathPairId && filesByPathPair[file.pathPairId]) {
-                filesByPathPair[file.pathPairId].push(file);
-            }
-        });
-
-        this.stats = enabledPairs.map(pair => this._buildStat(pair, filesByPathPair[pair.id] || []));
+        const summariesByPair: {[key: string]: any} = {};
+        this._summaries.forEach(summary => summariesByPair[summary.path_pair_id] = summary);
+        // Every enabled configured pair keeps its existing card; an absent
+        // aggregate is the normal empty-card state and contributes zero.
+        this.stats = enabledPairs.map(pair => this._buildStat(pair, summariesByPair[pair.id]));
         this._changeDetector.markForCheck();
     }
 
-    private _buildStat(pathPair: PathPair, files: ViewFile[]): PathPairStat {
-        let downloadingCount = 0;
-        let queuedCount = 0;
-        let downloadedCount = 0;
-        let totalRemoteSize = 0;
-        let completedSize = 0;
-        let totalSpeed = 0;
-
-        files.forEach((file: ViewFile) => {
-            const remoteSize = file.remoteSize || 0;
-            if (remoteSize <= 0) {
-                if (file.status === ViewFile.Status.DOWNLOADING) {
-                    downloadingCount++;
-                    totalSpeed += file.downloadingSpeed || 0;
-                } else if (file.status === ViewFile.Status.QUEUED) {
-                    queuedCount++;
-                } else if (file.status === ViewFile.Status.DOWNLOADED || file.status === ViewFile.Status.EXTRACTED) {
-                    downloadedCount++;
-                }
-                return;
-            }
-
-            totalRemoteSize += remoteSize;
-            completedSize += Math.min(Math.max(file.transferredSize || 0, 0), remoteSize);
-
-            if (file.status === ViewFile.Status.DOWNLOADING) {
-                downloadingCount++;
-                totalSpeed += file.downloadingSpeed || 0;
-            } else if (file.status === ViewFile.Status.QUEUED) {
-                queuedCount++;
-            } else if (file.status === ViewFile.Status.DOWNLOADED || file.status === ViewFile.Status.EXTRACTED) {
-                downloadedCount++;
-            }
-        });
-
-        completedSize = totalRemoteSize > 0 ? Math.min(completedSize, totalRemoteSize) : 0;
+    private _buildStat(pathPair: PathPair, summary: any): PathPairStat {
+        const current = summary || {};
+        const totalRemoteSize = Number(current.remote_size) || 0;
+        const completedSize = Math.min(Math.max(Number(current.transferred_size) || 0, 0), totalRemoteSize);
+        const totalSpeed = Number(current.downloading_speed) || 0;
         const remainingSize = Math.max(totalRemoteSize - completedSize, 0);
         const etaSeconds = totalSpeed > 0 && remainingSize > 0 ? Math.ceil(remainingSize / totalSpeed) : null;
 
         return {
             pathPairId: pathPair.id,
             pathPairName: pathPair.name,
-            totalFiles: files.length,
-            downloadingCount: downloadingCount,
-            queuedCount: queuedCount,
-            downloadedCount: downloadedCount,
+            totalFiles: Number(current.root_count) || 0,
+            downloadingCount: Number(current.active_count) || 0,
+            queuedCount: Number(current.queued_count) || 0,
+            downloadedCount: Number(current.completed_count) || 0,
             totalRemoteSize: totalRemoteSize,
             totalLocalSize: completedSize,
             totalSpeed: totalSpeed,

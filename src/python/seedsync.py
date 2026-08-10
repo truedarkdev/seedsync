@@ -35,16 +35,69 @@ from migration.runtime_exclusion import RuntimeExclusion, RuntimeExclusionError
 T_Persist = TypeVar('T_Persist', bound=Persist)
 
 
-def _configure_multiprocessing_start_method() -> None:
-    """Select spawn once, accepting an already-compatible configuration."""
+def _select_multiprocessing_start_method() -> str:
+    """Return the deterministic process start method for this platform."""
+    if getattr(sys, "frozen", False) or platform.system().lower() != "linux":
+        return "spawn"
+
     try:
-        multiprocessing.set_start_method("spawn")
+        available_methods = multiprocessing.get_all_start_methods() or ()
+    except (AttributeError, NotImplementedError, OSError, RuntimeError):
+        available_methods = ()
+
+    return "forkserver" if "forkserver" in available_methods else "spawn"
+
+
+def _configure_multiprocessing_start_method() -> None:
+    """Configure the selected method, accepting only an already-compatible context."""
+    selected_method = _select_multiprocessing_start_method()
+    current_method = cast(Optional[str], multiprocessing.get_start_method(allow_none=True))
+    if current_method == selected_method:
+        return
+    if selected_method == "forkserver" and current_method == "spawn":
+        return
+    if current_method is not None:
+        raise RuntimeError(
+            "SeedSync requires multiprocessing start method "
+            f"{selected_method!r}; current method is {current_method!r}"
+        )
+
+    try:
+        multiprocessing.set_start_method(selected_method)
+    except (NotImplementedError, OSError, ValueError):
+        # A platform can advertise forkserver support while failing to create
+        # that context at runtime. Spawn remains the safe cross-platform
+        # fallback in that case.
+        if selected_method != "forkserver":
+            raise
+        selected_method = "spawn"
+        try:
+            multiprocessing.set_start_method(selected_method)
+        except RuntimeError as runtime_exc:
+            current_method = cast(Optional[str], multiprocessing.get_start_method(allow_none=True))
+            if current_method != selected_method:
+                raise RuntimeError(
+                    "SeedSync requires multiprocessing start method "
+                    f"{selected_method!r}; current method is {current_method!r}"
+                ) from runtime_exc
+        return
     except RuntimeError as exc:
-        current_method = multiprocessing.get_start_method(allow_none=True)
-        if current_method != "spawn":
+        current_method = cast(Optional[str], multiprocessing.get_start_method(allow_none=True))
+        if selected_method == "forkserver" and current_method is None:
+            try:
+                multiprocessing.set_start_method("spawn")
+            except RuntimeError as spawn_exc:
+                current_method = cast(Optional[str], multiprocessing.get_start_method(allow_none=True))
+                if current_method != "spawn":
+                    raise RuntimeError(
+                        "SeedSync requires multiprocessing start method "
+                        f"'spawn'; current method is {current_method!r}"
+                    ) from spawn_exc
+            return
+        if current_method != selected_method:
             raise RuntimeError(
-                "SeedSync requires multiprocessing start method 'spawn'; "
-                f"current method is {current_method!r}"
+                "SeedSync requires multiprocessing start method "
+                f"{selected_method!r}; current method is {current_method!r}"
             ) from exc
 
 

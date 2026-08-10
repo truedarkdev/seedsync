@@ -1,291 +1,379 @@
-import {Injectable} from "@angular/core";
-import {BehaviorSubject, Observable} from "rxjs";
-
+import {Injectable, NgZone} from "@angular/core";
+import {HttpClient, HttpParams} from "@angular/common/http";
+import {BehaviorSubject, Observable, Subscription} from "rxjs";
 import * as Immutable from "immutable";
 
 import {LoggerService} from "../utils/logger.service";
 import {ModelFile} from "./model-file";
-import {BaseStreamService} from "../base/base-stream.service";
 import {RestService, WebReaction} from "../utils/rest.service";
 
+export class ModelEventSourceFactory {
+    public static create(url: string): EventSource { return new EventSource(url); }
+}
 
-/**
- * ModelFileService class provides the store for model files
- * It implements the observable service pattern to push updates
- * as they become available.
- * The model is stored as an Immutable Map of file identity=>ModelFiles. Hence, the
- * ModelFiles have no defined order. The identity key allows more efficient
- * lookup and model diffing.
- * Reference: http://blog.angular-university.io/how-to-build-angular2
- *            -apps-using-rxjs-observable-data-services-pitfalls-to-avoid
- */
+interface ModelPageResponse { records: any[]; next_cursor: string | null; }
+interface PendingRecord { file: ModelFile; version: number; }
+
+/** Bounded route-owned root transport; ViewFileService owns all presentation. */
 @Injectable()
-export class ModelFileService extends BaseStreamService {
-    private readonly EVENT_INIT = "model-init";
-    private readonly EVENT_ADDED = "model-added";
-    private readonly EVENT_UPDATED = "model-updated";
-    private readonly EVENT_REMOVED = "model-removed";
+export class ModelFileService {
+    private static readonly TRANSPORT_LIMIT = 200;
+    private static readonly MAX_PENDING_PATCHES = 256;
+    private static readonly PAGE_SIZES = new Set<number>([25, 50, 100, 500, 1000, 0]);
+    private readonly _files = new BehaviorSubject<Immutable.Map<string, ModelFile>>(Immutable.Map());
+    private readonly _summary = new BehaviorSubject<any[]>([]);
+    private readonly _visibleStateCounts = new BehaviorSubject<{[key: string]: number}>({});
+    private _scopeId: string | null = null;
+    private _eventSource: EventSource | null = null;
+    private _summarySource: EventSource | null = null;
+    private _summaryConsumers = 0;
+    private _summaryGeneration = 0;
+    private _summaryVersion = -1;
+    private _request: Subscription | null = null;
+    private _generation = 0;
+    private _pageSize = 0;
+    private _records = Immutable.Map<string, ModelFile>();
+    private _recordVersions = Immutable.Map<string, number>();
+    private _lastGoodRecords = Immutable.Map<string, ModelFile>();
+    private _lastGoodVersions = Immutable.Map<string, number>();
+    private _pendingRecords = Immutable.Map<string, PendingRecord>();
+    private _pendingRemoved = Immutable.Map<string, number>();
+    private _syncing = false;
+    private _recoveryAttempts = 0;
+    private _retryTimer: any = null;
 
-    private _files: BehaviorSubject<Immutable.Map<string, ModelFile>> =
-        new BehaviorSubject(Immutable.Map<string, ModelFile>());
+    constructor(private _logger: LoggerService, private _http: HttpClient,
+                private _rest: RestService, private _zone: NgZone) {}
 
-    constructor(private _logger: LoggerService,
-                private _restService: RestService) {
-        super();
-        this.registerEventName(this.EVENT_INIT);
-        this.registerEventName(this.EVENT_ADDED);
-        this.registerEventName(this.EVENT_UPDATED);
-        this.registerEventName(this.EVENT_REMOVED);
+    get files(): Observable<Immutable.Map<string, ModelFile>> { return this._files.asObservable(); }
+    get summaries(): Observable<any[]> { return this._summary.asObservable(); }
+    get visibleStateCounts(): Observable<{[key: string]: number}> { return this._visibleStateCounts.asObservable(); }
+    get isScoped(): boolean { return this._scopeId != null; }
+
+    public setPageSize(size: number): void {
+        if (ModelFileService.PAGE_SIZES.has(size)) { this._pageSize = size; }
     }
 
-    get files(): Observable<Immutable.Map<string, ModelFile>> {
-        return this._files.asObservable();
+    public activateScope(scopeId: string): void {
+        if (!scopeId || this._scopeId === scopeId) { return; }
+        this.deactivateScope();
+        this._scopeId = scopeId;
+        this._recoveryAttempts = 0;
+        this._updateVisibleStateCounts();
+        this._openStream(); // model-page atomically subscribes and supplies page one.
     }
 
-    private static getFileKey(file: ModelFile): string {
-        return file.file_id || file.name;
+    public deactivateScope(): void {
+        this._generation++;
+        this._request?.unsubscribe();
+        this._request = null;
+        if (this._retryTimer != null) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+        this._eventSource?.close();
+        this._eventSource = null;
+        this._scopeId = null;
+        this._records = Immutable.Map();
+        this._recordVersions = Immutable.Map();
+        this._lastGoodRecords = Immutable.Map();
+        this._lastGoodVersions = Immutable.Map();
+        this._pendingRecords = Immutable.Map();
+        this._pendingRemoved = Immutable.Map();
+        this._syncing = false;
+        this._files.next(Immutable.Map());
+        this._visibleStateCounts.next({});
     }
 
-    private static buildCommandUrl(action: string, file: ModelFile): string {
-        const fileNameEncoded = encodeURIComponent(encodeURIComponent(file.name));
-        let url: string = "/server/command/" + action + "/" + fileNameEncoded;
-        if (file.file_id) {
-            url += "?file_id=" + encodeURIComponent(file.file_id);
-        }
+    public refreshSummary(): void {
+        const generation = ++this._summaryGeneration;
+        this._http.get<any>("/server/model/v1/summary").subscribe({
+            next: response => {
+                if (generation === this._summaryGeneration && this._summarySource == null) { this._setSummaries(response); }
+            },
+            error: error => this._logger.warn("Unable to refresh model summary", error)
+        });
+    }
+
+    public startSummaryStream(): void {
+        this._summaryConsumers++;
+        if (this._summarySource != null) { return; }
+        this._summaryGeneration++;
+        this._summaryVersion = -1;
+        const source = ModelEventSourceFactory.create("/server/model/v1/summary/stream");
+        this._summarySource = source;
+        source.addEventListener("model-summary", event => this._zone.run(() => {
+            if (source !== this._summarySource) { return; }
+            try { this._setSummaries(JSON.parse((<MessageEvent>event).data)); }
+            catch (error) { this._logger.warn("Ignoring invalid model summary", error); }
+        }));
+        source.onerror = () => {
+            if (source === this._summarySource) {
+                // EventSource reconnects in place.  A restarted backend can
+                // legitimately begin a new model-version epoch at zero.
+                this._summaryVersion = -1;
+                this._logger.warn("Model summary stream disconnected");
+            }
+        };
+    }
+
+    public stopSummaryStream(): void {
+        this._summaryConsumers = Math.max(0, this._summaryConsumers - 1);
+        if (this._summaryConsumers > 0) { return; }
+        this._summarySource?.close();
+        this._summarySource = null;
+        this._summaryGeneration++;
+    }
+
+    private static key(file: ModelFile): string { return file.file_id || file.name; }
+    private static commandUrl(action: string, file: ModelFile): string {
+        let url = "/server/command/" + action + "/" + encodeURIComponent(encodeURIComponent(file.name));
+        if (file.file_id) { url += "?file_id=" + encodeURIComponent(file.file_id); }
         return url;
     }
+    public queue(file: ModelFile): Observable<WebReaction> { return this._rest.post(ModelFileService.commandUrl("queue", file)); }
+    public stop(file: ModelFile): Observable<WebReaction> { return this._rest.post(ModelFileService.commandUrl("stop", file)); }
+    public extract(file: ModelFile): Observable<WebReaction> { return this._rest.post(ModelFileService.commandUrl("extract", file)); }
+    public deleteLocal(file: ModelFile): Observable<WebReaction> { return this._rest.delete(ModelFileService.commandUrl("delete_local", file)); }
+    public deleteRemote(file: ModelFile): Observable<WebReaction> { return this._rest.delete(ModelFileService.commandUrl("delete_remote", file)); }
+    public validate(file: ModelFile): Observable<WebReaction> { return this._rest.post(ModelFileService.commandUrl("validate", file)); }
+    public retryMove(file: ModelFile): Observable<WebReaction> { return this._rest.post(ModelFileService.commandUrl("retry_move", file)); }
 
-    /**
-     * Queue a file for download
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public queue(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Queue model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("queue", file);
-        return this._restService.post(url);
-    }
-
-    /**
-     * Stop a file
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public stop(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Stop model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("stop", file);
-        return this._restService.post(url);
-    }
-
-    /**
-     * Extract a file
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public extract(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Extract model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("extract", file);
-        return this._restService.post(url);
-    }
-
-    /**
-     * Delete file locally
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public deleteLocal(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Delete locally model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("delete_local", file);
-        return this._restService.delete(url);
-    }
-
-    /**
-     * Delete file remotely
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public deleteRemote(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Delete remotely model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("delete_remote", file);
-        return this._restService.delete(url);
-    }
-
-    /**
-     * Validate a file
-     * @param {ModelFile} file
-     * @returns {Observable<WebReaction>}
-     */
-    public validate(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Validate model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("validate", file);
-        return this._restService.post(url);
-    }
-
-    public retryMove(file: ModelFile): Observable<WebReaction> {
-        this._logger.debug("Retry final move for model file: " + file.name);
-        const url: string = ModelFileService.buildCommandUrl("retry_move", file);
-        return this._restService.post(url);
-    }
-
-    protected onEvent(eventName: string, data: string) {
-        this.parseEvent(eventName, data);
-    }
-
-    protected onConnected() {
-        // nothing to do
-    }
-
-    protected onDisconnected() {
-        // Update clients by clearing the model
-        this._files.next(this._files.getValue().clear());
-    }
-
-    private parseJsonSafe(data: string): any | null {
+    // Compatibility only: StreamDispatch no longer registers this service.
+    public getEventNames(): string[] { return ["model-init", "model-added", "model-updated", "model-removed"]; }
+    public notifyConnected(): void {}
+    public notifyDisconnected(): void { if (this._scopeId == null) { this._files.next(Immutable.Map()); } }
+    public notifyEvent(event: string, data: string): void {
+        if (this._scopeId != null) { return; }
         try {
-            return JSON.parse(data);
+            const parsed = JSON.parse(data);
+            let current = this._files.value;
+            if (event === "model-init" && Array.isArray(parsed)) {
+                current = Immutable.Map<string, ModelFile>(parsed.map(record => {
+                    const file = ModelFile.fromJson({...record});
+                    return [ModelFileService.key(file), file];
+                }));
+            } else if ((event === "model-added" || event === "model-updated") && parsed?.new_file) {
+                const file = ModelFile.fromJson({...parsed.new_file});
+                current = current.set(ModelFileService.key(file), file);
+            } else if (event === "model-removed" && parsed?.old_file) {
+                const file = ModelFile.fromJson({...parsed.old_file});
+                current = current.remove(ModelFileService.key(file));
+            } else if (event.indexOf("model-") === 0) {
+                this._logger.error("Ignoring invalid legacy model payload");
+                return;
+            }
+            this._files.next(current);
+        } catch (error) { this._logger.error("Ignoring invalid legacy model payload", error); }
+    }
+
+    private _handleInitialPage(scopeId: string, event: Event): void {
+        if (scopeId !== this._scopeId) { return; }
+        try {
+            const page = JSON.parse((<MessageEvent>event).data) as ModelPageResponse;
+            if (!Array.isArray(page.records)) { throw new Error("Initial model page is invalid"); }
+            this._generation++;
+            this._request?.unsubscribe();
+            this._request = null;
+            this._syncing = true;
+            this._records = this._recordsFrom(page.records, this._version(page));
+            this._pendingRecords = Immutable.Map();
+            this._pendingRemoved = Immutable.Map();
+            if (this._pageSize === 0) { this._publish(); }
+            if (page.next_cursor) {
+                this._fetchTransportPage(scopeId, this._generation, page.next_cursor);
+            } else {
+                this._finishSync();
+            }
         } catch (error) {
-            this._logger.error("Failed to parse model stream payload: %O", error);
-            return null;
+            this._logger.warn("Ignoring invalid scoped model page", error);
+            this._scheduleRecovery(error, scopeId, this._generation);
         }
     }
 
-    private logTraceReceipt(eventName: string, trace: any, rawFile: any) {
-        if (trace == null || typeof trace !== "object") {
-            return;
-        }
-        this._logger.debug("Stop/resume model trace received", {
-            event: eventName,
-            browser_received_timestamp_ms: Date.now(),
-            trace: trace,
-            published_progress: rawFile && rawFile.download_progress,
-            published_transferred_size: rawFile && rawFile.transferred_size,
-            published_state: rawFile && rawFile.state
+    private _fetchTransportPage(scopeId: string, generation: number, cursor: string): void {
+        const params = new HttpParams().set("limit", String(ModelFileService.TRANSPORT_LIMIT)).set("cursor", cursor);
+        this._request = this._http.get<ModelPageResponse>(this._rootsUrl(scopeId), {params}).subscribe({
+            next: page => {
+                if (generation !== this._generation || scopeId !== this._scopeId) { return; }
+                if (!Array.isArray(page.records)) {
+                    this._scheduleRecovery(new Error("Scoped model continuation is invalid"), scopeId, generation);
+                    return;
+                }
+                this._mergeRecords(page.records, this._version(page));
+                if (this._pageSize === 0) { this._publish(); }
+                if (page.next_cursor) { this._fetchTransportPage(scopeId, generation, page.next_cursor); }
+                else { this._finishSync(); }
+            },
+            error: error => this._handleCursorError(error, scopeId, generation)
         });
     }
 
-    private logTraceApplied(trace: any, file: ModelFile) {
-        if (trace == null || typeof trace !== "object") {
-            return;
-        }
-        this._logger.debug("Stop/resume model trace applied", {
-            browser_applied_timestamp_ms: Date.now(),
-            trace: trace,
-            published_progress: file.download_progress,
-            published_transferred_size: file.transferred_size,
-            published_state: file.state
-        });
+    private _handleCursorError(error: any, scopeId: string, generation: number): void {
+        if (generation !== this._generation || scopeId !== this._scopeId) { return; }
+        this._scheduleRecovery(error, scopeId, generation);
     }
 
-    /**
-     * Parse an event and update the file model
-     * @param {string} name
-     * @param {string} data
-     */
-    private parseEvent(name: string, data: string) {
-        if (name === this.EVENT_INIT) {
-            // Init event receives an array of ModelFiles
-            let t0: number;
-            let t1: number;
+    private _finishSync(): void {
+        this._syncing = false;
+        this._applyPendingPatches();
+        this._lastGoodRecords = this._records;
+        this._lastGoodVersions = this._recordVersions;
+        this._recoveryAttempts = 0;
+        this._publish();
+    }
 
-            t0 = performance.now();
-            const parsed: [any] = this.parseJsonSafe(data);
-            if (parsed === null || !Array.isArray(parsed)) {
-                this._logger.error("Invalid model-init payload");
-                return;
-            }
-            t1 = performance.now();
-            this._logger.debug("Parsing took", (t1 - t0).toFixed(0), "ms");
-
-            try {
-                t0 = performance.now();
-                const newFiles: ModelFile[] = [];
-                for (const file of parsed) {
-                    newFiles.push(ModelFile.fromJson(file));
-                }
-                t1 = performance.now();
-                this._logger.debug("ModelFile creation took", (t1 - t0).toFixed(0), "ms");
-
-                // Replace the entire model
-                t0 = performance.now();
-                const newMap = Immutable.Map<string, ModelFile>(
-                    newFiles.map(value => ([ModelFileService.getFileKey(value), value]))
-                );
-                t1 = performance.now();
-                this._logger.debug("ModelFile map creation took", (t1 - t0).toFixed(0), "ms");
-
-                this._files.next(newMap);
-                // this._logger.debug("New model: %O", this._files.getValue().toJS());
-            } catch (error) {
-                this._logger.error("Failed to handle model-init payload: %O", error);
-            }
-        } else if (name === this.EVENT_ADDED) {
-            // Added event receives old and new ModelFiles
-            // Only new file is relevant
-            const parsed: any = this.parseJsonSafe(data);
-            if (parsed === null || !parsed.new_file) {
-                this._logger.error("Invalid model-added payload");
-                return;
-            }
-            this.logTraceReceipt(name, parsed.trace, parsed.new_file);
-            try {
-                const file = ModelFile.fromJson(parsed.new_file);
-                const fileKey = ModelFileService.getFileKey(file);
-                if (this._files.getValue().has(fileKey)) {
-                    this._logger.error("ModelFile identity " + fileKey + " already exists");
-                } else {
-                    this._files.next(this._files.getValue().set(fileKey, file));
-                    this._logger.debug("Added file: %O", file.toJS());
-                    this.logTraceApplied(parsed.trace, file);
-                }
-            } catch (error) {
-                this._logger.error("Failed to handle model-added payload: %O", error);
-            }
-        } else if (name === this.EVENT_REMOVED) {
-            // Removed event receives old and new ModelFiles
-            // Only old file is relevant
-            const parsed: any = this.parseJsonSafe(data);
-            if (parsed === null || !parsed.old_file) {
-                this._logger.error("Invalid model-removed payload");
-                return;
-            }
-            this.logTraceReceipt(name, parsed.trace, parsed.old_file);
-            try {
-                const file = ModelFile.fromJson(parsed.old_file);
-                const fileKey = ModelFileService.getFileKey(file);
-                if (this._files.getValue().has(fileKey)) {
-                    this._files.next(this._files.getValue().remove(fileKey));
-                    this._logger.debug("Removed file: %O", file.toJS());
-                    this.logTraceApplied(parsed.trace, file);
-                } else {
-                    this._logger.error("Failed to find ModelFile identity " + fileKey);
-                }
-            } catch (error) {
-                this._logger.error("Failed to handle model-removed payload: %O", error);
-            }
-        } else if (name === this.EVENT_UPDATED) {
-            // Updated event received old and new ModelFiles
-            // We will only use the new one here
-            const parsed: any = this.parseJsonSafe(data);
-            if (parsed === null || !parsed.new_file) {
-                this._logger.error("Invalid model-updated payload");
-                return;
-            }
-            this.logTraceReceipt(name, parsed.trace, parsed.new_file);
-            try {
-                const file = ModelFile.fromJson(parsed.new_file);
-                const fileKey = ModelFileService.getFileKey(file);
-                if (this._files.getValue().has(fileKey)) {
-                    this._files.next(this._files.getValue().set(fileKey, file));
-                    this._logger.debug("Updated file: %O", file.toJS());
-                    this.logTraceApplied(parsed.trace, file);
-                } else {
-                    this._logger.error("Failed to find ModelFile identity " + fileKey);
-                }
-            } catch (error) {
-                this._logger.error("Failed to handle model-updated payload: %O", error);
-            }
-        } else {
-            this._logger.error("Unrecognized event:", name);
+    private _scheduleRecovery(error: any, scopeId: string, generation: number): void {
+        if (generation !== this._generation || scopeId !== this._scopeId) { return; }
+        this._syncing = false;
+        this._records = this._lastGoodRecords;
+        this._recordVersions = this._lastGoodVersions;
+        this._pendingRecords = Immutable.Map();
+        this._pendingRemoved = Immutable.Map();
+        this._publish();
+        if (this._recoveryAttempts >= 1) {
+            this._logger.warn("Unable to refresh scoped model roots", error);
+            return;
         }
+        this._recoveryAttempts++;
+        this._logger.warn("Retrying scoped model roots after transport failure", error);
+        this._retryTimer = setTimeout(() => {
+            this._retryTimer = null;
+            if (scopeId === this._scopeId) { this._restartStream(); }
+        }, 250);
+    }
+
+    private _handlePatch(scopeId: string, event: Event): void {
+        if (scopeId !== this._scopeId) { return; }
+        try {
+            const patch = JSON.parse((<MessageEvent>event).data);
+            if (!Array.isArray(patch.records) || !Array.isArray(patch.removed_file_ids)) {
+                throw new Error("Scoped model patch is missing records or removed_file_ids");
+            }
+            if (this._syncing) {
+                const version = this._version(patch);
+                patch.records.forEach(record => this._queueRecordPatch(record, version));
+                patch.removed_file_ids.forEach(id => this._queueRemovalPatch(id, version));
+                if (this._pendingRecords.size + this._pendingRemoved.size > ModelFileService.MAX_PENDING_PATCHES) {
+                    this._restartStream();
+                }
+                return;
+            }
+            this._applyPatch(patch.records, patch.removed_file_ids, this._version(patch));
+            this._lastGoodRecords = this._records;
+            this._lastGoodVersions = this._recordVersions;
+            this._publish();
+        } catch (error) {
+            this._logger.warn("Ignoring invalid scoped model patch", error);
+            this._scheduleRecovery(error, scopeId, this._generation);
+        }
+    }
+
+    private _queueRecordPatch(record: any, version: number): void {
+        const file = ModelFile.fromJson({...record});
+        const key = ModelFileService.key(file);
+        if ((this._pendingRemoved.get(key) || -1) <= version) { this._pendingRemoved = this._pendingRemoved.remove(key); }
+        const pending = this._pendingRecords.get(key);
+        if (pending == null || pending.version <= version) { this._pendingRecords = this._pendingRecords.set(key, {file, version}); }
+    }
+    private _queueRemovalPatch(id: any, version: number): void {
+        if (typeof id !== "string") { return; }
+        const pending = this._pendingRecords.get(id);
+        if (pending == null || pending.version <= version) { this._pendingRecords = this._pendingRecords.remove(id); }
+        if ((this._pendingRemoved.get(id) || -1) <= version) { this._pendingRemoved = this._pendingRemoved.set(id, version); }
+    }
+    private _applyPendingPatches(): void {
+        this._pendingRecords.forEach((pending, id) => this._applyRecord(id, pending.file, pending.version));
+        this._pendingRemoved.forEach((version, id) => {
+            if ((this._recordVersions.get(id) || -1) <= version) {
+                this._records = this._records.remove(id);
+                this._recordVersions = this._recordVersions.set(id, version);
+            }
+        });
+        this._pendingRecords = Immutable.Map();
+        this._pendingRemoved = Immutable.Map();
+    }
+    private _applyPatch(records: any[], removedIds: any[], version: number): void {
+        this._mergeRecords(records, version);
+        removedIds.forEach(id => {
+            if (typeof id === "string" && (this._recordVersions.get(id) || -1) <= version) {
+                this._records = this._records.remove(id);
+                this._recordVersions = this._recordVersions.set(id, version);
+            }
+        });
+    }
+    private _recordsFrom(records: any[], version: number): Immutable.Map<string, ModelFile> {
+        let result = Immutable.Map<string, ModelFile>();
+        this._recordVersions = Immutable.Map();
+        records.forEach(record => {
+            const file = ModelFile.fromJson({...record});
+            result = result.set(ModelFileService.key(file), file);
+            this._recordVersions = this._recordVersions.set(ModelFileService.key(file), version);
+        });
+        return result;
+    }
+    private _mergeRecords(records: any[], version: number): void {
+        records.forEach(record => {
+            const file = ModelFile.fromJson({...record});
+            this._applyRecord(ModelFileService.key(file), file, version);
+        });
+    }
+    private _applyRecord(id: string, file: ModelFile, version: number): void {
+        if ((this._recordVersions.get(id) || -1) <= version) {
+            this._records = this._records.set(id, file);
+            this._recordVersions = this._recordVersions.set(id, version);
+        }
+    }
+    private _version(payload: any): number { return typeof payload?.model_version === "number" ? payload.model_version : 0; }
+    private _publish(): void { this._files.next(this._records); }
+
+    private _openStream(): void {
+        const scopeId = this._scopeId;
+        if (scopeId == null) { return; }
+        const source = ModelEventSourceFactory.create(this._streamUrl(scopeId) + "?limit=" + ModelFileService.TRANSPORT_LIMIT);
+        this._eventSource = source;
+        source.addEventListener("model-page", event => this._zone.run(() => {
+            if (source === this._eventSource && scopeId === this._scopeId) { this._handleInitialPage(scopeId, event); }
+        }));
+        source.addEventListener("model-invalidate", event => this._zone.run(() => {
+            if (source === this._eventSource && scopeId === this._scopeId) { this._handlePatch(scopeId, event); }
+        }));
+        source.addEventListener("model-patch", event => this._zone.run(() => {
+            if (source === this._eventSource && scopeId === this._scopeId) { this._handlePatch(scopeId, event); }
+        }));
+        source.addEventListener("model-reset", () => this._zone.run(() => {
+            if (source === this._eventSource && scopeId === this._scopeId) { this._restartStream(); }
+        }));
+        source.onerror = () => {
+            if (source === this._eventSource && scopeId === this._scopeId) {
+                this._logger.warn("Scoped model stream disconnected", {scopeId});
+            }
+        };
+    }
+    private _restartStream(): void {
+        if (this._scopeId == null) { return; }
+        this._generation++;
+        this._request?.unsubscribe();
+        this._request = null;
+        if (this._retryTimer != null) { clearTimeout(this._retryTimer); this._retryTimer = null; }
+        this._syncing = false;
+        this._pendingRecords = Immutable.Map();
+        this._pendingRemoved = Immutable.Map();
+        this._eventSource?.close();
+        this._eventSource = null;
+        this._openStream();
+    }
+
+    private _rootsUrl(scope: string): string { return "/server/model/v1/pairs/" + encodeURIComponent(scope) + "/roots"; }
+    private _streamUrl(scope: string): string { return "/server/model/v1/pairs/" + encodeURIComponent(scope) + "/stream"; }
+    private _setSummaries(payload: any): void {
+        const version = this._version(payload);
+        if (version < this._summaryVersion) { return; }
+        this._summaryVersion = version;
+        const summaries = Array.isArray(payload?.path_pairs) ? payload.path_pairs : Array.isArray(payload) ? payload : [];
+        this._summary.next(summaries);
+        this._updateVisibleStateCounts();
+    }
+    private _updateVisibleStateCounts(): void {
+        const summary = this._summary.value.find(value => value?.path_pair_id === this._scopeId);
+        const counts = summary?.visible_state_counts;
+        this._visibleStateCounts.next(counts != null && typeof counts === "object" ? counts : {});
     }
 }

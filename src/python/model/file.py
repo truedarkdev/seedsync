@@ -401,6 +401,11 @@ class ModelFile:
     def get_children(self) -> List["ModelFile"]:
         return copy.copy(self.__children)
 
+    @property
+    def child_count(self) -> int:
+        """Number of direct children without allocating a list snapshot."""
+        return len(self.__children)
+
     def iter_children(self) -> Iterator["ModelFile"]:
         # Read-only iterator over the live child list. Do not add or remove
         # children while consuming it; use get_children() if a mutation-tolerant

@@ -159,6 +159,57 @@ describe("Testing stream dispatch service", () => {
         expect(eventSources.length).toBe(2);
     }));
 
+    it("closes deliberately on page exit without disconnecting services or retrying", fakeAsync(() => {
+        dispatchService.shutdownForPageExit();
+        mockEventSource.onerror(new Event("late browser teardown error"));
+        tick(4000);
+
+        expect(mockEventSource.close).toHaveBeenCalledTimes(1);
+        expect(mockService1.connectedSeq).toEqual([]);
+        expect(mockService2.connectedSeq).toEqual([]);
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(1);
+    }));
+
+    it("keeps the stream open for BFCache pagehide", fakeAsync(() => {
+        (<any>dispatchService)._pageHideListener(<PageTransitionEvent>{persisted: true});
+        tick(4000);
+
+        expect(mockEventSource.close).not.toHaveBeenCalled();
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(1);
+    }));
+
+    it("closes on non-persisted pagehide and beforeunload only once", fakeAsync(() => {
+        (<any>dispatchService)._pageHideListener(<PageTransitionEvent>{persisted: false});
+        (<any>dispatchService)._beforeUnloadListener();
+        (<any>dispatchService)._pageHideListener(<PageTransitionEvent>{persisted: false});
+        tick();
+
+        expect(mockEventSource.close).toHaveBeenCalledTimes(1);
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(1);
+    }));
+
+    it("makes repeated page-exit teardown idempotent", fakeAsync(() => {
+        dispatchService.shutdownForPageExit();
+        dispatchService.shutdownForPageExit();
+        tick();
+
+        expect(mockEventSource.close).toHaveBeenCalledTimes(1);
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(1);
+    }));
+
+    it("ignores a stale source error after a real reconnect", fakeAsync(() => {
+        const staleSource = mockEventSource;
+        staleSource.onerror(new Event("real error"));
+        tick(3000);
+        expect(eventSources.length).toBe(2);
+        staleSource.onerror(new Event("late stale error"));
+        tick(4000);
+
+        expect(mockService1.connectedSeq).toEqual([false]);
+        expect(mockService2.connectedSeq).toEqual([false]);
+        expect(EventSourceFactory.createEventSource).toHaveBeenCalledTimes(2);
+    }));
+
     it("should ignore events whose service registration is missing", fakeAsync(() => {
         spyOn(console, "warn");
         (<any>dispatchService)["_eventNameToServiceMap"].delete("event1a");
@@ -236,8 +287,8 @@ describe("Testing stream service registry", () => {
         expect(registry).toBeDefined();
     });
 
-    it("should register model file service", () => {
-        expect(registered.includes(mockModelFileService)).toBe(true);
+    it("does not register model files on the global stream", () => {
+        expect(registered.includes(mockModelFileService)).toBe(false);
     });
 
     it("should register server status service", () => {

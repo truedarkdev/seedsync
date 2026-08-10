@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Optional, Protocol, Sequence, Set, Tuple, cast
+from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
 from threading import Lock, RLock
 from queue import Queue
 from enum import Enum
@@ -11,6 +11,7 @@ from datetime import datetime
 import copy
 import hashlib
 import json
+import heapq
 import os
 import ntpath
 import stat
@@ -50,6 +51,11 @@ ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
 LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
 RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
 
+# A single-path configuration still has no persisted path-pair id.  The web
+# model API exposes it through this explicit synthetic scope without changing
+# command/file identities (which remain the legacy unscoped file ids).
+MODEL_LEGACY_SCOPE_ID = "__legacy__"
+
 
 class _PathPairTransferBackend(Protocol):
     def set_path_pairs(self, path_pairs: list[PathPair]) -> None: ...
@@ -60,6 +66,20 @@ class ControllerError(AppError):
     Exception indicating a controller error
     """
     pass
+
+
+class ModelPageCursorError(ControllerError):
+    """The client supplied an invalid page cursor for a scoped model page."""
+    pass
+
+
+class _ReverseModelSortKey:
+    """heapq adapter that keeps the greatest selected key at heap[0]."""
+    def __init__(self, key: tuple[object, ...]):
+        self.key = key
+
+    def __lt__(self, other: "_ReverseModelSortKey") -> bool:
+        return self.key > other.key
 
 
 @dataclass(frozen=True)
@@ -483,6 +503,8 @@ class Controller:
         # Lock for the model. Listeners may re-enter controller model access
         # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
+        self.__model_summary_cache: Optional[dict[str, object]] = None
+        self.__model_summary_cache_at = 0.0
         self.__remote_delete_success_listeners = []
         self.__remote_delete_success_listeners_lock = Lock()
         self.__download_start_listeners = []
@@ -1713,6 +1735,378 @@ class Controller:
         with self.__model_lock:
             model_files = self.__get_model_files()
         return model_files
+
+    @staticmethod
+    def _model_scope_id(path_pair_id: Optional[str]) -> str:
+        return path_pair_id if path_pair_id is not None else MODEL_LEGACY_SCOPE_ID
+
+    @staticmethod
+    def _model_state_name(file: ModelFile) -> str:
+        return file.state.name.lower()
+
+    @classmethod
+    def _model_file_page_record(cls, file: ModelFile) -> dict[str, object]:
+        """Build one JSON-ready, shallow model record while the model is locked.
+
+        Do not copy the ModelFile and, in particular, do not walk descendants
+        here.  Children are fetched through the scoped child-page endpoint.
+        """
+        child_count = file.child_count
+        return {
+            "name": file.name,
+            "is_dir": file.is_dir,
+            "state": cls._model_state_name(file),
+            "remote_size": file.remote_size,
+            "local_size": file.local_size,
+            "remote_present": file.remote_present,
+            "local_present": file.local_present,
+            "remote_has_transferable_content": file.remote_has_transferable_content,
+            "transferred_size": file.transferred_size,
+            "download_progress": file.download_progress,
+            "downloading_speed": file.downloading_speed,
+            "eta": file.eta,
+            "is_extractable": file.is_extractable,
+            "is_stoppable": file.is_stoppable,
+            "local_created_timestamp": str(file.local_created_timestamp.timestamp()) if file.local_created_timestamp else None,
+            "local_modified_timestamp": str(file.local_modified_timestamp.timestamp()) if file.local_modified_timestamp else None,
+            "remote_created_timestamp": str(file.remote_created_timestamp.timestamp()) if file.remote_created_timestamp else None,
+            "remote_modified_timestamp": str(file.remote_modified_timestamp.timestamp()) if file.remote_modified_timestamp else None,
+            "downloaded_timestamp": str(file.downloaded_timestamp.timestamp()) if file.downloaded_timestamp else None,
+            "full_path": file.full_path,
+            "file_id": file.file_id,
+            "path_pair_id": file.path_pair_id,
+            "path_pair_name": file.path_pair_name,
+            "validation_progress": file.validation_progress,
+            "validation_error": file.validation_error,
+            "corrupt_chunks": file.corrupt_chunks,
+            "final_move_succeeded": file.final_move_succeeded,
+            # Keep the established object shape without smuggling the tree
+            # through a page response.
+            "children": [],
+            "child_count": child_count,
+            "has_children": child_count > 0,
+        }
+
+    @staticmethod
+    def _model_record_visible_state(file: ModelFile) -> str:
+        if file.local_present and not file.remote_has_transferable_content:
+            return "local_only"
+        has_retained_progress = (
+            file.remote_has_transferable_content
+            and (file.remote_size or 0) > 0
+            and ((file.transferred_size or 0) > 0 or (file.download_progress or 0) > 0)
+        )
+        if file.state == ModelFile.State.DEFAULT and has_retained_progress:
+            return "stopped"
+        if file.state == ModelFile.State.DOWNLOADED and file.final_move_succeeded:
+            return "move_succeeded"
+        return file.state.name.lower()
+
+    @staticmethod
+    def __scoped_file_path(scope_id: str, file_id: str) -> str:
+        """Decode one canonical ModelFile identity without searching the model."""
+        if scope_id == MODEL_LEGACY_SCOPE_ID:
+            path = file_id
+        else:
+            try:
+                payload = json.loads(file_id)
+            except (TypeError, ValueError) as exc:
+                raise ModelPageCursorError("File identity is malformed") from exc
+            if (
+                not isinstance(payload, list) or len(payload) != 2
+                or payload[0] != scope_id or not isinstance(payload[1], str)
+            ):
+                raise ModelPageCursorError("File identity is outside this path-pair scope")
+            path = payload[1]
+        if not isinstance(path, str) or not path or os.path.isabs(path):
+            raise ModelPageCursorError("File identity is malformed")
+        normalized = os.path.normpath(path)
+        if normalized in {".", ".."} or normalized.startswith(".." + os.sep):
+            raise ModelPageCursorError("File identity is malformed")
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+        if ModelFile.build_file_id(normalized, expected_path_pair_id) != file_id:
+            raise ModelPageCursorError("File identity is not canonical")
+        return normalized
+
+    def __resolve_scoped_model_file(self, scope_id: str, file_id: str) -> ModelFile:
+        path = self.__scoped_file_path(scope_id, file_id)
+        components = path.split(os.sep)
+        if not components or any(not component for component in components):
+            raise ModelPageCursorError("File identity is malformed")
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+        root_id = ModelFile.build_file_id(components[0], expected_path_pair_id)
+        try:
+            current = self.__model.get_file(root_id)
+        except ModelError as exc:
+            raise ModelPageCursorError("File does not exist in this path-pair scope") from exc
+        if current.path_pair_id != expected_path_pair_id:
+            raise ModelPageCursorError("File is outside this path-pair scope")
+        for component in components[1:]:
+            current = next((child for child in current.iter_children() if child.name == component), None)
+            if current is None:
+                raise ModelPageCursorError("File does not exist in this path-pair scope")
+        if current.file_id != file_id:
+            raise ModelPageCursorError("File identity is not canonical")
+        return current
+
+    def __scoped_model_file_candidates(
+        self, scope_id: str, parent_file_id: Optional[str]
+    ) -> Iterable[ModelFile]:
+        if parent_file_id is not None:
+            return self.__resolve_scoped_model_file(scope_id, parent_file_id).iter_children()
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+
+        def roots() -> Iterable[ModelFile]:
+            for candidate in self.__model.iter_files_by_id():
+                if candidate.path_pair_id == expected_path_pair_id:
+                    yield candidate
+        return roots()
+
+    def __bounded_model_page_files(
+        self,
+        candidates: Iterable[ModelFile],
+        limit: int,
+        cursor_file_id: Optional[str],
+        cursor_sort_key: Optional[tuple[object, ...]],
+        scope_id: str, parent_file_id: Optional[str],
+    ) -> tuple[int, list[ModelFile], bool]:
+        del scope_id
+        after_id = cursor_file_id
+        if cursor_sort_key is not None and len(cursor_sort_key) == 1 and isinstance(cursor_sort_key[0], str):
+            after_id = cursor_sort_key[0]
+        total = 0
+        if parent_file_id is None:
+            # Model.iter_files_by_id is a controller-lock-stable canonical
+            # identity index. Root cursors never depend on mutable view state.
+            selected: list[ModelFile] = []
+            has_successor = False
+            for candidate in candidates:
+                total += 1
+                if after_id is not None and candidate.file_id <= after_id:
+                    continue
+                if len(selected) < limit:
+                    selected.append(candidate)
+                else:
+                    has_successor = True
+            return total, selected, has_successor
+
+        # Children are not part of the dashboard transport path, but retain a
+        # bounded identity page for API symmetry without copying their list.
+        selected_heap: list[tuple[_ReverseModelSortKey, int, ModelFile]] = []
+        has_successor = False
+        serial = 0
+        for candidate in candidates:
+            total += 1
+            key = (candidate.file_id,)
+            if after_id is not None and candidate.file_id <= after_id:
+                continue
+            entry = (_ReverseModelSortKey(key), serial, candidate)
+            serial += 1
+            if len(selected_heap) < limit:
+                heapq.heappush(selected_heap, entry)
+            elif key < selected_heap[0][0].key:
+                heapq.heapreplace(selected_heap, entry)
+                has_successor = True
+            else:
+                has_successor = True
+        selected = [entry[2] for entry in selected_heap]
+        selected.sort(key=lambda file: file.file_id)
+        return total, selected, has_successor
+
+    def __get_model_page_locked(
+        self,
+        scope_id: str,
+        limit: int,
+        cursor_file_id: Optional[str] = None,
+        cursor_version: Optional[int] = None,
+        cursor_sort_key: Optional[tuple[object, ...]] = None,
+        parent_file_id: Optional[str] = None, sort_mode: int = 1, status_filter: Optional[str] = None,
+        name_filter: Optional[str] = None,
+    ) -> dict[str, object]:
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+        version = self.__model.scope_version(expected_path_pair_id)
+        total, page_files, has_successor = self.__bounded_model_page_files(
+            self.__scoped_model_file_candidates(scope_id, parent_file_id),
+            limit, cursor_file_id, cursor_sort_key, scope_id, parent_file_id,
+        )
+        next_cursor_file_id = None
+        if has_successor and page_files:
+            next_cursor_file_id = page_files[-1].file_id
+        return {
+            "model_version": version,
+            "path_pair_id": scope_id,
+            "parent_file_id": parent_file_id,
+            "limit": limit,
+            "total": total,
+            "records": [self._model_file_page_record(file) for file in page_files],
+            # The handler turns this identity/version pair into an opaque
+            # cursor; keeping it primitive here lets the controller stay HTTP
+            # agnostic and makes atomic setup reusable by SSE.
+            "next_cursor_file_id": next_cursor_file_id,
+            "next_cursor_sort_key": (page_files[-1].file_id,) if next_cursor_file_id else None,
+        }
+
+    def get_model_page(
+        self,
+        scope_id: str,
+        limit: int,
+        cursor_file_id: Optional[str] = None,
+        cursor_version: Optional[int] = None,
+        cursor_sort_key: Optional[tuple[object, ...]] = None,
+        parent_file_id: Optional[str] = None, sort_mode: int = 1, status_filter: Optional[str] = None,
+        name_filter: Optional[str] = None,
+    ) -> dict[str, object]:
+        with self.__model_lock:
+            return self.__get_model_page_locked(
+                scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key, parent_file_id, sort_mode, status_filter, name_filter
+            )
+
+    def get_model_page_and_add_listener(
+        self,
+        listener: IModelListener,
+        scope_id: str,
+        limit: int,
+        cursor_file_id: Optional[str] = None,
+        cursor_version: Optional[int] = None,
+        cursor_sort_key: Optional[tuple[object, ...]] = None,
+        parent_file_id: Optional[str] = None, sort_mode: int = 1, status_filter: Optional[str] = None,
+        name_filter: Optional[str] = None,
+    ) -> dict[str, object]:
+        """Atomically register a scoped listener and return its initial page."""
+        with self.__model_lock:
+            page = self.__get_model_page_locked(
+                scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key, parent_file_id, sort_mode, status_filter, name_filter
+            )
+            self.__model.add_listener(listener)
+            return page
+
+    def get_model_root_updates(self, scope_id: str, file_ids: Iterable[str]) -> dict[str, object]:
+        """Map primitive changed identities to bounded shallow root patches.
+
+        Listener queues deliberately retain no ModelFile references.  A child
+        identity maps to its root at emission time so dashboard rows can patch
+        without rescanning the selected scope.
+        """
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+        with self.__model_lock:
+            root_ids: set[str] = set()
+            for file_id in file_ids:
+                try:
+                    path = self.__scoped_file_path(scope_id, file_id)
+                except ModelPageCursorError:
+                    continue
+                root_name = path.split(os.sep)[0]
+                root_ids.add(ModelFile.build_file_id(root_name, expected_path_pair_id))
+            records: list[dict[str, object]] = []
+            removed_root_ids: list[str] = []
+            for root_id in sorted(root_ids):
+                try:
+                    root = self.__model.get_file(root_id)
+                except ModelError:
+                    removed_root_ids.append(root_id)
+                    continue
+                if root.path_pair_id == expected_path_pair_id:
+                    records.append(self._model_file_page_record(root))
+                else:
+                    removed_root_ids.append(root_id)
+            return {
+                "model_version": self.__model.scope_version(expected_path_pair_id),
+                "records": records,
+                "removed_file_ids": removed_root_ids,
+            }
+
+    def get_model_summary(self, max_age_seconds: float = 0.0) -> dict[str, object]:
+        """Return compact root-only counts; deliberately no file tree records."""
+        with self.__model_lock:
+            now = time.monotonic()
+            cached_summary = getattr(self, "_Controller__model_summary_cache", None)
+            cached_at = getattr(self, "_Controller__model_summary_cache_at", 0.0)
+            if (
+                max_age_seconds > 0 and isinstance(cached_summary, dict)
+                and cached_summary.get("model_version") == self.__model.version
+                and now - cached_at < max_age_seconds
+            ):
+                return cached_summary
+            summaries: dict[str, dict[str, object]] = {}
+            reconciled_local_scopes = {
+                self._model_scope_id(value) for value in self.__reconciled_local_path_pair_ids
+            }
+            reconciled_remote_scopes = {
+                self._model_scope_id(value) for value in self.__reconciled_remote_path_pair_ids
+            }
+            for file in self.__model.iter_files():
+                scope_id = self._model_scope_id(file.path_pair_id)
+                summary = summaries.setdefault(scope_id, {
+                    "path_pair_id": scope_id,
+                    "path_pair_name": file.path_pair_name,
+                    "root_count": 0,
+                    "remote_size": 0,
+                    "local_size": 0,
+                    "transferred_size": 0,
+                    "downloading_speed": 0,
+                    "remaining_bytes": 0,
+                    "active_eta_seconds_max": None,
+                    "active_count": 0,
+                    "queued_count": 0,
+                    "completed_count": 0,
+                    "state_counts": {},
+                    "visible_state_counts": {},
+                    "reconciled_local": scope_id in reconciled_local_scopes,
+                    "reconciled_remote": scope_id in reconciled_remote_scopes,
+                })
+                if summary["path_pair_name"] is None and file.path_pair_name is not None:
+                    summary["path_pair_name"] = file.path_pair_name
+                summary["root_count"] = int(summary["root_count"]) + 1
+                # Match the legacy path-pair card: roots without a positive
+                # remote size still contribute state counts, but not byte
+                # totals. Completion prefers transferred bytes, then local.
+                if file.remote_size is not None and file.remote_size > 0:
+                    completed_bytes = file.transferred_size
+                    if completed_bytes is None:
+                        completed_bytes = file.local_size
+                    completed_bytes = min(max(completed_bytes or 0, 0), file.remote_size)
+                    summary["remote_size"] = int(summary["remote_size"]) + file.remote_size
+                    summary["transferred_size"] = int(summary["transferred_size"]) + completed_bytes
+                    summary["local_size"] = int(summary["local_size"]) + completed_bytes
+                state_counts = cast(dict[str, int], summary["state_counts"])
+                state = self._model_state_name(file)
+                state_counts[state] = state_counts.get(state, 0) + 1
+                visible_state_counts = cast(dict[str, int], summary["visible_state_counts"])
+                visible_state = self._model_record_visible_state(file)
+                visible_state_counts[visible_state] = visible_state_counts.get(visible_state, 0) + 1
+                if file.state == ModelFile.State.DOWNLOADING:
+                    summary["active_count"] = int(summary["active_count"]) + 1
+                    summary["downloading_speed"] = int(summary["downloading_speed"]) + (file.downloading_speed or 0)
+                    if file.remote_size is not None:
+                        summary["remaining_bytes"] = int(summary["remaining_bytes"]) + max(
+                            0, file.remote_size - (file.transferred_size or 0)
+                        )
+                    if file.eta is not None:
+                        current_eta = summary["active_eta_seconds_max"]
+                        summary["active_eta_seconds_max"] = max(
+                            current_eta if isinstance(current_eta, int) else 0, file.eta
+                        )
+                elif file.state == ModelFile.State.QUEUED:
+                    summary["queued_count"] = int(summary["queued_count"]) + 1
+                elif file.state in {
+                    ModelFile.State.DOWNLOADED,
+                    ModelFile.State.EXTRACTED,
+                }:
+                    summary["completed_count"] = int(summary["completed_count"]) + 1
+            summary = {
+                "model_version": self.__model.version,
+                "path_pairs": [summaries[key] for key in sorted(summaries)],
+            }
+            self.__model_summary_cache = summary
+            self.__model_summary_cache_at = now
+            return summary
+
+    def get_model_summary_and_add_listener(self, listener: IModelListener) -> dict[str, object]:
+        """Atomically subscribe a compact-summary stream after its snapshot."""
+        with self.__model_lock:
+            summary = self.get_model_summary()
+            self.__model.add_listener(listener)
+            return summary
 
     def is_file_stopped(self, filename: str) -> bool:
         return filename in self.__persist.stopped_file_names

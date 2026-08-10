@@ -92,9 +92,12 @@ class WebAppJob(Job):
 
 class _BoundedWSGIServer(WSGIServer):
     normal_worker_count = 8
-    # SSE responses are long-lived. Twelve fixed slots cover a household or
-    # small LAN's normal browser usage without allowing unbounded threads.
-    stream_capacity = 12
+    # SSE responses are long-lived. Preserve the prior household/small-LAN
+    # envelope of twelve browser generations/tabs.  Each generation holds the
+    # global status stream plus one model summary or scoped-pair stream.
+    supported_browser_generations = 12
+    streams_per_browser_generation = 2
+    stream_capacity = supported_browser_generations * streams_per_browser_generation
     stream_worker_count = stream_capacity
     worker_count = normal_worker_count + stream_worker_count
     normal_queue_size = 5
@@ -104,6 +107,7 @@ class _BoundedWSGIServer(WSGIServer):
     stream_queue_size = stream_capacity
     request_queue_size = 5
     stream_request_path = "/server/stream"
+    summary_stream_request_path = "/server/model/v1/summary/stream"
     request_line_peek_size = 4096
     request_line_peek_timeout_seconds = 0.05
     stream_retry_after_seconds = 1
@@ -237,7 +241,18 @@ class _BoundedWSGIServer(WSGIServer):
         # Only the positively identified SSE endpoint should use the tiny
         # stream pool; ambiguous peeks stay on the normal queue so transient
         # socket timing cannot starve ordinary pages.
-        return request_path == self.stream_request_path
+        if request_path in {self.stream_request_path, self.summary_stream_request_path}:
+            return True
+        # Pair identifiers occupy exactly one decoded path component.  Keep
+        # this positive route shape intentionally narrow: other endpoints
+        # ending in /stream must retain ordinary WSGI admission.
+        components = request_path.split("/") if request_path is not None else []
+        return (
+            len(components) == 7
+            and components[:5] == ["", "server", "model", "v1", "pairs"]
+            and bool(components[5])
+            and components[6] == "stream"
+        )
 
     def _peek_request_path(self, request: object) -> str | None:
         if not isinstance(request, _PeekableRequest):

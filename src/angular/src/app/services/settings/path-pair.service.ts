@@ -43,6 +43,7 @@ export class PathPairService extends BaseWebService {
     private readonly PATH_PAIR_URL = "/server/path-pairs";
 
     private _pathPairs: BehaviorSubject<PathPair[]> = new BehaviorSubject([]);
+    private _loaded: BehaviorSubject<boolean> = new BehaviorSubject(false);
 
     constructor(_streamServiceRegistry: StreamServiceRegistry,
                 private _http: HttpClient,
@@ -57,10 +58,13 @@ export class PathPairService extends BaseWebService {
     get pathPairs$(): Observable<PathPair[]> {
         return this.pathPairs;
     }
+    get loaded(): Observable<boolean> { return this._loaded.asObservable(); }
 
     refresh() {
+        // Keep an already loaded snapshot active during an ordinary refresh;
+        // only startup/disconnect must withhold route-scope selection.
         this.getAll().subscribe({
-            next: pathPairs => this._pathPairs.next(pathPairs),
+            next: pathPairs => { this._pathPairs.next(pathPairs); this._loaded.next(true); },
             error: error => this._logger.error(error)
         });
     }
@@ -135,6 +139,7 @@ export class PathPairService extends BaseWebService {
     }
 
     protected onDisconnected() {
+        this._loaded.next(false);
         this._pathPairs.next([]);
     }
 }

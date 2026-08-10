@@ -150,12 +150,19 @@ class TestBoundedWSGIServer(unittest.TestCase):
     def test_uses_fixed_worker_pool_and_bounded_queue(self):
         self.assertFalse(issubclass(_BoundedWSGIServer, ThreadingMixIn))
         self.assertEqual(8, _BoundedWSGIServer.normal_worker_count)
-        self.assertEqual(12, _BoundedWSGIServer.stream_capacity)
+        self.assertEqual(12, _BoundedWSGIServer.supported_browser_generations)
+        self.assertEqual(2, _BoundedWSGIServer.streams_per_browser_generation)
+        self.assertEqual(
+            _BoundedWSGIServer.supported_browser_generations
+            * _BoundedWSGIServer.streams_per_browser_generation,
+            _BoundedWSGIServer.stream_capacity,
+        )
+        self.assertEqual(24, _BoundedWSGIServer.stream_capacity)
         self.assertEqual(
             _BoundedWSGIServer.stream_capacity,
             _BoundedWSGIServer.stream_worker_count,
         )
-        self.assertEqual(20, _BoundedWSGIServer.worker_count)
+        self.assertEqual(32, _BoundedWSGIServer.worker_count)
         self.assertEqual(5, _BoundedWSGIServer.normal_queue_size)
         self.assertEqual(
             _BoundedWSGIServer.stream_capacity,
@@ -396,6 +403,28 @@ class TestBoundedWSGIServer(unittest.TestCase):
         self.assertIs(encoded_stream_request, queued_request)
         self.assertEqual(("127.0.0.1", 1001), queued_client)
         server.shutdown_request.assert_not_called()
+
+    def test_model_sse_routes_use_stream_queue_and_non_sse_suffixes_do_not(self):
+        server = object.__new__(_BoundedWSGIServer)
+        server._worker_shutdown = Event()
+        server._request_admission_lock = Lock()
+        server._normal_request_queue = Queue(maxsize=4)
+        server._stream_request_queue = Queue(maxsize=4)
+        server._stream_admission = BoundedSemaphore(4)
+        server.shutdown_request = MagicMock()
+        requests = [
+            _FakeSocket(b"GET /server/model/v1/summary/stream?watch=1 HTTP/1.1\r\n\r\n"),
+            _FakeSocket(b"GET /server/model/v1/pairs/pair%2Da/stream?limit=200 HTTP/1.1\r\n\r\n"),
+            _FakeSocket(b"GET /server/model/v1/pairs/pair-a/not-stream HTTP/1.1\r\n\r\n"),
+            _FakeSocket(b"GET /server/other/stream HTTP/1.1\r\n\r\n"),
+            _FakeSocket(b"GET /server/model/v1/pairs/pair%2Fa/stream HTTP/1.1\r\n\r\n"),
+        ]
+        for index, request in enumerate(requests):
+            server.process_request(request, ("127.0.0.1", 1100 + index))
+
+        self.assertEqual(2, server._stream_request_queue.qsize())
+        self.assertEqual(3, server._normal_request_queue.qsize())
+        self.assertTrue(all(request.recv_flags == socket.MSG_PEEK for request in requests))
 
     def test_shutdown_rejects_new_stream_without_overload_response(self):
         server = self._routing_server()

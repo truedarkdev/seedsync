@@ -3,7 +3,7 @@ import {HttpClientTestingModule, HttpTestingController} from "@angular/common/ht
 
 import * as Immutable from "immutable";
 
-import {ModelFileService} from "../../../../services/files/model-file.service";
+import {ModelEventSourceFactory, ModelFileService} from "../../../../services/files/model-file.service";
 import {LoggerService} from "../../../../services/utils/logger.service";
 import {ModelFile} from "../../../../services/files/model-file";
 import {RestService} from "../../../../services/utils/rest.service";
@@ -11,6 +11,21 @@ import {RestService} from "../../../../services/utils/rest.service";
 
 // noinspection JSUnusedLocalSymbols
 const DoNothing = {next: reaction => {}};
+
+class FakeEventSource {
+    public onerror: (() => void) | null = null;
+    public readonly close = jasmine.createSpy("close");
+    private readonly listeners: {[event: string]: Array<(payload: any) => void>} = {};
+
+    public addEventListener(event: string, listener: (payload: any) => void): void {
+        this.listeners[event] = this.listeners[event] || [];
+        this.listeners[event].push(listener);
+    }
+
+    public emit(event: string, data: any = ""): void {
+        (this.listeners[event] || []).forEach(listener => listener({data}));
+    }
+}
 
 
 describe("Testing model file service", () => {
@@ -890,4 +905,230 @@ describe("Testing model file service", () => {
         modelFileService.deleteRemote(modelFile).subscribe(DoNothing);
         httpMock.expectOne(req => req.url === "/server/command/delete_remote/%252Ftest%252Fleadingslash" && req.method === "DELETE").flush("done");
     }));
+
+    it("automatically chains bounded shallow roots for All without server-side view queries", () => {
+        spyOn<any>(modelFileService, "_openStream");
+        modelFileService.setPageSize(0);
+        modelFileService.activateScope("movies");
+        (<any>modelFileService)._handleInitialPage("movies", <any>{data: JSON.stringify({
+            records: [{file_id: "one", name: "one", state: "default", children: []}], next_cursor: "one"
+        })});
+        const second = httpMock.expectOne(req => req.url === "/server/model/v1/pairs/movies/roots" &&
+            req.params.get("cursor") === "one" && req.params.get("limit") === "200");
+        expect(second.request.params.get("sort")).toBeNull();
+        expect(second.request.params.get("status")).toBeNull();
+        expect(second.request.params.get("name")).toBeNull();
+        second.flush({records: [{file_id: "two", name: "two", state: "default", children: []}], next_cursor: "two"});
+        const third = httpMock.expectOne(req => req.url === "/server/model/v1/pairs/movies/roots" &&
+            req.params.get("cursor") === "two" && req.params.get("limit") === "200");
+        third.flush({records: [{file_id: "three", name: "three", state: "default", children: []}], next_cursor: null});
+
+        let count = 0;
+        modelFileService.files.subscribe(files => count = files.size);
+        expect(count).toBe(3);
+        httpMock.expectNone(req => req.url.indexOf("/children") >= 0);
+        httpMock.verify();
+    });
+
+    it("accumulates every root with immutable identity deduplication before finite view pages render", () => {
+        spyOn<any>(modelFileService, "_openStream");
+        modelFileService.setPageSize(25);
+        modelFileService.activateScope("movies");
+        const chunk = (prefix: string) => Array.from({length: 200}, (_value, index) => ({
+            file_id: `${prefix}-${index}`, name: `${prefix}-${index}`, state: "default", children: []
+        }));
+        (<any>modelFileService)._handleInitialPage("movies", <any>{data: JSON.stringify({records: chunk("a"), next_cursor: "a"})});
+        const middle = httpMock.expectOne(req => req.params.get("cursor") === "a" && req.params.get("limit") === "200");
+        middle.flush({records: [{file_id: "a-0", name: "a-0 updated", state: "queued", children: []}].concat(chunk("b")), next_cursor: "b"});
+        const last = httpMock.expectOne(req => req.params.get("cursor") === "b" && req.params.get("limit") === "200");
+        last.flush({records: chunk("c").slice(0, 100), next_cursor: null});
+        let files: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(value => files = value);
+        expect(files.size).toBe(500);
+        expect(files.get("a-0").name).toBe("a-0 updated");
+        httpMock.verify();
+    });
+
+    it("applies transfer patches without a full root reload and resolves initial-chain races to the latest root", () => {
+        const stream = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValue(<any>stream);
+        modelFileService.activateScope("movies");
+        stream.emit("model-page", JSON.stringify({
+            records: [{file_id: "root-a", name: "root-a", state: "downloading", children: []}], next_cursor: "next"
+        }));
+        stream.emit("model-invalidate", JSON.stringify({
+            records: [{file_id: "root-a", name: "root-a", state: "downloaded", children: []}], removed_file_ids: []
+        }));
+        stream.emit("model-invalidate", JSON.stringify({records: [], removed_file_ids: ["root-b"]}));
+        httpMock.expectOne(req => req.params.get("cursor") === "next")
+            .flush({records: [{file_id: "root-b", name: "root-b", state: "default", children: []}], next_cursor: null});
+        let files: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(value => files = value);
+        expect(files.get("root-a").state).toBe(ModelFile.State.DOWNLOADED);
+        expect(files.has("root-b")).toBe(false);
+        stream.emit("model-invalidate", JSON.stringify({
+            records: [{file_id: "root-a", name: "root-a child update", state: "queued", children: []}], removed_file_ids: []
+        }));
+        expect(files.get("root-a").name).toBe("root-a child update");
+        httpMock.expectNone(req => req.url.endsWith("/roots"));
+        httpMock.verify();
+    });
+
+    it("applies live compact summary counts and closes the summary stream after its final consumer", () => {
+        const summarySource = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValue(<any>summarySource);
+        let counts: {[key: string]: number} = null;
+        modelFileService.visibleStateCounts.subscribe(value => counts = value);
+        (<any>modelFileService)._scopeId = "movies";
+
+        modelFileService.startSummaryStream();
+        httpMock.expectNone("/server/model/v1/summary");
+        expect(ModelEventSourceFactory.create).toHaveBeenCalledWith("/server/model/v1/summary/stream");
+
+        summarySource.emit("model-summary", JSON.stringify({model_version: 2, path_pairs: [
+            {path_pair_id: "movies", visible_state_counts: {queued: 2, stopped: 1}}
+        ]}));
+        expect(counts).toEqual({queued: 2, stopped: 1});
+
+        modelFileService.stopSummaryStream();
+        expect(summarySource.close).toHaveBeenCalled();
+        httpMock.verify();
+    });
+
+    it("keeps newer summary SSE data when an older explicit refresh resolves late or after stop", () => {
+        let summaries: any[] = null;
+        modelFileService.summaries.subscribe(value => summaries = value);
+        modelFileService.refreshSummary();
+        const refresh = httpMock.expectOne("/server/model/v1/summary");
+        const source = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValue(<any>source);
+        modelFileService.startSummaryStream();
+        source.emit("model-summary", JSON.stringify({model_version: 3, path_pairs: [{path_pair_id: "movies", root_count: 3}]}));
+        refresh.flush({model_version: 2, path_pairs: [{path_pair_id: "movies", root_count: 2}]});
+        expect(summaries[0].root_count).toBe(3);
+
+        modelFileService.stopSummaryStream();
+        modelFileService.refreshSummary();
+        const stoppedRefresh = httpMock.expectOne("/server/model/v1/summary");
+        modelFileService.stopSummaryStream();
+        stoppedRefresh.flush({model_version: 4, path_pairs: [{path_pair_id: "movies", root_count: 4}]});
+        expect(summaries[0].root_count).toBe(3);
+        httpMock.verify();
+    });
+
+    it("accepts a new lower summary version after current-stream reconnect but rejects a closed source", () => {
+        const first = new FakeEventSource();
+        const second = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>first, <any>second);
+        let summaries: any[] = null;
+        modelFileService.summaries.subscribe(value => summaries = value);
+        modelFileService.startSummaryStream();
+        first.emit("model-summary", JSON.stringify({model_version: 8, path_pairs: [{path_pair_id: "movies", root_count: 8}]}));
+        first.onerror!();
+        first.emit("model-summary", JSON.stringify({model_version: 1, path_pairs: [{path_pair_id: "movies", root_count: 1}]}));
+        expect(summaries[0].root_count).toBe(1);
+
+        modelFileService.stopSummaryStream();
+        modelFileService.startSummaryStream();
+        first.emit("model-summary", JSON.stringify({model_version: 99, path_pairs: [{path_pair_id: "movies", root_count: 99}]}));
+        second.emit("model-summary", JSON.stringify({model_version: 2, path_pairs: [{path_pair_id: "movies", root_count: 2}]}));
+        expect(summaries[0].root_count).toBe(2);
+        httpMock.verify();
+    });
+
+    it("retries one recoverable cursor failure with a bounded delay", fakeAsync(() => {
+        const initial = new FakeEventSource();
+        const retry = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>initial, <any>retry);
+        modelFileService.setPageSize(25);
+        modelFileService.activateScope("movies");
+        initial.emit("model-page", JSON.stringify({records: [], next_cursor: "stale"}));
+        httpMock.expectOne(req => req.url.endsWith("/pairs/movies/roots") && req.params.get("cursor") === "stale")
+            .flush({}, {status: 409, statusText: "Cursor conflict"});
+        tick(250);
+        expect(initial.close).toHaveBeenCalled();
+        retry.emit("model-page", JSON.stringify({records: [], next_cursor: null}));
+        httpMock.verify();
+    }));
+
+    it("stops after the bounded retry budget for repeated cursor or server failures", fakeAsync(() => {
+        const first = new FakeEventSource();
+        const second = new FakeEventSource();
+        const factory = spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>first, <any>second);
+        modelFileService.activateScope("movies");
+        first.emit("model-page", JSON.stringify({records: [], next_cursor: "first"}));
+        httpMock.expectOne(req => req.params.get("cursor") === "first")
+            .flush({}, {status: 409, statusText: "Cursor conflict"});
+        tick(250);
+        second.emit("model-page", JSON.stringify({records: [], next_cursor: "second"}));
+        httpMock.expectOne(req => req.params.get("cursor") === "second")
+            .flush({}, {status: 503, statusText: "Unavailable"});
+        tick(500);
+        expect(factory.calls.count()).toBe(2);
+        expect((<any>modelFileService)._pendingRecords.size).toBe(0);
+        expect((<any>modelFileService)._pendingRemoved.size).toBe(0);
+        httpMock.verify();
+    }));
+
+    it("stops after the bounded retry budget for persistently malformed initial pages", fakeAsync(() => {
+        const first = new FakeEventSource();
+        const second = new FakeEventSource();
+        const factory = spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>first, <any>second);
+        modelFileService.activateScope("movies");
+        first.emit("model-page", "not-json");
+        tick(250);
+        second.emit("model-page", "still-not-json");
+        tick(500);
+        expect(factory.calls.count()).toBe(2);
+        httpMock.verify();
+    }));
+
+    it("ignores stale callbacks from a closed stream for the same scope", () => {
+        const first = new FakeEventSource();
+        const second = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValues(<any>first, <any>second);
+        modelFileService.activateScope("movies");
+        first.emit("model-reset");
+        first.emit("model-page", JSON.stringify({
+            records: [{file_id: "stale", name: "stale", state: "default", children: []}], next_cursor: null
+        }));
+        second.emit("model-page", JSON.stringify({
+            records: [{file_id: "fresh", name: "fresh", state: "default", children: []}], next_cursor: null
+        }));
+        let files: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(value => files = value);
+        expect(files.has("stale")).toBe(false);
+        expect(files.has("fresh")).toBe(true);
+        httpMock.verify();
+    });
+
+    it("keeps a newer continuation page over an older pending patch", () => {
+        const stream = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValue(<any>stream);
+        modelFileService.activateScope("movies");
+        stream.emit("model-page", JSON.stringify({model_version: 2,
+            records: [{file_id: "root", name: "initial", state: "downloading", children: []}], next_cursor: "next"}));
+        stream.emit("model-invalidate", JSON.stringify({model_version: 2,
+            records: [{file_id: "root", name: "older patch", state: "downloaded", children: []}], removed_file_ids: []}));
+        httpMock.expectOne(req => req.params.get("cursor") === "next").flush({model_version: 3,
+            records: [{file_id: "root", name: "newer page", state: "queued", children: []}], next_cursor: null});
+        let files: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(value => files = value);
+        expect(files.get("root").name).toBe("newer page");
+        httpMock.verify();
+    });
+
+    it("applies a newer patch after an earlier page", () => {
+        const stream = new FakeEventSource();
+        spyOn(ModelEventSourceFactory, "create").and.returnValue(<any>stream);
+        modelFileService.activateScope("movies");
+        stream.emit("model-page", JSON.stringify({model_version: 2,
+            records: [{file_id: "root", name: "page", state: "downloading", children: []}], next_cursor: null}));
+        stream.emit("model-invalidate", JSON.stringify({model_version: 3,
+            records: [{file_id: "root", name: "newer patch", state: "downloaded", children: []}], removed_file_ids: []}));
+        let files: Immutable.Map<string, ModelFile> = null;
+        modelFileService.files.subscribe(value => files = value);
+        expect(files.get("root").name).toBe("newer patch");
+        httpMock.verify();
+    });
 });

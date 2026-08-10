@@ -112,6 +112,10 @@ export class ViewFileService {
                 @Inject(VIEW_FILE_COALESCE_MS) private _coalesceMs: number = 0) {
         this.modelFileService = _streamServiceRegistry.modelFileService;
         this._restorePageSizeFromStorage();
+        // The route-owned model transport uses this only to decide whether it
+        // can progressively publish an All-sized load; view paging remains
+        // entirely local.
+        this.modelFileService.setPageSize?.(this._pageSize);
         const _viewFileService = this;
 
         if (!this.USE_MOCK_MODEL) {
@@ -269,6 +273,7 @@ export class ViewFileService {
         this._currentPage = 0;
         this._pageSizeSubject.next(size);
         this._currentPageSubject.next(this._currentPage);
+        this.modelFileService.setPageSize?.(size);
         this._storage.set(StorageKeys.FILES_PAGE_SIZE, size);
         this.pushViewFiles();
     }

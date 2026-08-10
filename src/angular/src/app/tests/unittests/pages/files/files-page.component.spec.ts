@@ -7,6 +7,7 @@ import {FilesPageComponent} from "../../../../pages/files/files-page.component";
 import {ActivatedRoute} from "@angular/router";
 import {PathPair, PathPairService} from "../../../../services/settings/path-pair.service";
 import {ViewFileFilterService} from "../../../../services/files/view-file-filter.service";
+import {ModelFileService} from "../../../../services/files/model-file.service";
 
 
 @Component({
@@ -44,18 +45,35 @@ class MockActivatedRoute {
 
 class MockPathPairService {
     private readonly _pathPairs = new BehaviorSubject<PathPair[]>([]);
+    private readonly _loaded = new BehaviorSubject<boolean>(false);
 
     get pathPairs() {
         return this._pathPairs.asObservable();
     }
+    get loaded() { return this._loaded.asObservable(); }
 
     setPathPairs(pathPairs: PathPair[]) {
         this._pathPairs.next(pathPairs);
+        this._loaded.next(true);
+    }
+
+    setLoading() {
+        this._loaded.next(false);
+    }
+
+    disconnect() {
+        this._loaded.next(false);
+        this._pathPairs.next([]);
     }
 }
 
 class MockViewFileFilterService {
     setPathPairFilter = jasmine.createSpy("setPathPairFilter");
+}
+class MockModelFileService {
+    activateScope = jasmine.createSpy("activateScope");
+    deactivateScope = jasmine.createSpy("deactivateScope");
+    refreshSummary = jasmine.createSpy("refreshSummary");
 }
 
 function createPathPair(id: string, name: string, enabled = true): PathPair {
@@ -75,6 +93,7 @@ describe("Testing files page component", () => {
     let route: MockActivatedRoute;
     let pathPairService: MockPathPairService;
     let viewFileFilterService: MockViewFileFilterService;
+    let modelFileService: MockModelFileService;
 
     beforeEach(() => {
         TestBed.configureTestingModule({
@@ -82,7 +101,8 @@ describe("Testing files page component", () => {
             providers: [
                 {provide: ActivatedRoute, useClass: MockActivatedRoute},
                 {provide: PathPairService, useClass: MockPathPairService},
-                {provide: ViewFileFilterService, useClass: MockViewFileFilterService}
+                {provide: ViewFileFilterService, useClass: MockViewFileFilterService},
+                {provide: ModelFileService, useClass: MockModelFileService}
             ]
         });
         TestBed.overrideComponent(FilesPageComponent, {
@@ -94,6 +114,7 @@ describe("Testing files page component", () => {
         route = TestBed.get(ActivatedRoute);
         pathPairService = TestBed.get(PathPairService);
         viewFileFilterService = TestBed.get(ViewFileFilterService);
+        modelFileService = TestBed.get(ModelFileService);
     });
 
     afterEach(() => {
@@ -117,6 +138,36 @@ describe("Testing files page component", () => {
         expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
     });
 
+    it("does not activate the legacy scope for a cold pair deep link before readiness", () => {
+        fixture.detectChanges();
+        route.setParams({pathPairId: "movies"});
+
+        expect(modelFileService.activateScope).not.toHaveBeenCalled();
+
+        pathPairService.setPathPairs([
+            createPathPair("movies", "Movies"),
+            createPathPair("tv", "TV")
+        ]);
+        expect(modelFileService.activateScope).toHaveBeenCalledTimes(1);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("movies");
+        expect(modelFileService.activateScope).not.toHaveBeenCalledWith("__legacy__");
+    });
+
+    it("does not transiently activate the legacy scope when path-pair connection closes", () => {
+        fixture.detectChanges();
+        route.setParams({pathPairId: "movies"});
+        pathPairService.setPathPairs([
+            createPathPair("movies", "Movies"),
+            createPathPair("tv", "TV")
+        ]);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("movies");
+
+        pathPairService.disconnect();
+
+        expect(modelFileService.activateScope).not.toHaveBeenCalledWith("__legacy__");
+        expect(modelFileService.deactivateScope).toHaveBeenCalled();
+    });
+
     it("stays empty on the dashboard until path-pair data resolves, then shows overview", fakeAsync(() => {
         route.setParams({});
 
@@ -133,8 +184,9 @@ describe("Testing files page component", () => {
         tick();
 
         expect(component.showOverview).toBe(false);
-        expect(component.showDetailView).toBe(false);
+        expect(component.showDetailView).toBe(true);
         expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("__legacy__");
 
         setTimeout(() => {
             pathPairService.setPathPairs([
@@ -148,6 +200,7 @@ describe("Testing files page component", () => {
         expect(component.showOverview).toBe(true);
         expect(component.showDetailView).toBe(false);
         expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("__legacy__");
     }));
 
     it("stays empty on explicit dashboard path-pair routes until path-pair data resolves, then shows the filtered detail view", fakeAsync(() => {
@@ -166,8 +219,9 @@ describe("Testing files page component", () => {
         tick();
 
         expect(component.showOverview).toBe(false);
-        expect(component.showDetailView).toBe(false);
+        expect(component.showDetailView).toBe(true);
         expect(viewFileFilterService.setPathPairFilter.calls.mostRecent().args[0]).toBe(null);
+        expect(modelFileService.activateScope).toHaveBeenCalledWith("__legacy__");
 
         setTimeout(() => {
             pathPairService.setPathPairs([

@@ -2,7 +2,8 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, Set
+from bisect import insort
+from typing import Dict, Iterator, Optional, Set
 from threading import Lock
 
 # my libs
@@ -57,9 +58,52 @@ class Model:
     def __init__(self):
         self.logger = logging.getLogger("Model")
         self.__files_by_id: Dict[str, ModelFile] = {}
+        self.__ordered_file_ids: list[str] = []
         self.__file_ids_by_name: Dict[str, Set[str]] = {}
         self.__listeners: list[IModelListener] = []
         self.__listeners_lock = Lock()
+        # This is deliberately owned by the mutation boundary, rather than by
+        # an individual renderer.  Consumers can use it to reject a page whose
+        # cursor was produced from an older model without retaining a tree.
+        self.__version = 0
+        self.__scope_versions: Dict[Optional[str], int] = {}
+
+    @property
+    def version(self) -> int:
+        return self.__version
+
+    def scope_version(self, path_pair_id: Optional[str]) -> int:
+        """Version for one path-pair; unrelated pair mutations do not advance it."""
+        return self.__scope_versions.get(path_pair_id, 0)
+
+    def iter_files(self) -> Iterator[ModelFile]:
+        """Read-only live root iterator; callers hold the controller model lock."""
+        return iter(self.__files_by_id.values())
+
+    def iter_files_by_id(self) -> Iterator[ModelFile]:
+        """Stable canonical root order without allocating/sorting a snapshot."""
+        return (self.__files_by_id[file_id] for file_id in self.__ordered_file_ids)
+
+    def __notify_versioned_change(self, file: ModelFile) -> None:
+        """Notify optional lightweight listeners after a model mutation.
+
+        The historic IModelListener contract transports ModelFile instances.
+        New scoped web listeners intentionally consume only this primitive
+        identity/version notification so a slow browser cannot retain models.
+        """
+        scope_id = file.path_pair_id
+        file_id = file.file_id
+        with self.__listeners_lock:
+            listeners = list(self.__listeners)
+        for listener in listeners:
+            callback = getattr(listener, "model_version_changed", None)
+            if callable(callback):
+                callback(self.scope_version(scope_id), scope_id, file_id)
+
+    def __advance_version(self, file: ModelFile) -> None:
+        self.__version += 1
+        scope_id = file.path_pair_id
+        self.__scope_versions[scope_id] = self.scope_version(scope_id) + 1
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("Model")
@@ -106,13 +150,16 @@ class Model:
         if file_id in self.__files_by_id:
             raise ModelError("File already exists in the model")
         self.__files_by_id[file_id] = file
+        insort(self.__ordered_file_ids, file_id)
         if file.name not in self.__file_ids_by_name:
             self.__file_ids_by_name[file.name] = set()
         self.__file_ids_by_name[file.name].add(file_id)
+        self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_added(self.__files_by_id[file_id])
+        self.__notify_versioned_change(self.__files_by_id[file_id])
 
     def __resolve_file_id(self, identifier: str) -> str:
         if identifier in self.__files_by_id:
@@ -134,13 +181,16 @@ class Model:
         file = self.__files_by_id[file_id]
         self.logger.debug("LftpModel: Removing file '{}'".format(self.__format_file_for_log(file)))
         del self.__files_by_id[file_id]
+        self.__ordered_file_ids.remove(file_id)
         self.__file_ids_by_name[file.name].remove(file_id)
         if not self.__file_ids_by_name[file.name]:
             del self.__file_ids_by_name[file.name]
+        self.__advance_version(file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_removed(file)
+        self.__notify_versioned_change(file)
 
     def update_file(self, file: ModelFile) -> None:
         """
@@ -155,10 +205,12 @@ class Model:
         old_file = self.__files_by_id[file_id]
         new_file = file
         self.__files_by_id[file_id] = new_file
+        self.__advance_version(new_file)
         with self.__listeners_lock:
             listeners = list(self.__listeners)
         for listener in listeners:
             listener.file_updated(old_file, new_file)
+        self.__notify_versioned_change(new_file)
 
     def get_file(self, name: str) -> ModelFile:
         """

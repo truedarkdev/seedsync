@@ -6,7 +6,7 @@ from controller import Controller, AutoQueuePersist
 from controller.notifier import NotificationService
 from .auth_store import ApiKeyStore
 from .web_app import WebApp
-from .handler.stream_model import ModelStreamHandler
+from .handler.model_api import ModelApiHandler
 from .handler.stream_status import StatusStreamHandler
 from .handler.controller import ControllerHandler
 from .handler.server import ServerHandler
@@ -26,11 +26,6 @@ from .handler.historical_log import HistoricalLogHandler, HistoricalLogStore
 @runtime_checkable
 class _LoggerStreamRegistrar(Protocol):
     def register(self, *, web_app: WebApp, logger: object) -> None: ...
-
-
-@runtime_checkable
-class _ControllerStreamRegistrar(Protocol):
-    def register(self, *, web_app: WebApp, controller: Controller) -> None: ...
 
 
 @runtime_checkable
@@ -73,6 +68,7 @@ class WebAppBuilder:
         )
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
+        self.model_api_handler = ModelApiHandler(self.__controller)
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
         history_path = getattr(context.args, "history_log_path", None)
         self.historical_log_handler = HistoricalLogHandler(
@@ -107,12 +103,6 @@ class WebAppBuilder:
             raise TypeError("Log stream handler does not support registration")
         _register_log_stream(log_stream_registrar, web_app, self.__context.logger)
 
-        model_stream_registrar: object = ModelStreamHandler
-        if not isinstance(model_stream_registrar, _ControllerStreamRegistrar):
-            raise TypeError("Model stream handler does not support registration")
-        model_stream_registrar.register(web_app=web_app,
-                                        controller=self.__controller)
-
         heartbeat_stream_registrar: object = HeartbeatStreamHandler
         if not isinstance(heartbeat_stream_registrar, _EmptyStreamRegistrar):
             raise TypeError("Heartbeat stream handler does not support registration")
@@ -123,6 +113,7 @@ class WebAppBuilder:
         self.config_handler.add_routes(web_app)
         self.auto_queue_handler.add_routes(web_app)
         self.status_handler.add_routes(web_app)
+        self.model_api_handler.add_routes(web_app)
         self.breadcrumb_trace_handler.add_routes(web_app)
         if self.historical_log_handler is not None:
             self.historical_log_handler.add_routes(web_app)

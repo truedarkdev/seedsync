@@ -7,6 +7,7 @@ import {takeUntil} from "rxjs/operators";
 import {PathPair, PathPairService} from "../../services/settings/path-pair.service";
 import {resolvePathPairRouteSegment} from "../../services/settings/path-pair-route";
 import {ViewFileFilterService} from "../../services/files/view-file-filter.service";
+import {ModelFileService} from "../../services/files/model-file.service";
 import {FileOptionsComponent} from "./file-options.component";
 import {FileListComponent} from "./file-list.component";
 import {PathPairStatsComponent} from "./path-pair-stats.component";
@@ -29,7 +30,8 @@ export class FilesPageComponent implements OnInit, OnDestroy {
 
     constructor(private _route: ActivatedRoute,
                 private _pathPairService: PathPairService,
-                private _viewFileFilterService: ViewFileFilterService) {
+                private _viewFileFilterService: ViewFileFilterService,
+                private _modelFileService: ModelFileService) {
     }
 
     ngOnInit(): void {
@@ -43,18 +45,28 @@ export class FilesPageComponent implements OnInit, OnDestroy {
         this._pathPairService.pathPairs.pipe(takeUntil(this._destroy$)).subscribe({
             next: (pathPairs: PathPair[]) => {
                 this._pathPairs = pathPairs;
-                if ((this._pathPairs || []).length > 0) {
+                // Legacy test doubles and older hosts do not expose readiness;
+                // retain their non-empty signal while real PathPairService can
+                // distinguish a completed zero-pair response from startup.
+                if ((<any>this._pathPairService).loaded == null && (pathPairs || []).length > 0) {
                     this._pathPairsLoaded = true;
                 }
                 this._updateRouteMode();
             }
         });
+        if ((<any>this._pathPairService).loaded != null) {
+            (<any>this._pathPairService).loaded.pipe(takeUntil(this._destroy$)).subscribe((loaded: boolean) => {
+                this._pathPairsLoaded = loaded;
+                this._updateRouteMode();
+            });
+        }
 
         this._updateRouteMode();
     }
 
     ngOnDestroy(): void {
         this._viewFileFilterService.setPathPairFilter(null);
+        this._modelFileService.deactivateScope();
         this._destroy$.next();
         this._destroy$.complete();
     }
@@ -64,6 +76,7 @@ export class FilesPageComponent implements OnInit, OnDestroy {
             this.showOverview = false;
             this.showDetailView = false;
             this._viewFileFilterService.setPathPairFilter(null);
+            this._modelFileService.deactivateScope();
             return;
         }
 
@@ -74,6 +87,11 @@ export class FilesPageComponent implements OnInit, OnDestroy {
         this.showOverview = hasMultipleEnabledPathPairs && selectedPathPair == null;
         this.showDetailView = !this.showOverview;
         this._viewFileFilterService.setPathPairFilter(selectedPathPair != null ? selectedPathPair.id : null);
+        if (this.showOverview) {
+            this._modelFileService.deactivateScope();
+            return;
+        }
+        this._modelFileService.activateScope(selectedPathPair != null ? selectedPathPair.id : "__legacy__");
     }
 
     private _resolveSelectedPathPair(enabledPathPairs: PathPair[]): PathPair {

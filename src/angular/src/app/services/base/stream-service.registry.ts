@@ -63,6 +63,13 @@ export class StreamDispatchService {
     private _services: IStreamService[] = [];
     private _retryTimeout: any = null;
     private _streamSubscription: Subscription = null;
+    private _eventSource: EventSourceLike | null = null;
+    private _intentionallyClosed = false;
+    private _pageExitListenerAttached = false;
+    private readonly _pageHideListener = (event: PageTransitionEvent) => {
+        if (!event.persisted) { this.shutdownForPageExit(); }
+    };
+    private readonly _beforeUnloadListener = () => this.shutdownForPageExit();
 
     constructor(private _logger: LoggerService,
                 private _zone: NgZone) {
@@ -72,7 +79,19 @@ export class StreamDispatchService {
      * Call this method to finish initialization
      */
     public onInit() {
+        this._intentionallyClosed = false;
+        this.attachPageExitListener();
         this.createSseObserver();
+    }
+
+    /** Close transport before the browser tears down the document. */
+    public shutdownForPageExit(): void {
+        if (this._intentionallyClosed) { return; }
+        this._intentionallyClosed = true;
+        this.clearRetryTimeout();
+        this.clearStreamSubscription();
+        this._eventSource?.close();
+        this._eventSource = null;
     }
 
     /**
@@ -102,12 +121,21 @@ export class StreamDispatchService {
         }
     }
 
+    private attachPageExitListener(): void {
+        if (this._pageExitListenerAttached || typeof window === "undefined") { return; }
+        window.addEventListener("pagehide", this._pageHideListener);
+        window.addEventListener("beforeunload", this._beforeUnloadListener);
+        this._pageExitListenerAttached = true;
+    }
+
     private createSseObserver() {
+        if (this._intentionallyClosed) { return; }
         this.clearRetryTimeout();
         this.clearStreamSubscription();
 
         const observable = new Observable<{event: string; data: string}>(observer => {
             const eventSource = EventSourceFactory.createEventSource(this.STREAM_URL);
+            this._eventSource = eventSource;
             for (let eventName of Array.from(this._eventNameToServiceMap.keys())) {
                 eventSource.addEventListener(eventName, event => observer.next(
                     {
@@ -120,6 +148,7 @@ export class StreamDispatchService {
             // noinspection SpellCheckingInspection
             // noinspection JSUnusedLocalSymbols
             eventSource.onopen = event => {
+                if (eventSource !== this._eventSource || this._intentionallyClosed) { return; }
                 this._logger.info("Connected to server stream");
                 this.clearRetryTimeout();
 
@@ -132,12 +161,15 @@ export class StreamDispatchService {
             };
 
             eventSource.onerror = x => {
+                if (eventSource !== this._eventSource || this._intentionallyClosed) { return; }
                 eventSource.close();
+                this._eventSource = null;
                 observer.error(x);
             };
 
             return () => {
                 eventSource.close();
+                if (eventSource === this._eventSource) { this._eventSource = null; }
             };
         });
         this._streamSubscription = observable.subscribe({
@@ -155,6 +187,7 @@ export class StreamDispatchService {
                 });
             },
             error: err => {
+                if (this._intentionallyClosed) { return; }
                 this._logger.error("Error in stream: %O", err);
 
                 // Notify all services of disconnection
@@ -192,7 +225,6 @@ export class StreamServiceRegistry {
         // Register all services
         _dispatch.registerService(_connectedService);
         _dispatch.registerService(_serverStatusService);
-        _dispatch.registerService(_modelFileService);
         _dispatch.registerService(_logService);
     }
 

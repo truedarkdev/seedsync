@@ -8,13 +8,18 @@ import os
 import io
 import json
 import shutil
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from types import SimpleNamespace
 
 from common import overrides, Config, PathPairManager, PathPair, Constants, ServiceExit, ServiceRestart, AppError
 from controller import AutoQueuePattern, AutoQueuePersist
 from migration import MigrationDecision, MigrationState
-from seedsync import Seedsync, _configure_multiprocessing_start_method, _run_process_loop
+from seedsync import (
+    Seedsync,
+    _configure_multiprocessing_start_method,
+    _run_process_loop,
+    _select_multiprocessing_start_method,
+)
 from web.auth_store import ApiKeyStore
 
 
@@ -126,13 +131,154 @@ class TestSeedsync(unittest.TestCase):
         with self.assertRaises(ServiceExit):
             seedsync.run()
 
-    def test_configure_multiprocessing_selects_spawn(self):
-        with patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+    def test_select_multiprocessing_start_method_prefers_forkserver_on_posix(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ):
+            self.assertEqual("forkserver", _select_multiprocessing_start_method())
+
+    def test_select_multiprocessing_start_method_uses_spawn_for_frozen_runtime(self):
+        with patch("seedsync.sys.frozen", True, create=True), patch(
+            "seedsync.platform.system", return_value="Linux"
+        ), patch("seedsync.multiprocessing.get_all_start_methods") as get_all_start_methods:
+            self.assertEqual("spawn", _select_multiprocessing_start_method())
+        get_all_start_methods.assert_not_called()
+
+    def test_configure_multiprocessing_selects_forkserver_on_posix(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_called_once_with("forkserver")
+
+    def test_configure_multiprocessing_selects_spawn_on_windows(self):
+        with patch("seedsync.platform.system", return_value="Windows"), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
             _configure_multiprocessing_start_method()
         set_start_method.assert_called_once_with("spawn")
 
-    def test_configure_multiprocessing_accepts_existing_spawn(self):
-        with patch(
+    def test_configure_multiprocessing_selects_spawn_on_non_linux_posix(self):
+        with patch("seedsync.platform.system", return_value="Darwin"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_called_once_with("spawn")
+
+    def test_configure_multiprocessing_selects_spawn_for_frozen_runtime(self):
+        with patch("seedsync.sys.frozen", True, create=True), patch(
+            "seedsync.platform.system", return_value="Linux"
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_called_once_with("spawn")
+
+    def test_configure_multiprocessing_falls_back_to_spawn_without_forkserver(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_called_once_with("spawn")
+
+    def test_configure_multiprocessing_falls_back_when_forkserver_set_fails(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value=None,
+        ), patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=[ValueError("forkserver unavailable"), None],
+        ) as set_start_method:
+            _configure_multiprocessing_start_method()
+        self.assertEqual(
+            [("forkserver",), ("spawn",)],
+            [call.args for call in set_start_method.call_args_list],
+        )
+
+    def test_configure_multiprocessing_reentry_keeps_spawn_fallback(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            side_effect=[None, "spawn"],
+        ), patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=[ValueError("forkserver unavailable"), None],
+        ) as set_start_method:
+            _configure_multiprocessing_start_method()
+            _configure_multiprocessing_start_method()
+
+        self.assertEqual(
+            [("forkserver",), ("spawn",)],
+            [call.args for call in set_start_method.call_args_list],
+        )
+
+    def test_configure_multiprocessing_falls_back_when_forkserver_setup_has_no_context(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            side_effect=[None, None],
+        ), patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=[RuntimeError("context setup failed"), None],
+        ) as set_start_method:
+            _configure_multiprocessing_start_method()
+
+        self.assertEqual(
+            [("forkserver",), ("spawn",)],
+            [call.args for call in set_start_method.call_args_list],
+        )
+
+    def test_configure_multiprocessing_accepts_existing_method(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.set_start_method",
+            side_effect=RuntimeError("context already set"),
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value="forkserver",
+        ):
+            _configure_multiprocessing_start_method()
+
+    def test_configure_multiprocessing_accepts_existing_spawn_on_linux(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
+            "seedsync.multiprocessing.get_start_method",
+            return_value="spawn",
+        ), patch("seedsync.multiprocessing.set_start_method") as set_start_method:
+            _configure_multiprocessing_start_method()
+        set_start_method.assert_not_called()
+
+    def test_configure_multiprocessing_accepts_existing_spawn_fallback(self):
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn"],
+        ), patch(
             "seedsync.multiprocessing.set_start_method",
             side_effect=RuntimeError("context already set"),
         ), patch(
@@ -142,13 +288,16 @@ class TestSeedsync(unittest.TestCase):
             _configure_multiprocessing_start_method()
 
     def test_configure_multiprocessing_rejects_incompatible_method(self):
-        with patch(
+        with patch("seedsync.platform.system", return_value="Linux"), patch(
+            "seedsync.multiprocessing.get_all_start_methods",
+            return_value=["fork", "spawn", "forkserver"],
+        ), patch(
             "seedsync.multiprocessing.set_start_method",
             side_effect=RuntimeError("context already set"),
         ), patch(
             "seedsync.multiprocessing.get_start_method",
             return_value="fork",
-        ), self.assertRaisesRegex(RuntimeError, "requires multiprocessing start method 'spawn'"):
+        ), self.assertRaisesRegex(RuntimeError, "requires multiprocessing start method 'forkserver'"):
             _configure_multiprocessing_start_method()
 
     def test_args_config(self):
