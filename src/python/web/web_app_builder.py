@@ -18,6 +18,7 @@ from .handler.stream_heartbeat import HeartbeatStreamHandler
 from .handler.status import StatusHandler
 from .handler.path_pairs import PathPairsHandler
 from .handler.breadcrumb_trace import BreadcrumbTraceHandler
+from .handler.performance_diagnostics import PerformanceDiagnosticsHandler
 from .handler.notifications import NotificationsAdminHandler
 from .handler.migration_recovery import MigrationRecoveryHandler
 from .handler.historical_log import HistoricalLogHandler, HistoricalLogStore
@@ -68,8 +69,11 @@ class WebAppBuilder:
         )
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
-        self.model_api_handler = ModelApiHandler(self.__controller)
+        self.model_api_handler = ModelApiHandler(
+            self.__controller, getattr(context, "performance_diagnostics", None)
+        )
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
+        self.performance_diagnostics_handler = PerformanceDiagnosticsHandler(context)
         history_path = getattr(context.args, "history_log_path", None)
         self.historical_log_handler = HistoricalLogHandler(
             HistoricalLogStore(history_path, 10), context.logger
@@ -115,6 +119,7 @@ class WebAppBuilder:
         self.status_handler.add_routes(web_app)
         self.model_api_handler.add_routes(web_app)
         self.breadcrumb_trace_handler.add_routes(web_app)
+        self.performance_diagnostics_handler.add_routes(web_app)
         if self.historical_log_handler is not None:
             self.historical_log_handler.add_routes(web_app)
         if self.admin_handler is not None:

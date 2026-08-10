@@ -256,6 +256,9 @@ class TestConfig(unittest.TestCase):
             "disable_browser_auth": "True",
             "breadcrumb_trace_enabled": "False",
             "breadcrumb_trace_retention_depth": "128",
+            "performance_diagnostics_enabled": "True",
+            "performance_diagnostics_retention_depth": "64",
+            "performance_diagnostics_sample_interval_seconds": "10",
             "config_api_redact_remote_details": "False",
         }
         general = Config.General.from_dict(good_dict)
@@ -269,6 +272,9 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(general.disable_browser_auth)
         self.assertEqual(False, general.breadcrumb_trace_enabled)
         self.assertEqual(128, general.breadcrumb_trace_retention_depth)
+        self.assertTrue(general.performance_diagnostics_enabled)
+        self.assertEqual(64, general.performance_diagnostics_retention_depth)
+        self.assertEqual(10, general.performance_diagnostics_sample_interval_seconds)
         self.assertEqual(False, general.config_api_redact_remote_details)
 
         self.check_common(Config.General,
@@ -286,6 +292,10 @@ class TestConfig(unittest.TestCase):
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "0")
         self.check_bad_value_error(Config.General, good_dict, "breadcrumb_trace_retention_depth", "1025")
+        self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_retention_depth", "0")
+        self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_retention_depth", "241")
+        self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_sample_interval_seconds", "0")
+        self.check_bad_value_error(Config.General, good_dict, "performance_diagnostics_sample_interval_seconds", "3601")
 
     def test_general_defaults_log_level_to_info_when_missing(self):
         general = Config.General.from_dict({
@@ -395,6 +405,16 @@ class TestConfig(unittest.TestCase):
 
         general = Config.General.from_dict(good_dict)
         self.assertEqual(128, general.breadcrumb_trace_retention_depth)
+
+    def test_general_performance_diagnostics_defaults_are_safe(self):
+        general = Config.General.from_dict({
+            "log_level": "DEBUG", "verbose": "False", "api_token": "", "allowed_hostname": "",
+            "browser_handover_recovery_version": "", "breadcrumb_trace_enabled": "False",
+            "config_api_redact_remote_details": "True",
+        })
+        self.assertFalse(general.performance_diagnostics_enabled)
+        self.assertEqual(120, general.performance_diagnostics_retention_depth)
+        self.assertEqual(5, general.performance_diagnostics_sample_interval_seconds)
 
     def test_lftp(self):
         good_dict = {
@@ -1018,6 +1038,9 @@ class TestConfig(unittest.TestCase):
             config.general.browser_handover_recovery_version = "2026.04.03"
             config.general.breadcrumb_trace_enabled = False
             config.general.breadcrumb_trace_retention_depth = 128
+            config.general.performance_diagnostics_enabled = False
+            config.general.performance_diagnostics_retention_depth = 120
+            config.general.performance_diagnostics_sample_interval_seconds = 5
             config.general.config_api_redact_remote_details = True
             config.lftp.remote_address = "server.remote.com"
             config.lftp.remote_username = "user-on-remote-server"
@@ -1066,6 +1089,9 @@ class TestConfig(unittest.TestCase):
             disable_browser_auth = False
             breadcrumb_trace_enabled = False
             breadcrumb_trace_retention_depth = 128
+            performance_diagnostics_enabled = False
+            performance_diagnostics_retention_depth = 120
+            performance_diagnostics_sample_interval_seconds = 5
             config_api_redact_remote_details = True
 
             [Lftp]

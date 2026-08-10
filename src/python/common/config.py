@@ -287,6 +287,16 @@ class Checkers:
         return value
 
     @staticmethod
+    def int_range(min_val: int, max_val: int) -> Callable[[Any, str, int], int]:
+        def _checker(config_cls: Any, name: str, value: int) -> int:
+            if type(value) is not int or value < min_val or value > max_val:
+                raise ConfigError("Bad config: {}.{} ({}) must be between {} and {}".format(
+                    config_cls.__name__, name, value, min_val, max_val
+                ))
+            return value
+        return _checker
+
+    @staticmethod
     def byte_size_or_empty(config_cls: Any, name: str, value: Any) -> str:
         if type(value) is int:
             value = str(value)
@@ -477,6 +487,15 @@ class Config(Persist):
         breadcrumb_trace_retention_depth = PROP("breadcrumb_trace_retention_depth",
                                                 Checkers.int_non_negative_max(1024),
                                                 Converters.int)
+        performance_diagnostics_enabled = PROP("performance_diagnostics_enabled",
+                                               Checkers.bool_value,
+                                               Converters.bool)
+        performance_diagnostics_retention_depth = PROP("performance_diagnostics_retention_depth",
+                                                       Checkers.int_range(1, 240),
+                                                       Converters.int)
+        performance_diagnostics_sample_interval_seconds = PROP(
+            "performance_diagnostics_sample_interval_seconds", Checkers.int_range(1, 3600), Converters.int
+        )
         config_api_redact_remote_details = PROP("config_api_redact_remote_details",
                                                 Checkers.bool_value,
                                                 Converters.bool)
@@ -492,6 +511,9 @@ class Config(Persist):
             self.disable_browser_auth = False
             self.breadcrumb_trace_enabled = False
             self.breadcrumb_trace_retention_depth = 128
+            self.performance_diagnostics_enabled = False
+            self.performance_diagnostics_retention_depth = 120
+            self.performance_diagnostics_sample_interval_seconds = 5
             self.config_api_redact_remote_details = True
 
         @classmethod
@@ -537,6 +559,15 @@ class Config(Persist):
             if "breadcrumb_trace_retention_depth" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["breadcrumb_trace_retention_depth"] = 128
+            if "performance_diagnostics_enabled" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["performance_diagnostics_enabled"] = False
+            if "performance_diagnostics_retention_depth" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["performance_diagnostics_retention_depth"] = 120
+            if "performance_diagnostics_sample_interval_seconds" not in config_dict:
+                config_dict = dict(config_dict)
+                config_dict["performance_diagnostics_sample_interval_seconds"] = 5
             if "config_api_redact_remote_details" not in config_dict:
                 config_dict = dict(config_dict)
                 config_dict["config_api_redact_remote_details"] = True

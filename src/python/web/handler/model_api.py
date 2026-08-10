@@ -14,7 +14,7 @@ from typing import Iterator, Optional
 import bottle
 from bottle import HTTPResponse
 
-from common import overrides
+from common import PerformanceDiagnosticsCollector, overrides
 from controller import Controller
 from controller.controller import (
     MODEL_LEGACY_SCOPE_ID,
@@ -167,8 +167,9 @@ class ModelApiHandler(IHandler):
     _KEEPALIVE_INTERVAL_SECONDS = 5.0
     _SUMMARY_MIN_INTERVAL_SECONDS = 0.5
 
-    def __init__(self, controller: Controller):
+    def __init__(self, controller: Controller, performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         self.__controller = controller
+        self.__performance_diagnostics = performance_diagnostics
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp) -> None:
@@ -330,6 +331,8 @@ class ModelApiHandler(IHandler):
         return self.__public_page(page, query_signature)
 
     def __handle_summary(self) -> HTTPResponse:
+        if self.__performance_diagnostics is not None:
+            self.__performance_diagnostics.increment("model_summary_serializations")
         return self.__json_response(self.__controller.get_model_summary())
 
     def __handle_summary_stream(self) -> Iterator[str]:
@@ -387,6 +390,8 @@ class ModelApiHandler(IHandler):
     def __handle_roots(self, path_pair_id: str) -> HTTPResponse:
         scope_id = self.__validate_scope_id(path_pair_id)
         page = self.__get_page(scope_id, None)
+        if self.__performance_diagnostics is not None:
+            self.__performance_diagnostics.increment("model_page_serializations")
         return self.__json_response(
             page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
         )
@@ -395,6 +400,8 @@ class ModelApiHandler(IHandler):
         scope_id = self.__validate_scope_id(path_pair_id)
         parent_file_id = self.__read_parent_file_id()
         page = self.__get_page(scope_id, parent_file_id)
+        if self.__performance_diagnostics is not None:
+            self.__performance_diagnostics.increment("model_page_serializations")
         return self.__json_response(
             page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
         )

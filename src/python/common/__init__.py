@@ -4,6 +4,7 @@ from .types import overrides as overrides
 from .job import Job as Job
 from .context import Context as Context, Args as Args
 from .breadcrumb_trace import BreadcrumbTraceCollector as BreadcrumbTraceCollector
+from .performance_diagnostics import PerformanceDiagnosticsCollector as PerformanceDiagnosticsCollector
 from .error import AppError as AppError, ServiceExit as ServiceExit, ServiceRestart as ServiceRestart
 from .constants import Constants as Constants
 from .config import Config as Config, ConfigError as ConfigError

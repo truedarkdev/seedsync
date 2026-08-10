@@ -8,6 +8,7 @@ from threading import Lock
 import os
 
 from common import overrides, Constants, Context, Persist, PersistError, Serializable
+from common.performance_diagnostics import DURATION_AUTO_QUEUE_PROCESS
 from model import IModelListener, ModelFile
 from .controller import Controller
 
@@ -211,6 +212,7 @@ class AutoQueue:
                  persist: AutoQueuePersist,
                  controller: _AutoQueueController):
         self.logger = context.logger.getChild("AutoQueue")
+        self.__performance_diagnostics = getattr(context, "performance_diagnostics", None)
         self.__breadcrumb_trace = getattr(context, "breadcrumb_trace", None)
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
@@ -296,6 +298,21 @@ class AutoQueue:
         self.__target_archive_trace_logger.info("target_archive_trace %s", signature)
 
     def process(self) -> None:
+        diagnostics = self.__performance_diagnostics
+        try:
+            started_at = diagnostics.begin_duration(DURATION_AUTO_QUEUE_PROCESS) if diagnostics is not None else None
+        except Exception:
+            started_at = None
+        try:
+            self.__process_once()
+        finally:
+            if diagnostics is not None:
+                try:
+                    diagnostics.finish_duration(DURATION_AUTO_QUEUE_PROCESS, started_at)
+                except Exception:
+                    pass
+
+    def __process_once(self) -> None:
         """
         Advance the auto queue state
         :return:

@@ -23,6 +23,7 @@ GENERAL_RUNTIME_NO_RESTART_FIELDS = frozenset((
     "verbose",
     "exclude_patterns",
     "breadcrumb_trace_enabled",
+    "performance_diagnostics_enabled",
 ))
 
 

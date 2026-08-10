@@ -119,6 +119,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertTrue(tree.remote_present)
         self.assertTrue(tree.remote_has_transferable_content)
         self.assertTrue(tree.get_children()[0].remote_has_transferable_content)
+        self.assertEqual(2, tree_model.tree_file_count)
 
     def test_local_only_presence_includes_empty_local_files(self):
         local_empty = SystemFile("empty.bin", 0, False)

@@ -1525,6 +1525,7 @@ class ModelBuilder:
             model.add_file(built_root_file.model_file)
 
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
+        model.set_tree_file_count(len(seen_file_ids))
         self.__cached_model = model
         return model
 

@@ -8,6 +8,7 @@ from typing import Any, Optional
 # my libs
 from .config import Config
 from .breadcrumb_trace import BreadcrumbTraceCollector
+from .performance_diagnostics import PerformanceDiagnosticsCollector
 from .path_pair import PathPair, PathPairManager
 from .status import Status
 
@@ -48,7 +49,8 @@ class Context:
                  args: Args,
                  status: Status,
                  path_pair_manager: Optional[PathPairManager] = None,
-                 breadcrumb_trace: Optional[BreadcrumbTraceCollector] = None):
+                 breadcrumb_trace: Optional[BreadcrumbTraceCollector] = None,
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         """
         Primary constructor to construct the top-level context
         """
@@ -63,6 +65,12 @@ class Context:
             self.__breadcrumb_trace_enabled,
             max_entries=self.__breadcrumb_trace_retention_depth()
         )
+        self.performance_diagnostics = performance_diagnostics if performance_diagnostics is not None else \
+            PerformanceDiagnosticsCollector(
+                self.__performance_diagnostics_enabled,
+                retention_depth=self.__performance_diagnostics_retention_depth(),
+                sample_interval_seconds=self.__performance_diagnostics_sample_interval_seconds(),
+            )
 
     def create_child_context(self, context_name: str) -> "Context":
         child_context = copy.copy(self)
@@ -82,6 +90,21 @@ class Context:
             return 128
         retention_depth = getattr(general_config, "breadcrumb_trace_retention_depth", 128)
         return retention_depth if type(retention_depth) is int and retention_depth > 0 else 128
+
+    def __performance_diagnostics_enabled(self) -> bool:
+        general_config = getattr(self.config, "general", None)
+        enabled = getattr(general_config, "performance_diagnostics_enabled", False)
+        return enabled if type(enabled) is bool else False
+
+    def __performance_diagnostics_retention_depth(self) -> int:
+        general_config = getattr(self.config, "general", None)
+        value = getattr(general_config, "performance_diagnostics_retention_depth", 120)
+        return value if type(value) is int and 1 <= value <= 240 else 120
+
+    def __performance_diagnostics_sample_interval_seconds(self) -> int:
+        general_config = getattr(self.config, "general", None)
+        value = getattr(general_config, "performance_diagnostics_sample_interval_seconds", 5)
+        return value if type(value) is int and 1 <= value <= 3600 else 5
 
     def __redact_config_log_value(self, section: str, option: str, value: Any) -> Any:
         section_name = str(section).lower()

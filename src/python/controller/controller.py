@@ -40,6 +40,7 @@ from common import (
     AppError, AppOneShotProcess, AppProcess, Args, Config, Constants, Context,
     Localization, MultiprocessingLogger, PathPair, PathPairManager, PathPairError,
 )
+from common.performance_diagnostics import DURATION_CONTROLLER_PROCESS, DURATION_MODEL_UPDATE
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
@@ -1588,8 +1589,20 @@ class Controller:
         )
 
     def process(self):
-        with self.__persist.state_transaction():
-            self.__process_persist_transaction()
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        try:
+            started_at = diagnostics.begin_duration(DURATION_CONTROLLER_PROCESS) if diagnostics is not None else None
+        except Exception:
+            started_at = None
+        try:
+            with self.__persist.state_transaction():
+                self.__process_persist_transaction()
+        finally:
+            if diagnostics is not None:
+                try:
+                    diagnostics.finish_duration(DURATION_CONTROLLER_PROCESS, started_at)
+                except Exception:
+                    pass
 
     def __process_persist_transaction(self):
         """
@@ -1623,7 +1636,19 @@ class Controller:
             except Exception:
                 self.__restore_lftp_reconfigure_request()
                 self.logger.exception("Ignoring lftp reconfigure failure")
-        self.__updater.update()
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        try:
+            started_at = diagnostics.begin_duration(DURATION_MODEL_UPDATE) if diagnostics is not None else None
+        except Exception:
+            started_at = None
+        try:
+            self.__updater.update()
+        finally:
+            if diagnostics is not None:
+                try:
+                    diagnostics.finish_duration(DURATION_MODEL_UPDATE, started_at)
+                except Exception:
+                    pass
         self.__log_memory_usage()
 
     def __best_effort_teardown(self, label: str, teardown: Callable[[], object]):
@@ -1973,6 +1998,9 @@ class Controller:
         name_filter: Optional[str] = None,
     ) -> dict[str, object]:
         """Atomically register a scoped listener and return its initial page."""
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.increment("model_scoped_snapshot_registrations")
         with self.__model_lock:
             page = self.__get_model_page_locked(
                 scope_id, limit, cursor_file_id, cursor_version, cursor_sort_key, parent_file_id, sort_mode, status_filter, name_filter
@@ -2103,6 +2131,9 @@ class Controller:
 
     def get_model_summary_and_add_listener(self, listener: IModelListener) -> dict[str, object]:
         """Atomically subscribe a compact-summary stream after its snapshot."""
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.increment("model_summary_snapshot_registrations")
         with self.__model_lock:
             summary = self.get_model_summary()
             self.__model.add_listener(listener)
@@ -2387,6 +2418,9 @@ class Controller:
         :param listener:
         :return:
         """
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.increment("model_full_snapshot_listener_registrations")
         with self.__model_lock:
             self.__model.add_listener(listener)
             model_files = self.__get_model_files()
@@ -2560,6 +2594,9 @@ class Controller:
         )
 
     def __get_model_files(self) -> List[ModelFile]:
+        diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.increment("model_full_snapshot_requests")
         model_files: list[ModelFile] = []
         identifiers = self.__model.get_file_ids()
         for identifier in identifiers:
@@ -4243,7 +4280,7 @@ class Controller:
 
     def __log_memory_usage(self):
         with self.__model_lock:
-            model_file_count = len(self.__model.get_file_ids())
+            model_file_count = self.__model.file_count
 
         self.__memory_monitor.log_if_due(
             model_file_count=model_file_count,
@@ -4254,6 +4291,29 @@ class Controller:
             active_extract_count=len(self.__active_extracting_file_names),
             active_command_count=len(self.__active_command_processes)
         )
+        # This is deliberately independent of the legacy memory log interval.
+        # The collector's own bounded interval keeps procfs reads cheap and any
+        # diagnostic failure is isolated from the controller loop.
+        try:
+            self.__context.performance_diagnostics.sample_if_due(self.__performance_diagnostics_gauges)
+        except Exception:
+            pass
+
+    def __performance_diagnostics_gauges(self) -> dict[str, int]:
+        """Read existing ownership counts only when a diagnostics sample is due."""
+        with self.__model_lock:
+            model_root_count = self.__model.file_count
+            model_listener_count = self.__model.listener_count
+            model_tree_file_count = self.__model.tree_file_count
+        return {
+            "model_root_count": model_root_count,
+            "model_tree_file_count": model_tree_file_count,
+            "model_listener_count": model_listener_count,
+            "path_pair_count": len(self.__path_pairs_by_id),
+            "active_download_count": len(self.__active_downloading_file_names),
+            "active_extract_count": len(self.__active_extracting_file_names),
+            "active_command_count": len(self.__active_command_processes),
+        }
 
     def __propagate_exceptions(self):
         """

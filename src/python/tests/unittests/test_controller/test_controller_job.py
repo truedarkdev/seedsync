@@ -35,6 +35,14 @@ class TestControllerJob(unittest.TestCase):
         self.auto_queue.process.assert_called_once_with()
         self.assertEqual(["controller.process", "auto_queue.process"], call_order)
 
+    def test_execute_ignores_diagnostic_collector_failure(self):
+        self.context.performance_diagnostics.begin_duration.side_effect = RuntimeError("diagnostic")
+
+        self.job.execute()
+
+        self.controller.process.assert_called_once_with()
+        self.auto_queue.process.assert_called_once_with()
+
     def test_run_uses_controller_specific_sleep_interval(self):
         self.controller.process.side_effect = self.job.terminate
 

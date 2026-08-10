@@ -67,10 +67,29 @@ class Model:
         # cursor was produced from an older model without retaining a tree.
         self.__version = 0
         self.__scope_versions: Dict[Optional[str], int] = {}
+        self.__tree_file_count = 0
 
     @property
     def version(self) -> int:
         return self.__version
+
+    @property
+    def file_count(self) -> int:
+        """O(1) root-file cardinality for local diagnostics."""
+        return len(self.__files_by_id)
+
+    @property
+    def tree_file_count(self) -> int:
+        return self.__tree_file_count
+
+    def set_tree_file_count(self, value: int) -> None:
+        self.__tree_file_count = value if type(value) is int and value >= 0 else 0
+
+    @property
+    def listener_count(self) -> int:
+        """O(1) current listener cardinality without exposing listeners."""
+        with self.__listeners_lock:
+            return len(self.__listeners)
 
     def scope_version(self, path_pair_id: Optional[str]) -> int:
         """Version for one path-pair; unrelated pair mutations do not advance it."""

@@ -97,3 +97,11 @@ Use normal logs for long-lived operational history and broad troubleshooting con
 
 Breadcrumb entries are intentionally bounded and designed to redact common sensitive values.
 They are meant to explain what happened right before a failure, not to act as full command or payload logging or exhaustive secret scrubbing.
+
+## Performance diagnostics
+
+Performance diagnostics collect a fixed, numeric, bounded resource window locally when enabled with `general.performance_diagnostics_enabled=true`. Disabled mode performs no procfs/cgroup reads or sample retention; enabled collection is bounded by the configured interval and retention depth. The detailed duration aggregates use only fixed in-code metric names.
+
+Disabling diagnostics stops new collection but deliberately leaves prior numeric history available until reset or restart. Linux container metrics use cgroup v2 files; non-Linux and unavailable procfs/cgroup fields are reported as unknown. If `general.disable_browser_auth=true`, every `/server` route, including these diagnostics endpoints, is open; use that mode only behind appropriate network/proxy isolation.
+
+Admin sessions or admin-scoped API keys can read `GET /server/admin/performance-diagnostics/v1`, reset its retained window with `POST /server/admin/performance-diagnostics/v1/reset`, or request the bounded support form at `GET /server/admin/performance-diagnostics/v1/export`. The stable schema is `seedsync.performance-diagnostics.v1`; it contains no application, file, or path-pair identifiers, paths, commands, payloads, or credentials. Session and sequence values are bounded diagnostic cursors. `limit` and `since_sequence` only bound a retained numeric sample window.

@@ -23,6 +23,7 @@ from controller.scan import MultiPathActiveScanner, ScannerResult
 from controller.controller import ControllerError, DownloadStartLifecycleEntry
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
+from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
@@ -3233,7 +3234,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model = Model()
         self.controller._Controller__model.set_base_logger(self.controller.logger)
         self.controller._Controller__model_builder.has_changes.return_value = True
-        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        new_model = Model()
+        new_model.set_tree_file_count(2)
+        self.controller._Controller__model_builder.build_model.return_value = new_model
         self.controller._Controller__move_from_staging = MagicMock(
             return_value=Controller.MoveFromStagingResult.COMPLETED
         )
@@ -3250,6 +3253,8 @@ class TestController(unittest.TestCase):
         diff_models.return_value = [MagicMock(change=ModelDiff.Change.ADDED, new_file=added_file)]
 
         self.controller._Controller__update_model()
+
+        self.assertEqual(2, self.controller._Controller__model.tree_file_count)
 
         self.assertEqual({added_file.file_id}, self.controller._Controller__persist.downloaded_file_names)
         self.assertEqual(set(), self.controller._Controller__persist.extracted_file_names)
@@ -5975,7 +5980,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__validate_process.validate.assert_not_called()
 
     def test_log_memory_usage_reports_current_controller_collection_sizes(self):
-        self.controller._Controller__model.get_file_ids.return_value = {"a", "b", "c"}
+        self.controller._Controller__model.file_count = 3
         self.controller._Controller__persist.downloaded_file_names = {"d1", "d2"}
         self.controller._Controller__persist.extracted_file_names = {"e1"}
         self.controller._Controller__persist.stopped_file_names = {"s1", "s2", "s3"}
@@ -5994,6 +5999,19 @@ class TestController(unittest.TestCase):
             active_extract_count=2,
             active_command_count=2
         )
+
+    def test_snapshot_counter_only_advances_for_actual_full_snapshot_registration(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+        self.controller._Controller__model.file_count = 0
+        self.controller._Controller__model.get_file_ids.return_value = []
+
+        self.controller._Controller__log_memory_usage()
+        self.assertEqual(0, diagnostics.snapshot()["counters"]["model_full_snapshot_requests"])
+
+        self.controller.get_model_files_and_add_listener(MagicMock())
+        self.assertEqual(1, diagnostics.snapshot()["counters"]["model_full_snapshot_requests"])
+        self.assertEqual(1, diagnostics.snapshot()["counters"]["model_full_snapshot_listener_registrations"])
 
     def test_build_staging_path_prefers_explicit_single_path_override(self):
         self.assertEqual(

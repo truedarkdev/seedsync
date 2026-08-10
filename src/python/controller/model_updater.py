@@ -17,6 +17,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
+from common.performance_diagnostics import DURATION_MODEL_BUILD
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 from system import SystemFile
@@ -1021,7 +1022,19 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
         build_triggered = model_builder.has_changes()
         if build_triggered:
-            new_model = model_builder.build_model()
+            diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
+            try:
+                started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
+            except Exception:
+                started_at = None
+            try:
+                new_model = model_builder.build_model()
+            finally:
+                if diagnostics is not None:
+                    try:
+                        diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
+                    except Exception:
+                        pass
 
             with controller._Controller__model_lock:
                 def pending_completion_file_ids():
@@ -1536,4 +1549,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
+        if build_triggered:
+            with controller._Controller__model_lock:
+                controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
         return build_triggered
