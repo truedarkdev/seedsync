@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from queue import Queue
 from threading import Lock
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, mock_open, patch
 from types import SimpleNamespace
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
@@ -7612,6 +7612,693 @@ class TestController(unittest.TestCase):
             self.assertEqual(b"source", Path(source).read_bytes())
             self.assertEqual(b"existing", Path(destination).read_bytes())
             self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_unsupported_initial_and_final_no_replace_publish_file_without_clobbering(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+            calls = []
+
+            def unsupported_no_replace(src, dst):
+                calls.append((src, dst))
+                raise OSError(errno.EINVAL, "rename flags unsupported", dst)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=unsupported_no_replace):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(2, len(calls))
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_unsupported_final_no_replace_uses_exclusive_copy_when_hardlinks_are_unavailable(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+            calls = 0
+
+            def rename_side_effect(_src, dst):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(errno.EXDEV, "cross-device", dst)
+                raise OSError(errno.EINVAL, "rename flags unsupported", dst)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect), \
+                    patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(2, calls)
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+
+    def test_exclusive_copy_failure_retains_partial_target_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+            calls = 0
+
+            def rename_side_effect(_src, dst):
+                nonlocal calls
+                calls += 1
+                raise OSError(errno.EXDEV if calls == 1 else errno.EINVAL, "unsupported", dst)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect), \
+                    patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")), \
+                    patch("controller.controller.shutil.copyfileobj", side_effect=OSError(errno.ENOSPC, "full")):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.ENOSPC, error.exception.errno)
+            self.assertEqual(b"payload", Path(source).read_bytes())
+            self.assertTrue(os.path.lexists(destination))
+            self.assertEqual(0, os.path.getsize(destination))
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_portable_publish_syncs_read_only_source_before_copying_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+            os.chmod(source, stat.S_IRUSR | stat.S_IRGRP | stat.S_IROTH)
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            self.assertEqual(stat.S_IRUSR, stat.S_IMODE(os.lstat(destination).st_mode) & stat.S_IRUSR)
+
+    def test_portable_publish_preserves_nested_symlink_without_leaving_private_temporary(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            os.makedirs(source); os.mkdir(destination_parent)
+            os.symlink("movie.mkv", os.path.join(source, "movie.link"))
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertFalse(os.path.exists(source))
+            self.assertTrue(os.path.islink(os.path.join(destination, "movie.link")))
+            self.assertEqual("movie.mkv", os.readlink(os.path.join(destination, "movie.link")))
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_unsupported_directory_publish_uses_exclusive_directory_reservation(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            os.makedirs(os.path.join(source, "nested")); os.mkdir(destination_parent)
+            Path(os.path.join(source, "nested", "movie.mkv")).write_bytes(b"payload")
+            original = Controller._Controller__rename_no_replace
+            calls = 0
+
+            def rename_side_effect(src, dst):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(errno.EXDEV, "cross-device", dst)
+                if calls == 2:
+                    raise OSError(errno.EINVAL, "rename flags unsupported", dst)
+                return original(src, dst)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect):
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(os.path.join(destination, "nested", "movie.mkv")).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_capability_fallback_does_not_mask_permission_failures(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"payload")
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EACCES, "permission denied", destination),
+            ):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EACCES, error.exception.errno)
+            self.assertEqual(b"payload", Path(source).read_bytes())
+            self.assertFalse(os.path.exists(destination))
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_target_created_during_portable_final_publish_preserves_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            calls = 0
+
+            def rename_side_effect(_src, dst):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(errno.EXDEV, "cross-device", dst)
+                Path(destination).write_bytes(b"racer")
+                raise FileExistsError(errno.EEXIST, "exists", destination)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_side_effect):
+                with self.assertRaises(FileExistsError):
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(b"source", Path(source).read_bytes())
+            self.assertEqual(b"racer", Path(destination).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_temporary_directory_copy_failure_cleans_private_root_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            os.makedirs(source); os.mkdir(destination_parent)
+            Path(os.path.join(source, "movie.mkv")).write_bytes(b"payload")
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EXDEV, "cross-device", destination),
+            ), patch("controller.controller.shutil.copytree", side_effect=OSError(errno.ENOSPC, "full")):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.ENOSPC, error.exception.errno)
+            self.assertTrue(os.path.isdir(source))
+            self.assertFalse(os.path.lexists(destination))
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_source_change_during_portable_copy_keeps_source_and_does_not_delete_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            original_copyfile = shutil.copyfile
+
+            def copy_then_change(*args, **kwargs):
+                result = original_copyfile(*args, **kwargs)
+                Path(source).write_bytes(b"changed")
+                return result
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ), patch("controller.controller.shutil.copyfile", side_effect=copy_then_change):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(b"changed", Path(source).read_bytes())
+            self.assertEqual(b"source", Path(destination).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_source_replaced_after_stability_check_survives_portable_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            replacement = os.path.join(root, "staging", "replacement.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            Path(replacement).write_bytes(b"replacement")
+            original_snapshot = Controller._Controller__source_tree_snapshot
+            snapshot_calls = 0
+
+            def snapshot_then_replace(path, *args, **kwargs):
+                nonlocal snapshot_calls
+                result = original_snapshot(path)
+                snapshot_calls += 1
+                if snapshot_calls == 3:
+                    os.replace(replacement, source)
+                return result
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ), patch.object(Controller, "_Controller__source_tree_snapshot", side_effect=snapshot_then_replace):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(b"replacement", Path(source).read_bytes())
+            self.assertEqual(b"source", Path(destination).read_bytes())
+
+    def test_source_replaced_after_cleanup_check_is_retained_under_private_claim(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            replacement = os.path.join(root, "staging", "replacement.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            Path(replacement).write_bytes(b"replacement")
+            original_same_path_identity = Controller._Controller__same_path_identity
+            source_identity_checks = 0
+
+            def swap_after_cleanup_check(path, expected):
+                nonlocal source_identity_checks
+                result = original_same_path_identity(path, expected)
+                if path == source:
+                    source_identity_checks += 1
+                    if source_identity_checks == 1:
+                        os.replace(replacement, source)
+                return result
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ), patch.object(Controller, "_Controller__same_path_identity", side_effect=swap_after_cleanup_check):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            claims = [entry for entry in os.listdir(os.path.dirname(source)) if entry.startswith(".seedsync-retire-")]
+            self.assertEqual(1, len(claims))
+            self.assertEqual(b"replacement", Path(os.path.join(os.path.dirname(source), claims[0])).read_bytes())
+            self.assertEqual(b"source", Path(destination).read_bytes())
+
+    def test_cleanup_claim_syncs_parent_before_mismatch_validation_and_retention(self):
+        with tempfile.TemporaryDirectory() as root:
+            source_parent = os.path.join(root, "staging")
+            source = os.path.join(source_parent, "movie.mkv")
+            os.mkdir(source_parent)
+            Path(source).write_bytes(b"source")
+            source_stat = os.lstat(source)
+            source_snapshot = Controller._Controller__source_tree_snapshot(source, ignore_root_ctime=True)
+            events = []
+
+            def sync_parent(path):
+                self.assertEqual(source_parent, path)
+                events.append("sync")
+
+            def mismatched_snapshot(path, *args, **kwargs):
+                self.assertTrue(events)
+                self.assertEqual("sync", events[0])
+                self.assertTrue(os.path.basename(path).startswith(".seedsync-retire-"))
+                events.append("validate")
+                return b"replacement"
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=sync_parent), \
+                    patch.object(Controller, "_Controller__source_tree_snapshot", side_effect=mismatched_snapshot):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__remove_published_source(source, source_stat, source_snapshot)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(["sync", "validate", "sync"], events)
+            claims = [entry for entry in os.listdir(source_parent) if entry.startswith(".seedsync-retire-")]
+            self.assertEqual(1, len(claims))
+            self.assertEqual(b"source", Path(os.path.join(source_parent, claims[0])).read_bytes())
+
+    def test_same_target_symlink_replacement_fails_identity_proof_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            destination_link = os.path.join(destination, "movie.link")
+            displaced_link = os.path.join(destination_parent, "displaced.link")
+            os.makedirs(source); os.mkdir(destination_parent)
+            os.symlink("movie.mkv", os.path.join(source, "movie.link"))
+
+            def replace_destination_after_symlink_publish(path):
+                if path == destination:
+                    os.rename(destination_link, displaced_link)
+                    os.symlink("movie.mkv", destination_link)
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ), patch.object(
+                Controller,
+                "_Controller__sync_directory_if_supported",
+                side_effect=replace_destination_after_symlink_publish,
+            ):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertTrue(os.path.islink(os.path.join(source, "movie.link")))
+            self.assertTrue(os.path.islink(destination_link))
+            self.assertEqual("movie.mkv", os.readlink(destination_link))
+
+    def test_temporary_file_sync_uses_writable_descriptor_for_windows_compatibility(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "payload")
+            Path(temporary_path).write_bytes(b"payload")
+            with patch("controller.controller.os.open", return_value=42) as open_file, \
+                    patch("controller.controller.os.fsync"), \
+                    patch("controller.controller.os.close"), \
+                    patch("controller.controller.os.name", "nt"):
+                Controller._Controller__sync_publish_temporary(temporary_path)
+
+            self.assertTrue(open_file.call_args[0][1] & os.O_RDWR)
+
+    def test_nested_directory_portable_publish_does_not_recursively_recopy_temporary_children(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            os.makedirs(os.path.join(source, "nested")); os.mkdir(destination_parent)
+            Path(os.path.join(source, "nested", "movie.mkv")).write_bytes(b"payload")
+            original_copytree = shutil.copytree
+
+            with patch.object(
+                Controller,
+                "_Controller__rename_no_replace",
+                side_effect=OSError(errno.EINVAL, "rename flags unsupported", destination),
+            ), patch("controller.controller.shutil.copytree", wraps=original_copytree) as copytree:
+                Controller._Controller__publish_staging_no_replace(source, destination)
+
+            # copytree recursively calls itself once for the source's nested
+            # directory.  No call may use a destination-side private child as
+            # a fresh source copy.
+            self.assertEqual(2, copytree.call_count)
+            self.assertTrue(all(os.fspath(call.args[0]).startswith(source) for call in copytree.call_args_list))
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"payload", Path(os.path.join(destination, "nested", "movie.mkv")).read_bytes())
+            self.assertEqual([], [p for p in os.listdir(destination_parent) if p.startswith(".seedsync-publish-")])
+
+    def test_post_sync_replacement_fails_hardlink_and_exclusive_publication(self):
+        for hardlinks_available in (True, False):
+            with self.subTest(hardlinks_available=hardlinks_available), tempfile.TemporaryDirectory() as root:
+                temporary_path = os.path.join(root, "temporary")
+                destination = os.path.join(root, "destination")
+                racer = os.path.join(root, "racer")
+                Path(temporary_path).write_bytes(b"payload")
+                Path(racer).write_bytes(b"racer")
+
+                def replace_after_sync(_path):
+                    os.replace(racer, destination)
+
+                patches = [patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=replace_after_sync)]
+                if not hardlinks_available:
+                    patches.append(patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")))
+                with patches[0]:
+                    if len(patches) == 2:
+                        with patches[1]:
+                            with self.assertRaises(OSError) as error:
+                                Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+                    else:
+                        with self.assertRaises(OSError) as error:
+                            Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+                self.assertEqual(errno.EAGAIN, error.exception.errno)
+                self.assertEqual(b"racer", Path(destination).read_bytes())
+
+    def test_post_sync_same_inode_mutation_fails_file_publication_manifests(self):
+        for hardlinks_available in (True, False):
+            with self.subTest(hardlinks_available=hardlinks_available), tempfile.TemporaryDirectory() as root:
+                temporary_path = os.path.join(root, "temporary")
+                destination = os.path.join(root, "destination")
+                Path(temporary_path).write_bytes(b"payload")
+
+                def mutate_after_sync(_path):
+                    Path(destination).write_bytes(b"racer!!")
+                    changed_time = os.stat(destination).st_mtime_ns + 1_000_000_000
+                    os.utime(destination, ns=(changed_time, changed_time))
+
+                patches = [patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=mutate_after_sync)]
+                if not hardlinks_available:
+                    patches.append(patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")))
+                with patches[0]:
+                    if len(patches) == 2:
+                        with patches[1]:
+                            with self.assertRaises(OSError) as error:
+                                Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+                    else:
+                        with self.assertRaises(OSError) as error:
+                            Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+                self.assertEqual(errno.EAGAIN, error.exception.errno)
+                self.assertEqual(b"racer!!", Path(destination).read_bytes())
+
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "source")
+            destination = os.path.join(root, "destination")
+            Path(source).write_bytes(b"payload")
+            mutated = False
+
+            def mutate_native_after_sync(_path):
+                nonlocal mutated
+                if os.path.exists(destination) and not mutated:
+                    mutated = True
+                    Path(destination).write_bytes(b"racer!!")
+                    changed_time = os.stat(destination).st_mtime_ns + 1_000_000_000
+                    os.utime(destination, ns=(changed_time, changed_time))
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=mutate_native_after_sync):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(b"racer!!", Path(destination).read_bytes())
+
+    def test_post_sync_replacement_fails_directory_and_native_publication(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "temporary")
+            destination = os.path.join(root, "destination")
+            moved = os.path.join(root, "moved")
+            os.mkdir(temporary_path)
+            Path(os.path.join(temporary_path, "movie.mkv")).write_bytes(b"payload")
+
+            def replace_directory_after_sync(path):
+                if path == destination:
+                    os.rename(destination, moved)
+                    os.mkdir(destination)
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=replace_directory_after_sync):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertTrue(os.path.isdir(moved))
+
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "source")
+            destination = os.path.join(root, "destination")
+            moved = os.path.join(root, "moved")
+            Path(source).write_bytes(b"source")
+
+            def replace_native_after_sync(path):
+                if path == root and os.path.exists(destination) and not os.path.exists(moved):
+                    os.rename(destination, moved)
+                    Path(destination).write_bytes(b"racer")
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=replace_native_after_sync):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(b"source", Path(moved).read_bytes())
+            self.assertEqual(b"racer", Path(destination).read_bytes())
+
+    def test_exclusive_publication_never_copystats_the_public_destination(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "temporary")
+            destination = os.path.join(root, "destination")
+            Path(temporary_path).write_bytes(b"payload")
+            with patch("controller.controller.shutil.copystat") as copy_stat, \
+                    patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")):
+                Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+            copy_stat.assert_not_called()
+
+    def test_directory_publication_rejects_nested_mount_before_copy(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "release")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "release")
+            nested = os.path.join(source, "nested")
+            os.makedirs(nested); os.mkdir(destination_parent)
+            Path(os.path.join(nested, "movie.mkv")).write_bytes(b"payload")
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "unsupported", destination)), \
+                    patch("controller.controller.os.path.ismount", side_effect=lambda path: path == nested):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EXDEV, error.exception.errno)
+            self.assertTrue(os.path.isdir(source))
+            self.assertFalse(os.path.exists(destination))
+
+    def test_linux_mountinfo_rejects_same_device_bind_with_escaped_nested_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "safe root")
+            nested = os.path.join(source, "nested\tpath")
+            os.makedirs(nested)
+            escaped_nested = nested.replace("\\", "\\134").replace(" ", "\\040").replace("\t", "\\011")
+            mountinfo = "42 35 0:1 / " + escaped_nested + " rw,relatime - ext4 /dev/loop0 rw\n"
+            with patch("controller.controller.sys.platform", "linux"), \
+                    patch("builtins.open", mock_open(read_data=mountinfo)), \
+                    patch("controller.controller.os.path.ismount", return_value=False):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__reject_nested_mounts_or_reparse_points(source)
+
+            self.assertEqual(errno.EXDEV, error.exception.errno)
+
+    def test_linux_mountinfo_allows_source_root_and_non_nested_mounts(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "source")
+            outside = os.path.join(root, "outside")
+            os.mkdir(source); os.mkdir(outside)
+            mountinfo = "42 35 0:1 / " + source + " rw - ext4 /dev/loop0 rw\n" + \
+                        "43 35 0:2 / " + outside + " rw - ext4 /dev/loop1 rw\n"
+            with patch("controller.controller.sys.platform", "linux"), \
+                    patch("builtins.open", mock_open(read_data=mountinfo)), \
+                    patch("controller.controller.os.path.ismount", return_value=False):
+                Controller._Controller__reject_nested_mounts_or_reparse_points(source)
+
+    def test_reparse_point_source_root_is_rejected(self):
+        root_stat = SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=1)
+        with patch("controller.controller.stat.FILE_ATTRIBUTE_REPARSE_POINT", 1, create=True), \
+                patch("controller.controller.os.lstat", return_value=root_stat):
+            with self.assertRaises(OSError) as error:
+                Controller._Controller__reject_nested_mounts_or_reparse_points("C:\\staging")
+
+        self.assertEqual(errno.EXDEV, error.exception.errno)
+
+    @unittest.skipIf(os.name == "nt", "fd metadata expectations are POSIX-specific")
+    def test_exclusive_publish_preserves_mode_and_mtime_through_owned_descriptor(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "temporary")
+            destination = os.path.join(root, "destination")
+            Path(temporary_path).write_bytes(b"payload")
+            os.chmod(temporary_path, 0o640)
+            timestamp = 1_700_000_000_123_456_789
+            os.utime(temporary_path, ns=(timestamp, timestamp))
+            with patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")):
+                Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+            destination_stat = os.stat(destination)
+            self.assertEqual(0o640, stat.S_IMODE(destination_stat.st_mode))
+            self.assertEqual(timestamp, destination_stat.st_mtime_ns)
+
+    def test_windows_exclusive_publish_ignores_unavailable_mode_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "temporary")
+            destination = os.path.join(root, "destination")
+            Path(temporary_path).write_bytes(b"payload")
+            os.chmod(temporary_path, 0o444)
+            os.utime(temporary_path, ns=(1_700_000_000_123_456_789,) * 2)
+
+            with patch("controller.controller.os.name", "nt"), \
+                    patch("controller.controller.os.link", side_effect=OSError(errno.ENOTSUP, "no hardlinks")):
+                Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+            self.assertEqual(b"payload", Path(destination).read_bytes())
+            self.assertFalse(os.path.exists(temporary_path))
+
+    def test_directory_manifest_rejects_child_replacement_after_sync(self):
+        with tempfile.TemporaryDirectory() as root:
+            temporary_path = os.path.join(root, "temporary")
+            destination = os.path.join(root, "destination")
+            child = os.path.join(temporary_path, "movie.mkv")
+            os.mkdir(temporary_path)
+            Path(child).write_bytes(b"payload")
+
+            def replace_child_after_sync(path):
+                if path == destination:
+                    destination_child = os.path.join(destination, "movie.mkv")
+                    Path(destination_child).write_bytes(b"racer!!")
+                    changed_time = os.stat(destination_child).st_mtime_ns + 1_000_000_000
+                    os.utime(destination_child, ns=(changed_time, changed_time))
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported", side_effect=replace_child_after_sync):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_temporary_no_replace(temporary_path, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertTrue(os.path.isdir(destination))
+            self.assertEqual(b"racer!!", Path(os.path.join(destination, "movie.mkv")).read_bytes())
+
+    def test_same_size_restored_mtime_source_mutation_blocks_retirement(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            original_mtime = os.stat(source).st_mtime_ns
+            original_copyfile = shutil.copyfile
+
+            def copy_then_restore_mtime(*args, **kwargs):
+                result = original_copyfile(*args, **kwargs)
+                Path(source).write_bytes(b"change")
+                os.utime(source, ns=(original_mtime, original_mtime))
+                os.chmod(source, 0o600)
+                return result
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=OSError(errno.EINVAL, "unsupported", destination)), \
+                    patch("controller.controller.shutil.copyfile", side_effect=copy_then_restore_mtime):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(errno.EAGAIN, error.exception.errno)
+            self.assertEqual(b"change", Path(source).read_bytes())
+
+    def test_cleanup_error_retains_private_temporary_without_masking_publication_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            source = os.path.join(root, "staging", "movie.mkv")
+            destination_parent = os.path.join(root, "final")
+            destination = os.path.join(destination_parent, "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.mkdir(destination_parent)
+            Path(source).write_bytes(b"source")
+            original_unlink = os.unlink
+            calls = 0
+
+            def rename_then_conflict(_src, dst):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise OSError(errno.EXDEV, "cross-device", dst)
+                raise FileExistsError(errno.EEXIST, "exists", dst)
+
+            def fail_private_cleanup(path, *args, **kwargs):
+                if os.path.basename(path).startswith(".seedsync-publish-"):
+                    raise OSError(errno.EACCES, "cleanup denied", path)
+                return original_unlink(path, *args, **kwargs)
+
+            with patch.object(Controller, "_Controller__rename_no_replace", side_effect=rename_then_conflict), \
+                    patch("controller.controller.os.unlink", side_effect=fail_private_cleanup):
+                with self.assertRaises(FileExistsError):
+                    Controller._Controller__publish_staging_no_replace(source, destination)
+
+            self.assertEqual(b"source", Path(source).read_bytes())
+            self.assertTrue(any(entry.startswith(".seedsync-publish-") for entry in os.listdir(destination_parent)))
 
     def test_final_move_never_clobbers_existing_directory(self):
         with tempfile.TemporaryDirectory() as root:

@@ -19,6 +19,9 @@ import time
 import shutil
 import errno
 import tempfile
+import secrets
+import re
+import sys
 from dataclasses import dataclass
 
 # my libs
@@ -3261,48 +3264,505 @@ class Controller:
             error_no = ctypes.get_errno()
             raise OSError(error_no, os.strerror(error_no), dst)
 
+    @staticmethod
+    def __is_no_replace_capability_error(error: OSError) -> bool:
+        """Return whether a no-clobber primitive is unavailable, not failed."""
+        unsupported_errors = {
+            errno.EXDEV,
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+        }
+        eopnotsupp = getattr(errno, "EOPNOTSUPP", None)
+        if eopnotsupp is not None:
+            unsupported_errors.add(eopnotsupp)
+        return error.errno in unsupported_errors
+
+    @staticmethod
+    def __can_copy_instead_of_link(error: OSError) -> bool:
+        """Whether a failed hardlink can safely fall back to exclusive copy."""
+        fallback_errors = {
+            errno.EXDEV,
+            errno.EINVAL,
+            errno.ENOSYS,
+            errno.ENOTSUP,
+            errno.EPERM,
+            errno.EACCES,
+            errno.EMLINK,
+        }
+        eopnotsupp = getattr(errno, "EOPNOTSUPP", None)
+        if eopnotsupp is not None:
+            fallback_errors.add(eopnotsupp)
+        return error.errno in fallback_errors
+
+    @staticmethod
+    def __remove_published_source(
+            src: str, expected_stat: os.stat_result, expected_snapshot: bytes) -> None:
+        """Remove a source only after its replacement has been published.
+
+        Claim the source into an unguessable private sibling before deletion.
+        A noncooperating process can still race the claim rename itself, but a
+        mismatched claim is retained rather than deleted; no replacement at
+        the public source pathname is removed by cleanup.
+        """
+        if not Controller.__same_path_identity(src, expected_stat):
+            raise OSError(errno.EAGAIN, "staging source changed before deletion", src)
+        source_parent = os.path.dirname(src)
+        for _ in range(16):
+            claimed_path = os.path.join(source_parent, ".seedsync-retire-" + secrets.token_hex(24))
+            if not os.path.lexists(claimed_path):
+                break
+        else:
+            raise OSError(errno.EEXIST, "could not reserve private source cleanup path", src)
+        os.rename(src, claimed_path)
+        try:
+            # The public source name is gone after the claim rename.  Persist
+            # the parent before validating or deleting so a crash cannot lose
+            # both the public name and an unpersisted retained claim.
+            Controller.__sync_directory_if_supported(source_parent)
+            if not Controller.__same_path_identity(claimed_path, expected_stat) or \
+                    Controller.__source_tree_snapshot(claimed_path, ignore_root_ctime=True) != expected_snapshot:
+                raise OSError(errno.EAGAIN, "staging source changed during cleanup claim", src)
+            if os.path.isdir(claimed_path) and not os.path.islink(claimed_path):
+                Controller.__reject_nested_mounts_or_reparse_points(claimed_path)
+                shutil.rmtree(claimed_path)
+            else:
+                os.unlink(claimed_path)
+        finally:
+            # Also persist both retained mismatch claims and successful
+            # deletions.  Capability-limited platforms keep their documented
+            # best-effort behavior in __sync_directory_if_supported.
+            Controller.__sync_directory_if_supported(source_parent)
+
+    @staticmethod
+    def __same_path_identity(path: str, expected: os.stat_result) -> bool:
+        """Check that a published path still names the object we created."""
+        try:
+            return os.path.samestat(os.lstat(path), expected)
+        except FileNotFoundError:
+            return False
+
+    @staticmethod
+    def __source_tree_snapshot(path: str, ignore_root_ctime: bool = False) -> bytes:
+        """Return stable, no-follow source evidence before source deletion."""
+        digest = hashlib.sha256()
+
+        def visit(candidate: str, relative: str) -> None:
+            candidate_stat = os.lstat(candidate)
+            digest.update(os.fsencode(relative))
+            digest.update(repr((
+                candidate_stat.st_mode, candidate_stat.st_dev,
+                candidate_stat.st_ino, candidate_stat.st_size,
+                candidate_stat.st_mtime_ns,
+                None if ignore_root_ctime and relative == "." else candidate_stat.st_ctime_ns,
+            )).encode("ascii"))
+            if stat.S_ISLNK(candidate_stat.st_mode):
+                digest.update(os.fsencode(os.readlink(candidate)))
+                return
+            if stat.S_ISDIR(candidate_stat.st_mode):
+                with os.scandir(candidate) as entries:
+                    for entry in sorted(entries, key=lambda item: item.name):
+                        visit(entry.path, os.path.join(relative, entry.name))
+
+        visit(path, ".")
+        return digest.digest()
+
+    @staticmethod
+    def __publication_tree_manifest(path: str) -> Tuple[Tuple[object, ...], ...]:
+        """Describe a published tree without following links or using inode ids."""
+        entries: List[Tuple[object, ...]] = []
+
+        def visit(candidate: str, relative: str) -> None:
+            candidate_stat = os.lstat(candidate)
+            kind = stat.S_IFMT(candidate_stat.st_mode)
+            mode = stat.S_IMODE(candidate_stat.st_mode)
+            if os.name == "nt":
+                # Python 3.11 cannot apply file or directory metadata through
+                # an owned descriptor on Windows.  Keep restrictive creation
+                # modes instead of racing a public pathname, and exclude only
+                # those unsupported permission bits from the proof.
+                mode = -1
+            link_target = os.readlink(candidate) if stat.S_ISLNK(candidate_stat.st_mode) else None
+            size = -1 if stat.S_ISDIR(candidate_stat.st_mode) else candidate_stat.st_size
+            mtime = -1 if stat.S_ISLNK(candidate_stat.st_mode) else candidate_stat.st_mtime_ns
+            if os.name == "nt":
+                # Descriptor-based timestamp restoration is unavailable with
+                # the supported Python version for Windows as well.
+                mtime = -1
+            entries.append((relative, kind, mode, size,
+                            mtime, link_target))
+            if stat.S_ISDIR(candidate_stat.st_mode) and not stat.S_ISLNK(candidate_stat.st_mode):
+                with os.scandir(candidate) as children:
+                    for child in sorted(children, key=lambda item: item.name):
+                        visit(child.path, os.path.join(relative, child.name))
+
+        visit(path, ".")
+        return tuple(entries)
+
+    @staticmethod
+    def __reject_nested_mounts_or_reparse_points(path: str) -> None:
+        """Fail closed before recursively copying or deleting a directory."""
+        root_stat = os.lstat(path)
+        reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        root_attributes = getattr(root_stat, "st_file_attributes", 0)
+        if reparse_point and root_attributes & reparse_point:
+            raise OSError(errno.EXDEV, "reparse point staging root", path)
+        if not stat.S_ISDIR(root_stat.st_mode) or stat.S_ISLNK(root_stat.st_mode):
+            return
+        root_path = os.path.normcase(os.path.abspath(path))
+        if sys.platform.startswith("linux"):
+            try:
+                mount_points = Controller.__linux_mountinfo_mountpoints()
+            except (OSError, ValueError) as error:
+                raise OSError(getattr(error, "errno", None) or errno.EIO,
+                              "could not inspect Linux mount boundaries", path) from error
+            for mount_point in mount_points:
+                normalized_mount = os.path.normcase(os.path.abspath(mount_point))
+                try:
+                    nested = os.path.commonpath([root_path, normalized_mount]) == root_path
+                except ValueError:
+                    nested = False
+                if nested and normalized_mount != root_path:
+                    raise OSError(errno.EXDEV, "nested Linux mount in staging tree", mount_point)
+
+        def visit(candidate: str) -> None:
+            with os.scandir(candidate) as entries:
+                for entry in entries:
+                    child_stat = os.lstat(entry.path)
+                    attributes = getattr(child_stat, "st_file_attributes", 0)
+                    if reparse_point and attributes & reparse_point:
+                        raise OSError(errno.EXDEV, "reparse point in staging tree", entry.path)
+                    if stat.S_ISDIR(child_stat.st_mode) and not stat.S_ISLNK(child_stat.st_mode):
+                        if child_stat.st_dev != root_stat.st_dev or os.path.ismount(entry.path):
+                            raise OSError(errno.EXDEV, "nested mount in staging tree", entry.path)
+                        visit(entry.path)
+
+        visit(path)
+
+    @staticmethod
+    def __linux_mountinfo_mountpoints() -> List[str]:
+        """Read Linux mount points, preserving kernel mountinfo path escapes."""
+        escape_values = {"040": " ", "011": "\t", "012": "\n", "134": "\\"}
+
+        def decode_mountinfo_path(value: str) -> str:
+            return re.sub(r"\\(040|011|012|134)", lambda match: escape_values[match.group(1)], value)
+
+        mount_points = []
+        with open("/proc/self/mountinfo", encoding="utf-8") as mountinfo:
+            for line in mountinfo:
+                fields = line.rstrip("\n").split(" ")
+                if len(fields) < 6:
+                    raise ValueError("malformed /proc/self/mountinfo entry")
+                mount_points.append(decode_mountinfo_path(fields[4]))
+        return mount_points
+
+    @staticmethod
+    def __sync_publish_temporary(path: str) -> None:
+        """Flush copied regular files before their names become final targets."""
+        def sync_file(file_path: str) -> None:
+            # Windows requires a writable descriptor for fsync even though the
+            # copied temporary file is not modified here.  Private temporary
+            # files are synced before their source mode is copied onto them.
+            flags = os.O_RDWR if os.name == "nt" else os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(file_path, flags)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+        path_stat = os.lstat(path)
+        if stat.S_ISREG(path_stat.st_mode):
+            sync_file(path)
+            return
+        if not stat.S_ISDIR(path_stat.st_mode):
+            return
+        for root, _directories, file_names in os.walk(path):
+            for file_name in file_names:
+                candidate = os.path.join(root, file_name)
+                if stat.S_ISREG(os.lstat(candidate).st_mode):
+                    sync_file(candidate)
+
+    @staticmethod
+    def __sync_directory_if_supported(path: str) -> None:
+        """Flush a directory entry where the platform exposes directory fsync."""
+        if os.name == "nt":
+            return
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            if Controller.__is_no_replace_capability_error(error):
+                return
+            raise
+        try:
+            try:
+                os.fsync(fd)
+            except OSError as error:
+                if not Controller.__is_no_replace_capability_error(error):
+                    raise
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def __copy_to_publish_temporary(cls, src: str, destination_parent: str) -> Tuple[str, Optional[str]]:
+        """Copy src to a private destination-side path without following links."""
+        source_stat = os.lstat(src)
+        if stat.S_ISDIR(source_stat.st_mode):
+            cls.__reject_nested_mounts_or_reparse_points(src)
+            temporary_root = tempfile.mkdtemp(prefix=".seedsync-publish-", dir=destination_parent)
+            temporary_path = os.path.join(temporary_root, "payload")
+            try:
+                shutil.copytree(src, temporary_path, symlinks=True, copy_function=cls.__copy_regular_file_to_temporary)
+            except BaseException:
+                shutil.rmtree(temporary_root, ignore_errors=True)
+                raise
+            return temporary_path, temporary_root
+
+        fd, temporary_path = tempfile.mkstemp(prefix=".seedsync-publish-", dir=destination_parent)
+        os.close(fd)
+        try:
+            if stat.S_ISLNK(source_stat.st_mode):
+                os.unlink(temporary_path)
+                os.symlink(os.readlink(src), temporary_path)
+            elif stat.S_ISREG(source_stat.st_mode):
+                cls.__copy_regular_file_to_temporary(src, temporary_path)
+            else:
+                raise OSError(errno.ENOTSUP, "unsupported staging source type", src)
+        except BaseException:
+            try:
+                os.unlink(temporary_path)
+            except FileNotFoundError:
+                pass
+            raise
+        return temporary_path, None
+
+    @classmethod
+    def __copy_regular_file_to_temporary(cls, src: str, dst: str) -> str:
+        """Copy and flush private content before source permissions are copied."""
+        shutil.copyfile(src, dst, follow_symlinks=False)
+        cls.__sync_publish_temporary(dst)
+        shutil.copystat(src, dst, follow_symlinks=False)
+        return dst
+
+    @staticmethod
+    def __apply_owned_metadata(file_descriptor: int, source_stat: os.stat_result) -> None:
+        """Apply metadata only through an owned descriptor, never a public path."""
+        if os.name == "nt" or not hasattr(os, "fchmod"):
+            return
+        os.fchmod(file_descriptor, stat.S_IMODE(source_stat.st_mode))
+        try:
+            os.utime(file_descriptor, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns))
+        except (AttributeError, NotImplementedError, TypeError, ValueError):
+            # Some platforms do not expose fd-based utime.  Keep restrictive
+            # creation metadata rather than race a public pathname.
+            pass
+
+    @classmethod
+    def __publish_regular_file_exclusively(cls, temporary_path: str, dst: str) -> None:
+        """Copy a temporary regular file with O_EXCL and verify its identity."""
+        expected_manifest = cls.__publication_tree_manifest(temporary_path)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_BINARY"):
+            flags |= os.O_BINARY
+        fd = os.open(dst, flags, 0o600)
+        published_stat = os.fstat(fd)
+        try:
+            with open(temporary_path, "rb") as source, os.fdopen(fd, "wb", closefd=False) as target:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+            cls.__apply_owned_metadata(fd, os.lstat(temporary_path))
+            if not cls.__same_path_identity(dst, published_stat):
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+            cls.__sync_directory_if_supported(os.path.dirname(dst))
+            if not cls.__same_path_identity(dst, published_stat):
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+            if cls.__publication_tree_manifest(dst) != expected_manifest:
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+        except BaseException:
+            # Retain a partial destination rather than unlinking a pathname
+            # that an external process could have replaced after our check.
+            raise
+        finally:
+            os.close(fd)
+
+    @classmethod
+    def __publish_temporary_directory(cls, temporary_path: str, dst: str) -> None:
+        """Materialize a private directory through exclusive entries.
+
+        No portable system call atomically renames a directory without replacing
+        an existing destination.  Reserving the final directory with mkdir is
+        no-clobber; if publication later fails the complete source is retained.
+        The reserved partial directory is deliberately not removed because a
+        concurrent writer could have added entries that do not belong to us.
+        """
+        expected_manifest = cls.__publication_tree_manifest(temporary_path)
+        temporary_stat = os.lstat(temporary_path)
+        os.mkdir(dst, 0o700)
+        published_stat = os.lstat(dst)
+        directory_fd: Optional[int] = None
+        try:
+            if os.name != "nt" and hasattr(os, "fchmod"):
+                directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                directory_fd = os.open(dst, directory_flags)
+                if not os.path.samestat(os.fstat(directory_fd), published_stat):
+                    raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
+            with os.scandir(temporary_path) as entries:
+                for entry in entries:
+                    destination_child = os.path.join(dst, entry.name)
+                    try:
+                        cls.__rename_no_replace(entry.path, destination_child)
+                    except OSError as error:
+                        if not cls.__is_no_replace_capability_error(error):
+                            raise
+                        cls.__publish_temporary_no_replace(entry.path, destination_child)
+                    if not cls.__same_path_identity(dst, published_stat):
+                        raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
+            if directory_fd is not None:
+                cls.__apply_owned_metadata(directory_fd, temporary_stat)
+            if not cls.__same_path_identity(dst, published_stat):
+                raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
+            cls.__sync_directory_if_supported(dst)
+            cls.__sync_directory_if_supported(os.path.dirname(dst))
+            if not cls.__same_path_identity(dst, published_stat):
+                raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
+            if cls.__publication_tree_manifest(dst) != expected_manifest:
+                raise OSError(errno.EAGAIN, "final directory tree changed during publication", dst)
+            os.rmdir(temporary_path)
+        except BaseException:
+            raise
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    @classmethod
+    def __publish_temporary_no_replace(cls, temporary_path: str, dst: str) -> None:
+        """Publish a destination-side temporary object without clobbering dst."""
+        temporary_stat = os.lstat(temporary_path)
+        expected_manifest = cls.__publication_tree_manifest(temporary_path)
+        if stat.S_ISDIR(temporary_stat.st_mode):
+            cls.__publish_temporary_directory(temporary_path, dst)
+            return
+        if stat.S_ISLNK(temporary_stat.st_mode):
+            link_target = os.readlink(temporary_path)
+            os.symlink(link_target, dst)
+            published_stat = os.lstat(dst)
+            try:
+                if not stat.S_ISLNK(published_stat.st_mode) or os.readlink(dst) != link_target:
+                    raise OSError(errno.EAGAIN, "final symlink changed during publication", dst)
+                cls.__sync_directory_if_supported(os.path.dirname(dst))
+                if not cls.__same_path_identity(dst, published_stat):
+                    raise OSError(errno.EAGAIN, "final symlink changed during publication", dst)
+                if cls.__publication_tree_manifest(dst) != expected_manifest:
+                    raise OSError(errno.EAGAIN, "final symlink changed during publication", dst)
+            except BaseException:
+                # Retain the destination on failure for the same reason as
+                # regular-file fallback: cleanup must not delete a racer.
+                raise
+            os.unlink(temporary_path)
+            return
+        if not stat.S_ISREG(temporary_stat.st_mode):
+            raise OSError(errno.ENOTSUP, "unsupported temporary publication type", temporary_path)
+        try:
+            os.link(temporary_path, dst, follow_symlinks=False)
+            if not cls.__same_path_identity(dst, temporary_stat):
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+            cls.__sync_directory_if_supported(os.path.dirname(dst))
+            if not cls.__same_path_identity(dst, temporary_stat):
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+            if cls.__publication_tree_manifest(dst) != expected_manifest:
+                raise OSError(errno.EAGAIN, "final target changed during publication", dst)
+        except OSError as error:
+            if not cls.__can_copy_instead_of_link(error):
+                raise
+            cls.__publish_regular_file_exclusively(temporary_path, dst)
+        os.unlink(temporary_path)
+
     @classmethod
     def __publish_staging_no_replace(cls, src: str, dst: str) -> None:
-        """Publish staging content once; preserve src on collision or failure."""
+        """Publish staging content once; preserve src on collision or failure.
+
+        Native no-replace rename remains the fast path.  Filesystems such as
+        Unraid shfs can reject renameat2 flags with EINVAL; in that case a
+        complete private copy is made in the destination directory and then
+        published with exclusive primitives.  Permission, capacity, read-only,
+        and I/O errors are intentionally not treated as capability fallbacks.
+        """
+        source_manifest = cls.__publication_tree_manifest(src)
         try:
             cls.__rename_no_replace(src, dst)
+            if os.path.lexists(src) or not os.path.lexists(dst):
+                raise OSError(errno.EIO, "native publication did not reach the expected final state", dst)
+            published_stat = os.lstat(dst)
+            cls.__sync_directory_if_supported(os.path.dirname(dst))
+            cls.__sync_directory_if_supported(os.path.dirname(src))
+            # A process which replaces dst after this check is outside this
+            # pathname-only publication contract; it cannot be prevented once
+            # this call has returned to an uncooperative external writer.
+            if not cls.__same_path_identity(dst, published_stat):
+                raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+            if cls.__publication_tree_manifest(dst) != source_manifest:
+                raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
             return
         except OSError as error:
-            if error.errno != errno.EXDEV:
+            if not cls.__is_no_replace_capability_error(error):
                 raise
 
         destination_parent = os.path.dirname(dst)
+        source_stat = os.lstat(src)
+        source_snapshot = cls.__source_tree_snapshot(src)
+        source_claim_snapshot = cls.__source_tree_snapshot(src, ignore_root_ctime=True)
         temporary_path: Optional[str] = None
         temporary_root: Optional[str] = None
+        publication_error = False
         try:
-            if os.path.isdir(src) and not os.path.islink(src):
-                temporary_root = tempfile.mkdtemp(prefix=".seedsync-publish-", dir=destination_parent)
-                temporary_path = os.path.join(temporary_root, "payload")
-                shutil.copytree(src, temporary_path, symlinks=True)
-            else:
-                fd, temporary_path = tempfile.mkstemp(prefix=".seedsync-publish-", dir=destination_parent)
-                os.close(fd)
-                shutil.copy2(src, temporary_path, follow_symlinks=False)
-            cls.__rename_no_replace(temporary_path, dst)
+            temporary_path, temporary_root = cls.__copy_to_publish_temporary(src, destination_parent)
+            temporary_manifest = cls.__publication_tree_manifest(temporary_path)
+            try:
+                cls.__rename_no_replace(temporary_path, dst)
+                if not os.path.lexists(dst) or os.path.lexists(temporary_path):
+                    raise OSError(errno.EIO, "temporary publication did not reach the expected final state", dst)
+                published_stat = os.lstat(dst)
+                cls.__sync_directory_if_supported(os.path.dirname(dst))
+                if not cls.__same_path_identity(dst, published_stat):
+                    raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+                if cls.__publication_tree_manifest(dst) != temporary_manifest:
+                    raise OSError(errno.EAGAIN, "final target changed during native publication", dst)
+            except OSError as error:
+                if not cls.__is_no_replace_capability_error(error):
+                    raise
+                cls.__publish_temporary_no_replace(temporary_path, dst)
             temporary_path = None
-            if os.path.isdir(src) and not os.path.islink(src):
-                shutil.rmtree(src)
-            else:
-                os.unlink(src)
+            if cls.__source_tree_snapshot(src) != source_snapshot:
+                raise OSError(errno.EAGAIN, "staging source changed during publication", src)
+            cls.__remove_published_source(src, source_stat, source_claim_snapshot)
+            cls.__sync_directory_if_supported(os.path.dirname(src))
+        except BaseException:
+            publication_error = True
+            raise
         finally:
+            cleanup_paths = []
             if temporary_path is not None:
-                if os.path.isdir(temporary_path) and not os.path.islink(temporary_path):
-                    shutil.rmtree(temporary_path, ignore_errors=True)
-                else:
-                    try:
-                        os.unlink(temporary_path)
-                    except FileNotFoundError:
-                        pass
+                cleanup_paths.append(temporary_path)
             if temporary_root is not None:
+                cleanup_paths.append(temporary_root)
+            for cleanup_path in cleanup_paths:
                 try:
-                    os.rmdir(temporary_root)
+                    if os.path.isdir(cleanup_path) and not os.path.islink(cleanup_path):
+                        shutil.rmtree(cleanup_path)
+                    else:
+                        os.unlink(cleanup_path)
+                except FileNotFoundError:
+                    continue
                 except OSError:
-                    pass
+                    # Keep uncertain private residue.  In a failure path it
+                    # must not mask the error that controls source safety.
+                    if not publication_error:
+                        raise
 
     def _reserve_move_attempt(self, file_id: str) -> bool:
         # Lock order is model_lock -> move_attempt_lock. This helper never
