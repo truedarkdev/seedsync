@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from model import ModelFile
-from controller.scan import LocalScanner, ScannerError
+from controller.scan import LocalScanner, ScannerError, ScannerProcess
 from common import Localization
 
 
@@ -15,6 +15,41 @@ class TestLocalScanner(unittest.TestCase):
 
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
+
+    def test_progressive_scan_publishes_manifest_and_roots_without_full_snapshot(self):
+        os.mkdir(os.path.join(self.temp_dir, "root-a"))
+        with open(os.path.join(self.temp_dir, "root-a", "file.txt"), "w") as handle:
+            handle.write("content")
+        with open(os.path.join(self.temp_dir, "root-b"), "w") as handle:
+            handle.write("b")
+        scanner = LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair")
+        events = []
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+                                       events.append((files, roots, complete)))
+
+        final_files = scanner.scan()
+        self.assertEqual({"root-a", "root-b"}, {file.name for file in final_files})
+        self.assertEqual({"root-a", "root-b"}, events[0][1])
+        self.assertEqual({"root-a", "root-b"}, {file.name for event in events[1:-1] for file in event[0]})
+        self.assertTrue(events[-1][2])
+
+    def test_progressive_scan_returns_lossless_aggregate_for_bounded_queue_final(self):
+        for index in range(140):
+            with open(os.path.join(self.temp_dir, "root-{}".format(index)), "w") as handle:
+                handle.write(str(index))
+        scanner = ScannerProcess(
+            LocalScanner(self.temp_dir, use_temp_file=False, path_pair_id="pair"),
+            interval_in_ms=0,
+            verbose=False,
+        )
+        self.addCleanup(scanner.close_queues)
+
+        scanner.run_loop()
+        final_results = [result for result in scanner.pop_results() if result.is_full_snapshot]
+
+        self.assertEqual(1, len(final_results))
+        self.assertEqual({"root-{}".format(index) for index in range(140)},
+                         {file.name for file in final_results[0].files})
 
     def test_scan_merges_staging_results_without_exposing_staging_dir(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")

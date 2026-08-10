@@ -360,6 +360,72 @@ class TestSshcp(unittest.TestCase):
         self.assertEqual(b"", result)
         wait.assert_called_once_with()
 
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_shell_stream_requires_explicit_success_exit_status(self, mock_spawn_process):
+        for exitstatus in (None, 7):
+            with self.subTest(exitstatus=exitstatus):
+                spawn = MagicMock()
+                spawn.read_nonblocking.side_effect = [b"partial", pexpect.EOF("eof")]
+                spawn.exitstatus = exitstatus
+                spawn.before = b"partial"
+                spawn.after = b""
+                spawn.wait.return_value = None
+                mock_spawn_process.return_value = (spawn, True)
+                sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+                with self.assertRaises(SshcpError):
+                    sshcp.shell_stream("echo stream", lambda chunk: None)
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_shell_stream_can_avoid_retaining_raw_output(self, mock_spawn_process):
+        spawn = MagicMock()
+        spawn.read_nonblocking.side_effect = [b"large-chunk", pexpect.EOF("eof")]
+        spawn.exitstatus = 0
+        spawn.before = b""
+        spawn.after = b""
+        mock_spawn_process.return_value = (spawn, True)
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        chunks = []
+
+        output = sshcp.shell_stream("echo stream", chunks.append, retain_output=False)
+
+        self.assertEqual(b"", output)
+        self.assertEqual([b"large-chunk"], chunks)
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_shell_stream_returns_empty_for_chunked_legacy_json_without_retention(self, mock_spawn_process):
+        chunks = [b" \n[{\"name\":\"legacy.bin\",", b"\"size\":1,\"is_dir\":false}]\n"]
+        spawn = MagicMock()
+        spawn.read_nonblocking.side_effect = [*chunks, pexpect.EOF("eof")]
+        spawn.exitstatus = 0
+        spawn.before = b""
+        spawn.after = b""
+        mock_spawn_process.return_value = (spawn, True)
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        received = []
+
+        output = sshcp.shell_stream("echo stream", received.append, retain_output=False)
+
+        self.assertEqual(b"", output)
+        self.assertEqual(chunks, received)
+
+    @patch.object(Sshcp, "_Sshcp__spawn_process")
+    def test_shell_stream_retains_bounded_error_text_without_aggregate_output(self, mock_spawn_process):
+        spawn = MagicMock()
+        spawn.read_nonblocking.side_effect = [
+            b"usage: scanfs: unknown option --stream",
+            pexpect.EOF("eof"),
+        ]
+        spawn.exitstatus = 2
+        spawn.before = b""
+        spawn.after = b""
+        mock_spawn_process.return_value = (spawn, True)
+        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+
+        with self.assertRaises(SshcpError) as context:
+            sshcp.shell_stream("scanfs --stream", lambda chunk: None, retain_output=False)
+
+        self.assertIn("unknown option --stream", str(context.exception))
+
     def test_spawn_fallback_forwards_argv_list(self):
         sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
         spawn = MagicMock()

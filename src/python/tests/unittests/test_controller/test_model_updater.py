@@ -10,12 +10,464 @@ from unittest.mock import MagicMock, call
 from controller import ModelBuilder
 from controller.extract import ExtractCompletedResult
 from controller.persist_keys import KEY_SEP
-from controller.model_updater import ModelUpdater
+from controller.model_updater import (
+    ModelUpdater,
+    _ProgressiveScanAccumulator,
+    _JointProgressiveReconciler,
+    _filter_progressive_remote_state,
+    _remote_reconciliation_established,
+    _pop_scan_updates,
+)
+from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from model import Model, ModelFile
 from system import SystemFile
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_remote_lifecycle_requires_result_on_staggered_or_no_event_tick(self):
+        final_scan = SimpleNamespace(is_scan_final=True, failed=False, unknown_path_pair_ids=set())
+        self.assertTrue(_remote_reconciliation_established(final_scan, True))
+        self.assertFalse(_remote_reconciliation_established(None, True))
+        self.assertFalse(_remote_reconciliation_established(final_scan, False))
+
+    def test_refresh_resets_accumulator_before_first_new_event(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([
+            ScannerResult(datetime.now(), [SystemFile("old", 1)], scanned_path_pair_ids={"pair"},
+                          generation=1, is_progress=True, session_token="old-session"),
+        ])
+        controller = SimpleNamespace(_Controller__progressive_remote_scan_state=accumulator)
+        replacement = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0)
+        self.addCleanup(replacement.close_queues)
+
+        self.assertIsNone(_pop_scan_updates(controller, "remote", replacement))
+        self.assertEqual({}, accumulator.snapshot())
+    def test_progressive_remote_exclusions_match_legacy_root_and_nested_filtering(self):
+        root_skip = SystemFile("skip.nfo", 5)
+        root = SystemFile("Series", 100, True)
+        sample = SystemFile("Sample", 20, True)
+        sample.add_child(SystemFile("sample.mkv", 20))
+        season = SystemFile("Season 1", 70, True)
+        season.add_child(SystemFile("episode.nfo", 5))
+        season.add_child(SystemFile("episode.mkv", 65))
+        root.add_child(sample)
+        root.add_child(season)
+        root.add_child(SystemFile("keep.mkv", 10))
+        for file in (root, root_skip):
+            file.path_pair_id = "pair"
+
+        snapshot = {
+            ("pair", root.name): root,
+            ("pair", root_skip.name): root_skip,
+        }
+        filtered_snapshot, filtered_authority, excluded = _filter_progressive_remote_state(
+            snapshot,
+            dict(snapshot),
+            "*.nfo, Sample/",
+        )
+
+        self.assertNotIn(("pair", "skip.nfo"), filtered_snapshot)
+        self.assertIn(("pair", "skip.nfo"), excluded)
+        filtered_root = filtered_snapshot[("pair", "Series")]
+        self.assertEqual(["Season 1", "keep.mkv"], [child.name for child in filtered_root.children])
+        self.assertEqual(["episode.mkv"], [child.name for child in filtered_root.children[0].children])
+        self.assertEqual(set(), filtered_authority.keys() & excluded)
+        reconciler = _JointProgressiveReconciler()
+        _, remote_files, unknown = reconciler.reconcile(
+            filtered_snapshot, filtered_authority, set(), {"pair"},
+            filtered_snapshot, filtered_authority, set(), {"pair"},
+            {"pair"}, excluded,
+        )
+        self.assertEqual(["Series"], [file.name for file in remote_files])
+        self.assertNotIn("pair", unknown)
+
+    def test_joint_reconciler_marks_enabled_pairs_unknown_before_first_events(self):
+        reconciler = _JointProgressiveReconciler()
+        local_files, remote_files, unknown = reconciler.reconcile(
+            {}, {}, set(), set(),
+            {}, {}, set(), set(),
+            {"pair-a", "pair-b"},
+        )
+        self.assertEqual([], local_files)
+        self.assertEqual([], remote_files)
+        self.assertEqual({"pair-a", "pair-b"}, unknown)
+
+    def test_joint_reconciler_gates_new_root_until_both_sides_are_authoritative(self):
+        reconciler = _JointProgressiveReconciler()
+        remote = SystemFile("new.bin", 4)
+        key = ("pair", "new.bin")
+        local_files, remote_files, unknown = reconciler.reconcile(
+            {}, {}, {"pair"}, set(),
+            {key: remote}, {key: remote}, set(), {"pair"}, {"pair"},
+        )
+        self.assertEqual([], local_files)
+        self.assertEqual([], remote_files)
+        self.assertIn("pair", unknown)
+
+        local_files, remote_files, unknown = reconciler.reconcile(
+            {}, {}, set(), {"pair"},
+            {key: remote}, {key: remote}, set(), {"pair"}, {"pair"},
+        )
+        self.assertEqual([], local_files)
+        self.assertEqual(["new.bin"], [file.name for file in remote_files])
+        self.assertNotIn("pair", unknown)
+
+    def test_joint_reconciler_publishes_each_side_only_after_other_side_absence_or_presence(self):
+        reconciler = _JointProgressiveReconciler()
+        key = ("pair", "new.bin")
+        local = SystemFile("new.bin", 2)
+        remote = SystemFile("new.bin", 3)
+
+        _, remote_files, unknown = reconciler.reconcile(
+            {key: local}, {key: local}, set(), {"pair"},
+            {}, {}, {"pair"}, set(), {"pair"},
+        )
+        self.assertEqual([], remote_files)
+        self.assertIn("pair", unknown)
+
+        local_files, remote_files, unknown = reconciler.reconcile(
+            {key: local}, {key: local}, set(), {"pair"},
+            {}, {key: None}, set(), {"pair"}, {"pair"},
+        )
+        self.assertEqual(["new.bin"], [file.name for file in local_files])
+        self.assertEqual([], remote_files)
+        self.assertNotIn("pair", unknown)
+
+    def test_progressive_accumulator_keeps_unselected_committed_roots(self):
+        accumulator = _ProgressiveScanAccumulator()
+        first_a = SystemFile("a", 1)
+        first_a.path_pair_id = "pair-a"
+        first_b = SystemFile("b", 1)
+        first_b.path_pair_id = "pair-b"
+        second_a = SystemFile("a", 2)
+        second_a.path_pair_id = "pair-a"
+        accumulator.apply([
+            ScannerResult(datetime.now(), [first_a, first_b],
+                          scanned_path_pair_ids={"pair-a", "pair-b"}),
+        ])
+        accumulator.apply([
+            ScannerResult(datetime.now(), [second_a], scanned_path_pair_ids={"pair-a"}),
+        ])
+        snapshot = accumulator.snapshot()
+        self.assertEqual(2, snapshot[("pair-a", "a")].size)
+        self.assertEqual(1, snapshot[("pair-b", "b")].size)
+
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-a"}),
+        ])
+        snapshot = accumulator.snapshot()
+        self.assertNotIn(("pair-a", "a"), snapshot)
+        self.assertIn(("pair-b", "b"), snapshot)
+
+    def test_progressive_accumulator_keeps_last_good_roots_when_remote_setup_fails(self):
+        accumulator = _ProgressiveScanAccumulator()
+        good = SystemFile("last-good.bin", 1)
+        good.path_pair_id = "pair"
+        accumulator.apply([
+            ScannerResult(datetime.now(), [good], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+
+        failed = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          failed=True, error_message="Connection refused by server",
+                          unknown_path_pair_ids={"pair"}, is_progress=True),
+        ])
+
+        self.assertTrue(failed.failed)
+        self.assertEqual({("pair", "last-good.bin")}, set(accumulator.snapshot()))
+        self.assertEqual({"pair"}, accumulator.incomplete_pairs())
+
+        recovered = SystemFile("recovered.bin", 2)
+        recovered.path_pair_id = "pair"
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [recovered], scanned_path_pair_ids={"pair"}, generation=3,
+                          is_progress=True, completed_path_pair_ids={"pair"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+
+        self.assertFalse(result.failed)
+        self.assertEqual({("pair", "recovered.bin")}, set(accumulator.snapshot()))
+        self.assertEqual(set(), accumulator.incomplete_pairs())
+
+    def test_joint_reconciler_keeps_last_good_remote_root_unknown_during_setup_outage(self):
+        remote = _ProgressiveScanAccumulator()
+        local = _ProgressiveScanAccumulator()
+        remote_root = SystemFile("last-good.bin", 1)
+        remote_root.path_pair_id = "pair"
+        local_root = SystemFile("last-good.bin", 1)
+        local_root.path_pair_id = "pair"
+        remote.apply([ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={"pair"},
+                                    generation=1, is_progress=True, completed_path_pair_ids={"pair"},
+                                    is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"})])
+        local.apply([ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={"pair"},
+                                   generation=1, is_progress=True, completed_path_pair_ids={"pair"},
+                                   is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"})])
+        reconciler = _JointProgressiveReconciler()
+        first = reconciler.reconcile(
+            local.snapshot(), local.authority(), local.incomplete_pairs(), local.completed_pairs(),
+            remote.snapshot(), remote.authority(), remote.incomplete_pairs(), remote.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual(["last-good.bin"], [file.name for file in first[1]])
+
+        remote.apply([ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                                    failed=True, is_progress=True,
+                                    unknown_path_pair_ids={"pair"})])
+        outage = reconciler.reconcile(
+            local.snapshot(), local.authority(), local.incomplete_pairs(), local.completed_pairs(),
+            remote.snapshot(), remote.authority(), remote.incomplete_pairs(), remote.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual(["last-good.bin"], [file.name for file in outage[1]])
+        self.assertIn("pair", outage[2])
+
+    def test_joint_reconciler_excludes_disabled_pairs_from_live_output(self):
+        reconciler = _JointProgressiveReconciler()
+        root = SystemFile("old.bin", 1)
+        key = ("pair", root.name)
+        first = reconciler.reconcile(
+            {key: root}, {key: root}, set(), {"pair"},
+            {key: root}, {key: root}, set(), {"pair"}, {"pair"},
+        )
+        self.assertEqual(["old.bin"], [file.name for file in first[1]])
+        disabled = reconciler.reconcile(
+            {key: root}, {key: root}, set(), {"pair"},
+            {key: root}, {key: root}, set(), {"pair"}, set(),
+        )
+        self.assertEqual([], disabled[0])
+        self.assertEqual([], disabled[1])
+        reenabled = reconciler.reconcile(
+            {key: root}, {key: root}, set(), {"pair"},
+            {key: root}, {key: root}, set(), {"pair"}, {"pair"},
+        )
+        self.assertEqual(["old.bin"], [file.name for file in reenabled[1]])
+
+    def test_progressive_completion_waits_for_late_matching_root(self):
+        local_accumulator = _ProgressiveScanAccumulator()
+        remote_accumulator = _ProgressiveScanAccumulator()
+        local_root = SystemFile("late.bin", 2)
+        remote_root = SystemFile("late.bin", 3)
+        local_partial = local_accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"late.bin"}, session_token="local"),
+        ])
+        remote_final = remote_accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"late.bin"}, session_token="remote"),
+            ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="remote"),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote"),
+        ])
+        self.assertFalse(local_partial.is_scan_final)
+        self.assertTrue(remote_final.is_scan_final)
+
+        reconciler = _JointProgressiveReconciler()
+        local_files, remote_files, unknown = reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual([], remote_files)
+        self.assertIn("pair", unknown)
+
+        local_final = local_accumulator.apply([
+            ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="local"),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="local"),
+        ])
+        self.assertTrue(local_final.is_scan_final)
+        local_files, remote_files, unknown = reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual(["late.bin"], [file.name for file in local_files])
+        self.assertEqual(["late.bin"], [file.name for file in remote_files])
+        self.assertNotIn("pair", unknown)
+
+    def test_progressive_accumulator_keeps_unknown_pair_across_empty_drain(self):
+        accumulator = _ProgressiveScanAccumulator()
+        root = SystemFile("a", 1)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"a"}),
+            ScannerResult(datetime.now(), [root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True),
+        ])
+        self.assertEqual({"pair"}, accumulator.incomplete_pairs())
+        self.assertIsNone(accumulator.apply([]))
+        self.assertEqual({"pair"}, accumulator.incomplete_pairs())
+
+    def test_full_snapshot_completion_rebuilds_roots_after_dropped_progress(self):
+        accumulator = _ProgressiveScanAccumulator()
+        old = SystemFile("old", 1)
+        keep = SystemFile("keep", 2)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"old", "keep"}, session_token="session"),
+            ScannerResult(datetime.now(), [old, keep], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="session"),
+            ScannerResult(datetime.now(), [old, keep], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+        final_keep = SystemFile("keep", 3)
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [final_keep], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+
+        self.assertIsNotNone(result)
+        self.assertEqual({("pair", "keep")}, set(accumulator.snapshot()))
+        self.assertEqual(3, accumulator.snapshot()[("pair", "keep")].size)
+        self.assertEqual({"pair"}, accumulator.completed_pairs())
+        self.assertEqual(set(), accumulator.incomplete_pairs())
+
+    def test_managed_extract_pruned_root_survives_incomplete_then_is_removed_on_full_completion(self):
+        accumulator = _ProgressiveScanAccumulator()
+        old_root = SystemFile("movie", 10, True)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [old_root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, root_names={"movie"}, session_token="session"),
+        ])
+        self.assertIn(("pair", "movie"), accumulator.snapshot())
+
+        managed_result = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                          managed_extract_file_ids=[ModelFile.build_file_id("movie", "pair")]),
+        ])
+        self.assertEqual([ModelFile.build_file_id("movie", "pair")], managed_result.managed_extract_file_ids)
+        self.assertNotIn(("pair", "movie"), accumulator.snapshot())
+
+    def test_progressive_accumulator_resets_active_state_on_session_replacement(self):
+        accumulator = _ProgressiveScanAccumulator()
+        old = SystemFile("old", 1)
+        fresh = SystemFile("fresh", 2)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"old"}, session_token="session-a"),
+            ScannerResult(datetime.now(), [old], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="session-a"),
+        ])
+        accumulator.set_session_token("session-b")
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"fresh"}, session_token="session-b"),
+            ScannerResult(datetime.now(), [fresh], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="session-b"),
+        ])
+        self.assertEqual({"fresh"}, {key[1] for key in accumulator.snapshot()})
+
+    def test_progressive_accumulator_ignores_mixed_session_events(self):
+        accumulator = _ProgressiveScanAccumulator()
+        old = SystemFile("old", 1)
+        current = SystemFile("current", 2)
+        accumulator.set_session_token("current-session")
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [old], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, session_token="old-session"),
+            ScannerResult(datetime.now(), [current], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="current-session"),
+        ])
+        self.assertIsNotNone(result)
+        self.assertEqual({"current"}, {file.name for file in result.files})
+
+    def test_progressive_accumulator_uses_first_session_event_order(self):
+        accumulator = _ProgressiveScanAccumulator()
+        first = SystemFile("first", 1)
+        second = SystemFile("second", 2)
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [first], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="first-session"),
+            ScannerResult(datetime.now(), [second], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, session_token="second-session"),
+        ])
+        self.assertIsNotNone(result)
+        self.assertEqual({"first"}, {file.name for file in result.files})
+
+    def test_progressive_accumulator_rejects_stale_generation(self):
+        accumulator = _ProgressiveScanAccumulator()
+        first = SystemFile("a", 1)
+        newer = SystemFile("a", 2)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names={"a"}),
+            ScannerResult(datetime.now(), [first], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}),
+        ])
+        latest = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, root_names={"a"}),
+            ScannerResult(datetime.now(), [newer], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True),
+        ])
+        self.assertIsNotNone(latest)
+        self.assertEqual(2, latest.files[0].size)
+
+        stale = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, root_names=set(), completed_path_pair_ids={"pair"}),
+        ])
+        self.assertIsNotNone(stale)
+        self.assertEqual(2, stale.files[0].size)
+
+    def test_progressive_accumulator_rejects_stale_full_snapshot(self):
+        accumulator = _ProgressiveScanAccumulator()
+        current = SystemFile("current", 2)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [current], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+        stale = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
+                          session_token="session"),
+        ])
+        self.assertIsNone(stale)
+        self.assertEqual({("pair", "current")}, set(accumulator.snapshot()))
+
+    def test_progressive_accumulator_treats_empty_targeted_scan_as_noop(self):
+        accumulator = _ProgressiveScanAccumulator()
+        current = SystemFile("current", 2)
+        accumulator.apply([
+            ScannerResult(datetime.now(), [current], scanned_path_pair_ids={None}, generation=1,
+                          session_token="session"),
+        ])
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids=set(), generation=2,
+                          is_targeted_scan=True, session_token="session"),
+        ])
+        self.assertIsNone(result)
+        self.assertEqual({(None, "current")}, set(accumulator.snapshot()))
+
+    def test_unknown_local_scan_does_not_create_false_deleted_state(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("a", 100)])
+        builder.set_downloaded_files({"a"})
+        builder.set_unknown_local_path_pair_ids({None})
+
+        model = builder.build_model()
+
+        self.assertNotEqual(ModelFile.State.DELETED, model.get_file("a").state)
+
     def _make_controller(self, downloaded_file_names, extracted_file_names, stopped_file_names, path_pairs_by_id=None):
         persist = SimpleNamespace(
             downloaded_file_names=downloaded_file_names,

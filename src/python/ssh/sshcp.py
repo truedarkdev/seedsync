@@ -38,6 +38,9 @@ class Sshcp:
     # in efficient chunks.
     __PEXPECT_MAX_READ_BYTES = 64 * 1024
     __PEXPECT_SEARCH_WINDOW_BYTES = 1024
+    # Keep bounded remote diagnostics when a streaming command fails without
+    # retaining its successful aggregate output.
+    __STREAM_ERROR_CAPTURE_BYTES = 64 * 1024
     SHELL_CANDIDATES = ["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"]
     __SCP_DESTINATION_PERMISSION_DENIED = re.compile(
         r"^scp:\s+(?:dest open\s+)?(?P<path>.+):\s+(?:-\s+)?permission denied$",
@@ -528,6 +531,155 @@ class Sshcp:
             flags=flags,
             args=args
         )
+
+    def shell_stream(self, command: str, on_chunk, retain_output: bool = True) -> bytes:
+        """Run a shell command and forward stdout chunks as they arrive.
+
+        The command is still executed by one SSH process (like :meth:`shell`),
+        but callers can consume a long-running response before the remote
+        command reaches EOF.  The complete response is returned as bytes for
+        callers that also need a final integrity check.
+        """
+        if not command:
+            raise ValueError("Command cannot be empty")
+        if not callable(on_chunk):
+            raise TypeError("on_chunk must be callable")
+
+        if self.__detected_shell is None and "'" in command and '"' in command:
+            raise ValueError("Command cannot contain both single and double quotes")
+
+        if self.__detected_shell is not None:
+            command = "{} -c {}".format(
+                shlex.quote(self.__detected_shell),
+                shlex.quote(command)
+            )
+
+        flags = [
+            "-p", str(self.__port),  # port
+        ]
+        args = [
+            self.__remote_address(),
+            command
+        ]
+        return self.__run_command_stream(
+            command="ssh",
+            flags=flags,
+            args=args,
+            on_chunk=on_chunk,
+            retain_output=retain_output,
+        )
+
+    def __run_command_stream(self,
+                             command: str,
+                             flags: List[str],
+                             args: List[str],
+                             on_chunk,
+                             retain_output: bool = True) -> bytes:
+        """Execute one command while forwarding output incrementally."""
+        command_args = [command] + flags
+        command_args += [
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", "LogLevel=error",
+        ]
+        if self.__password is None:
+            command_args += ["-o", "PasswordAuthentication=no"]
+        else:
+            command_args += ["-o", "PubkeyAuthentication=no"]
+        command_args += args
+
+        self.logger.debug("Command: {}".format(command_args))
+        start_time = time.time()
+        sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        timeout_phase = "command execution"
+        output = bytearray()
+        error_output = bytearray()
+        cleanup_exitstatus = None
+        try:
+            if self.__password is not None:
+                timeout_phase = "password prompt"
+                i = sp.expect([
+                    r'(?i)password:\s*',
+                    pexpect.EOF,
+                    'lost connection',
+                    'Could not resolve hostname',
+                    'Connection refused',
+                    'Name or service not known',
+                    'No route to host',
+                    'Connection timed out',
+                    'REMOTE HOST IDENTIFICATION HAS CHANGED',
+                    'Permission denied',
+                ], timeout=self.__TIMEOUT_SECS)
+                self.__classify_expect_result(
+                    command,
+                    sp,
+                    i,
+                    eof_error="Unknown error",
+                    password_error=None,
+                    scp_permission_denied_is_destination_error=False
+                )
+                sp.sendline(self.__password)
+
+            while True:
+                try:
+                    chunk = sp.read_nonblocking(
+                        size=self.__PEXPECT_MAX_READ_BYTES,
+                        timeout=1
+                    )
+                except pexpect.exceptions.TIMEOUT:
+                    if time.time() - start_time >= self.__TIMEOUT_SECS:
+                        self.__log_timeout(timeout_phase, command, sp, start_time)
+                        raise SshcpError("Timed out")
+                    continue
+                except (pexpect.exceptions.EOF, pexpect.EOF):
+                    break
+
+                if chunk is None:
+                    continue
+                if not isinstance(chunk, bytes):
+                    chunk = self.__decode_spawn_output(chunk).encode()
+                if not chunk:
+                    continue
+                if retain_output:
+                    output.extend(chunk)
+                else:
+                    remaining = self.__STREAM_ERROR_CAPTURE_BYTES - len(error_output)
+                    if remaining > 0:
+                        error_output.extend(chunk[:remaining])
+                on_chunk(chunk)
+        except pexpect.exceptions.TIMEOUT:
+            self.__log_timeout(timeout_phase, command, sp, start_time)
+            raise SshcpError("Timed out")
+        finally:
+            try:
+                close = getattr(sp, "close", None)
+                if callable(close):
+                    close()
+                else:
+                    wait = getattr(sp, "wait", None)
+                    if callable(wait):
+                        cleanup_exitstatus = wait()
+            except Exception:
+                self.logger.warning("Failed to clean up SSH child process", exc_info=True)
+
+        exitstatus = getattr(sp, "exitstatus", None)
+        if exitstatus is None:
+            exitstatus = cleanup_exitstatus
+        if exitstatus is None:
+            wait = getattr(sp, "wait", None)
+            if callable(wait):
+                exitstatus = wait()
+
+        self.logger.debug("Return code: {}".format(exitstatus))
+        self.logger.debug("Command took {:.3f}s".format(time.time() - start_time))
+        if exitstatus != 0:
+            diagnostic = output if retain_output else error_output
+            output_text = bytes(diagnostic).decode(errors="replace").strip()
+            self.logger.warning("Command failed: '{}'".format(output_text))
+            self.__check_shell_not_found(output_text)
+            raise SshcpError(output_text)
+        if not retain_output:
+            return b""
+        return bytes(output).replace(b'\r\n', b'\n').strip()
 
     def copy(self, local_path: str, remote_path: str):
         """

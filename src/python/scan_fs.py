@@ -220,6 +220,7 @@ class SystemScanner:
         self.exclude_prefixes: List[str] = []
         self.exclude_suffixes: List[str] = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
         self.__lftp_temp_file_suffix: Optional[str] = None
+        self.scan_had_errors = False
 
     def add_exclude_prefix(self, prefix: str):
         """
@@ -243,11 +244,59 @@ class SystemScanner:
         """
         Scan the path to generate list of system files.
         """
+        self.scan_had_errors = False
         if not os.path.exists(self.path_to_scan):
             raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
         elif not os.path.isdir(self.path_to_scan):
             raise SystemScannerError("Path is not a directory: {}".format(self.path_to_scan))
         return self.__create_children(self.path_to_scan)
+
+    def root_names(self) -> List[str]:
+        self.scan_had_errors = False
+        if not os.path.exists(self.path_to_scan):
+            raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
+        if not os.path.isdir(self.path_to_scan):
+            raise SystemScannerError("Path is not a directory: {}".format(self.path_to_scan))
+        names: set[str] = set()
+        try:
+            for entry in os.scandir(self.path_to_scan):
+                if entry.is_symlink() and entry.is_dir():
+                    continue
+                if self.__excluded(entry.name):
+                    continue
+                names.add(entry.name)
+        except PermissionError as e:
+            self.scan_had_errors = True
+            raise SystemScannerError(
+                "Permission denied while scanning: {}".format(self.path_to_scan)
+            ) from e
+        return sorted(names)
+
+    def scan_single_if_present(self, name: str) -> Optional[SystemFile]:
+        path = os.path.join(self.path_to_scan, name)
+        temp_path = (path + self.__lftp_temp_file_suffix) if self.__lftp_temp_file_suffix else None
+        if os.path.exists(path):
+            pass
+        elif temp_path and os.path.isfile(temp_path):
+            path = temp_path
+        else:
+            return None
+        try:
+            return self.__create_system_file(PseudoDirEntry(
+                name=name,
+                path=path,
+                is_dir=os.path.isdir(path) and not os.path.islink(path),
+                stat_result=os.stat(path),
+            ))
+        except FileNotFoundError:
+            return None
+        except PermissionError:
+            self.scan_had_errors = True
+            return None
+
+    def __excluded(self, name: str) -> bool:
+        return any(name.startswith(prefix) for prefix in self.exclude_prefixes) or \
+            any(name.endswith(suffix) for suffix in self.exclude_suffixes)
 
     def scan_single(self, name: str) -> SystemFile:
         """
@@ -337,25 +386,34 @@ class SystemScanner:
     def __create_children(self, path: str) -> List[SystemFile]:
         children: List[SystemFile] = []
         # Files may get deleted while scanning, ignore the error.
-        for entry in os.scandir(path):
-            if entry.is_symlink() and entry.is_dir():
-                continue
-
-            skip = False
-            for prefix in self.exclude_prefixes:
-                if entry.name.startswith(prefix):
-                    skip = True
-            for suffix in self.exclude_suffixes:
-                if entry.name.endswith(suffix):
-                    skip = True
-            if skip:
-                continue
-
+        try:
+            entries = os.scandir(path)
+        except FileNotFoundError:
+            return children
+        except PermissionError:
+            self.scan_had_errors = True
+            return children
+        try:
             try:
-                sys_file = self.__create_system_file(entry)
-            except FileNotFoundError:
-                continue
-            children.append(sys_file)
+                for entry in entries:
+                    try:
+                        if entry.is_symlink() and entry.is_dir():
+                            continue
+
+                        if self.__excluded(entry.name):
+                            continue
+
+                        sys_file = self.__create_system_file(entry)
+                    except FileNotFoundError:
+                        continue
+                    except PermissionError:
+                        self.scan_had_errors = True
+                        continue
+                    children.append(sys_file)
+            except PermissionError:
+                self.scan_had_errors = True
+        finally:
+            entries.close()
         children.sort(key=lambda fl: fl.name)
         return children
 
@@ -411,17 +469,55 @@ if __name__ == "__main__":
                         help="Exclude hidden files")
     parser.add_argument("-H", "--human-readable", action="store_true", default=False,
                         help="Human readable output")
+    parser.add_argument("--stream", action="store_true", default=False,
+                        help="Emit batched SeedSync scan protocol records")
+    parser.add_argument("--stream-batch-size", type=int, default=8,
+                        help="Maximum top-level roots per streamed record")
     args = parser.parse_args()
 
     scanner = SystemScanner(args.path)
     if args.exclude_hidden:
         scanner.add_exclude_prefix(".")
     try:
-        root_files = scanner.scan()
+        if args.stream:
+            if args.stream_batch_size < 1 or args.stream_batch_size > 64:
+                parser.error("--stream-batch-size must be between 1 and 64")
+            root_names = scanner.root_names()
+            prefix = "SEEDSYNC_SCAN_V2\t"
+            sys.stdout.write(prefix + json.dumps({"type": "manifest", "names": root_names}) + "\n")
+            sys.stdout.flush()
+            batch: List[SystemFileData] = []
+            for root_name in root_names:
+                root_file = scanner.scan_single_if_present(root_name)
+                if root_file is None:
+                    continue
+                batch.append(root_file.to_dict())
+                if len(batch) >= args.stream_batch_size:
+                    sys.stdout.write(prefix + json.dumps({"type": "roots", "files": batch}) + "\n")
+                    sys.stdout.flush()
+                    batch = []
+            if batch:
+                sys.stdout.write(prefix + json.dumps({"type": "roots", "files": batch}) + "\n")
+                sys.stdout.flush()
+            if scanner.scan_had_errors:
+                raise SystemScannerError(
+                    "Permission denied while scanning: {}".format(args.path)
+                )
+            sys.stdout.write(prefix + json.dumps({"type": "complete"}) + "\n")
+            sys.stdout.flush()
+            root_files = []
+        else:
+            root_files = scanner.scan()
+            if scanner.scan_had_errors:
+                raise SystemScannerError(
+                    "Permission denied while scanning: {}".format(args.path)
+                )
     except SystemScannerError as e:
         sys.exit("SystemScannerError: {}".format(str(e)))
 
-    if args.human_readable:
+    if args.stream:
+        pass
+    elif args.human_readable:
         def print_file(file: SystemFile, level: int):
             sys.stdout.write("  " * level)
             sys.stdout.write("{} {} {}\n".format(

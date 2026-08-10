@@ -55,6 +55,7 @@ class SystemScanner:
         self.exclude_prefixes: list[str] = []
         self.exclude_suffixes: list[str] = [SystemScanner.__LFTP_STATUS_FILE_SUFFIX]
         self.__lftp_temp_file_suffix: str | None = None
+        self.__scan_had_errors = False
 
     def add_exclude_prefix(self, prefix: str):
         """
@@ -86,11 +87,64 @@ class SystemScanner:
         Scan the path to generate list of system files
         :return:
         """
+        self.__scan_had_errors = False
         if not os.path.exists(self.path_to_scan):
             raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
         elif not os.path.isdir(self.path_to_scan):
             raise SystemScannerError("Path is not a directory: {}".format(self.path_to_scan))
         return self.__create_children(self.path_to_scan)
+
+    @property
+    def scan_had_errors(self) -> bool:
+        """Whether a race/permission error made this generation incomplete."""
+        return self.__scan_had_errors
+
+    def reset_scan_errors(self) -> None:
+        self.__scan_had_errors = False
+
+    def root_names(self) -> List[str]:
+        """Return the filtered top-level manifest without scanning subtrees."""
+        if not os.path.exists(self.path_to_scan):
+            raise SystemScannerError("Path does not exist: {}".format(self.path_to_scan))
+        if not os.path.isdir(self.path_to_scan):
+            raise SystemScannerError("Path is not a directory: {}".format(self.path_to_scan))
+
+        names: set[str] = set()
+        for entry in os.scandir(self.path_to_scan):
+            if entry.is_symlink() and entry.is_dir():
+                continue
+            if self.__excluded(entry.name):
+                continue
+            name = entry.name
+            if self.__lftp_temp_file_suffix and name != self.__lftp_temp_file_suffix and \
+                    name.endswith(self.__lftp_temp_file_suffix):
+                name = name[:-len(self.__lftp_temp_file_suffix)]
+            names.add(name)
+        return sorted(names)
+
+    def scan_single_if_present(self, name: str) -> Optional[SystemFile]:
+        """Scan one top-level entry, returning ``None`` for a normal race."""
+        path = os.path.join(self.path_to_scan, name)
+        temp_path = (path + self.__lftp_temp_file_suffix) if self.__lftp_temp_file_suffix else None
+
+        if os.path.exists(path):
+            pass
+        elif temp_path and os.path.isfile(temp_path):
+            path = temp_path
+        else:
+            return None
+
+        try:
+            return self.__create_system_file(
+                PseudoDirEntry(
+                    name=name,
+                    path=path,
+                    is_dir=os.path.isdir(path) and not os.path.islink(path),
+                    stat=os.stat(path)
+                )
+            )
+        except FileNotFoundError:
+            return None
 
     def scan_single(self, name: str) -> SystemFile:
         """
@@ -102,10 +156,8 @@ class SystemScanner:
         temp_path = (path + self.__lftp_temp_file_suffix) if self.__lftp_temp_file_suffix else None
 
         if os.path.exists(path):
-            # We're good to go
             pass
         elif temp_path and os.path.isfile(temp_path):
-            # There's a temp file, use that
             path = temp_path
         else:
             raise SystemScannerError("Path does not exist: {}".format(path))
@@ -120,11 +172,14 @@ class SystemScanner:
                 )
             )
         except FileNotFoundError as error:
-            # The target can disappear between the existence check and
-            # stat/scandir (a normal TOCTOU race for incomplete downloads).
-            # Report only that disappearance as a scan miss; permission and
-            # I/O failures must remain visible to the caller.
+            # Preserve the explicit stat-race diagnostic for callers that
+            # requested a specific root; optional progressive scans use
+            # scan_single_if_present() instead.
             raise SystemScannerError("Failed to scan '{}': {}".format(path, error)) from error
+
+    def __excluded(self, name: str) -> bool:
+        return any(name.startswith(prefix) for prefix in self.exclude_prefixes) or \
+            any(name.endswith(suffix) for suffix in self.exclude_suffixes)
 
     @staticmethod
     def __get_created_time(stat_result: os.stat_result) -> Optional[datetime]:
@@ -204,18 +259,18 @@ class SystemScanner:
     def __create_children(self, path: str) -> List[SystemFile]:
         children: list[SystemFile] = []
         # Files may get deleted while scanning, ignore the error
-        for entry in os.scandir(path):
+        try:
+            entries = os.scandir(path)
+        except PermissionError:
+            self.__scan_had_errors = True
+            return children
+        except FileNotFoundError:
+            return children
+        for entry in entries:
             if entry.is_symlink() and entry.is_dir():
                 continue
             # Skip excluded entries
-            skip = False
-            for prefix in self.exclude_prefixes:
-                if entry.name.startswith(prefix):
-                    skip = True
-            for suffix in self.exclude_suffixes:
-                if entry.name.endswith(suffix):
-                    skip = True
-            if skip:
+            if self.__excluded(entry.name):
                 continue
 
             try:

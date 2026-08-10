@@ -4,7 +4,7 @@ import logging
 import os
 from typing import List, Optional
 
-from .scanner_process import IScanner, ScannerError
+from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from common import overrides, Localization, Constants
 from common.managed_extract import (
     is_managed_extract_marker_name,
@@ -42,6 +42,7 @@ class LocalScanner(IScanner):
         self.__managed_extract_file_ids: set[str] = set()
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
+        self.__progress_callback: Optional[ScanProgressCallback] = None
 
     @property
     def path_pair_id(self) -> Optional[str]:
@@ -56,15 +57,26 @@ class LocalScanner(IScanner):
         self.logger = base_logger.getChild("LocalScanner")
 
     @overrides(IScanner)
+    def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
+        self.__progress_callback = callback
+
+    @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         self.__managed_extract_file_ids = set()
         if not self.__is_valid_scan_path(self.__local_path):
             raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+        if self.__progress_callback is not None:
+            return self.__scan_progressively()
         try:
             result = self.__scanner.scan()
+            if self.__scanner.scan_had_errors:
+                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
         except SystemScannerError:
             self.logger.exception("Caught SystemScannerError")
             raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+        except OSError:
+            self.logger.exception("Caught local filesystem error")
+            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
 
         if self.__managed_extract_folders_enabled:
             result = self.__prune_managed_extract_entries(result, self.__local_path)
@@ -76,9 +88,14 @@ class LocalScanner(IScanner):
         if self.__staging_scanner is not None:
             try:
                 staging_result = self.__staging_scanner.scan()
+                if self.__staging_scanner.scan_had_errors:
+                    raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
             except SystemScannerError:
                 self.logger.exception("Caught SystemScannerError")
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+            except OSError:
+                self.logger.exception("Caught local staging filesystem error")
+                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
 
             if self.__managed_extract_folders_enabled and self.__staging_path is not None:
                 staging_result = self.__prune_managed_extract_entries(staging_result, self.__staging_path)
@@ -96,6 +113,62 @@ class LocalScanner(IScanner):
                         staging_file
                     )
         return result
+
+    def __scan_progressively(self) -> List[SystemFile]:
+        """Publish a manifest and bounded top-level root batches.
+
+        Each root is still scanned locally with the existing recursive scanner;
+        the callback only changes publication timing and does not alter the
+        resulting tree, exclusions, staging merge, or managed-marker rules.
+        """
+        assert self.__progress_callback is not None
+        try:
+            self.__scanner.reset_scan_errors()
+            if self.__staging_scanner is not None:
+                self.__staging_scanner.reset_scan_errors()
+            root_names = set(self.__scanner.root_names())
+            staging_names: set[str] = set()
+            if self.__staging_scanner is not None:
+                staging_names = set(self.__staging_scanner.root_names())
+            exclude_name = self.__get_nested_staging_name()
+            if exclude_name is not None:
+                root_names.discard(exclude_name)
+                staging_names.discard(exclude_name)
+            all_names = sorted(root_names.union(staging_names))
+            aggregate_results: List[SystemFile] = []
+            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, set(all_names), False)
+            for root_name in all_names:
+                result: Optional[SystemFile] = None
+                if root_name in root_names:
+                    result = self.__scanner.scan_single_if_present(root_name)
+                    if result is not None and self.__managed_extract_folders_enabled:
+                        pruned = self.__prune_managed_extract_entries([result], self.__local_path)
+                        result = pruned[0] if pruned else None
+                if root_name in staging_names and self.__staging_scanner is not None:
+                    staging_result = self.__staging_scanner.scan_single_if_present(root_name)
+                    if staging_result is not None:
+                        if self.__managed_extract_folders_enabled and self.__staging_path is not None:
+                            pruned = self.__prune_managed_extract_entries([staging_result], self.__staging_path)
+                            staging_result = pruned[0] if pruned else None
+                        if staging_result is not None:
+                            self.__mark_staging_file_tree(staging_result)
+                            result = staging_result if result is None else self.__merge_duplicate_local_entries(
+                                result, staging_result
+                            )
+                if result is not None:
+                    aggregate_results.append(result)
+                    self.__progress_callback([result], self.__path_pair_id, self.__path_pair_name, None, False)
+            if self.__scanner.scan_had_errors or (
+                    self.__staging_scanner is not None and self.__staging_scanner.scan_had_errors):
+                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
+            return aggregate_results
+        except SystemScannerError:
+            self.logger.exception("Caught SystemScannerError")
+            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
+        except OSError:
+            self.logger.exception("Caught local filesystem error")
+            raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
 
     def pop_managed_extract_file_ids(self) -> List[str]:
         managed_extract_file_ids = sorted(self.__managed_extract_file_ids)

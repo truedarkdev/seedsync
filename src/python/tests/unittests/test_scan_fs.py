@@ -1,13 +1,17 @@
 # Copyright 2026, SeedSync Contributors, All rights reserved.
 
+import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from system import SystemFile
 
@@ -72,3 +76,26 @@ class TestScanFsScript(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("SystemScannerError: Path does not exist", result.stderr)
+
+    def test_stream_reports_partial_scan_without_complete_on_permission_error(self):
+        self._write_file("nested", "secret.bin", content=b"secret")
+        blocked_path = os.path.abspath(os.path.join(self.temp_dir, "nested"))
+        real_scandir = os.scandir
+
+        def guarded_scandir(path):
+            if os.path.abspath(os.fspath(path)) == blocked_path:
+                raise PermissionError(13, "Permission denied", path)
+            return real_scandir(path)
+
+        stdout = io.StringIO()
+        argv = [str(self.script_path), "--stream", "--stream-batch-size", "1", self.temp_dir]
+        with patch.object(os, "scandir", side_effect=guarded_scandir):
+            with patch.object(sys, "argv", argv):
+                with redirect_stdout(stdout):
+                    with self.assertRaises(SystemExit) as context:
+                        runpy.run_path(str(self.script_path), run_name="__main__")
+
+        self.assertNotEqual(0, context.exception.code)
+        self.assertIn('"type": "manifest"', stdout.getvalue())
+        self.assertIn("SystemScannerError: Permission denied while scanning", str(context.exception.code))
+        self.assertNotIn('"type": "complete"', stdout.getvalue())

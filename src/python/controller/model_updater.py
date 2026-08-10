@@ -28,11 +28,370 @@ from common.exclude_patterns import filter_excluded_files
 from .controller_persist import ControllerPersist
 from .extract import ExtractCompletedResult, ExtractFailedResult, ExtractProcess, ExtractStatus
 from .model_builder import ModelBuilder
-from .scan import ScannerProcess
+from .scan import ScannerProcess, ScannerResult
 from .validate import ValidateProcess
 
 if TYPE_CHECKING:
     from .controller import Controller
+
+
+class _ProgressiveScanAccumulator:
+    """Reconcile manifest/root events without exposing unknown absence."""
+
+    def __init__(self) -> None:
+        self.__session_token: Optional[str] = None
+        self.__committed: dict[tuple[Optional[str], str], SystemFile] = {}
+        self.__working: dict[int, dict[Optional[str], dict[str, SystemFile]]] = {}
+        self.__manifests: dict[int, dict[Optional[str], Optional[set[str]]]] = {}
+        self.__active_generation: dict[Optional[str], int] = {}
+        self.__failed_pairs: set[tuple[int, Optional[str]]] = set()
+        self.__authoritative: dict[tuple[Optional[str], str], Optional[SystemFile]] = {}
+        self.__incomplete_pairs: set[Optional[str]] = set()
+        self.__completed_pairs: set[Optional[str]] = set()
+
+    def set_session_token(self, session_token: Optional[str]) -> None:
+        """Bind active evidence to the current scanner process identity."""
+        if not isinstance(session_token, str) or not session_token:
+            return
+        if self.__session_token == session_token:
+            return
+        self.__session_token = session_token
+        self.__working.clear()
+        self.__manifests.clear()
+        self.__active_generation.clear()
+        self.__failed_pairs.clear()
+        self.__incomplete_pairs.clear()
+        self.__authoritative.clear()
+        self.__completed_pairs.clear()
+
+    @staticmethod
+    def __pair_for_file(file: SystemFile, result: ScannerResult) -> Optional[str]:
+        if isinstance(file.path_pair_id, str) or file.path_pair_id is None:
+            return file.path_pair_id
+        ids = list(result.scanned_path_pair_ids)
+        return ids[0] if len(ids) == 1 else None
+
+    def apply(self, events: Sequence[ScannerResult]) -> Optional[ScannerResult]:
+        if not events:
+            return None
+        if self.__session_token is None:
+            session_token = next(
+                (getattr(event, "session_token", None) for event in events
+                 if isinstance(getattr(event, "session_token", None), str)),
+                None,
+            )
+            self.set_session_token(session_token)
+        if self.__session_token is not None:
+            events = [
+                event for event in events
+                if getattr(event, "session_token", None) == self.__session_token
+            ]
+            if not events:
+                return None
+        newest_generation = max((int(getattr(event, "generation", 0)) for event in events), default=0)
+        accepted: list[ScannerResult] = []
+        for event in events:
+            generation = int(getattr(event, "generation", 0))
+            if generation < newest_generation and getattr(event, "is_progress", False):
+                continue
+            accepted.append(event)
+        if not accepted:
+            return None
+        latest = accepted[-1]
+        if not any(getattr(event, "is_progress", False) for event in accepted):
+            selected_ids = set(latest.scanned_path_pair_ids)
+            if not selected_ids:
+                if bool(getattr(latest, "is_targeted_scan", False)):
+                    return None
+                selected_ids = {None}
+            latest_generation = int(getattr(latest, "generation", 0))
+            if any(
+                latest_generation < self.__active_generation.get(pair_id, -1)
+                for pair_id in selected_ids
+            ):
+                return None
+            if latest.failed:
+                return latest
+            for pair_id in selected_ids:
+                self.__active_generation[pair_id] = latest_generation
+                self.__completed_pairs.add(pair_id)
+                self.__incomplete_pairs.discard(pair_id)
+                for key in [key for key in self.__committed if key[0] == pair_id]:
+                    self.__committed.pop(key, None)
+                    self.__authoritative.pop(key, None)
+            for file in latest.files:
+                pair_id = file.path_pair_id if file.path_pair_id in selected_ids else (
+                    next(iter(selected_ids)) if len(selected_ids) == 1 else file.path_pair_id
+                )
+                self.__committed[(pair_id, file.name)] = file
+                self.__authoritative[(pair_id, file.name)] = file
+            return latest
+        malformed: list[str] = []
+        managed: list[str] = []
+        failed = False
+        error_message: Optional[str] = None
+        completed: set[Optional[str]] = set()
+        touched: set[Optional[str]] = set()
+        for event in accepted:
+            malformed.extend(event.malformed_status_only_file_ids)
+            managed.extend(event.managed_extract_file_ids)
+            generation = int(getattr(event, "generation", 0))
+            ids = set(event.scanned_path_pair_ids)
+            if not ids:
+                ids = {None}
+            for pair_id in ids:
+                previous_generation = self.__active_generation.get(pair_id, -1)
+                if generation < previous_generation:
+                    continue
+                if generation > previous_generation:
+                    self.__active_generation[pair_id] = generation
+                    self.__incomplete_pairs.add(pair_id)
+                    self.__completed_pairs.discard(pair_id)
+                    for old_generation in list(self.__working):
+                        if old_generation < generation:
+                            self.__working[old_generation].pop(pair_id, None)
+                            self.__manifests.get(old_generation, {}).pop(pair_id, None)
+                            self.__failed_pairs.discard((old_generation, pair_id))
+                            if not self.__working[old_generation]:
+                                self.__working.pop(old_generation, None)
+                            if not self.__manifests.get(old_generation):
+                                self.__manifests.pop(old_generation, None)
+                    previous = {
+                        name: file for (stored_pair, name), file in self.__committed.items()
+                        if stored_pair == pair_id
+                    }
+                    self.__working.setdefault(generation, {})[pair_id] = previous
+                    self.__manifests.setdefault(generation, {})[pair_id] = None
+                    self.__failed_pairs.discard((generation, pair_id))
+                    for key in [key for key in self.__authoritative if key[0] == pair_id]:
+                        self.__authoritative.pop(key, None)
+                touched.add(pair_id)
+                if event.failed:
+                    self.__failed_pairs.add((generation, pair_id))
+                    for key in [key for key in self.__authoritative if key[0] == pair_id]:
+                        self.__authoritative.pop(key, None)
+                    failed = True
+                    error_message = event.error_message
+                    self.__incomplete_pairs.add(pair_id)
+                    continue
+                working = self.__working.setdefault(generation, {}).setdefault(pair_id, {})
+                full_snapshot_ids = set(getattr(event, "full_snapshot_path_pair_ids", set()))
+                full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
+                    and pair_id in full_snapshot_ids
+                if full_snapshot:
+                    # The final aggregate is lossless even when intermediate
+                    # queue events were dropped. Rebuild this pair from it;
+                    # failed generations never carry this flag.
+                    working.clear()
+                manifest = getattr(event, "root_names", None)
+                if manifest is not None:
+                    self.__manifests.setdefault(generation, {})[pair_id] = set(manifest)
+                    for key in [key for key in self.__committed if key[0] == pair_id]:
+                        if key[1] not in manifest:
+                            self.__authoritative[key] = None
+                        else:
+                            self.__authoritative.pop(key, None)
+                for file in event.files:
+                    file_pair = self.__pair_for_file(file, event)
+                    if file_pair != pair_id and len(ids) > 1:
+                        continue
+                    working[file.name] = file
+                    self.__authoritative[(pair_id, file.name)] = file
+                if full_snapshot:
+                    self.__manifests.setdefault(generation, {})[pair_id] = set(working)
+                if pair_id in event.completed_path_pair_ids:
+                    manifest_names = self.__manifests.get(generation, {}).get(pair_id)
+                    if manifest_names is not None:
+                        for name in list(working):
+                            if name not in manifest_names:
+                                working.pop(name, None)
+                        for name in manifest_names:
+                            self.__authoritative.setdefault((pair_id, name), None)
+                    for name, file in working.items():
+                        self.__committed[(pair_id, name)] = file
+                    for key in [key for key in self.__committed if key[0] == pair_id and key[1] not in working]:
+                        self.__committed.pop(key, None)
+                        self.__authoritative.pop(key, None)
+                    completed.add(pair_id)
+                    self.__incomplete_pairs.discard(pair_id)
+                    self.__completed_pairs.add(pair_id)
+
+        visible: dict[tuple[Optional[str], str], SystemFile] = dict(self.__committed)
+        for generation, pair_maps in self.__working.items():
+            for pair_id, files in pair_maps.items():
+                if self.__active_generation.get(pair_id) != generation:
+                    continue
+                if (generation, pair_id) in self.__failed_pairs:
+                    continue
+                for name, file in files.items():
+                    visible[(pair_id, name)] = file
+        return ScannerResult(
+            latest.timestamp,
+            list(visible.values()),
+            malformed_status_only_file_ids=sorted(set(malformed)),
+            managed_extract_file_ids=sorted(set(managed)),
+            scanned_path_pair_ids=completed,
+            # A multi-pair scan may complete healthy pairs while another pair
+            # fails.  Publish the healthy incremental view and reserve the
+            # failed flag for an all-unknown update so callers do not discard
+            # unrelated progress.
+            failed=failed and not completed,
+            error_message=error_message,
+            generation=newest_generation,
+            is_progress=any(getattr(event, "is_progress", False) for event in accepted),
+            completed_path_pair_ids=completed,
+            unknown_path_pair_ids=set(self.__incomplete_pairs),
+            is_scan_final=bool(completed) and not self.__incomplete_pairs and not failed,
+        )
+
+    def snapshot(self) -> dict[tuple[Optional[str], str], SystemFile]:
+        visible: dict[tuple[Optional[str], str], SystemFile] = dict(self.__committed)
+        for generation, pair_maps in self.__working.items():
+            for pair_id, files in pair_maps.items():
+                if self.__active_generation.get(pair_id) != generation:
+                    continue
+                if (generation, pair_id) in self.__failed_pairs:
+                    continue
+                for name, file in files.items():
+                    visible[(pair_id, name)] = file
+        return visible
+
+    def authority(self) -> dict[tuple[Optional[str], str], Optional[SystemFile]]:
+        return dict(self.__authoritative)
+
+    def incomplete_pairs(self) -> set[Optional[str]]:
+        return set(self.__incomplete_pairs)
+
+    def completed_pairs(self) -> set[Optional[str]]:
+        return set(self.__completed_pairs)
+
+
+class _JointProgressiveReconciler:
+    """Gate new roots until local and remote evidence agree for that root."""
+
+    def __init__(self) -> None:
+        self.__published: dict[
+            tuple[Optional[str], str], tuple[Optional[SystemFile], Optional[SystemFile]]
+        ] = {}
+
+    def reconcile(
+        self,
+        local_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        local_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        local_incomplete: set[Optional[str]],
+        local_completed: set[Optional[str]],
+        remote_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        remote_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        remote_incomplete: set[Optional[str]],
+        remote_completed: set[Optional[str]],
+        enabled_pair_ids: set[Optional[str]],
+        remote_excluded_keys: Optional[set[tuple[Optional[str], str]]] = None,
+    ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
+        remote_excluded_keys = remote_excluded_keys or set()
+        keys = set(self.__published)
+        keys.update(local_snapshot)
+        keys.update(remote_snapshot)
+        keys.update(local_authority)
+        keys.update(remote_authority)
+        for pair_id, name in keys:
+            if pair_id not in enabled_pair_ids:
+                continue
+            if (pair_id, name) in remote_excluded_keys:
+                local_file = local_authority.get((pair_id, name), local_snapshot.get((pair_id, name)))
+                if local_file is None:
+                    self.__published.pop((pair_id, name), None)
+                else:
+                    self.__published[(pair_id, name)] = (local_file, None)
+                continue
+            local_known = (pair_id, name) in local_authority or pair_id in local_completed
+            remote_known = (pair_id, name) in remote_authority or pair_id in remote_completed
+            if not local_known or not remote_known:
+                continue
+            local_file = local_authority.get((pair_id, name))
+            remote_file = remote_authority.get((pair_id, name))
+            if local_file is None and remote_file is None:
+                self.__published.pop((pair_id, name), None)
+            else:
+                self.__published[(pair_id, name)] = (local_file, remote_file)
+
+        local_files: list[SystemFile] = []
+        remote_files: list[SystemFile] = []
+        for (pair_id, _), (local_file, remote_file) in self.__published.items():
+            if pair_id not in enabled_pair_ids:
+                continue
+            if local_file is not None:
+                local_files.append(local_file)
+            if remote_file is not None:
+                remote_files.append(remote_file)
+        unknown_local_pairs = set(local_incomplete) | set(remote_incomplete)
+        unknown_local_pairs.update(enabled_pair_ids - set(local_completed))
+        unknown_local_pairs.update(enabled_pair_ids - set(remote_completed))
+        return local_files, remote_files, unknown_local_pairs
+
+
+def _filter_progressive_remote_state(
+    snapshot: dict[tuple[Optional[str], str], SystemFile],
+    authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+    exclude_patterns: str,
+) -> tuple[
+    dict[tuple[Optional[str], str], SystemFile],
+    dict[tuple[Optional[str], str], Optional[SystemFile]],
+    set[tuple[Optional[str], str]],
+]:
+    """Apply legacy remote exclusions to progressive root evidence."""
+    if not exclude_patterns:
+        return dict(snapshot), dict(authority), set()
+
+    filtered_snapshot: dict[tuple[Optional[str], str], SystemFile] = {}
+    filtered_authority: dict[tuple[Optional[str], str], Optional[SystemFile]] = {}
+    excluded_keys: set[tuple[Optional[str], str]] = set()
+    keys = set(snapshot) | set(authority)
+    for key in keys:
+        raw_file = snapshot.get(key)
+        authority_present = key in authority
+        authority_file = authority.get(key)
+        candidate = raw_file if raw_file is not None else authority_file
+        filtered_file = None
+        if candidate is not None:
+            filtered = filter_excluded_files([candidate], exclude_patterns)
+            filtered_file = filtered[0] if filtered else None
+            if filtered_file is None and raw_file is not None:
+                excluded_keys.add(key)
+        if raw_file is not None and filtered_file is not None:
+            filtered_snapshot[key] = filtered_file
+        if authority_present:
+            if authority_file is None:
+                filtered_authority[key] = None
+            elif filtered_file is not None:
+                filtered_authority[key] = filtered_file
+            elif raw_file is None:
+                # A non-null authority entry without a snapshot is still
+                # authoritative; retain its exclusion semantics.
+                excluded_keys.add(key)
+    return filtered_snapshot, filtered_authority, excluded_keys
+
+
+def _remote_reconciliation_established(
+    latest_remote_scan: Optional[ScannerResult],
+    scan_final_relevant: bool,
+) -> bool:
+    """Gate remote lifecycle operations on a result-bearing final tick."""
+    return latest_remote_scan is not None and scan_final_relevant
+
+
+def _pop_scan_updates(controller: "Controller", side: str, process: object) -> Optional[ScannerResult]:
+    """Drain progressive events when available; preserve legacy mock behavior."""
+    if isinstance(process, ScannerProcess):
+        events = process.pop_results()
+        state_name = "_Controller__progressive_{}_scan_state".format(side)
+        accumulator = getattr(controller, state_name, None)
+        if not isinstance(accumulator, _ProgressiveScanAccumulator):
+            accumulator = _ProgressiveScanAccumulator()
+            setattr(controller, state_name, accumulator)
+        accumulator.set_session_token(getattr(process, "session_token", None))
+        return accumulator.apply(events)
+    pop_latest = getattr(process, "pop_latest_result", None)
+    return pop_latest() if callable(pop_latest) else None
 
 
 class _ControllerCoreAccess:
@@ -567,9 +926,70 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__last_local_reconciliation_healthy = False
 
         # Grab the latest scan results.
-        latest_remote_scan = controller._Controller__remote_scan_process.pop_latest_result()
-        latest_local_scan = controller._Controller__local_scan_process.pop_latest_result()
+        latest_remote_scan = _pop_scan_updates(controller, "remote", controller._Controller__remote_scan_process)
+        latest_local_scan = _pop_scan_updates(controller, "local", controller._Controller__local_scan_process)
         latest_active_scan = controller._Controller__active_scan_process.pop_latest_result()
+        progressive_mode = bool(getattr(controller, "_Controller__progressive_joint_mode", False)) or \
+            bool(getattr(latest_remote_scan, "is_progress", False)) or \
+            bool(getattr(latest_local_scan, "is_progress", False))
+        if progressive_mode:
+            controller._Controller__progressive_joint_mode = True
+        joint_reconciler = getattr(controller, "_Controller__progressive_joint_reconciler", None)
+        if progressive_mode and not isinstance(joint_reconciler, _JointProgressiveReconciler):
+            joint_reconciler = _JointProgressiveReconciler()
+            controller._Controller__progressive_joint_reconciler = joint_reconciler
+
+        def side_state(side: str, result: Optional[ScannerResult]):
+            accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
+            if isinstance(accumulator, _ProgressiveScanAccumulator):
+                return accumulator.snapshot(), accumulator.authority(), accumulator.incomplete_pairs(), accumulator.completed_pairs()
+            if result is None or bool(getattr(result, "failed", False)):
+                return {}, {}, set(getattr(result, "scanned_path_pair_ids", {None})) if result is not None else set(), set()
+            snapshot = {(file.path_pair_id, file.name): file for file in result.files}
+            ids = set(getattr(result, "scanned_path_pair_ids", {None}))
+            return snapshot, dict(snapshot), set(getattr(result, "unknown_path_pair_ids", set())), ids
+
+        joint_local_files: list[SystemFile] = []
+        joint_remote_files: list[SystemFile] = []
+        joint_unknown_local_ids: set[Optional[str]] = set()
+        joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
+        if progressive_mode and joint_reconciler is not None:
+            local_snapshot, local_authority, local_incomplete, local_completed = side_state("local", latest_local_scan)
+            remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state("remote", latest_remote_scan)
+            remote_snapshot, remote_authority, joint_remote_excluded_keys = _filter_progressive_remote_state(
+                remote_snapshot,
+                remote_authority,
+                self._get_exclude_patterns(controller),
+            )
+            enabled_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
+            if not enabled_pair_ids:
+                enabled_pair_ids = {None}
+            joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
+                local_snapshot, local_authority, local_incomplete,
+                local_completed,
+                remote_snapshot, remote_authority, remote_incomplete,
+                remote_completed,
+                enabled_pair_ids,
+                joint_remote_excluded_keys,
+            )
+
+        def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
+            """Return whether this side has a complete, authoritative view."""
+            if result is not None:
+                return bool(getattr(result, "is_scan_final", True)) \
+                    and not bool(getattr(result, "failed", False)) \
+                    and not bool(getattr(result, "unknown_path_pair_ids", set()))
+            if not progressive_mode:
+                return False
+            accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
+            if not isinstance(accumulator, _ProgressiveScanAccumulator):
+                return False
+            return not accumulator.incomplete_pairs() and bool(accumulator.completed_pairs())
+
+        remote_scan_final_relevant = scan_final_relevant("remote", latest_remote_scan)
+        local_scan_final_relevant = scan_final_relevant("local", latest_local_scan)
+        joint_reconciliation_final = remote_scan_final_relevant and local_scan_final_relevant \
+            and not joint_unknown_local_ids
 
         # Grab the Lftp status.
         lftp_statuses: Optional[list[LftpJobStatus]] = []
@@ -730,12 +1150,13 @@ class ModelUpdater(_ControllerCoreAccess):
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             remote_scan_failed = bool(getattr(latest_remote_scan, "failed", False))
-            remote_files = filter_excluded_files(
-                latest_remote_scan.files,
-                self._get_exclude_patterns(controller),
-            )
-            controller._Controller__last_remote_reconciliation_healthy = not remote_scan_failed
-            if not remote_scan_failed:
+            remote_files = joint_remote_files if progressive_mode else filter_excluded_files(
+                latest_remote_scan.files, self._get_exclude_patterns(controller))
+            remote_final = bool(getattr(latest_remote_scan, "is_scan_final", True)) and \
+                not bool(getattr(latest_remote_scan, "unknown_path_pair_ids", set()))
+            if remote_final and not progressive_mode:
+                controller._Controller__last_remote_reconciliation_healthy = not remote_scan_failed
+            if not remote_scan_failed and not progressive_mode:
                 model_builder.set_remote_files(remote_files)
             controller._Controller__record_breadcrumb(
                 stage="scan",
@@ -753,10 +1174,14 @@ class ModelUpdater(_ControllerCoreAccess):
             # last authoritative local snapshot and its history until a
             # healthy scan proves absence.
             local_scan_failed = bool(getattr(latest_local_scan, "failed", False))
-            controller._Controller__last_local_reconciliation_healthy = not local_scan_failed
+            local_final = bool(getattr(latest_local_scan, "is_scan_final", True)) and \
+                not bool(getattr(latest_local_scan, "unknown_path_pair_ids", set()))
+            if local_final and not progressive_mode:
+                controller._Controller__last_local_reconciliation_healthy = not local_scan_failed
             recovered_extracted_file_ids = []
-            if not local_scan_failed:
-                model_builder.set_local_files(latest_local_scan.files)
+            if not local_scan_failed and local_final:
+                if not progressive_mode:
+                    model_builder.set_local_files(latest_local_scan.files)
                 raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
                 if isinstance(raw_recovered_ids, (list, tuple, set)):
                     recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
@@ -779,13 +1204,32 @@ class ModelUpdater(_ControllerCoreAccess):
                 event_type="state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
             )
+            unknown_local_ids = joint_unknown_local_ids if progressive_mode else set(
+                getattr(latest_local_scan, "unknown_path_pair_ids", set())
+            )
+            if local_scan_failed and not unknown_local_ids:
+                unknown_local_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
+            setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
+            if callable(setter_unknown_local):
+                setter_unknown_local(unknown_local_ids)
+        if progressive_mode and joint_reconciler is not None:
+            model_builder.set_local_files(joint_local_files)
+            model_builder.set_remote_files(joint_remote_files)
+            setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
+            if callable(setter_unknown_local):
+                setter_unknown_local(joint_unknown_local_ids)
+            if joint_reconciliation_final:
+                controller._Controller__last_local_reconciliation_healthy = True
+                controller._Controller__last_remote_reconciliation_healthy = True
         healthy_local_ids: set[str | None] = set()
         healthy_remote_ids: set[str | None] = set()
-        if latest_local_scan is not None and not bool(getattr(latest_local_scan, "failed", False)):
+        if latest_local_scan is not None and not bool(getattr(latest_local_scan, "failed", False)) and \
+                bool(getattr(latest_local_scan, "is_scan_final", True)):
             raw_ids = getattr(latest_local_scan, "scanned_path_pair_ids", {None})
             if isinstance(raw_ids, set):
                 healthy_local_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
-        if latest_remote_scan is not None and not bool(getattr(latest_remote_scan, "failed", False)):
+        if latest_remote_scan is not None and not bool(getattr(latest_remote_scan, "failed", False)) and \
+                bool(getattr(latest_remote_scan, "is_scan_final", True)):
             raw_ids = getattr(latest_remote_scan, "scanned_path_pair_ids", {None})
             if isinstance(raw_ids, set):
                 healthy_remote_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
@@ -970,13 +1414,18 @@ class ModelUpdater(_ControllerCoreAccess):
 
         # Build the new model, if needed.
         auto_purge_candidate_ids: set[str] = set()
-        remote_reconciliation_established = (
-            latest_remote_scan is not None
-            and not bool(getattr(latest_remote_scan, "failed", False))
+        # Result-dependent remote lifecycle work must only run on a tick that
+        # actually delivered a remote result.  Accumulator state can remain
+        # final across no-event ticks, but there is no timestamp/files payload
+        # to prune or reconcile on those ticks.
+        remote_reconciliation_established = _remote_reconciliation_established(
+            latest_remote_scan,
+            remote_scan_final_relevant,
         )
         reconciliation_healthy = (
             controller._Controller__last_remote_reconciliation_healthy
             and controller._Controller__last_local_reconciliation_healthy
+            and (joint_reconciliation_final if progressive_mode else True)
         )
         if remote_reconciliation_established:
             remote_scan = latest_remote_scan
@@ -985,7 +1434,10 @@ class ModelUpdater(_ControllerCoreAccess):
             enabled_path_pair_ids = set(
                 getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
             )
-            scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
+            if bool(getattr(remote_scan, "is_progress", False)):
+                scanned_path_pair_ids = set(getattr(remote_scan, "completed_path_pair_ids", set()))
+            else:
+                scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
             remote_file_ids = {
                 ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None))
                 for file in remote_scan.files
@@ -1013,7 +1465,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         file_id for file_id in delete_items if isinstance(file_id, str)
                     )
             prune_lifecycles = getattr(controller, "_prune_download_start_lifecycles", None)
-            if callable(prune_lifecycles):
+            if reconciliation_healthy and callable(prune_lifecycles) and scanned_path_pair_ids:
                 prune_lifecycles(
                     remote_scan.timestamp,
                     scanned_path_pair_ids,
@@ -1379,7 +1831,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         and controller._Controller__should_auto_purge_local_file(new_file)
                     ):
                         current_auto_purge_candidate_ids.add(new_file.file_id)
-                if remote_reconciliation_established:
+                if remote_reconciliation_established and reconciliation_healthy:
                     auto_purge_candidate_ids.update(current_auto_purge_candidate_ids)
                 else:
                     controller._Controller__pending_auto_purge_file_ids.update(current_auto_purge_candidate_ids)
@@ -1415,6 +1867,14 @@ class ModelUpdater(_ControllerCoreAccess):
                     enabled_path_pair_ids = set(
                         getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
                     )
+                    if bool(getattr(latest_remote_scan, "is_progress", False)):
+                        enabled_path_pair_ids &= set(
+                            getattr(latest_remote_scan, "completed_path_pair_ids", set())
+                        )
+                    if bool(getattr(latest_local_scan, "is_progress", False)):
+                        enabled_path_pair_ids &= set(
+                            getattr(latest_local_scan, "completed_path_pair_ids", set())
+                        )
                     pending_ids = pending_completion_file_ids()
                     stale_move_failure_ids = {
                         file_id for file_id in persist.move_failure_counts
@@ -1520,7 +1980,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         controller._sync_final_move_succeeded_files_to_model()
 
-        if remote_reconciliation_established and controller._Controller__pending_auto_purge_file_ids:
+        if reconciliation_healthy and controller._Controller__pending_auto_purge_file_ids:
             pending_auto_purge_candidates: set[str] = set()
             for file_id in list(controller._Controller__pending_auto_purge_file_ids):
                 try:
@@ -1545,7 +2005,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__context.status.controller.latest_remote_scan_time = latest_remote_scan.timestamp
             controller._Controller__context.status.controller.latest_remote_scan_failed = remote_scan_failed
             controller._Controller__context.status.controller.latest_remote_scan_error = latest_remote_scan.error_message
-            if not remote_scan_failed and not controller._Controller__startup_recovery_done:
+            if remote_reconciliation_established and reconciliation_healthy \
+                    and not remote_scan_failed and not controller._Controller__startup_recovery_done:
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp

@@ -80,6 +80,7 @@ class ModelBuilder:
         self.__validation_statuses: dict[str, ValidateStatus] = {}
         self.__move_failed_files: set[str] = set()
         self.__final_move_succeeded_files: set[str] = set()
+        self.__unknown_local_path_pair_ids: set[Optional[str]] = set()
         self.__local_root_paths: dict[Optional[str], str] = {}
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
@@ -1231,6 +1232,13 @@ class ModelBuilder:
         if self.__downloaded_files != prev_downloaded_files:
             self.__cached_model = None
 
+    def set_unknown_local_path_pair_ids(self, path_pair_ids: Set[Optional[str]]) -> None:
+        """Keep persisted markers from becoming Deleted while local evidence is incomplete."""
+        normalized = set(path_pair_ids)
+        if normalized != self.__unknown_local_path_pair_ids:
+            self.__unknown_local_path_pair_ids = normalized
+            self.__cached_model = None
+
     def set_downloaded_timestamps(self, downloaded_timestamps: Dict[str, float]) -> None:
         previous = self.__downloaded_timestamps
         self.__downloaded_timestamps = dict(downloaded_timestamps)
@@ -2048,6 +2056,8 @@ class ModelBuilder:
     def __check_persist_authority(self, model_file: ModelFile, _incomplete_children: bool):
         # next we check persisted markers for previously downloaded files
         if self.__downloaded_files is None:
+            return
+        if model_file.path_pair_id in self.__unknown_local_path_pair_ids:
             return
         if model_file.state == ModelFile.State.DEFAULT and \
                 model_file.local_size is None and \

@@ -3,7 +3,7 @@
 import unittest
 import logging
 import sys
-from unittest.mock import patch, call, ANY
+from unittest.mock import patch, call, ANY, MagicMock
 import tempfile
 import os
 import json
@@ -24,6 +24,9 @@ class TestRemoteScanner(unittest.TestCase):
         self.addCleanup(ssh_patcher.stop)
         self.mock_ssh_cls = ssh_patcher.start()
         self.mock_ssh = self.mock_ssh_cls.return_value
+        # The production Sshcp exposes shell_stream, but keep legacy tests on
+        # the one-shot shell path unless they explicitly exercise streaming.
+        self.mock_ssh.shell_stream = None
         self.mock_ssh.detect_shell.return_value = "/bin/sh"
 
         logger = logging.getLogger()
@@ -243,6 +246,49 @@ class TestRemoteScanner(unittest.TestCase):
         self.mock_ssh.shell.assert_not_called()
         self.mock_ssh.copy.assert_not_called()
 
+    def test_raises_recoverable_error_when_first_run_shell_detection_is_transient(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/tmp/scanfs",
+        )
+        self.mock_ssh.detect_shell.side_effect = SshcpError("Connection refused by server")
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertTrue(scanner.export_recycled_state()[0])
+        self.mock_ssh.copy.assert_not_called()
+
+    def test_first_run_setup_retries_after_transient_shell_failure(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/tmp/scanfs",
+        )
+        self.mock_ssh.detect_shell.side_effect = [
+            SshcpError("Connection refused by server"),
+            "/bin/sh",
+        ]
+        self.mock_ssh.shell.side_effect = [b"", b"[]", b"[]"]
+
+        with self.assertRaises(ScannerError) as first_error:
+            scanner.scan()
+        self.assertTrue(first_error.exception.recoverable)
+
+        self.assertEqual([], scanner.scan())
+        self.assertFalse(scanner.export_recycled_state()[0])
+        self.mock_ssh.copy.assert_called_once()
+
     def test_skips_install_on_md5sum_match(self):
         scanner = RemoteScanner(
             remote_address="my remote address",
@@ -405,6 +451,363 @@ class TestRemoteScanner(unittest.TestCase):
         self.mock_ssh.shell.assert_called_with(
             self._scan_command("python3", "/remote/path/to/scan/script", "/remote/path/to/scan")
         )
+
+    def test_progressive_stream_decodes_manifest_and_batched_roots(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        stream = (
+            'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["a","b"]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"a","size":1,"is_dir":false}]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        ).encode()
+        self.mock_ssh.shell.side_effect = [b"", stream]
+        events = []
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+                                       events.append((files, roots, complete)))
+
+        files = scanner.scan()
+
+        self.assertEqual(["a"], [file.name for file in files])
+        self.assertEqual([({"a", "b"}, False), (None, False), (None, True)],
+                         [(roots, complete) for _, roots, complete in events])
+        self.assertIn("--stream", self.mock_ssh.shell.call_args.args[0])
+
+    def test_progressive_stream_publishes_before_remote_command_eof(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        events = []
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+                                       events.append((files, roots, complete)))
+        command_finished = [False]
+
+        def shell_stream(command, on_chunk):
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["a"]}\n')
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"a","size":1,"is_dir":false}]}\n')
+            self.assertFalse(command_finished[0])
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n')
+            command_finished[0] = True
+            return b""
+
+        self.mock_ssh.shell.side_effect = [b""]
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+
+        files = scanner.scan()
+
+        self.assertEqual(["a"], [file.name for file in files])
+        self.assertEqual([({"a"}, False), (None, False), (None, True)],
+                         [(roots, complete) for _, roots, complete in events])
+        self.mock_ssh.shell_stream.assert_called_once()
+        self.assertTrue(command_finished[0])
+        self.assertIn("--stream", self.mock_ssh.shell_stream.call_args.args[0])
+
+    def test_progressive_transport_accepts_chunked_legacy_json_with_empty_transport_return(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        root = {"name": "legacy.bin", "size": 7, "is_dir": False}
+        self.mock_ssh.shell.side_effect = [b""]
+        payload = b" \n" + json.dumps([root]).encode()
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(payload), 3):
+                on_chunk(payload[offset:offset + 3])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        events = []
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+                                       events.append((files, roots, complete)))
+
+        files = scanner.scan()
+
+        self.assertEqual(["legacy.bin"], [file.name for file in files])
+        self.assertEqual([({"legacy.bin"}, False), (None, False), (None, True)],
+                         [(roots, complete) for _, roots, complete in events])
+        self.mock_ssh.shell_stream.assert_called_once()
+        self.assertFalse(self.mock_ssh.shell_stream.call_args.kwargs["retain_output"])
+
+    def test_progressive_stream_does_not_retain_raw_v2_output(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        stream = (
+            'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["v2.bin"]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"v2.bin","size":1,"is_dir":false}]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        ).encode()
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(stream), 5):
+                on_chunk(stream[offset:offset + 5])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["v2.bin"], [file.name for file in files])
+        self.mock_ssh.shell_stream.assert_called_once()
+        self.assertFalse(self.mock_ssh.shell_stream.call_args.kwargs["retain_output"])
+
+    def test_progressive_stream_ignores_warning_before_split_v2_prefix(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        stream = (
+            b"[scanfs warning] legacy mode disabled\n"
+            b'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["warned.bin"]}\n'
+            b'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"warned.bin","size":1,"is_dir":false}]}\n'
+            b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        )
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(stream), 7):
+                on_chunk(stream[offset:offset + 7])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["warned.bin"], [file.name for file in files])
+        self.assertFalse(self.mock_ssh.shell_stream.call_args.kwargs["retain_output"])
+
+    def test_progressive_transport_ignores_warning_before_legacy_json(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        payload = (
+            b"[scanfs warning] stream disabled\n"
+            b"  [{\"name\":\"warned-legacy.bin\",\"size\":2,\"is_dir\":false}]\n"
+        )
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(payload), 4):
+                on_chunk(payload[offset:offset + 4])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["warned-legacy.bin"], [file.name for file in files])
+
+    def test_progressive_transport_bounds_long_nonprotocol_probe(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        payload = b"warning without a newline " + b"x" * (128 * 1024)
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(payload), 4096):
+                on_chunk(payload[offset:offset + 4096])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertIn("Invalid scan data", str(context.exception))
+
+    def test_progressive_transport_rejects_malformed_legacy_json_from_empty_return(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            on_chunk(b" \nnot-json")
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertIn("Invalid scan data", str(context.exception))
+
+    def test_progressive_transport_accepts_oversize_legacy_json_from_empty_return(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        roots = [
+            {"name": "legacy-{}.bin".format(index), "size": index, "is_dir": False}
+            for index in range(4096)
+        ]
+        payload = json.dumps(roots).encode()
+        self.assertGreater(len(payload), 64 * 1024)
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk, *, retain_output=True):
+            self.assertFalse(retain_output)
+            for offset in range(0, len(payload), 4096):
+                on_chunk(payload[offset:offset + 4096])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(len(roots), len(files))
+        self.assertEqual("legacy-4095.bin", files[-1].name)
+
+    def test_unsupported_stream_option_retries_once_with_legacy_command(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        self.mock_ssh.shell.side_effect = [b""]
+        self.mock_ssh.shell_stream = MagicMock(side_effect=[
+            SshcpError("usage: scanfs: unknown option --stream"),
+            json.dumps([{"name": "legacy.bin", "size": 1, "is_dir": False}]).encode(),
+        ])
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["legacy.bin"], [file.name for file in files])
+        self.assertEqual(2, self.mock_ssh.shell_stream.call_count)
+        first_command = self.mock_ssh.shell_stream.call_args_list[0].args[0]
+        second_command = self.mock_ssh.shell_stream.call_args_list[1].args[0]
+        self.assertIn("--stream", first_command)
+        self.assertNotIn("--stream", second_command)
+
+    def test_progressive_stream_decodes_utf8_codepoint_split_across_chunks(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        stream = (
+            'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["caf\u00e9.bin"]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"caf\u00e9.bin","size":1,"is_dir":false}]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        ).encode("utf-8")
+        split_at = stream.index(b"\xc3\xa9") + 1
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk):
+            on_chunk(stream[:split_at])
+            on_chunk(stream[split_at:])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["caf\u00e9.bin"], [file.name for file in files])
+
+    def test_stream_complete_is_provisional_until_successful_transport_exit(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
+                                       events.append((files, roots, complete)))
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["late.bin"]}\n'),
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"late.bin","size":1,"is_dir":false}]}\n'),
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'),
+            (_ for _ in ()).throw(SshcpError("remote exit status 1")),
+        )[-1])
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertEqual([False, False], [complete for _, _, complete in events])
 
     def test_uses_direct_scan_command_for_packaged_scanfs_helpers(self):
         packaged_scanfs_path = os.path.join(TestRemoteScanner.temp_dir, "scanfs")

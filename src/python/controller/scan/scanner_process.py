@@ -5,8 +5,9 @@ from abc import ABC, abstractmethod
 import multiprocessing
 import threading
 from datetime import datetime
-from typing import List, Optional, Protocol
+from typing import Callable, List, Optional, Protocol
 import queue
+import uuid
 from multiprocessing.queues import Queue as MPQueue
 from multiprocessing.synchronize import Event as EventType
 
@@ -59,6 +60,21 @@ class IScanner(ABC):
         """Roots covered by a successful scan; empty roots still count."""
         return {None}
 
+    def failed_path_pair_ids(self) -> set[str | None]:
+        """Path pairs whose current generation ended in a recoverable error."""
+        return set()
+
+    def set_progress_callback(self, callback: Optional["ScanProgressCallback"]) -> None:
+        """Receive bounded manifest/root/completion events during a scan."""
+        # Optional for legacy scanners.  Concrete scanners override this hook.
+        return None
+
+
+ScanProgressCallback = Callable[
+    [List[SystemFile], Optional[str], Optional[str], Optional[set[str]], bool],
+    None,
+]
+
 
 class ScannerResult:
     """
@@ -71,7 +87,17 @@ class ScannerResult:
                  managed_extract_file_ids: Optional[List[str]] = None,
                  scanned_path_pair_ids: Optional[set[str | None]] = None,
                  failed: bool = False,
-                 error_message: str | None = None):
+                 error_message: str | None = None,
+                 generation: int = 0,
+                 is_progress: bool = False,
+                 root_names: Optional[set[str]] = None,
+                 completed_path_pair_ids: Optional[set[str | None]] = None,
+                 is_scan_final: bool = True,
+                 unknown_path_pair_ids: Optional[set[str | None]] = None,
+                 session_token: Optional[str] = None,
+                 is_full_snapshot: bool = False,
+                 full_snapshot_path_pair_ids: Optional[set[str | None]] = None,
+                 is_targeted_scan: bool = False):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -79,11 +105,74 @@ class ScannerResult:
         self.scanned_path_pair_ids = {None} if scanned_path_pair_ids is None else scanned_path_pair_ids
         self.failed = failed
         self.error_message = error_message
+        self.generation = generation
+        self.is_progress = is_progress
+        self.root_names = root_names
+        self.completed_path_pair_ids = set() if completed_path_pair_ids is None else completed_path_pair_ids
+        self.is_scan_final = is_scan_final
+        self.unknown_path_pair_ids = set() if unknown_path_pair_ids is None else unknown_path_pair_ids
+        self.session_token = session_token
+        self.is_full_snapshot = is_full_snapshot
+        self.full_snapshot_path_pair_ids = set() if full_snapshot_path_pair_ids is None else full_snapshot_path_pair_ids
+        self.is_targeted_scan = is_targeted_scan
 
 
 class _ScannerQueueReleaseMarker:
     """Tiny queue item that lets the feeder release its prior large payload."""
     pass
+
+
+_PUBLISH_LOCK = threading.Lock()
+
+
+def _publish_bounded_result(output_queue: object,
+                            result: ScannerResult) -> None:
+    """Publish without blocking forever when a scan outruns its consumer.
+
+    Progress is deliberately lossy at the queue boundary: the reconciler keeps
+    committed state and rejects stale generations, so dropping the oldest
+    intermediate batch is safe and avoids startup/termination deadlocks.
+    """
+    with _PUBLISH_LOCK:
+        while True:
+            try:
+                put_nowait = getattr(output_queue, "put_nowait")
+                put_nowait(result)
+                return
+            except queue.Full:
+                retained = []
+                dropped = False
+                try:
+                    while True:
+                        item = output_queue.get_nowait()
+                        is_final = isinstance(item, ScannerResult) and (
+                            item.is_scan_final or item.is_full_snapshot
+                        )
+                        if not dropped and not is_final:
+                            dropped = True
+                            continue
+                        retained.append(item)
+                except queue.Empty:
+                    pass
+                except (OSError, EOFError, ValueError):
+                    return
+                for item in retained:
+                    try:
+                        output_queue.put_nowait(item)
+                    except (queue.Full, OSError, EOFError, ValueError):
+                        return
+                if not dropped:
+                    # Keep the bounded queue live when it contains only final
+                    # snapshots; a new progress event is safely discardable.
+                    if not (result.is_scan_final or result.is_full_snapshot):
+                        return
+                    try:
+                        output_queue.get_nowait()
+                    except (queue.Empty, OSError, EOFError, ValueError):
+                        continue
+
+            except (OSError, EOFError, ValueError):
+                return
 
 
 def _record_scan_breadcrumb(scanner: IScanner, breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
@@ -98,10 +187,12 @@ def _record_scan_breadcrumb(scanner: IScanner, breadcrumb_trace: Optional[_Bread
                             path_pair_name=path_pair_name if isinstance(path_pair_name, str) else None)
 
 
-def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _ScannerQueueReleaseMarker],
+def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                       scan_target_path_pair_ids: Optional[set[str]], control_connection: object,
                       breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
-                      mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int]) -> None:
+                      mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int],
+                      generation: int = 0, session_token: str = "",
+                      result_via_control: bool = False) -> None:
     """Run one scan in a spawn-context process, without a nested forkserver."""
     logger = logging.getLogger("{}ScanRun".format(scanner.__class__.__name__))
     if mp_log_queue is not None:
@@ -117,9 +208,44 @@ def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _
         logger = root_logger.getChild("{}ScanRun".format(scanner.__class__.__name__))
 
     setter = getattr(scanner, "set_scan_target_path_pair_ids", None)
+    progress_emitted = False
+    control_send_lock = threading.Lock()
+
+    def send_control_message(message: object) -> None:
+        # MultiPathRemoteScanner invokes progress callbacks from worker
+        # threads.  multiprocessing.Connection does not guarantee framing
+        # when concurrent writers share one endpoint, so serialize every
+        # progress/final/status send in the child.
+        with control_send_lock:
+            control_connection.send(message)
+
+    def publish_progress(files: List[SystemFile], path_pair_id: Optional[str], path_pair_name: Optional[str],
+                         root_names: Optional[set[str]], complete: bool) -> None:
+        nonlocal progress_emitted
+        progress_emitted = True
+        for system_file in files:
+            system_file.path_pair_id = path_pair_id
+            system_file.path_pair_name = path_pair_name
+        progress_result = ScannerResult(
+            datetime.now(),
+            files,
+            scanned_path_pair_ids={path_pair_id},
+            generation=generation,
+            is_progress=True,
+            root_names=None if root_names is None else set(root_names),
+            completed_path_pair_ids={path_pair_id} if complete else set(),
+            is_scan_final=False,
+            session_token=session_token,
+        )
+        if result_via_control:
+            send_control_message(("result", progress_result))
+        elif output_queue is not None:
+            _publish_bounded_result(output_queue, progress_result)
+
     outcome: tuple[str, object | None] = ("success", None)
     try:
         scanner.set_base_logger(logger)
+        scanner.set_progress_callback(publish_progress)
         if callable(setter):
             setter(scan_target_path_pair_ids)
         timestamp = datetime.now()
@@ -127,7 +253,21 @@ def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _
             files = scanner.scan()
             malformed = scanner.pop_malformed_status_only_file_ids()
             managed = scanner.pop_managed_extract_file_ids()
-            result = ScannerResult(timestamp, files, malformed, managed, scanner.scanned_path_pair_ids())
+            scanned_ids = scanner.scanned_path_pair_ids()
+            result = ScannerResult(
+                timestamp,
+                files,
+                malformed,
+                managed,
+                scanned_ids,
+                generation=generation,
+                is_progress=progress_emitted,
+                completed_path_pair_ids=scanned_ids if progress_emitted else set(),
+                is_full_snapshot=progress_emitted,
+                full_snapshot_path_pair_ids=scanned_ids if progress_emitted else set(),
+                is_targeted_scan=scan_target_path_pair_ids is not None,
+                session_token=session_token,
+            )
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_completed",
                                     {"scanner": scanner.__class__.__name__, "file_count": len(files),
                                      "malformed_status_only_file_count": len(malformed),
@@ -141,16 +281,39 @@ def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _
             files = error.files if error.files is not None else []
             malformed = scanner.pop_malformed_status_only_file_ids()
             managed = scanner.pop_managed_extract_file_ids()
-            result = ScannerResult(timestamp, files, malformed, managed, failed=True, error_message=str(error))
+            failed_ids = getattr(scanner, "failed_path_pair_ids", scanner.scanned_path_pair_ids)()
+            result = ScannerResult(
+                timestamp,
+                [] if progress_emitted else files,
+                malformed,
+                managed,
+                failed_ids,
+                failed=True,
+                error_message=str(error),
+                generation=generation,
+                # A setup failure can happen before the first stream batch.
+                # Treat its affected IDs as a progressive event so the
+                # reconciler marks them unknown and preserves last-good data.
+                is_progress=progress_emitted or bool(failed_ids),
+                unknown_path_pair_ids=failed_ids,
+                is_targeted_scan=scan_target_path_pair_ids is not None,
+                session_token=session_token,
+            )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
                                     {"scanner": scanner.__class__.__name__, "recoverable": True,
                                      "file_count": len(files), "malformed_status_only_file_count": len(malformed),
                                      "managed_extract_file_count": len(managed), "error_message": str(error)}, "failure")
-        output_queue.put(result)
-        output_queue.put(_ScannerQueueReleaseMarker())
-        # The parent-facing queue now owns the result; keep no completed scan
-        # graph in the coordinator or in this child while it exits.
+        if result_via_control:
+            # A spawn child must not leave a multiprocessing.Queue feeder
+            # thread behind.  Send the authoritative aggregate over the
+            # control pipe; the coordinator drains it while the worker is
+            # still alive and publishes it to its bounded local queue.
+            send_control_message(("result", result))
+        elif output_queue is not None:
+            _publish_bounded_result(output_queue, result)
+        # The parent-facing queue/pipe now owns the result; keep no completed
+        # scan graph in the coordinator or in this child while it exits.
         del result
         del files
         del malformed
@@ -159,6 +322,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _
         logger.debug("Process caught an exception")
         outcome = ("fatal", ExceptionWrapper(error))
     finally:
+        scanner.set_progress_callback(None)
         if callable(setter):
             setter(None)
         recycled_state: object | None = None
@@ -170,21 +334,22 @@ def _run_scanner_once(scanner: IScanner, output_queue: MPQueue[ScannerResult | _
             if outcome[0] != "fatal":
                 outcome = ("fatal", ExceptionWrapper(error))
         try:
-            control_connection.send((outcome[0], outcome[1], recycled_state))
+            send_control_message((outcome[0], outcome[1], recycled_state))
         finally:
             control_connection.close()
 
 
-def _create_scanner_worker(scanner: IScanner, output_queue: MPQueue[ScannerResult | _ScannerQueueReleaseMarker],
+def _create_scanner_worker(scanner: IScanner, output_queue: Optional[object],
                            scan_target_path_pair_ids: Optional[set[str]], control_connection: object,
                            breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
-                           mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int]) -> multiprocessing.Process:
+                           mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int],
+                           generation: int = 0, session_token: str = "") -> multiprocessing.Process:
     """Use spawn explicitly: coordinators can be forkserver children and threaded."""
     return multiprocessing.get_context("spawn").Process(
         name="{}ScanRun".format(scanner.__class__.__name__),
         target=_run_scanner_once,
         args=(scanner, output_queue, scan_target_path_pair_ids, control_connection, breadcrumb_trace, flow_id,
-              mp_log_queue, mp_log_level),
+              mp_log_queue, mp_log_level, generation, session_token, True),
     )
 
 
@@ -204,11 +369,12 @@ class ScannerProcess:
         """
         self.name = scanner.__class__.__name__
         self.logger = logging.getLogger(self.name)
-        # A recycled child crosses from a forkserver coordinator into an
-        # explicit spawn child; the ordinary inline path keeps its old queue.
-        self.__queue: Optional[MPQueue[ScannerResult | _ScannerQueueReleaseMarker]] = \
-            multiprocessing.get_context("spawn").Queue() if recycle_scan_worker else queue.Queue()
-        self.__queue_is_multiprocessing = recycle_scan_worker
+        # Spawned workers publish over their control pipe.  Keeping the
+        # coordinator-facing queue local avoids a second multiprocessing
+        # feeder thread and gives the same bounded/drop-oldest semantics to
+        # both inline and recycled scans.
+        self.__queue: Optional[queue.Queue[ScannerResult | _ScannerQueueReleaseMarker]] = queue.Queue(maxsize=128)
+        self.__queue_is_multiprocessing = False
         self.__scan_target_queue: Optional[queue.Queue[Optional[str]]] = queue.Queue()
         self.__wake_event: Optional[threading.Event] = threading.Event()
         self.__scanner = scanner
@@ -220,7 +386,10 @@ class ScannerProcess:
         self.__scan_worker: Optional[multiprocessing.Process] = None
         self.__scan_worker_started_at: Optional[datetime] = None
         self.__scan_worker_control_connection: object | None = None
+        self.__scan_worker_pending_status: object | None = None
         self.__scan_worker_force_pending = False
+        self.__scan_generation = 0
+        self.__session_token = uuid.uuid4().hex
         self.__thread: Optional[threading.Thread] = None
         self.__terminate_event = threading.Event()
         self.__exception: Optional[BaseException] = None
@@ -245,6 +414,10 @@ class ScannerProcess:
     def pid(self) -> Optional[int]:
         thread = self.__thread
         return thread.ident if thread is not None else None
+
+    @property
+    def session_token(self) -> str:
+        return self.__session_token
 
     def set_mp_log_queue(self, log_queue: MPQueue[logging.LogRecord], log_level: int) -> None:
         self._mp_log_queue = log_queue
@@ -310,8 +483,10 @@ class ScannerProcess:
         assert self.__queue is not None
         spawn_context = multiprocessing.get_context("spawn")
         receive_connection, send_connection = spawn_context.Pipe(duplex=False)
-        worker = _create_scanner_worker(self.__scanner, self.__queue, scan_target_path_pair_ids, send_connection,
-                                        self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level)
+        self.__scan_generation += 1
+        worker = _create_scanner_worker(self.__scanner, None, scan_target_path_pair_ids, send_connection,
+                                        self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
+                                        self.__scan_generation, self.__session_token)
         worker.daemon = True
         worker.start()
         send_connection.close()
@@ -334,12 +509,43 @@ class ScannerProcess:
         setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
         if callable(setter):
             setter(scan_target_path_pair_ids)
+        self.__scan_generation += 1
+        progress_emitted = False
+
+        def publish_progress(files: List[SystemFile], path_pair_id: Optional[str], path_pair_name: Optional[str],
+                             root_names: Optional[set[str]], complete: bool) -> None:
+            nonlocal progress_emitted
+            progress_emitted = True
+            for system_file in files:
+                system_file.path_pair_id = path_pair_id
+                system_file.path_pair_name = path_pair_name
+            assert self.__queue is not None
+            _publish_bounded_result(self.__queue, ScannerResult(
+                datetime.now(), files,
+                scanned_path_pair_ids={path_pair_id},
+                generation=self.__scan_generation,
+                is_progress=True,
+                root_names=None if root_names is None else set(root_names),
+                completed_path_pair_ids={path_pair_id} if complete else set(),
+                is_scan_final=False,
+                session_token=self.__session_token,
+            ))
+        self.__scanner.set_progress_callback(publish_progress)
         try:
             files = self.__scanner.scan()
             malformed = self.__scanner.pop_malformed_status_only_file_ids()
             managed = self.__scanner.pop_managed_extract_file_ids()
             self.__last_recoverable_error_message = None
-            result = ScannerResult(timestamp_start, files, malformed, managed, self.__scanner.scanned_path_pair_ids())
+            result = ScannerResult(timestamp_start, files, malformed, managed,
+                                    self.__scanner.scanned_path_pair_ids(), generation=self.__scan_generation,
+                                    is_progress=progress_emitted,
+                completed_path_pair_ids=self.__scanner.scanned_path_pair_ids()
+                                    if progress_emitted else set(),
+                                    is_full_snapshot=progress_emitted,
+                                    full_snapshot_path_pair_ids=self.__scanner.scanned_path_pair_ids()
+                                    if progress_emitted else set(),
+                                    is_targeted_scan=scan_target_path_pair_ids is not None,
+                                    session_token=self.__session_token)
             self.__record_breadcrumb("scan_completed", {"scanner": self.__scanner.__class__.__name__,
                                                           "file_count": len(files),
                                                           "malformed_status_only_file_count": len(malformed),
@@ -357,18 +563,26 @@ class ScannerProcess:
             if error_message != self.__last_recoverable_error_message:
                 self.logger.warning("Recoverable scanner error; returning failed result: {}".format(error_message))
                 self.__last_recoverable_error_message = error_message
-            result = ScannerResult(timestamp_start, files, malformed, managed, failed=True, error_message=error_message)
+            failed_ids = getattr(self.__scanner, "failed_path_pair_ids", self.__scanner.scanned_path_pair_ids)()
+            result = ScannerResult(timestamp_start, [] if progress_emitted else files, malformed, managed,
+                                   failed_ids,
+                                   failed=True, error_message=error_message, generation=self.__scan_generation,
+                                   is_progress=progress_emitted or bool(failed_ids),
+                                   unknown_path_pair_ids=failed_ids,
+                                   is_targeted_scan=scan_target_path_pair_ids is not None,
+                                   session_token=self.__session_token)
             self.__record_breadcrumb("scan_failed", {"scanner": self.__scanner.__class__.__name__,
                                                        "recoverable": True, "file_count": len(files),
                                                        "malformed_status_only_file_count": len(malformed),
                                                        "managed_extract_file_count": len(managed),
                                                        "error_message": error_message}, event_type="failure", flow_id=flow_id)
         finally:
+            self.__scanner.set_progress_callback(None)
             if callable(setter):
                 setter(None)
         assert self.__queue is not None
-        self.__queue.put(result)
-        self.__queue.put(_ScannerQueueReleaseMarker())
+        assert self.__queue is not None
+        _publish_bounded_result(self.__queue, result)
         # Do not retain the completed graph in this long-lived coordinator.
         del result
         del files
@@ -388,6 +602,12 @@ class ScannerProcess:
         started_at = self.__scan_worker_started_at
         worker.join(timeout=0.05)
         if worker.is_alive():
+            status = self.__drain_scan_worker_messages()
+            if status is not None:
+                # A child can finish its control-pipe sends just before its
+                # process object reports dead.  Retain the terminal status
+                # until the normal teardown path applies it exactly once.
+                self.__scan_worker_pending_status = status
             assert self.__wake_event is not None
             if self.__wake_event.wait(timeout=0.05):
                 self.__wake_event.clear()
@@ -395,11 +615,13 @@ class ScannerProcess:
             return
 
         try:
-            connection = self.__scan_worker_control_connection
-            try:
-                status = connection.recv() if connection is not None and connection.poll() else None
-            except (OSError, EOFError):
-                status = None
+            # The child has exited, so its terminal status must be retained;
+            # allow a short pipe-delivery window before tearing the endpoint
+            # down (especially important on Windows spawn).
+            status = self.__drain_scan_worker_messages(wait_timeout=1.0)
+            if status is None:
+                status = self.__scan_worker_pending_status
+            self.__scan_worker_pending_status = None
             if isinstance(status, tuple) and len(status) >= 3:
                 applier = getattr(self.__scanner, "apply_recycled_state", None)
                 if callable(applier):
@@ -424,11 +646,44 @@ class ScannerProcess:
             self.__wake_event.clear()
         self.__scan_worker_force_pending = False
 
+    def __drain_scan_worker_messages(self, wait_timeout: float = 0.0) -> object | None:
+        """Forward bounded progress and the final aggregate from a child.
+
+        The child sends result envelopes synchronously over the control pipe,
+        so it cannot strand a multiprocessing.Queue feeder at interpreter
+        shutdown.  The coordinator owns the local bounded queue and may drop
+        intermediate progress when the model updater is busy; the final
+        aggregate is marked as full/authoritative and replaces stale entries.
+        """
+        connection = self.__scan_worker_control_connection
+        if connection is None:
+            return None
+        status = None
+        first = True
+        while True:
+            try:
+                ready = connection.poll(wait_timeout if first else 0.0)
+                first = False
+                if not ready:
+                    break
+                message = connection.recv()
+            except (OSError, EOFError):
+                break
+            if isinstance(message, tuple) and len(message) == 2 and message[0] == "result":
+                result = message[1]
+                if isinstance(result, ScannerResult):
+                    assert self.__queue is not None
+                    _publish_bounded_result(self.__queue, result)
+            else:
+                status = message
+        return status
+
     def __teardown_scan_worker(self, terminate: bool = True) -> None:
         worker = self.__scan_worker
         connection = self.__scan_worker_control_connection
         self.__scan_worker = None
         self.__scan_worker_control_connection = None
+        self.__scan_worker_pending_status = None
         self.__scan_worker_started_at = None
         if connection is not None:
             connection.close()
@@ -504,6 +759,29 @@ class ScannerProcess:
                 self.logger.warning("Scanner queue read failed: {}".format(exc))
                 return latest_scan
         return latest_scan
+
+    def pop_results(self) -> List[ScannerResult]:
+        """Drain queued scan events in publication order.
+
+        ``pop_latest_result`` remains for legacy callers that intentionally
+        coalesce snapshots.  Progressive reconciliation uses this bounded
+        drain so a manifest and root batches cannot be dropped between ticks.
+        """
+        results: List[ScannerResult] = []
+        while True:
+            try:
+                assert self.__queue is not None
+                item = self.__queue.get(block=False)
+                if isinstance(item, _ScannerQueueReleaseMarker):
+                    continue
+                if isinstance(item, ScannerResult):
+                    results.append(item)
+            except queue.Empty:
+                break
+            except (OSError, EOFError) as exc:
+                self.logger.warning("Scanner queue read failed: {}".format(exc))
+                break
+        return results
 
     def force_scan(self, path_pair_id: Optional[str] = None) -> None:
         """Force process to wake and do an immediate scan"""

@@ -5,6 +5,7 @@ import inspect
 import multiprocessing
 import logging
 import queue
+from collections import deque
 from datetime import datetime
 import sys
 import time
@@ -15,6 +16,7 @@ import pytest
 from common import MultiprocessingLogger
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller import IScanner, ScannerProcess, ScannerError
+from controller.scan import MultiPathRemoteScanner
 from controller.scan.scanner_process import (
     ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _run_scanner_once,
 )
@@ -32,9 +34,111 @@ class DummyScanner(IScanner):
         pass
 
 
+class ProgressiveScanner(DummyScanner):
+    path_pair_id = "pair"
+    path_pair_name = "Pair"
+
+    def __init__(self):
+        self.callback = None
+
+    def set_progress_callback(self, callback):
+        self.callback = callback
+
+    def scanned_path_pair_ids(self):
+        return {self.path_pair_id}
+
+    def scan(self):
+        assert self.callback is not None
+        self.callback([], self.path_pair_id, self.path_pair_name, {"a", "b"}, False)
+        self.callback([SystemFile("a", 1)], self.path_pair_id, self.path_pair_name, None, False)
+        self.callback([], self.path_pair_id, self.path_pair_name, None, True)
+        return [SystemFile("a", 1), SystemFile("b", 2)]
+
+
+class BurstProgressiveScanner(ProgressiveScanner):
+    def scan(self):
+        assert self.callback is not None
+        aggregate = []
+        for index in range(512):
+            root = SystemFile("root-{}".format(index), index)
+            aggregate.append(root)
+            self.callback(
+                [root],
+                self.path_pair_id,
+                self.path_pair_name,
+                None,
+                False,
+            )
+        self.callback([], self.path_pair_id, self.path_pair_name, None, True)
+        return aggregate
+
+
+class LargeBurstProgressiveScanner(BurstProgressiveScanner):
+    def scan(self):
+        assert self.callback is not None
+        aggregate = []
+        for index in range(2048):
+            root = SystemFile("large-root-{}".format(index), index)
+            aggregate.append(root)
+            self.callback([root], self.path_pair_id, self.path_pair_name, None, False)
+        self.callback([], self.path_pair_id, self.path_pair_name, None, True)
+        return aggregate
+
+
+class PairBurstScanner(DummyScanner):
+    def __init__(self, pair_id: str):
+        self.path_pair_id = pair_id
+        self.path_pair_name = pair_id
+        self.callback = None
+
+    def set_progress_callback(self, callback):
+        self.callback = callback
+
+    def scanned_path_pair_ids(self):
+        return {self.path_pair_id}
+
+    def scan(self):
+        assert self.callback is not None
+        aggregate = []
+        for index in range(256):
+            root = SystemFile("{}-root-{}".format(self.path_pair_id, index), index)
+            root.path_pair_id = self.path_pair_id
+            root.path_pair_name = self.path_pair_name
+            aggregate.append(root)
+            self.callback([root], self.path_pair_id, self.path_pair_name, None, False)
+        self.callback([], self.path_pair_id, self.path_pair_name, set(), True)
+        return aggregate
+
+    def set_base_logger(self, base_logger: logging.Logger):
+        pass
+
+    def export_recycled_state(self):
+        return None
+
+    def apply_recycled_state(self, state):
+        if state is not None:
+            raise TypeError("unexpected burst scanner state")
+
+
+class SixPairBurstScanner(MultiPathRemoteScanner):
+    def __init__(self):
+        super().__init__([PairBurstScanner("pair-{}".format(index)) for index in range(1, 7)])
+
+
 class RecoverablePartialScanner(DummyScanner):
     def scan(self):
         raise ScannerError("recoverable child error", recoverable=True, files=[SystemFile("partial", 1)])
+
+
+class RecoverableSelectedPairScanner(DummyScanner):
+    def scanned_path_pair_ids(self):
+        return {"pair-a", "pair-b"}
+
+    def failed_path_pair_ids(self):
+        return {"pair-b"}
+
+    def scan(self):
+        raise ScannerError("one pair failed", recoverable=True)
 
 
 class FatalScanner(DummyScanner):
@@ -81,6 +185,35 @@ class _InspectingWakeEvent:
         self.run_loop_locals = set(caller.f_locals)
 
     def clear(self) -> None:
+        pass
+
+
+class _DelayedExitWorker:
+    def __init__(self):
+        self.pid = 1
+        self.alive = True
+
+    def join(self, timeout=None) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def close(self) -> None:
+        pass
+
+
+class _MessageConnection:
+    def __init__(self, messages):
+        self.messages = deque(messages)
+
+    def poll(self, timeout=0.0) -> bool:
+        return bool(self.messages)
+
+    def recv(self):
+        return self.messages.popleft()
+
+    def close(self) -> None:
         pass
 
 
@@ -165,6 +298,18 @@ class TestScannerProcess(unittest.TestCase):
             self.process = None
             mp_logger.stop()
 
+    def test_bounded_progress_queue_does_not_deadlock_on_burst_termination(self):
+        self.process = ScannerProcess(
+            scanner=BurstProgressiveScanner(),
+            interval_in_ms=0,
+            verbose=False,
+        )
+        self.process.start()
+        time.sleep(0.05)
+        self.process.terminate()
+        self.process.join(timeout=3)
+        self.assertFalse(self.process.is_alive())
+
     def test_one_shot_scan_worker_is_gone_after_direct_result_delivery(self):
         self._scan_run_patcher.stop()
         process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=0, verbose=False, recycle_scan_worker=True)
@@ -182,6 +327,111 @@ class TestScannerProcess(unittest.TestCase):
             process.run_loop()
         self.assertIsNone(process._ScannerProcess__scan_worker)
         self.assertFalse(any(child.name.endswith("ScanRun") for child in multiprocessing.active_children()))
+
+    def test_spawned_worker_finishes_after_large_progressive_full_snapshot(self):
+        self._scan_run_patcher.stop()
+        process = ScannerProcess(scanner=LargeBurstProgressiveScanner(), interval_in_ms=0, verbose=False,
+                                 recycle_scan_worker=True)
+        self.addCleanup(process.close_queues)
+
+        process.run_loop()
+        deadline = time.monotonic() + 8
+        while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            process.run_loop()
+            time.sleep(0.01)
+
+        self.assertIsNone(process._ScannerProcess__scan_worker)
+        result = process.pop_latest_result()
+        self.assertIsNotNone(result)
+        self.assertTrue(result.is_full_snapshot)
+
+    def test_spawned_six_pair_progress_survives_slow_parent_drain(self):
+        self._scan_run_patcher.stop()
+        process = ScannerProcess(scanner=SixPairBurstScanner(), interval_in_ms=0, verbose=False,
+                                 recycle_scan_worker=True)
+        self.addCleanup(process.close_queues)
+
+        process.run_loop()
+        # Let the child publish while the model-facing consumer is paused.
+        # The coordinator still drains the control pipe into its bounded
+        # local queue, dropping only intermediate progress under pressure.
+        pause_deadline = time.monotonic() + 0.5
+        while time.monotonic() < pause_deadline:
+            process.run_loop()
+            time.sleep(0.01)
+
+        deadline = time.monotonic() + 8
+        while process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            process.run_loop()
+            time.sleep(0.01)
+        self.assertIsNone(process._ScannerProcess__scan_worker)
+
+        results = process.pop_results()
+        final = [result for result in results if result.is_full_snapshot]
+        self.assertTrue(final)
+        self.assertEqual(6 * 256, len(final[-1].files))
+        self.assertEqual({"pair-{}".format(index) for index in range(1, 7)},
+                         {file.path_pair_id for file in final[-1].files})
+        progress_completed = set().union(*(
+            result.completed_path_pair_ids for result in results if not result.is_full_snapshot
+        ))
+        self.assertTrue({"pair-5", "pair-6"}.issubset(progress_completed))
+        self.assertLessEqual(len(results), 128)
+
+    def test_terminal_status_received_while_worker_alive_is_applied_after_final(self):
+        scanner = StatefulRecycledScanner()
+        process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False, recycle_scan_worker=True)
+        self.addCleanup(process.close_queues)
+        worker = _DelayedExitWorker()
+        final = ScannerResult(
+            datetime.now(),
+            [SystemFile("authoritative", 7)],
+            scanned_path_pair_ids={"pair"},
+            is_progress=True,
+            is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"pair"},
+            completed_path_pair_ids={"pair"},
+        )
+        connection = _MessageConnection([
+            ("result", final),
+            ("success", None, False),
+        ])
+        process._ScannerProcess__scan_worker = worker
+        process._ScannerProcess__scan_worker_started_at = datetime.now()
+        process._ScannerProcess__scan_worker_control_connection = connection
+        process._ScannerProcess__wake_event = _InspectingWakeEvent()
+
+        process._ScannerProcess__poll_scan_worker()
+        self.assertTrue(worker.alive)
+        self.assertIsNotNone(process._ScannerProcess__scan_worker_pending_status)
+
+        worker.alive = False
+        process._ScannerProcess__poll_scan_worker()
+
+        self.assertIsNone(process._ScannerProcess__scan_worker)
+        self.assertFalse(scanner.first_run)
+        results = process.pop_results()
+        self.assertEqual(["authoritative"], [file.name for file in results[-1].files])
+
+    def test_terminal_fatal_status_received_while_worker_alive_is_reraised(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=0, verbose=False, recycle_scan_worker=True)
+        self.addCleanup(process.close_queues)
+        worker = _DelayedExitWorker()
+
+        class RaisingWrapper:
+            def re_raise(self):
+                raise ScannerError("delayed fatal")
+
+        connection = _MessageConnection([("fatal", RaisingWrapper(), None)])
+        process._ScannerProcess__scan_worker = worker
+        process._ScannerProcess__scan_worker_started_at = datetime.now()
+        process._ScannerProcess__scan_worker_control_connection = connection
+        process._ScannerProcess__wake_event = _InspectingWakeEvent()
+
+        process._ScannerProcess__poll_scan_worker()
+        worker.alive = False
+        with self.assertRaisesRegex(ScannerError, "delayed fatal"):
+            process._ScannerProcess__poll_scan_worker()
 
     def test_spawned_worker_returns_recoverable_partial_result_directly(self):
         self._scan_run_patcher.stop()
@@ -290,7 +540,35 @@ class TestScannerProcess(unittest.TestCase):
 
         create_worker.assert_not_called()
         scanner.scan.assert_called_once_with()
+
+    def test_progressive_scan_keeps_manifest_and_root_events_in_order(self):
+        process = ScannerProcess(scanner=ProgressiveScanner(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.run_loop()
+        results = process.pop_results()
+
+        self.assertGreaterEqual(len(results), 4)
+        self.assertEqual({"a", "b"}, results[0].root_names)
+        self.assertEqual(["a"], [file.name for file in results[1].files])
+        self.assertEqual({"pair"}, results[-1].completed_path_pair_ids)
+        self.assertTrue(all(result.generation == 1 for result in results))
         self.assertIsNone(process._ScannerProcess__scan_worker)
+
+    def test_burst_progressive_queue_preserves_lossless_final_snapshot(self):
+        process = ScannerProcess(scanner=BurstProgressiveScanner(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+
+        process.run_loop()
+        results = process.pop_results()
+        final_results = [result for result in results if result.is_full_snapshot]
+
+        self.assertEqual(1, len(final_results))
+        final = final_results[0]
+        self.assertTrue(final.is_scan_final)
+        self.assertEqual({"pair"}, final.full_snapshot_path_pair_ids)
+        self.assertEqual({"root-{}".format(index) for index in range(512)},
+                         {file.name for file in final.files})
 
     def test_thread_coordinator_starts_stops_and_surfaces_inline_fatal_error(self):
         process = ScannerProcess(scanner=FatalScanner(), interval_in_ms=0, verbose=False)
@@ -491,6 +769,19 @@ class TestScannerProcess(unittest.TestCase):
         self.assertEqual([partial_file], result.files)
         self.assertTrue(result.failed)
         self.assertEqual("recoverable error", result.error_message)
+
+    def test_recoverable_error_reports_only_failed_path_pairs(self):
+        process = ScannerProcess(
+            scanner=RecoverableSelectedPairScanner(),
+            interval_in_ms=100,
+            verbose=False,
+        )
+        process.run_loop()
+        result = process.pop_latest_result()
+
+        self.assertTrue(result.failed)
+        self.assertEqual({"pair-b"}, result.scanned_path_pair_ids)
+        self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
 
     def test_propagates_malformed_status_only_file_ids_with_scan_result(self):
         mock_scanner = DummyScanner()
@@ -723,20 +1014,11 @@ class TestScannerProcess(unittest.TestCase):
         mock_scanner.scan.assert_called_once_with()
 
     def test_close_queues_releases_owned_queue_and_is_idempotent(self):
-        result_queue = MagicMock()
-        spawn_context = MagicMock()
-        spawn_context.Queue.return_value = result_queue
-
-        with patch("controller.scan.scanner_process.multiprocessing.get_context", return_value=spawn_context):
-            process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False, recycle_scan_worker=True)
-
-        self.assertIs(process._ScannerProcess__queue, result_queue)
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=100, verbose=False, recycle_scan_worker=True)
 
         process.close_queues()
         process.close_queues()
 
-        result_queue.close.assert_called_once_with()
-        result_queue.join_thread.assert_called_once_with()
         self.assertIsNone(process._ScannerProcess__queue)
         self.assertIsNone(process._ScannerProcess__scan_target_queue)
         self.assertIsNone(process._ScannerProcess__wake_event)
