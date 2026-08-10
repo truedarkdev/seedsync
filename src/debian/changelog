@@ -1,7 +1,38 @@
+seedsync (0.9.1) stable; urgency=low
+
+  * Streamed large path-pair models progressively with bounded worker memory
+  * Added bounded performance diagnostics for runtime and model-building work
+  * Reduced recursive scan and idle-controller CPU and memory usage
+  * Reconciled path-pair scans progressively without transient file removals
+  * Fixed no-clobber final moves on Unraid/FUSE and filesystems that reject
+    no-replace rename flags
+
+ -- Johan Rosén <johan.rosen.91@gmail.com>  Mon, 10 Aug 2026 23:14:58 +0200
+
 seedsync (0.9.0) stable; urgency=low
 
-  * Added multiple path pairs, improved transfer progress, safer local access,
-    configurable notifications, transfer backend choices, and searchable logs
+  * Added multiple path pairs for independent remote and local libraries,
+    including pair-scoped queue, staging, extraction, and validation behavior
+  * Added reliable live progress across active, stopped, resumed, and completed
+    transfers, with monotonic handoffs and clearer completion status
+  * Added trusted-browser sessions and scoped API keys with claim, remember,
+    rotate, revoke, same-origin, and first-run access protections
+  * Added configurable Generic Webhook and Apprise notifications for download,
+    extraction, and successful remote-delete events
+  * Added selectable LFTP SFTP/FTPS and rclone SFTP transfer backends while
+    isolating credentials from process arguments and diagnostic output
+  * Added retained, searchable, severity/time-filtered logs with redaction and
+    bounded diagnostic breadcrumbs for transfer investigations
+  * Added responsive large-library file views with virtualization, configurable
+    pagination, download-time and status sorting, and consistent row states
+  * Added a guarded v0.8.6 migration checkpoint with verified private backup,
+    user-paced browser handoff, restart recovery, and exact offline restore
+  * Hardened path-pair persistence, canonical identity, move completion, and
+    deployment-root continuity across restart and configuration changes
+  * Improved Docker and Unraid compatibility for numeric UID/GID deployments,
+    active-root validation, host-platform Angular builds, and multi-arch images
+  * Improved SSE responsiveness, AutoQueue idle behavior, mobile progress
+    layout, visible version reporting, and transfer status controls
 
  -- Johan Rosén <johan.rosen.91@gmail.com>  Tue, 21 Jul 2026 18:32:54 +0200
 
