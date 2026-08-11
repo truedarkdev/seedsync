@@ -6292,6 +6292,20 @@ class Controller:
                                 self._reset_move_retry_rebuild_gate(command_process.file_id)
                                 self.__deferred_move_file_ids.discard(command_process.file_id)
                                 self.__move_retry_due.pop(command_process.file_id, None)
+                                self.__pending_completion_file_names = {
+                                    entry for entry in self.__pending_completion_file_names
+                                    if ModelFile.build_file_id(entry[0], entry[1]) != command_process.file_id
+                                }
+                                getattr(
+                                    self,
+                                    "_Controller__pending_completion_progress_floors",
+                                    {},
+                                ).pop(command_process.file_id, None)
+                                getattr(
+                                    self,
+                                    "_Controller__successful_final_move_handoff_file_ids",
+                                    set(),
+                                ).discard(command_process.file_id)
                                 self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
                                 getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(
                                     command_process.file_id

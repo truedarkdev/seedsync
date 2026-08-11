@@ -5575,6 +5575,15 @@ class TestController(unittest.TestCase):
         file.state = ModelFile.State.DEFAULT
         self.controller._Controller__persist.stopped_file_names = {file.file_id}
         self.controller._Controller__persist.move_failure_counts = {file.file_id: 4}
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 123.0}
+        self.controller._Controller__pending_completion_file_names = {
+            (file.name, file.path_pair_id, "lftp")
+        }
+        self.controller._Controller__pending_completion_progress_floors = {
+            file.file_id: (10, 10)
+        }
+        self.controller._Controller__successful_final_move_handoff_file_ids = {file.file_id}
         self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
             "notified", file.path_pair_id, datetime.now()
         )
@@ -5606,12 +5615,18 @@ class TestController(unittest.TestCase):
         process.close_queues.assert_called_once_with()
         self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
         self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({file.file_id: 123.0}, self.controller._Controller__persist.downloaded_timestamps)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+        self.assertEqual({}, self.controller._Controller__pending_completion_progress_floors)
+        self.assertEqual(set(), self.controller._Controller__successful_final_move_handoff_file_ids)
         self.assertEqual("fresh_after_delete", self.controller._Controller__download_start_state[file.file_id].state)
         self.controller._Controller__model.get_file.return_value = file
         file.remote_size = 10
         self.controller.queue_command(Controller.Command(Controller.Command.Action.QUEUE, file.file_id))
         self.controller._Controller__process_commands()
         self.assertEqual("eligible", self.controller._Controller__download_start_state[file.file_id].state)
+        self.assertEqual(set(), self.controller._Controller__persist.stopped_file_names)
 
     def test_cleanup_commands_delete_local_surfaces_missing_file_failure(self):
         file = ModelFile("dup", False)
