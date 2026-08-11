@@ -70,6 +70,10 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model = MagicMock()
         self.controller._Controller__model_builder = MagicMock()
         self.controller._Controller__model_builder.has_changes.return_value = False
+        self.controller._Controller__model_builder.has_complete_local_coverage.return_value = True
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.return_value = False
+        self.controller._Controller__model_builder.get_unresolved_staging_collision_file_ids.return_value = set()
+        self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
         self.controller._Controller__model_lock = MagicMock()
         self.controller._Controller__remote_delete_success_listeners = []
         self.controller._Controller__remote_delete_success_listeners_lock = Lock()
@@ -135,6 +139,11 @@ class TestController(unittest.TestCase):
         self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
         self.controller._Controller__extract_process.pop_completed.return_value = []
         self.controller._Controller__extract_process.pop_failed.return_value = []
+
+    def _settle_collision_compare(self):
+        future = getattr(self.controller, "_Controller__collision_compare_future", None)
+        self.assertIsNotNone(future)
+        future.result(timeout=5)
 
     def _configure_real_model_autoqueue_pipeline(self, pair: PathPair, auto_delete_remote: bool = False):
         """Use production ModelUpdater/AutoQueue wiring, not listener mocks."""
@@ -1262,7 +1271,7 @@ class TestController(unittest.TestCase):
         )
 
     @patch("controller.model_updater.datetime")
-    def test_update_model_schedules_healthy_status_poll_about_200ms_out(self, datetime_mock):
+    def test_update_model_schedules_healthy_active_status_poll_about_100ms_out(self, datetime_mock):
         status = LftpJobStatus(0, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "a", "")
         now = datetime(2026, 4, 4, 12, 0, 0)
         datetime_mock.now.return_value = now
@@ -1271,10 +1280,41 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
 
         self.assertEqual(
-            now + timedelta(milliseconds=200),
+            now + timedelta(milliseconds=100),
             self.controller._Controller__next_lftp_status_poll_at
         )
         self.assertFalse(self.controller._Controller__lftp_status_poll_retry_active)
+
+    @patch("controller.model_updater.datetime")
+    def test_update_model_schedules_idle_status_poll_one_second_out_without_building(self, datetime_mock):
+        now = datetime(2026, 4, 4, 12, 0, 0)
+        datetime_mock.now.return_value = now
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__model_builder.has_changes.return_value = False
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertEqual(now + timedelta(seconds=1), self.controller._Controller__next_lftp_status_poll_at)
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.controller._Controller__model_builder.build_model.assert_not_called()
+
+    def test_queue_forces_immediate_lftp_status_poll_after_idle_cooldown(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 100
+        file.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=1)
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once()
+        self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
 
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True
@@ -6396,6 +6436,8 @@ class TestController(unittest.TestCase):
             os.makedirs(destination_tree)
             Path(os.path.join(destination_tree, "E06.mkv")).write_bytes(b"final")
             Path(os.path.join(source_tree, "E06.mkv")).write_bytes(b"stale")
+            os.utime(os.path.join(destination_tree, "E06.mkv"), ns=(1_786_400_000_000_000_000,) * 2)
+            os.utime(os.path.join(source_tree, "E06.mkv"), ns=(1_786_400_001_000_000_000,) * 2)
             Path(os.path.join(source_tree, "nested", "E07 [special].mkv")).write_bytes(b"staged")
             self.controller._Controller__staging_path = staging_root
             self.controller._Controller__legacy_local_path = final_root
@@ -6410,6 +6452,803 @@ class TestController(unittest.TestCase):
                 b"staged", Path(os.path.join(destination_tree, "nested", "E07 [special].mkv")).read_bytes()
             )
             self.assertEqual(b"stale", Path(os.path.join(source_tree, "E06.mkv")).read_bytes())
+
+    def test_move_from_staging_reconciles_verified_equivalent_nested_collision_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release", "nested")
+            destination_tree = os.path.join(final_root, "release", "nested")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "E06.mkv")
+            destination_leaf = os.path.join(destination_tree, "E06.mkv")
+            Path(source_leaf).write_bytes(b"equivalent")
+            Path(destination_leaf).write_bytes(b"equivalent")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+            self._settle_collision_compare()
+            result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+            self.assertFalse(os.path.exists(os.path.join(staging_root, "release")))
+            self.assertEqual(b"equivalent", Path(destination_leaf).read_bytes())
+
+    def test_move_from_staging_retains_same_size_same_mtime_different_content_collision_claim(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "movie.mkv")
+            destination_leaf = os.path.join(destination_tree, "movie.mkv")
+            Path(source_leaf).write_bytes(b"source")
+            Path(destination_leaf).write_bytes(b"target")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+            self._settle_collision_compare()
+            result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(b"target", Path(destination_leaf).read_bytes())
+            self.assertEqual(b"source", Path(source_leaf).read_bytes())
+
+    def test_collision_compare_uses_one_worker_caches_mismatch_and_reschedules_changed_leaf(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "movie.mkv")
+            destination_leaf = os.path.join(destination_tree, "movie.mkv")
+            Path(source_leaf).write_bytes(b"source")
+            Path(destination_leaf).write_bytes(b"target")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            compare_started = threading.Event()
+            release_compare = threading.Event()
+            calls = 0
+
+            def compare_in_worker(*_args):
+                nonlocal calls
+                calls += 1
+                compare_started.set()
+                self.assertTrue(release_compare.wait(2))
+                return False
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claimed_regular_file_matches_destination",
+                    side_effect=compare_in_worker,
+            ):
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.DEFERRED,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self.assertTrue(compare_started.wait(1))
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.DEFERRED,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self.assertEqual(1, calls)
+                release_compare.set()
+                self._settle_collision_compare()
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.CONFLICT,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.CONFLICT,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self.assertEqual(1, calls)
+
+                source_signature = Controller._Controller__collision_signature(source_leaf)
+                changed_ctime_signature = source_signature[:4] + (source_signature[4] + 1,) + source_signature[5:]
+                destination_signature = Controller._Controller__collision_signature(destination_leaf)
+                self.assertNotEqual(
+                    self.controller._Controller__collision_cache_key(
+                        source_leaf, destination_leaf, source_signature, destination_signature,
+                    ),
+                    self.controller._Controller__collision_cache_key(
+                        source_leaf, destination_leaf, changed_ctime_signature, destination_signature,
+                    ),
+                )
+
+                replacement_leaf = os.path.join(source_tree, "movie-replacement.mkv")
+                Path(replacement_leaf).write_bytes(b"change")
+                os.utime(replacement_leaf, ns=(timestamp, timestamp))
+                os.replace(replacement_leaf, source_leaf)
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.DEFERRED,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self._settle_collision_compare()
+                self.assertEqual(2, calls)
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.CONFLICT,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+
+                replacement_leaf = os.path.join(destination_tree, "movie-replacement.mkv")
+                Path(replacement_leaf).write_bytes(b"target")
+                os.utime(replacement_leaf, ns=(timestamp, timestamp))
+                os.replace(replacement_leaf, destination_leaf)
+                self.assertEqual(
+                    Controller.MoveFromStagingResult.DEFERRED,
+                    self.controller._Controller__move_from_staging("release"),
+                )
+                self._settle_collision_compare()
+                self.assertEqual(3, calls)
+            self.controller._Controller__shutdown_collision_compare_worker()
+
+    def test_collision_compare_rejects_over_budget_before_opening_a_leaf(self):
+        source_signature = (1, 2, 16 * 1024 * 1024 * 1024 + 1, 4, 5, 6)
+        destination_signature = (7, 8, source_signature[2], 10, 11, 12)
+
+        with patch.object(Controller, "_Controller__claimed_regular_file_matches_destination") as compare:
+            outcome, _, _ = Controller._Controller__compare_collision_leaf_job(
+                "missing-source",
+                "missing-destination",
+                source_signature,
+                destination_signature,
+                threading.Event(),
+            )
+
+        self.assertEqual("over_budget", outcome)
+        compare.assert_not_called()
+
+    def test_collision_compare_caches_stable_error_without_relaunching(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"equivalent")
+            Path(destination).write_bytes(b"equivalent")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claimed_regular_file_matches_destination",
+                    side_effect=OSError(errno.EIO, "read failed"),
+            ) as compare:
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+                self._settle_collision_compare()
+                self.assertEqual(Controller.MoveFromStagingResult.CONFLICT,
+                                 self.controller._Controller__move_from_staging("release"))
+                self.assertEqual(Controller.MoveFromStagingResult.CONFLICT,
+                                 self.controller._Controller__move_from_staging("release"))
+
+            compare.assert_called_once()
+            self.controller._Controller__shutdown_collision_compare_worker()
+
+    def test_collision_compare_exit_cancels_active_worker_without_retaining_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"equivalent")
+            Path(destination).write_bytes(b"equivalent")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            compare_started = threading.Event()
+            compare_cancelled = threading.Event()
+
+            def wait_for_cancellation(*args):
+                cancel_event = args[-2]
+                compare_started.set()
+                self.assertTrue(cancel_event.wait(2))
+                compare_cancelled.set()
+                raise OSError(errno.ECANCELED, "cancelled")
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claimed_regular_file_matches_destination",
+                    side_effect=wait_for_cancellation,
+            ):
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+                self.assertTrue(compare_started.wait(1))
+                future = self.controller._Controller__collision_compare_future
+                claim_restored = threading.Event()
+                future.add_done_callback(lambda _completed_future: claim_restored.set())
+                exit_started = time.monotonic()
+                self.controller.exit()
+                self.assertLess(time.monotonic() - exit_started, 1)
+                self.assertTrue(compare_cancelled.wait(1))
+                future.result(timeout=1)
+                self.assertTrue(claim_restored.wait(1))
+
+            self.assertIsNone(self.controller._Controller__collision_compare_executor)
+            self.assertIsNone(self.controller._Controller__collision_compare_future)
+            self.assertIsNone(self.controller._Controller__collision_compare_key)
+            self.assertIsNone(self.controller._Controller__collision_compare_result)
+            self.assertIsNone(self.controller._Controller__collision_compare_claim)
+            self.assertTrue(os.path.exists(source))
+            self.assertEqual([], [entry for entry in os.listdir(os.path.dirname(source))
+                                  if entry.startswith(".seedsync-retire-")])
+
+    def test_collision_compare_cancellation_closes_both_descriptors(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source")
+            destination = os.path.join(temp_dir, "destination")
+            Path(source).write_bytes(b"x" * (128 * 1024 + 1))
+            Path(destination).write_bytes(b"x" * (128 * 1024 + 1))
+            cancel_event = threading.Event()
+            original_read = Controller._Controller__read_descriptor_chunk
+            original_close = os.close
+            closed_descriptors = []
+            reads = 0
+
+            def read_then_cancel(file_descriptor, size):
+                nonlocal reads
+                result = original_read(file_descriptor, size)
+                reads += 1
+                if reads == 1:
+                    cancel_event.set()
+                return result
+
+            def record_close(file_descriptor):
+                closed_descriptors.append(file_descriptor)
+                original_close(file_descriptor)
+
+            with patch.object(
+                    Controller,
+                    "_Controller__read_descriptor_chunk",
+                    side_effect=read_then_cancel,
+            ), patch("controller.controller.os.close", side_effect=record_close):
+                with self.assertRaises(OSError) as error:
+                    Controller._Controller__claimed_regular_file_matches_destination(
+                        source,
+                        os.lstat(source),
+                        destination,
+                        os.lstat(destination),
+                        cancel_event,
+                    )
+
+            self.assertEqual(errno.ECANCELED, error.exception.errno)
+            self.assertEqual(2, len(closed_descriptors))
+            self.assertEqual(2, len(set(closed_descriptors)))
+
+    def test_move_from_staging_publishes_unrelated_leaf_while_equivalent_collision_is_deferred(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "E06.mkv")
+            destination_leaf = os.path.join(destination_tree, "E06.mkv")
+            Path(source_leaf).write_bytes(b"equivalent")
+            Path(destination_leaf).write_bytes(b"equivalent")
+            Path(os.path.join(source_tree, "E07.mkv")).write_bytes(b"unrelated")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(
+                Controller.MoveFromStagingResult.DEFERRED,
+                self.controller._Controller__move_from_staging("release"),
+            )
+            self.assertEqual(b"unrelated", Path(os.path.join(destination_tree, "E07.mkv")).read_bytes())
+            self.assertFalse(os.path.exists(source_leaf))
+            private_artifacts = [entry for entry in os.listdir(source_tree)
+                                 if entry.startswith(".seedsync-retire-")]
+            self.assertEqual(2, len(private_artifacts))
+            self.assertEqual(1, len([entry for entry in private_artifacts if entry.endswith(".json")]))
+            self._settle_collision_compare()
+            self.assertEqual(
+                Controller.MoveFromStagingResult.COMPLETED,
+                self.controller._Controller__move_from_staging("release"),
+            )
+
+    def test_collision_claim_compares_source_mutated_between_metadata_precheck_and_claim(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release", "nested")
+            destination_tree = os.path.join(final_root, "release", "nested")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "E06.mkv")
+            destination_leaf = os.path.join(destination_tree, "E06.mkv")
+            replacement_leaf = os.path.join(source_tree, "replacement.mkv")
+            Path(source_leaf).write_bytes(b"equivalent")
+            Path(destination_leaf).write_bytes(b"equivalent")
+            Path(replacement_leaf).write_bytes(b"replacement")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            original_claim = Controller._Controller__claim_collision_source
+            claim_raced = False
+
+            def replace_then_claim(path):
+                nonlocal claim_raced
+                if path == source_leaf and not claim_raced:
+                    claim_raced = True
+                    os.replace(replacement_leaf, source_leaf)
+                return original_claim(self.controller, path)
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claim_collision_source",
+                    side_effect=replace_then_claim,
+            ):
+                result = self.controller._Controller__move_from_staging("release")
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+                self._settle_collision_compare()
+                result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertTrue(claim_raced)
+            self.assertEqual(b"equivalent", Path(destination_leaf).read_bytes())
+            self.assertEqual(b"replacement", Path(source_leaf).read_bytes())
+            claims = [
+                entry for entry in os.listdir(source_tree)
+                if entry.startswith(".seedsync-retire-")
+            ]
+            self.assertEqual([], claims)
+
+    def test_collision_claim_restores_when_destination_changes_after_descriptor_proof(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release", "nested")
+            destination_tree = os.path.join(final_root, "release", "nested")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "E06.mkv")
+            destination_leaf = os.path.join(destination_tree, "E06.mkv")
+            replacement_leaf = os.path.join(destination_tree, "replacement.mkv")
+            Path(source_leaf).write_bytes(b"equivalent")
+            Path(destination_leaf).write_bytes(b"equivalent")
+            Path(replacement_leaf).write_bytes(b"changed-final")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            original_compare = Controller._Controller__claimed_regular_file_matches_destination
+            destination_replaced = False
+
+            def compare_then_replace(*args, **kwargs):
+                nonlocal destination_replaced
+                result = original_compare(*args, **kwargs)
+                if not destination_replaced:
+                    destination_replaced = True
+                    os.replace(replacement_leaf, destination_leaf)
+                return result
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claimed_regular_file_matches_destination",
+                    side_effect=compare_then_replace,
+            ):
+                result = self.controller._Controller__move_from_staging("release")
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+                self._settle_collision_compare()
+                result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+            self.assertTrue(destination_replaced)
+            self.assertEqual(b"changed-final", Path(destination_leaf).read_bytes())
+            self.assertEqual(b"equivalent", Path(source_leaf).read_bytes())
+            claims = [
+                entry for entry in os.listdir(source_tree)
+                if entry.startswith(".seedsync-retire-")
+            ]
+            self.assertEqual([], claims)
+
+    def test_collision_claim_restores_when_held_claim_inode_changes_after_comparison(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree); os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "movie.mkv")
+            destination_leaf = os.path.join(destination_tree, "movie.mkv")
+            Path(source_leaf).write_bytes(b"equal-data")
+            Path(destination_leaf).write_bytes(b"equal-data")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(source_leaf, ns=(timestamp, timestamp))
+            os.utime(destination_leaf, ns=(timestamp, timestamp))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            original_compare = Controller._Controller__claimed_regular_file_matches_destination
+
+            def compare_then_mutate_claim(*args, **kwargs):
+                result = original_compare(*args, **kwargs)
+                claimed_source = args[0]
+                file_descriptor = os.open(claimed_source, os.O_WRONLY | getattr(os, "O_BINARY", 0))
+                try:
+                    os.write(file_descriptor, b"changedata")
+                finally:
+                    os.close(file_descriptor)
+                return result
+
+            with patch.object(
+                    Controller,
+                    "_Controller__claimed_regular_file_matches_destination",
+                    side_effect=compare_then_mutate_claim,
+            ):
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+                self._settle_collision_compare()
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+
+            self.assertEqual(b"changedata", Path(source_leaf).read_bytes())
+            self.assertEqual(b"equal-data", Path(destination_leaf).read_bytes())
+            self.assertEqual([], [entry for entry in os.listdir(source_tree)
+                                  if entry.startswith(".seedsync-retire-")])
+
+    def test_collision_compare_reads_windows_text_sensitive_bytes_in_binary_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source")
+            destination = os.path.join(temp_dir, "destination")
+            Path(source).write_bytes(b"a\r\nb\x1a")
+            Path(destination).write_bytes(b"a\nb\x1a!")
+
+            self.assertFalse(Controller._Controller__claimed_regular_file_matches_destination(
+                source, os.lstat(source), destination, os.lstat(destination), threading.Event(),
+            ))
+
+    def test_fresh_merge_recovers_owned_crash_claim_before_comparing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree); os.makedirs(destination_tree)
+            original = os.path.join(source_tree, "movie.mkv")
+            claim = os.path.join(source_tree, ".seedsync-retire-" + "a" * 48)
+            destination = os.path.join(destination_tree, "movie.mkv")
+            Path(claim).write_bytes(b"source")
+            Path(destination).write_bytes(b"target")
+            timestamp = 1_786_400_000_000_000_000
+            os.utime(claim, ns=(timestamp, timestamp)); os.utime(destination, ns=(timestamp, timestamp))
+            Controller._Controller__write_collision_claim_sidecar(claim + ".json", "movie.mkv", None)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                             self.controller._Controller__move_from_staging("release"))
+            self._settle_collision_compare()
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT,
+                             self.controller._Controller__move_from_staging("release"))
+            self.assertEqual(b"source", Path(original).read_bytes())
+            self.assertFalse(os.path.exists(claim))
+            self.assertFalse(os.path.exists(claim + ".json"))
+
+    def test_recovery_retains_invalid_or_foreign_private_claim_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            scenarios = (
+                ("occupied", {"version": 1, "original_basename": "movie.mkv", "path_pair_id": "movies"}, True, "movies"),
+                ("foreign", {"version": 1, "original_basename": "movie.mkv", "path_pair_id": "tv"}, False, "movies"),
+                ("malformed", b"not-json", False, "movies"),
+                ("oversize", b"x" * 4097, False, "movies"),
+                ("traversal", {"version": 1, "original_basename": "../movie.mkv", "path_pair_id": "movies"}, False, "movies"),
+                ("missing-sidecar", None, False, "movies"),
+            )
+            for label, payload, occupy_original, owner in scenarios:
+                with self.subTest(label=label):
+                    directory = os.path.join(temp_dir, label)
+                    os.makedirs(directory)
+                    claim = os.path.join(directory, ".seedsync-retire-" + "b" * 47 + str(len(label) % 10))
+                    Path(claim).write_bytes(b"private")
+                    sidecar = claim + ".json"
+                    if isinstance(payload, dict):
+                        Path(sidecar).write_text(json.dumps(payload), encoding="utf-8")
+                    elif isinstance(payload, bytes):
+                        Path(sidecar).write_bytes(payload)
+                    if occupy_original:
+                        Path(os.path.join(directory, "movie.mkv")).write_bytes(b"newer")
+                    retained, overflow = self.controller._Controller__recover_collision_claims(directory, owner)
+                    self.assertFalse(overflow)
+                    self.assertIn(claim, retained)
+                    self.assertTrue(os.path.exists(claim))
+                    if payload is not None:
+                        self.assertIn(sidecar, retained)
+                        self.assertTrue(os.path.exists(sidecar))
+
+    def test_recovery_retains_unpaired_exact_token_sidecar_without_publishing_it(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sidecar = os.path.join(temp_dir, ".seedsync-retire-" + "c" * 48 + ".json")
+            Controller._Controller__write_collision_claim_sidecar(sidecar, "movie.mkv", "movies")
+
+            retained, overflow = self.controller._Controller__recover_collision_claims(temp_dir, "movies")
+            self.assertFalse(overflow)
+            self.assertEqual({sidecar}, retained)
+            self.assertTrue(os.path.exists(sidecar))
+
+    def test_recovery_overflow_retains_private_artifacts_beyond_scan_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(source_tree); os.makedirs(destination_tree)
+            for index in range(129):
+                token = "a" * 46 + "{:02x}".format(index)
+                claim = os.path.join(source_tree, ".seedsync-retire-" + token)
+                Path(claim).write_bytes(b"private")
+                Controller._Controller__write_collision_claim_sidecar(claim + ".json", "movie-{}.mkv".format(index), None)
+            Path(os.path.join(source_tree, "ordinary.mkv")).write_bytes(b"ordinary")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT,
+                             self.controller._Controller__move_from_staging("release"))
+            self.assertTrue(os.path.exists(os.path.join(source_tree, "ordinary.mkv")))
+            self.assertFalse(os.path.exists(os.path.join(destination_tree, "ordinary.mkv")))
+            self.assertEqual([], os.listdir(destination_tree))
+
+    def test_same_generation_callback_restores_owned_claim_without_mutating_state(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original = os.path.join(temp_dir, "movie.mkv")
+            claimed = os.path.join(temp_dir, ".seedsync-retire-" + "d" * 48)
+            destination = os.path.join(temp_dir, "final.mkv")
+            Path(claimed).write_bytes(b"old-generation")
+            Path(destination).write_bytes(b"final")
+            Controller._Controller__write_collision_claim_sidecar(claimed + ".json", "movie.mkv", None)
+            self.controller._Controller__collision_compare_epoch = 1
+            future_sentinel = MagicMock()
+            claim_sentinel = ("new", "claim", "destination", None)
+            self.controller._Controller__collision_compare_future = future_sentinel
+            self.controller._Controller__collision_compare_claim = claim_sentinel
+            cancelled = threading.Event(); cancelled.set()
+            completed = MagicMock(); completed.result.return_value = None
+
+            self.controller._Controller__restore_cancelled_collision_claim(
+                completed, original, claimed, destination, cancelled, 1, claimed + ".json",
+            )
+
+            self.assertEqual(b"old-generation", Path(original).read_bytes())
+            self.assertFalse(os.path.exists(claimed))
+            self.assertFalse(os.path.exists(claimed + ".json"))
+            self.assertIs(future_sentinel, self.controller._Controller__collision_compare_future)
+            self.assertIs(claim_sentinel, self.controller._Controller__collision_compare_claim)
+
+    def test_stale_callback_retains_durable_pair_for_owner_aware_recovery(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original = os.path.join(temp_dir, "movie.mkv")
+            claimed = os.path.join(temp_dir, ".seedsync-retire-" + "e" * 48)
+            destination = os.path.join(temp_dir, "final.mkv")
+            Path(claimed).write_bytes(b"old-generation")
+            Path(destination).write_bytes(b"final")
+            Controller._Controller__write_collision_claim_sidecar(claimed + ".json", "movie.mkv", "movies")
+            self.controller._Controller__collision_compare_epoch = 2
+            future_sentinel = MagicMock()
+            claim_sentinel = ("new", "claim", "destination", None)
+            self.controller._Controller__collision_compare_future = future_sentinel
+            self.controller._Controller__collision_compare_claim = claim_sentinel
+            cancelled = threading.Event(); cancelled.set()
+            completed = MagicMock(); completed.result.return_value = None
+
+            self.controller._Controller__restore_cancelled_collision_claim(
+                completed, original, claimed, destination, cancelled, 1, claimed + ".json",
+            )
+
+            self.assertFalse(os.path.exists(original))
+            self.assertTrue(os.path.exists(claimed))
+            self.assertTrue(os.path.exists(claimed + ".json"))
+            self.assertIs(future_sentinel, self.controller._Controller__collision_compare_future)
+            self.assertIs(claim_sentinel, self.controller._Controller__collision_compare_claim)
+            retained, overflow = self.controller._Controller__recover_collision_claims(temp_dir, "movies")
+            self.assertFalse(overflow)
+            self.assertEqual(set(), retained)
+            self.assertEqual(b"old-generation", Path(original).read_bytes())
+            self.assertFalse(os.path.exists(claimed))
+            self.assertFalse(os.path.exists(claimed + ".json"))
+
+    def test_merge_publishes_non_active_user_file_with_collision_claim_prefix(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", ".seedsync-retire-user.mkv")
+            destination = os.path.join(final_root, "release", ".seedsync-retire-user.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"user-file")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.COMPLETED,
+                             self.controller._Controller__move_from_staging("release"))
+            self.assertEqual(b"user-file", Path(destination).read_bytes())
+
+    def test_refresh_cancellation_restores_active_claim_before_runtime_remap(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"equal"); Path(destination).write_bytes(b"equal")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            started = threading.Event()
+
+            def wait_for_cancel(*args):
+                cancel_event = args[-2]
+                started.set()
+                cancel_event.wait(2)
+                raise OSError(errno.ECANCELED, "cancelled")
+
+            with patch.object(Controller, "_Controller__claimed_regular_file_matches_destination", side_effect=wait_for_cancel):
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+                self.assertTrue(started.wait(1))
+                self.assertTrue(self.controller._Controller__cancel_and_settle_collision_claim_for_refresh())
+
+            self.assertTrue(os.path.exists(source))
+            self.assertEqual([], [entry for entry in os.listdir(os.path.dirname(source))
+                                  if entry.startswith(".seedsync-retire-")])
+
+    def test_exit_restores_completed_claim_before_cancellation_callback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"different"); Path(destination).write_bytes(b"targeting")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                             self.controller._Controller__move_from_staging("release"))
+            self._settle_collision_compare()
+            self.controller.exit()
+
+            self.assertTrue(os.path.exists(source))
+            self.assertEqual([], [entry for entry in os.listdir(os.path.dirname(source))
+                                  if entry.startswith(".seedsync-retire-")])
+
+    def test_exit_restores_when_worker_finishes_after_shutdown_done_observation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"equal"); Path(destination).write_bytes(b"equal")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            compare_started = threading.Event()
+            allow_finish = threading.Event()
+            restore_finished = threading.Event()
+
+            def wait_for_shutdown(*args):
+                compare_started.set()
+                self.assertTrue(allow_finish.wait(2))
+                raise OSError(errno.ECANCELED, "cancelled")
+
+            with patch.object(Controller, "_Controller__claimed_regular_file_matches_destination", side_effect=wait_for_shutdown):
+                self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                                 self.controller._Controller__move_from_staging("release"))
+                self.assertTrue(compare_started.wait(1))
+                future = self.controller._Controller__collision_compare_future
+                original_done = future.done
+                first_done_observation = True
+
+                def finish_after_done_observation():
+                    nonlocal first_done_observation
+                    if first_done_observation:
+                        first_done_observation = False
+                        allow_finish.set()
+                        return False
+                    return original_done()
+
+                original_rename = Controller._Controller__rename_no_replace
+
+                def record_restore(rename_source, rename_destination):
+                    return original_rename(rename_source, rename_destination)
+
+                original_remove_sidecar = Controller._Controller__remove_collision_claim_sidecar
+
+                def record_sidecar_removal(sidecar_path):
+                    result = original_remove_sidecar(sidecar_path)
+                    restore_finished.set()
+                    return result
+
+                with patch.object(future, "done", side_effect=finish_after_done_observation), \
+                        patch.object(Controller, "_Controller__rename_no_replace", side_effect=record_restore), \
+                        patch.object(Controller, "_Controller__remove_collision_claim_sidecar", side_effect=record_sidecar_removal):
+                    self.controller.exit()
+                    self.assertTrue(restore_finished.wait(1))
+
+            self.assertTrue(os.path.exists(source))
+            self.assertEqual([], [entry for entry in os.listdir(os.path.dirname(source))
+                                  if entry.startswith(".seedsync-retire-")])
+
+    def test_active_collision_compare_predicate_tracks_claimed_root(self):
+        self.controller._Controller__collision_compare_claim = (
+            os.path.join("C:\\temporary", "incomplete", "release", "movie.mkv"),
+            os.path.join("C:\\temporary", "incomplete", "release", ".seedsync-retire-token"),
+            os.path.join("C:\\temporary", "final", "release", "movie.mkv"),
+            None,
+        )
+        with patch.object(
+                self.controller,
+                "_Controller__resolve_safe_final_move_paths",
+                return_value=("", "", os.path.join("C:\\temporary", "incomplete", "release"), ""),
+        ):
+            self.assertTrue(self.controller.has_active_collision_compare("release"))
+
+    def test_stale_collision_callback_cannot_restore_into_new_generation_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original = os.path.join(temp_dir, "movie.mkv")
+            claimed = os.path.join(temp_dir, ".seedsync-retire-old")
+            destination = os.path.join(temp_dir, "final.mkv")
+            Path(original).write_bytes(b"new-generation")
+            Path(claimed).write_bytes(b"old-generation")
+            Path(destination).write_bytes(b"final")
+            self.controller._Controller__collision_compare_epoch = 2
+            cancelled = threading.Event(); cancelled.set()
+            completed = MagicMock(); completed.result.return_value = None
+
+            self.controller._Controller__restore_cancelled_collision_claim(
+                completed, original, claimed, destination, cancelled, 1,
+            )
+
+            self.assertEqual(b"new-generation", Path(original).read_bytes())
+            self.assertEqual(b"old-generation", Path(claimed).read_bytes())
+
+    def test_move_from_staging_retains_same_size_nested_collision_with_different_mtime(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release", "nested")
+            destination_tree = os.path.join(final_root, "release", "nested")
+            os.makedirs(source_tree)
+            os.makedirs(destination_tree)
+            source_leaf = os.path.join(source_tree, "E06.mkv")
+            destination_leaf = os.path.join(destination_tree, "E06.mkv")
+            Path(source_leaf).write_bytes(b"same-size")
+            Path(destination_leaf).write_bytes(b"same-size")
+            os.utime(source_leaf, ns=(1_786_400_000_000_000_000,) * 2)
+            os.utime(destination_leaf, ns=(1_786_400_001_000_000_000,) * 2)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(b"same-size", Path(destination_leaf).read_bytes())
+            self.assertTrue(os.path.exists(source_leaf))
 
     def test_transfer_exclusions_preserve_user_patterns_and_escape_final_leaf_globs(self):
         self.controller._Controller__exclude_patterns = "*.nfo, Sample/"
@@ -6715,6 +7554,9 @@ class TestController(unittest.TestCase):
 
     def test_manual_retry_move_success_clears_terminal_marker(self):
         file, command, callback = self._prepare_terminal_move_command(path_pair_id="movies")
+        self.controller._Controller__pending_completion_progress_floors = {
+            file.file_id: (99, 99),
+        }
         self.controller._Controller__move_from_staging = MagicMock(
             return_value=Controller.MoveFromStagingResult.COMPLETED
         )
@@ -6728,6 +7570,7 @@ class TestController(unittest.TestCase):
         self.assertIn(file.file_id, self.controller._Controller__persist.final_move_succeeded_file_names)
         self.assertIn(file.file_id, self.controller._Controller__persist.downloaded_timestamps)
         self.assertIn(file.file_id, self.controller._Controller__successful_final_move_handoff_file_ids)
+        self.assertNotIn(file.file_id, self.controller._Controller__pending_completion_progress_floors)
         self.controller._Controller__model_builder.evict_active_file_ids.assert_called_once_with({file.file_id})
         self.controller._Controller__active_scan_process.force_scan.assert_called_once_with()
 
@@ -6930,6 +7773,41 @@ class TestController(unittest.TestCase):
         self.assertEqual(2, self.controller._Controller__persist.move_failure_counts[terminal.file_id])
         self.assertNotIn(terminal.file_id, self.controller._Controller__persist.downloaded_file_names)
 
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_automatic_move_deferred_then_completed_does_not_consume_failure_budget(self, diff_models):
+        completion_entry = ("movie.mkv", None, None)
+        active = ModelFile("movie.mkv", False)
+        active.remote_size = 100; active.local_size = 90; active.state = ModelFile.State.DOWNLOADING
+        terminal = ModelFile("movie.mkv", False)
+        terminal.remote_size = 100; terminal.local_size = 100; terminal.state = ModelFile.State.DOWNLOADED
+        current = Model(); current.set_base_logger(self.controller.logger); current.add_file(active)
+        rebuilt = Model(); rebuilt.set_base_logger(self.controller.logger); rebuilt.add_file(terminal)
+        self.controller._Controller__model = current
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = rebuilt
+        self.controller._Controller__remote_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__local_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__prev_downloading_file_names = {completion_entry}
+        self.controller._Controller__move_from_staging = MagicMock(side_effect=[
+            Controller.MoveFromStagingResult.DEFERRED,
+            Controller.MoveFromStagingResult.COMPLETED,
+        ])
+        diff_models.side_effect = [
+            [SimpleNamespace(change=ModelDiff.Change.UPDATED, old_file=active, new_file=terminal)],
+            [],
+        ]
+
+        self.controller._Controller__update_model()
+
+        self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+        self.assertIn(completion_entry, self.controller._Controller__pending_completion_file_names)
+        self.controller._Controller__update_model()
+        self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+        self.assertNotIn(completion_entry, self.controller._Controller__pending_completion_file_names)
+        self.assertIn(terminal.file_id, self.controller._Controller__persist.downloaded_file_names)
+
     def test_pending_move_retry_waits_for_clean_split_root_coverage(self):
         mtime_ns = 1786400003000000000
         remote_root = SystemFile("release", 20, True)
@@ -6980,6 +7858,385 @@ class TestController(unittest.TestCase):
         self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
         self.assertNotIn(release_id, self.controller._Controller__deferred_move_file_ids)
         self.assertIn(release_id, self.controller._Controller__persist.downloaded_file_names)
+
+    def test_model_updater_waits_for_fresh_healthy_empty_status_before_terminalizing_collision(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_nested)
+        local_root = SystemFile("release", 10, True)
+        local_nested = SystemFile("nested", 10, True)
+        local_episode = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        local_episode.has_staging_collision = True
+        local_nested.add_child(local_episode)
+        local_root.add_child(local_nested)
+        active_root = SystemFile("release", 10, True)
+        active_nested = SystemFile("nested", 10, True)
+        active_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns + 1_000_000_000))
+        active_root.add_child(active_nested)
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_root])
+        previous = Model()
+        previous.set_base_logger(self.controller.logger)
+        prior_release = ModelFile("release", True)
+        prior_release.remote_size = 10
+        prior_release.local_size = 10
+        prior_release.transferred_size = 10
+        prior_release.download_progress = 99
+        prior_release.state = ModelFile.State.DOWNLOADING
+        previous.add_file(prior_release)
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = previous
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+        self.controller._Controller__successful_final_move_handoff_file_ids = set()
+        self.controller._Controller__pending_completion_progress_floors = {}
+        pending_entry = ("release", None, None)
+        self.controller._Controller__pending_completion_file_names = {pending_entry}
+
+        ModelUpdater(self.controller).update()
+
+        release = self.controller._Controller__model.get_file("release")
+        self.assertNotEqual(ModelFile.State.MOVE_FAILED, release.state)
+        self.assertEqual(99, release.download_progress)
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+        self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.downloaded_file_names)
+        self.assertNotIn(release.file_id, self.controller._Controller__move_retry_due)
+
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        self.controller._has_active_collision_comparison = MagicMock(return_value=True)
+        ModelUpdater(self.controller).update()
+
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+        self.assertNotEqual(ModelFile.State.MOVE_FAILED, self.controller._Controller__model.get_file("release").state)
+        self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+
+        self.controller._has_active_collision_comparison.return_value = False
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        ModelUpdater(self.controller).update()
+
+        self.assertEqual(Controller._Controller__MAX_MOVE_FAILURES,
+                         self.controller._Controller__persist.move_failure_counts[release.file_id])
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertEqual(0, terminal_release.transferred_size)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+        self.assertNotIn(release.file_id, self.controller._Controller__pending_completion_progress_floors)
+
+        ModelUpdater(self.controller).update()
+
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertEqual(0, terminal_release.transferred_size)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+
+    def test_model_updater_terminalizes_pending_collision_after_healthy_poll_without_other_model_diff(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_nested)
+        local_root = SystemFile("release", 10, True)
+        local_nested = SystemFile("nested", 10, True)
+        local_episode = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        local_episode.has_staging_collision = True
+        local_nested.add_child(local_episode)
+        local_root.add_child(local_nested)
+        active_root = SystemFile("release", 10, True)
+        active_nested = SystemFile("nested", 10, True)
+        active_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns + 1_000_000_000))
+        active_root.add_child(active_nested)
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_root])
+        previous = builder.build_model()
+        self.assertEqual(ModelFile.State.DEFAULT, previous.get_file("release").state)
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = previous
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+        self.controller._Controller__successful_final_move_handoff_file_ids = set()
+        self.controller._Controller__pending_completion_progress_floors = {}
+        pending_entry = ("release", None, None)
+        self.controller._Controller__pending_completion_file_names = {pending_entry}
+
+        ModelUpdater(self.controller).update()
+
+        release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+        self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        ModelUpdater(self.controller).update()
+
+        self.assertEqual(Controller._Controller__MAX_MOVE_FAILURES,
+                         self.controller._Controller__persist.move_failure_counts[release.file_id])
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertEqual(0, terminal_release.transferred_size)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+        self.assertNotIn(release.file_id, self.controller._Controller__pending_completion_progress_floors)
+
+        ModelUpdater(self.controller).update()
+
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertEqual(0, terminal_release.transferred_size)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+
+    def test_model_updater_terminalizes_nonpending_cached_collision_after_fresh_healthy_poll(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        local_root.has_staging_collision = True
+        active_root = SystemFile("release", 10, False, mtime_ns=mtime_ns + 1_000_000_000)
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_root])
+        previous = builder.build_model()
+        self.assertEqual(ModelFile.State.DEFAULT, previous.get_file("release").state)
+        self.assertEqual({"release"}, builder.get_unresolved_staging_collision_file_ids())
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = previous
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+        self.controller._Controller__successful_final_move_handoff_file_ids = set()
+        release_id = ModelFile.build_file_id("release", None)
+        self.controller._Controller__pending_completion_progress_floors = {release_id: (99, 10)}
+
+        ModelUpdater(self.controller).update()
+
+        release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertNotIn(release_id, self.controller._Controller__persist.move_failure_counts)
+
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+        ModelUpdater(self.controller).update()
+
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertIsNone(terminal_release.transferred_size)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+        self.assertNotIn(release_id, self.controller._Controller__pending_completion_progress_floors)
+        self.assertIn(("release", None, None), self.controller._Controller__pending_completion_file_names)
+
+        ModelUpdater(self.controller).update()
+
+        terminal_release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+        self.assertIsNone(terminal_release.download_progress)
+        self.assertIsNone(terminal_release.downloading_speed)
+        self.assertIsNone(terminal_release.eta)
+
+    def test_model_updater_fresh_idle_poll_rebuilds_cached_complete_collision_once(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        clean_local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        collided_local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        collided_local_root.has_staging_collision = True
+        active_root = SystemFile("release", 10, False, mtime_ns=mtime_ns + 1_000_000_000)
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([clean_local_root])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        builder.set_local_files([collided_local_root])
+        builder.set_active_files([active_root])
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__successful_final_move_handoff_file_ids = set()
+        self.controller._Controller__pending_completion_progress_floors = {}
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+
+        with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+            ModelUpdater(self.controller).update()
+
+            self.assertEqual(1, build_model.call_count)
+            self.assertEqual({"release"}, builder.get_terminalizable_staging_collision_file_ids())
+            self.assertEqual(ModelFile.State.DEFAULT, self.controller._Controller__model.get_file("release").state)
+
+            self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            ModelUpdater(self.controller).update()
+
+            terminal_release = self.controller._Controller__model.get_file("release")
+            self.assertEqual(2, build_model.call_count)
+            self.assertEqual(ModelFile.State.MOVE_FAILED, terminal_release.state)
+            self.assertIsNone(terminal_release.download_progress)
+            self.assertIsNone(terminal_release.downloading_speed)
+            self.assertIsNone(terminal_release.eta)
+
+            ModelUpdater(self.controller).update()
+            self.assertEqual(3, build_model.call_count)
+            ModelUpdater(self.controller).update()
+            self.assertEqual(3, build_model.call_count)
+
+    def test_model_updater_does_not_trigger_for_collision_with_partial_remote_leaf_and_active_extra(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False, mtime_ns=mtime_ns))
+        clean_local_root = SystemFile("release", 20, True)
+        clean_local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        clean_local_root.add_child(SystemFile("E07.mkv", 10, False, mtime_ns=mtime_ns))
+        collided_local_root = SystemFile("release", 20, True)
+        collided_e06 = SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns)
+        collided_e06.has_staging_collision = True
+        collided_local_root.add_child(collided_e06)
+        collided_local_root.add_child(SystemFile("E07.mkv", 5, False, mtime_ns=mtime_ns))
+        active_root = SystemFile("release", 20, True)
+        active_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns + 1_000_000_000))
+        active_root.add_child(SystemFile("E07.mkv", 5, False, mtime_ns=mtime_ns))
+        active_root.add_child(SystemFile("obsolete.tmp", 5, False, mtime_ns=mtime_ns))
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([clean_local_root])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        builder.set_local_files([collided_local_root])
+        builder.set_active_files([active_root])
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+
+        with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+            ModelUpdater(self.controller).update()
+
+            self.assertEqual(1, build_model.call_count)
+            self.assertEqual({"release"}, builder.get_unresolved_staging_collision_file_ids())
+            self.assertEqual(set(), builder.get_terminalizable_staging_collision_file_ids())
+
+            self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            ModelUpdater(self.controller).update()
+            self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            ModelUpdater(self.controller).update()
+
+            self.assertEqual(1, build_model.call_count)
+            self.assertEqual(ModelFile.State.DEFAULT, self.controller._Controller__model.get_file("release").state)
+            self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+
+    def test_model_updater_does_not_terminalize_explicitly_stopped_collision(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root = SystemFile("release", 10, True)
+        local_leaf = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        local_leaf.has_staging_collision = True
+        local_root.add_child(local_leaf)
+        active_root = SystemFile("release", 10, True)
+        active_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns + 1_000_000_000))
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_root])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__persist.stopped_file_names = {"release"}
+        pending_entry = ("release", None, None)
+        self.controller._Controller__pending_completion_file_names = {pending_entry}
+
+        ModelUpdater(self.controller).update()
+
+        release = self.controller._Controller__model.get_file("release")
+        self.assertEqual(ModelFile.State.DEFAULT, release.state)
+        self.assertIn(release.file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+        self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+
+    def test_manual_retry_move_preserves_stale_equally_timestamped_collision_without_remote_proof(self):
+        remote_mtime_ns = 1786400003000000000
+        stale_mtime_ns = remote_mtime_ns - 1_000_000_000
+        remote_root = SystemFile("release", 10, True)
+        remote_leaf = SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns)
+        remote_root.add_child(remote_leaf)
+        local_root = SystemFile("release", 10, True)
+        local_leaf = SystemFile("episode.mkv", 10, False, mtime_ns=stale_mtime_ns)
+        local_leaf.has_staging_collision = True
+        local_root.add_child(local_leaf)
+        active_root = SystemFile("release", 10, True)
+        active_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=stale_mtime_ns))
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_root])
+        self.assertFalse(builder.has_complete_local_coverage("release"))
+        self.assertTrue(builder.has_unresolved_staging_collision("release"))
+
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        release = ModelFile("release", True)
+        release.remote_size = 10
+        release.local_size = 10
+        release.state = ModelFile.State.MOVE_FAILED
+        model.add_file(release)
+        self.controller._Controller__model = model
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__persist.move_failure_counts = {
+            release.file_id: Controller._Controller__MAX_MOVE_FAILURES,
+        }
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+        command.add_callback(callback)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            staging_leaf = os.path.join(staging_root, "release", "episode.mkv")
+            final_leaf = os.path.join(final_root, "release", "episode.mkv")
+            os.makedirs(os.path.dirname(staging_leaf))
+            os.makedirs(os.path.dirname(final_leaf))
+            Path(staging_leaf).write_bytes(b"same-bytes")
+            Path(final_leaf).write_bytes(b"same-bytes")
+            os.utime(staging_leaf, ns=(stale_mtime_ns, stale_mtime_ns))
+            os.utime(final_leaf, ns=(stale_mtime_ns, stale_mtime_ns))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+            self.assertTrue(os.path.exists(staging_leaf))
+            self.assertEqual(b"same-bytes", Path(final_leaf).read_bytes())
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.downloaded_file_names)
+        callback.on_failure.assert_called_once()
+        self.assertEqual(409, callback.on_failure.call_args.args[1])
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_automatic_already_completed_does_not_earn_success_marker(self, diff_models):
@@ -8535,6 +9792,9 @@ class TestController(unittest.TestCase):
             Path(os.path.join(final, "release", "movie.mkv")).write_bytes(b"target")
             self.controller._Controller__staging_path = staging
             self.controller._Controller__legacy_local_path = final
+            result = self.controller._Controller__move_from_staging("release")
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+            self._settle_collision_compare()
             result = self.controller._Controller__move_from_staging("release")
             self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
             self.assertTrue(os.path.isdir(os.path.join(staging, "release")))

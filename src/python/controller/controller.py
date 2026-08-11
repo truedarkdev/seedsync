@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
-from threading import Lock, RLock
+from threading import Event, Lock, RLock
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from queue import Queue
 from enum import Enum
 from datetime import datetime
@@ -105,6 +106,12 @@ class PendingQueueDispatch:
     accepted_at_monotonic: float
 
 
+_COLLISION_COMPARE_MAX_BYTES = 16 * 1024 * 1024 * 1024
+_COLLISION_COMPARE_CHUNK_BYTES = 128 * 1024
+_COLLISION_CLAIM_SIDECAR_MAX_BYTES = 4096
+_COLLISION_CLAIM_SCAN_LIMIT = 128
+
+
 class Controller:
     """
     Top-level class that controls the behaviour of the app
@@ -145,6 +152,7 @@ class Controller:
     __active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
     __prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     __pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    __pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
     __move_retry_due: dict[str, datetime]
     __move_attempt_reservations: set[str]
     __deferred_move_file_ids: set[str]
@@ -187,6 +195,7 @@ class Controller:
     _Controller__active_extracting_file_names: list[tuple[str, Optional[str], Optional[str]]]
     _Controller__prev_downloading_file_names: set[tuple[str, Optional[str], Optional[str]]]
     _Controller__pending_completion_file_names: set[tuple[str, Optional[str], Optional[str]]]
+    _Controller__pending_completion_progress_floors: dict[str, tuple[Optional[int], Optional[int]]]
     _Controller__move_retry_due: dict[str, datetime]
     _Controller__move_attempt_lock: Lock
     _Controller__move_attempt_reservations: set[str]
@@ -483,6 +492,15 @@ class Controller:
         self.__next_active_scan_force_at = None
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
+        self.__pending_completion_progress_floors = {}
+        self.__collision_compare_lock = Lock()
+        self.__collision_compare_executor = None
+        self.__collision_compare_future = None
+        self.__collision_compare_key = None
+        self.__collision_compare_result = None
+        self.__collision_compare_claim = None
+        self.__collision_compare_cancel_event = None
+        self.__collision_compare_epoch = 0
         self.__move_retry_due = {}
         self.__move_attempt_reservations = set()
         self.__move_attempt_lock = Lock()
@@ -663,6 +681,16 @@ class Controller:
         # visible until the model reaches a terminal state.
         self.__prev_downloading_file_names = set()
         self.__pending_completion_file_names = set()
+        self.__pending_completion_progress_floors = {}
+        self.__shutdown_collision_compare_worker()
+        self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
+        self.__collision_compare_lock = Lock()
+        self.__collision_compare_executor = None
+        self.__collision_compare_future = None
+        self.__collision_compare_key = None
+        self.__collision_compare_result = None
+        self.__collision_compare_claim = None
+        self.__collision_compare_cancel_event = None
         self.__move_retry_due = {}
         self.__move_attempt_reservations = set()
         self.__move_attempt_lock = Lock()
@@ -1529,6 +1557,9 @@ class Controller:
             updater.sync_persist_to_all_builders()
 
     def __apply_path_pair_refresh(self):
+        if not self.__cancel_and_settle_collision_claim_for_refresh():
+            raise ControllerError("Path-pair refresh deferred until collision comparison claim is restored")
+        self.__collision_compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0) + 1
         runtime_error_before_refresh = self.__path_pair_runtime_error
         # A path-pair refresh starts a new scan generation. Any prior scan
         # health evidence belongs to the old roots and must not authorize
@@ -1835,6 +1866,7 @@ class Controller:
 
     def exit(self):
         self.logger.debug("Exiting controller")
+        self.__shutdown_collision_compare_worker()
         if self.__started or getattr(self, "_Controller__startup_failed", False):
             try:
                 self.__lftp.exit()
@@ -3195,8 +3227,21 @@ class Controller:
         except (OSError, ValueError):
             return None
 
-    @classmethod
-    def __merge_staging_directory_no_replace(cls, src: str, dst: str) -> bool:
+    @staticmethod
+    def __staging_collision_is_verified_equivalent(
+            source_stat: os.stat_result, destination_stat: os.stat_result) -> bool:
+        """Recognize the same portable source identity without overwriting.
+
+        LFTP preserves mtimes at second precision.  Matching regular-file
+        size and that precision is only a prefilter; claimed leaves receive a
+        bounded descriptor-level byte comparison before staging cleanup.
+        """
+        return stat.S_ISREG(source_stat.st_mode) and stat.S_ISREG(destination_stat.st_mode) and \
+            source_stat.st_size == destination_stat.st_size and \
+            source_stat.st_mtime_ns // 1_000_000_000 == destination_stat.st_mtime_ns // 1_000_000_000
+
+    def __merge_staging_directory_no_replace(
+            self, src: str, dst: str, path_pair_id: Optional[str] = None) -> bool:
         """Publish missing descendants and retain every collision in staging.
 
         A split-root directory is expected after an interrupted portable
@@ -3205,36 +3250,79 @@ class Controller:
         at the staging pathname so a later scan/recovery cannot erase either
         authoritative final data or unresolved residue.
         """
-        if not cls.__safe_existing_directory(src) or not cls.__safe_existing_directory(dst):
+        if not self.__safe_existing_directory(src) or not self.__safe_existing_directory(dst):
             raise OSError(errno.ELOOP, "directory merge encountered unsafe path")
-        cls.__reject_nested_mounts_or_reparse_points(src)
-        cls.__reject_nested_mounts_or_reparse_points(dst)
+        self.__reject_nested_mounts_or_reparse_points(src)
+        self.__reject_nested_mounts_or_reparse_points(dst)
+        settled_claim = self.__settle_collision_claim_for_tree(src, dst)
+        if settled_claim == "pending":
+            self.__collision_merge_deferred = True
+        elif settled_claim == "retry":
+            self.__collision_merge_deferred = True
+            return False
+        elif settled_claim == "failed":
+            raise OSError(errno.EAGAIN, "collision claim could not be safely restored")
+        active_claim = getattr(self, "_Controller__collision_compare_claim", None)
+        active_claimed_path = active_claim[1] if active_claim is not None else None
+        active_sidecar_path = active_claim[4] if active_claim is not None and len(active_claim) > 4 else None
+        private_claim_artifacts, recovery_overflow = self.__recover_collision_claims(
+            src, path_pair_id, active_claimed_path,
+        )
+        if recovery_overflow:
+            # No descendant publication has started.  Retain the whole
+            # directory rather than allowing a second scandir to expose an
+            # exact-token artifact that was beyond the bounded recovery scan.
+            return False
+        if active_claimed_path is not None and self.__path_is_within(active_claimed_path, src):
+            private_claim_artifacts.add(active_claimed_path)
+            if active_sidecar_path is not None:
+                private_claim_artifacts.add(active_sidecar_path)
         for entry in sorted(os.scandir(src), key=lambda item: item.name):
-            source_child = cls.__safe_merge_child(src, entry.name)
-            destination_child = cls.__safe_merge_child(dst, entry.name)
+            source_child = self.__safe_merge_child(src, entry.name)
+            destination_child = self.__safe_merge_child(dst, entry.name)
             if source_child is None or destination_child is None:
                 raise OSError(errno.ELOOP, "directory merge child escapes root", entry.name)
+            if source_child in private_claim_artifacts:
+                continue
+            active_claim = getattr(self, "_Controller__collision_compare_claim", None)
+            if active_claim is not None and os.path.normcase(os.path.abspath(source_child)) == \
+                    os.path.normcase(os.path.abspath(active_claim[1])):
+                continue
+            try:
+                source_stat = os.lstat(source_child)
+            except FileNotFoundError:
+                # A source can be atomically claimed or externally replaced
+                # after scandir; never act on the stale directory entry.
+                continue
             try:
                 destination_stat = os.lstat(destination_child)
             except FileNotFoundError:
-                cls.__publish_staging_no_replace(source_child, destination_child)
+                self.__publish_staging_no_replace(source_child, destination_child)
                 continue
-            source_stat = os.lstat(source_child)
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
                     stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
-                cls.__merge_staging_directory_no_replace(source_child, destination_child)
+                self.__merge_staging_directory_no_replace(source_child, destination_child, path_pair_id)
                 continue
-            # Exact file/type collisions are retained in staging.  Never use
-            # a size comparison here: final identity wins and a retry may
-            # still publish unrelated missing descendants around the residue.
+            if self.__staging_collision_is_verified_equivalent(source_stat, destination_stat):
+                cached_outcome = self.__cached_collision_outcome(source_child, destination_child)
+                if cached_outcome is not None:
+                    continue
+                outcome = self.__claim_and_compare_collision_leaf(source_child, destination_child, path_pair_id)
+                if outcome == "pending":
+                    self.__collision_merge_deferred = True
+                    continue
+                raise OSError(errno.EAGAIN, "collision claim could not be scheduled")
+            # Non-equivalent file/type collisions are retained in staging.
+            # A retry may still publish unrelated missing descendants, but
+            # this root remains an actionable no-overwrite conflict.
         try:
             os.rmdir(src)
         except OSError as error:
             if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
                 return False
             raise
-        cls.__sync_directory_if_supported(os.path.dirname(src))
-        cls.__sync_directory_if_supported(dst)
+        self.__sync_directory_if_supported(os.path.dirname(src))
+        self.__sync_directory_if_supported(dst)
         return True
 
     def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> MoveFromStagingResult:
@@ -3305,7 +3393,10 @@ class Controller:
             if current is None or current[2:] != (src, dst):
                 return Controller.MoveFromStagingResult.FAILED
             if self.__safe_existing_directory(src) and self.__safe_existing_directory(dst):
-                if not self.__merge_staging_directory_no_replace(src, dst):
+                self.__collision_merge_deferred = False
+                if not self.__merge_staging_directory_no_replace(src, dst, path_pair_id):
+                    if self.__collision_merge_deferred:
+                        return Controller.MoveFromStagingResult.DEFERRED
                     return Controller.MoveFromStagingResult.CONFLICT
             else:
                 self.__publish_staging_no_replace(src, dst)
@@ -3407,7 +3498,8 @@ class Controller:
 
     @staticmethod
     def __remove_published_source(
-            src: str, expected_stat: os.stat_result, expected_snapshot: bytes) -> None:
+            src: str, expected_stat: os.stat_result, expected_snapshot: Optional[bytes],
+            validate_before_delete: Optional[Callable[[str], None]] = None) -> None:
         """Remove a source only after its replacement has been published.
 
         Claim the source into an unguessable private sibling before deletion.
@@ -3431,8 +3523,11 @@ class Controller:
             # both the public name and an unpersisted retained claim.
             Controller.__sync_directory_if_supported(source_parent)
             if not Controller.__same_path_identity(claimed_path, expected_stat) or \
-                    Controller.__source_tree_snapshot(claimed_path, ignore_root_ctime=True) != expected_snapshot:
+                    (expected_snapshot is not None and
+                     Controller.__source_tree_snapshot(claimed_path, ignore_root_ctime=True) != expected_snapshot):
                 raise OSError(errno.EAGAIN, "staging source changed during cleanup claim", src)
+            if validate_before_delete is not None:
+                validate_before_delete(claimed_path)
             if os.path.isdir(claimed_path) and not os.path.islink(claimed_path):
                 Controller.__reject_nested_mounts_or_reparse_points(claimed_path)
                 shutil.rmtree(claimed_path)
@@ -3443,6 +3538,605 @@ class Controller:
             # deletions.  Capability-limited platforms keep their documented
             # best-effort behavior in __sync_directory_if_supported.
             Controller.__sync_directory_if_supported(source_parent)
+
+    @staticmethod
+    def __claimed_regular_file_matches_destination(
+            claimed_source: str, expected_source_stat: os.stat_result,
+            destination: str, expected_destination_stat: os.stat_result,
+            cancel_event: Optional[Event] = None,
+            compared_signatures: Optional[list[tuple[int, int, int, int, int, int]]] = None) -> bool:
+        """Compare claimed and final regular leaves without trusting metadata.
+
+        Both public leaves are opened without following symlinks where the
+        platform supports it, and their full descriptor identities are checked
+        before and after bounded byte reads.  A race or I/O error raises so no
+        source leaf is consumed on uncertain evidence.
+        """
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+        source_fd: Optional[int] = None
+        destination_fd: Optional[int] = None
+        try:
+            source_fd = os.open(claimed_source, flags)
+            destination_fd = os.open(destination, flags)
+            source_before = os.fstat(source_fd)
+            destination_before = os.fstat(destination_fd)
+            source_before_signature = Controller.__regular_collision_stat_signature(source_before)
+            destination_before_signature = Controller.__regular_collision_stat_signature(destination_before)
+            if not Controller.__collision_stat_signatures_match(
+                    source_before_signature,
+                    Controller.__regular_collision_stat_signature(expected_source_stat),
+            ) or not Controller.__collision_stat_signatures_match(
+                    destination_before_signature,
+                    Controller.__regular_collision_stat_signature(expected_destination_stat),
+            ):
+                raise OSError(errno.EAGAIN, "collision leaf changed before content comparison")
+            if compared_signatures is not None:
+                compared_signatures.extend((source_before_signature, destination_before_signature))
+            if source_before.st_size != destination_before.st_size:
+                return False
+
+            remaining = source_before.st_size
+            while remaining:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise OSError(errno.ECANCELED, "collision comparison cancelled")
+                read_size = min(_COLLISION_COMPARE_CHUNK_BYTES, remaining)
+                source_chunk = Controller.__read_descriptor_chunk(source_fd, read_size)
+                destination_chunk = Controller.__read_descriptor_chunk(destination_fd, read_size)
+                if len(source_chunk) != read_size or len(destination_chunk) != read_size:
+                    raise OSError(errno.EIO, "collision leaf changed during content comparison")
+                if source_chunk != destination_chunk:
+                    return False
+                remaining -= read_size
+
+            source_after = os.fstat(source_fd)
+            destination_after = os.fstat(destination_fd)
+            if not Controller.__collision_stat_signatures_match(
+                    Controller.__regular_collision_stat_signature(source_after), source_before_signature,
+            ) or not Controller.__collision_stat_signatures_match(
+                    Controller.__regular_collision_stat_signature(destination_after), destination_before_signature,
+            ):
+                raise OSError(errno.EAGAIN, "collision leaf changed during content comparison")
+            return True
+        finally:
+            if destination_fd is not None:
+                os.close(destination_fd)
+            if source_fd is not None:
+                os.close(source_fd)
+
+    @staticmethod
+    def __read_descriptor_chunk(file_descriptor: int, size: int) -> bytes:
+        """Read exactly one bounded regular-file comparison chunk."""
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = os.read(file_descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    @staticmethod
+    def __regular_collision_stat_signature(candidate: os.stat_result) -> tuple[int, int, int, int, int, int]:
+        if not stat.S_ISREG(candidate.st_mode):
+            raise OSError(errno.EAGAIN, "collision leaf is no longer regular")
+        return (
+            candidate.st_dev, candidate.st_ino, candidate.st_size,
+            candidate.st_mtime_ns, candidate.st_ctime_ns, candidate.st_mode,
+        )
+
+    @staticmethod
+    def __collision_signature(path: str) -> tuple[int, int, int, int, int, int]:
+        return Controller.__regular_collision_stat_signature(os.lstat(path))
+
+    @staticmethod
+    def __collision_stat_signatures_match(
+            actual: tuple[int, int, int, int, int, int],
+            expected: tuple[int, int, int, int, int, int]) -> bool:
+        """Compare stable descriptor evidence on every supported platform.
+
+        Windows changes the ctime reported through an open descriptor even for
+        a read-only open.  The job still captures and keys full lstat
+        signatures before and after the read; only the descriptor-local check
+        omits that platform artifact.
+        """
+        if os.name == "nt":
+            return actual[:4] + actual[5:] == expected[:4] + expected[5:]
+        return actual == expected
+
+    @staticmethod
+    def __collision_cache_signature(
+            signature: tuple[int, int, int, int, int, int]) -> tuple[int, int, int, int, int, int]:
+        """Keep the complete restored source identity in terminal cache keys."""
+        return signature
+
+    @staticmethod
+    def __compare_collision_leaf_job(
+            source: str, destination: str,
+            source_signature: tuple[int, int, int, int, int, int],
+            destination_signature: tuple[int, int, int, int, int, int],
+            cancel_event: Event) -> tuple[str, tuple[int, int, int, int, int, int],
+                                         tuple[int, int, int, int, int, int]]:
+        if source_signature[2] > _COLLISION_COMPARE_MAX_BYTES:
+            return "over_budget", source_signature, destination_signature
+        try:
+            source_stat = os.lstat(source)
+            destination_stat = os.lstat(destination)
+            if Controller.__regular_collision_stat_signature(source_stat) != source_signature or \
+                    Controller.__regular_collision_stat_signature(destination_stat) != destination_signature:
+                return "changed", source_signature, destination_signature
+            compared_signatures: list[tuple[int, int, int, int, int, int]] = []
+            outcome = "equal" if Controller.__claimed_regular_file_matches_destination(
+                source, source_stat, destination, destination_stat, cancel_event, compared_signatures,
+            ) else "mismatch"
+            if len(compared_signatures) != 2:
+                return "error", source_signature, destination_signature
+            compared_source_signature, compared_destination_signature = compared_signatures
+            if outcome == "equal" and (
+                    not Controller.__collision_stat_signatures_match(
+                        Controller.__collision_signature(source), compared_source_signature,
+                    ) or not Controller.__collision_stat_signatures_match(
+                        Controller.__collision_signature(destination), compared_destination_signature,
+                    )
+            ):
+                return "changed", compared_source_signature, compared_destination_signature
+            return outcome, compared_source_signature, compared_destination_signature
+        except OSError:
+            try:
+                return "error", Controller.__collision_signature(source), Controller.__collision_signature(destination)
+            except OSError:
+                return "error", source_signature, destination_signature
+
+    def __collision_cache_key(
+            self, original_source: str, destination: str,
+            source_signature: tuple[int, int, int, int, int, int],
+            destination_signature: tuple[int, int, int, int, int, int]) -> tuple[str, str, tuple[int, int, int, int, int, int],
+                                                                                tuple[int, int, int, int, int, int]]:
+        return (
+            original_source,
+            destination,
+            self.__collision_cache_signature(source_signature),
+            destination_signature,
+        )
+
+    @staticmethod
+    def __path_is_within(path: str, root: str) -> bool:
+        try:
+            return os.path.normcase(os.path.commonpath([os.path.abspath(path), os.path.abspath(root)])) == \
+                os.path.normcase(os.path.abspath(root))
+        except ValueError:
+            return False
+
+    def __cached_collision_outcome(self, source: str, destination: str) -> Optional[str]:
+        try:
+            key = self.__collision_cache_key(
+                source, destination, self.__collision_signature(source), self.__collision_signature(destination),
+            )
+        except OSError:
+            return None
+        if getattr(self, "_Controller__collision_compare_key", None) == key:
+            return getattr(self, "_Controller__collision_compare_result", None)
+        return None
+
+    @staticmethod
+    def __collision_claim_sidecar_path(claimed_path: str) -> str:
+        return claimed_path + ".json"
+
+    @staticmethod
+    def __collision_claim_basename_is_valid(value: object) -> bool:
+        if not isinstance(value, str) or not value or len(value) > 255 or "\x00" in value:
+            return False
+        return value not in (".", "..") and "/" not in value and "\\" not in value
+
+    @staticmethod
+    def __collision_claim_owner_is_valid(value: object) -> bool:
+        return value is None or (isinstance(value, str) and 0 < len(value) <= 512 and "\x00" not in value)
+
+    @classmethod
+    def __read_collision_claim_sidecar(cls, sidecar_path: str) -> Optional[tuple[str, Optional[str]]]:
+        try:
+            sidecar_stat = os.lstat(sidecar_path)
+            if not stat.S_ISREG(sidecar_stat.st_mode) or sidecar_stat.st_size > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
+                return None
+            with open(sidecar_path, "rb") as handle:
+                payload = handle.read(_COLLISION_CLAIM_SIDECAR_MAX_BYTES + 1)
+            if len(payload) > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
+                return None
+            data = json.loads(payload.decode("utf-8"))
+            if not isinstance(data, dict) or set(data) != {"version", "original_basename", "path_pair_id"} or \
+                    data["version"] != 1 or not cls.__collision_claim_basename_is_valid(data["original_basename"]) or \
+                    not cls.__collision_claim_owner_is_valid(data["path_pair_id"]):
+                return None
+            return data["original_basename"], data["path_pair_id"]
+        except (OSError, UnicodeDecodeError, ValueError, TypeError):
+            return None
+
+    @classmethod
+    def __write_collision_claim_sidecar(
+            cls, sidecar_path: str, original_basename: str, path_pair_id: Optional[str]) -> None:
+        if not cls.__collision_claim_basename_is_valid(original_basename) or \
+                not cls.__collision_claim_owner_is_valid(path_pair_id):
+            raise OSError(errno.EINVAL, "invalid collision claim ownership")
+        payload = json.dumps(
+            {"version": 1, "original_basename": original_basename, "path_pair_id": path_pair_id},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("ascii")
+        if len(payload) > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
+            raise OSError(errno.E2BIG, "collision claim ownership metadata is too large")
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        descriptor = os.open(sidecar_path, flags, 0o600)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError(errno.EIO, "failed to write collision claim ownership metadata")
+                offset += written
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+
+    @classmethod
+    def __remove_collision_claim_sidecar(cls, sidecar_path: Optional[str]) -> None:
+        if sidecar_path is None:
+            return
+        try:
+            os.unlink(sidecar_path)
+        except FileNotFoundError:
+            return
+        cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+
+    def __recover_collision_claims(
+            self, source_directory: str, path_pair_id: Optional[str],
+            active_claimed_path: Optional[str] = None) -> tuple[set[str], bool]:
+        """Recover only complete, owned private claims before merge traversal.
+
+        A claim name alone is deliberately never enough to infer a public name.
+        Invalid, foreign, or unpaired metadata is retained and excluded from
+        publication; exact-token sidecars are reserved private artifacts too.
+        """
+        artifacts: set[str] = set()
+        claims: dict[str, str] = {}
+        sidecars: dict[str, str] = {}
+        for entry in sorted(os.scandir(source_directory), key=lambda item: item.name):
+            claim_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})", entry.name)
+            sidecar_match = re.fullmatch(r"\.seedsync-retire-([0-9a-f]{48})\.json", entry.name)
+            if claim_match:
+                claims[claim_match.group(1)] = entry.path
+            elif sidecar_match:
+                sidecars[sidecar_match.group(1)] = entry.path
+            if len(claims) + len(sidecars) > _COLLISION_CLAIM_SCAN_LIMIT:
+                self.logger.warning("Too many private collision claim artifacts in '%s'; retaining them", source_directory)
+                return artifacts, True
+        for token in sorted(set(claims) | set(sidecars)):
+            claim = claims.get(token)
+            sidecar = sidecars.get(token)
+            if claim is not None and claim == active_claimed_path:
+                artifacts.add(claim)
+                if sidecar:
+                    artifacts.add(sidecar)
+                continue
+            metadata = self.__read_collision_claim_sidecar(sidecar) if sidecar else None
+            if claim is None:
+                self.logger.warning("Retaining unpaired private collision sidecar '%s'", sidecar)
+                artifacts.add(cast(str, sidecar))
+                continue
+            try:
+                if not stat.S_ISREG(os.lstat(claim).st_mode):
+                    raise OSError(errno.EINVAL, "claim is not a regular file")
+            except OSError:
+                self.logger.warning("Retaining unsafe private collision claim '%s'", claim)
+                artifacts.add(claim)
+                if sidecar:
+                    artifacts.add(sidecar)
+                continue
+            if metadata is None:
+                self.logger.warning("Retaining private collision claim '%s' without valid ownership sidecar", claim)
+                artifacts.add(claim)
+                if sidecar:
+                    artifacts.add(sidecar)
+                continue
+            original_basename, owner = metadata
+            original = self.__safe_merge_child(source_directory, original_basename)
+            if original is None or owner != path_pair_id:
+                self.logger.warning("Retaining private collision claim '%s' with foreign or unsafe ownership", claim)
+                artifacts.update((claim, cast(str, sidecar)))
+                continue
+            if os.path.lexists(original):
+                self.logger.warning("Retaining private collision claim '%s': original '%s' is occupied", claim, original)
+                artifacts.update((claim, cast(str, sidecar)))
+                continue
+            try:
+                self.__rename_no_replace(claim, original)
+                self.__sync_directory_if_supported(source_directory)
+                self.__remove_collision_claim_sidecar(sidecar)
+            except OSError as error:
+                self.logger.warning("Retaining private collision claim '%s': restore failed: %s", claim, error)
+                artifacts.update((claim, cast(str, sidecar)))
+        return artifacts, False
+
+    def __claim_collision_source(self, source: str) -> str:
+        source_parent = os.path.dirname(source)
+        for _ in range(16):
+            claimed_path = os.path.join(source_parent, ".seedsync-retire-" + secrets.token_hex(24))
+            sidecar_path = self.__collision_claim_sidecar_path(claimed_path)
+            if not os.path.lexists(claimed_path) and not os.path.lexists(sidecar_path):
+                break
+        else:
+            raise OSError(errno.EEXIST, "could not reserve private collision claim", source)
+        self.__write_collision_claim_sidecar(
+            sidecar_path, os.path.basename(source), getattr(self, "_Controller__collision_claim_path_pair_id", None),
+        )
+        try:
+            self.__rename_no_replace(source, claimed_path)
+            self.__sync_directory_if_supported(source_parent)
+        except Exception:
+            self.__remove_collision_claim_sidecar(sidecar_path)
+            raise
+        return claimed_path
+
+    def __claim_and_compare_collision_leaf(
+            self, source: str, destination: str, path_pair_id: Optional[str] = None) -> str:
+        if not hasattr(self, "_Controller__collision_compare_lock"):
+            self.__collision_compare_lock = Lock()
+            self.__collision_compare_executor = None
+            self.__collision_compare_future = None
+            self.__collision_compare_key = None
+            self.__collision_compare_result = None
+            self.__collision_compare_claim = None
+            self.__collision_compare_cancel_event = None
+        with self.__collision_compare_lock:
+            if self.__collision_compare_future is not None or self.__collision_compare_claim is not None:
+                return "pending"
+            self.__collision_claim_path_pair_id = path_pair_id
+            try:
+                claimed_source = self.__claim_collision_source(source)
+            finally:
+                self.__collision_claim_path_pair_id = None
+            sidecar_path = self.__collision_claim_sidecar_path(claimed_source)
+            try:
+                source_signature = self.__collision_signature(claimed_source)
+                destination_signature = self.__collision_signature(destination)
+            except OSError:
+                try:
+                    self.__rename_no_replace(claimed_source, source)
+                    self.__sync_directory_if_supported(os.path.dirname(source))
+                    self.__remove_collision_claim_sidecar(sidecar_path)
+                except OSError as restore_error:
+                    self.logger.error(
+                        "Retained collision claim '%s' for '%s' versus '%s': %s",
+                        claimed_source, source, destination, restore_error,
+                    )
+                raise
+            key = self.__collision_cache_key(source, destination, source_signature, destination_signature)
+            self.__collision_compare_claim = (source, claimed_source, destination, key, sidecar_path, path_pair_id)
+            self.__collision_compare_key = None
+            self.__collision_compare_result = None
+            self.__collision_compare_cancel_event = Event()
+            cancel_event = self.__collision_compare_cancel_event
+            compare_epoch = getattr(self, "_Controller__collision_compare_epoch", 0)
+            if self.__collision_compare_executor is None:
+                self.__collision_compare_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seedsync-collision")
+            self.__collision_compare_future = self.__collision_compare_executor.submit(
+                Controller.__compare_collision_leaf_job,
+                claimed_source, destination, source_signature, destination_signature,
+                cancel_event,
+            )
+            self.__collision_compare_future.add_done_callback(
+                lambda completed_future: self.__restore_cancelled_collision_claim(
+                    completed_future,
+                    source,
+                    claimed_source,
+                    destination,
+                    cancel_event,
+                    compare_epoch,
+                    sidecar_path,
+                )
+            )
+            return "pending"
+
+    def __restore_cancelled_collision_claim(
+            self, completed_future: Optional[Future], original_source: str, claimed_source: str,
+            destination: str, cancel_event: Event, compare_epoch: int,
+            sidecar_path: Optional[str] = None) -> None:
+        """Return a cancelled private claim without blocking controller exit."""
+        if not cancel_event.is_set():
+            return
+        if not hasattr(self, "_Controller__collision_compare_lock"):
+            self.__collision_compare_lock = Lock()
+        with self.__collision_compare_lock:
+            owns_current_generation = getattr(self, "_Controller__collision_compare_epoch", 0) == compare_epoch
+            if not owns_current_generation:
+                # A stale worker has no authority over a remapped generation.
+                # Keep its durable pair private for owner-aware merge recovery.
+                return
+            if completed_future is not None:
+                try:
+                    completed_future.result()
+                except Exception:
+                    pass
+            try:
+                self.__rename_no_replace(claimed_source, original_source)
+                self.__sync_directory_if_supported(os.path.dirname(original_source))
+                self.__remove_collision_claim_sidecar(sidecar_path)
+                current_claim = getattr(self, "_Controller__collision_compare_claim", None)
+                if current_claim is not None and current_claim[1] == claimed_source:
+                    self.__collision_compare_future = None
+                    self.__collision_compare_claim = None
+                    self.__collision_compare_key = None
+                    self.__collision_compare_result = None
+                    self.__collision_compare_cancel_event = None
+            except OSError as restore_error:
+                if owns_current_generation and os.path.lexists(original_source) and not os.path.lexists(claimed_source):
+                    self.__collision_compare_future = None
+                    self.__collision_compare_claim = None
+                    self.__collision_compare_key = None
+                    self.__collision_compare_result = None
+                    self.__collision_compare_cancel_event = None
+                    return
+                self.logger.error(
+                    "Retained cancelled collision claim '%s' for '%s' versus '%s': %s",
+                    claimed_source, original_source, destination, restore_error,
+                )
+
+    def __settle_collision_claim_for_tree(self, source_root: str, destination_root: str) -> Optional[str]:
+        claim = getattr(self, "_Controller__collision_compare_claim", None)
+        if claim is None:
+            return None
+        original_source, claimed_source, destination, _ = claim[:4]
+        sidecar_path = claim[4] if len(claim) > 4 else None
+        if not self.__path_is_within(original_source, source_root) or \
+                not self.__path_is_within(destination, destination_root):
+            return None
+        with self.__collision_compare_lock:
+            future = self.__collision_compare_future
+            if future is not None and not future.done():
+                return "pending"
+            try:
+                outcome, source_signature, destination_signature = future.result() if future is not None else (
+                    "error", self.__collision_signature(claimed_source), self.__collision_signature(destination),
+                )
+            except Exception:
+                outcome, source_signature, destination_signature = "error", None, None
+            self.__collision_compare_future = None
+            if outcome == "equal" and source_signature is not None and destination_signature is not None:
+                try:
+                    if not self.__collision_stat_signatures_match(
+                            self.__collision_signature(claimed_source), source_signature,
+                    ) or not self.__collision_stat_signatures_match(
+                            self.__collision_signature(destination), destination_signature,
+                    ):
+                        outcome = "changed"
+                    else:
+                        os.unlink(claimed_source)
+                        self.__sync_directory_if_supported(os.path.dirname(claimed_source))
+                        self.__remove_collision_claim_sidecar(sidecar_path)
+                        self.__collision_compare_claim = None
+                        self.__collision_compare_key = None
+                        self.__collision_compare_result = None
+                        return "equal"
+                except OSError:
+                    outcome = "changed"
+            try:
+                self.__rename_no_replace(claimed_source, original_source)
+                self.__sync_directory_if_supported(os.path.dirname(original_source))
+                self.__remove_collision_claim_sidecar(sidecar_path)
+                restored_signature = self.__collision_signature(original_source)
+                current_destination_signature = self.__collision_signature(destination)
+                if outcome in ("mismatch", "error", "over_budget"):
+                    self.__collision_compare_key = self.__collision_cache_key(
+                        original_source, destination, restored_signature, current_destination_signature,
+                    )
+                    self.__collision_compare_result = outcome
+                else:
+                    self.__collision_compare_key = None
+                    self.__collision_compare_result = None
+                self.__collision_compare_claim = None
+                return "terminal" if outcome in ("mismatch", "error", "over_budget") else "retry"
+            except OSError as restore_error:
+                self.logger.error(
+                    "Retained collision claim '%s' for '%s' versus '%s': %s",
+                    claimed_source, original_source, destination, restore_error,
+                )
+                self.__collision_compare_claim = None
+                self.__collision_compare_key = None
+                self.__collision_compare_result = None
+                return "failed"
+
+    def __shutdown_collision_compare_worker(self) -> None:
+        if not hasattr(self, "_Controller__collision_compare_lock"):
+            self.__collision_compare_lock = Lock()
+        with self.__collision_compare_lock:
+            executor = getattr(self, "_Controller__collision_compare_executor", None)
+            cancel_event = getattr(self, "_Controller__collision_compare_cancel_event", None)
+            claim = getattr(self, "_Controller__collision_compare_claim", None)
+            future = getattr(self, "_Controller__collision_compare_future", None)
+            if cancel_event is not None:
+                cancel_event.set()
+            # Do not clear a running claim here.  Its callback holds the same
+            # lock and either restores under this generation (ordinary exit)
+            # or is fenced by reset's subsequent epoch change.
+            settle_now = claim is not None and (future is None or future.done())
+        if settle_now:
+            original_source, claimed_source, destination, _ = claim[:4]
+            sidecar_path = claim[4] if len(claim) > 4 else None
+            restore_event = cancel_event if cancel_event is not None else Event()
+            restore_event.set()
+            self.__restore_cancelled_collision_claim(
+                future,
+                original_source, claimed_source, destination,
+                restore_event,
+                getattr(self, "_Controller__collision_compare_epoch", 0), sidecar_path,
+            )
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
+        with self.__collision_compare_lock:
+            self.__collision_compare_executor = None
+            if claim is None or settle_now:
+                self.__collision_compare_future = None
+                self.__collision_compare_key = None
+                self.__collision_compare_result = None
+                self.__collision_compare_claim = None
+                self.__collision_compare_cancel_event = None
+
+    def _has_active_collision_comparison(self, name: str, path_pair_id: Optional[str] = None) -> bool:
+        claim = getattr(self, "_Controller__collision_compare_claim", None)
+        if claim is None:
+            return False
+        resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
+        return resolved is not None and self.__path_is_within(claim[0], resolved[2])
+
+    has_active_collision_compare = _has_active_collision_comparison
+
+    def __cancel_and_settle_collision_claim_for_refresh(self) -> bool:
+        """Restore any active claim before path-pair roots can be remapped."""
+        claim = getattr(self, "_Controller__collision_compare_claim", None)
+        if claim is None:
+            return True
+        original_source, claimed_source, destination, _ = claim[:4]
+        sidecar_path = claim[4] if len(claim) > 4 else None
+        cancel_event = getattr(self, "_Controller__collision_compare_cancel_event", None)
+        future = getattr(self, "_Controller__collision_compare_future", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        if future is not None:
+            try:
+                future.result(timeout=5)
+            except TimeoutError:
+                self.logger.error(
+                    "Deferring path-pair refresh while collision claim '%s' for '%s' is still active",
+                    claimed_source, original_source,
+                )
+                return False
+            except Exception:
+                pass
+        with self.__collision_compare_lock:
+            try:
+                if os.path.lexists(claimed_source):
+                    self.__rename_no_replace(claimed_source, original_source)
+                    self.__sync_directory_if_supported(os.path.dirname(original_source))
+                if os.path.lexists(original_source) and not os.path.lexists(claimed_source):
+                    self.__remove_collision_claim_sidecar(sidecar_path)
+            except OSError as restore_error:
+                if os.path.lexists(original_source) and not os.path.lexists(claimed_source):
+                    self.__collision_compare_future = None
+                    self.__collision_compare_claim = None
+                    self.__collision_compare_key = None
+                    self.__collision_compare_result = None
+                    self.__collision_compare_cancel_event = None
+                    return True
+                self.logger.error(
+                    "Deferring path-pair refresh; retained collision claim '%s' for '%s' versus '%s': %s",
+                    claimed_source, original_source, destination, restore_error,
+                )
+                return False
+            self.__collision_compare_future = None
+            self.__collision_compare_claim = None
+            self.__collision_compare_key = None
+            self.__collision_compare_result = None
+            self.__collision_compare_cancel_event = None
+            return True
 
     @staticmethod
     def __same_path_identity(path: str, expected: os.stat_result) -> bool:
@@ -4838,6 +5532,16 @@ class Controller:
                         self.__persist.move_failure_counts.get(file.file_id, 0) < Controller.__MAX_MOVE_FAILURES:
                     _notify_failure(command, "Final move is not failed for this file", 409, file)
                     continue
+                # Manual retries are allowed only after current scanner/model
+                # evidence proves the staging tree still matches the remote
+                # identity.  A terminal collision may contain equally sized,
+                # equally timestamped final/staging leaves that are both stale
+                # relative to the remote source; filesystem-only merging must
+                # never delete that staging evidence.
+                if not self.__model_builder.has_complete_local_coverage(file.file_id) or \
+                        self.__model_builder.has_unresolved_staging_collision(file.file_id):
+                    _notify_failure(command, "Final move requires current collision-free coverage", 409, file)
+                    continue
                 if not self._reserve_move_attempt(file.file_id):
                     _notify_failure(command, "Move retry is already active", 409, file)
                     continue
@@ -4862,6 +5566,10 @@ class Controller:
                             entry for entry in self.__pending_completion_file_names
                             if ModelFile.build_file_id(entry[0], entry[1]) != file.file_id
                         }
+                        getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(
+                            file.file_id,
+                            None,
+                        )
                         self.__model_builder.set_downloaded_files(self.__persist.downloaded_file_names)
                         self._sync_final_move_succeeded_files_to_model()
                         self.__model_builder.set_move_failed_files({

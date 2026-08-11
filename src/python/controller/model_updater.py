@@ -35,6 +35,10 @@ if TYPE_CHECKING:
     from .controller import Controller
 
 
+_ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
+_IDLE_LFTP_STATUS_POLL_INTERVAL = timedelta(seconds=1)
+
+
 class _ProgressiveScanAccumulator:
     """Reconcile manifest/root events without exposing unknown absence."""
 
@@ -1107,13 +1111,29 @@ class ModelUpdater(_ControllerCoreAccess):
                 lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
                 poll_finished_at = datetime.now()
                 if lftp_status_poll_healthy:
+                    recovering_from_unhealthy_poll = controller._Controller__lftp_status_poll_retry_active
                     controller._Controller__lftp_status_poll_retry_active = False
                     controller._Controller__last_lftp_statuses = lftp_statuses
                     controller._Controller__lftp_status_cache_expires_at = poll_finished_at + timedelta(
                         seconds=controller._Controller__lftp_status_cache_max_age_seconds
                     )
-                    # Keep healthy polls responsive without hammering lftp on every controller tick.
-                    controller._Controller__next_lftp_status_poll_at = poll_finished_at + timedelta(milliseconds=200)
+                    # Progress needs a short cadence; an idle controller does
+                    # not.  The cached model remains clean between idle polls,
+                    # so this avoids both lftp polling and full-model churn.
+                    active_transfer = any(
+                        status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
+                        for status in lftp_statuses
+                    )
+                    controller._Controller__next_lftp_status_poll_at = poll_finished_at + (
+                        _ACTIVE_LFTP_STATUS_POLL_INTERVAL if active_transfer
+                        else _IDLE_LFTP_STATUS_POLL_INTERVAL
+                    )
+                    # Fresh health is new arbitration evidence even when the
+                    # returned status list is still empty.  Rebuild once on
+                    # recovery so a pending collision can be terminalized;
+                    # steady idle polls remain cache-only.
+                    if recovering_from_unhealthy_poll:
+                        model_builder.request_rebuild()
                     lftp_status_source = "fresh_healthy"
                 else:
                     controller._Controller__lftp_status_poll_retry_active = True
@@ -1496,6 +1516,35 @@ class ModelUpdater(_ControllerCoreAccess):
             )
         )
 
+        # A local/active scan can cache a collision while status polling is in
+        # its idle cooldown.  The next fresh healthy empty poll is new
+        # arbitration evidence, but the unchanged status list does not by
+        # itself invalidate the model.  Request exactly one build for a
+        # complete, actionable cached collision so pre-diff terminalization
+        # can publish MOVE_FAILED; terminal/stopped/live/incomplete roots do
+        # not keep waking the idle loop.
+        if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
+                lftp_status_source == "fresh_healthy":
+            live_lftp_file_ids = {status.file_id for status in (lftp_statuses or [])}
+            for collision_file_id in model_builder.get_terminalizable_staging_collision_file_ids():
+                if collision_file_id in live_lftp_file_ids or \
+                        persist.move_failure_counts.get(collision_file_id, 0) >= \
+                        controller._Controller__MAX_MOVE_FAILURES:
+                    continue
+                try:
+                    with controller._Controller__model_lock:
+                        collision_file = model.get_file(collision_file_id)
+                except ModelError:
+                    continue
+                if collision_file.state == ModelFile.State.MOVE_FAILED or \
+                        controller._Controller__is_explicitly_stopped(
+                            collision_file.name,
+                            collision_file.path_pair_id,
+                        ):
+                    continue
+                model_builder.request_rebuild()
+                break
+
         retry_now = datetime.now()
         if any(
             0 < count < controller._Controller__MAX_MOVE_FAILURES
@@ -1723,6 +1772,73 @@ class ModelUpdater(_ControllerCoreAccess):
                     finally:
                         controller._release_move_attempt(file.file_id)
 
+                terminalized_collision_file_ids: set[str] = set()
+
+                def terminalize_unresolved_staging_collision(file: ModelFile) -> None:
+                    """Park an unprovable split-root collision for manual retry."""
+                    persist.move_failure_counts[file.file_id] = controller._Controller__MAX_MOVE_FAILURES
+                    persist.final_move_succeeded_file_names.discard(file.file_id)
+                    controller._Controller__successful_final_move_handoff_file_ids.discard(file.file_id)
+                    controller._Controller__current_process_final_publication_file_ids.discard(file.file_id)
+                    controller._Controller__deferred_move_file_ids.discard(file.file_id)
+                    controller._Controller__move_retry_due.pop(file.file_id, None)
+                    controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
+                    terminalized_collision_file_ids.add(file.file_id)
+                    controller._Controller__pending_completion_file_names.add((
+                        file.name,
+                        file.path_pair_id,
+                        file.path_pair_name,
+                    ))
+                    model_builder.set_move_failed_files({
+                        file_id for file_id, failures in persist.move_failure_counts.items()
+                        if failures >= controller._Controller__MAX_MOVE_FAILURES
+                    })
+                    controller._sync_final_move_succeeded_files_to_model()
+                    file.state = ModelFile.State.MOVE_FAILED
+                    file.download_progress = None
+                    file.downloading_speed = None
+                    file.eta = None
+                    controller.logger.warning(
+                        "Staging collision requires manual resolution before final move: %s",
+                        file.file_id,
+                    )
+
+                # A collision can be invisible to ModelDiff when the last
+                # rendered model is already otherwise identical.  Examine
+                # pending roots plus the collision identities cached during
+                # this normal model build, not every root or a rebuilt
+                # effective-local tree per candidate, before diffing so the
+                # MOVE_FAILED mutation itself becomes visible to listeners.
+                pending_file_ids = pending_completion_file_ids()
+                terminalizable_collision_file_ids = \
+                    model_builder.get_terminalizable_staging_collision_file_ids()
+                terminal_collision_candidate_ids = pending_file_ids.union(
+                    terminalizable_collision_file_ids
+                )
+                live_lftp_file_ids = {
+                    status.file_id for status in (lftp_statuses or [])
+                }
+                if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
+                        lftp_status_source == "fresh_healthy":
+                    for pending_file_id in terminal_collision_candidate_ids:
+                        if pending_file_id not in terminalizable_collision_file_ids or \
+                                persist.move_failure_counts.get(pending_file_id, 0) >= \
+                                controller._Controller__MAX_MOVE_FAILURES:
+                            continue
+                        try:
+                            pending_file = new_model.get_file(pending_file_id)
+                        except ModelError:
+                            continue
+                        if controller._Controller__is_explicitly_stopped(
+                                pending_file.name,
+                                pending_file.path_pair_id,
+                        ) or pending_file_id in live_lftp_file_ids or \
+                                controller._has_active_collision_comparison(
+                                    pending_file.name, pending_file.path_pair_id,
+                                ):
+                            continue
+                        terminalize_unresolved_staging_collision(pending_file)
+
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
                 attempted_move_file_ids: set[str] = set()
@@ -1750,12 +1866,18 @@ class ModelUpdater(_ControllerCoreAccess):
                         and old_file is not None
                         and new_file is not None
                     ):
-                        remember_pending_completion_floor(old_file)
-                        self._preserve_pending_completion_progress_floor(
-                            old_file,
-                            new_file,
-                            pending_completion_file_ids(),
-                        )
+                        if new_file.file_id in terminalized_collision_file_ids:
+                            controller._Controller__pending_completion_progress_floors.pop(
+                                new_file.file_id,
+                                None,
+                            )
+                        else:
+                            remember_pending_completion_floor(old_file)
+                            self._preserve_pending_completion_progress_floor(
+                                old_file,
+                                new_file,
+                                pending_completion_file_ids(),
+                            )
                     elif diff.change == ModelDiff.Change.REMOVED and old_file is not None:
                         remember_pending_completion_floor(old_file)
                     elif diff.change == ModelDiff.Change.ADDED and new_file is not None:

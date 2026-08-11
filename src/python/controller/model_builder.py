@@ -85,6 +85,8 @@ class ModelBuilder:
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
         self.__cached_model: Optional[Model] = None
+        self.__cached_unresolved_staging_collision_file_ids: set[str] = set()
+        self.__cached_terminalizable_staging_collision_file_ids: set[str] = set()
         self.__stop_resume_trace_cycle_id: Optional[int] = None
         self.__stop_resume_trace_cycle_context: dict[str, object] = {}
         self.__stop_resume_trace_breadcrumb: Optional[BreadcrumbTraceEmitter] = None
@@ -748,20 +750,25 @@ class ModelBuilder:
         A final pathname alone is not enough after an interrupted transfer:
         an older same-name file must remain eligible for download.  The scan
         carries size and source modification metadata, so require both exact
-        size and equal non-null epoch seconds.  LFTP preserves mtimes only to
-        whole-second precision; display timestamps are naive local datetimes
-        and cannot establish identity across hosts in different timezones.
-        This deliberately fails closed for legacy scans without raw epoch
-        provenance.
+        size and equal non-null raw nanosecond mtimes.  Display timestamps are
+        naive local datetimes and cannot establish identity across hosts in
+        different timezones.  This deliberately fails closed for legacy scans
+        without raw epoch provenance.
         """
-        local_mtime_second = ModelBuilder.__mtime_epoch_second(local_file)
-        remote_mtime_second = ModelBuilder.__mtime_epoch_second(remote_file)
         return not remote_file.is_dir and not local_file.is_dir and \
             ModelBuilder.__is_authoritative_local_file(local_file) and \
-            local_file.size == remote_file.size and \
-            local_mtime_second is not None and \
-            remote_mtime_second is not None and \
-            local_mtime_second == remote_mtime_second
+            ModelBuilder.__leaf_matches_remote_identity(remote_file, local_file)
+
+    @staticmethod
+    def __leaf_matches_remote_identity(remote_file: SystemFile, candidate_file: SystemFile) -> bool:
+        """Whether a leaf has exact scanner-proven remote source identity."""
+        local_mtime_ns = candidate_file.mtime_ns
+        remote_mtime_ns = remote_file.mtime_ns
+        return not remote_file.is_dir and not candidate_file.is_dir and \
+            candidate_file.size == remote_file.size and \
+            type(local_mtime_ns) is int and \
+            type(remote_mtime_ns) is int and \
+            local_mtime_ns == remote_mtime_ns
 
     @staticmethod
     def __combine_split_root_transfer_state(transfer_state: _TransferState,
@@ -848,6 +855,25 @@ class ModelBuilder:
         remote_file = self.__remote_files.get(file_id)
         local_file = self.__build_effective_local_files().get(file_id)
         return self.__effective_local_tree_proves_completion(remote_file, local_file)
+
+    def has_unresolved_staging_collision(self, file_id: str) -> bool:
+        """Whether the effective root still has an unproven staging collision."""
+        local_file = self.__build_effective_local_files().get(file_id)
+        if local_file is None:
+            return False
+        return self.__has_staging_collision_descendant(local_file)
+
+    def get_unresolved_staging_collision_file_ids(self) -> set[str]:
+        """Return a copy of collision roots computed for the cached model."""
+        if self.__cached_model is None:
+            return set()
+        return set(self.__cached_unresolved_staging_collision_file_ids)
+
+    def get_terminalizable_staging_collision_file_ids(self) -> set[str]:
+        """Return cached collision roots with complete remote leaf coverage."""
+        if self.__cached_model is None:
+            return set()
+        return set(self.__cached_terminalizable_staging_collision_file_ids)
 
     def is_remote_leaf_path(self, file_id: str, relative_path: str) -> bool:
         """Whether a source-root-relative leaf is currently remote-listed."""
@@ -1358,6 +1384,13 @@ class ModelBuilder:
         )
 
     @staticmethod
+    def __has_staging_collision_descendant(system_file: SystemFile) -> bool:
+        return system_file.has_staging_collision or any(
+            ModelBuilder.__has_staging_collision_descendant(child)
+            for child in system_file.iter_children()
+        )
+
+    @staticmethod
     def __clone_system_file(system_file: SystemFile,
                             children: Optional[List[SystemFile]] = None,
                             is_staging: Optional[bool] = None) -> SystemFile:
@@ -1470,14 +1503,15 @@ class ModelBuilder:
 
         if not existing_file.is_dir and not active_file.is_dir and \
                 not existing_file.is_staging and \
-                not existing_file.has_staging_collision and \
                 remote_file is not None and \
-                ModelBuilder.__is_verified_final_leaf(remote_file, existing_file):
+                ModelBuilder.__leaf_matches_remote_identity(remote_file, existing_file):
             merged = ModelBuilder.__clone_system_file(existing_file)
-            # The active staging duplicate may be a stale/preallocated copy.
-            # Keep the final bytes visible but retain the ambiguity so they
-            # cannot be added to both final and active progress.
-            merged.has_staging_collision = True
+            # The final copy always wins.  It is safe to reconcile only when
+            # the staging duplicate independently carries the same portable
+            # source identity; otherwise retain a terminal collision marker.
+            merged.has_staging_collision = not ModelBuilder.__leaf_matches_remote_identity(
+                remote_file, active_file
+            )
             return merged
 
         merged = ModelBuilder.__clone_system_file(active_file)
@@ -1538,6 +1572,37 @@ class ModelBuilder:
                 local_file.size >= remote_file.size
         return local_file.size >= remote_file.size
 
+    @staticmethod
+    def __effective_local_tree_covers_remote_leaves_allowing_collision(
+            remote_file: Optional[SystemFile], local_file: Optional[SystemFile]) -> bool:
+        """Prove every remote leaf is locally complete without trusting extras.
+
+        Terminal collision handling intentionally allows collision metadata on
+        matched remote paths, but must not treat a root aggregate as complete
+        when a remote leaf is partial or an unmatched staging branch inflates
+        the byte total.
+        """
+        if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
+            return False
+        if not remote_file.is_dir:
+            return local_file.size >= remote_file.size
+
+        remote_children = {child.name: child for child in remote_file.iter_children()}
+        local_children = {child.name: child for child in local_file.iter_children()}
+        if any(
+                child.is_staging or ModelBuilder.__has_staging_descendant(child)
+                for name, child in local_children.items()
+                if name not in remote_children
+        ):
+            return False
+        return all(
+            ModelBuilder.__effective_local_tree_covers_remote_leaves_allowing_collision(
+                remote_child,
+                local_children.get(remote_child.name),
+            )
+            for remote_child in remote_children.values()
+        )
+
     def __build_effective_local_files(self) -> Dict[str, SystemFile]:
         if not self.__active_files:
             return dict(self.__local_files)
@@ -1548,9 +1613,9 @@ class ModelBuilder:
             remote_file = self.__remote_files.get(file_id)
             if existing_file is not None and remote_file is not None and \
                     (self.__has_staging_descendant(existing_file) or
-                     existing_file.has_staging_collision) and \
+                     self.__has_staging_collision_descendant(existing_file)) and \
                     (self.__has_verified_split_root_final_leaf(existing_file, remote_file) or
-                     existing_file.has_staging_collision):
+                     self.__has_staging_collision_descendant(existing_file)):
                 effective_local_files[file_id] = self.__merge_active_split_root(
                     existing_file, active_file, remote_file
                 )
@@ -1687,13 +1752,20 @@ class ModelBuilder:
         self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__stop_resume_trace_last_signatures.clear()
         self.__cached_model = None
+        self.__cached_unresolved_staging_collision_file_ids.clear()
+        self.__cached_terminalizable_staging_collision_file_ids.clear()
 
     def has_changes(self) -> bool:
         """
         Returns true is model has changes and requires rebuild
         :return:
         """
-        return self.__cached_model is None or self.__has_pending_recent_live_transfer_snapshots()
+        # A retained live-progress floor is rendered into the cached model.
+        # It is continuity evidence, not an input change: rebuilding every
+        # controller tick would traverse every unrelated root until the next
+        # local scan catches up.  Source setters and snapshot eviction already
+        # invalidate this cache when the rendered value can actually change.
+        return self.__cached_model is None
 
     def request_rebuild(self) -> None:
         self.__cached_model = None
@@ -1710,13 +1782,26 @@ class ModelBuilder:
             self.__cached_model = applied_model
 
     def build_model(self) -> Model:
-        if self.__cached_model is not None and not self.__has_pending_recent_live_transfer_snapshots():
+        if self.__cached_model is not None:
             return self.__cached_model
 
         model = Model()
         model.logger = self.__build_dummy_model_logger()  # ignore the logs for this temp model
         live_transferred_file_ids: set[str] = set()
         effective_local_files = self.__build_effective_local_files()
+        self.__cached_unresolved_staging_collision_file_ids = {
+            file_id
+            for file_id, local_file in effective_local_files.items()
+            if self.__has_staging_collision_descendant(local_file)
+        }
+        self.__cached_terminalizable_staging_collision_file_ids = {
+            file_id
+            for file_id in self.__cached_unresolved_staging_collision_file_ids
+            if self.__effective_local_tree_covers_remote_leaves_allowing_collision(
+                self.__remote_files.get(file_id),
+                effective_local_files.get(file_id),
+            )
+        }
         all_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
         source_file_ids: set[str] = set(effective_local_files).union(self.__remote_files)
         for status_file_id in self.__lftp_statuses.keys():

@@ -891,7 +891,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(60, release.download_progress)
         self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
 
-    def test_split_root_trusts_lftp_normalized_epoch_mtime_despite_different_naive_display_times(self):
+    def test_split_root_rejects_same_second_raw_mtime_difference_despite_display_timezone_difference(self):
         remote_root = SystemFile("release", 200, True)
         remote_root.add_child(SystemFile(
             "E06.mkv", 100, False,
@@ -899,8 +899,8 @@ class TestModelBuilder(unittest.TestCase):
         ))
         remote_root.add_child(SystemFile("E07.mkv", 100, False))
         local_root = SystemFile("release", 120, True)
-        # These are local display times from different host timezones for the
-        # same LFTP-preserved filesystem second.
+        # Display timestamps can differ by timezone, but the raw scanner
+        # nanoseconds remain the identity proof for a final leaf.
         local_root.add_child(SystemFile(
             "E06.mkv", 100, False,
             time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000
@@ -914,8 +914,8 @@ class TestModelBuilder(unittest.TestCase):
 
         release = self.model_builder.build_model().get_file("release")
 
-        self.assertEqual(120, release.transferred_size)
-        self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+        self.assertEqual(20, release.transferred_size)
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
 
     def test_split_root_rejects_unequal_epoch_mtime_even_with_equal_naive_display_time(self):
         displayed_time = datetime(2026, 8, 11, 12, 0, 0)
@@ -1114,6 +1114,76 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(18, release.transferred_size)
         self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
         self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_nested_verified_equivalent_final_and_staging_leaf_reconciles_without_collision(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_nested)
+        local_root = SystemFile("release", 10, True)
+        local_nested = SystemFile("nested", 10, True)
+        local_episode = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        local_episode.has_staging_collision = True
+        local_nested.add_child(local_episode)
+        local_root.add_child(local_nested)
+        active_root = SystemFile("release", 10, True)
+        active_nested = SystemFile("nested", 10, True)
+        active_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        active_root.add_child(active_nested)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_leaf = next(child for child in next(effective_root.iter_children()).iter_children())
+
+        self.assertFalse(effective_leaf.has_staging_collision)
+        self.assertFalse(self.model_builder.has_unresolved_staging_collision("release"))
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_nested_same_size_different_mtime_staging_leaf_remains_unresolved_collision(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_nested = SystemFile("nested", 10, True)
+        remote_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_nested)
+        local_root = SystemFile("release", 10, True)
+        local_nested = SystemFile("nested", 10, True)
+        local_episode = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        local_episode.has_staging_collision = True
+        local_nested.add_child(local_episode)
+        local_root.add_child(local_nested)
+        active_root = SystemFile("release", 10, True)
+        active_nested = SystemFile("nested", 10, True)
+        active_nested.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns + 1_000_000_000))
+        active_root.add_child(active_nested)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_leaf = next(child for child in next(effective_root.iter_children()).iter_children())
+
+        self.assertTrue(effective_leaf.has_staging_collision)
+        self.assertTrue(self.model_builder.has_unresolved_staging_collision("release"))
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+        built_model = self.model_builder.build_model()
+
+        self.assertEqual({"release"}, self.model_builder.get_unresolved_staging_collision_file_ids())
+        self.assertEqual({"release"}, self.model_builder.get_terminalizable_staging_collision_file_ids())
+        self.assertFalse(self.model_builder.has_changes())
+        self.assertIs(built_model, self.model_builder.build_model())
+
+    def test_same_second_different_raw_mtime_is_not_trusted_as_remote_final_leaf(self):
+        remote = SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000100)
+        local = SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000900)
+        self.model_builder.set_remote_files([remote])
+        self.model_builder.set_local_files([local])
+
+        self.model_builder.build_model()
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("movie.mkv"))
 
     def test_active_only_extra_bytes_cannot_complete_partial_split_root_directory(self):
         mtime_ns = 1786400003000000000
@@ -1735,7 +1805,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADING, file_a.state)
         self.assertEqual(975, file_a.transferred_size)
         self.assertEqual(97, file_a.download_progress)
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
 
         self.model_builder.set_local_files([SystemFile("a", 975, False)])
         model = self.model_builder.build_model()
@@ -1811,7 +1881,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADING, built_child.state)
         self.assertEqual(750, built_child.transferred_size)
         self.assertEqual(75, built_child.download_progress)
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
 
         caught_up_local_root = SystemFile("a", 750, True)
         caught_up_local_child = SystemFile("aa", 750, False)
@@ -2008,7 +2078,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(75, file_dup.download_progress)
         self.assertEqual(1000, file_dup.downloading_speed)
         self.assertEqual(5, file_dup.eta)
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
 
     def test_build_stopped_staging_file_preserves_retained_snapshot_when_local_size_looks_complete(self):
         self.model_builder.clear()
@@ -3361,7 +3431,7 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(75, grandchild.download_progress)
         self.assertEqual(1000, grandchild.downloading_speed)
         self.assertEqual(5, grandchild.eta)
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
 
     def test_build_recent_live_transfer_snapshot_survives_until_local_catches_up(self):
         self.model_builder.clear()
@@ -3378,7 +3448,7 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.assertEqual(ModelFile.State.DOWNLOADING, model.get_file("a").state)
         self.assertEqual(750, model.get_file("a").transferred_size)
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
 
         self.model_builder.set_local_files([SystemFile("a", 750, False)])
         model = self.model_builder.build_model()
@@ -3386,6 +3456,38 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DEFAULT, file_a.state)
         self.assertEqual(750, file_a.transferred_size)
         self.assertIsNone(file_a.download_progress)
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_retained_snapshot_keeps_production_shaped_idle_model_cached_until_local_catches_up(self):
+        remote_files = [SystemFile("release-{:03}.mkv".format(index), 1000, False) for index in range(96)]
+        local_files = [SystemFile("release-{:03}.mkv".format(index), 100, False) for index in range(96)]
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+        self.model_builder._ModelBuilder__recent_live_transfer_snapshots["release-042.mkv"] = \
+            _RecentLiveTransferSnapshot(
+                root_file_id="release-042.mkv",
+                size_local=750,
+                percent_local=75,
+                speed=1000,
+                eta=5,
+            )
+
+        first_model = self.model_builder.build_model()
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, first_model.get_file("release-042.mkv").state)
+        self.assertFalse(self.model_builder.has_changes())
+        self.assertIs(first_model, self.model_builder.build_model())
+
+        caught_up_local_files = [
+            SystemFile(file.name, 750 if file.name == "release-042.mkv" else file.size, False)
+            for file in local_files
+        ]
+        self.model_builder.set_local_files(caught_up_local_files)
+        caught_up_model = self.model_builder.build_model()
+
+        self.assertIsNot(first_model, caught_up_model)
+        self.assertEqual(ModelFile.State.DEFAULT, caught_up_model.get_file("release-042.mkv").state)
+        self.assertNotIn("release-042.mkv", self.model_builder._ModelBuilder__recent_live_transfer_snapshots)
         self.assertFalse(self.model_builder.has_changes())
 
     def test_build_recent_live_transfer_child_snapshot_is_suppressed_by_queued_root_state(self):
