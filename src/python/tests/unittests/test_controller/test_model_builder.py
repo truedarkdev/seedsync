@@ -23,6 +23,30 @@ from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.performance_diagnostics import (
+    DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
+    DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+    DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
+    DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+    DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
+    MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+    MODEL_BUILDER_INVALIDATION_CLEAR,
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
+    MODEL_BUILDER_INVALIDATION_EXPLICIT,
+    MODEL_BUILDER_INVALIDATION_EXTRACTED_FILES,
+    MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES,
+    MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES,
+    MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+    MODEL_BUILDER_INVALIDATION_LOCAL_FILES,
+    MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS,
+    MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES,
+    MODEL_BUILDER_INVALIDATION_REMOTE_FILES,
+    MODEL_BUILDER_INVALIDATION_STOPPED_FILES,
+    MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
+    MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES,
+    PerformanceDiagnosticsCollector,
+)
 
 
 class TestModelBuilder(unittest.TestCase):
@@ -4660,6 +4684,124 @@ class TestModelBuilder(unittest.TestCase):
         # Invalidates when the active overlay is cleared after previously being populated
         self.model_builder.set_active_files([])
         self.assertTrue(self.model_builder.has_changes())
+
+    def test_cache_invalidation_counters_are_fixed_and_count_changed_inputs(self):
+        enabled = [True]
+        diagnostics = PerformanceDiagnosticsCollector(lambda: enabled[0])
+        self.model_builder.set_performance_diagnostics(diagnostics)
+
+        self.model_builder.set_local_files([SystemFile("local", 10)])
+        self.model_builder.set_local_files([SystemFile("local", 10)])
+        self.model_builder.set_local_files([SystemFile("local", 11)])
+
+        self.model_builder.set_remote_files([SystemFile("remote", 10)])
+        self.model_builder.set_remote_files([SystemFile("remote", 10)])
+        self.model_builder.set_remote_files([SystemFile("remote", 11)])
+
+        self.model_builder.set_active_files([SystemFile("active", 10)])
+        self.model_builder.set_active_files([SystemFile("active", 10)])
+
+        status = LftpJobStatus(3, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "status", "flags")
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_lftp_statuses([
+            LftpJobStatus(3, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "status", "flags")
+        ])
+        changed_status = LftpJobStatus(3, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "status", "flags")
+        self.model_builder.set_lftp_statuses([changed_status])
+
+        self.model_builder.set_unknown_local_path_pair_ids({None})
+        self.model_builder.set_unknown_local_path_pair_ids({None})
+        self.model_builder.set_unknown_local_path_pair_ids({"movies"})
+
+        self.model_builder.set_local_root_paths({None: "/local"})
+        self.model_builder.set_downloaded_files({"downloaded"})
+        self.model_builder.set_downloaded_files({"downloaded"})
+        self.model_builder.set_downloaded_timestamps({"downloaded": 1.0})
+        self.model_builder.set_extract_statuses([
+            ExtractStatus("archive", False, ExtractStatus.State.EXTRACTING)
+        ])
+        self.model_builder.set_extracted_files({"archive"})
+        self.model_builder.set_stopped_files({"stopped"})
+        self.model_builder.set_move_failed_files({"failed"})
+        self.model_builder.set_final_move_succeeded_files({"succeeded"})
+        self.model_builder.set_validation_statuses([
+            ValidateStatus("validated", ModelFile.State.VALIDATING)
+        ])
+        self.model_builder.request_rebuild()
+
+        enabled[0] = False
+        self.model_builder.set_remote_files([SystemFile("remote", 12)])
+        enabled[0] = True
+        counters = diagnostics.snapshot()["counters"]
+
+        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_LOCAL_FILES])
+        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_REMOTE_FILES])
+        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_ACTIVE_FILES])
+        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_LFTP_STATUSES])
+        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_EXTRACTED_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_STOPPED_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES])
+        self.model_builder.clear()
+        counters = diagnostics.snapshot()["counters"]
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_CLEAR])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_EXPLICIT])
+        diagnostics.increment("model_builder_cache_invalidation:/private/path")
+        self.assertNotIn("model_builder_cache_invalidation:/private/path", diagnostics.snapshot()["counters"])
+
+    def test_setter_durations_are_recorded_and_fail_closed(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(diagnostics)
+
+        self.model_builder.set_local_files([])
+        self.model_builder.set_remote_files([])
+        self.model_builder.set_active_files([])
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_stopped_files(set())
+
+        durations = diagnostics.snapshot()["durations"]
+        metrics = (
+            DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
+            DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+            DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
+            DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+            DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
+        )
+        for metric in metrics:
+            self.assertEqual(1, durations[metric]["count"])
+            self.assertGreaterEqual(durations[metric]["total_wall_seconds"], 0.0)
+
+        disabled = PerformanceDiagnosticsCollector(lambda: False)
+        disabled_builder = ModelBuilder()
+        disabled_builder.set_performance_diagnostics(disabled)
+        disabled_builder.set_local_files([])
+        disabled_builder.set_remote_files([])
+        disabled_builder.set_active_files([])
+        disabled_builder.set_lftp_statuses([])
+        disabled_builder.set_stopped_files(set())
+        self.assertEqual({}, disabled.snapshot()["durations"])
+
+        class FailingDiagnostics:
+            @staticmethod
+            def begin_duration(_metric):
+                raise RuntimeError("diagnostic begin failure")
+
+            @staticmethod
+            def finish_duration(_metric, _started_at):
+                raise RuntimeError("diagnostic finish failure")
+
+        self.model_builder.set_performance_diagnostics(FailingDiagnostics())
+        self.model_builder.set_local_files([])
+        self.model_builder.set_remote_files([])
+        self.model_builder.set_active_files([])
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.set_stopped_files(set())
 
     def test_rebuild_on_local_files(self):
         self.assertTrue(self.model_builder.has_changes())

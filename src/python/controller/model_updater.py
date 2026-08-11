@@ -25,6 +25,10 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
+    MODEL_REBUILD_REASON_COLLISION_RETRY,
+    MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
+    MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
+    MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION,
 )
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
@@ -45,6 +49,119 @@ if TYPE_CHECKING:
 
 _ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
 _IDLE_LFTP_STATUS_POLL_INTERVAL = timedelta(seconds=1)
+
+_MODEL_REBUILD_REASON_COUNTERS = {
+    MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION: "model_rebuild_terminalizable_collision",
+    MODEL_REBUILD_REASON_MOVE_RETRY_DUE: "model_rebuild_move_retry_due",
+    MODEL_REBUILD_REASON_COLLISION_RETRY: "model_rebuild_collision_retry",
+    MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING: "model_rebuild_deferred_move_pending",
+}
+
+
+class _MoveRetryRebuildGate:
+    """Edge-trigger rebuild requests for durable, due move-failure markers."""
+
+    def __init__(self) -> None:
+        self.__disarmed: set[str] = set()
+        self.__marker_tokens: dict[str, tuple[int, Optional[datetime]]] = {}
+        self.__deferred_recovery_disarmed: set[str] = set()
+        self.__deferred_recovery_tokens: dict[str, tuple[int, Optional[datetime]]] = {}
+
+    def reset(self, file_id: str) -> None:
+        """Forget all lifecycle state when a persisted marker is cleared."""
+        if not isinstance(file_id, str):
+            return
+        self.__disarmed.discard(file_id)
+        self.__marker_tokens.pop(file_id, None)
+        self.__deferred_recovery_disarmed.discard(file_id)
+        self.__deferred_recovery_tokens.pop(file_id, None)
+
+    def record_attempt(self, file_id: str, consume_budget: bool) -> None:
+        """Keep a deferred unchanged marker disarmed until its token changes."""
+        if not consume_budget and isinstance(file_id, str):
+            self.__disarmed.add(file_id)
+
+    def due_ids(
+        self,
+        failure_counts: dict[str, int],
+        retry_due: dict[str, datetime],
+        max_failures: int,
+        now: datetime,
+    ) -> list[str]:
+        self.__disarmed.intersection_update(failure_counts)
+        self.__marker_tokens = {
+            file_id: token for file_id, token in self.__marker_tokens.items()
+            if file_id in failure_counts
+        }
+        due: list[str] = []
+        for file_id, count in failure_counts.items():
+            if type(file_id) is not str or type(count) is not int or not 0 < count < max_failures:
+                self.__disarmed.discard(file_id)
+                self.__marker_tokens.pop(file_id, None)
+                continue
+            due_at = retry_due.get(file_id)
+            token_due = due_at if isinstance(due_at, datetime) else None
+            token = (count, token_due)
+            if self.__marker_tokens.get(file_id) != token:
+                self.__disarmed.discard(file_id)
+            self.__marker_tokens[file_id] = token
+            if isinstance(due_at, datetime) and due_at > now:
+                # A failed attempt re-arms this identity for its next due edge.
+                self.__disarmed.discard(file_id)
+                continue
+            if file_id not in self.__disarmed:
+                due.append(file_id)
+                self.__disarmed.add(file_id)
+        return due
+
+    def deferred_recovery_ids(
+        self,
+        failure_counts: dict[str, int],
+        retry_due: dict[str, datetime],
+        deferred_file_ids: set[str],
+        pending_file_ids: set[str],
+        max_failures: int,
+        now: datetime,
+    ) -> list[str]:
+        """Edge-trigger recovery rebuilds for unchanged deferred markers."""
+        eligible_ids = deferred_file_ids.intersection(pending_file_ids)
+        self.__deferred_recovery_disarmed.intersection_update(eligible_ids)
+        self.__deferred_recovery_tokens = {
+            file_id: token for file_id, token in self.__deferred_recovery_tokens.items()
+            if file_id in eligible_ids
+        }
+        recovery_ids: list[str] = []
+        for file_id in eligible_ids:
+            count = failure_counts.get(file_id, 0)
+            if type(file_id) is not str or type(count) is not int or not 0 <= count < max_failures:
+                self.__deferred_recovery_disarmed.discard(file_id)
+                self.__deferred_recovery_tokens.pop(file_id, None)
+                continue
+            due_at = retry_due.get(file_id)
+            token_due = due_at if isinstance(due_at, datetime) else None
+            token = (count, token_due)
+            if self.__deferred_recovery_tokens.get(file_id) != token:
+                self.__deferred_recovery_disarmed.discard(file_id)
+            self.__deferred_recovery_tokens[file_id] = token
+            if isinstance(due_at, datetime) and due_at > now:
+                self.__deferred_recovery_disarmed.discard(file_id)
+                continue
+            if file_id not in self.__deferred_recovery_disarmed:
+                recovery_ids.append(file_id)
+                self.__deferred_recovery_disarmed.add(file_id)
+        return recovery_ids
+
+
+def _request_model_rebuild(model_builder: ModelBuilder, diagnostics: object, reason: str) -> None:
+    """Invalidate the builder and increment one fixed, bounded reason counter."""
+    model_builder.request_rebuild()
+    counter = _MODEL_REBUILD_REASON_COUNTERS.get(reason)
+    if counter is None:
+        return
+    try:
+        diagnostics.increment(counter)
+    except Exception:
+        pass
 
 
 class _ModelUpdateStageTimer:
@@ -93,6 +210,7 @@ class _ProgressiveScanAccumulator:
         self.__authoritative: dict[tuple[Optional[str], str], Optional[SystemFile]] = {}
         self.__incomplete_pairs: set[Optional[str]] = set()
         self.__completed_pairs: set[Optional[str]] = set()
+        self.__session_has_progressive_evidence = False
 
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
@@ -108,6 +226,12 @@ class _ProgressiveScanAccumulator:
         self.__incomplete_pairs.clear()
         self.__authoritative.clear()
         self.__completed_pairs.clear()
+        self.__session_has_progressive_evidence = False
+
+    @property
+    def session_token(self) -> Optional[str]:
+        """Return the scanner process identity currently bound to this state."""
+        return self.__session_token
 
     @staticmethod
     def __pair_for_file(file: SystemFile, result: ScannerResult) -> Optional[str]:
@@ -188,6 +312,8 @@ class _ProgressiveScanAccumulator:
                 return None
             if latest.failed:
                 return latest
+            if latest.files:
+                self.__session_has_progressive_evidence = True
             for pair_id in selected_ids:
                 self.__active_generation[pair_id] = latest_generation
                 self.__completed_pairs.add(pair_id)
@@ -209,6 +335,11 @@ class _ProgressiveScanAccumulator:
         accepted = [event for event in accepted if event is not None]
         if not accepted:
             return None
+        if any(
+            not event.failed and bool(event.files)
+            for event in accepted
+        ):
+            self.__session_has_progressive_evidence = True
         latest = accepted[-1]
         malformed: list[str] = []
         managed: list[str] = []
@@ -358,6 +489,10 @@ class _ProgressiveScanAccumulator:
     def completed_pairs(self) -> set[Optional[str]]:
         return set(self.__completed_pairs)
 
+    def has_session_progressive_evidence(self) -> bool:
+        """Return whether this session supplied non-empty scan evidence."""
+        return self.__session_has_progressive_evidence
+
 
 class _JointProgressiveReconciler:
     """Gate new roots until local and remote evidence agree for that root."""
@@ -493,7 +628,10 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         if not isinstance(accumulator, _ProgressiveScanAccumulator):
             accumulator = _ProgressiveScanAccumulator()
             setattr(controller, state_name, accumulator)
-        accumulator.set_session_token(getattr(process, "session_token", None))
+        session_token = getattr(process, "session_token", None)
+        if accumulator.session_token is not None and accumulator.session_token != session_token:
+            setattr(controller, "_Controller__progressive_scan_session_changed", True)
+        accumulator.set_session_token(session_token)
         return accumulator.apply(events)
     pop_latest = getattr(process, "pop_latest_result", None)
     return pop_latest() if callable(pop_latest) else None
@@ -995,6 +1133,7 @@ class ModelUpdater(_ControllerCoreAccess):
 
     def _update_once_impl(self, stage_timer: _ModelUpdateStageTimer) -> bool:
         controller = self._controller
+        diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
         model_builder = controller._Controller__model_builder
         persist = controller._Controller__persist
         model = controller._Controller__model
@@ -1054,6 +1193,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__next_active_scan_force_at = None
         if not hasattr(controller, "_Controller__move_retry_due"):
             controller._Controller__move_retry_due = {}
+        if not hasattr(controller, "_Controller__move_retry_rebuild_gate"):
+            controller._Controller__move_retry_rebuild_gate = _MoveRetryRebuildGate()
         if not hasattr(controller, "_Controller__deferred_move_file_ids"):
             controller._Controller__deferred_move_file_ids = set()
         if not hasattr(controller, "_Controller__move_attempt_reservations"):
@@ -1064,6 +1205,16 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__last_remote_reconciliation_healthy = False
         if not hasattr(controller, "_Controller__last_local_reconciliation_healthy"):
             controller._Controller__last_local_reconciliation_healthy = False
+        # Progressive scans stream their first authoritative baseline so a
+        # new controller/session can populate the model promptly.  Once that
+        # baseline exists, partial refresh chunks stay in the reconciler until
+        # both sides reach their authority boundary; active LFTP/status inputs
+        # continue to update the builder independently below.
+        if not hasattr(controller, "_Controller__progressive_joint_authoritative"):
+            controller._Controller__progressive_joint_authoritative = False
+        if not hasattr(controller, "_Controller__progressive_joint_first_publication"):
+            controller._Controller__progressive_joint_first_publication = False
+        controller._Controller__progressive_scan_session_changed = False
 
         stage_timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
         # Grab the latest scan results.
@@ -1073,8 +1224,12 @@ class ModelUpdater(_ControllerCoreAccess):
         progressive_mode = bool(getattr(controller, "_Controller__progressive_joint_mode", False)) or \
             bool(getattr(latest_remote_scan, "is_progress", False)) or \
             bool(getattr(latest_local_scan, "is_progress", False))
+        progressive_scan_event_arrived = latest_remote_scan is not None or latest_local_scan is not None
         if progressive_mode:
             controller._Controller__progressive_joint_mode = True
+        if getattr(controller, "_Controller__progressive_scan_session_changed", False):
+            controller._Controller__progressive_joint_authoritative = False
+            controller._Controller__progressive_joint_first_publication = False
         joint_reconciler = getattr(controller, "_Controller__progressive_joint_reconciler", None)
         if progressive_mode and not isinstance(joint_reconciler, _JointProgressiveReconciler):
             joint_reconciler = _JointProgressiveReconciler()
@@ -1090,32 +1245,57 @@ class ModelUpdater(_ControllerCoreAccess):
             ids = set(getattr(result, "scanned_path_pair_ids", {None}))
             return snapshot, dict(snapshot), set(getattr(result, "unknown_path_pair_ids", set())), ids
 
+        def side_has_session_progressive_evidence(side: str, result: Optional[ScannerResult]) -> bool:
+            accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
+            if isinstance(accumulator, _ProgressiveScanAccumulator):
+                return accumulator.has_session_progressive_evidence()
+            if result is None or bool(getattr(result, "failed", False)):
+                return False
+            return bool(getattr(result, "files", ()))
+
         joint_local_files: list[SystemFile] = []
         joint_remote_files: list[SystemFile] = []
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
         if progressive_mode and joint_reconciler is not None:
-            local_snapshot, local_authority, local_incomplete, local_completed = side_state("local", latest_local_scan)
-            remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state("remote", latest_remote_scan)
-            remote_snapshot, remote_authority, joint_remote_excluded_keys = _filter_progressive_remote_state(
-                remote_snapshot,
-                remote_authority,
-                self._get_exclude_patterns(controller),
-            )
-            enabled_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
-            if not enabled_pair_ids:
-                enabled_pair_ids = {None}
-            joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
-                local_snapshot, local_authority, local_incomplete,
-                local_completed,
-                remote_snapshot, remote_authority, remote_incomplete,
-                remote_completed,
-                enabled_pair_ids,
-                joint_remote_excluded_keys,
-            )
+            # Standing authority is already represented by the builder after
+            # a progressive final publication.  Do not walk every retained
+            # root or re-submit the same file lists on idle ticks; a later
+            # event still re-enters reconciliation against the standing side.
+            if progressive_scan_event_arrived or not bool(
+                    getattr(controller, "_Controller__progressive_joint_authoritative", False)):
+                local_snapshot, local_authority, local_incomplete, local_completed = side_state(
+                    "local", latest_local_scan
+                )
+                remote_snapshot, remote_authority, remote_incomplete, remote_completed = side_state(
+                    "remote", latest_remote_scan
+                )
+                remote_snapshot, remote_authority, joint_remote_excluded_keys = _filter_progressive_remote_state(
+                    remote_snapshot,
+                    remote_authority,
+                    self._get_exclude_patterns(controller),
+                )
+                enabled_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
+                if not enabled_pair_ids:
+                    enabled_pair_ids = {None}
+                joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
+                    local_snapshot, local_authority, local_incomplete,
+                    local_completed,
+                    remote_snapshot, remote_authority, remote_incomplete,
+                    remote_completed,
+                    enabled_pair_ids,
+                    joint_remote_excluded_keys,
+                )
 
         def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
-            """Return whether this side has a complete, authoritative view."""
+            """Return whether this side has a complete, authoritative view.
+
+            Local and remote scanners intentionally run at independent
+            cadences (24h and 120s in the production-shaped configuration).
+            A completed accumulator therefore remains standing authority until
+            a new generation for that same side marks it incomplete; the two
+            sides must not be coupled by generation number.
+            """
             if result is not None:
                 return bool(getattr(result, "is_scan_final", True)) \
                     and not bool(getattr(result, "failed", False)) \
@@ -1130,7 +1310,47 @@ class ModelUpdater(_ControllerCoreAccess):
         remote_scan_final_relevant = scan_final_relevant("remote", latest_remote_scan)
         local_scan_final_relevant = scan_final_relevant("local", latest_local_scan)
         joint_reconciliation_final = remote_scan_final_relevant and local_scan_final_relevant \
-            and not joint_unknown_local_ids
+            and not joint_unknown_local_ids \
+            and (not progressive_mode or progressive_scan_event_arrived)
+        progressive_joint_first_partial_publication = (
+            progressive_mode
+            and not joint_reconciliation_final
+            and not bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
+            and not bool(getattr(controller, "_Controller__progressive_joint_first_publication", False))
+            and bool(joint_local_files)
+            and bool(joint_remote_files)
+            and side_has_session_progressive_evidence("local", latest_local_scan)
+            and side_has_session_progressive_evidence("remote", latest_remote_scan)
+        )
+        progressive_joint_publication_allowed = (
+            not progressive_mode
+            or (
+                progressive_scan_event_arrived
+                and (joint_reconciliation_final or progressive_joint_first_partial_publication)
+            )
+        )
+
+        def scan_generation(result: ScannerResult) -> int:
+            try:
+                return int(getattr(result, "generation", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        def scan_pair_count(result: ScannerResult, field_name: str) -> int:
+            values = getattr(result, field_name, ())
+            try:
+                return len(values)
+            except TypeError:
+                return 0
+
+        # Report the effective authority for this tick.  A final progressive
+        # result becomes authoritative immediately after this publication
+        # bracket, so expose that outcome in the breadcrumb without retaining
+        # any file identity or path data.
+        joint_authoritative_for_breadcrumb = (
+            bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
+            or (progressive_mode and joint_reconciliation_final)
+        )
 
         stage_timer.switch(DURATION_MODEL_UPDATE_STATUS_INGESTION)
         # Grab the Lftp status.
@@ -1138,6 +1358,7 @@ class ModelUpdater(_ControllerCoreAccess):
         lftp_status_poll_healthy = True
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
+        recovering_from_unhealthy_poll = False
         now = datetime.now()
         current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
         lftp_status_poll_due = (
@@ -1180,12 +1401,6 @@ class ModelUpdater(_ControllerCoreAccess):
                         _ACTIVE_LFTP_STATUS_POLL_INTERVAL if active_transfer
                         else _IDLE_LFTP_STATUS_POLL_INTERVAL
                     )
-                    # Fresh health is new arbitration evidence even when the
-                    # returned status list is still empty.  Rebuild once on
-                    # recovery so a pending collision can be terminalized;
-                    # steady idle polls remain cache-only.
-                    if recovering_from_unhealthy_poll:
-                        model_builder.request_rebuild()
                     lftp_status_source = "fresh_healthy"
                 else:
                     controller._Controller__lftp_status_poll_retry_active = True
@@ -1331,6 +1546,16 @@ class ModelUpdater(_ControllerCoreAccess):
                     "file_count": len(remote_files),
                     "failed": remote_scan_failed,
                     "error_message": latest_remote_scan.error_message,
+                    "is_progress": bool(getattr(latest_remote_scan, "is_progress", False)),
+                    "is_scan_final": bool(getattr(latest_remote_scan, "is_scan_final", True)),
+                    "generation": scan_generation(latest_remote_scan),
+                    "scanned_pair_count": scan_pair_count(latest_remote_scan, "scanned_path_pair_ids"),
+                    "completed_pair_count": scan_pair_count(latest_remote_scan, "completed_path_pair_ids"),
+                    "unknown_pair_count": scan_pair_count(latest_remote_scan, "unknown_path_pair_ids"),
+                    "joint_publication_allowed": progressive_joint_publication_allowed,
+                    "joint_authoritative": joint_authoritative_for_breadcrumb,
+                    "joint_local_root_count": len(joint_local_files),
+                    "joint_remote_root_count": len(joint_remote_files),
                 },
                 event_type="failure" if remote_scan_failed else "state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
@@ -1368,6 +1593,16 @@ class ModelUpdater(_ControllerCoreAccess):
                 details={
                     "file_count": len(latest_local_scan.files),
                     "managed_extract_file_count": len(recovered_extracted_file_ids),
+                    "is_progress": bool(getattr(latest_local_scan, "is_progress", False)),
+                    "is_scan_final": bool(getattr(latest_local_scan, "is_scan_final", True)),
+                    "generation": scan_generation(latest_local_scan),
+                    "scanned_pair_count": scan_pair_count(latest_local_scan, "scanned_path_pair_ids"),
+                    "completed_pair_count": scan_pair_count(latest_local_scan, "completed_path_pair_ids"),
+                    "unknown_pair_count": scan_pair_count(latest_local_scan, "unknown_path_pair_ids"),
+                    "joint_publication_allowed": progressive_joint_publication_allowed,
+                    "joint_authoritative": joint_authoritative_for_breadcrumb,
+                    "joint_local_root_count": len(joint_local_files),
+                    "joint_remote_root_count": len(joint_remote_files),
                 },
                 event_type="state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_local_scan.files, "local_scan"),
@@ -1378,17 +1613,26 @@ class ModelUpdater(_ControllerCoreAccess):
             if local_scan_failed and not unknown_local_ids:
                 unknown_local_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
             setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-            if callable(setter_unknown_local):
+            # The joint publication below owns this overlay for progressive
+            # scans.  Keeping the legacy setter here would apply the same
+            # value twice on every final tick (and would bypass the partial
+            # publication gate).
+            if callable(setter_unknown_local) and not progressive_mode:
                 setter_unknown_local(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
-            model_builder.set_local_files(joint_local_files)
-            model_builder.set_remote_files(joint_remote_files)
-            setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-            if callable(setter_unknown_local):
-                setter_unknown_local(joint_unknown_local_ids)
+            if progressive_joint_publication_allowed:
+                model_builder.set_local_files(joint_local_files)
+                model_builder.set_remote_files(joint_remote_files)
+                setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
+                if callable(setter_unknown_local):
+                    setter_unknown_local(joint_unknown_local_ids)
+                if progressive_joint_first_partial_publication:
+                    controller._Controller__progressive_joint_first_publication = True
             if joint_reconciliation_final:
                 controller._Controller__last_local_reconciliation_healthy = True
                 controller._Controller__last_remote_reconciliation_healthy = True
+                controller._Controller__progressive_joint_first_publication = True
+                controller._Controller__progressive_joint_authoritative = True
         healthy_local_ids: set[str | None] = set()
         healthy_remote_ids: set[str | None] = set()
         if latest_local_scan is not None and not bool(getattr(latest_local_scan, "failed", False)) and \
@@ -1577,6 +1821,23 @@ class ModelUpdater(_ControllerCoreAccess):
         # complete, actionable cached collision so pre-diff terminalization
         # can publish MOVE_FAILED; terminal/stopped/live/incomplete roots do
         # not keep waking the idle loop.
+        retry_now = datetime.now()
+        if recovering_from_unhealthy_poll and lftp_status_poll_healthy and \
+                lftp_status_snapshot_fresh and lftp_status_source == "fresh_healthy":
+            deferred_recovery_ids = controller._Controller__move_retry_rebuild_gate.deferred_recovery_ids(
+                persist.move_failure_counts,
+                controller._Controller__move_retry_due,
+                set(getattr(controller, "_Controller__deferred_move_file_ids", set())),
+                pending_completion_ids,
+                getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4),
+                retry_now,
+            )
+            if deferred_recovery_ids:
+                _request_model_rebuild(
+                    model_builder,
+                    diagnostics,
+                    MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
+                )
         if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                 lftp_status_source == "fresh_healthy":
             live_lftp_file_ids = {status.file_id for status in (lftp_statuses or [])}
@@ -1596,19 +1857,25 @@ class ModelUpdater(_ControllerCoreAccess):
                             collision_file.path_pair_id,
                         ):
                     continue
-                model_builder.request_rebuild()
+                _request_model_rebuild(
+                    model_builder,
+                    diagnostics,
+                    MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION,
+                )
                 break
 
-        retry_now = datetime.now()
-        if any(
-            0 < count < controller._Controller__MAX_MOVE_FAILURES
-            and (
-                file_id not in controller._Controller__move_retry_due
-                or controller._Controller__move_retry_due[file_id] <= retry_now
-            )
-            for file_id, count in persist.move_failure_counts.items()
-        ):
-            model_builder.request_rebuild()
+        due_retry_ids = controller._Controller__move_retry_rebuild_gate.due_ids(
+            persist.move_failure_counts,
+            controller._Controller__move_retry_due,
+            getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4),
+            retry_now,
+        )
+        if due_retry_ids:
+            unresolved_collision_ids = set(model_builder.get_unresolved_staging_collision_file_ids())
+            reason = MODEL_REBUILD_REASON_COLLISION_RETRY if any(
+                file_id in unresolved_collision_ids for file_id in due_retry_ids
+            ) else MODEL_REBUILD_REASON_MOVE_RETRY_DUE
+            _request_model_rebuild(model_builder, diagnostics, reason)
 
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILD_FINALIZATION)
         # Build the new model, if needed.
@@ -1768,6 +2035,10 @@ class ModelUpdater(_ControllerCoreAccess):
                         })
                     else:
                         controller._Controller__deferred_move_file_ids.add(file.file_id)
+                    controller._Controller__move_retry_rebuild_gate.record_attempt(
+                        file.file_id,
+                        consume_budget,
+                    )
                     controller.logger.warning(
                         "Keeping download completion pending after failed staging move: %s",
                         file.file_id,
@@ -1782,6 +2053,7 @@ class ModelUpdater(_ControllerCoreAccess):
                         current_process_publication: bool = False):
                     controller._record_download_completion(file)
                     persist.move_failure_counts.pop(file.file_id, None)
+                    controller._Controller__move_retry_rebuild_gate.reset(file.file_id)
                     controller._Controller__deferred_move_file_ids.discard(file.file_id)
                     controller._Controller__move_retry_due.pop(file.file_id, None)
                     model_builder.set_move_failed_files({
@@ -2183,6 +2455,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     if stale_move_failure_ids:
                         for file_id in stale_move_failure_ids:
                             persist.move_failure_counts.pop(file_id, None)
+                            controller._Controller__move_retry_rebuild_gate.reset(file_id)
                             controller._Controller__move_retry_due.pop(file_id, None)
                             controller._Controller__deferred_move_file_ids.discard(file_id)
                         with controller._Controller__move_attempt_lock:

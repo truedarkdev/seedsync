@@ -4,6 +4,7 @@ import unittest
 import inspect
 import multiprocessing
 import logging
+import pickle
 import queue
 from collections import deque
 from datetime import datetime
@@ -15,8 +16,15 @@ import pytest
 
 from common import MultiprocessingLogger
 from common.breadcrumb_trace import BreadcrumbTraceCollector
+from common.performance_diagnostics import (
+    DURATION_REMOTE_SCAN_AGGREGATION,
+    DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
+    DURATION_REMOTE_SCAN_STREAM_PARSING,
+    DURATION_REMOTE_SCAN_TRANSPORT_READ,
+    PerformanceDiagnosticsCollector,
+)
 from controller import IScanner, ScannerProcess, ScannerError
-from controller.scan import MultiPathRemoteScanner
+from controller.scan import MultiPathRemoteScanner, RemoteScanner
 from controller.scan.scanner_process import (
     ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _publish_bounded_result,
     _run_scanner_once,
@@ -185,6 +193,34 @@ class FatalStatefulRecycledScanner(StatefulRecycledScanner):
         raise ScannerError("fatal stateful child error", recoverable=False)
 
 
+class DiagnosticRecycledScanner(DummyScanner):
+    path_pair_id = "pair"
+    path_pair_name = "Pair"
+
+    def __init__(self):
+        self.__diagnostics = None
+
+    def set_performance_diagnostics(self, diagnostics):
+        self.__diagnostics = diagnostics
+
+    def scan(self):
+        for metric in (
+            DURATION_REMOTE_SCAN_TRANSPORT_READ,
+            DURATION_REMOTE_SCAN_STREAM_PARSING,
+            DURATION_REMOTE_SCAN_AGGREGATION,
+            DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
+        ):
+            started = self.__diagnostics.begin_duration(metric)
+            self.__diagnostics.finish_duration(metric, started)
+        return [SystemFile("diagnostic", 1)]
+
+
+class DelayedDiagnosticRecycledScanner(DiagnosticRecycledScanner):
+    def scan(self):
+        time.sleep(0.4)
+        return super().scan()
+
+
 class _InspectingWakeEvent:
     def __init__(self):
         self.run_loop_locals: set[str] = set()
@@ -273,6 +309,14 @@ class TestScannerProcess(unittest.TestCase):
         if self.process:
             self.process.terminate()
 
+    def _wait_for_recycled_worker(self):
+        deadline = time.monotonic() + 8
+        while self.process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            self.process.run_loop()
+            time.sleep(0.01)
+        self.assertIsNone(self.process._ScannerProcess__scan_worker)
+        self.assertIsNotNone(self.process.pop_latest_result())
+
     def test_real_spawn_with_production_breadcrumb_and_log_transport(self):
         self._scan_run_patcher.stop()
         collector = BreadcrumbTraceCollector(lambda: True)
@@ -307,6 +351,134 @@ class TestScannerProcess(unittest.TestCase):
             self.process.close_queues()
             self.process = None
             mp_logger.stop()
+
+    def test_spawned_remote_duration_aggregates_reach_parent_collector(self):
+        self._scan_run_patcher.stop()
+        collector = PerformanceDiagnosticsCollector(lambda: True, sample_interval_seconds=1)
+        self.process = ScannerProcess(
+            scanner=DiagnosticRecycledScanner(),
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+            performance_diagnostics=collector,
+        )
+
+        self.process.run_loop()
+        deadline = time.monotonic() + 8
+        while self.process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            self.process.run_loop()
+            time.sleep(0.01)
+        self.assertIsNone(self.process._ScannerProcess__scan_worker)
+        self.assertIsNotNone(self.process.pop_latest_result())
+
+        self.assertTrue(collector.sample_if_due())
+        sample = collector.snapshot()["samples"][-1]
+        metrics = sample["stage_window"]["metrics"]
+        for metric in (
+            DURATION_REMOTE_SCAN_TRANSPORT_READ,
+            DURATION_REMOTE_SCAN_STREAM_PARSING,
+            DURATION_REMOTE_SCAN_AGGREGATION,
+            DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
+        ):
+            self.assertEqual(1, metrics[metric]["count"])
+
+    def test_remote_scanner_spawn_pickle_strips_parent_collector(self):
+        collector = PerformanceDiagnosticsCollector(lambda: True)
+        first = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password=None,
+            remote_port=22,
+            remote_path_to_scan="/remote",
+            local_path_to_scan_script="/scanfs",
+            remote_path_to_scan_script="/scanfs",
+            performance_diagnostics=collector,
+        )
+        second = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password=None,
+            remote_port=22,
+            remote_path_to_scan="/remote-two",
+            local_path_to_scan_script="/scanfs",
+            remote_path_to_scan_script="/scanfs",
+            performance_diagnostics=collector,
+        )
+
+        restored = pickle.loads(pickle.dumps(MultiPathRemoteScanner(
+            [first, second], performance_diagnostics=collector,
+        )))
+
+        self.assertIsNone(restored._MultiPathRemoteScanner__performance_diagnostics)
+        for scanner in restored._MultiPathRemoteScanner__scanners:
+            self.assertIsNone(scanner._RemoteScanner__performance_diagnostics)
+            self.assertIsNone(scanner._RemoteScanner__ssh._Sshcp__performance_diagnostics)
+
+    def test_disabled_spawned_remote_diagnostics_are_isolated(self):
+        self._scan_run_patcher.stop()
+        collector = PerformanceDiagnosticsCollector(lambda: False, sample_interval_seconds=1)
+        self.process = ScannerProcess(
+            scanner=DiagnosticRecycledScanner(),
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+            performance_diagnostics=collector,
+        )
+
+        self.process.run_loop()
+        deadline = time.monotonic() + 8
+        while self.process._ScannerProcess__scan_worker is not None and time.monotonic() < deadline:
+            self.process.run_loop()
+            time.sleep(0.01)
+        self.assertIsNone(self.process._ScannerProcess__scan_worker)
+        self.assertIsNotNone(self.process.pop_latest_result())
+        self.assertFalse(collector.sample_if_due())
+        self.assertEqual([], collector.snapshot()["samples"])
+
+    def test_spawned_duration_aggregate_before_reset_is_fenced(self):
+        self._scan_run_patcher.stop()
+        collector = PerformanceDiagnosticsCollector(lambda: True, sample_interval_seconds=1)
+        self.process = ScannerProcess(
+            scanner=DelayedDiagnosticRecycledScanner(),
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+            performance_diagnostics=collector,
+        )
+        self.process.run_loop()
+        collector.reset()
+        self._wait_for_recycled_worker()
+        self.assertTrue(collector.sample_if_due())
+        metrics = collector.snapshot()["samples"][-1]["stage_window"]["metrics"]
+        self.assertEqual(0, metrics[DURATION_REMOTE_SCAN_STREAM_PARSING]["count"])
+
+        self.process.run_loop()
+        self._wait_for_recycled_worker()
+        self.assertTrue(collector.sample_if_due())
+        metrics = collector.snapshot()["samples"][-1]["stage_window"]["metrics"]
+        self.assertEqual(1, metrics[DURATION_REMOTE_SCAN_STREAM_PARSING]["count"])
+
+    def test_spawned_duration_aggregate_is_fenced_across_disable_reenable(self):
+        self._scan_run_patcher.stop()
+        enabled = [True]
+        collector = PerformanceDiagnosticsCollector(lambda: enabled[0], sample_interval_seconds=1)
+        self.process = ScannerProcess(
+            scanner=DelayedDiagnosticRecycledScanner(),
+            interval_in_ms=0,
+            verbose=False,
+            recycle_scan_worker=True,
+            performance_diagnostics=collector,
+        )
+        self.process.run_loop()
+        enabled[0] = False
+        self.assertFalse(collector.sample_if_due())
+        self.assertFalse(collector.snapshot()["enabled"])
+        enabled[0] = True
+        self.assertTrue(collector.snapshot()["enabled"])
+        self._wait_for_recycled_worker()
+        self.assertTrue(collector.sample_if_due())
+        metrics = collector.snapshot()["samples"][-1]["stage_window"]["metrics"]
+        self.assertEqual(0, metrics[DURATION_REMOTE_SCAN_STREAM_PARSING]["count"])
 
     def test_bounded_progress_queue_does_not_deadlock_on_burst_termination(self):
         self.process = ScannerProcess(

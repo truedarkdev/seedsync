@@ -101,7 +101,7 @@ class TestScanFsScript(unittest.TestCase):
         self.assertIn("SystemScannerError: Permission denied while scanning", str(context.exception.code))
         self.assertNotIn('"type": "complete"', stdout.getvalue())
 
-    def test_stream_flattens_a_large_recursive_root_into_bounded_node_records(self):
+    def test_stream_flattens_a_large_recursive_root_into_bounded_node_batches(self):
         for index in range(800):
             self._write_file("huge", "child-{:04d}-{}.bin".format(index, "x" * 80), content=b"")
 
@@ -116,7 +116,10 @@ class TestScanFsScript(unittest.TestCase):
         self.assertNotIn("roots", [payload["type"] for payload in payloads])
         root_start = next(payload for payload in payloads if payload["type"] == "root_begin")
         self.assertEqual("huge", root_start["name"])
-        nodes = [payload for payload in payloads if payload["type"] == "root_node"]
+        batches = [payload for payload in payloads if payload["type"] == "root_nodes"]
+        self.assertTrue(batches)
+        self.assertTrue(all(1 <= len(batch["nodes"]) <= 64 for batch in batches))
+        nodes = [node for batch in batches for node in batch["nodes"]]
         self.assertEqual(801, len(nodes))
         self.assertEqual("huge", nodes[0]["file"]["name"])
         self.assertNotIn("children", nodes[0]["file"])

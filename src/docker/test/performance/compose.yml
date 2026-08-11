@@ -1,0 +1,109 @@
+services:
+  fixture:
+    image: ${PERF_FIXTURE_IMAGE:-python:3.12-slim}
+    restart: "no"
+    volumes:
+      - type: volume
+        source: perf_local_fixture
+        target: /fixture/local
+      - type: volume
+        source: perf_remote_fixture
+        target: /fixture/remote
+      - type: bind
+        source: ${PERF_LAB_SOURCE_DIR:?PERF_LAB_SOURCE_DIR is required}
+        target: /lab
+        read_only: true
+      - type: bind
+        source: ${PERF_ARTIFACT_DIR:?PERF_ARTIFACT_DIR is required}
+        target: /artifacts
+    command:
+      - python3
+      - /lab/generate_fixture.py
+      - --local-root
+      - /fixture/local
+      - --remote-root
+      - /fixture/remote
+      - --manifest
+      - /artifacts/fixture-manifest.json
+      - --pairs
+      - "${PERF_PAIRS:-6}"
+      - --nodes-per-pair
+      - "${PERF_NODES_PER_PAIR:-32000}"
+
+  config_seed:
+    image: ${PERF_FIXTURE_IMAGE:-python:3.12-slim}
+    restart: "no"
+    volumes:
+      - type: volume
+        source: perf_config
+        target: /config
+      - type: bind
+        source: ${PERF_LAB_SOURCE_DIR:?PERF_LAB_SOURCE_DIR is required}
+        target: /lab
+        read_only: true
+    environment:
+      PERF_API_TOKEN: ${PERF_API_TOKEN:?PERF_API_TOKEN is required}
+    command:
+      - python3
+      - /lab/seed_config.py
+      - --config-dir
+      - /config
+      - --api-token
+      - "${PERF_API_TOKEN}"
+      - --pairs
+      - "${PERF_PAIRS:-6}"
+      - --breadcrumb-mode
+      - "${PERF_BREADCRUMB_MODE:-on}"
+      - --move-failure-mode
+      - "${PERF_MOVE_FAILURE_MODE:-stale}"
+
+  remote:
+    build:
+      context: ../../../../
+      dockerfile: src/docker/test/performance/remote.Dockerfile
+    image: ${PERF_REMOTE_IMAGE:-seedsync/performance-lab-remote:local}
+    depends_on:
+      fixture:
+        condition: service_completed_successfully
+    volumes:
+      - type: volume
+        source: perf_remote_fixture
+        target: /home/remoteuser/files
+    expose:
+      - "1234"
+
+  app:
+    image: ${PERF_IMAGE:?PERF_IMAGE must name the exact SeedSync image or candidate}
+    user: "99:100"
+    restart: "no"
+    shm_size: "64m"
+    pids_limit: 2048
+    depends_on:
+      config_seed:
+        condition: service_completed_successfully
+      fixture:
+        condition: service_completed_successfully
+      remote:
+        condition: service_started
+    environment:
+      SEEDSYNC_E2E_API_TOKEN: ${PERF_API_TOKEN}
+      SEEDSYNC_WEB_BIND_HOST: 0.0.0.0
+    ports:
+      - "127.0.0.1:${PERF_HOST_PORT:-18800}:8800"
+    volumes:
+      - type: volume
+        source: perf_config
+        target: /config
+      - type: volume
+        source: perf_local_fixture
+        target: /mounts
+      # Keep the historical path available for startup compatibility; seeded
+      # path pairs use /mounts/{path-pair-01,...,path-pair-06} only.
+      - type: volume
+        source: perf_local_fixture
+        target: /downloads
+
+volumes:
+  perf_config:
+  perf_local_fixture:
+  perf_remote_fixture:

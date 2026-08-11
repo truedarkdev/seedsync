@@ -47,6 +47,43 @@ class TestBreadcrumbTraceCollector(unittest.TestCase):
         self.assertFalse(snapshot["window_reset"])
         self.assertEqual(0, snapshot["version"])
 
+    def test_record_reads_enabled_gate_once(self):
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+
+        with patch.object(collector, "is_enabled", wraps=collector.is_enabled) as enabled_gate:
+            collector.record("controller", "start")
+
+        self.assertEqual(1, enabled_gate.call_count)
+
+    def test_record_bounds_external_queue_drain_cadence(self):
+        class FakeRecordQueue:
+            def __init__(self):
+                self.records = [
+                    {"source": "worker", "message": "queued-{}".format(index), "details": {}, "metadata": {}}
+                    for index in range(5)
+                ]
+
+            def get_nowait(self):
+                if not self.records:
+                    raise queue.Empty()
+                return self.records.pop(0)
+
+            def empty(self):
+                return not self.records
+
+        collector = BreadcrumbTraceCollector(lambda: True, max_entries=4)
+        collector._BreadcrumbTraceCollector__external_records = FakeRecordQueue()
+
+        with patch("common.breadcrumb_trace.time.monotonic", side_effect=(0.0, 0.05, 0.11)):
+            collector.record("controller", "local-1")
+            self.assertEqual(4, collector._BreadcrumbTraceCollector__external_queue_last_drain_count)
+            collector.record("controller", "local-2")
+            self.assertEqual(4, collector._BreadcrumbTraceCollector__external_queue_last_drain_count)
+            collector.record("controller", "local-3")
+            self.assertEqual(1, collector._BreadcrumbTraceCollector__external_queue_last_drain_count)
+
+        self.assertEqual(4, collector.snapshot()["entry_count"])
+
     def test_disabled_emitter_traffic_stays_bounded_without_retaining_raw_backlog(self):
         enabled = {"value": False}
         collector = BreadcrumbTraceCollector(lambda: enabled["value"], max_entries=2)

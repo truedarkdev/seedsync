@@ -430,6 +430,18 @@ class TestAutoQueue(unittest.TestCase):
 
         self.controller.get_model_files.assert_not_called()
 
+    def test_idle_process_emits_one_unchanged_cycle_breadcrumb(self):
+        auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
+
+        auto_queue.process()
+        auto_queue.process()
+
+        cycle_calls = [
+            call for call in self.context.breadcrumb_trace.record.call_args_list
+            if len(call.args) >= 2 and call.args[1] == "auto_queue_cycle"
+        ]
+        self.assertEqual(1, len(cycle_calls))
+
     def test_idle_process_keeps_deferred_lineage_without_snapshot(self):
         auto_queue = AutoQueue(self.context, AutoQueuePersist(), self.controller)
         deferred_file_id = "deferred-file"

@@ -88,7 +88,17 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
             "truncated": False,
             "visited_object_count": 3,
             "total_shallow_bytes": 120,
-            "owners": {"live_model_graph": {"object_count": 3, "shallow_bytes": 120}},
+            "graph_truncated": False,
+            "graph_visited_node_count": 2,
+            "owners": {
+                "live_model_graph": {
+                    "object_count": 3,
+                    "shallow_bytes": 120,
+                    "graph_node_count": 2,
+                    "graph_shallow_bytes": 96,
+                    "graph_truncated": False,
+                }
+            },
         }
 
         response = self.test_app.get("/server/admin/performance-diagnostics/v1/ownership")
@@ -96,6 +106,7 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
         payload = json.loads(response.body.decode("utf-8"))
         self.assertEqual("seedsync.memory-ownership-census.v1", payload["schema"])
         self.assertEqual(120, payload["total_shallow_bytes"])
+        self.assertEqual(2, payload["graph_visited_node_count"])
         self.assertNotIn("sensitive-test-string", response.text)
         self.controller.get_memory_ownership_census.assert_called_once_with()
 

@@ -1,0 +1,4 @@
+networks:
+  default:
+    external: true
+    name: ${PERF_EXTERNAL_NETWORK:?PERF_EXTERNAL_NETWORK must name an existing Docker network}

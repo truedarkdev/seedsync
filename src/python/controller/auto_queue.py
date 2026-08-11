@@ -233,6 +233,7 @@ class AutoQueue:
         self.__pair_auto_queue: dict[str, bool] = {}
         self.__queue_enabled = self.__enabled
         self.__cycle_sequence = 0
+        self.__idle_cycle_breadcrumb_recorded = False
         self.__deferred_remote_delete_file_ids: set[str] = set()
         # Files first observed while one root is still unreconciled may later
         # appear as DEFAULT -> DOWNLOADED solely because the other root caught
@@ -338,22 +339,26 @@ class AutoQueue:
                 or self.__model_listener.new_files
                 or self.__model_listener.modified_files
         ):
-            self.__record_breadcrumb(
-                "auto_queue_cycle",
-                {
-                    "cycle": self.__cycle_sequence,
-                    "new_queue_candidates": 0,
-                    "modified_queue_candidates": 0,
-                    "queue_count": 0,
-                    "extract_count": 0,
-                    "patterns_only": self.__patterns_only,
-                    "auto_extract_enabled": self.__auto_extract_enabled,
-                    "queue_blocked_reason_counts": {},
-                    "extract_blocked_reason_counts": {},
-                    "blocked_samples": [],
-                }
-            )
+            if not self.__idle_cycle_breadcrumb_recorded:
+                self.__record_breadcrumb(
+                    "auto_queue_cycle",
+                    {
+                        "cycle": self.__cycle_sequence,
+                        "new_queue_candidates": 0,
+                        "modified_queue_candidates": 0,
+                        "queue_count": 0,
+                        "extract_count": 0,
+                        "patterns_only": self.__patterns_only,
+                        "auto_extract_enabled": self.__auto_extract_enabled,
+                        "queue_blocked_reason_counts": {},
+                        "extract_blocked_reason_counts": {},
+                        "blocked_samples": [],
+                    }
+                )
+                self.__idle_cycle_breadcrumb_recorded = True
             return
+
+        self.__idle_cycle_breadcrumb_recorded = False
 
         try:
             current_files = self.__current_model_by_id()

@@ -14,6 +14,10 @@ import pexpect.popen_spawn
 
 # my libs
 from common import AppError
+from common.performance_diagnostics import (
+    DURATION_REMOTE_SCAN_TRANSPORT_READ,
+    PerformanceDiagnosticsCollector,
+)
 
 
 class SshcpError(AppError):
@@ -51,16 +55,47 @@ class Sshcp:
                  host: Optional[str],
                  port: int,
                  user: Optional[str] = None,
-                 password: Optional[str] = None):
+                 password: Optional[str] = None,
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         if host is None:
             raise ValueError("Hostname not specified.")
         self.__host = host
         self.__port = port
         self.__user = user
         self.__password = password
+        self.__performance_diagnostics = performance_diagnostics
         self.__detected_shell: Optional[str] = None
         self.__shell_detection_in_progress = False
         self.logger = logging.getLogger(self.__class__.__name__)
+
+    def set_performance_diagnostics(
+            self, diagnostics: object) -> None:
+        self.__performance_diagnostics = diagnostics
+
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_Sshcp__performance_diagnostics"] = None
+        return state
+
+    def __begin_duration(self) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(DURATION_REMOTE_SCAN_TRANSPORT_READ)
+        except Exception:
+            return None
+
+    def __finish_duration(self, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(DURATION_REMOTE_SCAN_TRANSPORT_READ, started_at)
+        except Exception:
+            pass
 
     def set_base_logger(self, base_logger: logging.Logger):
         self.logger = base_logger.getChild(self.__class__.__name__)
@@ -409,6 +444,7 @@ class Sshcp:
 
         start_time = time.time()
         sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        transport_started = self.__begin_duration()
         timeout_phase: str = "command execution"
         cleanup_exitstatus = None
         try:
@@ -478,6 +514,7 @@ class Sshcp:
                         cleanup_exitstatus = wait()
             except Exception:
                 self.logger.warning("Failed to clean up SSH child process", exc_info=True)
+            self.__finish_duration(transport_started)
         end_time = time.time()
 
         exitstatus = getattr(sp, "exitstatus", None)
@@ -590,6 +627,7 @@ class Sshcp:
         self.logger.debug("Command: {}".format(command_args))
         start_time = time.time()
         sp, _using_spawn_fallback = self.__spawn_process(command_args[0], command_args[1:])
+        transport_started = self.__begin_duration()
         timeout_phase = "command execution"
         output = bytearray()
         error_output = bytearray()
@@ -660,6 +698,7 @@ class Sshcp:
                         cleanup_exitstatus = wait()
             except Exception:
                 self.logger.warning("Failed to clean up SSH child process", exc_info=True)
+            self.__finish_duration(transport_started)
 
         exitstatus = getattr(sp, "exitstatus", None)
         if exitstatus is None:

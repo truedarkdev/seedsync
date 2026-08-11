@@ -33,12 +33,41 @@ DURATION_CONTROLLER_JOB = "controller_job"
 DURATION_CONTROLLER_PROCESS = "controller_process"
 DURATION_AUTO_QUEUE_PROCESS = "auto_queue_process"
 DURATION_MODEL_BUILD = "model_build"
+DURATION_MODEL_BUILDER_SET_LOCAL_FILES = "model_builder_set_local_files"
+DURATION_MODEL_BUILDER_SET_REMOTE_FILES = "model_builder_set_remote_files"
+DURATION_MODEL_BUILDER_SET_ACTIVE_FILES = "model_builder_set_active_files"
+DURATION_MODEL_BUILDER_SET_LFTP_STATUSES = "model_builder_set_lftp_statuses"
+DURATION_MODEL_BUILDER_SET_STOPPED_FILES = "model_builder_set_stopped_files"
 DURATION_MODEL_UPDATE_STATE_PREPARATION = "model_update_state_preparation"
 DURATION_MODEL_UPDATE_SCAN_INTAKE = "model_update_scan_intake"
 DURATION_MODEL_UPDATE_STATUS_INGESTION = "model_update_status_ingestion"
 DURATION_MODEL_UPDATE_BUILDER_SYNC = "model_update_builder_sync"
 DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE = "model_update_lifecycle_maintenance"
 DURATION_MODEL_UPDATE_BUILD_FINALIZATION = "model_update_build_finalization"
+# Fixed model-rebuild trigger names.  These are intentionally closed-world
+# labels: diagnostics must never accept caller-provided paths or identifiers.
+MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION = "terminalizable_collision"
+MODEL_REBUILD_REASON_MOVE_RETRY_DUE = "move_retry_due"
+MODEL_REBUILD_REASON_COLLISION_RETRY = "collision_retry"
+MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING = "deferred_move_pending"
+# Fixed ModelBuilder cache-invalidation sources.  These labels intentionally
+# carry no file, path-pair, or cardinality data.
+MODEL_BUILDER_INVALIDATION_LOCAL_FILES = "model_builder_cache_invalidation_local_files"
+MODEL_BUILDER_INVALIDATION_REMOTE_FILES = "model_builder_cache_invalidation_remote_files"
+MODEL_BUILDER_INVALIDATION_ACTIVE_FILES = "model_builder_cache_invalidation_active_files"
+MODEL_BUILDER_INVALIDATION_LFTP_STATUSES = "model_builder_cache_invalidation_lftp_statuses"
+MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS = "model_builder_cache_invalidation_unknown_local_pairs"
+MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS = "model_builder_cache_invalidation_local_root_paths"
+MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES = "model_builder_cache_invalidation_downloaded_files"
+MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS = "model_builder_cache_invalidation_downloaded_timestamps"
+MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES = "model_builder_cache_invalidation_extract_statuses"
+MODEL_BUILDER_INVALIDATION_EXTRACTED_FILES = "model_builder_cache_invalidation_extracted_files"
+MODEL_BUILDER_INVALIDATION_STOPPED_FILES = "model_builder_cache_invalidation_stopped_files"
+MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES = "model_builder_cache_invalidation_move_failed_files"
+MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES = "model_builder_cache_invalidation_final_move_succeeded_files"
+MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES = "model_builder_cache_invalidation_validation_statuses"
+MODEL_BUILDER_INVALIDATION_CLEAR = "model_builder_cache_invalidation_clear"
+MODEL_BUILDER_INVALIDATION_EXPLICIT = "model_builder_cache_invalidation_explicit"
 # Scanner stages intentionally use fixed names.  They are safe to expose in
 # support snapshots because callers cannot supply labels, paths, or ids.
 DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL = "local_scan_filesystem_traversal"
@@ -46,6 +75,10 @@ DURATION_LOCAL_SCAN_MANAGED_EXTRACT = "local_scan_managed_extract"
 DURATION_LOCAL_SCAN_STAGING_MERGE = "local_scan_staging_merge"
 DURATION_LOCAL_SCAN_AGGREGATION = "local_scan_aggregation"
 DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION = "local_scan_progress_publication"
+DURATION_REMOTE_SCAN_TRANSPORT_READ = "remote_scan_transport_read"
+DURATION_REMOTE_SCAN_STREAM_PARSING = "remote_scan_stream_parsing"
+DURATION_REMOTE_SCAN_AGGREGATION = "remote_scan_aggregation"
+DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION = "remote_scan_progress_publication"
 
 # Short aliases keep call sites readable while retaining one canonical wire
 # name for each stage.
@@ -55,9 +88,14 @@ DURATION_LOCAL_SCAN_PROGRESS = DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION
 
 _DURATION_METRICS_ORDER = (
     DURATION_MODEL_UPDATE, DURATION_CONTROLLER_JOB, DURATION_CONTROLLER_PROCESS, DURATION_AUTO_QUEUE_PROCESS,
-    DURATION_MODEL_BUILD, DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
+    DURATION_MODEL_BUILD, DURATION_MODEL_BUILDER_SET_LOCAL_FILES, DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+    DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+    DURATION_MODEL_BUILDER_SET_STOPPED_FILES, DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+    DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
     DURATION_LOCAL_SCAN_STAGING_MERGE, DURATION_LOCAL_SCAN_AGGREGATION,
-    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, DURATION_MODEL_UPDATE_STATE_PREPARATION,
+    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, DURATION_REMOTE_SCAN_TRANSPORT_READ,
+    DURATION_REMOTE_SCAN_STREAM_PARSING, DURATION_REMOTE_SCAN_AGGREGATION,
+    DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION, DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE, DURATION_MODEL_UPDATE_STATUS_INGESTION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC, DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
@@ -65,7 +103,9 @@ _DURATION_METRICS_ORDER = (
 _SCANNER_DURATION_METRICS_ORDER = (
     DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
     DURATION_LOCAL_SCAN_STAGING_MERGE, DURATION_LOCAL_SCAN_AGGREGATION,
-    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION,
+    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, DURATION_REMOTE_SCAN_TRANSPORT_READ,
+    DURATION_REMOTE_SCAN_STREAM_PARSING, DURATION_REMOTE_SCAN_AGGREGATION,
+    DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
 )
 
 _SAMPLE_FIELDS = frozenset((
@@ -79,6 +119,17 @@ _COUNTERS = frozenset((
     "model_full_snapshot_requests", "model_full_snapshot_listener_registrations",
     "model_scoped_snapshot_registrations",
     "model_summary_snapshot_registrations", "model_page_serializations", "model_summary_serializations",
+    "model_rebuild_terminalizable_collision", "model_rebuild_move_retry_due",
+    "model_rebuild_collision_retry", "model_rebuild_deferred_move_pending",
+    "model_builder_cache_invalidation_local_files", "model_builder_cache_invalidation_remote_files",
+    "model_builder_cache_invalidation_active_files", "model_builder_cache_invalidation_lftp_statuses",
+    "model_builder_cache_invalidation_unknown_local_pairs",
+    "model_builder_cache_invalidation_local_root_paths", "model_builder_cache_invalidation_downloaded_files",
+    "model_builder_cache_invalidation_downloaded_timestamps", "model_builder_cache_invalidation_extract_statuses",
+    "model_builder_cache_invalidation_extracted_files", "model_builder_cache_invalidation_stopped_files",
+    "model_builder_cache_invalidation_move_failed_files", "model_builder_cache_invalidation_final_move_succeeded_files",
+    "model_builder_cache_invalidation_validation_statuses", "model_builder_cache_invalidation_clear",
+    "model_builder_cache_invalidation_explicit",
 ))
 _GAUGES = frozenset((
     "model_root_count", "model_tree_file_count", "model_listener_count", "path_pair_count", "active_download_count",
@@ -107,6 +158,77 @@ def _derived(value: object, digits: int) -> Optional[float]:
         return None
     rounded = round(numeric, digits)
     return rounded if math.isfinite(rounded) and rounded <= _MAX_NUMERIC_VALUE else None
+
+
+class FixedDurationRecorder:
+    """Child-only fixed-stage recorder with a pickle-safe aggregate snapshot."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+        thread_time_fn: Callable[[], float] = getattr(time, "thread_time", time.process_time),
+    ) -> None:
+        self.__enabled = type(enabled) is bool and enabled
+        self.__monotonic = monotonic_fn
+        self.__thread_time = thread_time_fn
+        self.__lock = Lock()
+        self.__active: dict[int, tuple[str, float, float]] = {}
+        self.__next_token = 1
+        self.__durations: dict[str, dict[str, float | int]] = {}
+
+    def begin_duration(self, metric: str) -> Optional[tuple[float, float, int]]:
+        if not self.__enabled or metric not in _DURATION_METRICS:
+            return None
+        try:
+            wall_started = self.__monotonic()
+            cpu_started = self.__thread_time()
+            with self.__lock:
+                token = self.__next_token
+                self.__next_token += 1
+                self.__active[token] = (metric, wall_started, cpu_started)
+            return wall_started, cpu_started, token
+        except Exception:
+            return None
+
+    def finish_duration(self, metric: str, started_at: object) -> None:
+        if started_at is None:
+            return
+        try:
+            started = tuple(started_at)  # type: ignore[arg-type]
+            if len(started) < 3 or type(started[2]) is not int:
+                return
+            with self.__lock:
+                active = self.__active.pop(started[2], None)
+            if active is None or active[0] != metric:
+                return
+            wall_value = max(0.0, float(self.__monotonic() - started[0]))
+            cpu_value = max(0.0, float(self.__thread_time() - started[1]))
+            with self.__lock:
+                aggregate = self.__durations.setdefault(metric, {
+                    "count": 0,
+                    "total_wall_seconds": 0.0,
+                    "max_wall_seconds": 0.0,
+                    "total_cpu_seconds": 0.0,
+                    "cpu_observation_count": 0,
+                })
+                aggregate["count"] = int(aggregate["count"]) + 1
+                aggregate["total_wall_seconds"] = float(aggregate["total_wall_seconds"]) + wall_value
+                aggregate["max_wall_seconds"] = max(
+                    float(aggregate["max_wall_seconds"]), wall_value,
+                )
+                aggregate["total_cpu_seconds"] = float(aggregate["total_cpu_seconds"]) + cpu_value
+                aggregate["cpu_observation_count"] = int(aggregate["cpu_observation_count"]) + 1
+        except Exception:
+            return
+
+    def snapshot(self) -> dict[str, dict[str, float | int]]:
+        with self.__lock:
+            return {
+                metric: dict(values)
+                for metric, values in self.__durations.items()
+                if metric in _DURATION_METRICS
+            }
 
 
 class ProcessContainerSampler:
@@ -296,6 +418,7 @@ class PerformanceDiagnosticsCollector:
         self.__active_counts = {metric: 0 for metric in _DURATION_METRICS}
         self.__next_span_id = 1
         self.__active_generation = 0
+        self.__enabled_state: Optional[bool] = None
 
     @property
     def retention_depth(self) -> int:
@@ -303,31 +426,58 @@ class PerformanceDiagnosticsCollector:
 
     def is_enabled(self) -> bool:
         try:
-            return bool(self.__enabled_getter())
+            enabled = bool(self.__enabled_getter())
         except Exception:
-            return False
+            enabled = False
+        self.__observe_enabled_state(enabled)
+        return enabled
 
-    def __clear_active_if_disabled(self) -> None:
+    def __observe_enabled_state(self, enabled: bool) -> None:
+        with self.__lock:
+            previous = self.__enabled_state
+            self.__enabled_state = enabled
+            if previous is not None and previous != enabled:
+                self.__active_generation += 1
+                self.__retire_active_locked(increment_generation=False)
+
+    def duration_worker_state(self) -> tuple[bool, int]:
+        """Atomically observe enablement and capture a worker generation."""
+        try:
+            enabled = bool(self.__enabled_getter())
+        except Exception:
+            enabled = False
+        self.__observe_enabled_state(enabled)
+        with self.__lock:
+            return enabled, self.__active_generation
+
+    def duration_generation(self) -> int:
+        """Return the current generation after observing the enable state."""
+        return self.duration_worker_state()[1]
+
+    def __clear_active_if_disabled(self, enabled: Optional[bool] = None) -> None:
         """Drop in-flight spans when diagnostics is hot-disabled.
 
         A span's ``finish_duration`` still safely accepts its old token after
         this cleanup, so toggling diagnostics cannot leave active counts stuck.
         """
         try:
-            if self.is_enabled():
+            if enabled is None:
+                enabled = self.is_enabled()
+            if enabled:
                 return
         except Exception:
             return
         with self.__lock:
-            self.__retire_active_locked()
+            self.__retire_active_locked(increment_generation=False)
 
-    def __retire_active_locked(self) -> None:
+    def __retire_active_locked(self, *, increment_generation: bool = True) -> None:
         self.__active_spans.clear()
         for metric in self.__active_counts:
             self.__active_counts[metric] = 0
         # Invalidate begin/finish calls that captured a span before the
         # disable transition but have not yet committed it.
-        self.__active_generation += 1
+        if increment_generation:
+            self.__active_generation += 1
 
     def increment(self, metric: str, count: int = 1) -> None:
         if not self.is_enabled() or metric not in _COUNTERS or type(count) is not int or count < 0:
@@ -355,7 +505,8 @@ class PerformanceDiagnosticsCollector:
     def observe_duration(self, metric: str, wall_seconds: object, cpu_seconds: object = None) -> None:
         # Detailed callers use only code-defined metric names, never runtime labels.
         try:
-            if not self.is_enabled() or metric not in _DURATION_METRICS:
+            enabled = self.is_enabled()
+            if not enabled or metric not in _DURATION_METRICS:
                 return
             with self.__lock:
                 generation = self.__active_generation
@@ -364,9 +515,50 @@ class PerformanceDiagnosticsCollector:
             if wall_value is None:
                 return
             with self.__lock:
-                if generation != self.__active_generation or not self.is_enabled():
+                if generation != self.__active_generation or self.__enabled_state is not True:
                     return
                 self.__observe_duration_locked(metric, wall_value, cpu_value)
+        except Exception:
+            return
+
+    def observe_duration_aggregate(
+        self, metric: str, aggregate: object, expected_generation: Optional[int] = None
+    ) -> None:
+        """Merge a bounded child-process aggregate into the current window."""
+        try:
+            enabled = self.is_enabled()
+            if not enabled or metric not in _DURATION_METRICS or not isinstance(aggregate, Mapping) or \
+                    (expected_generation is not None and type(expected_generation) is not int):
+                return
+            count = aggregate.get("count")
+            total_wall = _numeric(aggregate.get("total_wall_seconds"))
+            max_wall = _numeric(aggregate.get("max_wall_seconds"))
+            total_cpu = _numeric(aggregate.get("total_cpu_seconds"))
+            cpu_count = aggregate.get("cpu_observation_count")
+            if type(count) is not int or count < 0 or total_wall is None or max_wall is None or \
+                    max_wall < 0 or total_wall < 0 or max_wall > total_wall or \
+                    type(cpu_count) is not int or cpu_count < 0 or \
+                    cpu_count > count or (cpu_count and (total_cpu is None or total_cpu < 0)):
+                return
+            if count == 0:
+                return
+            with self.__lock:
+                if self.__enabled_state is not True or \
+                        (expected_generation is not None and expected_generation != self.__active_generation):
+                    return
+                current = self.__durations.setdefault(metric, {
+                    "count": 0,
+                    "total_wall_seconds": 0.0,
+                    "max_wall_seconds": 0.0,
+                    "total_cpu_seconds": 0.0,
+                    "cpu_observation_count": 0,
+                })
+                current["count"] = int(current["count"]) + count
+                current["total_wall_seconds"] = float(current["total_wall_seconds"]) + float(total_wall)
+                current["max_wall_seconds"] = max(float(current["max_wall_seconds"]), float(max_wall))
+                if cpu_count:
+                    current["total_cpu_seconds"] = float(current["total_cpu_seconds"]) + float(total_cpu)
+                    current["cpu_observation_count"] = int(current["cpu_observation_count"]) + cpu_count
         except Exception:
             return
 
@@ -387,7 +579,8 @@ class PerformanceDiagnosticsCollector:
     def begin_duration(self, metric: str) -> Optional[tuple[float, float, int, int]]:
         """Start one fixed-name timing span, with a disabled fast path."""
         try:
-            if not self.is_enabled() or metric not in _DURATION_METRICS:
+            enabled = self.is_enabled()
+            if not enabled or metric not in _DURATION_METRICS:
                 return None
             # Capture the generation before potentially blocking clock calls.
             # Reset/disable increments it while holding the same lock, so a
@@ -399,8 +592,8 @@ class PerformanceDiagnosticsCollector:
             with self.__lock:
                 if generation != self.__active_generation:
                     return None
-                if not self.is_enabled():
-                    self.__retire_active_locked()
+                if self.__enabled_state is not True:
+                    self.__retire_active_locked(increment_generation=False)
                     return None
                 if len(self.__active_spans) >= _MAX_ACTIVE_DURATION_SPANS:
                     self.__counters["duration_spans_dropped"] += 1
@@ -421,7 +614,8 @@ class PerformanceDiagnosticsCollector:
         if started_at is None:
             return
         try:
-            self.__clear_active_if_disabled()
+            enabled_before = self.is_enabled()
+            self.__clear_active_if_disabled(enabled_before)
             span_id = started_at[2] if len(started_at) >= 3 else None
             if type(span_id) is int:
                 with self.__lock:
@@ -431,6 +625,7 @@ class PerformanceDiagnosticsCollector:
                     active_generation = active[3]
                 wall_value = _numeric(self.__monotonic() - started_at[0])
                 cpu_value = _numeric(self.__thread_time() - started_at[1])
+                enabled_now = self.is_enabled()
                 with self.__lock:
                     # Reset/disable may have retired the span while clocks
                     # were being sampled.  Only the original generation may
@@ -443,25 +638,26 @@ class PerformanceDiagnosticsCollector:
                     self.__active_counts[active_metric] = max(0, self.__active_counts[active_metric] - 1)
                     if metric != active_metric:
                         return
-                    enabled_now = self.is_enabled()
-                    if not enabled_now:
-                        self.__retire_active_locked()
+                    if not enabled_now or self.__enabled_state is not True:
+                        self.__retire_active_locked(increment_generation=False)
                         return
                     if wall_value is not None and enabled_now:
                         self.__observe_duration_locked(metric, wall_value, cpu_value)
                 return
             if metric not in _DURATION_METRICS:
                 return
-            if not self.is_enabled():
+            enabled = self.is_enabled()
+            if not enabled:
                 return
             with self.__lock:
                 generation = self.__active_generation
             wall_value = _numeric(self.__monotonic() - started_at[0])
             cpu_value = _numeric(self.__thread_time() - started_at[1])
-            if wall_value is None:
+            enabled_after = self.is_enabled()
+            if wall_value is None or not enabled_after:
                 return
             with self.__lock:
-                if generation != self.__active_generation or not self.is_enabled():
+                if generation != self.__active_generation or self.__enabled_state is not True:
                     return
                 self.__observe_duration_locked(metric, wall_value, cpu_value)
         except Exception:
@@ -472,7 +668,8 @@ class PerformanceDiagnosticsCollector:
         # allocate/retain samples.  The gate is only a boolean getter on the
         # controller hot path.
         try:
-            if not self.is_enabled():
+            enabled = self.is_enabled()
+            if not enabled:
                 return False
             now = self.__monotonic()
             with self.__lock:
@@ -501,7 +698,8 @@ class PerformanceDiagnosticsCollector:
         self, values: Mapping[str, object], *, gauges: Optional[Mapping[str, object]] = None,
         close_window_at: Optional[float] = None,
     ) -> None:
-        if not self.is_enabled():
+        enabled = self.is_enabled()
+        if not enabled:
             return
         sanitized = {name: _numeric(values.get(name)) for name in _SAMPLE_FIELDS}
         with self.__lock:
@@ -641,7 +839,8 @@ class PerformanceDiagnosticsCollector:
 
     def snapshot(self, since_sequence: Optional[int] = None, limit: Optional[int] = None) -> dict[str, object]:
         bounded_limit = self.__retention_depth if limit is None else min(max(1, limit), self.__retention_depth)
-        self.__clear_active_if_disabled()
+        enabled = self.is_enabled()
+        self.__clear_active_if_disabled(enabled)
         with self.__lock:
             samples = [sample for sample in self.__samples if since_sequence is None or int(sample["sequence"]) > since_sequence]
             truncated = len(samples) > bounded_limit
@@ -665,7 +864,7 @@ class PerformanceDiagnosticsCollector:
                 ) if window_elapsed_seconds > 0 and int(aggregate["cpu_observation_count"]) else None
             return {
                 "schema": PERFORMANCE_DIAGNOSTICS_SCHEMA,
-                "enabled": self.is_enabled(),
+                "enabled": enabled,
                 "session": self.__session,
                 "session_start_sequence": self.__session_start_sequence,
                 "sequence": self.__sequence,

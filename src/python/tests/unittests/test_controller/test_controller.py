@@ -571,6 +571,20 @@ class TestController(unittest.TestCase):
         self.assertIsNone(controller._Controller__startup_validation_error)
         self.assertIs(controller._Controller__lftp, mock_backend)
 
+    def test_constructor_wires_shared_performance_diagnostics_to_model_builder(self):
+        context = self._make_startup_context(local_path="/local")
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        context.performance_diagnostics = diagnostics
+
+        with patch("controller.controller.create_transfer_backend") as mock_create_transfer_backend:
+            mock_create_transfer_backend.return_value = MagicMock()
+            controller = Controller(context, ControllerPersist())
+
+        self.assertIs(
+            diagnostics,
+            controller._Controller__model_builder._ModelBuilder__performance_diagnostics,
+        )
+
     def test_constructor_passes_sftp_defaults_to_lftp(self):
         context = self._make_startup_context(local_path="/local")
 
@@ -638,6 +652,7 @@ class TestController(unittest.TestCase):
 
     @patch("controller.controller.RemoteScanner")
     def test_build_remote_scanner_passes_remote_python_path(self, mock_remote_scanner):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
         self.controller._Controller__context.config = SimpleNamespace(
             lftp=SimpleNamespace(
                 remote_address="remote.server.com",
@@ -649,6 +664,7 @@ class TestController(unittest.TestCase):
             )
         )
         self.controller._Controller__context.args = SimpleNamespace(local_path_to_scanfs="/local-scanfs")
+        self.controller._Controller__context.performance_diagnostics = diagnostics
         path_pair = PathPair(
             id="movies",
             name="Movies",
@@ -671,6 +687,54 @@ class TestController(unittest.TestCase):
             remote_python_path="/opt/python/bin/python3",
             path_pair_id="movies",
             path_pair_name="Movies",
+            performance_diagnostics=diagnostics,
+        )
+
+    def test_build_remote_scanner_wires_shared_diagnostics_for_enabled_pairs(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        scanner_a = MagicMock(name="scanner_a")
+        scanner_b = MagicMock(name="scanner_b")
+        pair_a = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="/remote/movies",
+            local_path="/local/movies",
+            enabled=True,
+            auto_queue=False,
+        )
+        pair_b = PathPair(
+            id="tv",
+            name="TV",
+            remote_path="/remote/tv",
+            local_path="/local/tv",
+            enabled=True,
+            auto_queue=False,
+        )
+        self.controller._Controller__context.config = SimpleNamespace(
+            lftp=SimpleNamespace(
+                remote_address="remote.server.com",
+                remote_username="user",
+                remote_port=22,
+                remote_path_to_scan_script="/scanfs",
+                remote_python_path="python3",
+            )
+        )
+        self.controller._Controller__context.args = SimpleNamespace(local_path_to_scanfs="/local-scanfs")
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+
+        with patch("controller.controller.RemoteScanner", side_effect=[scanner_a, scanner_b]) as mock_remote, \
+                patch("controller.controller.MultiPathRemoteScanner") as mock_multi:
+            scanner = self.controller._Controller__build_remote_scanner([pair_a, pair_b])
+
+        self.assertIs(scanner, mock_multi.return_value)
+        self.assertEqual(2, mock_remote.call_count)
+        self.assertTrue(all(
+            call.kwargs["performance_diagnostics"] is diagnostics
+            for call in mock_remote.call_args_list
+        ))
+        mock_multi.assert_called_once_with(
+            [scanner_a, scanner_b],
+            performance_diagnostics=diagnostics,
         )
 
     def test_constructor_requires_password_for_ftps_even_when_ssh_key_is_enabled(self):
@@ -8191,6 +8255,147 @@ class TestController(unittest.TestCase):
             self.assertEqual(3, build_model.call_count)
             ModelUpdater(self.controller).update()
             self.assertEqual(3, build_model.call_count)
+
+    def test_model_updater_unhealthy_then_fresh_empty_poll_without_collision_stays_cached(self):
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_local_files([])
+        builder.set_remote_files([])
+        builder.set_active_files([])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        for process in (
+            self.controller._Controller__remote_scan_process,
+            self.controller._Controller__local_scan_process,
+            self.controller._Controller__active_scan_process,
+        ):
+            process.pop_latest_result.return_value = None
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__extract_process.pop_completed.return_value = []
+        self.controller._Controller__extract_process.pop_failed.return_value = []
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = False
+        self.controller._Controller__next_lftp_status_poll_at = None
+
+        with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+            ModelUpdater(self.controller).update()
+            self.controller._Controller__lftp.last_status_poll_healthy = True
+            self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+            ModelUpdater(self.controller).update()
+            self.assertEqual(set(), builder.get_terminalizable_staging_collision_file_ids())
+            self.assertEqual(0, build_model.call_count)
+
+    def test_model_updater_due_move_failure_rebuilds_once_until_due_edge_rearms(self):
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_local_files([])
+        builder.set_remote_files([])
+        builder.set_active_files([])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        for process in (
+            self.controller._Controller__remote_scan_process,
+            self.controller._Controller__local_scan_process,
+            self.controller._Controller__active_scan_process,
+        ):
+            process.pop_latest_result.return_value = None
+        self.controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__extract_process.pop_completed.return_value = []
+        self.controller._Controller__extract_process.pop_failed.return_value = []
+        self.controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=10)
+        self.controller._Controller__persist.move_failure_counts = {"retry": 1}
+
+        with patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+            ModelUpdater(self.controller).update()
+            ModelUpdater(self.controller).update()
+            self.assertEqual(1, build_model.call_count)
+            self.controller._Controller__move_retry_due["retry"] = datetime.now() + timedelta(seconds=10)
+            ModelUpdater(self.controller).update()
+            self.controller._Controller__move_retry_due["retry"] = datetime.now() - timedelta(seconds=1)
+            ModelUpdater(self.controller).update()
+            self.assertEqual(2, build_model.call_count)
+
+    @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
+    def test_model_updater_retries_deferred_pending_after_fresh_healthy_poll_without_model_diff(
+            self, diff_models):
+        for initial_count in (0, 1):
+            with self.subTest(initial_count=initial_count):
+                # Keep each marker variant independent; this exercises the
+                # count-zero deferred path as well as a durable nonzero retry.
+                self.setUp()
+                mtime_ns = 1786400003000000000
+                remote_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+                local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+                active_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+                builder = ModelBuilder()
+                builder.set_base_logger(self.controller.logger)
+                builder.set_remote_files([remote_root])
+                builder.set_local_files([local_root])
+                builder.set_active_files([active_root])
+                self.controller._Controller__model_builder = builder
+                self.controller._Controller__model = builder.build_model()
+                self.controller._Controller__model_lock = threading.RLock()
+                self.controller._Controller__lftp.status.return_value = []
+                self.controller._Controller__lftp.last_status_poll_healthy = False
+                self.controller._Controller__next_lftp_status_poll_at = None
+                pending_entry = ("release", None, None)
+                release_id = ModelFile.build_file_id(*pending_entry[:2])
+                self.controller._Controller__pending_completion_file_names = {pending_entry}
+                self.controller._Controller__persist.move_failure_counts = {
+                    release_id: initial_count,
+                }
+                self.controller._Controller__deferred_move_file_ids = {release_id}
+                self.controller._Controller__move_from_staging = MagicMock(
+                    side_effect=[
+                        Controller.MoveFromStagingResult.DEFERRED,
+                        Controller.MoveFromStagingResult.DEFERRED,
+                        Controller.MoveFromStagingResult.COMPLETED,
+                    ]
+                )
+
+                # The first attempt is deliberately driven by a rebuild with
+                # no model diff.  The second rebuild must come only from the
+                # unhealthy -> fresh-healthy status edge.
+                builder.request_rebuild()
+                ModelUpdater(self.controller).update()
+                self.controller._Controller__move_from_staging.assert_called_once_with(
+                    "release", None,
+                )
+                self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+
+                self.controller._Controller__lftp.last_status_poll_healthy = True
+                self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                ModelUpdater(self.controller).update()
+
+                self.assertEqual(2, self.controller._Controller__move_from_staging.call_count)
+                self.assertIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+
+                # Alternating retry_empty/fresh_healthy edges with the same
+                # deferred token must not recreate the rebuild churn.
+                self.controller._Controller__lftp.last_status_poll_healthy = False
+                self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                ModelUpdater(self.controller).update()
+                self.controller._Controller__lftp.last_status_poll_healthy = True
+                self.controller._Controller__next_lftp_status_poll_at = datetime.now() - timedelta(seconds=1)
+                ModelUpdater(self.controller).update()
+                self.assertEqual(2, self.controller._Controller__move_from_staging.call_count)
+
+                # A meaningful explicit rebuild still permits the pending
+                # move to succeed, which clears the lifecycle marker and
+                # resets both edge gates.
+                builder.request_rebuild()
+                ModelUpdater(self.controller).update()
+
+                self.assertEqual(3, self.controller._Controller__move_from_staging.call_count)
+                self.assertNotIn(pending_entry, self.controller._Controller__pending_completion_file_names)
+                self.assertNotIn(release_id, self.controller._Controller__persist.move_failure_counts)
+                self.assertNotIn(release_id, self.controller._Controller__deferred_move_file_ids)
 
     def test_model_updater_does_not_trigger_for_collision_with_partial_remote_leaf_and_active_extra(self):
         mtime_ns = 1786400003000000000

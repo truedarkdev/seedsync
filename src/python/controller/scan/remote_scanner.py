@@ -18,6 +18,11 @@ import shlex
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from common import overrides, Localization, escape_remote_path_for_shell
 from ssh import Sshcp, SshcpError, TRANSIENT_ERROR_PATTERNS
+from common.performance_diagnostics import (
+    DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
+    DURATION_REMOTE_SCAN_STREAM_PARSING,
+    PerformanceDiagnosticsCollector,
+)
 from system import SystemFile
 
 
@@ -139,6 +144,12 @@ class RemoteScanner(IScanner):
     # malformed unterminated stream cannot retain arbitrary callback data in
     # the incremental decoder buffer.
     _MAX_V2_STREAM_RECORD_BYTES = 64 * 1024
+    _MAX_V2_ROOT_NODES_PER_RECORD = 64
+    # Coalesce only completed framed roots waiting for publication.  The age
+    # check runs on root completion instead of using a timer/thread, keeping
+    # stream parsing and active transfer status independent.
+    _ROOT_PROGRESS_BATCH_SIZE = 8
+    _ROOT_PROGRESS_MAX_AGE_SECONDS = 0.1
 
     @classmethod
     def _validate_v2_stream_record_bytes(cls, record: bytes) -> None:
@@ -264,17 +275,20 @@ class RemoteScanner(IScanner):
                  remote_python_path: Optional[str] = "python3",
                  path_pair_id: Optional[str] = None,
                  path_pair_name: Optional[str] = None,
-                 remote_scan_lease: Optional[RemoteScanLease] = None):
+                 remote_scan_lease: Optional[RemoteScanLease] = None,
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         self.logger = logging.getLogger("RemoteScanner")
         self.__remote_path_to_scan = remote_path_to_scan
         self.__local_path_to_scan_script = local_path_to_scan_script
         self.__remote_path_to_scan_script = remote_path_to_scan_script
         self.__remote_python_path = remote_python_path
         self.__remote_scan_lease = remote_scan_lease
+        self.__performance_diagnostics = performance_diagnostics
         self.__ssh = Sshcp(host=remote_address,
                            port=remote_port,
                            user=remote_username,
-                           password=remote_password)
+                           password=remote_password,
+                           performance_diagnostics=performance_diagnostics)
         self.__first_run = True
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
@@ -299,6 +313,11 @@ class RemoteScanner(IScanner):
         """Return the small mutable state that must survive one-shot workers."""
         return self.__first_run, self.__remote_path_to_scan_script
 
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_RemoteScanner__performance_diagnostics"] = None
+        return state
+
     def apply_recycled_state(self, state: object) -> None:
         if not isinstance(state, tuple) or len(state) != 2 or \
                 type(state[0]) is not bool or not isinstance(state[1], str):
@@ -310,6 +329,50 @@ class RemoteScanner(IScanner):
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("RemoteScanner")
         self.__ssh.set_base_logger(self.logger)
+
+    def set_performance_diagnostics(self, diagnostics: object) -> None:
+        self.__performance_diagnostics = diagnostics
+        self.__ssh.set_performance_diagnostics(diagnostics)
+
+    def __begin_duration(self, metric: str) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(metric)
+        except Exception:
+            return None
+
+    def __finish_duration(self, metric: str, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)
+        except Exception:
+            pass
+
+    def __publish_progress(self, *args: object) -> None:
+        callback = self.__progress_callback
+        if callback is None:
+            return
+        started_at = self.__begin_duration(DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION)
+        try:
+            callback(*args)
+        finally:
+            self.__finish_duration(DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION, started_at)
+
+    def __flush_pending_root_progress(self, state: dict[str, object]) -> None:
+        """Publish completed framed roots in wire order and clear the batch."""
+        pending_roots = cast(List[SystemFile], state["pending_roots"])
+        if not pending_roots:
+            return
+        batch = list(pending_roots)
+        pending_roots.clear()
+        state["pending_roots_started_at"] = None
+        self.__publish_progress(batch, self.__path_pair_id, self.__path_pair_name, None, False)
 
     @overrides(IScanner)
     def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
@@ -346,7 +409,7 @@ class RemoteScanner(IScanner):
             )
             # Run packaged binaries or non-Python shebang helpers directly; Python shebang
             # helpers keep the configured interpreter path.
-            stream_args = " --stream --stream-batch-size 8" if self.__progress_callback is not None else ""
+            stream_args = " --stream --stream-batch-size 64" if self.__progress_callback is not None else ""
             if self.__should_execute_scanfs_directly(self.__local_path_to_scan_script):
                 command = "{}{} {}".format(remote_scanfs_path, stream_args, remote_scan_path)
                 legacy_command = "{} {}".format(remote_scanfs_path, remote_scan_path)
@@ -376,6 +439,8 @@ class RemoteScanner(IScanner):
                     "current_root": None,
                     "next_root_id": 0,
                     "emitted_root_names": set(),
+                    "pending_roots": [],
+                    "pending_roots_started_at": None,
                     "dialect": None,
                 }
 
@@ -500,6 +565,7 @@ class RemoteScanner(IScanner):
                 nonlocal stream_buffer
                 if stream_error:
                     return
+                parsing_started = self.__begin_duration(DURATION_REMOTE_SCAN_STREAM_PARSING)
                 try:
                     raw_chunk = retain_legacy_chunk(chunk)
                     if stream_protocol_mode == "v2":
@@ -518,6 +584,8 @@ class RemoteScanner(IScanner):
                         )
                 except (json.JSONDecodeError, AttributeError, KeyError, TypeError, ValueError) as err:
                     stream_error.append(err)
+                finally:
+                    self.__finish_duration(DURATION_REMOTE_SCAN_STREAM_PARSING, parsing_started)
 
             def invoke_stream(command_to_run: str, callback, retain_output: bool) -> bytes:
                 implementation = getattr(stream_shell, "side_effect", None)
@@ -593,22 +661,23 @@ class RemoteScanner(IScanner):
                         if not isinstance(item, dict):
                             raise TypeError("scan entries must be objects")
                         remote_files.append(decode_system_file(cast(dict[str, object], item)))
-                    self.__progress_callback(
+                    self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         {file.name for file in remote_files}, False
                     )
-                    self.__progress_callback(
+                    self.__publish_progress(
                         remote_files, self.__path_pair_id, self.__path_pair_name,
                         None, False
                     )
-                    self.__progress_callback(
+                    self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         None, True
                     )
                 if stream_state["saw_prefix"]:
                     # Protocol completion is provisional until the transport
                     # has returned successfully and validated its exit status.
-                    self.__progress_callback(
+                    self.__flush_pending_root_progress(stream_state)
+                    self.__publish_progress(
                         [], self.__path_pair_id, self.__path_pair_name,
                         None, True
                     )
@@ -641,7 +710,11 @@ class RemoteScanner(IScanner):
                 # record before the SSH process reached EOF.
                 pass
             elif self.__progress_callback is not None and b"SEEDSYNC_SCAN_V2\t" in out:
-                remote_files = self.__decode_stream(out)
+                parsing_started = self.__begin_duration(DURATION_REMOTE_SCAN_STREAM_PARSING)
+                try:
+                    remote_files = self.__decode_stream(out)
+                finally:
+                    self.__finish_duration(DURATION_REMOTE_SCAN_STREAM_PARSING, parsing_started)
             else:
                 out_str = out.decode("utf-8")
                 decoded: object = json.loads(out_str)
@@ -697,7 +770,7 @@ class RemoteScanner(IScanner):
             state["manifest"] = True
             manifest_names = cast(set[str], state["manifest_names"])
             manifest_names.update(names)
-            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, manifest_names, False)
+            self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, manifest_names, False)
         elif record_type == "manifest_begin":
             count = record.get("count")
             if type(count) is not int or count < 0 or state["dialect"] not in (None, "framed") or \
@@ -722,7 +795,7 @@ class RemoteScanner(IScanner):
                 raise TypeError("incomplete scan manifest")
             state["manifest_collecting"] = False
             state["manifest"] = True
-            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, manifest_names, False)
+            self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, manifest_names, False)
         elif record_type == "roots":
             data = record.get("files")
             if state["dialect"] != "legacy" or not state["manifest"] or \
@@ -742,7 +815,7 @@ class RemoteScanner(IScanner):
                 raise TypeError("invalid or duplicate scan root")
             remote_files.extend(batch)
             emitted_root_names.update(batch_names)
-            self.__progress_callback(batch, self.__path_pair_id, self.__path_pair_name, None, False)
+            self.__publish_progress(batch, self.__path_pair_id, self.__path_pair_name, None, False)
         elif record_type == "root_begin":
             root_id = record.get("id")
             name = record.get("name")
@@ -761,35 +834,25 @@ class RemoteScanner(IScanner):
                 "stack": [],
             }
         elif record_type == "root_node":
-            current_root = state["current_root"]
-            if state["dialect"] != "framed" or not isinstance(current_root, dict):
-                raise TypeError("scan node without a root")
+            self.__decode_framed_root_node(
+                state, record.get("root"), record.get("id"), record.get("parent"), record.get("file")
+            )
+        elif record_type == "root_nodes":
             root_id = record.get("root")
-            node_id = record.get("id")
-            parent_id = record.get("parent")
-            data = record.get("file")
-            if root_id != current_root["id"] or type(node_id) is not int or \
-                    node_id != current_root["next_node_id"] or \
-                    (parent_id is not None and type(parent_id) is not int) or \
-                    not isinstance(data, dict) or "children" in data:
-                raise TypeError("invalid scan root node")
-            decode_system_file = cast(Callable[[dict[str, object]], SystemFile], getattr(SystemFile, "from_dict"))
-            node = decode_system_file(cast(dict[str, object], data))
-            stack = cast(list[tuple[int, SystemFile]], current_root["stack"])
-            if not stack:
-                if parent_id is not None or node.name != current_root["name"]:
-                    raise TypeError("invalid scan root node ordering")
-                current_root["root"] = node
-            else:
-                parent_index = next((index for index, item in enumerate(stack) if item[0] == parent_id), None)
-                if parent_index is None:
-                    raise TypeError("invalid scan node parent")
-                parent = stack[parent_index][1]
-                parent.add_child(node)
-                del stack[parent_index + 1:]
-            stack.append((node_id, node))
-            current_root["next_node_id"] = node_id + 1
-            current_root["node_count"] = cast(int, current_root["node_count"]) + 1
+            nodes = record.get("nodes")
+            if type(root_id) is not int or not isinstance(nodes, list) or not nodes or \
+                    len(nodes) > self._MAX_V2_ROOT_NODES_PER_RECORD:
+                raise TypeError("invalid scan root node batch")
+            for node_record in nodes:
+                if not isinstance(node_record, dict):
+                    raise TypeError("invalid scan root node")
+                self.__decode_framed_root_node(
+                    state,
+                    root_id,
+                    node_record.get("id"),
+                    node_record.get("parent"),
+                    node_record.get("file"),
+                )
         elif record_type == "root_end":
             current_root = state["current_root"]
             root_id = record.get("id")
@@ -800,7 +863,16 @@ class RemoteScanner(IScanner):
                 raise TypeError("incomplete scan root")
             root = cast(SystemFile, current_root["root"])
             remote_files.append(root)
-            self.__progress_callback([root], self.__path_pair_id, self.__path_pair_name, None, False)
+            completed_at = time.monotonic()
+            pending_roots = cast(List[SystemFile], state["pending_roots"])
+            if not pending_roots:
+                state["pending_roots_started_at"] = completed_at
+            pending_roots.append(root)
+            pending_started_at = cast(Optional[float], state["pending_roots_started_at"])
+            if len(pending_roots) >= self._ROOT_PROGRESS_BATCH_SIZE or (
+                    pending_started_at is not None and
+                    completed_at - pending_started_at >= self._ROOT_PROGRESS_MAX_AGE_SECONDS):
+                self.__flush_pending_root_progress(state)
             cast(set[str], state["emitted_root_names"]).add(root.name)
             state["next_root_id"] = cast(int, state["next_root_id"]) + 1
             state["current_root"] = None
@@ -809,9 +881,43 @@ class RemoteScanner(IScanner):
                 raise TypeError("incomplete scan stream")
             state["complete"] = True
             if not state.get("defer_complete", False):
-                self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
+                self.__flush_pending_root_progress(state)
+                self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         else:
             raise TypeError("unknown scan stream record")
+
+    def __decode_framed_root_node(self,
+                                  state: dict[str, object],
+                                  root_id: object,
+                                  node_id: object,
+                                  parent_id: object,
+                                  data: object) -> None:
+        """Apply one framed node from either legacy or batched V2 records."""
+        current_root = state["current_root"]
+        if state["dialect"] != "framed" or not isinstance(current_root, dict):
+            raise TypeError("scan node without a root")
+        if root_id != current_root["id"] or type(node_id) is not int or \
+                node_id != current_root["next_node_id"] or \
+                (parent_id is not None and type(parent_id) is not int) or \
+                not isinstance(data, dict) or "children" in data:
+            raise TypeError("invalid scan root node")
+        decode_system_file = cast(Callable[[dict[str, object]], SystemFile], getattr(SystemFile, "from_dict"))
+        node = decode_system_file(cast(dict[str, object], data))
+        stack = cast(list[tuple[int, SystemFile]], current_root["stack"])
+        if not stack:
+            if parent_id is not None or node.name != current_root["name"]:
+                raise TypeError("invalid scan root node ordering")
+            current_root["root"] = node
+        else:
+            parent_index = next((index for index, item in enumerate(stack) if item[0] == parent_id), None)
+            if parent_index is None:
+                raise TypeError("invalid scan node parent")
+            parent = stack[parent_index][1]
+            parent.add_child(node)
+            del stack[parent_index + 1:]
+        stack.append((node_id, node))
+        current_root["next_node_id"] = node_id + 1
+        current_root["node_count"] = cast(int, current_root["node_count"]) + 1
 
     def __decode_stream(self, output: bytes) -> List[SystemFile]:
         assert self.__progress_callback is not None
@@ -829,6 +935,8 @@ class RemoteScanner(IScanner):
             "current_root": None,
             "next_root_id": 0,
             "emitted_root_names": set(),
+            "pending_roots": [],
+            "pending_roots_started_at": None,
             "dialect": None,
         }
         for raw_line in output.splitlines(keepends=True):
@@ -841,7 +949,8 @@ class RemoteScanner(IScanner):
             self.__decode_stream_record(line, remote_files, state)
         if not state["manifest"] or not state["complete"]:
             raise TypeError("incomplete scan stream")
-        self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
+        self.__flush_pending_root_progress(state)
+        self.__publish_progress([], self.__path_pair_id, self.__path_pair_name, None, True)
         return remote_files
 
     def __check_remote_scanfs_target(self, remote_path: str) -> str:

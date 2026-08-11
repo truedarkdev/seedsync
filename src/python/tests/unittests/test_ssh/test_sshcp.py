@@ -17,6 +17,7 @@ from parameterized import parameterized
 from tests.utils import TestUtils, requires_live_ssh
 from common import overrides
 from ssh import Sshcp, SshcpError
+from common.performance_diagnostics import DURATION_REMOTE_SCAN_TRANSPORT_READ
 
 
 # Test credentials for the Docker-based test container.
@@ -341,6 +342,8 @@ class TestSshcp(unittest.TestCase):
 
     @patch.object(Sshcp, "_Sshcp__spawn_process")
     def test_run_command_waits_when_spawn_has_no_close(self, mock_spawn_process):
+        diagnostics = MagicMock()
+        diagnostics.begin_duration.return_value = "transport-start"
         wait = MagicMock(return_value=0)
         spawn = SimpleNamespace(
             expect=MagicMock(return_value=0),
@@ -349,7 +352,13 @@ class TestSshcp(unittest.TestCase):
             wait=wait,
         )
         mock_spawn_process.return_value = (spawn, True)
-        sshcp = Sshcp(host=self.host, port=self.port, user=self.user, password=None)
+        sshcp = Sshcp(
+            host=self.host,
+            port=self.port,
+            user=self.user,
+            password=None,
+            performance_diagnostics=diagnostics,
+        )
 
         result = sshcp._Sshcp__run_command(
             command="ssh",
@@ -359,6 +368,11 @@ class TestSshcp(unittest.TestCase):
 
         self.assertEqual(b"", result)
         wait.assert_called_once_with()
+        diagnostics.begin_duration.assert_called_once_with(DURATION_REMOTE_SCAN_TRANSPORT_READ)
+        diagnostics.finish_duration.assert_called_once_with(
+            DURATION_REMOTE_SCAN_TRANSPORT_READ,
+            "transport-start",
+        )
 
     @patch.object(Sshcp, "_Sshcp__spawn_process")
     def test_shell_stream_requires_explicit_success_exit_status(self, mock_spawn_process):

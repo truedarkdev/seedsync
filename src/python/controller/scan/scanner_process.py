@@ -4,6 +4,7 @@ import logging
 from abc import ABC, abstractmethod
 import multiprocessing
 import threading
+from collections import deque
 from datetime import datetime
 from typing import Callable, List, Optional, Protocol
 import queue
@@ -13,6 +14,7 @@ from multiprocessing.synchronize import Event as EventType
 
 from common import AppError
 from common.app_process import ExceptionWrapper
+from common.performance_diagnostics import FixedDurationRecorder, PerformanceDiagnosticsCollector
 from system import SystemFile
 
 
@@ -97,7 +99,9 @@ class ScannerResult:
                  session_token: Optional[str] = None,
                  is_full_snapshot: bool = False,
                  full_snapshot_path_pair_ids: Optional[set[str | None]] = None,
-                 is_targeted_scan: bool = False):
+                 is_targeted_scan: bool = False,
+                 duration_aggregates: Optional[dict[str, dict[str, float | int]]] = None,
+                 duration_aggregate_token: Optional[tuple[str, int, int]] = None):
         self.timestamp = timestamp
         self.files = files
         self.malformed_status_only_file_ids = [] if malformed_status_only_file_ids is None else malformed_status_only_file_ids
@@ -115,6 +119,8 @@ class ScannerResult:
         self.is_full_snapshot = is_full_snapshot
         self.full_snapshot_path_pair_ids = set() if full_snapshot_path_pair_ids is None else full_snapshot_path_pair_ids
         self.is_targeted_scan = is_targeted_scan
+        self.duration_aggregates = duration_aggregates
+        self.duration_aggregate_token = duration_aggregate_token
 
 
 class _ScannerQueueReleaseMarker:
@@ -273,7 +279,9 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                       breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
                       mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int],
                       generation: int = 0, session_token: str = "",
-                      result_via_control: bool = False) -> None:
+                      result_via_control: bool = False,
+                      performance_diagnostics_enabled: bool = False,
+                      performance_diagnostics_generation: int = 0) -> None:
     """Run one scan in a spawn-context process, without a nested forkserver."""
     logger = logging.getLogger("{}ScanRun".format(scanner.__class__.__name__))
     if mp_log_queue is not None:
@@ -289,6 +297,10 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         logger = root_logger.getChild("{}ScanRun".format(scanner.__class__.__name__))
 
     setter = getattr(scanner, "set_scan_target_path_pair_ids", None)
+    duration_recorder = FixedDurationRecorder(performance_diagnostics_enabled)
+    diagnostics_setter = getattr(scanner, "set_performance_diagnostics", None)
+    if callable(diagnostics_setter):
+        diagnostics_setter(duration_recorder)
     progress_emitted = False
     progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
     control_send_lock = threading.Lock()
@@ -366,6 +378,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 full_snapshot_path_pair_ids=scanned_ids if progress_emitted else set(),
                 is_targeted_scan=scan_target_path_pair_ids is not None,
                 session_token=session_token,
+                duration_aggregates=duration_recorder.snapshot(),
+                duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_completed",
                                     {"scanner": scanner.__class__.__name__, "file_count": len(files),
@@ -397,6 +411,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 unknown_path_pair_ids=failed_ids,
                 is_targeted_scan=scan_target_path_pair_ids is not None,
                 session_token=session_token,
+                duration_aggregates=duration_recorder.snapshot(),
+                duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
@@ -422,6 +438,8 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         outcome = ("fatal", ExceptionWrapper(error))
     finally:
         scanner.set_progress_callback(None)
+        if callable(diagnostics_setter):
+            diagnostics_setter(None)
         if callable(setter):
             setter(None)
         recycled_state: object | None = None
@@ -442,13 +460,16 @@ def _create_scanner_worker(scanner: IScanner, output_queue: Optional[object],
                            scan_target_path_pair_ids: Optional[set[str]], control_connection: object,
                            breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
                            mp_log_queue: Optional[MPQueue[logging.LogRecord]], mp_log_level: Optional[int],
-                           generation: int = 0, session_token: str = "") -> multiprocessing.Process:
+                           generation: int = 0, session_token: str = "",
+                           performance_diagnostics_enabled: bool = False,
+                           performance_diagnostics_generation: int = 0) -> multiprocessing.Process:
     """Use spawn explicitly: coordinators can be forkserver children and threaded."""
     return multiprocessing.get_context("spawn").Process(
         name="{}ScanRun".format(scanner.__class__.__name__),
         target=_run_scanner_once,
         args=(scanner, output_queue, scan_target_path_pair_ids, control_connection, breadcrumb_trace, flow_id,
-              mp_log_queue, mp_log_level, generation, session_token, True),
+              mp_log_queue, mp_log_level, generation, session_token, True,
+              performance_diagnostics_enabled, performance_diagnostics_generation),
     )
 
 
@@ -460,7 +481,8 @@ class ScannerProcess:
                  scanner: IScanner, interval_in_ms: int,
                  verbose: bool = True,
                  breadcrumb_trace: Optional[_BreadcrumbEmitter] = None,
-                 recycle_scan_worker: bool = False):
+                 recycle_scan_worker: bool = False,
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         """
         Create a scanner process
         :param scanner: IScanner implementation
@@ -482,6 +504,8 @@ class ScannerProcess:
         self.verbose = verbose
         self.__breadcrumb_trace = breadcrumb_trace
         self.__recycle_scan_worker = recycle_scan_worker
+        self.__performance_diagnostics = performance_diagnostics
+        self.__ingested_duration_tokens: deque[tuple[str, int, int]] = deque(maxlen=64)
         self.__scan_worker: Optional[multiprocessing.Process] = None
         self.__scan_worker_started_at: Optional[datetime] = None
         self.__scan_worker_control_connection: object | None = None
@@ -583,9 +607,15 @@ class ScannerProcess:
         spawn_context = multiprocessing.get_context("spawn")
         receive_connection, send_connection = spawn_context.Pipe(duplex=False)
         self.__scan_generation += 1
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            diagnostics_enabled, diagnostics_generation = False, 0
+        else:
+            diagnostics_enabled, diagnostics_generation = diagnostics.duration_worker_state()
         worker = _create_scanner_worker(self.__scanner, None, scan_target_path_pair_ids, send_connection,
                                         self.__breadcrumb_trace, flow_id, self._mp_log_queue, self._mp_log_level,
-                                        self.__scan_generation, self.__session_token)
+                                        self.__scan_generation, self.__session_token,
+                                        diagnostics_enabled, diagnostics_generation)
         worker.daemon = True
         worker.start()
         send_connection.close()
@@ -784,11 +814,27 @@ class ScannerProcess:
             if isinstance(message, tuple) and len(message) == 2 and message[0] == "result":
                 result = message[1]
                 if isinstance(result, ScannerResult):
+                    self.__ingest_duration_aggregates(result)
                     assert self.__queue is not None
                     _publish_bounded_result(self.__queue, result)
             else:
                 status = message
         return status
+
+    def __ingest_duration_aggregates(self, result: ScannerResult) -> None:
+        diagnostics = self.__performance_diagnostics
+        aggregates = result.duration_aggregates
+        token = result.duration_aggregate_token
+        if diagnostics is None or not isinstance(aggregates, dict) or not isinstance(token, tuple) or len(token) != 3:
+            return
+        if not isinstance(token[0], str) or type(token[1]) is not int or type(token[2]) is not int:
+            return
+        if token in self.__ingested_duration_tokens:
+            return
+        self.__ingested_duration_tokens.append(token)
+        for metric, aggregate in aggregates.items():
+            if isinstance(metric, str):
+                diagnostics.observe_duration_aggregate(metric, aggregate, expected_generation=token[2])
 
     def __teardown_scan_worker(self, terminate: bool = True) -> None:
         worker = self.__scan_worker

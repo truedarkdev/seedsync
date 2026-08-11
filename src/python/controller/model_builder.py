@@ -16,6 +16,29 @@ from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
 from common.breadcrumb_trace import BreadcrumbTraceEmitter
+from common.performance_diagnostics import (
+    DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
+    DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+    DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
+    DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+    DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
+    MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+    MODEL_BUILDER_INVALIDATION_CLEAR,
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
+    MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS,
+    MODEL_BUILDER_INVALIDATION_EXPLICIT,
+    MODEL_BUILDER_INVALIDATION_EXTRACTED_FILES,
+    MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES,
+    MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES,
+    MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+    MODEL_BUILDER_INVALIDATION_LOCAL_FILES,
+    MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS,
+    MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES,
+    MODEL_BUILDER_INVALIDATION_REMOTE_FILES,
+    MODEL_BUILDER_INVALIDATION_STOPPED_FILES,
+    MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS,
+    MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES,
+)
 from .extract import ExtractStatus, Extract
 from .validate import ValidateStatus
 
@@ -93,10 +116,48 @@ class ModelBuilder:
         self.__stop_resume_trace_last_signatures: OrderedDict[tuple[str, str], str] = OrderedDict()
         self.__stop_resume_trace_last_enabled = False
         self.__target_archive_trace_last_signature: Optional[str] = None
+        self.__performance_diagnostics: object | None = None
 
     def set_base_logger(self, base_logger: logging.Logger) -> None:
         self.logger = base_logger.getChild("ModelBuilder")
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
+
+    def set_performance_diagnostics(self, diagnostics: object | None) -> None:
+        """Attach the shared fixed-counter diagnostics collector."""
+        self.__performance_diagnostics = diagnostics
+
+    def __record_cache_invalidation(self, counter: str) -> None:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.increment(counter)
+        except Exception:
+            pass
+
+    def __invalidate_cache(self, counter: str) -> None:
+        self.__cached_model = None
+        self.__record_cache_invalidation(counter)
+
+    def __begin_duration(self, metric: str) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(metric)
+        except Exception:
+            return None
+
+    def __finish_duration(self, metric: str, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)
+        except Exception:
+            pass
 
     @staticmethod
     def __build_dummy_model_logger() -> logging.Logger:
@@ -464,7 +525,7 @@ class ModelBuilder:
             path_pair_id: path for path_pair_id, path in (local_staging_paths or {}).items() if path
         }
         if next_local_root_paths != self.__local_root_paths or next_local_staging_paths != self.__local_staging_paths:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS)
         self.__local_root_paths = next_local_root_paths
         self.__local_staging_paths = next_local_staging_paths
 
@@ -1434,20 +1495,24 @@ class ModelBuilder:
         self.__retained_stopped_transfer_snapshots[file_id] = snapshot
 
     def set_active_files(self, active_files: List[SystemFile]) -> None:
-        had_active_files = bool(self.__active_files)
-        self.__active_file_ids = set()
-        self.__active_files = {}
-        for file in active_files:
-            # Active scanners read the staging path.  Some scanner paths do
-            # not carry that location tag into their SystemFile roots, so make
-            # the semantic boundary explicit here without changing sidecar or
-            # collision metadata.
-            self.__mark_active_tree_staging(file)
-            self.__collect_active_file_ids(file, self.__active_file_ids)
-            self.__active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
-        # Invalidate the cache
-        if had_active_files or len(active_files) > 0:
-            self.__cached_model = None
+        started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES)
+        try:
+            had_active_files = bool(self.__active_files)
+            self.__active_file_ids = set()
+            self.__active_files = {}
+            for file in active_files:
+                # Active scanners read the staging path.  Some scanner paths do
+                # not carry that location tag into their SystemFile roots, so make
+                # the semantic boundary explicit here without changing sidecar or
+                # collision metadata.
+                self.__mark_active_tree_staging(file)
+                self.__collect_active_file_ids(file, self.__active_file_ids)
+                self.__active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
+            # Invalidate the cache
+            if had_active_files or len(active_files) > 0:
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_ACTIVE_FILES)
+        finally:
+            self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
 
     def evict_active_file_ids(self, file_ids: Set[str]) -> None:
         """Drop exact active-scan roots during a completed move handoff."""
@@ -1464,7 +1529,7 @@ class ModelBuilder:
         self.__active_file_ids = set()
         for active_file in retained_active_files.values():
             self.__collect_active_file_ids(active_file, self.__active_file_ids)
-        self.__cached_model = None
+        self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_ACTIVE_FILES)
 
     @staticmethod
     def __mark_active_tree_staging(system_file: SystemFile) -> None:
@@ -1728,31 +1793,43 @@ class ModelBuilder:
         return effective_local_files
 
     def set_local_files(self, local_files: List[SystemFile]) -> None:
-        prev_local_files = self.__local_files
-        next_local_files = {
-            self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
-        }
-        # Invalidate the cache
-        if next_local_files != prev_local_files:
-            self.__local_files = next_local_files
-            self.__cached_model = None
+        started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES)
+        try:
+            prev_local_files = self.__local_files
+            next_local_files = {
+                self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
+            }
+            # Invalidate the cache
+            if next_local_files != prev_local_files:
+                self.__local_files = next_local_files
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES)
+        finally:
+            self.__finish_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES, started_at)
 
     def set_remote_files(self, remote_files: List[SystemFile]) -> None:
-        prev_remote_files = self.__remote_files
-        next_remote_files = {
-            self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
-        }
-        # Invalidate the cache
-        if next_remote_files != prev_remote_files:
-            self.__remote_files = next_remote_files
-            self.__cached_model = None
+        started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES)
+        try:
+            prev_remote_files = self.__remote_files
+            next_remote_files = {
+                self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
+            }
+            # Invalidate the cache
+            if next_remote_files != prev_remote_files:
+                self.__remote_files = next_remote_files
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_REMOTE_FILES)
+        finally:
+            self.__finish_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES, started_at)
 
     def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]) -> None:
-        prev_lftp_statuses = self.__lftp_statuses
-        self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
-        # Invalidate the cache
-        if self.__lftp_statuses != prev_lftp_statuses:
-            self.__cached_model = None
+        started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES)
+        try:
+            prev_lftp_statuses = self.__lftp_statuses
+            self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
+            # Invalidate the cache
+            if self.__lftp_statuses != prev_lftp_statuses:
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
+        finally:
+            self.__finish_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES, started_at)
 
     def evict_recent_live_transfer_snapshots_missing_roots(self, active_root_file_ids: Set[str]) -> None:
         removed = False
@@ -1765,27 +1842,27 @@ class ModelBuilder:
             self.__recent_live_transfer_snapshots.pop(file_id, None)
             removed = True
         if removed:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
 
     def set_downloaded_files(self, downloaded_files: Set[str]) -> None:
         prev_downloaded_files = self.__downloaded_files
         self.__downloaded_files = set(downloaded_files)
         # Invalidate the cache
         if self.__downloaded_files != prev_downloaded_files:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES)
 
     def set_unknown_local_path_pair_ids(self, path_pair_ids: Set[Optional[str]]) -> None:
         """Keep persisted markers from becoming Deleted while local evidence is incomplete."""
         normalized = set(path_pair_ids)
         if normalized != self.__unknown_local_path_pair_ids:
             self.__unknown_local_path_pair_ids = normalized
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS)
 
     def set_downloaded_timestamps(self, downloaded_timestamps: Dict[str, float]) -> None:
         previous = self.__downloaded_timestamps
         self.__downloaded_timestamps = dict(downloaded_timestamps)
         if self.__downloaded_timestamps != previous:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_DOWNLOADED_TIMESTAMPS)
 
     def set_extract_statuses(self, extract_statuses: List[ExtractStatus]) -> None:
         prev_extract_statuses = self.__extract_statuses
@@ -1794,40 +1871,44 @@ class ModelBuilder:
         }
         # Invalidate the cache
         if self.__extract_statuses != prev_extract_statuses:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_EXTRACT_STATUSES)
 
     def set_extracted_files(self, extracted_files: Set[str]) -> None:
         prev_extracted_files = self.__extracted_files
         self.__extracted_files = extracted_files
         # Invalidate the cache
         if self.__extracted_files != prev_extracted_files:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_EXTRACTED_FILES)
 
     def set_stopped_files(self, stopped_files: Set[str]) -> None:
-        prev_stopped_files = self.__stopped_files
-        self.__stopped_files = set(stopped_files)
-        self.__sweep_recent_live_transfer_snapshots()
-        # Invalidate the cache
-        if self.__stopped_files != prev_stopped_files:
-            self.__cached_model = None
+        started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_STOPPED_FILES)
+        try:
+            prev_stopped_files = self.__stopped_files
+            self.__stopped_files = set(stopped_files)
+            self.__sweep_recent_live_transfer_snapshots()
+            # Invalidate the cache
+            if self.__stopped_files != prev_stopped_files:
+                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_STOPPED_FILES)
+        finally:
+            self.__finish_duration(DURATION_MODEL_BUILDER_SET_STOPPED_FILES, started_at)
 
     def set_move_failed_files(self, move_failed_files: Set[str]) -> None:
         previous = self.__move_failed_files
         self.__move_failed_files = set(move_failed_files)
         if self.__move_failed_files != previous:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES)
 
     def set_final_move_succeeded_files(self, file_ids: Set[str]) -> None:
         previous = self.__final_move_succeeded_files
         self.__final_move_succeeded_files = set(file_ids)
         if self.__final_move_succeeded_files != previous:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_FINAL_MOVE_SUCCEEDED_FILES)
 
     def set_validation_statuses(self, validation_statuses: List[ValidateStatus]) -> None:
         prev_validation_statuses = self.__validation_statuses
         self.__validation_statuses = {status.file_id: status for status in validation_statuses}
         if self.__validation_statuses != prev_validation_statuses:
-            self.__cached_model = None
+            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_VALIDATION_STATUSES)
 
     def clear(self) -> None:
         self.__local_files.clear()
@@ -1847,7 +1928,7 @@ class ModelBuilder:
         self.__final_move_succeeded_files.clear()
         self.__suppressed_ambiguous_extracted_file_names.clear()
         self.__stop_resume_trace_last_signatures.clear()
-        self.__cached_model = None
+        self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_CLEAR)
         self.__cached_unresolved_staging_collision_file_ids.clear()
         self.__cached_terminalizable_staging_collision_file_ids.clear()
 
@@ -1864,7 +1945,7 @@ class ModelBuilder:
         return self.__cached_model is None
 
     def request_rebuild(self) -> None:
-        self.__cached_model = None
+        self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_EXPLICIT)
 
     def adopt_applied_model(self, built_model: Model, applied_model: Model) -> None:
         """Alias the cache to the controller's live model after a successful diff.

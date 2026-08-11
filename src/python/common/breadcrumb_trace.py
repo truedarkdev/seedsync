@@ -80,6 +80,7 @@ class BreadcrumbTraceCollector:
     __MAX_COLLECTION_DEPTH = 3
     __MAX_LIST_ITEMS = 16
     __EXTERNAL_QUEUE_FIRST_RECORD_WAIT_SECONDS = 0.02
+    __EXTERNAL_QUEUE_DRAIN_INTERVAL_SECONDS = 0.1
     __SENSITIVE_KEYWORDS = (
         "password",
         "passwd",
@@ -120,6 +121,7 @@ class BreadcrumbTraceCollector:
         self.__external_queue_last_drain_count = 0
         self.__external_queue_last_drain_limit = self.__max_entries
         self.__external_queue_drain_limited = False
+        self.__external_queue_last_drain_monotonic: Optional[float] = None
         self.__last_signature: Optional[str] = None
         self.__last_failure_entry: Optional[Dict[str, Any]] = None
         self.__last_failure_version: Optional[int] = None
@@ -166,7 +168,7 @@ class BreadcrumbTraceCollector:
             pass
 
     def clear(self) -> None:
-        self.__drain_external_records(limit=None)
+        self.__drain_external_records(limit=None, force=True)
         with self.__lock:
             self.__entries.clear()
             self.__last_signature = None
@@ -178,7 +180,7 @@ class BreadcrumbTraceCollector:
             self.__window_truncated_pending = False
 
     def reset(self) -> None:
-        self.__drain_external_records(limit=None)
+        self.__drain_external_records(limit=None, force=True)
         with self.__lock:
             self.__entries.clear()
             self.__last_signature = None
@@ -190,9 +192,11 @@ class BreadcrumbTraceCollector:
             self.__window_truncated_pending = False
 
     def record(self, source: str, message: str, details: object = None, **metadata: Any) -> None:
-        if self.is_enabled():
-            self.__drain_external_records(limit=self.__max_entries)
-        self.__record_entry(source, message, details, **metadata)
+        enabled = self.is_enabled()
+        if not enabled:
+            return
+        self.__drain_external_records_if_due(limit=self.__max_entries)
+        self.__record_entry(source, message, details, allow_when_disabled=True, **metadata)
 
     def __record_entry(
         self,
@@ -312,6 +316,7 @@ class BreadcrumbTraceCollector:
         self.__drain_external_records(
             limit=self.__max_entries,
             wait_for_first_record=True,
+            force=True,
         )
         with self.__lock:
             enabled = self.is_enabled()
@@ -576,12 +581,29 @@ class BreadcrumbTraceCollector:
     def __sanitize_string_content(self, value: str) -> str:
         return redact_sensitive_text(value) or ""
 
-    def __drain_external_records(self, limit: Optional[int] = None, wait_for_first_record: bool = False) -> None:
+    def __drain_external_records_if_due(self, limit: Optional[int]) -> None:
+        if self.__external_records is None:
+            return
+        now = time.monotonic()
+        last_drain = self.__external_queue_last_drain_monotonic
+        if last_drain is not None and now - last_drain < self.__EXTERNAL_QUEUE_DRAIN_INTERVAL_SECONDS:
+            return
+        self.__external_queue_last_drain_monotonic = now
+        self.__drain_external_records(limit=limit)
+
+    def __drain_external_records(
+        self,
+        limit: Optional[int] = None,
+        wait_for_first_record: bool = False,
+        force: bool = False,
+    ) -> None:
         if self.__external_records is None:
             self.__external_queue_last_drain_count = 0
             self.__external_queue_last_drain_limit = limit if limit is not None else self.__max_entries
             self.__external_queue_drain_limited = False
             return
+        if force:
+            self.__external_queue_last_drain_monotonic = time.monotonic()
         drained_count = 0
         drain_limited = False
         drain_limit = limit if limit is not None else self.__max_entries

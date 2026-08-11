@@ -13,6 +13,10 @@ import shlex
 from controller.scan import RemoteScanner, ScannerError
 from ssh import SshcpError
 from common import Localization, escape_remote_path_for_shell
+from common.performance_diagnostics import (
+    DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION,
+    DURATION_REMOTE_SCAN_STREAM_PARSING,
+)
 
 
 class TestRemoteScanner(unittest.TestCase):
@@ -78,6 +82,26 @@ class TestRemoteScanner(unittest.TestCase):
         return "{} {}".format(
             escape_remote_path_for_shell(remote_script, allow_tilde_expansion=True),
             escape_remote_path_for_shell(remote_path, allow_tilde_expansion=True)
+        )
+
+    @staticmethod
+    def _framed_stream(root_names):
+        records = [
+            {"type": "manifest_begin", "count": len(root_names)},
+            {"type": "manifest_names", "names": list(root_names)},
+            {"type": "manifest_end"},
+        ]
+        for root_id, name in enumerate(root_names):
+            records.extend((
+                {"type": "root_begin", "id": root_id, "name": name},
+                {"type": "root_node", "root": root_id, "id": 0, "parent": None,
+                 "file": {"name": name, "size": root_id, "is_dir": False}},
+                {"type": "root_end", "id": root_id, "nodes": 1},
+            ))
+        records.append({"type": "complete"})
+        return b"".join(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+            for record in records
         )
 
     def test_correctly_initializes_ssh(self):
@@ -479,7 +503,204 @@ class TestRemoteScanner(unittest.TestCase):
                          [(roots, complete) for _, roots, complete in events])
         self.assertIn("--stream", self.mock_ssh.shell.call_args.args[0])
 
-    def test_progressive_stream_publishes_before_remote_command_eof(self):
+    def test_framed_progress_coalesces_roots_in_order_with_bounded_batches(self):
+        names = ["root-{}".format(index) for index in range(17)]
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+        stream = self._framed_stream(names)
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (on_chunk(stream), b"")[-1])
+
+        files = scanner.scan()
+
+        self.assertEqual(names, [file.name for file in files])
+        root_events = [files for files, roots, complete in events if files and roots is None and not complete]
+        self.assertEqual([names[:8], names[8:16], names[16:]], root_events)
+        self.assertEqual(set(names), events[0][1])
+        self.assertTrue(events[-1][2])
+
+    def test_framed_progress_flushes_small_batch_before_completion(self):
+        names = ["slow-0", "slow-1", "slow-2"]
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+        stream = self._framed_stream(names)
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (on_chunk(stream), b"")[-1])
+
+        scanner.scan()
+
+        self.assertEqual([names], [files for files, roots, complete in events if files and roots is None])
+        self.assertEqual([False, False, True], [complete for _, _, complete in events])
+
+    def test_framed_progress_flushes_slow_roots_on_next_root_completion(self):
+        names = ["slow-root-0", "slow-root-1"]
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+        stream = self._framed_stream(names)
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (on_chunk(stream), b"")[-1])
+
+        with patch("controller.scan.remote_scanner.time.monotonic", side_effect=(0.0, 0.2)):
+            scanner.scan()
+
+        root_events = [files for files, roots, complete in events if files and roots is None and not complete]
+        self.assertEqual([names], root_events)
+        self.assertEqual([False, False, True], [complete for _, _, complete in events])
+
+    def test_framed_progress_does_not_flush_pending_roots_before_validated_completion(self):
+        names = ["pending-root"]
+        stream = self._framed_stream(names)
+        malformed = b'SEEDSYNC_SCAN_V2\t{not-json}\n'
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+        self.mock_ssh.shell_stream = None
+        self.mock_ssh.shell.return_value = stream + malformed
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertEqual([([], {"pending-root"}, False)], events)
+        self.assertFalse(any(complete for _, _, complete in events))
+
+    def test_framed_progress_keeps_flushed_batch_after_late_malformed_data_without_completion(self):
+        names = ["late-{}".format(index) for index in range(9)]
+        stream = self._framed_stream(names) + b'SEEDSYNC_SCAN_V2\t{not-json}\n'
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+        self.mock_ssh.shell_stream = None
+        self.mock_ssh.shell.return_value = stream
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        root_events = [files for files, roots, complete in events if files and roots is None and not complete]
+        self.assertEqual([names[:8]], root_events)
+        self.assertFalse(any(names[8] in files for files, _, _ in events))
+        self.assertFalse(any(complete for _, _, complete in events))
+
+    def test_framed_progress_checks_exact_age_boundary_on_next_root_completion(self):
+        names = ["boundary-0", "boundary-1"]
+        records = self._framed_stream(names).splitlines(keepends=True)
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+
+        def shell_stream(command, on_chunk):
+            on_chunk(b"".join(records[:6]))  # manifest + first root; no timer flush occurs here
+            self.assertEqual([], [files for files, roots, complete in events
+                                  if files and roots is None and not complete])
+            on_chunk(b"".join(records[6:9]))  # second root reaches the exact 100 ms boundary
+            self.assertEqual([names], [files for files, roots, complete in events
+                                       if files and roots is None and not complete])
+            on_chunk(records[9])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        with patch("controller.scan.remote_scanner.time.monotonic", side_effect=(0.0, 0.1)):
+            scanner.scan()
+
+        self.assertTrue(events[-1][2])
+
+    def test_framed_progress_preserves_manifest_event_order_across_fragmented_chunks(self):
+        names = ["fragment-0", "fragment-1"]
+        records = [
+            {"type": "manifest_begin", "count": len(names)},
+            {"type": "manifest_names", "names": [names[0]]},
+            {"type": "manifest_names", "names": [names[1]]},
+            {"type": "manifest_end"},
+            {"type": "root_begin", "id": 0, "name": names[0]},
+            {"type": "root_node", "root": 0, "id": 0, "parent": None,
+             "file": {"name": names[0], "size": 0, "is_dir": False}},
+            {"type": "root_end", "id": 0, "nodes": 1},
+            {"type": "root_begin", "id": 1, "name": names[1]},
+            {"type": "root_node", "root": 1, "id": 0, "parent": None,
+             "file": {"name": names[1], "size": 1, "is_dir": False}},
+            {"type": "root_end", "id": 1, "nodes": 1},
+            {"type": "complete"},
+        ]
+        stream = b"".join(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+            for record in records
+        )
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        events = []
+        scanner.set_progress_callback(
+            lambda files, pair_id, pair_name, roots, complete:
+            events.append(([file.name for file in files], roots, complete))
+        )
+
+        def shell_stream(command, on_chunk):
+            for offset in range(0, len(stream), 5):
+                on_chunk(stream[offset:offset + 5])
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.scan()
+
+        self.assertEqual(set(names), events[0][1])
+        self.assertEqual([names], [files for files, roots, complete in events if files and roots is None])
+        self.assertEqual([False, False, True], [complete for _, _, complete in events])
+
+    def test_one_shot_v2_decode_is_attributed_to_stream_parsing(self):
+        diagnostics = MagicMock()
+        diagnostics.begin_duration.side_effect = lambda metric: metric
         scanner = RemoteScanner(
             remote_address="host",
             remote_username="user",
@@ -488,6 +709,34 @@ class TestRemoteScanner(unittest.TestCase):
             remote_path_to_scan="/remote/path/to/scan",
             local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
             remote_path_to_scan_script="/remote/path/to/scan/script",
+            performance_diagnostics=diagnostics,
+        )
+        stream = (
+            'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["a"]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"a","size":1,"is_dir":false}]}\n'
+            'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        ).encode()
+        self.mock_ssh.shell.side_effect = [b"", stream]
+        scanner.set_progress_callback(lambda *_args: None)
+
+        self.assertEqual(["a"], [file.name for file in scanner.scan()])
+        started_metrics = [call.args[0] for call in diagnostics.begin_duration.call_args_list]
+        finished_metrics = [call.args[0] for call in diagnostics.finish_duration.call_args_list]
+        self.assertIn(DURATION_REMOTE_SCAN_STREAM_PARSING, started_metrics)
+        self.assertIn(DURATION_REMOTE_SCAN_STREAM_PARSING, finished_metrics)
+
+    def test_progressive_stream_publishes_before_remote_command_eof(self):
+        diagnostics = MagicMock()
+        diagnostics.begin_duration.side_effect = lambda metric: metric
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+            performance_diagnostics=diagnostics,
         )
         events = []
         scanner.set_progress_callback(lambda files, pair_id, pair_name, roots, complete:
@@ -513,6 +762,13 @@ class TestRemoteScanner(unittest.TestCase):
         self.mock_ssh.shell_stream.assert_called_once()
         self.assertTrue(command_finished[0])
         self.assertIn("--stream", self.mock_ssh.shell_stream.call_args.args[0])
+        started_metrics = [call.args[0] for call in diagnostics.begin_duration.call_args_list]
+        self.assertIn(DURATION_REMOTE_SCAN_STREAM_PARSING, started_metrics)
+        self.assertIn(DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION, started_metrics)
+        self.assertEqual(
+            diagnostics.begin_duration.call_count,
+            diagnostics.finish_duration.call_count,
+        )
 
     def test_progressive_transport_accepts_chunked_legacy_json_with_empty_transport_return(self):
         scanner = RemoteScanner(
@@ -794,13 +1050,18 @@ class TestRemoteScanner(unittest.TestCase):
             {"type": "manifest_names", "names": ["huge"]},
             {"type": "manifest_end"},
             {"type": "root_begin", "id": 0, "name": "huge"},
-            {"type": "root_node", "root": 0, "id": 0, "parent": None,
-             "file": {"name": "huge", "size": 0, "is_dir": True}},
+        ]
+        nodes = [
+            {"id": 0, "parent": None, "file": {"name": "huge", "size": 0, "is_dir": True}},
+            *[
+                {"id": index + 1, "parent": 0,
+                 "file": {"name": name, "size": index, "is_dir": False}}
+                for index, name in enumerate(child_names)
+            ],
         ]
         records.extend(
-            {"type": "root_node", "root": 0, "id": index + 1, "parent": 0,
-             "file": {"name": name, "size": index, "is_dir": False}}
-            for index, name in enumerate(child_names)
+            {"type": "root_nodes", "root": 0, "nodes": nodes[index:index + 64]}
+            for index in range(0, len(nodes), 64)
         )
         records.extend((
             {"type": "root_end", "id": 0, "nodes": 801},
@@ -842,6 +1103,37 @@ class TestRemoteScanner(unittest.TestCase):
                 {"type": "root_begin", "id": 0, "name": "root"},
                 {"type": "root_node", "root": 0, "id": 1, "parent": None,
                  "file": {"name": "root", "size": 0, "is_dir": True}},
+            ]),
+            ("batched_out_of_order", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_nodes", "root": 0, "nodes": [
+                    {"id": 1, "parent": None,
+                     "file": {"name": "root", "size": 0, "is_dir": True}},
+                ]},
+            ]),
+            ("oversized_node_batch", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_nodes", "root": 0, "nodes": [
+                    {"id": index, "parent": None,
+                     "file": {"name": "root", "size": 0, "is_dir": True}}
+                    for index in range(65)
+                ]},
+            ]),
+            ("batched_boolean_root", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_nodes", "root": False, "nodes": [
+                    {"id": 0, "parent": None,
+                     "file": {"name": "root", "size": 0, "is_dir": True}},
+                ]},
             ]),
             ("duplicate", [
                 {"type": "manifest_begin", "count": 1},

@@ -17,6 +17,7 @@ _STREAM_PREFIX = "SEEDSYNC_SCAN_V2\t"
 # This is a wire limit, not a root-size limit.  Recursive roots are emitted as
 # ordered node records below, so a large tree never becomes one buffered line.
 _MAX_STREAM_RECORD_BYTES = 64 * 1024
+_MAX_STREAM_NODE_BATCH_SIZE = 64
 
 
 class SystemFileDataRequired(TypedDict):
@@ -567,8 +568,8 @@ def _write_stream_manifest(root_names: List[str]) -> None:
     _write_stream_record({"type": "manifest_end"})
 
 
-def _write_stream_root(root_id: int, root: SystemFile) -> None:
-    """Emit a recursive root as ordered, bounded node records.
+def _write_stream_root(root_id: int, root: SystemFile, node_batch_size: int) -> None:
+    """Emit a recursive root as ordered, bounded node batches.
 
     Parent ids point only into the current root's active preorder stack.  The
     receiver can therefore build the final tree without retaining JSON
@@ -576,21 +577,42 @@ def _write_stream_root(root_id: int, root: SystemFile) -> None:
     """
     _write_stream_record({"type": "root_begin", "id": root_id, "name": root.name})
     next_node_id = 0
+    node_batch: List[dict] = []
+
+    def flush_node_batch() -> None:
+        if node_batch:
+            _write_stream_record({"type": "root_nodes", "root": root_id, "nodes": node_batch})
+            node_batch.clear()
 
     pending_nodes: List[Tuple[SystemFile, Optional[int]]] = [(root, None)]
     while pending_nodes:
         node, parent_id = pending_nodes.pop()
         node_id = next_node_id
         next_node_id += 1
-        _write_stream_record({
-            "type": "root_node",
-            "root": root_id,
+        node_record = {
             "id": node_id,
             "parent": parent_id,
             "file": _stream_shallow_file_data(node),
-        })
+        }
+        # Keep the established small CLI batch cap for uploaded-helper
+        # compatibility, while also proving each record remains below the V2
+        # 64 KiB wire limit before it is buffered.
+        if len(node_batch) >= node_batch_size:
+            flush_node_batch()
+        candidate = node_batch + [node_record]
+        try:
+            _encode_stream_record({"type": "root_nodes", "root": root_id, "nodes": candidate})
+        except SystemScannerError:
+            if not node_batch:
+                raise
+            flush_node_batch()
+            _encode_stream_record({"type": "root_nodes", "root": root_id, "nodes": [node_record]})
+            node_batch.append(node_record)
+        else:
+            node_batch.append(node_record)
         pending_nodes.extend((child, node_id) for child in reversed(node.children))
 
+    flush_node_batch()
     _write_stream_record({"type": "root_end", "id": root_id, "nodes": next_node_id})
 
 
@@ -606,8 +628,8 @@ if __name__ == "__main__":
                         help="Human readable output")
     parser.add_argument("--stream", action="store_true", default=False,
                         help="Emit bounded SeedSync scan protocol records")
-    parser.add_argument("--stream-batch-size", type=int, default=8,
-                        help="Deprecated compatibility option")
+    parser.add_argument("--stream-batch-size", type=int, default=_MAX_STREAM_NODE_BATCH_SIZE,
+                        help="Maximum V2 nodes per bounded record")
     args = parser.parse_args()
 
     scanner = SystemScanner(args.path)
@@ -615,8 +637,8 @@ if __name__ == "__main__":
         scanner.add_exclude_prefix(".")
     try:
         if args.stream:
-            if args.stream_batch_size < 1 or args.stream_batch_size > 64:
-                parser.error("--stream-batch-size must be between 1 and 64")
+            if args.stream_batch_size < 1 or args.stream_batch_size > _MAX_STREAM_NODE_BATCH_SIZE:
+                parser.error("--stream-batch-size must be between 1 and {}".format(_MAX_STREAM_NODE_BATCH_SIZE))
             root_names = scanner.root_names()
             _write_stream_manifest(root_names)
             emitted_root_id = 0
@@ -624,7 +646,7 @@ if __name__ == "__main__":
                 root_file = scanner.scan_single_if_present(root_name)
                 if root_file is None:
                     continue
-                _write_stream_root(emitted_root_id, root_file)
+                _write_stream_root(emitted_root_id, root_file, args.stream_batch_size)
                 emitted_root_id += 1
             if scanner.scan_had_errors:
                 raise SystemScannerError(

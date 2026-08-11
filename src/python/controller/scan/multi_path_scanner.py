@@ -10,6 +10,7 @@ from .remote_scanner import RemoteScanner
 from common import overrides
 from common.performance_diagnostics import (
     DURATION_LOCAL_SCAN_AGGREGATION,
+    DURATION_REMOTE_SCAN_AGGREGATION,
     PerformanceDiagnosticsCollector,
 )
 from system import SystemFile
@@ -191,9 +192,14 @@ class MultiPathRemoteScanner(IScanner):
     Scanner that aggregates remote scan results from multiple path pairs.
     """
 
-    def __init__(self, scanners: List[RemoteScanner]):
+    def __init__(
+        self,
+        scanners: List[RemoteScanner],
+        performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None,
+    ):
         self.logger = logging.getLogger("MultiPathRemoteScanner")
         self.__scanners = scanners
+        self.__performance_diagnostics = performance_diagnostics
         self.__scan_target_path_pair_ids: Optional[set[str]] = None
         self.__failed_path_pair_ids: set[str | None] = set()
 
@@ -206,10 +212,22 @@ class MultiPathRemoteScanner(IScanner):
     def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]) -> None:
         self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
 
+    def __getstate__(self) -> dict[str, object]:
+        state = self.__dict__.copy()
+        state["_MultiPathRemoteScanner__performance_diagnostics"] = None
+        return state
+
     @overrides(IScanner)
     def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
         for scanner in self.__scanners:
             scanner.set_progress_callback(callback)
+
+    def set_performance_diagnostics(self, diagnostics: object) -> None:
+        self.__performance_diagnostics = diagnostics
+        for scanner in self.__scanners:
+            setter = getattr(scanner, "set_performance_diagnostics", None)
+            if callable(setter):
+                setter(diagnostics)
 
     @overrides(IScanner)
     def scanned_path_pair_ids(self) -> set[str | None]:
@@ -223,6 +241,26 @@ class MultiPathRemoteScanner(IScanner):
     @overrides(IScanner)
     def failed_path_pair_ids(self) -> set[str | None]:
         return set(self.__failed_path_pair_ids)
+
+    def __begin_stage(self) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(DURATION_REMOTE_SCAN_AGGREGATION)
+        except Exception:
+            return None
+
+    def __finish_stage(self, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(DURATION_REMOTE_SCAN_AGGREGATION, started_at)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
     def export_recycled_state(self) -> tuple[object, ...]:
         return tuple(scanner.export_recycled_state() for scanner in self.__scanners)
@@ -242,12 +280,15 @@ class MultiPathRemoteScanner(IScanner):
                     scanner.path_pair_id in self.__scan_target_path_pair_ids]
 
         # RemoteScanner performs setup (including scanfs check/copy) and the
-        # scan over one SSH transport.  Keep those operations serialized across
-        # path pairs: multiple first-run transports to the same destination can
-        # contend for one password prompt and leave later scans blocked for the
-        # SSH timeout.  Results and progress therefore retain input order while
-        # local scans continue to use the bounded worker pool above.
-        for scanner in scanners:
+        # scan over one SSH transport.  Keep a generation serialized while any
+        # selected scanner is still on its first run: multiple first-run
+        # transports to the same destination can contend for one password
+        # prompt.  Once all selected scanners have completed setup, refreshes
+        # use the bounded worker pool to avoid making every refresh wait for
+        # the slowest path pair.
+        first_run_states = [self.__scanner_is_first_run(scanner) for scanner in scanners]
+
+        def scan_one(scanner: RemoteScanner) -> tuple[RemoteScanner, List[SystemFile], Optional[ScannerError]]:
             err: Optional[ScannerError] = None
             try:
                 files = scanner.scan()
@@ -256,19 +297,31 @@ class MultiPathRemoteScanner(IScanner):
                     raise
                 err = scan_error
                 files = scan_error.files or []
-            if err is not None:
-                error_message = "Failed to scan remote path for pair '{}': {}".format(
-                    scanner.path_pair_name, str(err)
-                )
-                self.logger.warning(error_message)
-                if not err.recoverable:
-                    raise err
-                self.__failed_path_pair_ids.add(scanner.path_pair_id)
-                recoverable_errors.append(error_message)
-            for system_file in files:
-                system_file.path_pair_id = scanner.path_pair_id
-                system_file.path_pair_name = scanner.path_pair_name
-            all_files.extend(files)
+            return scanner, files, err
+
+        if any(first_run_states):
+            scan_results = [scan_one(scanner) for scanner in scanners]
+        else:
+            scan_results = _run_bounded_scan_tasks(scanners, scan_one, "remote-scan")
+
+        for scanner, files, err in scan_results:
+            aggregation_started = self.__begin_stage()
+            try:
+                if err is not None:
+                    error_message = "Failed to scan remote path for pair '{}': {}".format(
+                        scanner.path_pair_name, str(err)
+                    )
+                    self.logger.warning(error_message)
+                    if not err.recoverable:
+                        raise err
+                    self.__failed_path_pair_ids.add(scanner.path_pair_id)
+                    recoverable_errors.append(error_message)
+                for system_file in files:
+                    system_file.path_pair_id = scanner.path_pair_id
+                    system_file.path_pair_name = scanner.path_pair_name
+                all_files.extend(files)
+            finally:
+                self.__finish_stage(aggregation_started)
         if recoverable_errors:
             raise ScannerError(
                 "Remote scan completed with recoverable errors: {}".format("; ".join(recoverable_errors)),
@@ -276,3 +329,17 @@ class MultiPathRemoteScanner(IScanner):
                 files=all_files
             )
         return all_files
+
+    @staticmethod
+    def __scanner_is_first_run(scanner: object) -> bool:
+        exporter = getattr(scanner, "export_recycled_state", None)
+        if not callable(exporter):
+            # Unknown scanner state is not safe to run concurrently with a
+            # first-run SSH setup, so retain the conservative serial behavior.
+            return True
+        try:
+            state = exporter()
+            first_run = state[0]
+        except Exception:
+            return True
+        return first_run if isinstance(first_run, bool) else True

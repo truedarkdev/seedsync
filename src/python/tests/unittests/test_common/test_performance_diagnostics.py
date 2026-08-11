@@ -9,14 +9,22 @@ import common.performance_diagnostics as performance_diagnostics
 
 from common.performance_diagnostics import (
     DURATION_CONTROLLER_PROCESS,
+    DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
+    DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+    DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
+    DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+    DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
     DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
     DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION,
+    DURATION_REMOTE_SCAN_STREAM_PARSING,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC,
     DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
+    MODEL_REBUILD_REASON_COLLISION_RETRY,
+    FixedDurationRecorder,
     PerformanceDiagnosticsCollector,
     ProcessContainerSampler,
 )
@@ -37,6 +45,16 @@ class _FailingSampler:
 
 
 class TestPerformanceDiagnosticsCollector(unittest.TestCase):
+    def test_rebuild_reason_counters_are_fixed_and_bounded(self):
+        collector = PerformanceDiagnosticsCollector(lambda: True)
+        collector.increment("model_rebuild_collision_retry", 2)
+        collector.increment("model_rebuild_collision_retry", -1)
+        collector.increment("model_rebuild:/private/path")
+        snapshot = collector.snapshot()
+        self.assertEqual(2, snapshot["counters"]["model_rebuild_collision_retry"])
+        self.assertNotIn("model_rebuild:/private/path", snapshot["counters"])
+        self.assertEqual("collision_retry", MODEL_REBUILD_REASON_COLLISION_RETRY)
+
     def test_samples_are_bounded_numeric_and_track_peaks(self):
         collector = PerformanceDiagnosticsCollector(lambda: True, retention_depth=2)
         collector.record_sample({"process_rss_bytes": 10, "process_fds": 3, "path": "/secret"})
@@ -89,6 +107,51 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         duration = collector.snapshot()["durations"][DURATION_CONTROLLER_PROCESS]
         self.assertEqual(1, duration["count"])
         self.assertEqual(2.0, duration["average_wall_seconds"])
+
+    def test_child_duration_aggregate_is_fixed_and_validated(self):
+        collector = PerformanceDiagnosticsCollector(lambda: True)
+        generation = collector.duration_generation()
+        collector.observe_duration_aggregate(
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            {
+                "count": 2,
+                "total_wall_seconds": 3.0,
+                "max_wall_seconds": 2.0,
+                "total_cpu_seconds": 1.0,
+                "cpu_observation_count": 2,
+            },
+            expected_generation=generation,
+        )
+        collector.observe_duration_aggregate(
+            "/private/path",
+            {"count": 4, "total_wall_seconds": 4.0, "max_wall_seconds": 1.0, "cpu_observation_count": 0},
+        )
+        collector.observe_duration_aggregate(
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            {"count": 1, "total_wall_seconds": 1.0, "max_wall_seconds": 2.0, "cpu_observation_count": 0},
+            expected_generation=generation - 1,
+        )
+        duration = collector.snapshot()["durations"][DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL]
+        self.assertEqual(2, duration["count"])
+        self.assertEqual(3.0, duration["total_wall_seconds"])
+        self.assertNotIn("/private/path", collector.snapshot()["durations"])
+
+    def test_child_recorder_collects_only_fixed_metrics_and_can_be_disabled(self):
+        clock = [1.0]
+        cpu_clock = [2.0]
+        recorder = FixedDurationRecorder(
+            True, monotonic_fn=lambda: clock[0], thread_time_fn=lambda: cpu_clock[0]
+        )
+        token = recorder.begin_duration(DURATION_REMOTE_SCAN_STREAM_PARSING)
+        clock[0], cpu_clock[0] = 3.0, 2.5
+        recorder.finish_duration(DURATION_REMOTE_SCAN_STREAM_PARSING, token)
+        recorder.finish_duration("/private/path", token)
+        snapshot = recorder.snapshot()
+        self.assertEqual(1, snapshot[DURATION_REMOTE_SCAN_STREAM_PARSING]["count"])
+        self.assertNotIn("/private/path", snapshot)
+        disabled = FixedDurationRecorder(False)
+        self.assertIsNone(disabled.begin_duration(DURATION_REMOTE_SCAN_STREAM_PARSING))
+        self.assertEqual({}, disabled.snapshot())
 
     def test_export_is_bounded_and_reset_does_not_disable_collection(self):
         collector = PerformanceDiagnosticsCollector(lambda: True, retention_depth=2)
@@ -189,6 +252,26 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         ))
         for metric, token in zip(metrics, tokens):
             collector.finish_duration(metric, token)
+
+    def test_model_builder_setter_durations_are_fixed_registered_metrics(self):
+        collector = PerformanceDiagnosticsCollector(lambda: True)
+        metrics = (
+            DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
+            DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
+            DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
+            DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
+            DURATION_MODEL_BUILDER_SET_STOPPED_FILES,
+        )
+        tokens = [collector.begin_duration(metric) for metric in metrics]
+        snapshot = collector.snapshot()
+        self.assertEqual(metrics, tuple(
+            metric for metric in metrics if snapshot["active_stage_counts"][metric] == 1
+        ))
+        for metric, token in zip(metrics, tokens):
+            collector.finish_duration(metric, token)
+        durations = collector.snapshot()["durations"]
+        for metric in metrics:
+            self.assertEqual(1, durations[metric]["count"])
 
     def test_four_concurrent_scanner_stages_cleanup_after_finish_and_exception(self):
         collector = PerformanceDiagnosticsCollector(lambda: True)

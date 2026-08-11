@@ -5,7 +5,7 @@ import logging
 from datetime import datetime, timedelta
 from threading import RLock
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 from controller import ModelBuilder
 from controller.extract import ExtractCompletedResult
@@ -20,18 +20,121 @@ from controller.model_updater import (
     _remote_reconciliation_established,
     _pop_scan_updates,
     _ModelUpdateStageTimer,
+    _MoveRetryRebuildGate,
+    _request_model_rebuild,
 )
 from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
+    MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
 )
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
+from lftp import LftpJobStatus
 from model import Model, ModelFile
 from system import SystemFile
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_move_retry_rebuild_gate_is_edge_triggered_and_rearms_after_future_due(self):
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 1}
+        retry_due = {}
+
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, retry_due, 4, now))
+        self.assertEqual([], gate.due_ids(failure_counts, retry_due, 4, now))
+
+        retry_due["retry"] = now + timedelta(seconds=10)
+        self.assertEqual([], gate.due_ids(failure_counts, retry_due, 4, now))
+        retry_due["retry"] = now - timedelta(seconds=1)
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, retry_due, 4, now))
+
+        failure_counts.clear()
+        self.assertEqual([], gate.due_ids(failure_counts, retry_due, 4, now))
+
+    def test_move_retry_gate_detects_due_token_change_without_intermediate_tick(self):
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 1}
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, {}, 4, now))
+
+        # A failed attempt writes a new future due time while the controller
+        # is busy.  The next observation is already past that due time.
+        retry_due = {"retry": now + timedelta(seconds=10)}
+        later = now + timedelta(seconds=20)
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, retry_due, 4, later))
+
+    def test_deferred_attempt_stays_retryable_without_repeated_idle_rebuilds(self):
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 1}
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, {}, 4, now))
+        gate.record_attempt("retry", consume_budget=False)
+        self.assertEqual([], gate.due_ids(failure_counts, {}, 4, now))
+        self.assertEqual([], gate.due_ids(failure_counts, {}, 4, now))
+        self.assertEqual(["retry"], gate.due_ids(
+            failure_counts, {"retry": now - timedelta(seconds=1)}, 4, now
+        ))
+
+    def test_move_retry_gate_resets_when_an_identical_marker_is_recreated(self):
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 1}
+
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, {}, 4, now))
+        self.assertEqual([], gate.due_ids(failure_counts, {}, 4, now))
+
+        # The marker can be removed and recreated before the next updater
+        # observation.  Explicit lifecycle reset must not suppress the new
+        # marker merely because its persisted token is identical.
+        gate.reset("retry")
+        failure_counts.clear()
+        failure_counts["retry"] = 1
+        self.assertEqual(["retry"], gate.due_ids(failure_counts, {}, 4, now))
+
+        deferred_ids = {"retry"}
+        pending_ids = {"retry"}
+        self.assertEqual(["retry"], gate.deferred_recovery_ids(
+            failure_counts, {}, deferred_ids, pending_ids, 4, now
+        ))
+        self.assertEqual([], gate.deferred_recovery_ids(
+            failure_counts, {}, deferred_ids, pending_ids, 4, now
+        ))
+        gate.reset("retry")
+        self.assertEqual(["retry"], gate.deferred_recovery_ids(
+            failure_counts, {}, deferred_ids, pending_ids, 4, now
+        ))
+
+    def test_deferred_recovery_gate_is_edge_triggered_and_rearms_on_token_change(self):
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 0}
+        retry_due = {}
+        deferred_ids = {"retry"}
+        pending_ids = {"retry"}
+
+        self.assertEqual(["retry"], gate.deferred_recovery_ids(
+            failure_counts, retry_due, deferred_ids, pending_ids, 4, now
+        ))
+        self.assertEqual([], gate.deferred_recovery_ids(
+            failure_counts, retry_due, deferred_ids, pending_ids, 4, now
+        ))
+        failure_counts["retry"] = 1
+        self.assertEqual(["retry"], gate.deferred_recovery_ids(
+            failure_counts, retry_due, deferred_ids, pending_ids, 4, now
+        ))
+
+    def test_rebuild_reason_attribution_is_fixed_and_fail_closed(self):
+        builder = MagicMock()
+        diagnostics = MagicMock()
+        _request_model_rebuild(builder, diagnostics, MODEL_REBUILD_REASON_MOVE_RETRY_DUE)
+        diagnostics.increment.assert_called_once_with("model_rebuild_move_retry_due")
+        diagnostics.reset_mock()
+
+        _request_model_rebuild(builder, diagnostics, "file:/private/path")
+        diagnostics.increment.assert_not_called()
+
     def test_model_update_stage_timer_switches_fixed_stages_and_closes_on_finish_error(self):
         class Diagnostics:
             def __init__(self):
@@ -397,6 +500,160 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(["late.bin"], [file.name for file in remote_files])
         self.assertNotIn("pair", unknown)
 
+    def test_matching_partial_roots_stream_before_completion_with_unknown_pair(self):
+        local_accumulator = _ProgressiveScanAccumulator()
+        remote_accumulator = _ProgressiveScanAccumulator()
+        local_root = SystemFile("stream.bin", 2)
+        local_root.path_pair_id = "pair"
+        remote_root = SystemFile("stream.bin", 3)
+        remote_root.path_pair_id = "pair"
+        local_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [local_root], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, session_token="local",
+            ),
+        ])
+        remote_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [remote_root], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, session_token="remote",
+            ),
+        ])
+
+        local_files, remote_files, unknown = _JointProgressiveReconciler().reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+
+        self.assertEqual(["stream.bin"], [file.name for file in local_files])
+        self.assertEqual(["stream.bin"], [file.name for file in remote_files])
+        self.assertEqual({"pair"}, unknown)
+
+    def test_remote_refresh_reuses_standing_local_authority(self):
+        """Remote refreshes must not wait for the intentionally slower local scan."""
+        local_accumulator = _ProgressiveScanAccumulator()
+        remote_accumulator = _ProgressiveScanAccumulator()
+        local_root = SystemFile("standing.bin", 2)
+        remote_root = SystemFile("standing.bin", 3)
+
+        local_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [local_root], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="local",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        remote_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [remote_root], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        reconciler = _JointProgressiveReconciler()
+        reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+
+        refreshed_remote = SystemFile("standing.bin", 4)
+        remote_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [refreshed_remote], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        local_files, remote_files, unknown = reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+
+        self.assertEqual(["standing.bin"], [file.name for file in local_files])
+        self.assertEqual([4], [file.size for file in remote_files])
+        self.assertEqual(set(), unknown)
+
+    def test_joint_session_refresh_keeps_last_good_output_unknown_until_both_sides_refresh(self):
+        local_accumulator = _ProgressiveScanAccumulator()
+        remote_accumulator = _ProgressiveScanAccumulator()
+        old_local = SystemFile("old.bin", 2)
+        old_local.path_pair_id = "pair"
+        old_remote = SystemFile("old.bin", 3)
+        old_remote.path_pair_id = "pair"
+        local_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [old_local], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="local-a",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        remote_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [old_remote], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote-a",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        reconciler = _JointProgressiveReconciler()
+        reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+
+        local_accumulator.set_session_token("local-b")
+        remote_accumulator.set_session_token("remote-b")
+        new_remote = SystemFile("new.bin", 4)
+        new_remote.path_pair_id = "pair"
+        remote_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [new_remote], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote-b",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        local_files, remote_files, unknown = reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual(["old.bin"], [file.name for file in local_files])
+        self.assertEqual(["old.bin"], [file.name for file in remote_files])
+        self.assertEqual({"pair"}, unknown)
+
+        new_local = SystemFile("new.bin", 5)
+        new_local.path_pair_id = "pair"
+        local_accumulator.apply([
+            ScannerResult(
+                datetime.now(), [new_local], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="local-b",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        local_files, remote_files, unknown = reconciler.reconcile(
+            local_accumulator.snapshot(), local_accumulator.authority(),
+            local_accumulator.incomplete_pairs(), local_accumulator.completed_pairs(),
+            remote_accumulator.snapshot(), remote_accumulator.authority(),
+            remote_accumulator.incomplete_pairs(), remote_accumulator.completed_pairs(),
+            {"pair"},
+        )
+        self.assertEqual(["new.bin"], [file.name for file in local_files])
+        self.assertEqual(["new.bin"], [file.name for file in remote_files])
+        self.assertEqual(set(), unknown)
+
     def test_lossy_progress_completion_never_proves_marker_backed_local_absence_before_full_snapshot(self):
         """A bounded queue may retain completion before its authoritative aggregate."""
         local = _ProgressiveScanAccumulator()
@@ -707,6 +964,434 @@ class TestModelUpdater(unittest.TestCase):
             controller._Controller__path_pairs_by_id = path_pairs_by_id
         return controller, model_builder
 
+    def _make_progressive_update_controller(
+            self, remote_scan, local_scan=None, *, authoritative=True,
+            downloaded_file_names=None, downloaded_timestamps=None,
+            model_builder=None, model=None):
+        """Build the narrow controller boundary needed by progressive update tests."""
+        persist = SimpleNamespace(
+            downloaded_file_names=set(downloaded_file_names or set()),
+            downloaded_timestamps=dict(downloaded_timestamps or {}),
+            extracted_file_names=set(),
+            stopped_file_names=set(),
+            move_failure_counts={},
+            final_move_succeeded_file_names=set(),
+        )
+        if model_builder is None:
+            model_builder = MagicMock()
+            model_builder.has_changes.return_value = False
+            model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
+            model_builder.get_unresolved_staging_collision_file_ids.return_value = set()
+        if model is None:
+            model = MagicMock()
+            model.get_file_ids.return_value = {"root"}
+            model.get_file_names.return_value = {"root"}
+        status = SimpleNamespace(
+            latest_remote_scan_time=None,
+            latest_remote_scan_failed=False,
+            latest_remote_scan_error=None,
+            latest_local_scan_time=None,
+        )
+        controller = SimpleNamespace(
+            _Controller__persist=persist,
+            _Controller__model_builder=model_builder,
+            _Controller__model=model,
+            _Controller__model_lock=RLock(),
+            _Controller__remote_scan_process=MagicMock(),
+            _Controller__local_scan_process=MagicMock(),
+            _Controller__active_scan_process=MagicMock(),
+            _Controller__extract_process=MagicMock(),
+            _Controller__validate_process=MagicMock(),
+            _Controller__lftp=MagicMock(),
+            _Controller__context=SimpleNamespace(
+                config=SimpleNamespace(general=SimpleNamespace(exclude_patterns="")),
+                status=SimpleNamespace(controller=status, server=SimpleNamespace()),
+            ),
+            logger=MagicMock(),
+            _Controller__temp_diag=MagicMock(),
+            _Controller__set_active_scanner_files=MagicMock(),
+            _Controller__record_breadcrumb=MagicMock(),
+            _Controller__trace_corr_id_from_files=MagicMock(return_value="progressive-test"),
+            _Controller__startup_recovery_done=True,
+            _Controller__pending_completion_file_names=set(),
+            _Controller__prev_downloading_file_names=set(),
+            _Controller__malformed_status_only_file_ids=set(),
+            _Controller__pending_auto_purge_file_ids=set(),
+            _Controller__last_lftp_statuses=[],
+            _Controller__active_downloading_file_names=[],
+            _Controller__active_extracting_file_names=[],
+            _Controller__next_lftp_status_poll_at=None,
+            _Controller__lftp_status_poll_retry_seconds=1,
+            _Controller__lftp_status_cache_expires_at=None,
+            _Controller__lftp_status_cache_max_age_seconds=3,
+            _Controller__lftp_status_poll_retry_active=False,
+            _Controller__exclude_patterns="",
+            _Controller__last_remote_reconciliation_healthy=False,
+            _Controller__last_local_reconciliation_healthy=False,
+            _Controller__path_pairs_by_id={},
+            _Controller__progressive_joint_authoritative=authoritative,
+            _Controller__MAX_MOVE_FAILURES=4,
+            _Controller__MOVE_RETRY_DELAYS=(1, 2, 3, 4),
+            _Controller__get_path_pair=MagicMock(return_value=None),
+            _Controller__is_target_archive_trace_enabled=MagicMock(return_value=False),
+            _Controller__find_target_archive_model_file=MagicMock(return_value=None),
+            _Controller__should_auto_purge_local_file=MagicMock(return_value=False),
+            _sync_final_move_succeeded_files_to_model=MagicMock(),
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = remote_scan
+        controller._Controller__local_scan_process.pop_latest_result.return_value = local_scan
+        controller._Controller__active_scan_process.pop_latest_result.return_value = None
+        controller._Controller__extract_process.pop_latest_statuses.return_value = None
+        controller._Controller__extract_process.pop_completed.return_value = []
+        controller._Controller__extract_process.pop_failed.return_value = []
+        controller._Controller__validate_process.pop_latest_statuses.return_value = None
+        controller._Controller__lftp.status.return_value = []
+        controller._Controller__lftp.last_status_poll_healthy = True
+        return controller, model_builder
+
+    @staticmethod
+    def _progressive_result(name="root", size=1, *, final=False, unknown=None):
+        completed = {None} if final else set()
+        return ScannerResult(
+            datetime.now(),
+            [SystemFile(name, size)],
+            scanned_path_pair_ids={None},
+            is_progress=True,
+            completed_path_pair_ids=completed,
+            is_scan_final=final,
+            unknown_path_pair_ids=set(unknown or set()),
+        )
+
+    @staticmethod
+    def _progressive_process(session_token, result_batches):
+        process = ScannerProcess(
+            scanner=SimpleNamespace(), interval_in_ms=0, verbose=False,
+        )
+        process._ScannerProcess__session_token = session_token
+        process.pop_results = MagicMock(side_effect=result_batches)
+        return process
+
+    @staticmethod
+    def _progressive_final_result(session_token, size=1, generation=1):
+        return ScannerResult(
+            datetime.now(),
+            [SystemFile("root", size)],
+            scanned_path_pair_ids={None},
+            generation=generation,
+            is_progress=True,
+            completed_path_pair_ids={None},
+            is_scan_final=True,
+            session_token=session_token,
+            is_full_snapshot=True,
+            full_snapshot_path_pair_ids={None},
+        )
+
+    def test_authoritative_progressive_no_event_ticks_skip_joint_builder_inputs(self):
+        remote_token = "remote-no-event"
+        local_token = "local-no-event"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [], []],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], [], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        model_builder.reset_mock()
+
+        updater.update()
+        updater.update()
+
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+        model_builder.build_model.assert_not_called()
+
+    def test_later_progressive_final_event_republishes_against_standing_authority(self):
+        remote_token = "remote-later-final"
+        local_token = "local-later-final"
+        initial_remote = self._progressive_final_result(remote_token, size=1)
+        initial_local = self._progressive_final_result(local_token, size=1)
+        later_remote = self._progressive_final_result(remote_token, size=2, generation=2)
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [], [later_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], [], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        model_builder.reset_mock()
+        updater.update()
+        model_builder.reset_mock()
+
+        updater.update()
+
+        model_builder.set_local_files.assert_called_once()
+        model_builder.set_remote_files.assert_called_once()
+        self.assertEqual(1, model_builder.set_local_files.call_args.args[0][0].size)
+        self.assertEqual(2, model_builder.set_remote_files.call_args.args[0][0].size)
+
+    def test_authoritative_progressive_no_event_tick_keeps_active_lftp_status_updates(self):
+        remote_token = "remote-lftp-cadence"
+        local_token = "local-lftp-cadence"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], []],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], []],
+        )
+        status = LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "root",
+            "",
+        )
+        controller._Controller__lftp.status.return_value = [status]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        model_builder.reset_mock()
+        controller._Controller__next_lftp_status_poll_at = None
+        updater.update()
+
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+        model_builder.set_lftp_statuses.assert_called_once_with([status])
+
+    def test_partial_progressive_refresh_after_baseline_does_not_rebuild_or_churn_markers(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        controller, model_builder = self._make_progressive_update_controller(
+            partial,
+            downloaded_file_names={"root"},
+            downloaded_timestamps={"root": 1.0},
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        updater.update()
+
+        model_builder.build_model.assert_not_called()
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+        model_builder.set_unknown_local_path_pair_ids.assert_not_called()
+        model_builder.set_downloaded_files.assert_not_called()
+        model_builder.set_downloaded_timestamps.assert_not_called()
+
+    def test_first_progressive_baseline_still_streams_partial_remote_state(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        controller, model_builder = self._make_progressive_update_controller(
+            partial,
+            local_scan=partial,
+            authoritative=False,
+        )
+
+        ModelUpdater(controller).update()
+
+        model_builder.set_remote_files.assert_called_once_with(partial.files)
+        model_builder.set_local_files.assert_called_once_with(partial.files)
+        model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})
+
+    def test_progressive_scanner_session_change_reopens_initial_publication_window(self):
+        process = object.__new__(ScannerProcess)
+        process._ScannerProcess__session_token = "session-a"
+        controller = SimpleNamespace()
+
+        with patch.object(ScannerProcess, "pop_results", return_value=[]):
+            _pop_scan_updates(controller, "remote", process)
+            process._ScannerProcess__session_token = "session-b"
+            _pop_scan_updates(controller, "remote", process)
+
+        self.assertTrue(controller._Controller__progressive_scan_session_changed)
+
+    def test_replaced_progressive_sessions_ignore_stale_rows_until_new_partial_evidence(self):
+        def process(session_token, results):
+            scanner_process = ScannerProcess(
+                scanner=SimpleNamespace(), interval_in_ms=0, verbose=False,
+            )
+            scanner_process._ScannerProcess__session_token = session_token
+            scanner_process.pop_results = MagicMock(side_effect=results)
+            return scanner_process
+
+        def scan_result(session_token, size, *, final=False, failed=False, manifest_only=False):
+            return ScannerResult(
+                datetime.now(), [] if failed or manifest_only else [SystemFile("root", size)],
+                scanned_path_pair_ids={None},
+                generation=1,
+                is_progress=True,
+                failed=failed,
+                root_names={"root"} if manifest_only else None,
+                completed_path_pair_ids={None} if final else set(),
+                is_scan_final=final,
+                unknown_path_pair_ids=set() if final and not failed else {None},
+                session_token=session_token,
+                is_full_snapshot=final,
+                full_snapshot_path_pair_ids={None} if final else set(),
+            )
+
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        old_remote = process("old-remote", [[scan_result("old-remote", 1, final=True)]])
+        old_local = process("old-local", [[scan_result("old-local", 1, final=True)]])
+        controller._Controller__remote_scan_process = old_remote
+        controller._Controller__local_scan_process = old_local
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        model_builder.reset_mock()
+
+        new_remote = process(
+            "new-remote",
+            [
+                [],
+                [scan_result("new-remote", 0, failed=True)],
+                [scan_result("new-remote", 0, manifest_only=True)],
+                [scan_result("new-remote", 2)],
+                [scan_result("new-remote", 3)],
+                [scan_result("new-remote", 4, final=True)],
+            ],
+        )
+        new_local = process(
+            "new-local",
+            [
+                [],
+                [scan_result("new-local", 0, failed=True)],
+                [scan_result("new-local", 0, manifest_only=True)],
+                [scan_result("new-local", 2)],
+                [scan_result("new-local", 3)],
+                [scan_result("new-local", 4, final=True)],
+            ],
+        )
+        controller._Controller__remote_scan_process = new_remote
+        controller._Controller__local_scan_process = new_local
+
+        # Session replacement alone must not consume the reopened publication
+        # budget from the reconciler's retained last-good rows.
+        updater.update()
+        self.assertFalse(controller._Controller__progressive_joint_first_publication)
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+
+        updater.update()
+        self.assertFalse(controller._Controller__progressive_joint_first_publication)
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+
+        updater.update()
+        self.assertFalse(controller._Controller__progressive_joint_first_publication)
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+
+        updater.update()
+        self.assertTrue(controller._Controller__progressive_joint_first_publication)
+        model_builder.set_local_files.assert_called_once()
+        model_builder.set_remote_files.assert_called_once()
+        model_builder.reset_mock()
+
+        updater.update()
+        self.assertTrue(controller._Controller__progressive_joint_first_publication)
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
+
+        updater.update()
+        self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        model_builder.set_local_files.assert_called_once()
+        model_builder.set_remote_files.assert_called_once()
+
+    def test_progressive_final_reconciliation_publishes_and_prunes_markers(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        controller, model_builder = self._make_progressive_update_controller(
+            partial,
+            downloaded_file_names={"root", "stale"},
+            downloaded_timestamps={"root": 1.0, "stale": 2.0},
+        )
+        updater = ModelUpdater(controller)
+        updater.update()
+        model_builder.reset_mock()
+        model_builder.has_changes.return_value = True
+        model_builder.build_model.return_value = controller._Controller__model
+
+        final_remote = self._progressive_result(size=2, final=True)
+        final_local = self._progressive_result(size=2, final=True)
+        controller._Controller__remote_scan_process.pop_latest_result.return_value = final_remote
+        controller._Controller__local_scan_process.pop_latest_result.return_value = final_local
+        updater.update()
+
+        model_builder.set_remote_files.assert_called_once_with(final_remote.files)
+        model_builder.set_local_files.assert_called_once_with(final_local.files)
+        model_builder.set_unknown_local_path_pair_ids.assert_called_once_with(set())
+        model_builder.set_downloaded_files.assert_called_once_with({"root"})
+        model_builder.set_downloaded_timestamps.assert_called_once_with({"root": 1.0})
+        self.assertEqual({"root"}, controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({"root": 1.0}, controller._Controller__persist.downloaded_timestamps)
+
+    def test_identical_authoritative_progressive_refresh_keeps_real_builder_clean(self):
+        final = self._progressive_result(final=True)
+        model_builder = ModelBuilder()
+        model_builder.set_local_files(final.files)
+        model_builder.set_remote_files(final.files)
+        model_builder.set_unknown_local_path_pair_ids(set())
+        model_builder.set_downloaded_files({"root"})
+        model_builder.set_downloaded_timestamps({"root": 1.0})
+        baseline_model = model_builder.build_model()
+        model_builder.adopt_applied_model(baseline_model, baseline_model)
+        self.assertFalse(model_builder.has_changes())
+
+        controller, _ = self._make_progressive_update_controller(
+            final,
+            local_scan=final,
+            downloaded_file_names={"root"},
+            downloaded_timestamps={"root": 1.0},
+            model_builder=model_builder,
+            model=baseline_model,
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        updater.update()
+
+        self.assertFalse(model_builder.has_changes())
+        self.assertIs(baseline_model, model_builder.build_model())
+
+    def test_partial_progressive_refresh_keeps_active_lftp_updates_immediate(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        controller, model_builder = self._make_progressive_update_controller(partial)
+        status = LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            "root",
+            "",
+        )
+        controller._Controller__lftp.status.return_value = [status]
+        updater = ModelUpdater(controller)
+
+        updater.update()
+
+        model_builder.set_lftp_statuses.assert_called_once_with([status])
+        next_poll = controller._Controller__next_lftp_status_poll_at
+        self.assertIsNotNone(next_poll)
+        self.assertGreater(next_poll, datetime.now())
+        self.assertLessEqual(next_poll - datetime.now(), timedelta(milliseconds=100))
+
     def _make_lftp_completion_controller(self, prev_downloading_file_names=None):
         controller = SimpleNamespace(
             _Controller__prev_downloading_file_names=set(prev_downloading_file_names or []),
@@ -915,6 +1600,16 @@ class TestModelUpdater(unittest.TestCase):
                 "file_count": 1,
                 "failed": False,
                 "error_message": None,
+                "is_progress": False,
+                "is_scan_final": True,
+                "generation": 0,
+                "scanned_pair_count": 0,
+                "completed_pair_count": 0,
+                "unknown_pair_count": 0,
+                "joint_publication_allowed": True,
+                "joint_authoritative": False,
+                "joint_local_root_count": 0,
+                "joint_remote_root_count": 0,
             },
             event_type="state_transition",
             corr_id="remote-scan-corr",

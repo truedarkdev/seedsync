@@ -17,6 +17,15 @@ from model import ModelFile
 from system import SystemFile
 
 
+# Detailed traversal deliberately remains globally capped at two million
+# objects.  Structural graph census only follows ModelFile/SystemFile child
+# links, so it can establish the cardinality of the three large file graphs
+# without retaining every primitive field.  The bounds remain finite in case a
+# corrupted or future graph is unexpectedly large.
+DEFAULT_MAX_GRAPH_NODES_PER_ROOT = 1_000_000
+DEFAULT_MAX_GRAPH_NODES = 4_000_000
+
+
 class OwnershipRoot(NamedTuple):
     label: str
     values: tuple[object, ...]
@@ -105,10 +114,18 @@ def snapshot_container(label: str, value: object) -> OwnershipRoot:
     return OwnershipRoot(label, ())
 
 
-def build_ownership_census(roots: Iterable[OwnershipRoot], max_objects: int = 2_000_000) -> dict[str, object]:
+def build_ownership_census(roots: Iterable[OwnershipRoot], max_objects: int = 2_000_000,
+                           max_graph_nodes_per_root: int = DEFAULT_MAX_GRAPH_NODES_PER_ROOT,
+                           max_graph_nodes: int = DEFAULT_MAX_GRAPH_NODES) -> dict[str, object]:
     """Traverse only explicitly allowed values and return fixed, numeric aggregates."""
+    roots = tuple(roots)
     seen = _CompactIdSet()
     owners: dict[str, dict[str, int | bool]] = {}
+    for root in roots:
+        owner: dict[str, int | bool] = {"object_count": 0, "shallow_bytes": 0}
+        if root.aliases_live_model is not None:
+            owner["aliases_live_model"] = root.aliases_live_model
+        owners[root.label] = owner
     truncated = False
 
     def add(value: object, owner: dict[str, int | bool]) -> bool:
@@ -153,10 +170,7 @@ def build_ownership_census(roots: Iterable[OwnershipRoot], max_objects: int = 2_
             return
 
     for root in roots:
-        owner: dict[str, int | bool] = {"object_count": 0, "shallow_bytes": 0}
-        if root.aliases_live_model is not None:
-            owner["aliases_live_model"] = root.aliases_live_model
-        owners[root.label] = owner
+        owner = owners[root.label]
         if root.shallow_container_id is not None:
             if root.shallow_container_id not in seen:
                 if len(seen) >= max_objects:
@@ -169,12 +183,22 @@ def build_ownership_census(roots: Iterable[OwnershipRoot], max_objects: int = 2_
             walk(value, owner)
 
     total_bytes = sum(int(owner["shallow_bytes"]) for owner in owners.values())
+    graph_visited_node_count, graph_truncated = _add_structural_graph_totals(
+        roots, owners, max_graph_nodes_per_root, max_graph_nodes
+    )
     result = {
         "schema": "seedsync.memory-ownership-census.v1",
         "enabled": True,
         "truncated": truncated,
         "visited_object_count": len(seen),
         "total_shallow_bytes": total_bytes,
+        # Unlike detailed totals above, structural results intentionally use a
+        # fresh identity set for every owner.  A live/cached/scan graph can
+        # therefore appear in multiple owner records without being hidden by
+        # owner ordering.  graph_visited_node_count is the similarly
+        # overlapping sum of the per-root graph counts.
+        "graph_truncated": graph_truncated,
+        "graph_visited_node_count": graph_visited_node_count,
         "owners": owners,
     }
     seen.release()
@@ -188,11 +212,33 @@ def disabled_ownership_census() -> dict[str, object]:
         "truncated": False,
         "visited_object_count": 0,
         "total_shallow_bytes": 0,
+        "graph_truncated": False,
+        "graph_visited_node_count": 0,
         "owners": {},
     }
 
 
-def unavailable_ownership_census() -> dict[str, object]:
+OWNERSHIP_FAILURE_STAGES = frozenset({"capture_roots", "build_census"})
+OWNERSHIP_FAILURE_KINDS = frozenset({"memory_error", "recursion_error", "runtime_error", "unexpected_error"})
+
+
+def ownership_failure_kind(error: BaseException) -> str:
+    """Map an exception to a fixed, privacy-safe diagnostic category."""
+    if isinstance(error, MemoryError):
+        return "memory_error"
+    if isinstance(error, RecursionError):
+        return "recursion_error"
+    if isinstance(error, RuntimeError):
+        return "runtime_error"
+    return "unexpected_error"
+
+
+def unavailable_ownership_census(failure_stage: str = "build_census",
+                                 failure_kind: str = "unexpected_error") -> dict[str, object]:
+    if failure_stage not in OWNERSHIP_FAILURE_STAGES:
+        failure_stage = "build_census"
+    if failure_kind not in OWNERSHIP_FAILURE_KINDS:
+        failure_kind = "unexpected_error"
     return {
         "schema": "seedsync.memory-ownership-census.v1",
         "enabled": True,
@@ -200,6 +246,10 @@ def unavailable_ownership_census() -> dict[str, object]:
         "truncated": False,
         "visited_object_count": 0,
         "total_shallow_bytes": 0,
+        "graph_truncated": False,
+        "graph_visited_node_count": 0,
+        "failure_stage": failure_stage,
+        "failure_kind": failure_kind,
         "owners": {},
     }
 
@@ -209,6 +259,50 @@ def _size_of(value: object) -> int:
         return sys.getsizeof(value)
     except (TypeError, ValueError):
         return 0
+
+
+def _add_structural_graph_totals(roots: Iterable[OwnershipRoot], owners: dict[str, dict[str, int | bool]],
+                                 max_nodes_per_root: int, max_nodes: int) -> tuple[int, bool]:
+    """Add independently-deduped ModelFile/SystemFile totals for every fixed root."""
+    total_nodes = 0
+    globally_truncated = False
+    for root in roots:
+        owner = owners[root.label]
+        owner["graph_node_count"] = 0
+        owner["graph_shallow_bytes"] = 0
+        owner["graph_truncated"] = False
+        seen = _CompactIdSet()
+        pending = deque(value for value in root.values if isinstance(value, (ModelFile, SystemFile)))
+        try:
+            while pending:
+                value = pending.popleft()
+                value_id = id(value)
+                if value_id in seen:
+                    continue
+                if len(seen) >= max_nodes_per_root or total_nodes >= max_nodes:
+                    owner["graph_truncated"] = True
+                    globally_truncated = True
+                    break
+                seen.add_if_absent(value_id)
+                owner["graph_node_count"] += 1
+                owner["graph_shallow_bytes"] += _size_of(value)
+                total_nodes += 1
+                try:
+                    pending.extend(_iter_structural_children(value))
+                except RuntimeError:
+                    # A concurrently mutating child list yields a bounded
+                    # partial result rather than affecting controller work.
+                    owner["graph_truncated"] = True
+                    globally_truncated = True
+                    break
+        finally:
+            seen.release()
+    return total_nodes, globally_truncated
+
+
+def _iter_structural_children(value: ModelFile | SystemFile):
+    """Follow only fixed file-node child edges; primitive/runtime data stays out."""
+    return value.iter_children()
 
 
 def release_ownership_census_working_memory() -> None:
@@ -227,10 +321,8 @@ def release_ownership_census_working_memory() -> None:
         malloc_trim.restype = ctypes.c_int
         malloc_trim(0)
     except Exception:
-        # Diagnostics must never affect normal controller behavior.
+        # Reclamation must never affect normal controller behavior.
         return
-
-
 def _iter_slot_values(value: ModelFile | SystemFile):
     slots = getattr(type(value), "__slots__", ())
     for slot in slots:

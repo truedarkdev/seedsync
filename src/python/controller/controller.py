@@ -43,7 +43,7 @@ from .model_builder import ModelBuilder
 from .memory_monitor import ControllerMemoryMonitor
 from .ownership_census import (
     OwnershipRoot, build_ownership_census, disabled_ownership_census,
-    release_ownership_census_working_memory, snapshot_container,
+    ownership_failure_kind, release_ownership_census_working_memory, snapshot_container,
     unavailable_ownership_census,
 )
 from common import (
@@ -581,6 +581,9 @@ class Controller:
         # Model builder
         self.__model_builder = ModelBuilder()
         self.__model_builder.set_base_logger(self.logger)
+        self.__model_builder.set_performance_diagnostics(
+            getattr(self.__context, "performance_diagnostics", None)
+        )
         # Keep one shared emitter wired at all times; its process-safe gate
         # makes disabled tracing effectively free and enables hot settings
         # changes without restarting workers or selecting a file.
@@ -1006,6 +1009,7 @@ class Controller:
             ),
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
             recycle_scan_worker=True,
+            performance_diagnostics=getattr(self.__context, "performance_diagnostics", None),
         )
 
         old_path_pairs_by_id = self.__path_pairs_by_id
@@ -1197,6 +1201,7 @@ class Controller:
             enabled_path_pairs: List[PathPair],
             fallback_remote_path: Optional[str] = None) -> RemoteScannerRuntime:
         config = self.__context.config
+        performance_diagnostics = getattr(self.__context, "performance_diagnostics", None)
         remote_python_path = getattr(config.lftp, "remote_python_path", None)
         if not isinstance(remote_python_path, str):
             remote_python_path = None
@@ -1221,9 +1226,10 @@ class Controller:
                     remote_python_path=remote_python_path,
                     path_pair_id=pair.id,
                     path_pair_name=pair.name,
+                    performance_diagnostics=performance_diagnostics,
                     **remote_scan_lease_kwargs,
                 ) for pair in enabled_path_pairs
-            ])
+            ], performance_diagnostics=performance_diagnostics)
         return RemoteScanner(
             remote_address=Controller.__require_runtime_path(config.lftp.remote_address, "Lftp.remote_address"),
             remote_username=Controller.__require_runtime_path(config.lftp.remote_username, "Lftp.remote_username"),
@@ -1237,6 +1243,7 @@ class Controller:
                 config.lftp.remote_path_to_scan_script, "Lftp.remote_path_to_scan_script"
             ),
             remote_python_path=remote_python_path,
+            performance_diagnostics=performance_diagnostics,
             **remote_scan_lease_kwargs,
         )
 
@@ -4808,6 +4815,12 @@ class Controller:
         with self.__move_attempt_lock:
             self.__move_attempt_reservations.discard(file_id)
 
+    def _reset_move_retry_rebuild_gate(self, file_id: str) -> None:
+        gate = getattr(self, "_Controller__move_retry_rebuild_gate", None)
+        reset = getattr(gate, "reset", None)
+        if callable(reset):
+            reset(file_id)
+
     def __source_has_lftp_temp_artifact(self, staging_path: str, src: str, file_id: str) -> bool:
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
         try:
@@ -5416,6 +5429,7 @@ class Controller:
                         stopped_queue_lifecycle_ids.discard(file.file_id)
                         if is_new_transfer_lifecycle:
                             self.__persist.move_failure_counts.pop(file.file_id, None)
+                            self._reset_move_retry_rebuild_gate(file.file_id)
                             self.__move_retry_due.pop(file.file_id, None)
                             self.__deferred_move_file_ids.discard(file.file_id)
                             self.__pending_completion_file_names = {
@@ -5865,6 +5879,7 @@ class Controller:
                         Controller.MoveFromStagingResult.ALREADY_COMPLETED,
                     ):
                         self.__persist.move_failure_counts.pop(file.file_id, None)
+                        self._reset_move_retry_rebuild_gate(file.file_id)
                         self.__deferred_move_file_ids.discard(file.file_id)
                         self.__move_retry_due.pop(file.file_id, None)
                         self._record_download_completion(file)
@@ -6053,11 +6068,17 @@ class Controller:
             return disabled_ownership_census()
         roots: tuple[OwnershipRoot, ...] | None = None
         try:
-            roots = self.__capture_memory_ownership_roots()
-            return build_ownership_census(roots)
-        except Exception:
+            try:
+                roots = self.__capture_memory_ownership_roots()
+            except Exception as error:
+                return unavailable_ownership_census("capture_roots", ownership_failure_kind(error))
+            try:
+                return build_ownership_census(roots)
+            except Exception as error:
+                return unavailable_ownership_census("build_census", ownership_failure_kind(error))
+        except Exception as error:
             # A diagnostic request must never change normal controller behavior.
-            return unavailable_ownership_census()
+            return unavailable_ownership_census("build_census", ownership_failure_kind(error))
         finally:
             roots = None
             release_ownership_census_working_memory()
@@ -6268,6 +6289,7 @@ class Controller:
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
                                 self.__advance_transfer_lifecycle(command_process.file_id)
                                 self.__persist.move_failure_counts.pop(command_process.file_id, None)
+                                self._reset_move_retry_rebuild_gate(command_process.file_id)
                                 self.__deferred_move_file_ids.discard(command_process.file_id)
                                 self.__move_retry_due.pop(command_process.file_id, None)
                                 self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
