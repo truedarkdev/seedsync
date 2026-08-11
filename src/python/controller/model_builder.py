@@ -771,6 +771,25 @@ class ModelBuilder:
             local_mtime_ns == remote_mtime_ns
 
     @staticmethod
+    def __leaf_matches_remote_collision_identity(remote_file: SystemFile,
+                                                  candidate_file: SystemFile) -> bool:
+        """Whether a collision leaf matches size and portable raw mtime.
+
+        Remote scanner mtimes may retain fractional nanoseconds while LFTP's
+        published final/staging leaves are second-precision.  Keep the raw
+        epoch value (rather than display datetimes), but compare the finest
+        precision common to both sides.  The controller's byte comparator is
+        still required before any collided staging leaf is removed.
+        """
+        local_mtime_ns = candidate_file.mtime_ns
+        remote_mtime_ns = remote_file.mtime_ns
+        return not remote_file.is_dir and not candidate_file.is_dir and \
+            candidate_file.size == remote_file.size and \
+            type(local_mtime_ns) is int and \
+            type(remote_mtime_ns) is int and \
+            local_mtime_ns // 1_000_000_000 == remote_mtime_ns // 1_000_000_000
+
+    @staticmethod
     def __combine_split_root_transfer_state(transfer_state: _TransferState,
                                             remote_file: Optional[SystemFile],
                                             local_file: Optional[SystemFile]) -> _TransferState:
@@ -874,6 +893,83 @@ class ModelBuilder:
         if self.__cached_model is None:
             return set()
         return set(self.__cached_terminalizable_staging_collision_file_ids)
+
+    def has_verified_staging_collision_remote_identity(self, file_id: str) -> bool:
+        """Whether a cached terminal collision has exact remote leaf identity.
+
+        ``get_terminalizable_staging_collision_file_ids`` deliberately uses
+        apparent size only to classify complete collision roots.  A manual
+        retry may invoke the byte comparator only after every remote-covered
+        leaf below the collision is also backed by scanner identity: exact
+        size and raw epoch mtime at the portable whole-second precision LFTP
+        preserves.  If an active scan supplies the same leaf, it is evidence
+        for the current staging tree and must carry that identity too.
+        Missing or malformed metadata fails closed; byte equality remains the
+        final proof before staging cleanup.
+        """
+        if self.__cached_model is None or file_id not in self.__cached_terminalizable_staging_collision_file_ids:
+            return False
+        remote_root = self.__remote_files.get(file_id)
+        effective_root = self.__build_effective_local_files().get(file_id)
+        active_root = self.__active_files.get(file_id)
+        if remote_root is None or effective_root is None or remote_root.is_dir != effective_root.is_dir:
+            return False
+
+        def visit(
+                remote_file: SystemFile,
+                effective_file: Optional[SystemFile],
+                active_file: Optional[SystemFile],
+                ancestor_has_collision: bool = False,
+        ) -> bool:
+            if effective_file is None or remote_file.is_dir != effective_file.is_dir:
+                return False
+            has_collision = ancestor_has_collision or effective_file.has_staging_collision
+            if remote_file.is_dir:
+                effective_children = {child.name: child for child in effective_file.iter_children()}
+                active_children = {
+                    child.name: child for child in active_file.iter_children()
+                } if active_file is not None and active_file.is_dir else {}
+                if active_file is not None and not active_file.is_dir:
+                    return False
+                return all(
+                    visit(
+                        remote_child,
+                        effective_children.get(remote_child.name),
+                        active_children.get(remote_child.name) if active_file is not None else None,
+                        has_collision,
+                    )
+                    for remote_child in remote_file.iter_children()
+                )
+            if not has_collision:
+                return True
+            if not ModelBuilder.__leaf_matches_remote_collision_identity(remote_file, effective_file):
+                return False
+            return active_file is None or ModelBuilder.__leaf_matches_remote_collision_identity(
+                remote_file, active_file
+            )
+
+        return visit(remote_root, effective_root, active_root)
+
+    def get_staging_collision_relative_paths(self, file_id: str) -> tuple[str, ...]:
+        """Return cached remote-relative leaves covered by collision metadata."""
+        if self.__cached_model is None or file_id not in self.__cached_unresolved_staging_collision_file_ids:
+            return ()
+        effective_root = self.__build_effective_local_files().get(file_id)
+        if effective_root is None:
+            return ()
+        paths: list[str] = []
+
+        def visit(system_file: SystemFile, relative: str, ancestor_has_collision: bool = False) -> None:
+            has_collision = ancestor_has_collision or system_file.has_staging_collision
+            if system_file.is_dir:
+                for child in system_file.iter_children():
+                    child_relative = child.name if not relative else relative + "/" + child.name
+                    visit(child, child_relative, has_collision)
+            elif has_collision:
+                paths.append(relative)
+
+        visit(effective_root, "")
+        return tuple(sorted(set(paths)))
 
     def is_remote_leaf_path(self, file_id: str, relative_path: str) -> bool:
         """Whether a source-root-relative leaf is currently remote-listed."""

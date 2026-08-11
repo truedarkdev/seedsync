@@ -7089,6 +7089,98 @@ class TestController(unittest.TestCase):
                              self.controller._Controller__move_from_staging("release"))
             self.assertEqual(b"user-file", Path(destination).read_bytes())
 
+    def test_completed_move_cleans_only_empty_legacy_retired_directory_claim(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            destination = os.path.join(final_root, "Maid")
+            claim = os.path.join(staging_root, ".seedsync-retire-" + "f" * 48)
+            os.makedirs(os.path.join(claim, "S01", "Maid")); os.makedirs(destination)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                             self.controller._Controller__move_from_staging("Maid"))
+            self.assertFalse(os.path.lexists(claim))
+
+    def test_completed_move_retains_nonempty_or_sidecar_retired_directory_claim(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            destination = os.path.join(final_root, "Maid")
+            nonempty_claim = os.path.join(staging_root, ".seedsync-retire-" + "1" * 48)
+            sidecar_claim = os.path.join(staging_root, ".seedsync-retire-" + "2" * 48)
+            os.makedirs(nonempty_claim); os.makedirs(sidecar_claim); os.makedirs(destination)
+            Path(os.path.join(nonempty_claim, "payload")).write_bytes(b"do-not-delete")
+            Controller._Controller__write_collision_claim_sidecar(sidecar_claim + ".json", "Maid", None)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                             self.controller._Controller__move_from_staging("Maid"))
+            self.assertTrue(os.path.isdir(nonempty_claim))
+            self.assertTrue(os.path.exists(os.path.join(nonempty_claim, "payload")))
+            self.assertTrue(os.path.isdir(sidecar_claim))
+            self.assertTrue(os.path.exists(sidecar_claim + ".json"))
+
+    def test_completed_move_retains_retired_claim_with_linux_bind_mountpoint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            destination = os.path.join(final_root, "Maid")
+            claim = os.path.join(staging_root, ".seedsync-retire-" + "3" * 48)
+            nested = os.path.join(claim, "S01")
+            os.makedirs(nested); os.makedirs(destination)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            for mount_point in (claim, nested):
+                with self.subTest(mount_point=mount_point), \
+                        patch("controller.controller.sys.platform", "linux"), \
+                        patch.object(Controller, "_Controller__linux_mountinfo_mountpoints", return_value=[mount_point]), \
+                        patch("controller.controller.os.path.ismount", return_value=False):
+                    self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                                     self.controller._Controller__move_from_staging("Maid"))
+
+            self.assertTrue(os.path.isdir(claim))
+            self.assertTrue(os.path.isdir(nested))
+
+    def test_completed_move_retains_retired_directory_tree_at_bound_without_recursion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            destination = os.path.join(final_root, "Maid")
+            claim = os.path.join(staging_root, ".seedsync-retire-" + "4" * 48)
+            nested = os.path.join(claim, "one", "two")
+            os.makedirs(nested); os.makedirs(destination)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            with patch("controller.controller._EMPTY_RETIRED_DIRECTORY_TREE_LIMIT", 2):
+                self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                                 self.controller._Controller__move_from_staging("Maid"))
+
+            self.assertTrue(os.path.isdir(claim))
+            self.assertTrue(os.path.isdir(nested))
+
+    def test_completed_move_retains_wide_retired_directory_tree_at_pending_bound(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            destination = os.path.join(final_root, "Maid")
+            claim = os.path.join(staging_root, ".seedsync-retire-" + "5" * 48)
+            os.makedirs(os.path.join(claim, "one")); os.makedirs(os.path.join(claim, "two")); os.makedirs(destination)
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            with patch("controller.controller._EMPTY_RETIRED_DIRECTORY_TREE_LIMIT", 2):
+                self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
+                                 self.controller._Controller__move_from_staging("Maid"))
+
+            self.assertTrue(os.path.isdir(claim))
+            self.assertTrue(os.path.isdir(os.path.join(claim, "one")))
+            self.assertTrue(os.path.isdir(os.path.join(claim, "two")))
+
     def test_refresh_cancellation_restores_active_claim_before_runtime_remap(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -8237,6 +8329,548 @@ class TestController(unittest.TestCase):
         self.assertNotIn(release.file_id, self.controller._Controller__persist.downloaded_file_names)
         callback.on_failure.assert_called_once()
         self.assertEqual(409, callback.on_failure.call_args.args[1])
+
+    def _prepare_authoritative_collision_retry(self, *, partial=False, unmatched=False):
+        remote_mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns))
+        local_root = SystemFile("release", 15 if unmatched else 10, True)
+        local_leaf = SystemFile(
+            "episode.mkv",
+            5 if partial else 10,
+            False,
+            mtime_ns=remote_mtime_ns,
+        )
+        local_leaf.has_staging_collision = True
+        local_root.add_child(local_leaf)
+        if unmatched:
+            local_root.add_child(SystemFile("obsolete.tmp", 5, False, is_staging=True))
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.build_model()
+        self.controller._Controller__model_builder = builder
+
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        release = ModelFile("release", True)
+        release.remote_size = 10
+        release.local_size = 10
+        release.state = ModelFile.State.MOVE_FAILED
+        model.add_file(release)
+        self.controller._Controller__model = model
+        self.controller._Controller__persist.move_failure_counts = {
+            release.file_id: Controller._Controller__MAX_MOVE_FAILURES,
+        }
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__reconciled_local_path_pair_ids = {None}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {None}
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() + timedelta(seconds=30)
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+        command.add_callback(callback)
+        return release, command, callback
+
+    def test_manual_retry_move_authoritative_terminal_collision_reaches_move(self):
+        release, command, callback = self._prepare_authoritative_collision_retry()
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED
+        )
+
+        self.assertEqual({release.file_id}, self.controller._Controller__model_builder.get_unresolved_staging_collision_file_ids())
+        self.assertEqual({release.file_id}, self.controller._Controller__model_builder.get_terminalizable_staging_collision_file_ids())
+        self.assertTrue(
+            self.controller._Controller__model_builder.has_verified_staging_collision_remote_identity(
+                release.file_id
+            )
+        )
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__move_from_staging.assert_called_once_with(
+            "release", None, require_collision_proof=True
+        )
+        callback.on_success.assert_called_once_with()
+        self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+
+    def test_manual_retry_move_collision_safety_matrix_remains_rejected(self):
+        cases = (
+            "partial", "unmatched", "unreconciled", "stopped", "live",
+            "queued", "running", "stale_status", "retry_status", "active_command", "active_compare",
+        )
+        for case in cases:
+            with self.subTest(case=case):
+                release, command, callback = self._prepare_authoritative_collision_retry(
+                    partial=case == "partial",
+                    unmatched=case == "unmatched",
+                )
+                if case == "unreconciled":
+                    self.controller._Controller__last_local_reconciliation_healthy = False
+                elif case == "stopped":
+                    self.controller._Controller__persist.stopped_file_names = {release.file_id}
+                elif case == "live":
+                    self.controller._Controller__active_downloading_file_names = [
+                        (release.name, release.path_pair_id, release.path_pair_name)
+                    ]
+                elif case in ("queued", "running"):
+                    self.controller._Controller__last_lftp_statuses = [LftpJobStatus(
+                        0,
+                        LftpJobStatus.Type.MIRROR,
+                        LftpJobStatus.State.QUEUED if case == "queued" else LftpJobStatus.State.RUNNING,
+                        release.name,
+                        "",
+                    )]
+                elif case == "stale_status":
+                    self.controller._Controller__lftp.last_status_poll_healthy = False
+                    self.controller._Controller__lftp_status_cache_expires_at = datetime.now() - timedelta(seconds=1)
+                elif case == "retry_status":
+                    self.controller._Controller__lftp_status_poll_retry_active = True
+                elif case == "active_command":
+                    self.controller._Controller__active_command_processes = [
+                        SimpleNamespace(file_id=release.file_id)
+                    ]
+                elif case == "active_compare":
+                    self.controller._Controller__collision_compare_claim = (
+                        os.path.join("/local/incomplete", "release", "episode.mkv"),
+                        os.path.join("/local/incomplete", "release", ".seedsync-retire-token"),
+                        os.path.join("/local", "release", "episode.mkv"),
+                        "collision-key",
+                        os.path.join("/local/incomplete", "release", ".seedsync-retire-token.json"),
+                    )
+                    self.controller._Controller__collision_compare_future = SimpleNamespace(
+                        done=lambda: False
+                    )
+                self.controller._Controller__move_from_staging = MagicMock(
+                    return_value=Controller.MoveFromStagingResult.COMPLETED
+                )
+
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+                self.controller._Controller__move_from_staging.assert_not_called()
+                callback.on_failure.assert_called_once()
+                self.assertEqual(409, callback.on_failure.call_args.args[1])
+                self.assertEqual(
+                    Controller._Controller__MAX_MOVE_FAILURES,
+                    self.controller._Controller__persist.move_failure_counts[release.file_id],
+                )
+
+    def test_manual_retry_move_authoritative_collision_deferred_remains_terminal(self):
+        release, command, callback = self._prepare_authoritative_collision_retry()
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.DEFERRED
+        )
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__move_from_staging.assert_called_once_with(
+            "release", None, require_collision_proof=True
+        )
+        callback.on_failure.assert_called_once()
+        self.assertEqual(409, callback.on_failure.call_args.args[1])
+        self.assertEqual(
+            Controller._Controller__MAX_MOVE_FAILURES,
+            self.controller._Controller__persist.move_failure_counts[release.file_id],
+        )
+
+    def _prepare_collision_retry_disk(self, source_bytes=b"same", destination_bytes=b"same"):
+        release, command, callback = self._prepare_authoritative_collision_retry()
+        temp_dir = tempfile.TemporaryDirectory()
+        staging_root = os.path.join(temp_dir.name, "incomplete")
+        final_root = os.path.join(temp_dir.name, "final")
+        source_tree = os.path.join(staging_root, "release")
+        destination_tree = os.path.join(final_root, "release")
+        os.makedirs(source_tree)
+        os.makedirs(destination_tree)
+        source_leaf = os.path.join(source_tree, "episode.mkv")
+        destination_leaf = os.path.join(destination_tree, "episode.mkv")
+        Path(source_leaf).write_bytes(source_bytes)
+        Path(destination_leaf).write_bytes(destination_bytes)
+        timestamp = 1_786_400_003_000_000_000
+        os.utime(source_leaf, ns=(timestamp, timestamp))
+        os.utime(destination_leaf, ns=(timestamp, timestamp))
+        self.controller._Controller__staging_path = staging_root
+        self.controller._Controller__legacy_local_path = final_root
+        return temp_dir, release, command, callback, source_tree, source_leaf, destination_leaf
+
+    def test_manual_retry_move_authoritative_collision_reaches_real_comparator_and_clears_max(self):
+        temp_dir, release, command, callback, source_tree, source_leaf, destination_leaf = \
+            self._prepare_collision_retry_disk()
+        try:
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self._settle_collision_compare()
+
+            retry_callback = MagicMock()
+            retry_command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+            retry_command.add_callback(retry_callback)
+            self.controller.queue_command(retry_command)
+            self.controller._Controller__process_commands()
+
+            retry_callback.on_success.assert_called_once_with()
+            self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+            self.assertFalse(os.path.exists(source_tree))
+            self.assertEqual(b"same", Path(destination_leaf).read_bytes())
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_authoritative_collision_mismatch_retains_max(self):
+        temp_dir, release, command, callback, source_tree, source_leaf, destination_leaf = \
+            self._prepare_collision_retry_disk(source_bytes=b"source", destination_bytes=b"target")
+        try:
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+            self._settle_collision_compare()
+
+            retry_callback = MagicMock()
+            retry_command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+            retry_command.add_callback(retry_callback)
+            self.controller.queue_command(retry_command)
+            self.controller._Controller__process_commands()
+
+            retry_callback.on_failure.assert_called_once()
+            self.assertEqual(500, retry_callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self.assertTrue(os.path.exists(source_leaf))
+            self.assertEqual(b"target", Path(destination_leaf).read_bytes())
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_authoritative_collision_missing_or_empty_source_retains_max(self):
+        for empty_root in (False, True):
+            with self.subTest(empty_root=empty_root):
+                temp_dir, release, command, callback, source_tree, source_leaf, _ = \
+                    self._prepare_collision_retry_disk()
+                try:
+                    os.unlink(source_leaf)
+                    if empty_root:
+                        os.rmdir(source_tree)
+                    self.controller.queue_command(command)
+                    self.controller._Controller__process_commands()
+
+                    callback.on_failure.assert_called_once()
+                    self.assertEqual(409, callback.on_failure.call_args.args[1])
+                    self.assertEqual(
+                        Controller._Controller__MAX_MOVE_FAILURES,
+                        self.controller._Controller__persist.move_failure_counts[release.file_id],
+                    )
+                finally:
+                    self.controller._Controller__shutdown_collision_compare_worker()
+                    temp_dir.cleanup()
+
+    def test_manual_retry_move_collision_nested_clean_sibling_schedules_and_settles(self):
+        self.addCleanup(self.controller._Controller__shutdown_collision_compare_worker)
+        mtime_ns = 1_786_400_003_000_000_000
+        remote_root = SystemFile("release", 20, True)
+        remote_clean = SystemFile("a-clean", 10, True)
+        remote_clean.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_collision = SystemFile("z-collision", 10, True)
+        remote_collision.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_clean)
+        remote_root.add_child(remote_collision)
+
+        local_root = SystemFile("release", 20, True)
+        local_clean = SystemFile("a-clean", 10, True, is_staging=True)
+        local_clean.add_child(SystemFile("episode.mkv", 10, False, is_staging=True, mtime_ns=mtime_ns))
+        local_collision = SystemFile("z-collision", 10, True)
+        collision_leaf = SystemFile("episode.mkv", 10, False, mtime_ns=mtime_ns)
+        collision_leaf.has_staging_collision = True
+        local_collision.add_child(collision_leaf)
+        local_root.add_child(local_clean)
+        local_root.add_child(local_collision)
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.build_model()
+        self.controller._Controller__model_builder = builder
+
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        release = ModelFile("release", True)
+        release.remote_size = 20
+        release.local_size = 20
+        release.state = ModelFile.State.MOVE_FAILED
+        model.add_file(release)
+        self.controller._Controller__model = model
+        self.controller._Controller__persist.move_failure_counts = {
+            release.file_id: Controller._Controller__MAX_MOVE_FAILURES,
+        }
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__reconciled_local_path_pair_ids = {None}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {None}
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() + timedelta(seconds=30)
+
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+        command.add_callback(callback)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            source_clean = os.path.join(source_tree, "a-clean", "episode.mkv")
+            source_collision = os.path.join(source_tree, "z-collision", "episode.mkv")
+            destination_clean = os.path.join(destination_tree, "a-clean", "episode.mkv")
+            destination_collision = os.path.join(destination_tree, "z-collision", "episode.mkv")
+            os.makedirs(os.path.dirname(source_clean))
+            os.makedirs(os.path.dirname(source_collision))
+            os.makedirs(os.path.dirname(destination_clean))
+            os.makedirs(os.path.dirname(destination_collision))
+            Path(source_clean).write_bytes(b"clean")
+            Path(source_collision).write_bytes(b"same")
+            Path(destination_collision).write_bytes(b"same")
+            os.utime(source_clean, ns=(mtime_ns, mtime_ns))
+            os.utime(source_collision, ns=(mtime_ns, mtime_ns))
+            os.utime(destination_collision, ns=(mtime_ns, mtime_ns))
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            merge_paths = []
+            original_merge = self.controller._Controller__merge_staging_directory_no_replace
+
+            def record_merge(*args, **kwargs):
+                merge_paths.append(os.path.normpath(args[0]))
+                return original_merge(*args, **kwargs)
+
+            with patch.object(
+                    self.controller,
+                    "_Controller__merge_staging_directory_no_replace",
+                    side_effect=record_merge,
+            ):
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+            self.assertTrue(os.path.exists(destination_clean))
+            self.assertFalse(os.path.exists(source_clean))
+            self.assertTrue(os.path.exists(source_tree))
+            self.assertIsNotNone(self.controller._Controller__collision_compare_claim)
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self._settle_collision_compare()
+
+            retry_callback = MagicMock()
+            retry_command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+            retry_command.add_callback(retry_callback)
+            with patch.object(
+                    self.controller,
+                    "_Controller__merge_staging_directory_no_replace",
+                    side_effect=record_merge,
+            ):
+                self.controller.queue_command(retry_command)
+                self.controller._Controller__process_commands()
+
+            retry_callback.on_success.assert_called_once_with()
+            self.assertIn(os.path.normpath(os.path.join(source_tree, "a-clean")), merge_paths)
+            self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+            self.assertFalse(os.path.exists(source_tree))
+            self.assertEqual(b"clean", Path(destination_clean).read_bytes())
+            self.assertEqual(b"same", Path(destination_collision).read_bytes())
+
+    def _prepare_root_file_collision_retry_disk(self, source_bytes=b"same", destination_bytes=b"same"):
+        remote_mtime_ns = 1_786_400_003_000_000_000
+        remote_file = SystemFile("release", len(destination_bytes), False, mtime_ns=remote_mtime_ns)
+        local_file = SystemFile("release", len(source_bytes), False, mtime_ns=remote_mtime_ns)
+        local_file.has_staging_collision = True
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_file])
+        builder.set_local_files([local_file])
+        builder.build_model()
+        self.controller._Controller__model_builder = builder
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        release = ModelFile("release", False)
+        release.remote_size = len(destination_bytes)
+        release.local_size = len(source_bytes)
+        release.state = ModelFile.State.MOVE_FAILED
+        model.add_file(release)
+        self.controller._Controller__model = model
+        self.controller._Controller__persist.move_failure_counts = {
+            release.file_id: Controller._Controller__MAX_MOVE_FAILURES,
+        }
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__reconciled_local_path_pair_ids = {None}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {None}
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() + timedelta(seconds=30)
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+        command.add_callback(callback)
+        temp_dir = tempfile.TemporaryDirectory()
+        staging_root = os.path.join(temp_dir.name, "incomplete")
+        final_root = os.path.join(temp_dir.name, "final")
+        os.makedirs(staging_root)
+        os.makedirs(final_root)
+        source = os.path.join(staging_root, "release")
+        destination = os.path.join(final_root, "release")
+        Path(source).write_bytes(source_bytes)
+        Path(destination).write_bytes(destination_bytes)
+        os.utime(source, ns=(remote_mtime_ns, remote_mtime_ns))
+        os.utime(destination, ns=(remote_mtime_ns, remote_mtime_ns))
+        self.controller._Controller__staging_path = staging_root
+        self.controller._Controller__legacy_local_path = final_root
+        return temp_dir, release, command, callback, source, destination
+
+    def test_manual_retry_move_root_file_collision_equal_settles_and_clears_max(self):
+        temp_dir, release, command, callback, source, destination = \
+            self._prepare_root_file_collision_retry_disk()
+        try:
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            callback.on_failure.assert_called_once()
+            self._settle_collision_compare()
+
+            retry_callback = MagicMock()
+            retry_command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+            retry_command.add_callback(retry_callback)
+            self.controller.queue_command(retry_command)
+            self.controller._Controller__process_commands()
+
+            retry_callback.on_success.assert_called_once_with()
+            self.assertNotIn(release.file_id, self.controller._Controller__persist.move_failure_counts)
+            self.assertFalse(os.path.exists(source))
+            self.assertEqual(b"same", Path(destination).read_bytes())
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_root_file_collision_mismatch_restores_and_retains_max(self):
+        temp_dir, release, command, callback, source, destination = \
+            self._prepare_root_file_collision_retry_disk(b"source", b"target")
+        try:
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+            callback.on_failure.assert_called_once()
+            self._settle_collision_compare()
+
+            retry_callback = MagicMock()
+            retry_command = Controller.Command(Controller.Command.Action.RETRY_MOVE, release.file_id)
+            retry_command.add_callback(retry_callback)
+            self.controller.queue_command(retry_command)
+            self.controller._Controller__process_commands()
+
+            retry_callback.on_failure.assert_called_once()
+            self.assertEqual(500, retry_callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self.assertTrue(os.path.exists(source))
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_root_file_missing_source_without_claim_retains_max(self):
+        temp_dir, release, command, callback, source, _ = self._prepare_root_file_collision_retry_disk()
+        try:
+            os.unlink(source)
+            self.controller.queue_command(command)
+            self.controller._Controller__process_commands()
+
+            callback.on_failure.assert_called_once()
+            self.assertEqual(409, callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_collision_source_disappearing_after_proof_retains_max(self):
+        temp_dir, release, command, callback, source_tree, source_leaf, _ = \
+            self._prepare_collision_retry_disk()
+        try:
+            def remove_after_proof(*_args):
+                os.unlink(source_leaf)
+                return True
+
+            with patch.object(
+                    self.controller,
+                    "_Controller__collision_move_source_has_physical_proof",
+                    side_effect=remove_after_proof,
+            ):
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            callback.on_failure.assert_called_once()
+            self.assertEqual(500, callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self.assertTrue(os.path.exists(source_tree))
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
+
+    def test_manual_retry_move_collision_source_disappearing_after_merge_entry_retains_max(self):
+        temp_dir, release, command, callback, source_tree, source_leaf, _ = \
+            self._prepare_collision_retry_disk()
+        try:
+            original_recover = self.controller._Controller__recover_collision_claims
+            removed = False
+
+            def recover_then_remove(*args, **kwargs):
+                nonlocal removed
+                result = original_recover(*args, **kwargs)
+                if not removed:
+                    os.unlink(source_leaf)
+                    removed = True
+                return result
+
+            with patch.object(
+                    self.controller,
+                    "_Controller__recover_collision_claims",
+                    side_effect=recover_then_remove,
+            ):
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+            callback.on_failure.assert_called_once()
+            self.assertEqual(500, callback.on_failure.call_args.args[1])
+            self.assertEqual(
+                Controller._Controller__MAX_MOVE_FAILURES,
+                self.controller._Controller__persist.move_failure_counts[release.file_id],
+            )
+            self.assertTrue(os.path.exists(source_tree))
+            self.assertFalse(os.path.exists(source_leaf))
+        finally:
+            self.controller._Controller__shutdown_collision_compare_worker()
+            temp_dir.cleanup()
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_automatic_already_completed_does_not_earn_success_marker(self, diff_models):

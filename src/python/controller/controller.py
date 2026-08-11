@@ -110,6 +110,8 @@ _COLLISION_COMPARE_MAX_BYTES = 16 * 1024 * 1024 * 1024
 _COLLISION_COMPARE_CHUNK_BYTES = 128 * 1024
 _COLLISION_CLAIM_SIDECAR_MAX_BYTES = 4096
 _COLLISION_CLAIM_SCAN_LIMIT = 128
+_EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT = 128
+_EMPTY_RETIRED_DIRECTORY_TREE_LIMIT = 1024
 
 
 class Controller:
@@ -3244,7 +3246,8 @@ class Controller:
             source_stat.st_mtime_ns // 1_000_000_000 == destination_stat.st_mtime_ns // 1_000_000_000
 
     def __merge_staging_directory_no_replace(
-            self, src: str, dst: str, path_pair_id: Optional[str] = None) -> bool:
+            self, src: str, dst: str, path_pair_id: Optional[str] = None,
+            required_collision_sources: Optional[set[str]] = None) -> bool:
         """Publish missing descendants and retain every collision in staging.
 
         A split-root directory is expected after an interrupted portable
@@ -3257,7 +3260,10 @@ class Controller:
             raise OSError(errno.ELOOP, "directory merge encountered unsafe path")
         self.__reject_nested_mounts_or_reparse_points(src)
         self.__reject_nested_mounts_or_reparse_points(dst)
+        claim_before_settle = getattr(self, "_Controller__collision_compare_claim", None)
         settled_claim = self.__settle_collision_claim_for_tree(src, dst)
+        if settled_claim == "equal" and required_collision_sources is not None and claim_before_settle is not None:
+            required_collision_sources.discard(claim_before_settle[0])
         if settled_claim == "pending":
             self.__collision_merge_deferred = True
         elif settled_claim == "retry":
@@ -3265,6 +3271,11 @@ class Controller:
             return False
         elif settled_claim == "failed":
             raise OSError(errno.EAGAIN, "collision claim could not be safely restored")
+        if required_collision_sources is not None and any(
+                self.__path_is_within(path, src) and not os.path.lexists(path)
+                for path in required_collision_sources
+        ):
+            return False
         active_claim = getattr(self, "_Controller__collision_compare_claim", None)
         active_claimed_path = active_claim[1] if active_claim is not None else None
         active_sidecar_path = active_claim[4] if active_claim is not None and len(active_claim) > 4 else None
@@ -3296,6 +3307,12 @@ class Controller:
             except FileNotFoundError:
                 # A source can be atomically claimed or externally replaced
                 # after scandir; never act on the stale directory entry.
+                if required_collision_sources is not None and any(
+                        os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(source_child))
+                        or self.__path_is_within(path, source_child)
+                        for path in required_collision_sources
+                ):
+                    return False
                 continue
             try:
                 destination_stat = os.lstat(destination_child)
@@ -3304,7 +3321,14 @@ class Controller:
                 continue
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
                     stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
-                self.__merge_staging_directory_no_replace(source_child, destination_child, path_pair_id)
+                nested_merge_succeeded = self.__merge_staging_directory_no_replace(
+                    source_child, destination_child, path_pair_id, required_collision_sources
+                )
+                if required_collision_sources is not None and not nested_merge_succeeded and any(
+                        self.__path_is_within(path, source_child)
+                        for path in required_collision_sources
+                ):
+                    return False
                 continue
             if self.__staging_collision_is_verified_equivalent(source_stat, destination_stat):
                 cached_outcome = self.__cached_collision_outcome(source_child, destination_child)
@@ -3318,6 +3342,16 @@ class Controller:
             # Non-equivalent file/type collisions are retained in staging.
             # A retry may still publish unrelated missing descendants, but
             # this root remains an actionable no-overwrite conflict.
+        # Proof-mode retries may only remove the root once every required
+        # collision leaf has been settled equal.  The set is reduced solely by
+        # descriptor-level equal claim settlement above; keeping any path here
+        # prevents an external disappearance between scandir and rmdir from
+        # being mistaken for successful collision recovery.
+        if required_collision_sources is not None and any(
+                self.__path_is_within(path, src)
+                for path in required_collision_sources
+        ):
+            return False
         try:
             os.rmdir(src)
         except OSError as error:
@@ -3328,13 +3362,86 @@ class Controller:
         self.__sync_directory_if_supported(dst)
         return True
 
-    def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> MoveFromStagingResult:
+    def __collision_move_source_has_physical_proof(
+            self, src: str, dst: str, file_id: str
+    ) -> bool:
+        required_sources = self.__collision_move_required_sources(src, file_id)
+        if required_sources is None:
+            return False
+        for source_leaf in required_sources:
+            relative_path = os.path.relpath(source_leaf, src)
+            if relative_path == ".":
+                destination_leaf = dst
+            else:
+                destination_leaf = self.__safe_final_move_candidate(dst, relative_path)
+            if destination_leaf is None:
+                return False
+            try:
+                source_stat = os.lstat(source_leaf)
+                destination_stat = os.lstat(destination_leaf)
+            except OSError:
+                if self.__completed_owned_collision_claim_matches(source_leaf, destination_leaf):
+                    continue
+                return False
+            if not self.__staging_collision_is_verified_equivalent(source_stat, destination_stat):
+                return False
+        return True
+
+    def __collision_move_required_sources(self, src: str, file_id: str) -> Optional[set[str]]:
+        collision_paths = getattr(self.__model_builder, "get_staging_collision_relative_paths", None)
+        if not callable(collision_paths):
+            return None
+        try:
+            required_paths = collision_paths(file_id)
+        except Exception:
+            return None
+        if not isinstance(required_paths, tuple) or not required_paths:
+            return None
+        required_sources: set[str] = set()
+        for relative_path in required_paths:
+            source_leaf = src if not relative_path else self.__safe_final_move_candidate(src, relative_path)
+            if source_leaf is None:
+                return None
+            required_sources.add(source_leaf)
+        return required_sources
+
+    def __completed_owned_collision_claim_matches(self, source: str, destination: str) -> bool:
+        claim = getattr(self, "_Controller__collision_compare_claim", None)
+        future = getattr(self, "_Controller__collision_compare_future", None)
+        if claim is None or future is None or not future.done() or len(claim) < 5:
+            return False
+        claimed_source = claim[1]
+        sidecar_path = claim[4]
+        return os.path.normcase(os.path.abspath(claim[0])) == os.path.normcase(os.path.abspath(source)) \
+            and os.path.normcase(os.path.abspath(claim[2])) == os.path.normcase(os.path.abspath(destination)) \
+            and os.path.lexists(claimed_source) \
+            and isinstance(sidecar_path, str) and os.path.lexists(sidecar_path)
+
+    def __move_from_staging(
+            self,
+            name: str,
+            path_pair_id: Optional[str] = None,
+            require_collision_proof: bool = False,
+    ) -> MoveFromStagingResult:
         resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
         if resolved is None:
             return Controller.MoveFromStagingResult.FAILED
         staging_path, final_path, src, dst = resolved
 
         trace_file_id = ModelFile.build_file_id(name, path_pair_id)
+        required_collision_sources = None
+        if require_collision_proof and not self.__collision_move_source_has_physical_proof(
+                src, dst, trace_file_id
+        ):
+            self.logger.warning(
+                "Deferring collision retry of '%s': physical staging collision proof is unavailable",
+                name,
+            )
+            return Controller.MoveFromStagingResult.DEFERRED
+        if require_collision_proof:
+            required_collision_sources = self.__collision_move_required_sources(src, trace_file_id)
+            if required_collision_sources is None:
+                return Controller.MoveFromStagingResult.DEFERRED
         should_trace = self.__target_archive_trace_selector_matches_file(trace_file_id, name)
         if should_trace:
             self.__trace_target_archive_event("move_from_staging_attempt", {
@@ -3348,7 +3455,16 @@ class Controller:
                 "source_exists": os.path.exists(src),
                 "same_path": os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)),
             })
+        self.__cleanup_empty_retired_source_claims(os.path.dirname(src))
         if not os.path.exists(src):
+            if require_collision_proof:
+                if self.__completed_owned_collision_claim_matches(src, dst):
+                    settled_claim = self.__settle_collision_claim_for_tree(src, dst)
+                    if settled_claim == "equal":
+                        return Controller.MoveFromStagingResult.ALREADY_COMPLETED
+                    if settled_claim == "terminal":
+                        return Controller.MoveFromStagingResult.CONFLICT
+                return Controller.MoveFromStagingResult.DEFERRED
             destination_exists = os.path.exists(dst)
             if not destination_exists:
                 self.logger.warning(
@@ -3397,10 +3513,22 @@ class Controller:
                 return Controller.MoveFromStagingResult.FAILED
             if self.__safe_existing_directory(src) and self.__safe_existing_directory(dst):
                 self.__collision_merge_deferred = False
-                if not self.__merge_staging_directory_no_replace(src, dst, path_pair_id):
+                if not self.__merge_staging_directory_no_replace(
+                        src, dst, path_pair_id, required_collision_sources
+                ):
                     if self.__collision_merge_deferred:
                         return Controller.MoveFromStagingResult.DEFERRED
                     return Controller.MoveFromStagingResult.CONFLICT
+            elif require_collision_proof and self.__staging_collision_is_verified_equivalent(
+                    os.lstat(src), os.lstat(dst),
+            ):
+                cached_outcome = self.__cached_collision_outcome(src, dst)
+                if cached_outcome is not None:
+                    return Controller.MoveFromStagingResult.CONFLICT
+                outcome = self.__claim_and_compare_collision_leaf(src, dst, path_pair_id)
+                if outcome == "pending":
+                    return Controller.MoveFromStagingResult.DEFERRED
+                return Controller.MoveFromStagingResult.FAILED
             else:
                 self.__publish_staging_no_replace(src, dst)
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
@@ -3789,6 +3917,78 @@ class Controller:
         except FileNotFoundError:
             return
         cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+
+    def __cleanup_empty_retired_source_claims(self, source_parent: str) -> None:
+        """Remove only empty legacy publication claims left after final publish.
+
+        ``__remove_published_source`` predates collision sidecars and can
+        leave a private directory after a late ``rmtree`` ENOTEMPTY race.
+        This recovery never traverses or removes content: a matching claim is
+        eligible only when it has no sidecar and its entire tree is made of
+        ordinary, same-device empty directories.
+        """
+        try:
+            retired: list[str] = []
+            with os.scandir(source_parent) as entries:
+                for entry in entries:
+                    if re.fullmatch(r"\.seedsync-retire-[0-9a-f]{48}", entry.name):
+                        retired.append(entry.path)
+                        if len(retired) > _EMPTY_RETIRED_DIRECTORY_SCAN_LIMIT:
+                            self.logger.warning(
+                                "Skipping empty retired-source cleanup in '%s': bounded scan limit reached", source_parent,
+                            )
+                            return
+        except OSError:
+            return
+        for claim in retired:
+            sidecar_path = self.__collision_claim_sidecar_path(claim)
+            if os.path.lexists(sidecar_path):
+                continue
+            try:
+                claim_stat = os.lstat(claim)
+                reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+                if not stat.S_ISDIR(claim_stat.st_mode) or stat.S_ISLNK(claim_stat.st_mode) or \
+                        (reparse_point and getattr(claim_stat, "st_file_attributes", 0) & reparse_point) or \
+                        os.path.ismount(claim) or self.__has_linux_mountpoint_at_or_below(claim):
+                    continue
+                directories: list[str] = []
+                pending_directories = [claim]
+                tree_is_empty = True
+                while pending_directories:
+                    if len(directories) >= _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT:
+                        tree_is_empty = False
+                        break
+                    directory = pending_directories.pop()
+                    directory_stat = os.lstat(directory)
+                    if not stat.S_ISDIR(directory_stat.st_mode) or stat.S_ISLNK(directory_stat.st_mode) or \
+                            directory_stat.st_dev != claim_stat.st_dev or os.path.ismount(directory) or \
+                            (reparse_point and getattr(directory_stat, "st_file_attributes", 0) & reparse_point):
+                        tree_is_empty = False
+                        break
+                    directories.append(directory)
+                    for child in os.scandir(directory):
+                        child_stat = os.lstat(child.path)
+                        if not stat.S_ISDIR(child_stat.st_mode) or stat.S_ISLNK(child_stat.st_mode):
+                            tree_is_empty = False
+                            break
+                        if len(directories) + len(pending_directories) >= _EMPTY_RETIRED_DIRECTORY_TREE_LIMIT:
+                            tree_is_empty = False
+                            break
+                        pending_directories.append(child.path)
+                    if not tree_is_empty:
+                        break
+                if not tree_is_empty:
+                    continue
+                for directory in reversed(directories):
+                    if self.__has_linux_mountpoint_at_or_below(claim):
+                        raise OSError(errno.EXDEV, "Linux mount appeared during retired-source cleanup", claim)
+                    os.rmdir(directory)
+                self.__sync_directory_if_supported(source_parent)
+                self.logger.info("Removed empty retired staging claim '%s' after completed publication", claim)
+            except OSError as error:
+                # A concurrent writer turns the candidate into retained
+                # residue; never retry recursively or remove its content.
+                self.logger.warning("Retained private source cleanup claim '%s': %s", claim, error)
 
     def __recover_collision_claims(
             self, source_directory: str, path_pair_id: Optional[str],
@@ -4262,6 +4462,30 @@ class Controller:
                     raise ValueError("malformed /proc/self/mountinfo entry")
                 mount_points.append(decode_mountinfo_path(fields[4]))
         return mount_points
+
+    @staticmethod
+    def __has_linux_mountpoint_at_or_below(path: str) -> bool:
+        """Fail closed for cleanup when Linux mountinfo names this tree.
+
+        ``os.path.ismount`` cannot reliably see same-device bind mounts.
+        Unlike publication's nested-mount check, cleanup rejects a mount at
+        the claim root too because no external mounted tree is disposable.
+        """
+        if not sys.platform.startswith("linux"):
+            return False
+        root = os.path.normcase(os.path.abspath(path))
+        try:
+            for mount_point in Controller.__linux_mountinfo_mountpoints():
+                candidate = os.path.normcase(os.path.abspath(mount_point))
+                try:
+                    if os.path.commonpath([root, candidate]) == root:
+                        return True
+                except ValueError:
+                    continue
+        except (OSError, ValueError) as error:
+            raise OSError(getattr(error, "errno", None) or errno.EIO,
+                          "could not inspect Linux mount boundaries", path) from error
+        return False
 
     @staticmethod
     def __sync_publish_temporary(path: str) -> None:
@@ -5540,16 +5764,102 @@ class Controller:
                 # identity.  A terminal collision may contain equally sized,
                 # equally timestamped final/staging leaves that are both stale
                 # relative to the remote source; filesystem-only merging must
-                # never delete that staging evidence.
-                if not self.__model_builder.has_complete_local_coverage(file.file_id) or \
-                        self.__model_builder.has_unresolved_staging_collision(file.file_id):
+                # never delete that staging evidence.  The collision path is
+                # therefore narrower than the ordinary coverage path: it must
+                # be terminalizable, have exact scanner identity, and be
+                # backed by fresh local+remote reconciliation with no active
+                # transfer or comparison claim.
+                has_unresolved_collision = self.__model_builder.has_unresolved_staging_collision(file.file_id)
+                if has_unresolved_collision:
+                    terminalizable_collision_ids = self.__model_builder.get_terminalizable_staging_collision_file_ids()
+                    collision_identity_check = getattr(
+                        self.__model_builder,
+                        "has_verified_staging_collision_remote_identity",
+                        None,
+                    )
+                    active_file_ids = {
+                        ModelFile.build_file_id(name, path_pair_id)
+                        for name, path_pair_id, _ in (
+                            list(getattr(self, "_Controller__active_downloading_file_names", []))
+                            + list(getattr(self, "_Controller__active_extracting_file_names", []))
+                        )
+                    }
+                    active_file_ids.update(
+                        status.file_id
+                        for status in (getattr(self, "_Controller__last_lftp_statuses", None) or [])
+                        if getattr(status, "state", None) in (
+                            LftpJobStatus.State.QUEUED,
+                            LftpJobStatus.State.RUNNING,
+                        )
+                    )
+                    active_file_ids.update(
+                        getattr(process, "file_id", None)
+                        for process in getattr(self, "_Controller__active_command_processes", [])
+                        if isinstance(getattr(process, "file_id", None), str)
+                    )
+                    active_file_ids.update(
+                        file_id for file_id in getattr(self, "_Controller__pending_command_dispatch_file_ids", set())
+                        if isinstance(file_id, str) and file_id != file.file_id
+                    )
+                    active_file_ids.update(
+                        file_id for file_id in getattr(self, "_Controller__pending_extract_file_ids", set())
+                        if isinstance(file_id, str)
+                    )
+                    active_file_ids.update(
+                        file_id for file_id in getattr(self, "_Controller__pending_validation_file_ids", set())
+                        if isinstance(file_id, str)
+                    )
+                    pending_queue_dispatches = getattr(self, "_Controller__pending_queue_dispatches", {})
+                    if isinstance(pending_queue_dispatches, dict):
+                        active_file_ids.update(
+                            file_id for file_id in pending_queue_dispatches
+                            if isinstance(file_id, str)
+                        )
+                    status_cache_expires_at = getattr(
+                        self, "_Controller__lftp_status_cache_expires_at", None
+                    )
+                    current_status_authority = (
+                        getattr(self.__lftp, "last_status_poll_healthy", False) is True
+                        and not bool(getattr(self, "_Controller__lftp_status_poll_retry_active", False))
+                        and isinstance(status_cache_expires_at, datetime)
+                        and datetime.now() <= status_cache_expires_at
+                    )
+                    collision_claim = self._has_active_collision_comparison(
+                        file.name, file.path_pair_id,
+                    )
+                    collision_future = getattr(self, "_Controller__collision_compare_future", None)
+                    collision_comparison_in_flight = collision_claim and (
+                        collision_future is None or not collision_future.done()
+                    )
+                    collision_retry_authorized = (
+                        file.file_id in terminalizable_collision_ids
+                        and callable(collision_identity_check)
+                        and collision_identity_check(file.file_id) is True
+                        and bool(getattr(self, "_Controller__last_local_reconciliation_healthy", False))
+                        and bool(getattr(self, "_Controller__last_remote_reconciliation_healthy", False))
+                        and bool(self.is_path_pair_reconciled(file.path_pair_id))
+                        and current_status_authority
+                        and file.file_id not in active_file_ids
+                        and not self.__is_explicitly_stopped(file.name, file.path_pair_id)
+                        and not collision_comparison_in_flight
+                    )
+                else:
+                    collision_retry_authorized = self.__model_builder.has_complete_local_coverage(file.file_id)
+                if not collision_retry_authorized:
                     _notify_failure(command, "Final move requires current collision-free coverage", 409, file)
                     continue
                 if not self._reserve_move_attempt(file.file_id):
                     _notify_failure(command, "Move retry is already active", 409, file)
                     continue
                 try:
-                    result = self.__move_from_staging(file.name, file.path_pair_id)
+                    if has_unresolved_collision:
+                        result = self.__move_from_staging(
+                            file.name,
+                            file.path_pair_id,
+                            require_collision_proof=True,
+                        )
+                    else:
+                        result = self.__move_from_staging(file.name, file.path_pair_id)
                     if result in (
                         Controller.MoveFromStagingResult.COMPLETED,
                         Controller.MoveFromStagingResult.ALREADY_COMPLETED,

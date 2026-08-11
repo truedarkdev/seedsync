@@ -1172,8 +1172,58 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual({"release"}, self.model_builder.get_unresolved_staging_collision_file_ids())
         self.assertEqual({"release"}, self.model_builder.get_terminalizable_staging_collision_file_ids())
+        self.assertFalse(self.model_builder.has_verified_staging_collision_remote_identity("release"))
         self.assertFalse(self.model_builder.has_changes())
         self.assertIs(built_model, self.model_builder.build_model())
+
+    def test_terminal_collision_identity_accepts_fractional_remote_mtime_at_portable_second(self):
+        remote_mtime_ns = 1786400003000000100
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns))
+        local_root = SystemFile("release", 10, True)
+        local_leaf = SystemFile(
+            "episode.mkv",
+            10,
+            False,
+            mtime_ns=remote_mtime_ns - 100,
+        )
+        local_leaf.has_staging_collision = True
+        local_root.add_child(local_leaf)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.model_builder.build_model()
+
+        self.assertEqual({"release"}, self.model_builder.get_terminalizable_staging_collision_file_ids())
+        self.assertTrue(self.model_builder.has_verified_staging_collision_remote_identity("release"))
+
+    def test_terminal_collision_identity_checks_active_leaf_at_portable_second(self):
+        remote_mtime_ns = 1786400003000000100
+        remote_root = SystemFile("release", 10, True)
+        remote_root.add_child(SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns))
+        local_root = SystemFile("release", 10, True)
+        local_leaf = SystemFile("episode.mkv", 10, False, mtime_ns=remote_mtime_ns)
+        local_leaf.has_staging_collision = True
+        local_root.add_child(local_leaf)
+
+        for active_mtime_ns, expected in (
+            (remote_mtime_ns - 100, True),
+            (remote_mtime_ns + 1_000_000_000, False),
+        ):
+            with self.subTest(expected=expected):
+                active_root = SystemFile("release", 10, True)
+                active_root.add_child(SystemFile(
+                    "episode.mkv", 10, False, mtime_ns=active_mtime_ns
+                ))
+                self.model_builder.set_remote_files([remote_root])
+                self.model_builder.set_local_files([local_root])
+                self.model_builder.set_active_files([active_root])
+                self.model_builder.build_model()
+
+                self.assertTrue(
+                    self.model_builder.has_verified_staging_collision_remote_identity("release")
+                    is expected
+                )
 
     def test_same_second_different_raw_mtime_is_not_trusted_as_remote_final_leaf(self):
         remote = SystemFile("movie.mkv", 10, False, mtime_ns=1786400003000000100)
