@@ -19,6 +19,12 @@ from controller.model_updater import (
     _merge_targeted_legacy_scan_files,
     _remote_reconciliation_established,
     _pop_scan_updates,
+    _ModelUpdateStageTimer,
+)
+from common.performance_diagnostics import (
+    DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+    DURATION_MODEL_UPDATE_SCAN_INTAKE,
+    DURATION_MODEL_UPDATE_STATE_PREPARATION,
 )
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from model import Model, ModelFile
@@ -26,6 +32,35 @@ from system import SystemFile
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_model_update_stage_timer_switches_fixed_stages_and_closes_on_finish_error(self):
+        class Diagnostics:
+            def __init__(self):
+                self.events = []
+
+            def begin_duration(self, metric):
+                self.events.append(("begin", metric))
+                return (1.0, 1.0, len(self.events), 0)
+
+            def finish_duration(self, metric, token):
+                self.events.append(("finish", metric))
+                if metric == DURATION_MODEL_UPDATE_SCAN_INTAKE:
+                    raise RuntimeError("diagnostic failure")
+
+        diagnostics = Diagnostics()
+        timer = _ModelUpdateStageTimer(diagnostics)
+        timer.switch(DURATION_MODEL_UPDATE_STATE_PREPARATION)
+        timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
+        timer.switch(DURATION_MODEL_UPDATE_BUILD_FINALIZATION)
+        timer.finish()
+        self.assertEqual([
+            ("begin", DURATION_MODEL_UPDATE_STATE_PREPARATION),
+            ("finish", DURATION_MODEL_UPDATE_STATE_PREPARATION),
+            ("begin", DURATION_MODEL_UPDATE_SCAN_INTAKE),
+            ("finish", DURATION_MODEL_UPDATE_SCAN_INTAKE),
+            ("begin", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
+            ("finish", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
+        ], diagnostics.events)
+
     def test_remote_lifecycle_requires_result_on_staggered_or_no_event_tick(self):
         final_scan = SimpleNamespace(is_scan_final=True, failed=False, unknown_path_pair_ids=set())
         self.assertTrue(_remote_reconciliation_established(final_scan, True))

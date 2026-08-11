@@ -6,6 +6,14 @@ from typing import List, Optional
 
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from common import overrides, Localization, Constants
+from common.performance_diagnostics import (
+    DURATION_LOCAL_SCAN_AGGREGATION,
+    DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+    DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
+    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION,
+    DURATION_LOCAL_SCAN_STAGING_MERGE,
+    PerformanceDiagnosticsCollector,
+)
 from common.managed_extract import (
     is_managed_extract_marker_name,
     read_managed_extract_marker,
@@ -24,7 +32,8 @@ class LocalScanner(IScanner):
                  staging_path: Optional[str] = None,
                  managed_extract_folders_enabled: bool = True,
                  path_pair_id: Optional[str] = None,
-                 path_pair_name: Optional[str] = None):
+                 path_pair_name: Optional[str] = None,
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
         self.__local_path = local_path
         self.__staging_path = staging_path
         self.__scanner = SystemScanner(local_path)
@@ -43,6 +52,7 @@ class LocalScanner(IScanner):
         self.__path_pair_id = path_pair_id
         self.__path_pair_name = path_pair_name
         self.__progress_callback: Optional[ScanProgressCallback] = None
+        self.__performance_diagnostics = performance_diagnostics
 
     @property
     def path_pair_id(self) -> Optional[str]:
@@ -60,6 +70,26 @@ class LocalScanner(IScanner):
     def set_progress_callback(self, callback: Optional[ScanProgressCallback]) -> None:
         self.__progress_callback = callback
 
+    def __begin_stage(self, metric: str) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(metric)
+        except Exception:
+            return None
+
+    def __finish_stage(self, metric: str, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)  # type: ignore[arg-type]
+        except Exception:
+            pass
+
     @overrides(IScanner)
     def scan(self) -> List[SystemFile]:
         self.__managed_extract_file_ids = set()
@@ -68,9 +98,13 @@ class LocalScanner(IScanner):
         if self.__progress_callback is not None:
             return self.__scan_progressively()
         try:
-            result = self.__scanner.scan()
-            if self.__scanner.scan_had_errors:
-                raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+            try:
+                result = self.__scanner.scan()
+                if self.__scanner.scan_had_errors:
+                    raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
         except SystemScannerError:
             self.logger.exception("Caught SystemScannerError")
             raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=False)
@@ -79,13 +113,22 @@ class LocalScanner(IScanner):
             raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
 
         if self.__managed_extract_folders_enabled:
-            result = self.__prune_managed_extract_entries(result, self.__local_path)
+            managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
+            try:
+                result = self.__prune_managed_extract_entries(result, self.__local_path)
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT, managed_extract_started)
 
         exclude_name = self.__get_nested_staging_name()
         if exclude_name is not None:
-            result = [system_file for system_file in result if system_file.name != exclude_name]
+            aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
+            try:
+                result = [system_file for system_file in result if system_file.name != exclude_name]
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
 
         if self.__staging_scanner is not None:
+            filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
             try:
                 staging_result = self.__staging_scanner.scan()
                 if self.__staging_scanner.scan_had_errors:
@@ -96,23 +139,37 @@ class LocalScanner(IScanner):
             except OSError:
                 self.logger.exception("Caught local staging filesystem error")
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
 
             if self.__managed_extract_folders_enabled and self.__staging_path is not None:
-                staging_result = self.__prune_managed_extract_entries(staging_result, self.__staging_path)
+                managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
+                try:
+                    staging_result = self.__prune_managed_extract_entries(staging_result, self.__staging_path)
+                finally:
+                    self.__finish_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT, managed_extract_started)
 
-            local_names = {system_file.name: index for index, system_file in enumerate(result)}
-            for staging_file in staging_result:
-                self.__mark_staging_file_tree(staging_file)
-                if staging_file.name not in local_names:
-                    local_names[staging_file.name] = len(result)
-                    result.append(staging_file)
-                else:
-                    existing_file = result[local_names[staging_file.name]]
-                    result[local_names[staging_file.name]] = self.__merge_duplicate_local_entries(
-                        existing_file,
-                        staging_file
-                    )
-        return result
+            staging_started = self.__begin_stage(DURATION_LOCAL_SCAN_STAGING_MERGE)
+            try:
+                local_names = {system_file.name: index for index, system_file in enumerate(result)}
+                for staging_file in staging_result:
+                    self.__mark_staging_file_tree(staging_file)
+                    if staging_file.name not in local_names:
+                        local_names[staging_file.name] = len(result)
+                        result.append(staging_file)
+                    else:
+                        existing_file = result[local_names[staging_file.name]]
+                        result[local_names[staging_file.name]] = self.__merge_duplicate_local_entries(
+                            existing_file,
+                            staging_file
+                        )
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_STAGING_MERGE, staging_started)
+        aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
+        try:
+            return result
+        finally:
+            self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
 
     def __scan_progressively(self) -> List[SystemFile]:
         """Publish a manifest and bounded top-level root batches.
@@ -126,42 +183,90 @@ class LocalScanner(IScanner):
             self.__scanner.reset_scan_errors()
             if self.__staging_scanner is not None:
                 self.__staging_scanner.reset_scan_errors()
-            root_names = set(self.__scanner.root_names())
+            filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+            try:
+                root_names = set(self.__scanner.root_names())
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
             staging_names: set[str] = set()
             if self.__staging_scanner is not None:
-                staging_names = set(self.__staging_scanner.root_names())
+                filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+                try:
+                    staging_names = set(self.__staging_scanner.root_names())
+                finally:
+                    self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
             exclude_name = self.__get_nested_staging_name()
             if exclude_name is not None:
                 root_names.discard(exclude_name)
                 staging_names.discard(exclude_name)
-            all_names = sorted(root_names.union(staging_names))
+            aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
+            try:
+                all_names = sorted(root_names.union(staging_names))
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
             aggregate_results: List[SystemFile] = []
-            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, set(all_names), False)
+            progress_started = self.__begin_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION)
+            try:
+                self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, set(all_names), False)
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             for root_name in all_names:
                 result: Optional[SystemFile] = None
                 if root_name in root_names:
-                    result = self.__scanner.scan_single_if_present(root_name)
+                    filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+                    try:
+                        result = self.__scanner.scan_single_if_present(root_name)
+                    finally:
+                        self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
                     if result is not None and self.__managed_extract_folders_enabled:
-                        pruned = self.__prune_managed_extract_entries([result], self.__local_path)
+                        managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
+                        try:
+                            pruned = self.__prune_managed_extract_entries([result], self.__local_path)
+                        finally:
+                            self.__finish_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT, managed_extract_started)
                         result = pruned[0] if pruned else None
                 if root_name in staging_names and self.__staging_scanner is not None:
-                    staging_result = self.__staging_scanner.scan_single_if_present(root_name)
+                    filesystem_started = self.__begin_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+                    try:
+                        staging_result = self.__staging_scanner.scan_single_if_present(root_name)
+                    finally:
+                        self.__finish_stage(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, filesystem_started)
                     if staging_result is not None:
                         if self.__managed_extract_folders_enabled and self.__staging_path is not None:
-                            pruned = self.__prune_managed_extract_entries([staging_result], self.__staging_path)
+                            managed_extract_started = self.__begin_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT)
+                            try:
+                                pruned = self.__prune_managed_extract_entries([staging_result], self.__staging_path)
+                            finally:
+                                self.__finish_stage(DURATION_LOCAL_SCAN_MANAGED_EXTRACT, managed_extract_started)
                             staging_result = pruned[0] if pruned else None
                         if staging_result is not None:
-                            self.__mark_staging_file_tree(staging_result)
-                            result = staging_result if result is None else self.__merge_duplicate_local_entries(
-                                result, staging_result
-                            )
+                            staging_started = self.__begin_stage(DURATION_LOCAL_SCAN_STAGING_MERGE)
+                            try:
+                                self.__mark_staging_file_tree(staging_result)
+                                result = staging_result if result is None else self.__merge_duplicate_local_entries(
+                                    result, staging_result
+                                )
+                            finally:
+                                self.__finish_stage(DURATION_LOCAL_SCAN_STAGING_MERGE, staging_started)
                 if result is not None:
-                    aggregate_results.append(result)
-                    self.__progress_callback([result], self.__path_pair_id, self.__path_pair_name, None, False)
+                    aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
+                    try:
+                        aggregate_results.append(result)
+                    finally:
+                        self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
+                    progress_started = self.__begin_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION)
+                    try:
+                        self.__progress_callback([result], self.__path_pair_id, self.__path_pair_name, None, False)
+                    finally:
+                        self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             if self.__scanner.scan_had_errors or (
                     self.__staging_scanner is not None and self.__staging_scanner.scan_had_errors):
                 raise ScannerError(Localization.Error.LOCAL_SERVER_SCAN, recoverable=True)
-            self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
+            progress_started = self.__begin_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION)
+            try:
+                self.__progress_callback([], self.__path_pair_id, self.__path_pair_name, None, True)
+            finally:
+                self.__finish_stage(DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION, progress_started)
             return aggregate_results
         except SystemScannerError:
             self.logger.exception("Caught SystemScannerError")

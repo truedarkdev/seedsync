@@ -17,7 +17,15 @@ from datetime import datetime, timedelta
 from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
-from common.performance_diagnostics import DURATION_MODEL_BUILD
+from common.performance_diagnostics import (
+    DURATION_MODEL_BUILD,
+    DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+    DURATION_MODEL_UPDATE_BUILDER_SYNC,
+    DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
+    DURATION_MODEL_UPDATE_SCAN_INTAKE,
+    DURATION_MODEL_UPDATE_STATE_PREPARATION,
+    DURATION_MODEL_UPDATE_STATUS_INGESTION,
+)
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import Model, ModelDiff, ModelDiffUtil, ModelError, ModelFile
 from system import SystemFile
@@ -37,6 +45,39 @@ if TYPE_CHECKING:
 
 _ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
 _IDLE_LFTP_STATUS_POLL_INTERVAL = timedelta(seconds=1)
+
+
+class _ModelUpdateStageTimer:
+    """Switch between fixed, bounded model-update diagnostic stages."""
+
+    def __init__(self, diagnostics: object | None) -> None:
+        self.__diagnostics = diagnostics
+        self.__metric: Optional[str] = None
+        self.__started_at: object = None
+
+    def switch(self, metric: str) -> None:
+        self.finish()
+        self.__metric = metric
+        diagnostics = self.__diagnostics
+        if diagnostics is None:
+            return
+        try:
+            self.__started_at = diagnostics.begin_duration(metric)
+        except Exception:
+            self.__started_at = None
+
+    def finish(self) -> None:
+        diagnostics = self.__diagnostics
+        metric = self.__metric
+        started_at = self.__started_at
+        self.__metric = None
+        self.__started_at = None
+        if diagnostics is None or metric is None or started_at is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)
+        except Exception:
+            pass
 
 
 class _ProgressiveScanAccumulator:
@@ -944,6 +985,15 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller.logger.debug("Ignoring stop/resume trace finalization failure", exc_info=True)
 
     def _update_once(self) -> bool:
+        diagnostics = getattr(getattr(self._controller, "_Controller__context", None), "performance_diagnostics", None)
+        stage_timer = _ModelUpdateStageTimer(diagnostics)
+        stage_timer.switch(DURATION_MODEL_UPDATE_STATE_PREPARATION)
+        try:
+            return self._update_once_impl(stage_timer)
+        finally:
+            stage_timer.finish()
+
+    def _update_once_impl(self, stage_timer: _ModelUpdateStageTimer) -> bool:
         controller = self._controller
         model_builder = controller._Controller__model_builder
         persist = controller._Controller__persist
@@ -1015,6 +1065,7 @@ class ModelUpdater(_ControllerCoreAccess):
         if not hasattr(controller, "_Controller__last_local_reconciliation_healthy"):
             controller._Controller__last_local_reconciliation_healthy = False
 
+        stage_timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
         # Grab the latest scan results.
         latest_remote_scan = _pop_scan_updates(controller, "remote", controller._Controller__remote_scan_process)
         latest_local_scan = _pop_scan_updates(controller, "local", controller._Controller__local_scan_process)
@@ -1081,6 +1132,7 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_reconciliation_final = remote_scan_final_relevant and local_scan_final_relevant \
             and not joint_unknown_local_ids
 
+        stage_timer.switch(DURATION_MODEL_UPDATE_STATUS_INGESTION)
         # Grab the Lftp status.
         lftp_statuses: Optional[list[LftpJobStatus]] = []
         lftp_status_poll_healthy = True
@@ -1252,6 +1304,7 @@ class ModelUpdater(_ControllerCoreAccess):
             "remote_scan_arrived": latest_remote_scan is not None,
         })
 
+        stage_timer.switch(DURATION_MODEL_UPDATE_BUILDER_SYNC)
         # Update model builder state.
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
@@ -1516,6 +1569,7 @@ class ModelUpdater(_ControllerCoreAccess):
             )
         )
 
+        stage_timer.switch(DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE)
         # A local/active scan can cache a collision while status polling is in
         # its idle cooldown.  The next fresh healthy empty poll is new
         # arbitration evidence, but the unchanged status list does not by
@@ -1556,6 +1610,7 @@ class ModelUpdater(_ControllerCoreAccess):
         ):
             model_builder.request_rebuild()
 
+        stage_timer.switch(DURATION_MODEL_UPDATE_BUILD_FINALIZATION)
         # Build the new model, if needed.
         auto_purge_candidate_ids: set[str] = set()
         # Result-dependent remote lifecycle work must only run on a tick that

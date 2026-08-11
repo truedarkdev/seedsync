@@ -1163,6 +1163,7 @@ class Controller:
         fallback_staging_path: Optional[str] = None,
     ) -> LocalScannerRuntime:
         config = self.__context.config
+        performance_diagnostics = getattr(self.__context, "performance_diagnostics", None)
         if enabled_path_pairs:
             return MultiPathLocalScanner([
                 LocalScanner(
@@ -1174,9 +1175,10 @@ class Controller:
                         "Controller.managed_extract_folders_enabled",
                     ),
                     path_pair_id=pair.id,
-                    path_pair_name=pair.name
+                    path_pair_name=pair.name,
+                    performance_diagnostics=performance_diagnostics,
                 ) for pair in enabled_path_pairs
-            ])
+            ], performance_diagnostics=performance_diagnostics)
         return LocalScanner(
             local_path=fallback_local_path or self.__legacy_local_path,
             use_temp_file=Controller.__require_runtime_bool(config.lftp.use_temp_file, "Lftp.use_temp_file"),
@@ -1184,7 +1186,8 @@ class Controller:
             managed_extract_folders_enabled=Controller.__require_runtime_bool(
                 config.controller.managed_extract_folders_enabled,
                 "Controller.managed_extract_folders_enabled",
-            )
+            ),
+            performance_diagnostics=performance_diagnostics,
         )
 
     def __build_remote_scanner(

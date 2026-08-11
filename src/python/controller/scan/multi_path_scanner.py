@@ -8,6 +8,10 @@ from .scanner_process import IScanner, ScannerError, ScanProgressCallback
 from .local_scanner import LocalScanner
 from .remote_scanner import RemoteScanner
 from common import overrides
+from common.performance_diagnostics import (
+    DURATION_LOCAL_SCAN_AGGREGATION,
+    PerformanceDiagnosticsCollector,
+)
 from system import SystemFile
 
 
@@ -72,9 +76,14 @@ class MultiPathLocalScanner(IScanner):
     Scanner that aggregates local scan results from multiple path pairs.
     """
 
-    def __init__(self, scanners: List[LocalScanner]):
+    def __init__(
+        self,
+        scanners: List[LocalScanner],
+        performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None,
+    ):
         self.logger = logging.getLogger("MultiPathLocalScanner")
         self.__scanners = scanners
+        self.__performance_diagnostics = performance_diagnostics
         self.__scan_target_path_pair_ids: Optional[set[str]] = None
         self.__progress_callback: Optional[ScanProgressCallback] = None
         self.__failed_path_pair_ids: set[str | None] = set()
@@ -124,20 +133,24 @@ class MultiPathLocalScanner(IScanner):
                 return scanner, err.files or [], err
 
         scan_results = _run_bounded_scan_tasks(scanners, scan_one, "local-scan")
-        for scanner, files, err in scan_results:
-            if err is not None:
-                error_message = "Failed to scan local path for pair '{}': {}".format(
-                    scanner.path_pair_name, str(err)
-                )
-                self.logger.warning(error_message)
-                if not err.recoverable:
-                    raise err
-                self.__failed_path_pair_ids.add(scanner.path_pair_id)
-                recoverable_errors.append(error_message)
-            for system_file in files:
-                system_file.path_pair_id = scanner.path_pair_id
-                system_file.path_pair_name = scanner.path_pair_name
-            all_files.extend(files)
+        aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
+        try:
+            for scanner, files, err in scan_results:
+                if err is not None:
+                    error_message = "Failed to scan local path for pair '{}': {}".format(
+                        scanner.path_pair_name, str(err)
+                    )
+                    self.logger.warning(error_message)
+                    if not err.recoverable:
+                        raise err
+                    self.__failed_path_pair_ids.add(scanner.path_pair_id)
+                    recoverable_errors.append(error_message)
+                for system_file in files:
+                    system_file.path_pair_id = scanner.path_pair_id
+                    system_file.path_pair_name = scanner.path_pair_name
+                all_files.extend(files)
+        finally:
+            self.__finish_stage(DURATION_LOCAL_SCAN_AGGREGATION, aggregation_started)
         if recoverable_errors:
             raise ScannerError(
                 "Local scan completed with recoverable errors: {}".format("; ".join(recoverable_errors)),
@@ -145,6 +158,26 @@ class MultiPathLocalScanner(IScanner):
                 files=all_files,
             )
         return all_files
+
+    def __begin_stage(self, metric: str) -> object:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return None
+        try:
+            return diagnostics.begin_duration(metric)
+        except Exception:
+            return None
+
+    def __finish_stage(self, metric: str, started_at: object) -> None:
+        if started_at is None:
+            return
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)  # type: ignore[arg-type]
+        except Exception:
+            pass
 
     def pop_managed_extract_file_ids(self) -> List[str]:
         managed_extract_file_ids: List[str] = []

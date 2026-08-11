@@ -7,6 +7,14 @@ import unittest
 from model import ModelFile
 from controller.scan import LocalScanner, ScannerError, ScannerProcess
 from common import Localization
+from common.performance_diagnostics import (
+    DURATION_LOCAL_SCAN_AGGREGATION,
+    DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+    DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
+    DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION,
+    DURATION_LOCAL_SCAN_STAGING_MERGE,
+)
+from common import PerformanceDiagnosticsCollector
 
 
 class TestLocalScanner(unittest.TestCase):
@@ -32,6 +40,36 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual({"root-a", "root-b"}, events[0][1])
         self.assertEqual({"root-a", "root-b"}, {file.name for event in events[1:-1] for file in event[0]})
         self.assertTrue(events[-1][2])
+
+    def test_progressive_scan_records_fixed_scanner_stage_durations(self):
+        with open(os.path.join(self.temp_dir, "root.txt"), "w") as handle:
+            handle.write("content")
+        staging_dir = os.path.join(self.temp_dir, "staging")
+        os.mkdir(staging_dir)
+        with open(os.path.join(staging_dir, "partial.txt"), "w") as handle:
+            handle.write("partial")
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        scanner = LocalScanner(
+            self.temp_dir,
+            use_temp_file=False,
+            staging_path=staging_dir,
+            path_pair_id="pair",
+            performance_diagnostics=diagnostics,
+        )
+        scanner.set_progress_callback(lambda *args: None)
+
+        scanner.scan()
+
+        durations = diagnostics.snapshot()["durations"]
+        for metric in (
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
+            DURATION_LOCAL_SCAN_AGGREGATION,
+            DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION,
+            DURATION_LOCAL_SCAN_STAGING_MERGE,
+        ):
+            self.assertGreaterEqual(durations[metric]["count"], 1)
+        self.assertNotIn(self.temp_dir, str(diagnostics.snapshot()))
 
     def test_progressive_scan_returns_lossless_aggregate_for_bounded_queue_final(self):
         for index in range(140):

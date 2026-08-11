@@ -5,7 +5,10 @@ import json
 from webtest import TestApp
 
 from tests.integration.test_web.test_web_app import BaseTestWebApp
-from common.performance_diagnostics import PerformanceDiagnosticsCollector
+from common.performance_diagnostics import (
+    DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+    PerformanceDiagnosticsCollector,
+)
 
 
 class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
@@ -31,14 +34,31 @@ class TestPerformanceDiagnosticsHandler(BaseTestWebApp):
             "process_rss_bytes": 123,
             "path": "/must-not-appear",
         })
+        started = self.context.performance_diagnostics.begin_duration(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL)
+        self.addCleanup(
+            self.context.performance_diagnostics.finish_duration,
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            started,
+        )
         response = self.test_app.get("/server/admin/performance-diagnostics/v1?limit=1")
         self.assertEqual("application/json", response.content_type)
         self.assertEqual("nosniff", response.headers["X-Content-Type-Options"])
         payload = json.loads(response.body.decode("utf-8"))
         self.assertEqual("seedsync.performance-diagnostics.v1", payload["schema"])
         self.assertEqual(1, payload["sample_count"])
+        self.assertEqual(1, payload["active_stage_counts"][DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL])
+        self.assertEqual(
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            payload["active_stage"]["name"],
+        )
+        self.assertEqual(
+            DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
+            payload["active_scanner_stage"]["name"],
+        )
+        self.assertIsNone(payload["active_stage"]["cpu_seconds"])
         self.assertNotIn("path", payload["samples"][0])
         self.assertNotIn("must-not-appear", response.text)
+        self.context.performance_diagnostics.finish_duration(DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, started)
         reset = self.test_app.post("/server/admin/performance-diagnostics/v1/reset")
         self.assertEqual("application/json", reset.content_type)
         self.assertEqual("nosniff", reset.headers["X-Content-Type-Options"])
