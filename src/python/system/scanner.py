@@ -194,6 +194,22 @@ class SystemScanner:
         except (AttributeError, OSError, OverflowError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def __get_mtime_ns(stat_result: os.stat_result) -> Optional[int]:
+        try:
+            mtime_ns = getattr(stat_result, "st_mtime_ns")
+            if type(mtime_ns) is int:
+                return mtime_ns
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        try:
+            mtime = stat_result.st_mtime
+            if isinstance(mtime, (int, float)):
+                return int(mtime * 1_000_000_000)
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            pass
+        return None
+
     def __create_system_file(self, entry: _ScanEntry) -> SystemFile:
         """
         Creates a system file from a DirEntry.
@@ -215,11 +231,13 @@ class SystemScanner:
             size = sum(sub_child.size for sub_child in sub_children)
             time_created = SystemScanner.__get_created_time(entry_stat)
             time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
+            mtime_ns = SystemScanner.__get_mtime_ns(entry_stat)
             sys_file = SystemFile(name,
                                   size,
                                   True,
                                   time_created=time_created,
-                                  time_modified=time_modified)
+                                  time_modified=time_modified,
+                                  mtime_ns=mtime_ns)
             for sub_child in sub_children:
                 sys_file.add_child(sub_child)
         else:
@@ -248,11 +266,13 @@ class SystemScanner:
                 file_name = file_name[:-len(self.__lftp_temp_file_suffix)]
             time_created = SystemScanner.__get_created_time(entry_stat)
             time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
+            mtime_ns = SystemScanner.__get_mtime_ns(entry_stat)
             sys_file = SystemFile(file_name,
                                   file_size,
                                   False,
                                   time_created=time_created,
-                                  time_modified=time_modified)
+                                  time_modified=time_modified,
+                                  mtime_ns=mtime_ns)
             sys_file.status_sidecar_ready = status_sidecar_ready
         return sys_file
 

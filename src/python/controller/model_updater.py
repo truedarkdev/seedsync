@@ -71,6 +71,38 @@ class _ProgressiveScanAccumulator:
         ids = list(result.scanned_path_pair_ids)
         return ids[0] if len(ids) == 1 else None
 
+    @staticmethod
+    def __legacy_result_as_progress_snapshot(event: ScannerResult) -> Optional[ScannerResult]:
+        """Make legacy evidence explicit when it shares a progressive drain."""
+        selected_ids = set(event.scanned_path_pair_ids)
+        if not selected_ids:
+            if bool(getattr(event, "is_targeted_scan", False)):
+                return None
+            selected_ids = {None}
+        failed = bool(event.failed)
+        unknown_ids = set(event.unknown_path_pair_ids)
+        if failed and not unknown_ids:
+            unknown_ids = set(selected_ids)
+        return ScannerResult(
+            event.timestamp,
+            event.files,
+            event.malformed_status_only_file_ids,
+            event.managed_extract_file_ids,
+            selected_ids,
+            failed=failed,
+            error_message=event.error_message,
+            generation=event.generation,
+            is_progress=True,
+            root_names=event.root_names,
+            completed_path_pair_ids=set() if failed else set(selected_ids),
+            is_scan_final=not failed,
+            unknown_path_pair_ids=unknown_ids,
+            session_token=event.session_token,
+            is_full_snapshot=not failed,
+            full_snapshot_path_pair_ids=set() if failed else set(selected_ids),
+            is_targeted_scan=event.is_targeted_scan,
+        )
+
     def apply(self, events: Sequence[ScannerResult]) -> Optional[ScannerResult]:
         if not events:
             return None
@@ -88,13 +120,12 @@ class _ProgressiveScanAccumulator:
             ]
             if not events:
                 return None
-        newest_generation = max((int(getattr(event, "generation", 0)) for event in events), default=0)
-        accepted: list[ScannerResult] = []
-        for event in events:
-            generation = int(getattr(event, "generation", 0))
-            if generation < newest_generation and getattr(event, "is_progress", False):
-                continue
-            accepted.append(event)
+        # Generations are owned by path pair, not by an entire queue drain.
+        # A targeted refresh of A can validly overtake a queued full snapshot
+        # for untouched B; the per-pair comparison inside the event loop
+        # rejects only evidence superseded for that same pair.
+        accepted = list(events)
+        newest_generation = max((int(getattr(event, "generation", 0)) for event in accepted), default=0)
         if not accepted:
             return None
         latest = accepted[-1]
@@ -126,6 +157,14 @@ class _ProgressiveScanAccumulator:
                 self.__committed[(pair_id, file.name)] = file
                 self.__authoritative[(pair_id, file.name)] = file
             return latest
+        accepted = [
+            event if event.is_progress else self.__legacy_result_as_progress_snapshot(event)
+            for event in accepted
+        ]
+        accepted = [event for event in accepted if event is not None]
+        if not accepted:
+            return None
+        latest = accepted[-1]
         malformed: list[str] = []
         managed: list[str] = []
         failed = False
@@ -186,11 +225,16 @@ class _ProgressiveScanAccumulator:
                 manifest = getattr(event, "root_names", None)
                 if manifest is not None:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(manifest)
-                    for key in [key for key in self.__committed if key[0] == pair_id]:
-                        if key[1] not in manifest:
-                            self.__authoritative[key] = None
-                        else:
-                            self.__authoritative.pop(key, None)
+                    # Progress manifests are bounded/lossy transport hints.
+                    # They can establish that a root is present, but must not
+                    # establish that a previously committed root is absent.
+                    # Only the lossless aggregate below may replace a pair.
+                    if full_snapshot:
+                        for key in [key for key in self.__committed if key[0] == pair_id]:
+                            if key[1] not in manifest:
+                                self.__authoritative[key] = None
+                            else:
+                                self.__authoritative.pop(key, None)
                 for file in event.files:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
@@ -199,7 +243,11 @@ class _ProgressiveScanAccumulator:
                     self.__authoritative[(pair_id, file.name)] = file
                 if full_snapshot:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(working)
-                if pair_id in event.completed_path_pair_ids:
+                # A progressive completion marker can arrive after earlier
+                # root batches were evicted from the bounded queue.  Do not
+                # let it complete a pair or prove absence; the same scan's
+                # lossless full snapshot is the authority boundary.
+                if full_snapshot and pair_id in event.completed_path_pair_ids:
                     manifest_names = self.__manifests.get(generation, {}).get(pair_id)
                     if manifest_names is not None:
                         for name in list(working):
@@ -379,6 +427,18 @@ def _remote_reconciliation_established(
     return latest_remote_scan is not None and scan_final_relevant
 
 
+def _lifecycle_scanned_path_pair_ids(
+    remote_scan: ScannerResult, enabled_path_pair_ids: set[str],
+) -> set[str | None]:
+    """Limit lifecycle pruning to roots the arriving scan actually covered."""
+    if bool(getattr(remote_scan, "is_progress", False)):
+        return set(getattr(remote_scan, "completed_path_pair_ids", set()))
+    if bool(getattr(remote_scan, "is_targeted_scan", False)):
+        raw_ids = getattr(remote_scan, "scanned_path_pair_ids", set())
+        return set(raw_ids) if isinstance(raw_ids, set) else set()
+    return set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
+
+
 def _pop_scan_updates(controller: "Controller", side: str, process: object) -> Optional[ScannerResult]:
     """Drain progressive events when available; preserve legacy mock behavior."""
     if isinstance(process, ScannerProcess):
@@ -392,6 +452,32 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         return accumulator.apply(events)
     pop_latest = getattr(process, "pop_latest_result", None)
     return pop_latest() if callable(pop_latest) else None
+
+
+def _merge_targeted_legacy_scan_files(
+    controller: "Controller", side: str, result: ScannerResult, files: Sequence[SystemFile],
+) -> list[SystemFile]:
+    """Retain unselected roots when a legacy scanner returns one target pair."""
+    state_name = "_Controller__legacy_{}_scan_files".format(side)
+    cached = getattr(controller, state_name, None)
+    if not isinstance(cached, dict):
+        cached = {}
+    targeted = bool(getattr(result, "is_targeted_scan", False))
+    raw_ids = getattr(result, "scanned_path_pair_ids", set())
+    selected_ids = set(raw_ids) if isinstance(raw_ids, set) else set()
+    if not targeted:
+        cached = {
+            (getattr(file, "path_pair_id", None), file.name): file
+            for file in files
+        }
+    elif selected_ids:
+        for key in [key for key in cached if key[0] in selected_ids]:
+            cached.pop(key, None)
+        for file in files:
+            if getattr(file, "path_pair_id", None) in selected_ids:
+                cached[(file.path_pair_id, file.name)] = file
+    setattr(controller, state_name, cached)
+    return list(cached.values())
 
 
 class _ControllerCoreAccess:
@@ -1150,8 +1236,15 @@ class ModelUpdater(_ControllerCoreAccess):
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
             remote_scan_failed = bool(getattr(latest_remote_scan, "failed", False))
-            remote_files = joint_remote_files if progressive_mode else filter_excluded_files(
-                latest_remote_scan.files, self._get_exclude_patterns(controller))
+            if progressive_mode:
+                remote_files = joint_remote_files
+            else:
+                remote_files = _merge_targeted_legacy_scan_files(
+                    controller,
+                    "remote",
+                    latest_remote_scan,
+                    filter_excluded_files(latest_remote_scan.files, self._get_exclude_patterns(controller)),
+                )
             remote_final = bool(getattr(latest_remote_scan, "is_scan_final", True)) and \
                 not bool(getattr(latest_remote_scan, "unknown_path_pair_ids", set()))
             if remote_final and not progressive_mode:
@@ -1181,7 +1274,9 @@ class ModelUpdater(_ControllerCoreAccess):
             recovered_extracted_file_ids = []
             if not local_scan_failed and local_final:
                 if not progressive_mode:
-                    model_builder.set_local_files(latest_local_scan.files)
+                    model_builder.set_local_files(_merge_targeted_legacy_scan_files(
+                        controller, "local", latest_local_scan, latest_local_scan.files,
+                    ))
                 raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
                 if isinstance(raw_recovered_ids, (list, tuple, set)):
                     recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
@@ -1427,17 +1522,28 @@ class ModelUpdater(_ControllerCoreAccess):
             and controller._Controller__last_local_reconciliation_healthy
             and (joint_reconciliation_final if progressive_mode else True)
         )
+        # A zero-byte local-only row is retained until this tick establishes
+        # healthy remote authority for its absence and covers its path pair.
+        # Local scan health is not part of that remote reconciliation decision.
+        remote_auto_purge_reconciliation_healthy = (
+            remote_reconciliation_established
+            and controller._Controller__last_remote_reconciliation_healthy
+        )
+        enabled_path_pair_ids = set(
+            getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
+        )
+        remote_auto_purge_path_pair_ids = (
+            _lifecycle_scanned_path_pair_ids(latest_remote_scan, enabled_path_pair_ids)
+            if remote_auto_purge_reconciliation_healthy and latest_remote_scan is not None
+            else set()
+        )
         if remote_reconciliation_established:
             remote_scan = latest_remote_scan
             if remote_scan is None:
                 raise RuntimeError("Remote reconciliation requires a scan result")
-            enabled_path_pair_ids = set(
-                getattr(controller, "_Controller__path_pairs_by_id", {}).keys()
+            scanned_path_pair_ids = _lifecycle_scanned_path_pair_ids(
+                remote_scan, enabled_path_pair_ids,
             )
-            if bool(getattr(remote_scan, "is_progress", False)):
-                scanned_path_pair_ids = set(getattr(remote_scan, "completed_path_pair_ids", set()))
-            else:
-                scanned_path_pair_ids = set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
             remote_file_ids = {
                 ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None))
                 for file in remote_scan.files
@@ -1465,7 +1571,12 @@ class ModelUpdater(_ControllerCoreAccess):
                         file_id for file_id in delete_items if isinstance(file_id, str)
                     )
             prune_lifecycles = getattr(controller, "_prune_download_start_lifecycles", None)
-            if reconciliation_healthy and callable(prune_lifecycles) and scanned_path_pair_ids:
+            # Download-start lifecycle pruning establishes remote absence. It
+            # requires this remote scan's authoritative coverage, but a
+            # concurrent local scan outage must not retain stale remote
+            # lifecycle entries indefinitely.
+            if controller._Controller__last_remote_reconciliation_healthy \
+                    and callable(prune_lifecycles) and scanned_path_pair_ids:
                 prune_lifecycles(
                     remote_scan.timestamp,
                     scanned_path_pair_ids,
@@ -1697,6 +1808,7 @@ class ModelUpdater(_ControllerCoreAccess):
                             old_file.remote_size is not None
                             and new_file.local_size is not None
                             and new_file.local_size >= old_file.remote_size
+                            and model_builder.has_complete_local_coverage(new_file.file_id)
                         ):
                             completion_proved = True
 
@@ -1799,6 +1911,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         pending_file = new_model.get_file(file_id)
                     except ModelError:
                         continue
+                    # Durable retry state alone must not re-authorize a move:
+                    # the current effective local tree can have gained an
+                    # active-only branch or collision since the last attempt.
+                    # Leave pending/retry state intact until coverage is
+                    # proven again.
+                    if not model_builder.has_complete_local_coverage(file_id):
+                        continue
                     move_result = run_reserved_automatic_move(pending_file)
                     if move_result is None:
                         continue
@@ -1822,7 +1941,6 @@ class ModelUpdater(_ControllerCoreAccess):
                     else:
                         keep_completion_pending_after_failed_staging_move(pending_file, False)
 
-                current_auto_purge_candidate_ids: set[str] = set()
                 for diff in model_diff:
                     new_file = getattr(diff, "new_file", None)
                     if (
@@ -1830,11 +1948,10 @@ class ModelUpdater(_ControllerCoreAccess):
                         and new_file is not None
                         and controller._Controller__should_auto_purge_local_file(new_file)
                     ):
-                        current_auto_purge_candidate_ids.add(new_file.file_id)
-                if remote_reconciliation_established and reconciliation_healthy:
-                    auto_purge_candidate_ids.update(current_auto_purge_candidate_ids)
-                else:
-                    controller._Controller__pending_auto_purge_file_ids.update(current_auto_purge_candidate_ids)
+                        if new_file.path_pair_id in remote_auto_purge_path_pair_ids:
+                            auto_purge_candidate_ids.add(new_file.file_id)
+                        else:
+                            controller._Controller__pending_auto_purge_file_ids.add(new_file.file_id)
 
                 # Prune the extracted files list of any files that were deleted locally.
                 # This prevents these files from going to EXTRACTED state if they are re-downloaded.
@@ -1980,13 +2097,15 @@ class ModelUpdater(_ControllerCoreAccess):
                         )
                         controller._sync_final_move_succeeded_files_to_model()
 
-        if reconciliation_healthy and controller._Controller__pending_auto_purge_file_ids:
+        if remote_auto_purge_reconciliation_healthy and controller._Controller__pending_auto_purge_file_ids:
             pending_auto_purge_candidates: set[str] = set()
             for file_id in list(controller._Controller__pending_auto_purge_file_ids):
                 try:
                     file = model.get_file(file_id)
                 except ModelError:
                     controller._Controller__pending_auto_purge_file_ids.discard(file_id)
+                    continue
+                if file.path_pair_id not in remote_auto_purge_path_pair_ids:
                     continue
                 if controller._Controller__should_auto_purge_local_file(file):
                     pending_auto_purge_candidates.add(file_id)

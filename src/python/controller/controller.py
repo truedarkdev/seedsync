@@ -30,6 +30,7 @@ from .scan import (
     ActiveScanner,
     LocalScanner,
     RemoteScanner,
+    RemoteScanLease,
     MultiPathActiveScanner,
     MultiPathLocalScanner,
     MultiPathRemoteScanner,
@@ -49,6 +50,7 @@ from common import (
     Localization, MultiprocessingLogger, PathPair, PathPairManager, PathPairError,
 )
 from common.performance_diagnostics import DURATION_CONTROLLER_PROCESS, DURATION_MODEL_UPDATE
+from common.exclude_patterns import ExactPathExclusion, parse_exclude_patterns
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
@@ -134,6 +136,7 @@ class Controller:
     __active_scan_process: ScannerProcess
     __local_scan_process: ScannerProcess
     __remote_scan_process: ScannerProcess
+    __remote_scan_lease: Optional[RemoteScanLease]
     __extract_process: ExtractProcess
     __validate_process: ValidateProcess
     __lftp: Lftp | RcloneTransferBackend
@@ -335,6 +338,28 @@ class Controller:
         exclude_patterns = getattr(general_cfg, "exclude_patterns", "")
         return exclude_patterns if isinstance(exclude_patterns, str) else ""
 
+    def __transfer_exclude_patterns(
+            self, file_id: str, is_dir: bool
+    ) -> str | list[str | ExactPathExclusion]:
+        configured_patterns = Controller.__get_exclude_patterns(self)
+        patterns = parse_exclude_patterns(configured_patterns)
+        if not is_dir:
+            return configured_patterns
+        trusted_patterns: list[ExactPathExclusion] = []
+        for relative_path in self.__model_builder.get_trusted_final_leaf_paths(file_id):
+            try:
+                exact_path = ExactPathExclusion(relative_path)
+            except (TypeError, ValueError):
+                # A Linux filename can contain control characters which neither
+                # transport can safely encode in its command grammar.  Keep
+                # user globs and redownload that uncertain leaf instead.
+                continue
+            if exact_path not in trusted_patterns:
+                trusted_patterns.append(exact_path)
+        if not trusted_patterns:
+            return configured_patterns
+        return [*patterns, *trusted_patterns]
+
     @staticmethod
     def collect_missing_startup_fields(
         config: Config,
@@ -444,6 +469,7 @@ class Controller:
             "__active_scan_process",
             "__local_scan_process",
             "__remote_scan_process",
+            "__remote_scan_lease",
             "__extract_process",
             "__validate_process",
             "__mp_logger",
@@ -570,6 +596,10 @@ class Controller:
             else self.__ssh_password
         )
         self.__password = self.__ssh_password
+
+        config_file_path = getattr(config, "file_path", None)
+        lock_directory = os.path.dirname(config_file_path) if isinstance(config_file_path, str) else None
+        self.__remote_scan_lease = RemoteScanLease.create(lock_directory)
 
         # Preserve the configured legacy roots independently from the runtime
         # fallback. The latter follows the first enabled pair and must return
@@ -1137,6 +1167,10 @@ class Controller:
         remote_python_path = getattr(config.lftp, "remote_python_path", None)
         if not isinstance(remote_python_path, str):
             remote_python_path = None
+        remote_scan_lease = getattr(self, "_Controller__remote_scan_lease", None)
+        remote_scan_lease_kwargs = {} if remote_scan_lease is None else {
+            "remote_scan_lease": remote_scan_lease,
+        }
         if enabled_path_pairs:
             return MultiPathRemoteScanner([
                 RemoteScanner(
@@ -1153,7 +1187,8 @@ class Controller:
                     ),
                     remote_python_path=remote_python_path,
                     path_pair_id=pair.id,
-                    path_pair_name=pair.name
+                    path_pair_name=pair.name,
+                    **remote_scan_lease_kwargs,
                 ) for pair in enabled_path_pairs
             ])
         return RemoteScanner(
@@ -1168,7 +1203,8 @@ class Controller:
             remote_path_to_scan_script=Controller.__require_runtime_path(
                 config.lftp.remote_path_to_scan_script, "Lftp.remote_path_to_scan_script"
             ),
-            remote_python_path=remote_python_path
+            remote_python_path=remote_python_path,
+            **remote_scan_lease_kwargs,
         )
 
     def __mark_path_pair_refresh_completed(self, generation: Optional[int] = None):
@@ -3131,6 +3167,76 @@ class Controller:
             return None
         return staging_path, final_path, src, dst
 
+    @staticmethod
+    def __safe_existing_directory(path: str) -> bool:
+        try:
+            path_stat = os.lstat(path)
+        except OSError:
+            return False
+        return stat.S_ISDIR(path_stat.st_mode) and not stat.S_ISLNK(path_stat.st_mode)
+
+    @staticmethod
+    def __safe_merge_child(parent: str, child_name: str) -> Optional[str]:
+        """Build one contained child path without following parent links."""
+        separators = {os.sep}
+        if os.altsep:
+            separators.add(os.altsep)
+        if not child_name or child_name in (".", "..") or any(
+                separator in child_name for separator in separators):
+            return None
+        try:
+            candidate = os.path.normpath(os.path.join(parent, child_name))
+            if os.path.normcase(os.path.commonpath([os.path.abspath(parent), candidate])) != \
+                    os.path.normcase(os.path.abspath(parent)):
+                return None
+            if not Controller.__safe_existing_directory(parent):
+                return None
+            return candidate
+        except (OSError, ValueError):
+            return None
+
+    @classmethod
+    def __merge_staging_directory_no_replace(cls, src: str, dst: str) -> bool:
+        """Publish missing descendants and retain every collision in staging.
+
+        A split-root directory is expected after an interrupted portable
+        publication.  Descendants are individually published through the
+        existing no-clobber primitive; collided leaves are deliberately left
+        at the staging pathname so a later scan/recovery cannot erase either
+        authoritative final data or unresolved residue.
+        """
+        if not cls.__safe_existing_directory(src) or not cls.__safe_existing_directory(dst):
+            raise OSError(errno.ELOOP, "directory merge encountered unsafe path")
+        cls.__reject_nested_mounts_or_reparse_points(src)
+        cls.__reject_nested_mounts_or_reparse_points(dst)
+        for entry in sorted(os.scandir(src), key=lambda item: item.name):
+            source_child = cls.__safe_merge_child(src, entry.name)
+            destination_child = cls.__safe_merge_child(dst, entry.name)
+            if source_child is None or destination_child is None:
+                raise OSError(errno.ELOOP, "directory merge child escapes root", entry.name)
+            try:
+                destination_stat = os.lstat(destination_child)
+            except FileNotFoundError:
+                cls.__publish_staging_no_replace(source_child, destination_child)
+                continue
+            source_stat = os.lstat(source_child)
+            if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
+                    stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
+                cls.__merge_staging_directory_no_replace(source_child, destination_child)
+                continue
+            # Exact file/type collisions are retained in staging.  Never use
+            # a size comparison here: final identity wins and a retry may
+            # still publish unrelated missing descendants around the residue.
+        try:
+            os.rmdir(src)
+        except OSError as error:
+            if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                return False
+            raise
+        cls.__sync_directory_if_supported(os.path.dirname(src))
+        cls.__sync_directory_if_supported(dst)
+        return True
+
     def __move_from_staging(self, name: str, path_pair_id: Optional[str] = None) -> MoveFromStagingResult:
         resolved = self.__resolve_safe_final_move_paths(name, path_pair_id)
         if resolved is None:
@@ -3177,7 +3283,7 @@ class Controller:
                     "result": "same_path",
                 })
             return Controller.MoveFromStagingResult.NO_MOVE_APPLICABLE
-        if self.__source_has_lftp_temp_artifact(staging_path, src):
+        if self.__source_has_lftp_temp_artifact(staging_path, src, trace_file_id):
             self.logger.warning(
                 "Deferring move of '%s' from staging '%s' to '%s': staging source still has an lftp temp artifact",
                 name,
@@ -3198,7 +3304,11 @@ class Controller:
             current = self.__resolve_safe_final_move_paths(name, path_pair_id)
             if current is None or current[2:] != (src, dst):
                 return Controller.MoveFromStagingResult.FAILED
-            self.__publish_staging_no_replace(src, dst)
+            if self.__safe_existing_directory(src) and self.__safe_existing_directory(dst):
+                if not self.__merge_staging_directory_no_replace(src, dst):
+                    return Controller.MoveFromStagingResult.CONFLICT
+            else:
+                self.__publish_staging_no_replace(src, dst)
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
@@ -3777,8 +3887,7 @@ class Controller:
         with self.__move_attempt_lock:
             self.__move_attempt_reservations.discard(file_id)
 
-    @staticmethod
-    def __source_has_lftp_temp_artifact(staging_path: str, src: str) -> bool:
+    def __source_has_lftp_temp_artifact(self, staging_path: str, src: str, file_id: str) -> bool:
         suffix = Constants.LFTP_TEMP_FILE_SUFFIX
         try:
             resolved_staging_root = os.path.realpath(staging_path)
@@ -3795,22 +3904,57 @@ class Controller:
         except ValueError:
             return False
 
-        temp_candidate = src + suffix
-        try:
-            resolved_temp_candidate = os.path.realpath(temp_candidate)
-        except OSError:
-            return False
-
-        try:
-            if os.path.normcase(os.path.commonpath([resolved_staging_root, resolved_temp_candidate])) != os.path.normcase(resolved_staging_root):
+        def is_contained(candidate: str) -> bool:
+            try:
+                return os.path.normcase(os.path.commonpath([
+                    resolved_staging_root, os.path.realpath(candidate)
+                ])) == os.path.normcase(resolved_staging_root)
+            except (OSError, ValueError):
                 return False
-        except ValueError:
+
+        def remote_leaf_exists(relative_path: str) -> bool:
+            try:
+                result = self.__model_builder.is_remote_leaf_path(file_id, relative_path)
+            except Exception:
+                return False
+            return result if type(result) is bool else False
+
+        def visit(candidate: str, relative_path: str) -> bool:
+            if not is_contained(candidate):
+                return True
+            try:
+                candidate_stat = os.lstat(candidate)
+            except OSError:
+                return True
+            if stat.S_ISLNK(candidate_stat.st_mode):
+                return True
+            if not stat.S_ISDIR(candidate_stat.st_mode):
+                name = os.path.basename(candidate)
+                if name.endswith(".lftp-pget-status"):
+                    return True
+                if not relative_path or not name.endswith(suffix):
+                    return False
+                # A remote leaf really named ``foo.lftp`` is payload.  An
+                # otherwise absent ``foo.lftp`` beside remote ``foo`` is the
+                # pget artifact and must remain in staging.
+                return not remote_leaf_exists(relative_path) and \
+                    remote_leaf_exists(relative_path[:-len(suffix)])
+            try:
+                with os.scandir(candidate) as entries:
+                    for entry in entries:
+                        child_relative = entry.name if not relative_path else relative_path + "/" + entry.name
+                        if visit(entry.path, child_relative):
+                            return True
+            except OSError:
+                return True
             return False
 
-        try:
-            return os.path.isfile(resolved_temp_candidate)
-        except OSError:
-            return False
+        # A single file whose requested name itself ends in .lftp remains a
+        # supported payload.  Directory descendants use the remote scan to
+        # distinguish a real ``foo.lftp`` from a pget temporary for ``foo``.
+        if os.path.isdir(src) and not os.path.islink(src):
+            return visit(src, "")
+        return os.path.lexists(src + suffix) or os.path.lexists(src + ".lftp-pget-status")
 
     def __get_delete_local_target(self, file: ModelFile) -> Tuple[str, str]:
         path_pair = self.__get_path_pair(file.path_pair_id)
@@ -3830,6 +3974,25 @@ class Controller:
             return staging_path, file.name + Constants.LFTP_TEMP_FILE_SUFFIX
 
         return final_path, file.name
+
+    def __has_ambiguous_split_local_target(self, file: ModelFile) -> bool:
+        """Whether deleting one root could discard final split-root content."""
+        path_pair = self.__get_path_pair(file.path_pair_id)
+        final_root = path_pair.local_path if path_pair is not None else self.__legacy_local_path
+        staging_root = self.__get_staging_path(file.path_pair_id if path_pair is not None else None)
+        if not final_root or not staging_root:
+            return False
+        final_target = Controller.__safe_final_move_candidate(final_root, file.name)
+        staging_target = Controller.__safe_final_move_candidate(staging_root, file.name)
+        if final_target is None or staging_target is None:
+            return True
+        try:
+            return os.path.lexists(final_target) and (
+                os.path.lexists(staging_target) or
+                os.path.lexists(staging_target + Constants.LFTP_TEMP_FILE_SUFFIX)
+            )
+        except OSError:
+            return True
 
     @staticmethod
     def __is_delete_command_action(action: "Controller.Command.Action") -> bool:
@@ -4071,9 +4234,9 @@ class Controller:
                         staging_path,
                         False
                     )
-                    queue_kwargs: dict[str, str] = {}
-                    exclude_patterns = Controller.__get_exclude_patterns(self)
-                    if exclude_patterns.strip():
+                    queue_kwargs: dict[str, object] = {}
+                    exclude_patterns = self.__transfer_exclude_patterns(file_id, is_dir)
+                    if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
                     self.__lftp.queue(
                         file_name,
@@ -4304,9 +4467,9 @@ class Controller:
                             local_base_dir_path,
                             stopped_marked
                         )
-                        queue_kwargs: dict[str, str] = {}
-                        exclude_patterns = Controller.__get_exclude_patterns(self)
-                        if exclude_patterns.strip():
+                        queue_kwargs: dict[str, object] = {}
+                        exclude_patterns = self.__transfer_exclude_patterns(file.file_id, file.is_dir)
+                        if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
                         self.__lftp.queue(
                             file.name,
@@ -4627,6 +4790,16 @@ class Controller:
                     continue
                 elif file.local_size is None:
                     _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
+                    continue
+                elif self.__has_ambiguous_split_local_target(file):
+                    _notify_failure(
+                        command,
+                        "Local file '{}' has both final and staging content; refusing ambiguous delete".format(
+                            command.filename
+                        ),
+                        409,
+                        file,
+                    )
                     continue
                 else:
                     if len(self.__active_command_processes) >= Controller._MAX_CONCURRENT_COMMAND_PROCESSES:

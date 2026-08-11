@@ -208,19 +208,21 @@ class MultiPathRemoteScanner(IScanner):
         scanners = [scanner for scanner in self.__scanners if self.__scan_target_path_pair_ids is None or
                     scanner.path_pair_id in self.__scan_target_path_pair_ids]
 
-        def scan_one(scanner: RemoteScanner) -> tuple[RemoteScanner, List[SystemFile], Optional[ScannerError]]:
+        # RemoteScanner performs setup (including scanfs check/copy) and the
+        # scan over one SSH transport.  Keep those operations serialized across
+        # path pairs: multiple first-run transports to the same destination can
+        # contend for one password prompt and leave later scans blocked for the
+        # SSH timeout.  Results and progress therefore retain input order while
+        # local scans continue to use the bounded worker pool above.
+        for scanner in scanners:
+            err: Optional[ScannerError] = None
             try:
-                return scanner, scanner.scan(), None
-            except ScannerError as err:
-                if not err.recoverable:
+                files = scanner.scan()
+            except ScannerError as scan_error:
+                if not scan_error.recoverable:
                     raise
-                return scanner, err.files or [], err
-
-        # One SSH command is issued by each RemoteScanner.  The bounded pool
-        # amortizes WAN latency across pairs while preventing unbounded in-flight
-        # work or result queues.
-        scan_results = _run_bounded_scan_tasks(scanners, scan_one, "remote-scan")
-        for scanner, files, err in scan_results:
+                err = scan_error
+                files = scan_error.files or []
             if err is not None:
                 error_message = "Failed to scan remote path for pair '{}': {}".format(
                     scanner.path_pair_name, str(err)

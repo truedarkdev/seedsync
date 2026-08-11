@@ -668,6 +668,284 @@ class TestRemoteScanner(unittest.TestCase):
         self.assertTrue(context.exception.recoverable)
         self.assertIn("Invalid scan data", str(context.exception))
 
+    def test_progressive_v2_stream_accepts_record_at_encoded_limit(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        prefix = b"SEEDSYNC_SCAN_V2\t"
+        head = b'{"type":"manifest","names":["'
+        tail = b'"]}\n'
+        name = b"a" * (RemoteScanner._MAX_V2_STREAM_RECORD_BYTES - len(prefix) - len(head) - len(tail))
+        manifest = prefix + head + name + tail
+        self.assertEqual(RemoteScanner._MAX_V2_STREAM_RECORD_BYTES, len(manifest))
+        self.mock_ssh.shell.side_effect = [b""]
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            on_chunk(manifest),
+            on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'),
+            b"",
+        )[-1])
+        scanner.set_progress_callback(lambda *args: None)
+
+        self.assertEqual([], scanner.scan())
+
+    def test_progressive_v2_stream_rejects_prefixed_unterminated_oversized_record(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        oversized = b"SEEDSYNC_SCAN_V2\t{" + b"x" * RemoteScanner._MAX_V2_STREAM_RECORD_BYTES
+        self.mock_ssh.shell.side_effect = [b""]
+        self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+            on_chunk(oversized), b"",
+        )[-1])
+        scanner.set_progress_callback(lambda *args: None)
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertIn("Invalid scan data", str(context.exception))
+
+    def test_one_shot_v2_fallback_enforces_the_same_exact_and_oversize_record_limits(self):
+        prefix = b"SEEDSYNC_SCAN_V2\t"
+        head = b'{"type":"manifest","names":["'
+        tail = b'"]}\n'
+        name = b"a" * (RemoteScanner._MAX_V2_STREAM_RECORD_BYTES - len(prefix) - len(head) - len(tail))
+        exact_stream = prefix + head + name + tail + b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        scanner.set_progress_callback(lambda *args: None)
+        self.mock_ssh.shell.return_value = exact_stream
+        self.assertEqual([], scanner.scan())
+
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+        scanner.set_progress_callback(lambda *args: None)
+        self.mock_ssh.shell.return_value = b"SEEDSYNC_SCAN_V2\t{" + b"x" * RemoteScanner._MAX_V2_STREAM_RECORD_BYTES
+
+        with self.assertRaises(ScannerError) as context:
+            scanner.scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertIn("Invalid scan data", str(context.exception))
+
+    def test_one_shot_v2_does_not_publish_complete_before_trailing_data_is_validated(self):
+        valid_stream = (
+            b'SEEDSYNC_SCAN_V2\t{"type":"manifest","names":["root"]}\n'
+            b'SEEDSYNC_SCAN_V2\t{"type":"roots","files":[{"name":"root","size":0,"is_dir":false}]}\n'
+            b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'
+        )
+        trailing_records = (
+            b"SEEDSYNC_SCAN_V2\t{not-json}\n",
+            b"SEEDSYNC_SCAN_V2\t{" + b"x" * RemoteScanner._MAX_V2_STREAM_RECORD_BYTES,
+            b"warning: " + b"x" * RemoteScanner._MAX_V2_STREAM_RECORD_BYTES,
+        )
+        for trailing_record in trailing_records:
+            with self.subTest(trailing_record=trailing_record[:32]):
+                scanner = RemoteScanner(
+                    remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+                    remote_path_to_scan="/remote/path/to/scan",
+                    local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+                    remote_path_to_scan_script="/remote/path/to/scan/script",
+                )
+                scanner.apply_recycled_state((False, "/remote/path/to/scan/script"))
+                events = []
+                scanner.set_progress_callback(
+                    lambda files, pair_id, pair_name, roots, complete: events.append((files, roots, complete))
+                )
+                self.mock_ssh.shell_stream = None
+                self.mock_ssh.shell.return_value = valid_stream + trailing_record
+
+                with self.assertRaises(ScannerError) as context:
+                    scanner.scan()
+
+                self.assertTrue(context.exception.recoverable)
+                self.assertFalse(any(complete for _, _, complete in events))
+
+    def test_progressive_v2_round_trips_large_recursive_root_as_bounded_nodes(self):
+        scanner = RemoteScanner(
+            remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan", local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        child_names = ["child-{:04d}-{}.bin".format(index, "x" * 80) for index in range(800)]
+        records = [
+            {"type": "manifest_begin", "count": 1},
+            {"type": "manifest_names", "names": ["huge"]},
+            {"type": "manifest_end"},
+            {"type": "root_begin", "id": 0, "name": "huge"},
+            {"type": "root_node", "root": 0, "id": 0, "parent": None,
+             "file": {"name": "huge", "size": 0, "is_dir": True}},
+        ]
+        records.extend(
+            {"type": "root_node", "root": 0, "id": index + 1, "parent": 0,
+             "file": {"name": name, "size": index, "is_dir": False}}
+            for index, name in enumerate(child_names)
+        )
+        records.extend((
+            {"type": "root_end", "id": 0, "nodes": 801},
+            {"type": "complete"},
+        ))
+        encoded = ["SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+                   for record in records]
+        self.assertTrue(all(len(record) <= RemoteScanner._MAX_V2_STREAM_RECORD_BYTES for record in encoded))
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk):
+            for record in encoded:
+                on_chunk(record)
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(["huge"], [file.name for file in files])
+        self.assertEqual(child_names, [child.name for child in files[0].children])
+
+    def test_progressive_v2_rejects_malformed_root_node_ordering_recoverably(self):
+        cases = (
+            ("missing", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_node", "root": 0, "id": 0, "parent": None,
+                 "file": {"name": "root", "size": 0, "is_dir": True}},
+                {"type": "complete"},
+            ]),
+            ("out_of_order", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_node", "root": 0, "id": 1, "parent": None,
+                 "file": {"name": "root", "size": 0, "is_dir": True}},
+            ]),
+            ("duplicate", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "root_begin", "id": 0, "name": "root"},
+                {"type": "root_node", "root": 0, "id": 0, "parent": None,
+                 "file": {"name": "root", "size": 0, "is_dir": True}},
+                {"type": "root_node", "root": 0, "id": 0, "parent": 0,
+                 "file": {"name": "duplicate", "size": 0, "is_dir": False}},
+            ]),
+            ("mixed_framed_legacy", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root"]},
+                {"type": "manifest_end"},
+                {"type": "roots", "files": [{"name": "root", "size": 0, "is_dir": False}]},
+            ]),
+            ("duplicate_manifest_fragment_name", [
+                {"type": "manifest_begin", "count": 1},
+                {"type": "manifest_names", "names": ["root", "root"]},
+            ]),
+            ("mixed_legacy_framed", [
+                {"type": "manifest", "names": ["root"]},
+                {"type": "root_begin", "id": 0, "name": "root"},
+            ]),
+            ("legacy_unknown_root", [
+                {"type": "manifest", "names": ["root"]},
+                {"type": "roots", "files": [{"name": "other", "size": 0, "is_dir": False}]},
+            ]),
+            ("legacy_duplicate_root", [
+                {"type": "manifest", "names": ["root"]},
+                {"type": "roots", "files": [{"name": "root", "size": 0, "is_dir": False}]},
+                {"type": "roots", "files": [{"name": "root", "size": 0, "is_dir": False}]},
+            ]),
+            ("duplicate_complete", [
+                {"type": "manifest", "names": []},
+                {"type": "complete"},
+                {"type": "complete"},
+            ]),
+        )
+        for name, records in cases:
+            with self.subTest(name=name):
+                scanner = RemoteScanner(
+                    remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+                    remote_path_to_scan="/remote/path/to/scan",
+                    local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+                    remote_path_to_scan_script="/remote/path/to/scan/script",
+                )
+                payload = b"".join(
+                    "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps(record, separators=(",", ":"))).encode()
+                    for record in records
+                )
+                self.mock_ssh.shell.side_effect = [b""]
+                self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+                    on_chunk(payload), b""
+                )[-1])
+                scanner.set_progress_callback(lambda *args: None)
+
+                with self.assertRaises(ScannerError) as context:
+                    scanner.scan()
+
+                self.assertTrue(context.exception.recoverable)
+                self.assertIn("Invalid scan data", str(context.exception))
+
+    def test_progressive_v2_stream_accepts_many_bounded_records(self):
+        scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/remote/path/to/scan",
+            local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+            remote_path_to_scan_script="/remote/path/to/scan/script",
+        )
+        roots = [
+            {"name": "root-{}".format(index), "size": index, "is_dir": False}
+            for index in range(256)
+        ]
+        records = [
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps({
+                "type": "manifest", "names": [root["name"] for root in roots],
+            })).encode(),
+        ]
+        records.extend(
+            "SEEDSYNC_SCAN_V2\t{}\n".format(json.dumps({"type": "roots", "files": [root]})).encode()
+            for root in roots
+        )
+        records.append(b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n')
+        self.mock_ssh.shell.side_effect = [b""]
+
+        def shell_stream(command, on_chunk):
+            for record in records:
+                self.assertLessEqual(len(record), RemoteScanner._MAX_V2_STREAM_RECORD_BYTES)
+                on_chunk(record)
+            return b""
+
+        self.mock_ssh.shell_stream = MagicMock(side_effect=shell_stream)
+        scanner.set_progress_callback(lambda *args: None)
+
+        files = scanner.scan()
+
+        self.assertEqual(256, len(files))
+        self.assertEqual("root-255", files[-1].name)
+
     def test_progressive_transport_rejects_malformed_legacy_json_from_empty_return(self):
         scanner = RemoteScanner(
             remote_address="host",
@@ -781,6 +1059,39 @@ class TestRemoteScanner(unittest.TestCase):
         files = scanner.scan()
 
         self.assertEqual(["caf\u00e9.bin"], [file.name for file in files])
+
+    def test_progressive_v2_utf8_split_counts_pending_bytes_at_the_record_limit(self):
+        prefix = b"SEEDSYNC_SCAN_V2\t"
+        head = b'{"type":"manifest","names":["'
+        tail = b'"]}\n'
+        ascii_name_size = RemoteScanner._MAX_V2_STREAM_RECORD_BYTES - len(prefix) - len(head) - len(tail) - 2
+
+        def scan_manifest(ascii_name: bytes):
+            scanner = RemoteScanner(
+                remote_address="host", remote_username="user", remote_password="password", remote_port=22,
+                remote_path_to_scan="/remote/path/to/scan",
+                local_path_to_scan_script=TestRemoteScanner.temp_scan_script,
+                remote_path_to_scan_script="/remote/path/to/scan/script",
+            )
+            first_chunk = prefix + head + ascii_name + b"\xc3"
+            second_chunk = b"\xa9" + tail
+            self.mock_ssh.shell.side_effect = [b""]
+            self.mock_ssh.shell_stream = MagicMock(side_effect=lambda command, on_chunk: (
+                on_chunk(first_chunk),
+                on_chunk(second_chunk),
+                on_chunk(b'SEEDSYNC_SCAN_V2\t{"type":"complete"}\n'),
+                b"",
+            )[-1])
+            scanner.set_progress_callback(lambda *args: None)
+            return scanner
+
+        self.assertEqual([], scan_manifest(b"a" * ascii_name_size).scan())
+
+        with self.assertRaises(ScannerError) as context:
+            scan_manifest(b"a" * (ascii_name_size + 1)).scan()
+
+        self.assertTrue(context.exception.recoverable)
+        self.assertIn("Invalid scan data", str(context.exception))
 
     def test_stream_complete_is_provisional_until_successful_transport_exit(self):
         scanner = RemoteScanner(

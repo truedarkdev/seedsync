@@ -10,7 +10,13 @@ import os
 import re
 import sys
 from datetime import datetime
-from typing import List, Optional, Protocol, TypedDict
+from typing import List, Optional, Protocol, Tuple, TypedDict
+
+
+_STREAM_PREFIX = "SEEDSYNC_SCAN_V2\t"
+# This is a wire limit, not a root-size limit.  Recursive roots are emitted as
+# ordered node records below, so a large tree never becomes one buffered line.
+_MAX_STREAM_RECORD_BYTES = 64 * 1024
 
 
 class SystemFileDataRequired(TypedDict):
@@ -22,9 +28,11 @@ class SystemFileDataRequired(TypedDict):
 class SystemFileData(SystemFileDataRequired, total=False):
     time_created: Optional[str]
     time_modified: Optional[str]
+    mtime_ns: int
     path_pair_id: Optional[str]
     path_pair_name: Optional[str]
     is_staging: bool
+    has_staging_collision: bool
     children: List["SystemFileData"]
 
 
@@ -50,7 +58,8 @@ class SystemFile:
                  is_dir: bool = False,
                  time_created: Optional[datetime] = None,
                  time_modified: Optional[datetime] = None,
-                 is_staging: bool = False):
+                 is_staging: bool = False,
+                 mtime_ns: Optional[int] = None):
         if size < 0:
             raise ValueError("File size must be zero or greater")
         self.__name = name
@@ -58,10 +67,12 @@ class SystemFile:
         self.__is_dir = is_dir
         self.__timestamp_created = time_created
         self.__timestamp_modified = time_modified
+        self.__mtime_ns = mtime_ns
         self.__children: List[SystemFile] = []
         self.__path_pair_id: Optional[str] = None
         self.__path_pair_name: Optional[str] = None
         self.__is_staging = is_staging
+        self.__has_staging_collision = False
         self.__status_sidecar_ready = False
 
     def __eq__(self, other: object) -> bool:
@@ -91,6 +102,10 @@ class SystemFile:
     @property
     def timestamp_modified(self) -> Optional[datetime]:
         return self.__timestamp_modified
+
+    @property
+    def mtime_ns(self) -> Optional[int]:
+        return self.__mtime_ns
 
     @property
     def children(self) -> List["SystemFile"]:
@@ -127,6 +142,16 @@ class SystemFile:
         self.__is_staging = is_staging
 
     @property
+    def has_staging_collision(self) -> bool:
+        return self.__has_staging_collision
+
+    @has_staging_collision.setter
+    def has_staging_collision(self, value: bool):
+        if type(value) != bool:
+            raise TypeError
+        self.__has_staging_collision = value
+
+    @property
     def status_sidecar_ready(self) -> bool:
         return self.__status_sidecar_ready
 
@@ -151,12 +176,16 @@ class SystemFile:
             d["time_created"] = self.__timestamp_created.isoformat()
         if self.__timestamp_modified is not None:
             d["time_modified"] = self.__timestamp_modified.isoformat()
+        if self.__mtime_ns is not None:
+            d["mtime_ns"] = self.__mtime_ns
         if self.__path_pair_id is not None:
             d["path_pair_id"] = self.__path_pair_id
         if self.__path_pair_name is not None:
             d["path_pair_name"] = self.__path_pair_name
         if self.__is_staging:
             d["is_staging"] = True
+        if self.__has_staging_collision:
+            d["has_staging_collision"] = True
         if self.__children:
             d["children"] = [child.to_dict() for child in self.__children]
         return d
@@ -175,10 +204,12 @@ class SystemFile:
             is_dir=data.get("is_dir", False),
             time_created=time_created,
             time_modified=time_modified,
+            mtime_ns=data.get("mtime_ns"),
             is_staging=data.get("is_staging", False),
         )
         system_file.path_pair_id = data.get("path_pair_id")
         system_file.path_pair_name = data.get("path_pair_name")
+        system_file.has_staging_collision = data.get("has_staging_collision", False)
         for child_data in data.get("children", []):
             system_file.add_child(cls.from_dict(child_data))
         return system_file
@@ -334,6 +365,22 @@ class SystemScanner:
         except (AttributeError, OSError, OverflowError, TypeError, ValueError):
             return None
 
+    @staticmethod
+    def __get_mtime_ns(stat_result: os.stat_result) -> Optional[int]:
+        try:
+            mtime_ns = getattr(stat_result, "st_mtime_ns")
+            if type(mtime_ns) is int:
+                return mtime_ns
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+        try:
+            mtime = stat_result.st_mtime
+            if isinstance(mtime, (int, float)):
+                return int(mtime * 1_000_000_000)
+        except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+            pass
+        return None
+
     def __create_system_file(self, entry: ScanEntry) -> SystemFile:
         """
         Creates a system file from a DirEntry.
@@ -345,11 +392,13 @@ class SystemScanner:
             size = sum(sub_child.size for sub_child in sub_children)
             time_created = SystemScanner.__get_created_time(entry_stat)
             time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
+            mtime_ns = SystemScanner.__get_mtime_ns(entry_stat)
             sys_file = SystemFile(name,
                                   size,
                                   True,
                                   time_created=time_created,
-                                  time_modified=time_modified)
+                                  time_modified=time_modified,
+                                  mtime_ns=mtime_ns)
             for sub_child in sub_children:
                 sys_file.add_child(sub_child)
         else:
@@ -375,11 +424,13 @@ class SystemScanner:
                 file_name = file_name[:-len(self.__lftp_temp_file_suffix)]
             time_created = SystemScanner.__get_created_time(entry_stat)
             time_modified = datetime.fromtimestamp(entry_stat.st_mtime)
+            mtime_ns = SystemScanner.__get_mtime_ns(entry_stat)
             sys_file = SystemFile(file_name,
                                   file_size,
                                   False,
                                   time_created=time_created,
-                                  time_modified=time_modified)
+                                  time_modified=time_modified,
+                                  mtime_ns=mtime_ns)
             sys_file.status_sidecar_ready = status_sidecar_ready
         return sys_file
 
@@ -459,6 +510,90 @@ class SystemScanner:
         return total_size - empty_size
 
 
+def _stream_shallow_file_data(file: SystemFile) -> SystemFileData:
+    """Serialize one node without recursively materializing its descendants."""
+    data: SystemFileData = {
+        "name": file.name,
+        "size": file.size,
+        "is_dir": file.is_dir,
+    }
+    if file.timestamp_created is not None:
+        data["time_created"] = file.timestamp_created.isoformat()
+    if file.timestamp_modified is not None:
+        data["time_modified"] = file.timestamp_modified.isoformat()
+    if file.mtime_ns is not None:
+        data["mtime_ns"] = file.mtime_ns
+    if file.path_pair_id is not None:
+        data["path_pair_id"] = file.path_pair_id
+    if file.path_pair_name is not None:
+        data["path_pair_name"] = file.path_pair_name
+    if file.is_staging:
+        data["is_staging"] = True
+    if file.has_staging_collision:
+        data["has_staging_collision"] = True
+    return data
+
+
+def _encode_stream_record(record: dict) -> str:
+    line = _STREAM_PREFIX + json.dumps(record, separators=(",", ":")) + "\n"
+    if len(line.encode("utf-8")) > _MAX_STREAM_RECORD_BYTES:
+        raise SystemScannerError("Scan stream record exceeded {} bytes".format(_MAX_STREAM_RECORD_BYTES))
+    return line
+
+
+def _write_stream_record(record: dict) -> None:
+    sys.stdout.write(_encode_stream_record(record))
+    sys.stdout.flush()
+
+
+def _write_stream_manifest(root_names: List[str]) -> None:
+    """Emit a bounded manifest before progressive root records."""
+    _write_stream_record({"type": "manifest_begin", "count": len(root_names)})
+    batch: List[str] = []
+    for name in root_names:
+        candidate = batch + [name]
+        try:
+            _encode_stream_record({"type": "manifest_names", "names": candidate})
+        except SystemScannerError:
+            if not batch:
+                raise
+            _write_stream_record({"type": "manifest_names", "names": batch})
+            batch = [name]
+            _encode_stream_record({"type": "manifest_names", "names": batch})
+        else:
+            batch = candidate
+    if batch:
+        _write_stream_record({"type": "manifest_names", "names": batch})
+    _write_stream_record({"type": "manifest_end"})
+
+
+def _write_stream_root(root_id: int, root: SystemFile) -> None:
+    """Emit a recursive root as ordered, bounded node records.
+
+    Parent ids point only into the current root's active preorder stack.  The
+    receiver can therefore build the final tree without retaining JSON
+    fragments or a node-id map for the whole root.
+    """
+    _write_stream_record({"type": "root_begin", "id": root_id, "name": root.name})
+    next_node_id = 0
+
+    pending_nodes: List[Tuple[SystemFile, Optional[int]]] = [(root, None)]
+    while pending_nodes:
+        node, parent_id = pending_nodes.pop()
+        node_id = next_node_id
+        next_node_id += 1
+        _write_stream_record({
+            "type": "root_node",
+            "root": root_id,
+            "id": node_id,
+            "parent": parent_id,
+            "file": _stream_shallow_file_data(node),
+        })
+        pending_nodes.extend((child, node_id) for child in reversed(node.children))
+
+    _write_stream_record({"type": "root_end", "id": root_id, "nodes": next_node_id})
+
+
 if __name__ == "__main__":
     if sys.hexversion < 0x03080000:
         sys.exit("Python 3.8 or later is required to run this program.")
@@ -470,9 +605,9 @@ if __name__ == "__main__":
     parser.add_argument("-H", "--human-readable", action="store_true", default=False,
                         help="Human readable output")
     parser.add_argument("--stream", action="store_true", default=False,
-                        help="Emit batched SeedSync scan protocol records")
+                        help="Emit bounded SeedSync scan protocol records")
     parser.add_argument("--stream-batch-size", type=int, default=8,
-                        help="Maximum top-level roots per streamed record")
+                        help="Deprecated compatibility option")
     args = parser.parse_args()
 
     scanner = SystemScanner(args.path)
@@ -483,28 +618,19 @@ if __name__ == "__main__":
             if args.stream_batch_size < 1 or args.stream_batch_size > 64:
                 parser.error("--stream-batch-size must be between 1 and 64")
             root_names = scanner.root_names()
-            prefix = "SEEDSYNC_SCAN_V2\t"
-            sys.stdout.write(prefix + json.dumps({"type": "manifest", "names": root_names}) + "\n")
-            sys.stdout.flush()
-            batch: List[SystemFileData] = []
+            _write_stream_manifest(root_names)
+            emitted_root_id = 0
             for root_name in root_names:
                 root_file = scanner.scan_single_if_present(root_name)
                 if root_file is None:
                     continue
-                batch.append(root_file.to_dict())
-                if len(batch) >= args.stream_batch_size:
-                    sys.stdout.write(prefix + json.dumps({"type": "roots", "files": batch}) + "\n")
-                    sys.stdout.flush()
-                    batch = []
-            if batch:
-                sys.stdout.write(prefix + json.dumps({"type": "roots", "files": batch}) + "\n")
-                sys.stdout.flush()
+                _write_stream_root(emitted_root_id, root_file)
+                emitted_root_id += 1
             if scanner.scan_had_errors:
                 raise SystemScannerError(
                     "Permission denied while scanning: {}".format(args.path)
                 )
-            sys.stdout.write(prefix + json.dumps({"type": "complete"}) + "\n")
-            sys.stdout.flush()
+            _write_stream_record({"type": "complete"})
             root_files = []
         else:
             root_files = scanner.scan()

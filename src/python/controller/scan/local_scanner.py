@@ -252,22 +252,18 @@ class LocalScanner(IScanner):
             system_file.is_dir,
             time_created=system_file.timestamp_created,
             time_modified=system_file.timestamp_modified,
+            mtime_ns=system_file.mtime_ns,
             is_staging=system_file.is_staging
         )
         cloned.path_pair_id = system_file.path_pair_id
         cloned.path_pair_name = system_file.path_pair_name
         cloned.status_sidecar_ready = system_file.status_sidecar_ready
+        cloned.has_staging_collision = system_file.has_staging_collision
         for child in children if children is not None else system_file.iter_children():
             cloned.add_child(child)
         return cloned
 
     @staticmethod
-    def __should_prefer_existing_local_file(existing_file: SystemFile, staging_file: SystemFile) -> bool:
-        return not existing_file.is_staging and \
-            not existing_file.is_dir and \
-            not staging_file.is_dir and \
-            existing_file.size >= staging_file.size
-
     @staticmethod
     def __build_merged_directory(existing_file: SystemFile, staging_file: SystemFile) -> SystemFile:
         merged_children: List[SystemFile] = []
@@ -296,6 +292,7 @@ class LocalScanner(IScanner):
             True,
             time_created=existing_file.timestamp_created,
             time_modified=existing_file.timestamp_modified,
+            mtime_ns=existing_file.mtime_ns,
             is_staging=False
         )
         merged_file.path_pair_id = existing_file.path_pair_id
@@ -309,7 +306,18 @@ class LocalScanner(IScanner):
         if existing_file.is_dir and staging_file.is_dir:
             return LocalScanner.__build_merged_directory(existing_file, staging_file)
         if existing_file.is_dir != staging_file.is_dir:
-            return existing_file
-        if LocalScanner.__should_prefer_existing_local_file(existing_file, staging_file):
-            return existing_file
-        return staging_file
+            # Keep the final-root shape, but record that an incompatible
+            # staging residue still exists.  Treating this as an ordinary
+            # final leaf would otherwise permit trusted exclusion/progress
+            # even though publication must retain a type collision.
+            merged_file = LocalScanner.__clone_system_file(existing_file)
+            merged_file.has_staging_collision = True
+            return merged_file
+        # The final root is authoritative by location.  A split-root recovery
+        # can contain a completed final leaf beside an older or sparse staging
+        # leaf with the same relative identity; selecting by apparent size
+        # would let preallocation or a stale sidecar replace final content in
+        # the model.  Keep the final leaf regardless of its byte count.
+        merged_file = LocalScanner.__clone_system_file(existing_file)
+        merged_file.has_staging_collision = True
+        return merged_file

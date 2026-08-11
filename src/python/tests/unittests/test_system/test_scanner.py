@@ -92,6 +92,7 @@ class TestSystemScanner(unittest.TestCase):
         self.assertTrue(b.is_dir)
         self.assertEqual("c", c.name)
         self.assertFalse(c.is_dir)
+        self.assertEqual(os.stat(os.path.join(TestSystemScanner.temp_dir, "c")).st_mtime_ns, c.mtime_ns)
 
         self.assertEqual(2, len(a.children))
         aa, ab = tuple(a.children)

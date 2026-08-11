@@ -15,6 +15,8 @@ from controller.model_updater import (
     _ProgressiveScanAccumulator,
     _JointProgressiveReconciler,
     _filter_progressive_remote_state,
+    _lifecycle_scanned_path_pair_ids,
+    _merge_targeted_legacy_scan_files,
     _remote_reconciliation_established,
     _pop_scan_updates,
 )
@@ -191,6 +193,67 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual({("pair", "recovered.bin")}, set(accumulator.snapshot()))
         self.assertEqual(set(), accumulator.incomplete_pairs())
 
+    def test_progressive_accumulator_commits_healthy_pair_when_another_pair_recovers_with_failure(self):
+        accumulator = _ProgressiveScanAccumulator()
+        healthy = SystemFile("healthy", 1)
+        healthy.path_pair_id = "pair-a"
+
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [healthy], scanned_path_pair_ids={"pair-a"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair-a"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"}),
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+                          is_progress=True, failed=True, unknown_path_pair_ids={"pair-b"}),
+        ])
+
+        self.assertIsNotNone(result)
+        self.assertFalse(result.failed)
+        self.assertEqual({"pair-a"}, accumulator.completed_pairs())
+        self.assertEqual({"pair-b"}, accumulator.incomplete_pairs())
+        self.assertEqual({("pair-a", "healthy")}, set(accumulator.snapshot()))
+
+    def test_progressive_accumulator_keeps_lower_generation_full_snapshot_for_untouched_pair(self):
+        accumulator = _ProgressiveScanAccumulator()
+        pair_b = SystemFile("pair-b-root", 1)
+        pair_b.path_pair_id = "pair-b"
+        pair_a = SystemFile("pair-a-root", 2)
+        pair_a.path_pair_id = "pair-a"
+
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [pair_b], scanned_path_pair_ids={"pair-b"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair-b"},
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-b"}),
+            ScannerResult(datetime.now(), [pair_a], scanned_path_pair_ids={"pair-a"}, generation=2,
+                          is_progress=True),
+        ])
+
+        self.assertIsNotNone(result)
+        self.assertEqual({"pair-b"}, accumulator.completed_pairs())
+        self.assertEqual({"pair-a"}, accumulator.incomplete_pairs())
+        self.assertEqual({("pair-a", "pair-a-root"), ("pair-b", "pair-b-root")},
+                         set(accumulator.snapshot()))
+
+    def test_progressive_accumulator_normalizes_legacy_snapshot_in_mixed_targeted_drain(self):
+        accumulator = _ProgressiveScanAccumulator()
+        legacy_pair_b = SystemFile("legacy-pair-b", 1)
+        legacy_pair_b.path_pair_id = "pair-b"
+        targeted_pair_a = SystemFile("targeted-pair-a", 2)
+        targeted_pair_a.path_pair_id = "pair-a"
+
+        result = accumulator.apply([
+            ScannerResult(datetime.now(), [legacy_pair_b], scanned_path_pair_ids={"pair-b"}, generation=1),
+            ScannerResult(datetime.now(), [targeted_pair_a], scanned_path_pair_ids={"pair-a"}, generation=2,
+                          is_progress=True, is_targeted_scan=True),
+        ])
+
+        self.assertIsNotNone(result)
+        self.assertEqual({"pair-b"}, accumulator.completed_pairs())
+        self.assertEqual({"pair-a"}, accumulator.incomplete_pairs())
+        self.assertEqual(
+            {("pair-a", "targeted-pair-a"), ("pair-b", "legacy-pair-b")},
+            set(accumulator.snapshot()),
+        )
+
     def test_joint_reconciler_keeps_last_good_remote_root_unknown_during_setup_outage(self):
         remote = _ProgressiveScanAccumulator()
         local = _ProgressiveScanAccumulator()
@@ -260,6 +323,9 @@ class TestModelUpdater(unittest.TestCase):
                           is_progress=True, session_token="remote"),
             ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
                           is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote"),
+            ScannerResult(datetime.now(), [remote_root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
         ])
         self.assertFalse(local_partial.is_scan_final)
         self.assertTrue(remote_final.is_scan_final)
@@ -280,6 +346,9 @@ class TestModelUpdater(unittest.TestCase):
                           is_progress=True, session_token="local"),
             ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=1,
                           is_progress=True, completed_path_pair_ids={"pair"}, session_token="local"),
+            ScannerResult(datetime.now(), [local_root], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="local",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
         ])
         self.assertTrue(local_final.is_scan_final)
         local_files, remote_files, unknown = reconciler.reconcile(
@@ -292,6 +361,96 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual(["late.bin"], [file.name for file in local_files])
         self.assertEqual(["late.bin"], [file.name for file in remote_files])
         self.assertNotIn("pair", unknown)
+
+    def test_lossy_progress_completion_never_proves_marker_backed_local_absence_before_full_snapshot(self):
+        """A bounded queue may retain completion before its authoritative aggregate."""
+        local = _ProgressiveScanAccumulator()
+        remote = _ProgressiveScanAccumulator()
+        reconciler = _JointProgressiveReconciler()
+        marker_id = ModelFile.build_file_id("movie.mkv", "pair")
+
+        def root(name, size):
+            system_file = SystemFile(name, size)
+            system_file.path_pair_id = "pair"
+            return system_file
+
+        local_movie = root("movie.mkv", 100)
+        remote_movie = root("movie.mkv", 100)
+        local.apply([
+            ScannerResult(datetime.now(), [local_movie], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="local",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+        remote.apply([
+            ScannerResult(datetime.now(), [remote_movie], scanned_path_pair_ids={"pair"}, generation=1,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="remote",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+
+        def current_movie_state():
+            local_files, remote_files, unknown_pairs = reconciler.reconcile(
+                local.snapshot(), local.authority(), local.incomplete_pairs(), local.completed_pairs(),
+                remote.snapshot(), remote.authority(), remote.incomplete_pairs(), remote.completed_pairs(),
+                {"pair"},
+            )
+            builder = ModelBuilder()
+            builder.set_local_files(local_files)
+            builder.set_remote_files(remote_files)
+            builder.set_downloaded_files({marker_id})
+            builder.set_unknown_local_path_pair_ids(unknown_pairs)
+            return builder.build_model().get_file(marker_id).state, unknown_pairs
+
+        state, unknown_pairs = current_movie_state()
+        self.assertNotEqual(ModelFile.State.DELETED, state)
+        self.assertEqual(set(), unknown_pairs)
+
+        # This mimics a slow parent drain: 129 root batches mean the bounded
+        # 128-event progress queue can evict arbitrary earlier batches, while
+        # the completion marker still precedes the lossless aggregate.
+        manifest = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+            is_progress=True, root_names={"root-{}".format(index) for index in range(129)},
+            session_token="local",
+        )
+        local.apply([manifest])
+        state, unknown_pairs = current_movie_state()
+        self.assertNotEqual(ModelFile.State.DELETED, state)
+        self.assertIn("pair", unknown_pairs)
+
+        for index in range(129):
+            local.apply([
+                ScannerResult(datetime.now(), [root("root-{}".format(index), index)],
+                              scanned_path_pair_ids={"pair"}, generation=2,
+                              is_progress=True, session_token="local"),
+            ])
+            state, unknown_pairs = current_movie_state()
+            self.assertNotEqual(ModelFile.State.DELETED, state)
+            self.assertIn("pair", unknown_pairs)
+
+        completion = local.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="local"),
+        ])
+        self.assertIsNotNone(completion)
+        self.assertFalse(completion.is_scan_final)
+        self.assertNotIn("pair", local.completed_pairs())
+        state, unknown_pairs = current_movie_state()
+        self.assertNotEqual(ModelFile.State.DELETED, state)
+        self.assertIn("pair", unknown_pairs)
+
+        # Only this lossless aggregate is allowed to establish the local
+        # absence, after which the canonical downloaded marker may be Deleted.
+        final = local.apply([
+            ScannerResult(datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=2,
+                          is_progress=True, completed_path_pair_ids={"pair"}, session_token="local",
+                          is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"}),
+        ])
+        self.assertIsNotNone(final)
+        self.assertTrue(final.is_scan_final)
+        self.assertEqual({"pair"}, local.completed_pairs())
+        state, unknown_pairs = current_movie_state()
+        self.assertEqual(ModelFile.State.DELETED, state)
+        self.assertEqual(set(), unknown_pairs)
 
     def test_progressive_accumulator_keeps_unknown_pair_across_empty_drain(self):
         accumulator = _ProgressiveScanAccumulator()
@@ -457,6 +616,36 @@ class TestModelUpdater(unittest.TestCase):
         ])
         self.assertIsNone(result)
         self.assertEqual({(None, "current")}, set(accumulator.snapshot()))
+
+    def test_targeted_legacy_scan_keeps_unselected_model_roots_and_scopes_lifecycle(self):
+        controller = SimpleNamespace()
+        root_a = SystemFile("root-a", 1)
+        root_a.path_pair_id = "pair-a"
+        root_b = SystemFile("root-b", 2)
+        root_b.path_pair_id = "pair-b"
+        replacement_a = SystemFile("root-a-new", 3)
+        replacement_a.path_pair_id = "pair-a"
+        full_result = ScannerResult(
+            datetime.now(), [root_a, root_b], scanned_path_pair_ids={"pair-a", "pair-b"},
+        )
+        targeted_result = ScannerResult(
+            datetime.now(), [replacement_a], scanned_path_pair_ids={"pair-a"},
+            is_targeted_scan=True,
+        )
+
+        initial = _merge_targeted_legacy_scan_files(controller, "remote", full_result, full_result.files)
+        merged = _merge_targeted_legacy_scan_files(
+            controller, "remote", targeted_result, targeted_result.files,
+        )
+        builder = ModelBuilder()
+        builder.set_remote_files(initial)
+        builder.set_remote_files(merged)
+
+        self.assertEqual({"root-a-new", "root-b"}, builder.build_model().get_file_names())
+        self.assertEqual(
+            {"pair-a"},
+            _lifecycle_scanned_path_pair_ids(targeted_result, {"pair-a", "pair-b"}),
+        )
 
     def test_unknown_local_scan_does_not_create_false_deleted_state(self):
         builder = ModelBuilder()

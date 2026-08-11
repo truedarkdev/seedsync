@@ -5,4 +5,4 @@ from .active_scanner import ActiveScanner as ActiveScanner
 from .multi_path_active_scanner import MultiPathActiveScanner as MultiPathActiveScanner
 from .local_scanner import LocalScanner as LocalScanner
 from .multi_path_scanner import MultiPathLocalScanner as MultiPathLocalScanner, MultiPathRemoteScanner as MultiPathRemoteScanner
-from .remote_scanner import RemoteScanner as RemoteScanner
+from .remote_scanner import RemoteScanLease as RemoteScanLease, RemoteScanner as RemoteScanner

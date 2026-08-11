@@ -18,7 +18,8 @@ from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller import IScanner, ScannerProcess, ScannerError
 from controller.scan import MultiPathRemoteScanner
 from controller.scan.scanner_process import (
-    ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _run_scanner_once,
+    ScannerResult, _ScannerQueueReleaseMarker, _create_scanner_worker, _publish_bounded_result,
+    _run_scanner_once,
 )
 from controller.extract import ExtractProcess
 from system import SystemFile
@@ -131,6 +132,12 @@ class RecoverablePartialScanner(DummyScanner):
 
 
 class RecoverableSelectedPairScanner(DummyScanner):
+    def __init__(self):
+        self.callback = None
+
+    def set_progress_callback(self, callback):
+        self.callback = callback
+
     def scanned_path_pair_ids(self):
         return {"pair-a", "pair-b"}
 
@@ -138,6 +145,9 @@ class RecoverableSelectedPairScanner(DummyScanner):
         return {"pair-b"}
 
     def scan(self):
+        assert self.callback is not None
+        self.callback([SystemFile("healthy", 1)], "pair-a", "Pair A", None, False)
+        self.callback([], "pair-a", "Pair A", None, True)
         raise ScannerError("one pair failed", recoverable=True)
 
 
@@ -563,12 +573,128 @@ class TestScannerProcess(unittest.TestCase):
         results = process.pop_results()
         final_results = [result for result in results if result.is_full_snapshot]
 
-        self.assertEqual(1, len(final_results))
+        self.assertEqual(2, len(final_results))
         final = final_results[0]
         self.assertTrue(final.is_scan_final)
         self.assertEqual({"pair"}, final.full_snapshot_path_pair_ids)
         self.assertEqual({"root-{}".format(index) for index in range(512)},
                          {file.name for file in final.files})
+        completion_index = next(
+            index for index, result in enumerate(results)
+            if result.completed_path_pair_ids == {"pair"} and not result.is_full_snapshot
+        )
+        self.assertLess(completion_index, results.index(final))
+
+    def test_bounded_queue_preserves_pair_completion_markers_before_full_snapshot(self):
+        bounded_queue = queue.Queue(maxsize=3)
+
+        def ordinary(name):
+            return ScannerResult(
+                datetime.now(), [SystemFile(name, 1)], scanned_path_pair_ids={"pair"},
+                is_progress=True, is_scan_final=False,
+            )
+
+        def completion(pair_id):
+            return ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={pair_id},
+                is_progress=True, completed_path_pair_ids={pair_id}, is_scan_final=False,
+            )
+
+        for index in range(3):
+            _publish_bounded_result(bounded_queue, ordinary("root-{}".format(index)))
+        _publish_bounded_result(bounded_queue, completion("pair-a"))
+        _publish_bounded_result(bounded_queue, completion("pair-b"))
+        _publish_bounded_result(bounded_queue, ordinary("discarded-root"))
+
+        retained = list(bounded_queue.queue)
+        self.assertEqual(
+            {"pair-a", "pair-b"},
+            set().union(*(result.completed_path_pair_ids for result in retained)),
+        )
+        self.assertEqual(1, len([result for result in retained if result.files]))
+
+        full_snapshot = ScannerResult(
+            datetime.now(), [SystemFile("authoritative", 10)], scanned_path_pair_ids={"pair"},
+            is_progress=True, completed_path_pair_ids={"pair"},
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+        _publish_bounded_result(bounded_queue, full_snapshot)
+        _publish_bounded_result(bounded_queue, ordinary("still-discarded"))
+
+        retained = list(bounded_queue.queue)
+        self.assertIn(full_snapshot, retained)
+        self.assertEqual(
+            {"pair-a", "pair-b"},
+            set().union(*(
+                result.completed_path_pair_ids
+                for result in retained if not result.is_full_snapshot
+            )),
+        )
+
+        protected_only_queue = queue.Queue(maxsize=2)
+        _publish_bounded_result(protected_only_queue, completion("pair-a"))
+        _publish_bounded_result(protected_only_queue, completion("pair-b"))
+        _publish_bounded_result(protected_only_queue, full_snapshot)
+
+        retained = list(protected_only_queue.queue)
+        self.assertIn(full_snapshot, retained)
+        self.assertEqual(2, len(retained))
+
+    def test_bounded_queue_retries_authoritative_publish_after_concurrent_drain(self):
+        class FullThenDrainedQueue:
+            def __init__(self):
+                self.put_attempts = 0
+                self.published = []
+
+            def put_nowait(self, item):
+                self.put_attempts += 1
+                if self.put_attempts == 1:
+                    raise queue.Full
+                self.published.append(item)
+
+            @staticmethod
+            def get_nowait():
+                # Simulate another consumer emptying the queue after the
+                # producer observed Full but before it could inspect entries.
+                raise queue.Empty
+
+        output_queue = FullThenDrainedQueue()
+        final = ScannerResult(
+            datetime.now(), [SystemFile("authoritative", 10)], scanned_path_pair_ids={"pair"},
+            is_progress=True, completed_path_pair_ids={"pair"},
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+
+        _publish_bounded_result(output_queue, final)
+
+        self.assertEqual(2, output_queue.put_attempts)
+        self.assertEqual([final], output_queue.published)
+
+    def test_bounded_queue_keeps_unrelated_failure_through_repeated_targeted_full_snapshots(self):
+        bounded_queue = queue.Queue(maxsize=128)
+        failed_pair = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair-b"}, generation=1,
+            failed=True, unknown_path_pair_ids={"pair-b"}, is_progress=True,
+            is_targeted_scan=True,
+        )
+        _publish_bounded_result(bounded_queue, failed_pair)
+
+        for generation in range(1, 131):
+            targeted_final = ScannerResult(
+                datetime.now(), [SystemFile("pair-a-{}".format(generation), generation)],
+                scanned_path_pair_ids={"pair-a"}, generation=generation,
+                is_progress=True, completed_path_pair_ids={"pair-a"},
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+                is_targeted_scan=True,
+            )
+            _publish_bounded_result(bounded_queue, targeted_final)
+
+        retained = list(bounded_queue.queue)
+        self.assertIn(failed_pair, retained)
+        self.assertTrue(any(
+            result.full_snapshot_path_pair_ids == {"pair-a"} and result.generation == 130
+            for result in retained
+        ))
 
     def test_thread_coordinator_starts_stops_and_surfaces_inline_fatal_error(self):
         process = ScannerProcess(scanner=FatalScanner(), interval_in_ms=0, verbose=False)
@@ -782,6 +908,27 @@ class TestScannerProcess(unittest.TestCase):
         self.assertTrue(result.failed)
         self.assertEqual({"pair-b"}, result.scanned_path_pair_ids)
         self.assertEqual({"pair-b"}, result.unknown_path_pair_ids)
+
+    def test_recoverable_multi_pair_scan_publishes_lossless_snapshot_for_completed_pair(self):
+        process = ScannerProcess(
+            scanner=RecoverableSelectedPairScanner(),
+            interval_in_ms=100,
+            verbose=False,
+        )
+        self.addCleanup(process.close_queues)
+
+        process.run_loop()
+        results = process.pop_results()
+
+        healthy = [
+            result for result in results
+            if result.is_full_snapshot and result.full_snapshot_path_pair_ids == {"pair-a"}
+        ]
+        self.assertEqual(1, len(healthy))
+        self.assertEqual(["healthy"], [file.name for file in healthy[0].files])
+        failed = results[-1]
+        self.assertTrue(failed.failed)
+        self.assertEqual({"pair-b"}, failed.unknown_path_pair_ids)
 
     def test_propagates_malformed_status_only_file_ids_with_scan_result(self):
         mock_scanner = DummyScanner()

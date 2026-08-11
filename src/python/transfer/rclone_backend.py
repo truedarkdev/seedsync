@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from typing import Deque, Dict, Iterable, List, Optional, Protocol
 
 from common import AppError, Constants
-from common.exclude_patterns import parse_exclude_patterns
+from common.exclude_patterns import ExactPathExclusion, partition_transfer_exclusions
 from common.redaction import redact_sensitive_text
 from lftp import LftpJobStatus
 
@@ -54,6 +54,7 @@ class _RcloneJob:
     path_pair_id: Optional[str]
     path_pair_name: Optional[str]
     exclude_patterns: Iterable[str]
+    exact_exclude_paths: Iterable[ExactPathExclusion]
     process: Optional[subprocess.Popen[str]] = None
     cancel_requested: bool = False
     sample: _TransferSample = field(default_factory=_TransferSample)
@@ -227,7 +228,7 @@ class RcloneTransferBackend:
         is_dir: bool,
         remote_base_dir_path: Optional[str] = None,
         local_base_dir_path: Optional[str] = None,
-        exclude_patterns: str | Iterable[str] | None = None,
+        exclude_patterns: str | Iterable[str | ExactPathExclusion] | None = None,
     ):
         with self.__lock:
             remote_base = remote_base_dir_path if remote_base_dir_path is not None else self.__base_remote_dir_path
@@ -236,6 +237,7 @@ class RcloneTransferBackend:
             destination_path = os.path.join(local_base, destination_name)
             final_destination_path = os.path.join(local_base, name)
             path_pair_id, path_pair_name = self.__resolve_path_pair(remote_base, local_base)
+            user_exclude_patterns, exact_exclude_paths = partition_transfer_exclusions(exclude_patterns)
             job = _RcloneJob(
                 job_id=self.__next_job_id,
                 name=name,
@@ -246,7 +248,8 @@ class RcloneTransferBackend:
                 final_destination_path=final_destination_path,
                 path_pair_id=path_pair_id,
                 path_pair_name=path_pair_name,
-                exclude_patterns=parse_exclude_patterns(exclude_patterns),
+                exclude_patterns=user_exclude_patterns,
+                exact_exclude_paths=exact_exclude_paths,
             )
             self.__next_job_id += 1
             self.__pending_jobs.append(job)
@@ -426,9 +429,27 @@ class RcloneTransferBackend:
             command.extend(["--transfers", str(self.__num_parallel_files)])
         for pattern in job.exclude_patterns:
             command.extend(["--exclude", pattern])
+        for exact_path in job.exact_exclude_paths:
+            command.extend(["--exclude", self.__exact_exclude_pattern(exact_path)])
         command.append(remote_path)
         command.append(job.destination_path if not job.is_dir else job.final_destination_path)
         return command
+
+    @staticmethod
+    def __exact_exclude_pattern(exact_path: ExactPathExclusion) -> str:
+        """Render an exact source-root-relative rclone filter pattern.
+
+        A leading slash anchors rclone filters at the transfer source root.
+        Escape every documented glob-reserved character while retaining a
+        literal POSIX backslash filename rather than rewriting it as a path
+        separator.
+        """
+        reserved = "*?\\[{}"
+        escaped_path = "".join(
+            "\\" + character if character in reserved else character
+            for character in exact_path.relative_path
+        )
+        return "/" + escaped_path
 
     def __write_config(self):
         lines = [

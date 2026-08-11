@@ -125,13 +125,94 @@ class _ScannerQueueReleaseMarker:
 _PUBLISH_LOCK = threading.Lock()
 
 
+def _is_authoritative_scan_result(item: object) -> bool:
+    return isinstance(item, ScannerResult) and (item.is_scan_final or item.is_full_snapshot)
+
+
+def _is_progress_completion_result(item: object) -> bool:
+    return isinstance(item, ScannerResult) and item.is_progress and bool(item.completed_path_pair_ids) \
+        and not _is_authoritative_scan_result(item)
+
+
+def _is_protected_scan_result(item: object) -> bool:
+    """Return whether an item must survive ordinary bounded progress loss."""
+    return _is_authoritative_scan_result(item) or _is_progress_completion_result(item)
+
+
+def _scan_result_pair_ids(item: object) -> set[str | None]:
+    if not isinstance(item, ScannerResult):
+        return set()
+    return set(item.scanned_path_pair_ids) | set(item.completed_path_pair_ids) \
+        | set(item.full_snapshot_path_pair_ids) | set(item.unknown_path_pair_ids)
+
+
+def _is_failure_scan_result(item: object) -> bool:
+    return isinstance(item, ScannerResult) and (item.failed or bool(item.unknown_path_pair_ids))
+
+
+def _replacement_index(retained: list[object], result: ScannerResult) -> Optional[int]:
+    """Choose a bounded eviction without discarding unrelated failure state first."""
+    ordinary = next((
+        index for index, item in enumerate(retained)
+        if not _is_protected_scan_result(item)
+    ), None)
+    if ordinary is not None:
+        return ordinary
+
+    incoming_pairs = _scan_result_pair_ids(result)
+    incoming_generation = result.generation
+    same_pair = [
+        index for index, item in enumerate(retained)
+        if isinstance(item, ScannerResult)
+        and bool(_scan_result_pair_ids(item) & incoming_pairs)
+        and item.generation <= incoming_generation
+    ]
+    same_completion = next((
+        index for index in same_pair if _is_progress_completion_result(retained[index])
+    ), None)
+    if same_completion is not None:
+        return same_completion
+    if _is_progress_completion_result(result):
+        return None
+    if not _is_authoritative_scan_result(result):
+        return None
+    same_healthy = next((
+        index for index in same_pair if not _is_failure_scan_result(retained[index])
+    ), None)
+    if same_healthy is not None:
+        return same_healthy
+    same_failure = next((
+        index for index in same_pair if _is_failure_scan_result(retained[index])
+    ), None)
+    if same_failure is not None:
+        return same_failure
+    unrelated_completion = next((
+        index for index, item in enumerate(retained)
+        if _is_progress_completion_result(item)
+    ), None)
+    if unrelated_completion is not None:
+        return unrelated_completion
+    unrelated_healthy = next((
+        index for index, item in enumerate(retained)
+        if not _is_failure_scan_result(item)
+    ), None)
+    if unrelated_healthy is not None:
+        return unrelated_healthy
+    # Every remaining item is an unrelated failure/unknown record. Capacity
+    # is finite, so retain newest arrivals while callers still receive the
+    # bounded queue's newest authoritative evidence.
+    return 0
+
+
 def _publish_bounded_result(output_queue: object,
                             result: ScannerResult) -> None:
     """Publish without blocking forever when a scan outruns its consumer.
 
-    Progress is deliberately lossy at the queue boundary: the reconciler keeps
-    committed state and rejects stale generations, so dropping the oldest
-    intermediate batch is safe and avoids startup/termination deadlocks.
+    Ordinary root progress is deliberately lossy at the queue boundary. Pair
+    completion markers and final/full snapshots are retained: completion is
+    useful progress metadata for every scanned pair, while the accumulator
+    separately requires the lossless full snapshot before treating it as
+    authority for absence or completion.
     """
     with _PUBLISH_LOCK:
         while True:
@@ -140,36 +221,36 @@ def _publish_bounded_result(output_queue: object,
                 put_nowait(result)
                 return
             except queue.Full:
-                retained = []
-                dropped = False
+                retained: list[object] = []
                 try:
                     while True:
-                        item = output_queue.get_nowait()
-                        is_final = isinstance(item, ScannerResult) and (
-                            item.is_scan_final or item.is_full_snapshot
-                        )
-                        if not dropped and not is_final:
-                            dropped = True
-                            continue
-                        retained.append(item)
+                        retained.append(output_queue.get_nowait())
                 except queue.Empty:
                     pass
                 except (OSError, EOFError, ValueError):
                     return
+                if not retained:
+                    # A consumer can drain the queue between the failed put
+                    # and this producer's non-blocking drain. Retry the
+                    # direct put instead of treating an empty protected set
+                    # as evictable state.
+                    continue
+                drop_index = _replacement_index(retained, result)
+                if drop_index is None:
+                    # An ordinary root batch, or a completion for a new pair
+                    # when every slot is protected, is safely lossy.
+                    for item in retained:
+                        try:
+                            output_queue.put_nowait(item)
+                        except (queue.Full, OSError, EOFError, ValueError):
+                            return
+                    return
+                retained.pop(drop_index)
                 for item in retained:
                     try:
                         output_queue.put_nowait(item)
                     except (queue.Full, OSError, EOFError, ValueError):
                         return
-                if not dropped:
-                    # Keep the bounded queue live when it contains only final
-                    # snapshots; a new progress event is safely discardable.
-                    if not (result.is_scan_final or result.is_full_snapshot):
-                        return
-                    try:
-                        output_queue.get_nowait()
-                    except (queue.Empty, OSError, EOFError, ValueError):
-                        continue
 
             except (OSError, EOFError, ValueError):
                 return
@@ -209,6 +290,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
 
     setter = getattr(scanner, "set_scan_target_path_pair_ids", None)
     progress_emitted = False
+    progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
     control_send_lock = threading.Lock()
 
     def send_control_message(message: object) -> None:
@@ -226,6 +308,7 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
         for system_file in files:
             system_file.path_pair_id = path_pair_id
             system_file.path_pair_name = path_pair_name
+        progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
         progress_result = ScannerResult(
             datetime.now(),
             files,
@@ -241,6 +324,22 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             send_control_message(("result", progress_result))
         elif output_queue is not None:
             _publish_bounded_result(output_queue, progress_result)
+        if complete:
+            pair_snapshot = ScannerResult(
+                datetime.now(),
+                list(progress_files_by_pair.get(path_pair_id, [])),
+                scanned_path_pair_ids={path_pair_id},
+                generation=generation,
+                is_progress=True,
+                completed_path_pair_ids={path_pair_id},
+                is_full_snapshot=True,
+                full_snapshot_path_pair_ids={path_pair_id},
+                session_token=session_token,
+            )
+            if result_via_control:
+                send_control_message(("result", pair_snapshot))
+            elif output_queue is not None:
+                _publish_bounded_result(output_queue, pair_snapshot)
 
     outcome: tuple[str, object | None] = ("success", None)
     try:
@@ -511,6 +610,7 @@ class ScannerProcess:
             setter(scan_target_path_pair_ids)
         self.__scan_generation += 1
         progress_emitted = False
+        progress_files_by_pair: dict[Optional[str], list[SystemFile]] = {}
 
         def publish_progress(files: List[SystemFile], path_pair_id: Optional[str], path_pair_name: Optional[str],
                              root_names: Optional[set[str]], complete: bool) -> None:
@@ -519,6 +619,7 @@ class ScannerProcess:
             for system_file in files:
                 system_file.path_pair_id = path_pair_id
                 system_file.path_pair_name = path_pair_name
+            progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
             assert self.__queue is not None
             _publish_bounded_result(self.__queue, ScannerResult(
                 datetime.now(), files,
@@ -530,6 +631,17 @@ class ScannerProcess:
                 is_scan_final=False,
                 session_token=self.__session_token,
             ))
+            if complete:
+                _publish_bounded_result(self.__queue, ScannerResult(
+                    datetime.now(), list(progress_files_by_pair.get(path_pair_id, [])),
+                    scanned_path_pair_ids={path_pair_id},
+                    generation=self.__scan_generation,
+                    is_progress=True,
+                    completed_path_pair_ids={path_pair_id},
+                    is_full_snapshot=True,
+                    full_snapshot_path_pair_ids={path_pair_id},
+                    session_token=self.__session_token,
+                ))
         self.__scanner.set_progress_callback(publish_progress)
         try:
             files = self.__scanner.scan()

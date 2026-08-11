@@ -24,6 +24,7 @@ from controller.controller import ControllerError, DownloadStartLifecycleEntry
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
 from common.performance_diagnostics import PerformanceDiagnosticsCollector
+from common.exclude_patterns import ExactPathExclusion
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
 from model import IModelListener, Model, ModelDiff, ModelError, ModelFile
@@ -1123,6 +1124,10 @@ class TestController(unittest.TestCase):
             files=[],
             failed=True,
             error_message="scan failed",
+            is_scan_final=False,
+            is_progress=False,
+            scanned_path_pair_ids={None},
+            unknown_path_pair_ids={None},
         )
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = failed_scan
 
@@ -1134,6 +1139,10 @@ class TestController(unittest.TestCase):
             files=[],
             failed=False,
             error_message=None,
+            is_scan_final=True,
+            is_progress=False,
+            scanned_path_pair_ids={None},
+            unknown_path_pair_ids=set(),
         )
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = healthy_scan
 
@@ -4407,6 +4416,61 @@ class TestController(unittest.TestCase):
         self.assertEqual(1, len(self.controller._Controller__active_command_processes))
         self.assertEqual(file.file_id, self.controller._Controller__active_command_processes[0].file_id)
 
+    @patch("controller.model_updater.ModelDiffUtil.diff_models")
+    def test_update_model_releases_pending_zero_byte_auto_purge_only_for_covered_remote_pair(self, diff_models):
+        file = ModelFile("stale", False)
+        file.path_pair_id = "pair-b"
+        file.local_size = 0
+        file.remote_size = None
+        file.state = ModelFile.State.DEFAULT
+
+        self.controller._Controller__model_builder.has_changes.return_value = True
+        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            SimpleNamespace(
+                timestamp=object(), files=[], failed=True, error_message="remote failed",
+                is_scan_final=False, is_targeted_scan=True,
+                scanned_path_pair_ids={"pair-b"}, unknown_path_pair_ids={"pair-b"},
+            ),
+            SimpleNamespace(
+                timestamp=object(), files=[], failed=False, error_message=None,
+                is_scan_final=True, is_targeted_scan=True,
+                scanned_path_pair_ids={"pair-a"}, unknown_path_pair_ids=set(),
+            ),
+            SimpleNamespace(
+                timestamp=object(), files=[], failed=False, error_message=None,
+                is_scan_final=True, is_targeted_scan=True,
+                scanned_path_pair_ids={"pair-b"}, unknown_path_pair_ids=set(),
+            ),
+        ]
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__model.get_file_ids.return_value = set()
+        self.controller._Controller__model.get_file_names.return_value = set()
+        diff_models.return_value = [SimpleNamespace(change=ModelDiff.Change.ADDED, new_file=file)]
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": SimpleNamespace(local_path="/local/a"),
+            "pair-b": SimpleNamespace(local_path="/local/b"),
+        }
+        self.controller._Controller__path_pair_staging_paths = {
+            "pair-a": "/local/a/incomplete",
+            "pair-b": "/local/b/incomplete",
+        }
+
+        with patch("controller.controller.DeleteLocalProcess") as delete_local_process:
+            self.controller._Controller__update_model()
+            self.assertEqual({file.file_id}, self.controller._Controller__pending_auto_purge_file_ids)
+
+            self.controller._Controller__model_builder.has_changes.return_value = False
+            self.controller._Controller__update_model()
+            delete_local_process.assert_not_called()
+            self.assertEqual({file.file_id}, self.controller._Controller__pending_auto_purge_file_ids)
+
+            self.controller._Controller__update_model()
+
+        delete_local_process.assert_called_once_with(local_path="/local/b", file_name="stale")
+        delete_local_process.return_value.start.assert_called_once_with()
+        self.assertEqual(set(), self.controller._Controller__pending_auto_purge_file_ids)
+
     def test_update_model_skips_auto_purge_for_tracked_zero_byte_local_only_file(self):
         file = ModelFile("stale", False)
         file.path_pair_id = "movies"
@@ -6261,7 +6325,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
-    def test_move_from_staging_moves_directory_with_legitimate_lftp_child_name(self, move):
+    def test_move_from_staging_defers_directory_with_nested_lftp_payload(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
@@ -6273,36 +6337,145 @@ class TestController(unittest.TestCase):
 
             self.controller._Controller__staging_path = staging_root
             self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__model_builder.is_remote_leaf_path.side_effect = \
+                lambda _file_id, relative_path: relative_path == "notes"
 
             result = self.controller._Controller__move_from_staging("movie.mkv")
 
-        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie.mkv"))
-        self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
-        self.controller.logger.warning.assert_not_called()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        move.assert_not_called()
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
-    def test_move_from_staging_moves_directory_with_legitimate_lftp_child_pair(self, move):
+    def test_move_from_staging_allows_directory_with_remote_lftp_payload_name(self, move):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
             source_tree = os.path.join(staging_root, "movie")
             os.makedirs(source_tree)
             os.makedirs(final_root)
-            with open(os.path.join(source_tree, "foo"), "w", encoding="utf-8") as child_file:
-                child_file.write("complete payload")
-            with open(os.path.join(source_tree, "foo.lftp"), "w", encoding="utf-8") as child_file:
-                child_file.write("also complete payload")
+            with open(os.path.join(source_tree, "notes.lftp"), "w", encoding="utf-8") as child_file:
+                child_file.write("legitimate payload")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__model_builder.is_remote_leaf_path.side_effect = \
+                lambda _file_id, relative_path: relative_path == "notes.lftp"
+
+            result = self.controller._Controller__move_from_staging("movie")
+
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"))
+        self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
+
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
+    def test_move_from_staging_defers_directory_with_nested_lftp_status_sidecar(self, move):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "movie")
+            os.makedirs(source_tree)
+            os.makedirs(final_root)
+            with open(os.path.join(source_tree, "foo.lftp-pget-status"), "w", encoding="utf-8") as child_file:
+                child_file.write("status sidecar")
 
             self.controller._Controller__staging_path = staging_root
             self.controller._Controller__legacy_local_path = final_root
 
             result = self.controller._Controller__move_from_staging("movie")
 
-        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"))
-        self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
-        self.controller.logger.warning.assert_not_called()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        move.assert_not_called()
+        self.assertEqual(Controller.MoveFromStagingResult.DEFERRED, result)
+        self.controller._Controller__local_scan_process.force_scan.assert_not_called()
+
+    def test_move_from_staging_merges_missing_descendants_and_retains_collision_residue(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source_tree = os.path.join(staging_root, "release")
+            destination_tree = os.path.join(final_root, "release")
+            os.makedirs(os.path.join(source_tree, "nested"))
+            os.makedirs(destination_tree)
+            Path(os.path.join(destination_tree, "E06.mkv")).write_bytes(b"final")
+            Path(os.path.join(source_tree, "E06.mkv")).write_bytes(b"stale")
+            Path(os.path.join(source_tree, "nested", "E07 [special].mkv")).write_bytes(b"staged")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+
+            result = self.controller._Controller__move_from_staging("release")
+            repeated_result = self.controller._Controller__move_from_staging("release")
+
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, result)
+            self.assertEqual(Controller.MoveFromStagingResult.CONFLICT, repeated_result)
+            self.assertEqual(b"final", Path(os.path.join(destination_tree, "E06.mkv")).read_bytes())
+            self.assertEqual(
+                b"staged", Path(os.path.join(destination_tree, "nested", "E07 [special].mkv")).read_bytes()
+            )
+            self.assertEqual(b"stale", Path(os.path.join(source_tree, "E06.mkv")).read_bytes())
+
+    def test_transfer_exclusions_preserve_user_patterns_and_escape_final_leaf_globs(self):
+        self.controller._Controller__exclude_patterns = "*.nfo, Sample/"
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (
+            "nested/[E06]*?.mkv",
+            "name,with,commas.mkv",
+        )
+
+        exclusions = self.controller._Controller__transfer_exclude_patterns("release", True)
+
+        self.assertEqual(
+            [
+                "*.nfo",
+                "Sample/",
+                ExactPathExclusion("nested/[E06]*?.mkv"),
+                ExactPathExclusion("name,with,commas.mkv"),
+            ],
+            exclusions,
+        )
+
+    def test_transfer_exclusions_skip_unrepresentable_exact_path_without_losing_user_globs(self):
+        self.controller._Controller__exclude_patterns = "*.nfo"
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (
+            "E06.mkv",
+            "nested/bad\nname.mkv",
+            "nested/tab\tname.mkv",
+        )
+
+        exclusions = self.controller._Controller__transfer_exclude_patterns("release", True)
+
+        self.assertEqual(["*.nfo", ExactPathExclusion("E06.mkv")], exclusions)
+
+    def test_process_commands_queue_passes_typed_exact_exclusions_without_string_joining(self):
+        file = ModelFile("release", True)
+        file.remote_size = 100
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__exclude_patterns = "*.nfo"
+        self.controller._Controller__model_builder.get_trusted_final_leaf_paths.return_value = (
+            "E06.mkv",
+        )
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        self.controller._Controller__lftp.queue.assert_called_once_with(
+            "release",
+            True,
+            remote_base_dir_path=None,
+            local_base_dir_path="/local/incomplete",
+            exclude_patterns=["*.nfo", ExactPathExclusion("E06.mkv")],
+        )
+
+    def test_ambiguous_split_local_target_refuses_final_delete(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            final_root = os.path.join(temp_dir, "final")
+            staging_root = os.path.join(temp_dir, "staging")
+            os.makedirs(final_root)
+            os.makedirs(staging_root)
+            Path(os.path.join(final_root, "release")).write_bytes(b"final")
+            Path(os.path.join(staging_root, "release")).write_bytes(b"staged")
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__staging_path = staging_root
+            file = ModelFile("release", False)
+
+            self.assertTrue(self.controller._Controller__has_ambiguous_split_local_target(file))
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_defers_when_lftp_temp_artifact_matches_path_pair_source(self, move):
@@ -6756,6 +6929,57 @@ class TestController(unittest.TestCase):
         self.controller._Controller__update_model()
         self.assertEqual(2, self.controller._Controller__persist.move_failure_counts[terminal.file_id])
         self.assertNotIn(terminal.file_id, self.controller._Controller__persist.downloaded_file_names)
+
+    def test_pending_move_retry_waits_for_clean_split_root_coverage(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root = SystemFile("release", 20, True)
+        local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("E07.mkv", 10, False, is_staging=True))
+        active_with_extra = SystemFile("release", 15, True)
+        active_with_extra.add_child(SystemFile("E07.mkv", 10, False))
+        active_with_extra.add_child(SystemFile("obsolete.tmp", 5, False))
+
+        builder = ModelBuilder()
+        builder.set_base_logger(self.controller.logger)
+        builder.set_remote_files([remote_root])
+        builder.set_local_files([local_root])
+        builder.set_active_files([active_with_extra])
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = builder.build_model()
+        self.controller._Controller__model_lock = threading.RLock()
+        self.controller._Controller__lftp.status.return_value = []
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        pending_entry = ("release", None, None)
+        release_id = ModelFile.build_file_id(*pending_entry[:2])
+        self.controller._Controller__pending_completion_file_names = {pending_entry}
+        self.controller._Controller__persist.move_failure_counts = {release_id: 1}
+        self.controller._Controller__deferred_move_file_ids.add(release_id)
+        self.controller._Controller__move_from_staging = MagicMock(
+            return_value=Controller.MoveFromStagingResult.COMPLETED
+        )
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__move_from_staging.assert_not_called()
+        self.assertEqual({pending_entry}, self.controller._Controller__pending_completion_file_names)
+        self.assertEqual({release_id: 1}, self.controller._Controller__persist.move_failure_counts)
+        self.assertIn(release_id, self.controller._Controller__deferred_move_file_ids)
+        self.assertNotIn(release_id, self.controller._Controller__persist.downloaded_file_names)
+
+        active_clean = SystemFile("release", 10, True)
+        active_clean.add_child(SystemFile("E07.mkv", 10, False))
+        builder.set_active_files([active_clean])
+
+        self.controller._Controller__update_model()
+
+        self.controller._Controller__move_from_staging.assert_called_once_with("release", None)
+        self.assertEqual(set(), self.controller._Controller__pending_completion_file_names)
+        self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+        self.assertNotIn(release_id, self.controller._Controller__deferred_move_file_ids)
+        self.assertIn(release_id, self.controller._Controller__persist.downloaded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models")
     def test_automatic_already_completed_does_not_earn_success_marker(self, diff_models):

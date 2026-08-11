@@ -674,7 +674,9 @@ class ModelBuilder:
 
     @staticmethod
     def __is_authoritative_local_file(local_file: Optional[SystemFile]) -> bool:
-        return local_file is not None and not getattr(local_file, "is_staging", False)
+        return local_file is not None and \
+            not getattr(local_file, "is_staging", False) and \
+            not getattr(local_file, "has_staging_collision", False)
 
     @staticmethod
     def __local_size_is_authoritative_progress(local_file: Optional[SystemFile],
@@ -695,6 +697,171 @@ class ModelBuilder:
         if remote_file is None:
             return False
         return local_file.size >= remote_file.size
+
+    @staticmethod
+    def __trusted_final_leaf_bytes(remote_file: Optional[SystemFile],
+                                   local_file: Optional[SystemFile],
+                                   ancestor_has_staging_collision: bool = False) -> int:
+        """Return the unique remote-covered bytes held below the final root.
+
+        ``LocalScanner`` represents a split-root directory as one tree: final
+        leaves are non-staging and incomplete leaves are staging.  A running
+        backend reports only the latter, so directory progress needs the two
+        disjoint sources.  The location tag, not a size comparison, decides
+        whether a leaf is final-authoritative.
+        """
+        if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
+            return 0
+        has_staging_collision = ancestor_has_staging_collision or \
+            getattr(local_file, "has_staging_collision", False)
+        if not remote_file.is_dir:
+            if ModelBuilder.__is_verified_final_leaf(remote_file, local_file) and \
+                    not has_staging_collision:
+                return min(local_file.size, remote_file.size)
+            return 0
+        remote_children = {child.name: child for child in remote_file.iter_children()}
+        return sum(
+            ModelBuilder.__trusted_final_leaf_bytes(
+                remote_children.get(child.name), child, has_staging_collision
+            )
+            for child in local_file.iter_children()
+        )
+
+    @staticmethod
+    def __mtime_epoch_second(system_file: SystemFile) -> Optional[int]:
+        """Return the finest portable mtime identity preserved by LFTP.
+
+        LFTP mirrors source mtimes at whole-second resolution, even when the
+        source filesystem reports nanoseconds.  Compare the raw epoch value at
+        that portable precision rather than falling back to timezone-dependent
+        display datetimes.
+        """
+        mtime_ns = system_file.mtime_ns
+        if type(mtime_ns) is not int:
+            return None
+        return mtime_ns // 1_000_000_000
+
+    @staticmethod
+    def __is_verified_final_leaf(remote_file: SystemFile, local_file: SystemFile) -> bool:
+        """Require positive content identity before trusting final-only data.
+
+        A final pathname alone is not enough after an interrupted transfer:
+        an older same-name file must remain eligible for download.  The scan
+        carries size and source modification metadata, so require both exact
+        size and equal non-null epoch seconds.  LFTP preserves mtimes only to
+        whole-second precision; display timestamps are naive local datetimes
+        and cannot establish identity across hosts in different timezones.
+        This deliberately fails closed for legacy scans without raw epoch
+        provenance.
+        """
+        local_mtime_second = ModelBuilder.__mtime_epoch_second(local_file)
+        remote_mtime_second = ModelBuilder.__mtime_epoch_second(remote_file)
+        return not remote_file.is_dir and not local_file.is_dir and \
+            ModelBuilder.__is_authoritative_local_file(local_file) and \
+            local_file.size == remote_file.size and \
+            local_mtime_second is not None and \
+            remote_mtime_second is not None and \
+            local_mtime_second == remote_mtime_second
+
+    @staticmethod
+    def __combine_split_root_transfer_state(transfer_state: _TransferState,
+                                            remote_file: Optional[SystemFile],
+                                            local_file: Optional[SystemFile]) -> _TransferState:
+        def has_staging_descendant(candidate: Optional[SystemFile]) -> bool:
+            if candidate is None:
+                return False
+            if getattr(candidate, "is_staging", False):
+                return True
+            return any(has_staging_descendant(child) for child in candidate.iter_children())
+
+        if not has_staging_descendant(local_file):
+            return transfer_state
+        final_bytes = ModelBuilder.__trusted_final_leaf_bytes(remote_file, local_file)
+        if final_bytes == 0:
+            return transfer_state
+        staged_bytes = transfer_state.size_local or 0
+        size_local = final_bytes + staged_bytes
+        if remote_file is not None:
+            size_local = min(size_local, remote_file.size)
+        percent_local = transfer_state.percent_local
+        if remote_file is not None and remote_file.size > 0:
+            percent_local = int(round((size_local * 100) / remote_file.size))
+        return _TransferState(
+            size_local,
+            remote_file.size if remote_file is not None else transfer_state.size_remote,
+            percent_local,
+            transfer_state.speed,
+            transfer_state.eta,
+        )
+
+    def get_trusted_final_leaf_paths(self, file_id: str) -> tuple[str, ...]:
+        """Return exact root-relative final leaves safe to omit on resume.
+
+        Only paths present in both the current remote and local scan are
+        returned.  This is intentionally location-based and does not infer a
+        completed final leaf from an equal apparent size in staging.
+        """
+        remote_root = self.__remote_files.get(file_id)
+        local_root = self.__local_files.get(file_id)
+        if remote_root is None or local_root is None or not remote_root.is_dir or not local_root.is_dir:
+            return ()
+
+        def has_staging_descendant(candidate: SystemFile) -> bool:
+            return getattr(candidate, "is_staging", False) or any(
+                has_staging_descendant(child) for child in candidate.iter_children()
+            )
+
+        if not has_staging_descendant(local_root):
+            return ()
+        paths: list[str] = []
+
+        def visit(remote_file: SystemFile, local_file: SystemFile, relative: str,
+                  ancestor_has_staging_collision: bool = False) -> None:
+            if remote_file.is_dir != local_file.is_dir:
+                return
+            has_staging_collision = ancestor_has_staging_collision or \
+                getattr(local_file, "has_staging_collision", False)
+            if not remote_file.is_dir:
+                if ModelBuilder.__is_verified_final_leaf(remote_file, local_file) and \
+                        not has_staging_collision:
+                    paths.append(relative)
+                return
+            remote_children = {child.name: child for child in remote_file.iter_children()}
+            for local_child in local_file.iter_children():
+                remote_child = remote_children.get(local_child.name)
+                if remote_child is None:
+                    continue
+                child_relative = local_child.name if not relative else relative + "/" + local_child.name
+                visit(remote_child, local_child, child_relative, has_staging_collision)
+
+        visit(remote_root, local_root, "")
+        return tuple(sorted(set(paths)))
+
+    def has_complete_local_coverage(self, file_id: str) -> bool:
+        """Whether the current remote/effective-local tree proves completion.
+
+        This is intentionally narrower than model state: pending completion
+        needs to recognize a fully staged directory after LFTP status has
+        disappeared, while still rejecting collisions, partial leaves, and
+        active-only paths that only inflate aggregate directory size.
+        """
+        remote_file = self.__remote_files.get(file_id)
+        local_file = self.__build_effective_local_files().get(file_id)
+        return self.__effective_local_tree_proves_completion(remote_file, local_file)
+
+    def is_remote_leaf_path(self, file_id: str, relative_path: str) -> bool:
+        """Whether a source-root-relative leaf is currently remote-listed."""
+        remote_file = self.__remote_files.get(file_id)
+        if remote_file is None or not relative_path:
+            return False
+        current = remote_file
+        for component in relative_path.split("/"):
+            if not current.is_dir:
+                return False
+            current = next((child for child in current.iter_children() if child.name == component), None)
+            if current is None:
+                return False
+        return not current.is_dir
 
     @staticmethod
     def __has_incomplete_remote_file_children(model_file: ModelFile) -> bool:
@@ -765,9 +932,15 @@ class ModelBuilder:
             return False
         if not ModelBuilder.__local_file_proves_download_completion(local_file, remote_file):
             return True
-        if local_file.timestamp_modified is None or remote_file.timestamp_modified is None:
+        # Display timestamps are naive local datetimes.  They cannot establish
+        # ordering between the seedbox and controller when their timezones
+        # differ, so retain the authoritative final file unless raw epoch
+        # provenance proves the remote content is newer.
+        local_mtime_second = ModelBuilder.__mtime_epoch_second(local_file)
+        remote_mtime_second = ModelBuilder.__mtime_epoch_second(remote_file)
+        if local_mtime_second is None or remote_mtime_second is None:
             return False
-        return remote_file.timestamp_modified > local_file.timestamp_modified
+        return remote_mtime_second > local_mtime_second
 
     def __store_recent_live_transfer_snapshot(self,
                                               file_id: str,
@@ -1143,6 +1316,11 @@ class ModelBuilder:
         self.__active_file_ids = set()
         self.__active_files = {}
         for file in active_files:
+            # Active scanners read the staging path.  Some scanner paths do
+            # not carry that location tag into their SystemFile roots, so make
+            # the semantic boundary explicit here without changing sidecar or
+            # collision metadata.
+            self.__mark_active_tree_staging(file)
             self.__collect_active_file_ids(file, self.__active_file_ids)
             self.__active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
         # Invalidate the cache
@@ -1166,6 +1344,200 @@ class ModelBuilder:
             self.__collect_active_file_ids(active_file, self.__active_file_ids)
         self.__cached_model = None
 
+    @staticmethod
+    def __mark_active_tree_staging(system_file: SystemFile) -> None:
+        system_file.is_staging = True
+        for child in system_file.iter_children():
+            ModelBuilder.__mark_active_tree_staging(child)
+
+    @staticmethod
+    def __has_staging_descendant(system_file: SystemFile) -> bool:
+        return getattr(system_file, "is_staging", False) or any(
+            ModelBuilder.__has_staging_descendant(child)
+            for child in system_file.iter_children()
+        )
+
+    @staticmethod
+    def __clone_system_file(system_file: SystemFile,
+                            children: Optional[List[SystemFile]] = None,
+                            is_staging: Optional[bool] = None) -> SystemFile:
+        cloned = SystemFile(
+            system_file.name,
+            sum(child.size for child in children) if children is not None else system_file.size,
+            system_file.is_dir,
+            time_created=system_file.timestamp_created,
+            time_modified=system_file.timestamp_modified,
+            is_staging=system_file.is_staging if is_staging is None else is_staging,
+            mtime_ns=system_file.mtime_ns,
+        )
+        cloned.path_pair_id = system_file.path_pair_id
+        cloned.path_pair_name = system_file.path_pair_name
+        cloned.status_sidecar_ready = system_file.status_sidecar_ready
+        cloned.has_staging_collision = system_file.has_staging_collision
+        for child in children if children is not None else system_file.iter_children():
+            cloned.add_child(child)
+        return cloned
+
+    @staticmethod
+    def __has_verified_split_root_final_leaf(existing_file: SystemFile,
+                                             remote_file: Optional[SystemFile]) -> bool:
+        if remote_file is None or existing_file.is_dir != remote_file.is_dir:
+            return False
+        if not existing_file.is_dir:
+            return not existing_file.has_staging_collision and \
+                ModelBuilder.__is_verified_final_leaf(remote_file, existing_file)
+        remote_children = {child.name: child for child in remote_file.iter_children()}
+        return any(
+            ModelBuilder.__has_verified_split_root_final_leaf(
+                child, remote_children.get(child.name)
+            )
+            for child in existing_file.iter_children()
+        )
+
+    @staticmethod
+    def __final_split_root_structure(existing_file: SystemFile,
+                                     remote_file: Optional[SystemFile]) -> Optional[SystemFile]:
+        """Keep only final evidence absent from a fresh active staging scan."""
+        if remote_file is None or existing_file.is_dir != remote_file.is_dir:
+            return None
+        if not existing_file.is_dir:
+            if existing_file.is_staging or not ModelBuilder.__is_verified_final_leaf(
+                    remote_file, existing_file):
+                return None
+            return existing_file
+        remote_children = {child.name: child for child in remote_file.iter_children()}
+        retained_children = [
+            retained_child
+            for child in existing_file.iter_children()
+            if (retained_child := ModelBuilder.__final_split_root_structure(
+                child, remote_children.get(child.name)
+            )) is not None
+        ]
+        if not retained_children and existing_file.is_staging:
+            return None
+        return ModelBuilder.__clone_system_file(
+            existing_file,
+            retained_children,
+            is_staging=False,
+        )
+
+    @staticmethod
+    def __merge_active_split_root(existing_file: SystemFile,
+                                  active_file: SystemFile,
+                                  remote_file: Optional[SystemFile]) -> SystemFile:
+        """Overlay fresh staging state without hiding verified final leaves."""
+        if existing_file.is_dir != active_file.is_dir:
+            if remote_file is not None and existing_file.is_dir == remote_file.is_dir:
+                # Keep the shape that matches the remote tree.  The competing
+                # active shape is retained as ambiguity metadata so neither
+                # this node nor its descendants can be trusted as final.
+                merged = ModelBuilder.__clone_system_file(existing_file)
+                merged.has_staging_collision = True
+                return merged
+            merged = ModelBuilder.__clone_system_file(active_file)
+            merged.has_staging_collision = True
+            return merged
+        if existing_file.is_dir and active_file.is_dir:
+            remote_children = {
+                child.name: child for child in remote_file.iter_children()
+            } if remote_file is not None and remote_file.is_dir else {}
+            active_children = {child.name: child for child in active_file.iter_children()}
+            merged_children: List[SystemFile] = []
+            for existing_child in existing_file.iter_children():
+                active_child = active_children.pop(existing_child.name, None)
+                if active_child is None:
+                    retained_final_child = ModelBuilder.__final_split_root_structure(
+                        existing_child, remote_children.get(existing_child.name)
+                    )
+                    if retained_final_child is not None:
+                        merged_children.append(retained_final_child)
+                    continue
+                merged_children.append(ModelBuilder.__merge_active_split_root(
+                    existing_child,
+                    active_child,
+                    remote_children.get(existing_child.name),
+                ))
+            merged_children.extend(active_children.values())
+            merged_children.sort(key=lambda child: child.name)
+            merged = ModelBuilder.__clone_system_file(
+                existing_file,
+                merged_children,
+                is_staging=existing_file.is_staging and active_file.is_staging,
+            )
+            merged.has_staging_collision = \
+                existing_file.has_staging_collision or active_file.has_staging_collision
+            return merged
+
+        if not existing_file.is_dir and not active_file.is_dir and \
+                not existing_file.is_staging and \
+                not existing_file.has_staging_collision and \
+                remote_file is not None and \
+                ModelBuilder.__is_verified_final_leaf(remote_file, existing_file):
+            merged = ModelBuilder.__clone_system_file(existing_file)
+            # The active staging duplicate may be a stale/preallocated copy.
+            # Keep the final bytes visible but retain the ambiguity so they
+            # cannot be added to both final and active progress.
+            merged.has_staging_collision = True
+            return merged
+
+        merged = ModelBuilder.__clone_system_file(active_file)
+        merged.has_staging_collision = existing_file.has_staging_collision or \
+            active_file.has_staging_collision
+        return merged
+
+    @staticmethod
+    def __directory_leaves_cover_remote(remote_file: Optional[SystemFile],
+                                        local_file: Optional[SystemFile]) -> bool:
+        """Whether every remote leaf has a non-ambiguous complete local leaf."""
+        if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
+            return False
+        if local_file.has_staging_collision:
+            return False
+        if not remote_file.is_dir:
+            if local_file.is_staging:
+                return local_file.size >= remote_file.size
+            # Directory completion historically accepts a complete final leaf
+            # without scan provenance; reserve raw-mtime identity for split-root
+            # trust/exclusion.  Collision metadata still fails closed above.
+            return local_file.size >= remote_file.size
+        local_children = {child.name: child for child in local_file.iter_children()}
+        remote_children = {child.name: child for child in remote_file.iter_children()}
+        # A fresh active staging tree can contain obsolete or unrelated
+        # entries.  They must not inflate a complete-looking directory into a
+        # move candidate, while ordinary final-only local structure remains
+        # non-blocking for compatibility with existing local scans.
+        if any(
+                child.has_staging_collision or ModelBuilder.__has_staging_descendant(child)
+                for name, child in local_children.items()
+                if name not in remote_children
+        ):
+            return False
+        return all(
+            ModelBuilder.__directory_leaves_cover_remote(
+                remote_child, local_children.get(remote_child.name)
+            )
+            for remote_child in remote_children.values()
+        )
+
+    @staticmethod
+    def __effective_local_tree_proves_completion(remote_file: Optional[SystemFile],
+                                                 local_file: Optional[SystemFile]) -> bool:
+        """Apply split-root collision and staging-extra completion rules."""
+        if remote_file is None or local_file is None or remote_file.is_dir != local_file.is_dir:
+            return False
+        if local_file.has_staging_collision:
+            return False
+        if remote_file.is_dir:
+            if ModelBuilder.__directory_leaves_cover_remote(remote_file, local_file):
+                return True
+            # Some backends only report a staged root total while a remote
+            # child has no size.  With no scanned local children there is no
+            # split-root branch (or staging-only extra) to arbitrate, so keep
+            # the established root-total recovery behavior.
+            return local_file.is_staging and not tuple(local_file.iter_children()) and \
+                local_file.size >= remote_file.size
+        return local_file.size >= remote_file.size
+
     def __build_effective_local_files(self) -> Dict[str, SystemFile]:
         if not self.__active_files:
             return dict(self.__local_files)
@@ -1174,6 +1546,15 @@ class ModelBuilder:
         for file_id, active_file in self.__active_files.items():
             existing_file = effective_local_files.get(file_id)
             remote_file = self.__remote_files.get(file_id)
+            if existing_file is not None and remote_file is not None and \
+                    (self.__has_staging_descendant(existing_file) or
+                     existing_file.has_staging_collision) and \
+                    (self.__has_verified_split_root_final_leaf(existing_file, remote_file) or
+                     existing_file.has_staging_collision):
+                effective_local_files[file_id] = self.__merge_active_split_root(
+                    existing_file, active_file, remote_file
+                )
+                continue
             if existing_file is not None and getattr(existing_file, "is_staging", False):
                 continue
             if existing_file is not None and \
@@ -1573,6 +1954,12 @@ class ModelBuilder:
         arbitration_source = "scan_only"
         raw_current_transfer_state = self.__transfer_state(status.total_transfer_state) if status and \
             status.state == LftpJobStatus.State.RUNNING else None
+        if raw_current_transfer_state is not None:
+            raw_current_transfer_state = self.__combine_split_root_transfer_state(
+                raw_current_transfer_state,
+                remote,
+                local,
+            )
         current_transfer_state = raw_current_transfer_state if not is_stopped else None
         if is_stopped and raw_current_transfer_state is not None:
             retained_transfer_state = self.__build_retained_transfer_state(
@@ -1931,7 +2318,8 @@ class ModelBuilder:
         incomplete_children = False
 
         if model_file.state == ModelFile.State.DOWNLOADING and \
-                self.__local_file_proves_download_completion(local, remote):
+                self.__local_file_proves_download_completion(local, remote) and \
+                self.__effective_local_tree_proves_completion(remote, local):
             self.__evict_transfer_completion_snapshots(
                 file_id,
                 status.file_id if status is not None else model_file.file_id
@@ -1949,6 +2337,7 @@ class ModelBuilder:
                 local is not None and \
                 getattr(local, "is_staging", False) and \
                 local.size >= remote.size and \
+                self.__effective_local_tree_proves_completion(remote, local) and \
                 not self.__has_incomplete_remote_file_children(model_file) and \
                 self.__resolve_recent_live_transfer_snapshot(
                     file_id,
@@ -1974,6 +2363,7 @@ class ModelBuilder:
                     model_file.local_size is not None and \
                     model_file.remote_size is not None and \
                     self.__is_authoritative_local_file(local) and \
+                    self.__effective_local_tree_proves_completion(remote, local) and \
                     model_file.local_size >= model_file.remote_size:
                 # root is a finished single file
                 model_file.state = ModelFile.State.DOWNLOADED
@@ -1983,6 +2373,7 @@ class ModelBuilder:
                     model_file.local_size is not None and \
                     model_file.remote_size is not None and \
                     getattr(local, "is_staging", False) and \
+                    self.__effective_local_tree_proves_completion(remote, local) and \
                     model_file.local_size >= model_file.remote_size:
                 # Keep scan-only recovery for full-size staging copies so
                 # they can leave incomplete and continue through the
@@ -2001,6 +2392,7 @@ class ModelBuilder:
                         not is_stopped and \
                         local is not None and \
                         getattr(local, "is_staging", False) and \
+                        self.__effective_local_tree_proves_completion(remote, local) and \
                         local.size >= model_file.remote_size:
                     # A fully staged directory copy should be treated as complete even
                     # if live transfer state has already disappeared.
@@ -2022,7 +2414,8 @@ class ModelBuilder:
                                 all_downloaded = False
                                 break
                         frontier.extend(_child_file.iter_children())
-                    if has_downloadable_children and all_downloaded:
+                    if has_downloadable_children and all_downloaded and \
+                            self.__effective_local_tree_proves_completion(remote, local):
                         model_file.state = ModelFile.State.DOWNLOADED
                     else:
                         incomplete_children = True

@@ -2,9 +2,17 @@
 
 import threading
 import unittest
+import os
 from unittest.mock import MagicMock
 
-from controller.scan import MultiPathLocalScanner, MultiPathRemoteScanner, ScannerError, ScannerProcess
+from controller.scan import (
+    MultiPathLocalScanner,
+    MultiPathRemoteScanner,
+    RemoteScanLease,
+    RemoteScanner,
+    ScannerError,
+    ScannerProcess,
+)
 from system import SystemFile
 
 
@@ -40,7 +48,102 @@ class _BlockingPathPairScanner:
         return [system_file]
 
 
+class _SerialPathPairScanner:
+    """Remote-like scanner that exposes overlap and invocation ordering."""
+
+    def __init__(self, path_pair_id, release, state, fail=False):
+        self.path_pair_id = path_pair_id
+        self.path_pair_name = path_pair_id
+        self.started = threading.Event()
+        self.release = release
+        self.state = state
+        self.fail = fail
+        self.__progress_callback = None
+
+    def set_base_logger(self, logger):
+        return None
+
+    def set_progress_callback(self, callback):
+        self.__progress_callback = callback
+
+    def scan(self):
+        self.started.set()
+        with self.state["lock"]:
+            self.state["active"] += 1
+            self.state["max_active"] = max(self.state["max_active"], self.state["active"])
+            self.state["order"].append(self.path_pair_id)
+        try:
+            self.release.wait(timeout=5)
+            if self.fail:
+                raise ScannerError("temporary failure", recoverable=True)
+            system_file = SystemFile(self.path_pair_id + ".bin", 1, False)
+            if self.__progress_callback is not None:
+                self.__progress_callback([system_file], self.path_pair_id, self.path_pair_name, None, False)
+                self.__progress_callback([], self.path_pair_id, self.path_pair_name, None, True)
+            return [system_file]
+        finally:
+            with self.state["lock"]:
+                self.state["active"] -= 1
+
+
 class TestMultiPathRemoteScanner(unittest.TestCase):
+    def test_remote_scan_lease_serializes_refresh_generations(self):
+        lease = RemoteScanLease.create()
+        self.addCleanup(lambda: os.path.exists(lease.path) and os.unlink(lease.path))
+        old_scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/old",
+            local_path_to_scan_script="/scanfs",
+            remote_path_to_scan_script="/scanfs",
+            remote_scan_lease=lease,
+        )
+        new_scanner = RemoteScanner(
+            remote_address="host",
+            remote_username="user",
+            remote_password="password",
+            remote_port=22,
+            remote_path_to_scan="/new",
+            local_path_to_scan_script="/scanfs",
+            remote_path_to_scan_script="/scanfs",
+            remote_scan_lease=lease,
+        )
+        old_entered = threading.Event()
+        release_old = threading.Event()
+        new_entered = threading.Event()
+
+        def old_scan():
+            old_entered.set()
+            self.assertTrue(release_old.wait(timeout=5))
+            return []
+
+        def new_scan():
+            new_entered.set()
+            return []
+
+        old_scanner._RemoteScanner__scan = old_scan
+        new_scanner._RemoteScanner__scan = new_scan
+        old_process = ScannerProcess(scanner=old_scanner, interval_in_ms=0, verbose=False)
+        new_process = ScannerProcess(scanner=new_scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(old_process.close_queues)
+        self.addCleanup(new_process.close_queues)
+
+        old_thread = threading.Thread(target=old_process.run_loop)
+        new_thread = threading.Thread(target=new_process.run_loop)
+        old_thread.start()
+        self.assertTrue(old_entered.wait(timeout=2))
+        new_thread.start()
+        self.assertFalse(new_entered.wait(timeout=0.1))
+
+        release_old.set()
+        old_thread.join(timeout=5)
+        new_thread.join(timeout=5)
+        self.assertFalse(old_thread.is_alive())
+        self.assertFalse(new_thread.is_alive())
+        self.assertTrue(new_entered.is_set())
+
     def test_scanner_process_publishes_all_six_selected_pairs(self):
         release = threading.Event()
         release.set()
@@ -68,94 +171,54 @@ class TestMultiPathRemoteScanner(unittest.TestCase):
         }
         full_snapshots = [result for result in results if result.is_full_snapshot]
         self.assertEqual(pair_ids, progress_ids)
-        self.assertEqual(1, len(full_snapshots))
-        self.assertEqual(pair_ids, full_snapshots[0].full_snapshot_path_pair_ids)
-        self.assertEqual(pair_ids, {file.path_pair_id for file in full_snapshots[0].files})
+        self.assertEqual(7, len(full_snapshots))
+        pair_snapshots = [result for result in full_snapshots
+                          if len(result.full_snapshot_path_pair_ids) == 1]
+        self.assertEqual(pair_ids, {
+            next(iter(result.full_snapshot_path_pair_ids)) for result in pair_snapshots
+        })
+        aggregate_snapshots = [result for result in full_snapshots
+                               if result.full_snapshot_path_pair_ids == pair_ids]
+        self.assertEqual(1, len(aggregate_snapshots))
+        self.assertEqual(pair_ids, {file.path_pair_id for file in aggregate_snapshots[0].files})
 
-    def test_fatal_worker_error_stops_new_submissions_and_propagates(self):
-        release = threading.Event()
-        started = [threading.Event() for _ in range(6)]
-        scanners = [
-            _BlockingPathPairScanner(
-                "pair-{}".format(index + 1),
-                started[index],
-                release,
-                block=index in {0, 1, 2, 3},
-                fatal=index == 0,
-            )
-            for index in range(6)
-        ]
-        scanner = MultiPathRemoteScanner(scanners)
-        published = []
-        scanner.set_progress_callback(
-            lambda files, path_pair_id, path_pair_name, root_names, complete:
-            published.append(path_pair_id)
-        )
+    def test_remote_scans_are_serialized_and_keep_input_order(self):
+        first_release = threading.Event()
+        second_release = threading.Event()
+        second_release.set()
+        state = {"lock": threading.Lock(), "active": 0, "max_active": 0, "order": []}
+        first = _SerialPathPairScanner("pair-1", first_release, state)
+        second = _SerialPathPairScanner("pair-2", second_release, state)
+        scanner = MultiPathRemoteScanner([first, second])
         result = []
 
-        def run_scan():
-            try:
-                scanner.scan()
-            except Exception as error:
-                result.append(error)
-
-        thread = threading.Thread(target=run_scan)
+        thread = threading.Thread(target=lambda: result.append(scanner.scan()))
         thread.start()
-        self.assertTrue(all(started[index].wait(timeout=2) for index in range(4)))
-        self.assertFalse(started[4].is_set())
-        self.assertFalse(started[5].is_set())
-        release.set()
+        self.assertTrue(first.started.wait(timeout=2))
+        self.assertFalse(second.started.wait(timeout=0.1))
+
+        first_release.set()
+        self.assertTrue(second.started.wait(timeout=2))
         thread.join(timeout=5)
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(1, len(result))
-        self.assertIsInstance(result[0], RuntimeError)
+        self.assertEqual(["pair-1", "pair-2"], state["order"])
+        self.assertEqual(1, state["max_active"])
+        self.assertEqual(["pair-1.bin", "pair-2.bin"], [file.name for file in result[0]])
+
+    def test_fatal_remote_error_stops_following_scans(self):
+        release = threading.Event()
+        release.set()
+        first = _BlockingPathPairScanner("pair-1", threading.Event(), release, fatal=True)
+        second = _BlockingPathPairScanner("pair-2", threading.Event(), release)
+        scanner = MultiPathRemoteScanner([first, second])
+
+        with self.assertRaises(RuntimeError):
+            scanner.scan()
+        self.assertTrue(first.started.is_set())
+        self.assertFalse(second.started.is_set())
         self.assertEqual(set(), scanner.failed_path_pair_ids())
-        self.assertNotIn("pair-5", published)
-        self.assertNotIn("pair-6", published)
-
-    def test_bounded_scheduler_advances_after_early_error_and_first_wave(self):
-        release = threading.Event()
-        started = [threading.Event() for _ in range(6)]
-        scanners = [
-            _BlockingPathPairScanner(
-                "pair-{}".format(index + 1),
-                started[index],
-                release,
-                block=index in {1, 2, 3, 4},
-                fail=index == 0,
-            )
-            for index in range(6)
-        ]
-        scanner = MultiPathRemoteScanner(scanners)
-        published = []
-        scanner.set_progress_callback(
-            lambda files, path_pair_id, path_pair_name, root_names, complete:
-            published.append((path_pair_id, complete))
-        )
-        result = []
-
-        def run_scan():
-            try:
-                scanner.scan()
-            except ScannerError as error:
-                result.append(error)
-
-        thread = threading.Thread(target=run_scan)
-        thread.start()
-        self.assertTrue(started[4].wait(timeout=2))
-        self.assertFalse(started[5].is_set())
-        release.set()
-        thread.join(timeout=5)
-
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(1, len(result))
-        self.assertTrue(result[0].recoverable)
-        self.assertEqual({"pair-1"}, scanner.failed_path_pair_ids())
-        self.assertTrue(started[5].is_set())
-        published_ids = {path_pair_id for path_pair_id, _ in published}
-        self.assertIn("pair-5", published_ids)
-        self.assertIn("pair-6", published_ids)
 
     def test_recycled_state_round_trips_each_remote_scanner_in_order(self):
         movie_scanner = MagicMock()

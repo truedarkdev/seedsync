@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from dataclasses import dataclass
 from typing import Iterable, List, Sequence, Tuple
 import fnmatch
 
@@ -7,6 +8,38 @@ from system import SystemFile
 
 
 ExcludePattern = Tuple[str, bool]
+
+
+@dataclass(frozen=True)
+class ExactPathExclusion:
+    """A verified source-root-relative path, not a user glob pattern."""
+    relative_path: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.relative_path, str):
+            raise TypeError("relative_path must be a string")
+        if not self.relative_path or self.relative_path.startswith("/") or any(
+                part in ("", ".", "..") for part in self.relative_path.split("/")):
+            raise ValueError("relative_path must be contained and root-relative")
+        if any(ord(character) < 32 or ord(character) == 127 for character in self.relative_path):
+            raise ValueError("relative_path cannot contain control characters")
+
+
+def partition_transfer_exclusions(
+        exclude_patterns: str | Iterable[str | ExactPathExclusion | None] | None,
+) -> tuple[List[str], List[ExactPathExclusion]]:
+    """Keep configured globs and exact recovery exclusions distinct."""
+    if isinstance(exclude_patterns, str) or exclude_patterns is None:
+        return parse_exclude_patterns(exclude_patterns), []
+    user_patterns: List[str] = []
+    exact_paths: List[ExactPathExclusion] = []
+    for pattern in exclude_patterns:
+        if isinstance(pattern, ExactPathExclusion):
+            if pattern not in exact_paths:
+                exact_paths.append(pattern)
+        else:
+            user_patterns.append(pattern)
+    return parse_exclude_patterns(user_patterns), exact_paths
 
 
 def parse_exclude_patterns(exclude_patterns: str | Iterable[str | None] | None) -> List[str]:
@@ -52,11 +85,13 @@ def _clone_system_file(system_file: SystemFile, children: Sequence[SystemFile] |
         system_file.is_dir,
         time_created=system_file.timestamp_created,
         time_modified=system_file.timestamp_modified,
+        mtime_ns=system_file.mtime_ns,
         is_staging=system_file.is_staging,
     )
     cloned.path_pair_id = system_file.path_pair_id
     cloned.path_pair_name = system_file.path_pair_name
     cloned.status_sidecar_ready = system_file.status_sidecar_ready
+    cloned.has_staging_collision = system_file.has_staging_collision
     for child in children if children is not None else system_file.iter_children():
         cloned.add_child(child)
     return cloned

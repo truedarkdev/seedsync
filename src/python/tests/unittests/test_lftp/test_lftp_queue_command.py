@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from lftp import Lftp, LftpError
+from common.exclude_patterns import ExactPathExclusion
 
 
 class TestLftpQueueCommand(unittest.TestCase):
@@ -69,3 +70,21 @@ class TestLftpQueueCommand(unittest.TestCase):
             'queue pget -c "/remote/path/movie.mkv" -o "/local/path/"',
             command
         )
+
+    def test_queue_dir_renders_typed_exact_paths_as_anchored_regexes(self):
+        lftp = self._make_lftp()
+
+        lftp.queue(
+            "show",
+            True,
+            exclude_patterns=[
+                "*.nfo",
+                ExactPathExclusion("E06.mkv"),
+                ExactPathExclusion(r"nested/[E07]*?,comma\name.mkv"),
+            ],
+        )
+
+        command = lftp._Lftp__run_command.call_args[0][0]
+        self.assertIn('--exclude-glob "*.nfo"', command)
+        self.assertIn('--exclude "^E06\\\\.mkv$"', command)
+        self.assertIn('--exclude "^nested/\\\\[E07\\\\]\\\\*\\\\?,comma\\\\\\\\name\\\\.mkv$"', command)

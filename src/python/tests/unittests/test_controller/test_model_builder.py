@@ -2,7 +2,9 @@
 
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 import json
@@ -15,6 +17,7 @@ from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelError, ModelFile, Model
 from controller import ModelBuilder
+from controller.scan import LocalScanner
 from controller.model_builder import _RecentLiveTransferSnapshot
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractStatus
@@ -859,6 +862,590 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DEFAULT, built_root.state)
         self.assertEqual(ModelFile.State.DEFAULT, built_root.get_children()[0].state)
 
+    def test_split_root_combines_final_and_staged_bytes_and_returns_exact_final_leaves(self):
+        stamp = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 300, True)
+        remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=1))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False))
+        remote_nested = SystemFile("nested", 100, True)
+        remote_nested.add_child(SystemFile("[E08]*.mkv", 100, False))
+        remote_root.add_child(remote_nested)
+
+        local_root = SystemFile("release", 180, True)
+        local_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=1))
+        local_root.add_child(SystemFile("E07.mkv", 80, False, is_staging=True))
+        local_nested = SystemFile("nested", 0, True)
+        local_nested.add_child(SystemFile("[E08]*.mkv", 0, False, is_staging=True))
+        local_root.add_child(local_nested)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(80, 300, 27, 100, 3)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        model = self.model_builder.build_model()
+        release = model.get_file("release")
+
+        self.assertEqual(180, release.transferred_size)
+        self.assertEqual(60, release.download_progress)
+        self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_trusts_lftp_normalized_epoch_mtime_despite_different_naive_display_times(self):
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile(
+            "E06.mkv", 100, False,
+            time_modified=datetime(2026, 8, 11, 12, 0, 0), mtime_ns=1786400003444444444
+        ))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False))
+        local_root = SystemFile("release", 120, True)
+        # These are local display times from different host timezones for the
+        # same LFTP-preserved filesystem second.
+        local_root.add_child(SystemFile(
+            "E06.mkv", 100, False,
+            time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000
+        ))
+        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(20, 200, 10, 100, 3)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(120, release.transferred_size)
+        self.assertEqual(("E06.mkv",), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_rejects_unequal_epoch_mtime_even_with_equal_naive_display_time(self):
+        displayed_time = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile(
+            "E06.mkv", 100, False, time_modified=displayed_time, mtime_ns=1786400004000000000
+        ))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False))
+        local_root = SystemFile("release", 120, True)
+        local_root.add_child(SystemFile(
+            "E06.mkv", 100, False, time_modified=displayed_time, mtime_ns=1786400003000000000
+        ))
+        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_does_not_trust_legacy_leaf_without_epoch_mtime(self):
+        displayed_time = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=displayed_time))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False))
+        local_root = SystemFile("release", 120, True)
+        local_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=displayed_time))
+        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_active_staging_does_not_supersede_final_for_equal_lftp_epoch_across_display_timezones(self):
+        final_file = SystemFile(
+            "movie.mkv", 100, False,
+            time_modified=datetime(2026, 8, 11, 12, 0, 0), mtime_ns=1786400003000000000
+        )
+        remote_file = SystemFile(
+            "movie.mkv", 100, False,
+            time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003444444444
+        )
+        active_staging = SystemFile("movie.mkv", 20, False, is_staging=True)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([final_file])
+        self.model_builder.set_active_files([active_staging])
+
+        effective_file = self.model_builder._ModelBuilder__build_effective_local_files()["movie.mkv"]
+
+        self.assertIs(final_file, effective_file)
+
+    def test_active_staging_supersedes_final_for_next_lftp_epoch_second(self):
+        final_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000
+        )
+        remote_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 12, 0, 0), mtime_ns=1786400004000000000
+        )
+        active_staging = SystemFile("movie.mkv", 20, False, is_staging=True)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([final_file])
+        self.model_builder.set_active_files([active_staging])
+
+        effective_file = self.model_builder._ModelBuilder__build_effective_local_files()["movie.mkv"]
+
+        self.assertIs(active_staging, effective_file)
+
+    def test_active_staging_does_not_supersede_final_for_older_epoch_despite_newer_display_time(self):
+        final_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 12, 0, 0), mtime_ns=1786400004000000000
+        )
+        remote_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 14, 0, 0), mtime_ns=1786400003000000000
+        )
+        active_staging = SystemFile("movie.mkv", 20, False, is_staging=True)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([final_file])
+        self.model_builder.set_active_files([active_staging])
+
+        effective_file = self.model_builder._ModelBuilder__build_effective_local_files()["movie.mkv"]
+
+        self.assertIs(final_file, effective_file)
+
+    def test_active_staging_does_not_supersede_final_without_epoch_provenance(self):
+        final_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 12, 0, 0)
+        )
+        remote_file = SystemFile(
+            "movie.mkv", 100, False, time_modified=datetime(2026, 8, 11, 14, 0, 0)
+        )
+        active_staging = SystemFile("movie.mkv", 20, False, is_staging=True)
+        self.model_builder.set_remote_files([remote_file])
+        self.model_builder.set_local_files([final_file])
+        self.model_builder.set_active_files([active_staging])
+
+        effective_file = self.model_builder._ModelBuilder__build_effective_local_files()["movie.mkv"]
+
+        self.assertIs(final_file, effective_file)
+
+    def test_active_staging_overlay_preserves_verified_split_root_final_leaves_and_completion(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 28, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 7, False))
+        remote_nested = SystemFile("nested", 11, True)
+        remote_nested.add_child(SystemFile("E06.mkv", 11, False))
+        remote_root.add_child(remote_nested)
+
+        final_e06 = SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns)
+        staged_e07 = SystemFile("E07.mkv", 7, False, is_staging=True)
+        staged_nested = SystemFile("nested", 11, True, is_staging=True)
+        staged_nested.add_child(SystemFile("E06.mkv", 11, False, is_staging=True))
+        stale_staged = SystemFile("stale.mkv", 5, False, is_staging=True)
+        merged_local_root = SystemFile("release", 33, True)
+        merged_local_root.add_child(final_e06)
+        merged_local_root.add_child(staged_e07)
+        merged_local_root.add_child(staged_nested)
+        merged_local_root.add_child(stale_staged)
+
+        active_e07 = SystemFile("E07.mkv", 7, False)
+        active_e07.status_sidecar_ready = True
+        active_nested = SystemFile("nested", 11, True)
+        active_nested.add_child(SystemFile("E06.mkv", 11, False))
+        # ActiveScanner historically returns this staging-root tree without
+        # location flags; ModelBuilder owns the semantic normalization.
+        active_root = SystemFile("release", 18, True)
+        active_root.add_child(active_e07)
+        active_root.add_child(active_nested)
+
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(18, 28, 64, 100, 1)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([merged_local_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_children = {child.name: child for child in effective_root.iter_children()}
+
+        self.assertTrue(active_root.is_staging)
+        self.assertTrue(active_nested.is_staging)
+        self.assertEqual(28, effective_root.size)
+        self.assertIs(final_e06, effective_children["E06.mkv"])
+        self.assertNotIn("stale.mkv", effective_children)
+        self.assertTrue(effective_children["E07.mkv"].status_sidecar_ready)
+
+        release = self.model_builder.build_model().get_file("release")
+        release_children = {child.name: child for child in release.get_children()}
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, release.state)
+        self.assertEqual(28, release.local_size)
+        self.assertEqual(28, release.transferred_size)
+        self.assertTrue(release_children["E06.mkv"].local_present)
+        self.assertEqual(10, release_children["E06.mkv"].transferred_size)
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+
+        # The active tree remains complete after the LFTP status vanishes;
+        # ModelUpdater's pending-completion move gate uses this exact query.
+        self.model_builder.set_lftp_statuses([])
+        self.model_builder.build_model()
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_active_duplicate_of_verified_split_leaf_retains_collision_without_double_counting(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 38, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 7, False))
+        remote_nested = SystemFile("nested", 11, True)
+        remote_nested.add_child(SystemFile("E06.mkv", 11, False))
+        remote_root.add_child(remote_nested)
+        remote_root.add_child(SystemFile("missing.mkv", 10, False))
+
+        existing_root = SystemFile("release", 28, True)
+        existing_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        existing_root.add_child(SystemFile("E07.mkv", 7, False, is_staging=True))
+        existing_nested = SystemFile("nested", 11, True, is_staging=True)
+        existing_nested.add_child(SystemFile("E06.mkv", 11, False, is_staging=True))
+        existing_root.add_child(existing_nested)
+
+        active_root = SystemFile("release", 28, True)
+        active_root.add_child(SystemFile("E06.mkv", 10, False))
+        active_root.add_child(SystemFile("E07.mkv", 7, False))
+        active_nested = SystemFile("nested", 11, True)
+        active_nested.add_child(SystemFile("E06.mkv", 11, False))
+        active_root.add_child(active_nested)
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(18, 38, 47, 100, 1)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([existing_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_e06 = next(child for child in effective_root.iter_children() if child.name == "E06.mkv")
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertTrue(effective_e06.has_staging_collision)
+        self.assertEqual(18, release.transferred_size)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_active_only_extra_bytes_cannot_complete_partial_split_root_directory(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root = SystemFile("release", 15, True)
+        local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("E07.mkv", 5, False, is_staging=True))
+        active_root = SystemFile("release", 10, True)
+        active_root.add_child(SystemFile("E07.mkv", 5, False))
+        active_root.add_child(SystemFile("x", 5, False))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(5, 20, 25, 100, 1)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(20, release.local_size)
+        self.assertEqual(15, release.transferred_size)
+        self.assertEqual(ModelFile.State.DOWNLOADING, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_active_only_staging_extra_rejects_complete_split_root_coverage(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root = SystemFile("release", 20, True)
+        local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("E07.mkv", 10, False, is_staging=True))
+        active_root = SystemFile("release", 15, True)
+        active_root.add_child(SystemFile("E07.mkv", 10, False))
+        active_root.add_child(SystemFile("x", 5, False))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(10, 20, 50, 100, 1)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(ModelFile.State.DOWNLOADING, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_final_only_extra_does_not_reject_complete_split_root_coverage(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root = SystemFile("release", 25, True)
+        local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("E07.mkv", 10, False, is_staging=True))
+        local_root.add_child(SystemFile("notes.txt", 5, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertTrue(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_active_file_type_mismatch_preserves_remote_matching_final_directory_shape(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 15, True)
+        remote_payload = SystemFile("payload", 10, True)
+        remote_payload.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(remote_payload)
+        remote_root.add_child(SystemFile("progress", 5, False))
+        local_root = SystemFile("release", 15, True)
+        local_payload = SystemFile("payload", 10, True)
+        local_payload.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(local_payload)
+        local_root.add_child(SystemFile("progress", 5, False, is_staging=True))
+        active_root = SystemFile("release", 15, True)
+        active_root.add_child(SystemFile("payload", 10, False))
+        active_root.add_child(SystemFile("progress", 5, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_payload = next(child for child in effective_root.iter_children() if child.name == "payload")
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertTrue(effective_payload.is_dir)
+        self.assertTrue(effective_payload.has_staging_collision)
+        self.assertTrue(next(child for child in release.get_children() if child.name == "payload").is_dir)
+
+    def test_active_directory_type_mismatch_preserves_remote_matching_final_file_shape(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 15, True)
+        remote_root.add_child(SystemFile("payload", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("progress", 5, False))
+        local_root = SystemFile("release", 15, True)
+        local_root.add_child(SystemFile("payload", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("progress", 5, False, is_staging=True))
+        active_root = SystemFile("release", 15, True)
+        active_payload = SystemFile("payload", 10, True)
+        active_payload.add_child(SystemFile("staged.mkv", 10, False))
+        active_root.add_child(active_payload)
+        active_root.add_child(SystemFile("progress", 5, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        effective_payload = next(child for child in effective_root.iter_children() if child.name == "payload")
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertFalse(effective_payload.is_dir)
+        self.assertTrue(effective_payload.has_staging_collision)
+        self.assertFalse(next(child for child in release.get_children() if child.name == "payload").is_dir)
+
+    def test_active_root_file_type_mismatch_preserves_split_final_directory_shape(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 15, True)
+        remote_root.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("progress", 5, False))
+        local_root = SystemFile("release", 15, True)
+        local_root.add_child(SystemFile("complete.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("progress", 5, False, is_staging=True))
+        active_root = SystemFile("release", 15, False)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertTrue(effective_root.is_dir)
+        self.assertTrue(effective_root.has_staging_collision)
+        self.assertTrue(release.is_dir)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_active_root_directory_type_mismatch_preserves_collided_final_file_shape(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        local_root = SystemFile("release", 10, False, mtime_ns=mtime_ns)
+        local_root.has_staging_collision = True
+        active_root = SystemFile("release", 10, True)
+        active_root.add_child(SystemFile("staged.mkv", 10, False))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        effective_root = self.model_builder._ModelBuilder__build_effective_local_files()["release"]
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertFalse(effective_root.is_dir)
+        self.assertTrue(effective_root.has_staging_collision)
+        self.assertFalse(release.is_dir)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_root_collision_blocks_all_children_downloaded_promotion(self):
+        mtime_ns = 1786400003000000000
+        remote_root = SystemFile("release", 20, True)
+        remote_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        remote_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root = SystemFile("release", 20, True)
+        local_root.add_child(SystemFile("E06.mkv", 10, False, mtime_ns=mtime_ns))
+        local_root.add_child(SystemFile("E07.mkv", 10, False))
+        local_root.has_staging_collision = True
+        active_root = SystemFile("release", 20, False)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_active_files([active_root])
+
+        release = self.model_builder.build_model().get_file("release")
+        children = {child.name: child for child in release.get_children()}
+
+        self.assertEqual(ModelFile.State.DOWNLOADED, children["E06.mkv"].state)
+        self.assertEqual(ModelFile.State.DOWNLOADED, children["E07.mkv"].state)
+        self.assertNotEqual(ModelFile.State.DOWNLOADED, release.state)
+        self.assertFalse(self.model_builder.has_complete_local_coverage("release"))
+
+    def test_split_root_does_not_trust_stale_final_leaf_by_name_or_size_alone(self):
+        remote_stamp = datetime(2026, 8, 11, 12, 0, 0)
+        stale_stamp = datetime(2026, 8, 10, 12, 0, 0)
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile(
+            "E06.mkv", 100, False, time_modified=remote_stamp, mtime_ns=2000000000
+        ))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, time_modified=remote_stamp))
+        local_root = SystemFile("release", 120, True)
+        local_root.add_child(SystemFile(
+            "E06.mkv", 100, False, time_modified=stale_stamp, mtime_ns=3000000000
+        ))
+        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_ordinary_final_directory_does_not_generate_split_root_exclusions(self):
+        stamp = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 100, True)
+        remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=4))
+        local_root = SystemFile("release", 100, True)
+        local_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=4))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_does_not_trust_same_name_final_leaf_with_changed_size(self):
+        stamp = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 220, True)
+        remote_root.add_child(SystemFile("E06.mkv", 120, False, time_modified=stamp, mtime_ns=5))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, time_modified=stamp))
+        local_root = SystemFile("release", 120, True)
+        local_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=5))
+        local_root.add_child(SystemFile("E07.mkv", 20, False, is_staging=True))
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_collision_leaf_is_not_added_to_staged_progress(self):
+        stamp = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=6))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, time_modified=stamp))
+        local_root = SystemFile("release", 170, True)
+        local_e06 = SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=6)
+        local_e06.has_staging_collision = True
+        local_root.add_child(local_e06)
+        local_root.add_child(SystemFile("E07.mkv", 70, False, is_staging=True))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(70, 200, 35, 100, 3)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(70, release.transferred_size)
+        self.assertEqual(35, release.download_progress)
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_type_collision_leaf_is_not_trusted_or_added_to_progress(self):
+        stamp = datetime(2026, 8, 11, 12, 0, 0)
+        remote_root = SystemFile("release", 200, True)
+        remote_root.add_child(SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=7))
+        remote_root.add_child(SystemFile("E07.mkv", 100, False, time_modified=stamp))
+        local_root = SystemFile("release", 170, True)
+        final_e06 = SystemFile("E06.mkv", 100, False, time_modified=stamp, mtime_ns=7)
+        # LocalScanner sets this when an incompatible staging directory named
+        # E06.mkv is retained beside the final file.
+        final_e06.has_staging_collision = True
+        local_root.add_child(final_e06)
+        local_root.add_child(SystemFile("E07.mkv", 70, False, is_staging=True))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(70, 200, 35, 100, 3)
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertEqual(70, release.transferred_size)
+        self.assertEqual(35, release.download_progress)
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
+    def test_split_root_final_directory_staging_file_collision_does_not_trust_descendants(self):
+        local_dir = tempfile.mkdtemp(prefix="test_split_root_final_directory_collision")
+        self.addCleanup(shutil.rmtree, local_dir)
+        staging_dir = os.path.join(local_dir, "incomplete")
+        os.mkdir(staging_dir)
+        os.mkdir(os.path.join(local_dir, "release"))
+        with open(os.path.join(local_dir, "release", "complete.mkv"), "w") as handle:
+            handle.write("complete")
+        with open(os.path.join(staging_dir, "release"), "w") as handle:
+            handle.write("incomplete")
+
+        local_root = LocalScanner(local_dir, use_temp_file=False, staging_path=staging_dir).scan()[0]
+        local_complete = list(local_root.iter_children())[0]
+        remote_root = SystemFile("release", local_complete.size, True)
+        remote_root.add_child(SystemFile(
+            "complete.mkv", local_complete.size, False,
+            time_modified=local_complete.timestamp_modified, mtime_ns=local_complete.mtime_ns
+        ))
+
+        self.assertTrue(local_root.has_staging_collision)
+        self.assertEqual(
+            0,
+            ModelBuilder._ModelBuilder__trusted_final_leaf_bytes(remote_root, local_root),
+        )
+
+    def test_split_root_nested_type_collision_does_not_trust_descendant_from_scanner_tree(self):
+        local_dir = tempfile.mkdtemp(prefix="test_split_root_nested_collision")
+        self.addCleanup(shutil.rmtree, local_dir)
+        staging_dir = os.path.join(local_dir, "incomplete")
+        os.mkdir(staging_dir)
+        os.makedirs(os.path.join(local_dir, "release", "nested"))
+        with open(os.path.join(local_dir, "release", "nested", "complete.mkv"), "w") as handle:
+            handle.write("complete")
+        os.mkdir(os.path.join(staging_dir, "release"))
+        with open(os.path.join(staging_dir, "release", "nested"), "w") as handle:
+            handle.write("incomplete")
+        with open(os.path.join(staging_dir, "release", "partial.mkv"), "w") as handle:
+            handle.write("part")
+
+        local_root = LocalScanner(local_dir, use_temp_file=False, staging_path=staging_dir).scan()[0]
+        local_children = {child.name: child for child in local_root.iter_children()}
+        local_complete = list(local_children["nested"].iter_children())[0]
+        local_partial = local_children["partial.mkv"]
+        remote_root = SystemFile("release", local_complete.size + 100, True)
+        remote_nested = SystemFile("nested", local_complete.size, True)
+        remote_nested.add_child(SystemFile(
+            "complete.mkv", local_complete.size, False,
+            time_modified=local_complete.timestamp_modified, mtime_ns=local_complete.mtime_ns
+        ))
+        remote_root.add_child(remote_nested)
+        remote_root.add_child(SystemFile("partial.mkv", 100, False))
+        running_status = LftpJobStatus(0, LftpJobStatus.Type.MIRROR, LftpJobStatus.State.RUNNING, "release", "")
+        running_status.total_transfer_state = LftpJobStatus.TransferState(
+            local_partial.size, remote_root.size, 50, 100, 3
+        )
+        self.model_builder.set_remote_files([remote_root])
+        self.model_builder.set_local_files([local_root])
+        self.model_builder.set_lftp_statuses([running_status])
+
+        release = self.model_builder.build_model().get_file("release")
+
+        self.assertTrue(local_children["nested"].has_staging_collision)
+        self.assertEqual(local_partial.size, release.transferred_size)
+        self.assertEqual((), self.model_builder.get_trusted_final_leaf_paths("release"))
+
     def test_build_state_dir_persist_staging_root_stays_default_with_incomplete_remote_children(self):
         remote_root = SystemFile("release", 300, True)
         remote_root.add_child(SystemFile("part1.rar", 100, False))
@@ -1575,10 +2162,14 @@ class TestModelBuilder(unittest.TestCase):
     def test_build_running_file_prefers_staging_copy_when_remote_timestamp_indicates_newer_content(self):
         self.model_builder.clear()
         self.model_builder.set_remote_files([
-            SystemFile("a", 1000, False, time_modified=datetime(2026, 3, 26, 12, 0, 0))
+            SystemFile(
+                "a", 1000, False, time_modified=datetime(2026, 3, 26, 12, 0, 0), mtime_ns=2000000000
+            )
         ])
         self.model_builder.set_local_files([
-            SystemFile("a", 1000, False, time_modified=datetime(2026, 3, 25, 12, 0, 0))
+            SystemFile(
+                "a", 1000, False, time_modified=datetime(2026, 3, 25, 12, 0, 0), mtime_ns=1000000000
+            )
         ])
         self.model_builder.set_active_files([SystemFile("a", 100, False, is_staging=True)])
 
@@ -4139,7 +4730,7 @@ class TestModelBuilder(unittest.TestCase):
             "context",
         ):
             self.assertIn(key, details)
-        self.assertEqual({"present": True, "is_staging": False}, details["matched_local"])
+        self.assertEqual({"present": True, "is_staging": True}, details["matched_local"])
         self.assertNotIn("C:\\seedsync", str(details))
         self.assertNotIn("command", str(details).lower())
 

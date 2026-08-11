@@ -13,7 +13,7 @@ import pexpect
 # my libs
 from common import AppError
 from common.config import Checkers
-from common.exclude_patterns import parse_exclude_patterns
+from common.exclude_patterns import ExactPathExclusion, partition_transfer_exclusions
 from common.redaction import redact_sensitive_text
 from .job_status_parser import LftpJobStatus, LftpJobStatusParser, LftpJobStatusParserError
 
@@ -872,7 +872,7 @@ class Lftp:
               is_dir: bool,
               remote_base_dir_path: Optional[str] = None,
               local_base_dir_path: Optional[str] = None,
-              exclude_patterns: str | Iterable[str] | None = None):
+              exclude_patterns: str | Iterable[str | ExactPathExclusion] | None = None):
         """
         Queues a job for download
         This method may cause an exception to be generated in a later method call:
@@ -891,12 +891,21 @@ class Lftp:
             "-c",
         ]
         if is_dir:
-            parsed_exclude_patterns = parse_exclude_patterns(exclude_patterns)
-            if parsed_exclude_patterns:
+            user_exclude_patterns, exact_exclude_paths = partition_transfer_exclusions(exclude_patterns)
+            if user_exclude_patterns:
                 parts.extend(
                     "--exclude-glob {}".format(Lftp.__quote_command_argument(pattern))
-                    for pattern in parsed_exclude_patterns
+                    for pattern in user_exclude_patterns
                 )
+            # LFTP's glob exclusions match basenames at every depth.  Its
+            # regex exclusion is evaluated against the source-root-relative
+            # path, so anchors make this an exact leaf exclusion.
+            parts.extend(
+                "--exclude {}".format(Lftp.__quote_command_argument(
+                    "^{}$".format(re.escape(exact_path.relative_path))
+                ))
+                for exact_path in exact_exclude_paths
+            )
 
         parts.append(Lftp.__quote_command_argument("{remote_dir}/{filename}".format(
             remote_dir=remote_dir,

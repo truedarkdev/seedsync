@@ -59,6 +59,15 @@ class TestSystemFile(unittest.TestCase):
         sf = SystemFile("", 0, True)
         self.assertIsNone(sf.timestamp_modified)
 
+    def test_mtime_ns_round_trips_without_changing_display_timestamp(self):
+        displayed_time = datetime(2018, 11, 9, 21, 40, 18)
+        sf = SystemFile("", 0, True, time_modified=displayed_time, mtime_ns=1541796018123456789)
+
+        restored = SystemFile.from_dict(sf.to_dict())
+
+        self.assertEqual(displayed_time, restored.timestamp_modified)
+        self.assertEqual(1541796018123456789, restored.mtime_ns)
+
     def test_add_child(self):
         sf = SystemFile("", 0, True)
         sf.add_child(SystemFile("child1", 42, True))
@@ -77,6 +86,15 @@ class TestSystemFile(unittest.TestCase):
 
         sf.is_staging = False
         self.assertFalse(sf.is_staging)
+
+    def test_staging_collision_round_trips_without_changing_staging_role(self):
+        sf = SystemFile("test", 0, False)
+        sf.has_staging_collision = True
+
+        restored = SystemFile.from_dict(sf.to_dict())
+
+        self.assertTrue(restored.has_staging_collision)
+        self.assertFalse(restored.is_staging)
 
     def test_fail_add_child_to_file(self):
         sf = SystemFile("", 0, False)

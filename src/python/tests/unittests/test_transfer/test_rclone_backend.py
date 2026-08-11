@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 from transfer.rclone_backend import RcloneTransferBackend, RcloneTransferError
+from common.exclude_patterns import ExactPathExclusion
 
 
 class _FakePopen:
@@ -80,6 +81,34 @@ class TestRcloneTransferBackend(unittest.TestCase):
             self.assertEqual(1, len(statuses))
             self.assertEqual("movie.mkv", statuses[0].name)
             self.assertEqual(128, statuses[0].total_transfer_state.size_local)
+
+    @patch("transfer.rclone_backend.shutil.which", return_value="rclone")
+    @patch("transfer.rclone_backend.subprocess.run", return_value=_CompletedProcess())
+    @patch("transfer.rclone_backend.subprocess.Popen", side_effect=_FakePopen)
+    def test_queue_renders_typed_exact_paths_as_root_anchored_literals(self, _mock_popen, _mock_run, _mock_which):
+        with tempfile.TemporaryDirectory(prefix="test_rclone_backend_") as temp_dir:
+            backend = RcloneTransferBackend(
+                address="remote.server.com", port=22, user="user", password="password"
+            )
+            backend.set_base_remote_dir_path("/remote")
+            backend.set_base_local_dir_path(temp_dir)
+
+            backend.queue(
+                "show",
+                True,
+                exclude_patterns=[
+                    "*.nfo",
+                    ExactPathExclusion("E06.mkv"),
+                    ExactPathExclusion(r"nested/[E07]*?,comma\name.mkv"),
+                ],
+            )
+
+            command = _FakePopen.instances[0].command
+            exclusions = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "--exclude"]
+            self.assertEqual(
+                ["*.nfo", "/E06.mkv", r"/nested/\[E07]\*\?,comma\\name.mkv"],
+                exclusions,
+            )
 
     @patch("transfer.rclone_backend.shutil.which", return_value="rclone")
     @patch("transfer.rclone_backend.subprocess.run", return_value=_CompletedProcess())

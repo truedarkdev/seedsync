@@ -11,9 +11,11 @@ class SystemFileData(TypedDict):
     is_dir: bool
     time_created: NotRequired[str | None]
     time_modified: NotRequired[str | None]
+    mtime_ns: NotRequired[int]
     path_pair_id: NotRequired[str]
     path_pair_name: NotRequired[str]
     is_staging: NotRequired[bool]
+    has_staging_collision: NotRequired[bool]
     children: NotRequired[list["SystemFileData"]]
 
 
@@ -27,11 +29,12 @@ class SystemFile:
         "__flags",
         "__timestamp_created",
         "__timestamp_modified",
+        "__mtime_ns",
         "__children",
         "__path_pair_id",
         "__path_pair_name",
     )
-    __DIR, __STAGING, __STATUS_READY = 1, 2, 4
+    __DIR, __STAGING, __STATUS_READY, __STAGING_COLLISION = 1, 2, 4, 8
 
     def __init__(self,
                  name: str,
@@ -39,7 +42,8 @@ class SystemFile:
                  is_dir: bool = False,
                  time_created: datetime | None = None,
                  time_modified: datetime | None = None,
-        is_staging: bool = False):
+                 is_staging: bool = False,
+                 mtime_ns: int | None = None):
         if size < 0:
             raise ValueError("File size must be zero or greater")
         self.__name = name
@@ -47,6 +51,7 @@ class SystemFile:
         self.__flags = self.__DIR if is_dir else 0
         self.__timestamp_created = time_created
         self.__timestamp_modified = time_modified
+        self.__mtime_ns = mtime_ns
         # Most scan nodes are leaves.  Preserve the mutable public ``children``
         # list, but allocate it only when a caller actually needs it.
         self.__children: list[SystemFile] | None = None
@@ -64,10 +69,12 @@ class SystemFile:
             and self.is_dir == other.is_dir
             and self.__timestamp_created == other.__timestamp_created
             and self.__timestamp_modified == other.__timestamp_modified
+            and self.__mtime_ns == other.__mtime_ns
             and (self.__children or []) == (other.__children or [])
             and self.__path_pair_id == other.__path_pair_id
             and self.__path_pair_name == other.__path_pair_name
             and self.is_staging == other.is_staging
+            and self.has_staging_collision == other.has_staging_collision
             and self.status_sidecar_ready == other.status_sidecar_ready
         )
 
@@ -82,11 +89,13 @@ class SystemFile:
             "_SystemFile__is_dir": self.is_dir,
             "_SystemFile__timestamp_created": self.__timestamp_created,
             "_SystemFile__timestamp_modified": self.__timestamp_modified,
+            "_SystemFile__mtime_ns": self.__mtime_ns,
             "_SystemFile__children": self.__children or [],
             "_SystemFile__path_pair_id": self.__path_pair_id,
             "_SystemFile__path_pair_name": self.__path_pair_name,
             "_SystemFile__is_staging": self.is_staging,
             "_SystemFile__status_sidecar_ready": self.status_sidecar_ready,
+            "_SystemFile__has_staging_collision": self.has_staging_collision,
         }
 
     @property
@@ -103,6 +112,9 @@ class SystemFile:
 
     @property
     def timestamp_modified(self) -> datetime | None: return self.__timestamp_modified
+
+    @property
+    def mtime_ns(self) -> int | None: return self.__mtime_ns
 
     @property
     def children(self) -> List["SystemFile"]:
@@ -141,6 +153,16 @@ class SystemFile:
         self.__flags = self.__flags | self.__STAGING if is_staging else self.__flags & ~self.__STAGING
 
     @property
+    def has_staging_collision(self) -> bool: return bool(self.__flags & self.__STAGING_COLLISION)
+
+    @has_staging_collision.setter
+    def has_staging_collision(self, value: bool):
+        if type(value) != bool:
+            raise TypeError
+        self.__flags = self.__flags | self.__STAGING_COLLISION if value else \
+            self.__flags & ~self.__STAGING_COLLISION
+
+    @property
     def status_sidecar_ready(self) -> bool: return bool(self.__flags & self.__STATUS_READY)
 
     @status_sidecar_ready.setter
@@ -166,12 +188,16 @@ class SystemFile:
             d["time_created"] = self.__timestamp_created.isoformat()
         if self.__timestamp_modified is not None:
             d["time_modified"] = self.__timestamp_modified.isoformat()
+        if self.__mtime_ns is not None:
+            d["mtime_ns"] = self.__mtime_ns
         if self.__path_pair_id is not None:
             d["path_pair_id"] = self.__path_pair_id
         if self.__path_pair_name is not None:
             d["path_pair_name"] = self.__path_pair_name
         if self.is_staging:
             d["is_staging"] = True
+        if self.has_staging_collision:
+            d["has_staging_collision"] = True
         if self.__children:
             d["children"] = [child.to_dict() for child in self.__children]
         return d
@@ -190,10 +216,12 @@ class SystemFile:
             is_dir=data.get("is_dir", False),
             time_created=time_created,
             time_modified=time_modified,
+            mtime_ns=data.get("mtime_ns"),
             is_staging=data.get("is_staging", False),
         )
         system_file.path_pair_id = data.get("path_pair_id")
         system_file.path_pair_name = data.get("path_pair_name")
+        system_file.has_staging_collision = data.get("has_staging_collision", False)
         for child_data in data.get("children", []):
             system_file.add_child(cls.from_dict(child_data))
         return system_file

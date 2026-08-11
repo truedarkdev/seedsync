@@ -63,6 +63,7 @@ class TestScanFsScript(unittest.TestCase):
         nested = files[1]
         self.assertFalse(alpha.is_dir)
         self.assertEqual(3, alpha.size)
+        self.assertEqual(os.stat(os.path.join(self.temp_dir, "alpha.txt")).st_mtime_ns, alpha.mtime_ns)
         self.assertTrue(nested.is_dir)
         self.assertEqual(4, nested.size)
         self.assertEqual(1, len(nested.children))
@@ -96,6 +97,27 @@ class TestScanFsScript(unittest.TestCase):
                         runpy.run_path(str(self.script_path), run_name="__main__")
 
         self.assertNotEqual(0, context.exception.code)
-        self.assertIn('"type": "manifest"', stdout.getvalue())
+        self.assertIn('"type":"manifest_begin"', stdout.getvalue())
         self.assertIn("SystemScannerError: Permission denied while scanning", str(context.exception.code))
         self.assertNotIn('"type": "complete"', stdout.getvalue())
+
+    def test_stream_flattens_a_large_recursive_root_into_bounded_node_records(self):
+        for index in range(800):
+            self._write_file("huge", "child-{:04d}-{}.bin".format(index, "x" * 80), content=b"")
+
+        result = self._run_scan_fs("--stream", self.temp_dir, check=True)
+
+        records = [line.encode("utf-8") for line in result.stdout.splitlines(keepends=True)]
+        self.assertTrue(records)
+        self.assertTrue(all(len(record) <= 64 * 1024 for record in records))
+        payloads = [json.loads(record.decode("utf-8").split("\t", 1)[1]) for record in records]
+        self.assertEqual("manifest_begin", payloads[0]["type"])
+        self.assertIn("manifest_end", [payload["type"] for payload in payloads])
+        self.assertNotIn("roots", [payload["type"] for payload in payloads])
+        root_start = next(payload for payload in payloads if payload["type"] == "root_begin")
+        self.assertEqual("huge", root_start["name"])
+        nodes = [payload for payload in payloads if payload["type"] == "root_node"]
+        self.assertEqual(801, len(nodes))
+        self.assertEqual("huge", nodes[0]["file"]["name"])
+        self.assertNotIn("children", nodes[0]["file"])
+        self.assertEqual(800, sum(node["parent"] == 0 for node in nodes[1:]))

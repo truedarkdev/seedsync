@@ -47,9 +47,11 @@ class TestLocalScanner(unittest.TestCase):
         scanner.run_loop()
         final_results = [result for result in scanner.pop_results() if result.is_full_snapshot]
 
-        self.assertEqual(1, len(final_results))
+        # Completion publishes a per-pair lossless snapshot before the final
+        # aggregate; both remain authoritative under bounded queue pressure.
+        self.assertEqual(2, len(final_results))
         self.assertEqual({"root-{}".format(index) for index in range(140)},
-                         {file.name for file in final_results[0].files})
+                         {file.name for result in final_results for file in result.files})
 
     def test_scan_merges_staging_results_without_exposing_staging_dir(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
@@ -89,7 +91,7 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual(8, files[0].size)
         self.assertFalse(files[0].is_staging)
 
-    def test_scan_prefers_staging_entry_when_same_name_final_duplicate_is_less_complete(self):
+    def test_scan_prefers_final_entry_when_same_name_staging_duplicate_is_larger(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
         os.mkdir(staging_dir)
         with open(os.path.join(self.temp_dir, "movie.mkv"), "w") as handle:
@@ -106,8 +108,9 @@ class TestLocalScanner(unittest.TestCase):
         files = scanner.scan()
 
         self.assertEqual(["movie.mkv"], [system_file.name for system_file in files])
-        self.assertEqual(7, files[0].size)
-        self.assertTrue(files[0].is_staging)
+        self.assertEqual(4, files[0].size)
+        self.assertFalse(files[0].is_staging)
+        self.assertTrue(files[0].has_staging_collision)
 
     def test_scan_prefers_final_entry_when_same_name_duplicate_sizes_are_equal(self):
         staging_dir = os.path.join(self.temp_dir, "incomplete")
@@ -195,6 +198,7 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertTrue(files["series"].is_dir)
         self.assertFalse(files["series"].is_staging)
+        self.assertTrue(files["series"].has_staging_collision)
         self.assertEqual(["complete.txt"], [child.name for child in files["series"].children])
 
     def test_scan_prefers_final_file_when_staging_has_same_name_directory(self):
@@ -216,6 +220,7 @@ class TestLocalScanner(unittest.TestCase):
 
         self.assertFalse(files["movie.mkv"].is_dir)
         self.assertFalse(files["movie.mkv"].is_staging)
+        self.assertTrue(files["movie.mkv"].has_staging_collision)
         self.assertEqual(8, files["movie.mkv"].size)
 
     def test_scan_prefers_final_nested_directory_when_staging_has_same_name_file(self):
@@ -242,6 +247,7 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual(["extras"], [child.name for child in files["series"].children])
         self.assertTrue(files["series"].children[0].is_dir)
         self.assertFalse(files["series"].children[0].is_staging)
+        self.assertTrue(files["series"].children[0].has_staging_collision)
         self.assertEqual(
             ["complete.txt"],
             [child.name for child in files["series"].children[0].children]
@@ -271,6 +277,7 @@ class TestLocalScanner(unittest.TestCase):
         self.assertEqual(["extras"], [child.name for child in files["series"].children])
         self.assertFalse(files["series"].children[0].is_dir)
         self.assertFalse(files["series"].children[0].is_staging)
+        self.assertTrue(files["series"].children[0].has_staging_collision)
         self.assertEqual(8, files["series"].children[0].size)
 
     def test_scan_rejects_non_absolute_local_path(self):
