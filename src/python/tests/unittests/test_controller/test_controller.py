@@ -23,7 +23,17 @@ from controller.scan import MultiPathActiveScanner, ScannerResult
 from controller.controller import ControllerError, DownloadStartLifecycleEntry
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
-from common.performance_diagnostics import PerformanceDiagnosticsCollector
+from common.performance_diagnostics import (
+    DURATION_CONTROLLER_AUXILIARY_REAP,
+    DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CONFIGURATION,
+    DURATION_CONTROLLER_DIAGNOSTICS,
+    DURATION_CONTROLLER_PROCESS,
+    DURATION_CONTROLLER_PROCESS_COMMANDS,
+    DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS,
+    DURATION_MODEL_UPDATE,
+    PerformanceDiagnosticsCollector,
+)
 from common.exclude_patterns import ExactPathExclusion
 from common.path_pair import PathPair
 from lftp import LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -1808,6 +1818,32 @@ class TestController(unittest.TestCase):
         self.controller._Controller__process_commands.assert_called_once_with()
         self.controller._Controller__updater.update.assert_called_once_with()
         self.controller._Controller__log_memory_usage.assert_called_once_with()
+
+    def test_process_attributes_each_fixed_child_stage(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.controller._Controller__context.performance_diagnostics = diagnostics
+        self.controller._Controller__started = True
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__reap_idle_auxiliary_workers = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+
+        self.controller.process()
+
+        durations = diagnostics.snapshot()["durations"]
+        for metric in (
+            DURATION_CONTROLLER_PROCESS,
+            DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS,
+            DURATION_CONTROLLER_CLEANUP_COMMANDS,
+            DURATION_CONTROLLER_PROCESS_COMMANDS,
+            DURATION_CONTROLLER_CONFIGURATION,
+            DURATION_MODEL_UPDATE,
+            DURATION_CONTROLLER_AUXILIARY_REAP,
+            DURATION_CONTROLLER_DIAGNOSTICS,
+        ):
+            self.assertEqual(1, durations[metric]["count"], metric)
 
     def test_process_clears_blank_lftp_settings_during_reconfigure(self):
         self.controller._Controller__started = True

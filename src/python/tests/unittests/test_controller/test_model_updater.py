@@ -27,6 +27,9 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
+    DURATION_MODEL_UPDATE_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+    DURATION_MODEL_UPDATE_TRACE_SETUP,
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
 )
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
@@ -36,6 +39,37 @@ from system import SystemFile
 
 
 class TestModelUpdater(unittest.TestCase):
+    def test_update_attributes_trace_setup_lock_wait_and_finalization(self):
+        diagnostics = MagicMock()
+        diagnostics.begin_duration.side_effect = lambda metric: (metric,)
+        builder = MagicMock()
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(performance_diagnostics=diagnostics),
+            _Controller__model_builder=builder,
+            _Controller__model=MagicMock(),
+            _Controller__work_state_lock=RLock(),
+            _Controller__stop_resume_trace_cycle_id=4,
+            logger=MagicMock(),
+        )
+        updater = ModelUpdater(controller)
+        updater._update_once = MagicMock(return_value=False)
+
+        updater.update()
+
+        self.assertEqual(5, controller._Controller__stop_resume_trace_cycle_id)
+        builder.begin_stop_resume_trace_cycle.assert_called_once_with(5)
+        builder.finish_stop_resume_trace_cycle.assert_called_once_with(controller._Controller__model, False)
+        self.assertEqual([
+            call(DURATION_MODEL_UPDATE_TRACE_SETUP),
+            call(DURATION_MODEL_UPDATE_LOCK_WAIT),
+            call(DURATION_MODEL_UPDATE_TRACE_FINALIZATION),
+        ], diagnostics.begin_duration.call_args_list)
+        self.assertEqual([
+            call(DURATION_MODEL_UPDATE_TRACE_SETUP, (DURATION_MODEL_UPDATE_TRACE_SETUP,)),
+            call(DURATION_MODEL_UPDATE_LOCK_WAIT, (DURATION_MODEL_UPDATE_LOCK_WAIT,)),
+            call(DURATION_MODEL_UPDATE_TRACE_FINALIZATION, (DURATION_MODEL_UPDATE_TRACE_FINALIZATION,)),
+        ], diagnostics.finish_duration.call_args_list)
+
     def test_move_retry_rebuild_gate_is_edge_triggered_and_rearms_after_future_due(self):
         gate = _MoveRetryRebuildGate()
         now = datetime.now()

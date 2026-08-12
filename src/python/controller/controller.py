@@ -50,7 +50,16 @@ from common import (
     AppError, AppOneShotProcess, AppProcess, Args, Config, Constants, Context,
     Localization, MultiprocessingLogger, PathPair, PathPairManager, PathPairError,
 )
-from common.performance_diagnostics import DURATION_CONTROLLER_PROCESS, DURATION_MODEL_UPDATE
+from common.performance_diagnostics import (
+    DURATION_CONTROLLER_AUXILIARY_REAP,
+    DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CONFIGURATION,
+    DURATION_CONTROLLER_DIAGNOSTICS,
+    DURATION_CONTROLLER_PROCESS,
+    DURATION_CONTROLLER_PROCESS_COMMANDS,
+    DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS,
+    DURATION_MODEL_UPDATE,
+)
 from common.exclude_patterns import ExactPathExclusion, parse_exclude_patterns
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
@@ -78,6 +87,35 @@ class ControllerError(AppError):
     Exception indicating a controller error
     """
     pass
+
+
+class _ControllerProcessStageTimer:
+    """Attribute one controller tick to fixed, sequential child stages."""
+
+    def __init__(self, diagnostics: object | None) -> None:
+        self.__diagnostics = diagnostics
+        self.__metric: Optional[str] = None
+        self.__started_at: object = None
+
+    def switch(self, metric: str) -> None:
+        self.finish()
+        self.__metric = metric
+        try:
+            self.__started_at = self.__diagnostics.begin_duration(metric) \
+                if self.__diagnostics is not None else None
+        except Exception:
+            self.__started_at = None
+
+    def finish(self) -> None:
+        diagnostics, metric, started_at = self.__diagnostics, self.__metric, self.__started_at
+        self.__metric = None
+        self.__started_at = None
+        if diagnostics is None or metric is None or started_at is None:
+            return
+        try:
+            diagnostics.finish_duration(metric, started_at)
+        except Exception:
+            pass
 
 
 class ModelPageCursorError(ControllerError):
@@ -1756,47 +1794,47 @@ class Controller:
         This method should return relatively quickly as the heavy lifting is done by concurrent tasks
         :return:
         """
-        startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
-        if startup_validation_error is not None:
-            raise ControllerError(startup_validation_error)
-        if getattr(self, "_Controller__startup_failed", False):
-            raise ControllerError("Cannot process, controller startup failed")
-        if not self.__started:
-            raise ControllerError("Cannot process, controller is not started")
-        self.__propagate_exceptions()
-        self.__cleanup_commands()
-        self.__process_commands()
-        refresh_generation = self.__consume_path_pair_refresh_request()
-        if refresh_generation is not None:
-            try:
-                self.__apply_path_pair_refresh()
-            except Exception:
-                self.logger.exception("Ignoring path pair refresh failure")
-            finally:
-                self.__mark_path_pair_refresh_completed(refresh_generation)
-        lftp_reconfigure_requested = self.__consume_lftp_reconfigure_request()
-        if lftp_reconfigure_requested:
-            try:
-                self.__configure_lftp()
-                self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
-            except Exception:
-                self.__restore_lftp_reconfigure_request()
-                self.logger.exception("Ignoring lftp reconfigure failure")
         diagnostics = getattr(self.__context, "performance_diagnostics", None)
+        stage_timer = _ControllerProcessStageTimer(diagnostics)
         try:
-            started_at = diagnostics.begin_duration(DURATION_MODEL_UPDATE) if diagnostics is not None else None
-        except Exception:
-            started_at = None
-        try:
-            self.__updater.update()
-        finally:
-            if diagnostics is not None:
+            stage_timer.switch(DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS)
+            startup_validation_error = getattr(self, "_Controller__startup_validation_error", None)
+            if startup_validation_error is not None:
+                raise ControllerError(startup_validation_error)
+            if getattr(self, "_Controller__startup_failed", False):
+                raise ControllerError("Cannot process, controller startup failed")
+            if not self.__started:
+                raise ControllerError("Cannot process, controller is not started")
+            self.__propagate_exceptions()
+            stage_timer.switch(DURATION_CONTROLLER_CLEANUP_COMMANDS)
+            self.__cleanup_commands()
+            stage_timer.switch(DURATION_CONTROLLER_PROCESS_COMMANDS)
+            self.__process_commands()
+            stage_timer.switch(DURATION_CONTROLLER_CONFIGURATION)
+            refresh_generation = self.__consume_path_pair_refresh_request()
+            if refresh_generation is not None:
                 try:
-                    diagnostics.finish_duration(DURATION_MODEL_UPDATE, started_at)
+                    self.__apply_path_pair_refresh()
                 except Exception:
-                    pass
-        self.__reap_idle_auxiliary_workers()
-        self.__log_memory_usage()
+                    self.logger.exception("Ignoring path pair refresh failure")
+                finally:
+                    self.__mark_path_pair_refresh_completed(refresh_generation)
+            lftp_reconfigure_requested = self.__consume_lftp_reconfigure_request()
+            if lftp_reconfigure_requested:
+                try:
+                    self.__configure_lftp()
+                    self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
+                except Exception:
+                    self.__restore_lftp_reconfigure_request()
+                    self.logger.exception("Ignoring lftp reconfigure failure")
+            stage_timer.switch(DURATION_MODEL_UPDATE)
+            self.__updater.update()
+            stage_timer.switch(DURATION_CONTROLLER_AUXILIARY_REAP)
+            self.__reap_idle_auxiliary_workers()
+            stage_timer.switch(DURATION_CONTROLLER_DIAGNOSTICS)
+            self.__log_memory_usage()
+        finally:
+            stage_timer.finish()
 
     def __best_effort_teardown(self, label: str, teardown: Callable[[], object]):
         try:

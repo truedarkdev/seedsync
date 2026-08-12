@@ -8,7 +8,15 @@ from unittest.mock import patch
 import common.performance_diagnostics as performance_diagnostics
 
 from common.performance_diagnostics import (
+    DURATION_AUTO_QUEUE_PROCESS,
+    DURATION_CONTROLLER_AUXILIARY_REAP,
+    DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_CONFIGURATION,
+    DURATION_CONTROLLER_DIAGNOSTICS,
+    DURATION_CONTROLLER_JOB,
     DURATION_CONTROLLER_PROCESS,
+    DURATION_CONTROLLER_PROCESS_COMMANDS,
+    DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS,
     DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
     DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
     DURATION_MODEL_BUILDER_SET_LOCAL_FILES,
@@ -23,6 +31,10 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
+    DURATION_MODEL_UPDATE,
+    DURATION_MODEL_UPDATE_LOCK_WAIT,
+    DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+    DURATION_MODEL_UPDATE_TRACE_SETUP,
     MODEL_REBUILD_REASON_COLLISION_RETRY,
     FixedDurationRecorder,
     PerformanceDiagnosticsCollector,
@@ -256,6 +268,9 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             DURATION_MODEL_UPDATE_BUILDER_SYNC,
             DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
             DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+            DURATION_MODEL_UPDATE_TRACE_SETUP,
+            DURATION_MODEL_UPDATE_LOCK_WAIT,
+            DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
         )
         tokens = [collector.begin_duration(metric) for metric in metrics]
         snapshot = collector.snapshot()
@@ -264,6 +279,44 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         ))
         for metric, token in zip(metrics, tokens):
             collector.finish_duration(metric, token)
+
+    def test_stage_windows_report_fixed_parent_child_cpu_attribution(self):
+        clock = [0.0]
+        collector = PerformanceDiagnosticsCollector(lambda: True, monotonic_fn=lambda: clock[0])
+        collector.observe_duration(DURATION_CONTROLLER_JOB, 1.0, 1.0)
+        collector.observe_duration(DURATION_CONTROLLER_PROCESS, 0.8, 0.8)
+        collector.observe_duration(DURATION_AUTO_QUEUE_PROCESS, 0.18, 0.18)
+        collector.observe_duration(DURATION_MODEL_UPDATE, 0.5, 0.5)
+        for metric, cpu in (
+            (DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS, 0.04),
+            (DURATION_CONTROLLER_CLEANUP_COMMANDS, 0.04),
+            (DURATION_CONTROLLER_PROCESS_COMMANDS, 0.04),
+            (DURATION_CONTROLLER_CONFIGURATION, 0.04),
+            (DURATION_CONTROLLER_AUXILIARY_REAP, 0.04),
+            (DURATION_CONTROLLER_DIAGNOSTICS, 0.04),
+        ):
+            collector.observe_duration(metric, cpu, cpu)
+        for metric, cpu in (
+            (DURATION_MODEL_UPDATE_TRACE_SETUP, 0.01),
+            (DURATION_MODEL_UPDATE_LOCK_WAIT, 0.01),
+            (DURATION_MODEL_UPDATE_STATE_PREPARATION, 0.08),
+            (DURATION_MODEL_UPDATE_SCAN_INTAKE, 0.08),
+            (DURATION_MODEL_UPDATE_STATUS_INGESTION, 0.08),
+            (DURATION_MODEL_UPDATE_BUILDER_SYNC, 0.08),
+            (DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE, 0.08),
+            (DURATION_MODEL_UPDATE_BUILD_FINALIZATION, 0.08),
+            (DURATION_MODEL_UPDATE_TRACE_FINALIZATION, 0.01),
+        ):
+            collector.observe_duration(metric, cpu, cpu)
+
+        clock[0] = 5.0
+        collector.record_sample({}, close_window_at=clock[0])
+        attribution = collector.snapshot()["samples"][-1]["stage_window"]["attribution"]
+
+        self.assertEqual(98.0, attribution["controller_job"]["coverage_percent"])
+        self.assertEqual(92.5, attribution["controller_process"]["coverage_percent"])
+        self.assertEqual(100.0, attribution["model_update"]["coverage_percent"])
+        self.assertEqual(0.02, attribution["controller_job"]["unattributed_cpu_seconds"])
 
     def test_model_builder_setter_durations_are_fixed_registered_metrics(self):
         collector = PerformanceDiagnosticsCollector(lambda: True)

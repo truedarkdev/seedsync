@@ -22,9 +22,12 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC,
     DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
+    DURATION_MODEL_UPDATE_LOCK_WAIT,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
+    DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+    DURATION_MODEL_UPDATE_TRACE_SETUP,
     MODEL_REBUILD_REASON_COLLISION_RETRY,
     MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING,
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
@@ -1161,10 +1164,24 @@ class ModelUpdater(_ControllerCoreAccess):
     def update(self) -> None:
         """Run one model refresh bracketed by the optional trace cycle."""
         controller = self._controller
-        cycle_id = getattr(controller, "_Controller__stop_resume_trace_cycle_id", 0) + 1
-        controller._Controller__stop_resume_trace_cycle_id = cycle_id
+        diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
         model_builder = controller._Controller__model_builder
-        model_builder.begin_stop_resume_trace_cycle(cycle_id)
+        trace_setup_started = None
+        try:
+            trace_setup_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_TRACE_SETUP) \
+                if diagnostics is not None else None
+        except Exception:
+            pass
+        try:
+            cycle_id = getattr(controller, "_Controller__stop_resume_trace_cycle_id", 0) + 1
+            controller._Controller__stop_resume_trace_cycle_id = cycle_id
+            model_builder.begin_stop_resume_trace_cycle(cycle_id)
+        finally:
+            if diagnostics is not None:
+                try:
+                    diagnostics.finish_duration(DURATION_MODEL_UPDATE_TRACE_SETUP, trace_setup_started)
+                except Exception:
+                    pass
         build_triggered = False
         work_state_lock = getattr(controller, "_Controller__work_state_lock", None)
         try:
@@ -1174,11 +1191,33 @@ class ModelUpdater(_ControllerCoreAccess):
             if work_state_lock is None:
                 build_triggered = self._update_once()
             else:
-                with work_state_lock:
+                lock_wait_started = None
+                try:
+                    lock_wait_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_LOCK_WAIT) \
+                        if diagnostics is not None else None
+                except Exception:
+                    pass
+                try:
+                    work_state_lock.acquire()
+                finally:
+                    if diagnostics is not None:
+                        try:
+                            diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
+                        except Exception:
+                            pass
+                try:
                     build_triggered = self._update_once()
+                finally:
+                    work_state_lock.release()
         finally:
             # Keep the no-rebuild case observable and finish only after all
             # model listeners have seen the applied diff.
+            trace_finalization_started = None
+            try:
+                trace_finalization_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_TRACE_FINALIZATION) \
+                    if diagnostics is not None else None
+            except Exception:
+                pass
             try:
                 model_builder.finish_stop_resume_trace_cycle(
                     controller._Controller__model,
@@ -1186,6 +1225,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
             except Exception:
                 controller.logger.debug("Ignoring stop/resume trace finalization failure", exc_info=True)
+            finally:
+                if diagnostics is not None:
+                    try:
+                        diagnostics.finish_duration(DURATION_MODEL_UPDATE_TRACE_FINALIZATION, trace_finalization_started)
+                    except Exception:
+                        pass
 
     def _update_once(self) -> bool:
         diagnostics = getattr(getattr(self._controller, "_Controller__context", None), "performance_diagnostics", None)

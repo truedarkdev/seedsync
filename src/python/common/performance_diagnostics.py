@@ -32,6 +32,12 @@ DURATION_MODEL_UPDATE = "model_update"
 DURATION_CONTROLLER_JOB = "controller_job"
 DURATION_CONTROLLER_PROCESS = "controller_process"
 DURATION_AUTO_QUEUE_PROCESS = "auto_queue_process"
+DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS = "controller_propagate_exceptions"
+DURATION_CONTROLLER_CLEANUP_COMMANDS = "controller_cleanup_commands"
+DURATION_CONTROLLER_PROCESS_COMMANDS = "controller_process_commands"
+DURATION_CONTROLLER_CONFIGURATION = "controller_configuration"
+DURATION_CONTROLLER_AUXILIARY_REAP = "controller_auxiliary_reap"
+DURATION_CONTROLLER_DIAGNOSTICS = "controller_diagnostics"
 DURATION_MODEL_BUILD = "model_build"
 DURATION_MODEL_BUILDER_SET_LOCAL_FILES = "model_builder_set_local_files"
 DURATION_MODEL_BUILDER_SET_REMOTE_FILES = "model_builder_set_remote_files"
@@ -44,6 +50,9 @@ DURATION_MODEL_UPDATE_STATUS_INGESTION = "model_update_status_ingestion"
 DURATION_MODEL_UPDATE_BUILDER_SYNC = "model_update_builder_sync"
 DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE = "model_update_lifecycle_maintenance"
 DURATION_MODEL_UPDATE_BUILD_FINALIZATION = "model_update_build_finalization"
+DURATION_MODEL_UPDATE_TRACE_SETUP = "model_update_trace_setup"
+DURATION_MODEL_UPDATE_LOCK_WAIT = "model_update_lock_wait"
+DURATION_MODEL_UPDATE_TRACE_FINALIZATION = "model_update_trace_finalization"
 # Fixed model-rebuild trigger names.  These are intentionally closed-world
 # labels: diagnostics must never accept caller-provided paths or identifiers.
 MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION = "terminalizable_collision"
@@ -88,6 +97,9 @@ DURATION_LOCAL_SCAN_PROGRESS = DURATION_LOCAL_SCAN_PROGRESS_PUBLICATION
 
 _DURATION_METRICS_ORDER = (
     DURATION_MODEL_UPDATE, DURATION_CONTROLLER_JOB, DURATION_CONTROLLER_PROCESS, DURATION_AUTO_QUEUE_PROCESS,
+    DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS, DURATION_CONTROLLER_CLEANUP_COMMANDS,
+    DURATION_CONTROLLER_PROCESS_COMMANDS, DURATION_CONTROLLER_CONFIGURATION,
+    DURATION_CONTROLLER_AUXILIARY_REAP, DURATION_CONTROLLER_DIAGNOSTICS,
     DURATION_MODEL_BUILD, DURATION_MODEL_BUILDER_SET_LOCAL_FILES, DURATION_MODEL_BUILDER_SET_REMOTE_FILES,
     DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
     DURATION_MODEL_BUILDER_SET_STOPPED_FILES, DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL,
@@ -98,8 +110,42 @@ _DURATION_METRICS_ORDER = (
     DURATION_REMOTE_SCAN_PROGRESS_PUBLICATION, DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE, DURATION_MODEL_UPDATE_STATUS_INGESTION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC, DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
-    DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+    DURATION_MODEL_UPDATE_BUILD_FINALIZATION, DURATION_MODEL_UPDATE_TRACE_SETUP,
+    DURATION_MODEL_UPDATE_LOCK_WAIT, DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
 )
+
+_ATTRIBUTION_GROUPS = {
+    "controller_job": (
+        DURATION_CONTROLLER_JOB,
+        (DURATION_CONTROLLER_PROCESS, DURATION_AUTO_QUEUE_PROCESS),
+    ),
+    "controller_process": (
+        DURATION_CONTROLLER_PROCESS,
+        (
+            DURATION_CONTROLLER_PROPAGATE_EXCEPTIONS,
+            DURATION_CONTROLLER_CLEANUP_COMMANDS,
+            DURATION_CONTROLLER_PROCESS_COMMANDS,
+            DURATION_CONTROLLER_CONFIGURATION,
+            DURATION_MODEL_UPDATE,
+            DURATION_CONTROLLER_AUXILIARY_REAP,
+            DURATION_CONTROLLER_DIAGNOSTICS,
+        ),
+    ),
+    "model_update": (
+        DURATION_MODEL_UPDATE,
+        (
+            DURATION_MODEL_UPDATE_TRACE_SETUP,
+            DURATION_MODEL_UPDATE_LOCK_WAIT,
+            DURATION_MODEL_UPDATE_STATE_PREPARATION,
+            DURATION_MODEL_UPDATE_SCAN_INTAKE,
+            DURATION_MODEL_UPDATE_STATUS_INGESTION,
+            DURATION_MODEL_UPDATE_BUILDER_SYNC,
+            DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
+            DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
+            DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+        ),
+    ),
+}
 _SCANNER_DURATION_METRICS_ORDER = (
     DURATION_LOCAL_SCAN_FILESYSTEM_TRAVERSAL, DURATION_LOCAL_SCAN_MANAGED_EXTRACT,
     DURATION_LOCAL_SCAN_STAGING_MERGE, DURATION_LOCAL_SCAN_AGGREGATION,
@@ -746,6 +792,30 @@ class PerformanceDiagnosticsCollector:
                 if elapsed > 0 and cpu_observation_count else None,
             }
         closed_window = {"elapsed_seconds": _derived(elapsed, 6), "metrics": window}
+        attribution: dict[str, object] = {}
+        for name, (parent_name, child_names) in _ATTRIBUTION_GROUPS.items():
+            parent_cpu = window[parent_name]["total_cpu_seconds"]
+            child_cpu_values = [window[child_name]["total_cpu_seconds"] for child_name in child_names]
+            named_cpu = sum(float(value) for value in child_cpu_values if type(value) in (int, float))
+            if type(parent_cpu) not in (int, float):
+                attribution[name] = {
+                    "parent_cpu_seconds": None,
+                    "named_cpu_seconds": _derived(named_cpu, 6),
+                    "unattributed_cpu_seconds": None,
+                    "coverage_percent": None,
+                }
+                continue
+            parent_value = float(parent_cpu)
+            unattributed_cpu = max(0.0, parent_value - named_cpu)
+            coverage = min(100.0, named_cpu / parent_value * 100.0) if parent_value > 0 else \
+                (100.0 if named_cpu == 0 else None)
+            attribution[name] = {
+                "parent_cpu_seconds": _derived(parent_value, 6),
+                "named_cpu_seconds": _derived(named_cpu, 6),
+                "unattributed_cpu_seconds": _derived(unattributed_cpu, 6),
+                "coverage_percent": _derived(coverage, 3) if coverage is not None else None,
+            }
+        closed_window["attribution"] = attribution
         self.__stage_window_current = copy.deepcopy(closed_window)
         for metric, values in window.items():
             if not isinstance(values, dict):
