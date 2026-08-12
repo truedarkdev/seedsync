@@ -21,6 +21,7 @@ PERF_HOST_PORT="${PERF_HOST_PORT:-18800}"
 PERF_MEASURE_TIMEOUT_SECONDS="${PERF_MEASURE_TIMEOUT_SECONDS:-900}"
 PERF_SETTLED_SAMPLES="${PERF_SETTLED_SAMPLES:-6}"
 PERF_SAMPLE_SLEEP_SECONDS="${PERF_SAMPLE_SLEEP_SECONDS:-2}"
+PERF_POST_TARGET_POLL_SECONDS="${PERF_POST_TARGET_POLL_SECONDS:-10}"
 # The production-shaped remote scan repeats every 120 seconds.  A shorter
 # post-target window can incorrectly certify the quiet gap before that refresh
 # restarts, so the default acceptance window spans one complete refresh edge.
@@ -355,9 +356,11 @@ PY
   while (( $(date +%s) < deadline )); do
     index=$((index + 1))
     local diagnostics_path="$phase_dir/diagnostics-$(printf '%04d' "$index").json"
-    local breadcrumbs_path="$phase_dir/breadcrumbs-$(printf '%04d' "$index").json"
+    # Monitoring needs only the latest retained sample plus cumulative
+    # counters/durations. Re-fetching the full retained history here makes the
+    # observer itself a recurring CPU load and contaminates idle acceptance.
     if ! curl --silent --show-error --fail --max-time 20 \
-      -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url" > "$diagnostics_path"; then
+      -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url?limit=1" > "$diagnostics_path"; then
       local app_id app_running
       app_id="$(compose ps --all -q app)"
       app_running=""
@@ -378,9 +381,6 @@ PY
       continue
     fi
     last_success_index="$index"
-    curl --silent --show-error --fail --max-time 20 \
-      -H "Authorization: Bearer $PERF_API_TOKEN" "$base_url/server/breadcrumbs/get" \
-      > "$breadcrumbs_path" || true
     [[ -n "$first_ms" ]] || first_ms="$(date -u +%s%3N)"
     local observed_count observed_sequence observed_build_count
     read -r observed_count observed_sequence observed_build_count <<<"$(python3 - "$diagnostics_path" <<'PY'
@@ -433,7 +433,10 @@ PY
       observation_now_ms="$(date -u +%s%3N)"
       if (( observed_sequence < target_sequence + PERF_SETTLED_SAMPLES )) || \
          (( observation_now_ms < target_ms + PERF_POST_TARGET_OBSERVATION_SECONDS * 1000 )); then
-        sleep "$PERF_SAMPLE_SLEEP_SECONDS"
+        # Diagnostics samples arrive every five seconds and the acceptance
+        # window lasts 150 seconds. A ten-second observer cadence still sees
+        # every relevant boundary without becoming measurable idle work.
+        sleep "$PERF_POST_TARGET_POLL_SECONDS"
         continue
       fi
       settled_ms="$observation_now_ms"
@@ -456,12 +459,18 @@ PY
     echo "Timed out waiting for diagnostics readiness" >&2
     return 1
   fi
-  local latest="$phase_dir/diagnostics-$(printf '%04d' "$last_success_index").json"
-  cp "$latest" "$phase_dir/diagnostics.json"
-  local latest_breadcrumbs="$phase_dir/breadcrumbs-$(printf '%04d' "$last_success_index").json"
-  if [[ -f "$latest_breadcrumbs" ]]; then
-    cp "$latest_breadcrumbs" "$phase_dir/breadcrumbs.json"
-  else
+  # Fetch each potentially expensive support payload exactly once after the
+  # timed observation. Their serialization cannot then inflate a later idle
+  # sample, while the full retained history remains available for analysis.
+  if ! curl --silent --show-error --fail --max-time 120 \
+    -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url" \
+    > "$phase_dir/diagnostics.json"; then
+    echo "Failed to capture final diagnostics history" >&2
+    return 1
+  fi
+  if ! curl --silent --show-error --fail --max-time 20 \
+    -H "Authorization: Bearer $PERF_API_TOKEN" "$base_url/server/breadcrumbs/get" \
+    > "$phase_dir/breadcrumbs.json"; then
     printf '{}\n' > "$phase_dir/breadcrumbs.json"
   fi
   local target_argument=()

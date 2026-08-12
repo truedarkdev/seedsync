@@ -80,6 +80,13 @@ baseline for refresh-delta analysis. `PERF_POST_TARGET_OBSERVATION_SECONDS`
 may be shortened only for diagnostic worker self-checks, never final
 performance acceptance.
 
+The observation loop requests only the latest retained diagnostics sample.
+It fetches the full retained history and breadcrumb snapshot once after the
+timed window, so evidence collection does not become the recurring idle load
+being measured. After the model target, it checks that compact view every ten
+seconds; the app's own five-second samples remain the source for final CPU
+classification.
+
 After the final diagnostics window and final container resource snapshot,
 `measure` requests the admin ownership census once and writes the sanitized
 `ownership-final.json` artifact. The retained file contains only its fixed

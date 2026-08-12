@@ -282,6 +282,23 @@ def test_measure_captures_one_sanitized_ownership_artifact_after_resource_measur
     assert '"capture_status":"unavailable"' in lab_source
 
 
+def test_measure_uses_compact_monitoring_and_defers_support_snapshots():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    measure_source = lab_source[lab_source.index("measure()") :]
+    loop_source = measure_source[measure_source.index("while ((") : measure_source.index("done\n  if ((")]
+    final_diagnostics = '> "$phase_dir/diagnostics.json"'
+    final_breadcrumbs = '> "$phase_dir/breadcrumbs.json"'
+
+    assert '"$diagnostics_url?limit=1"' in loop_source
+    assert "/server/breadcrumbs/get" not in loop_source
+    assert 'PERF_POST_TARGET_POLL_SECONDS="${PERF_POST_TARGET_POLL_SECONDS:-10}"' in lab_source
+    assert 'sleep "$PERF_POST_TARGET_POLL_SECONDS"' in loop_source
+    assert measure_source.count(final_diagnostics) == 1
+    assert measure_source.count('"$base_url/server/breadcrumbs/get"') == 1
+    assert measure_source.index(final_diagnostics) > measure_source.index("post_scan_settled_idle_observation_ms")
+    assert measure_source.index(final_breadcrumbs) > measure_source.index(final_diagnostics)
+
+
 def test_ownership_capture_validates_fixed_schema_and_drops_unexpected_fields():
     lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
     assert 'seedsync.memory-ownership-census.v1' in lab_source
