@@ -415,6 +415,9 @@ class ModelApiHandler(IHandler):
 
     def __handle_stream(self, path_pair_id: str) -> Iterator[str]:
         scope_id = self.__validate_scope_id(path_pair_id)
+        prioritize = getattr(self.__controller, "prioritize_path_pair_scan", None)
+        if callable(prioritize):
+            prioritize(scope_id)
         listener = ScopedModelListener(scope_id)
         page = self.__get_page(scope_id, None, add_listener=listener)
         if page.get("error"):

@@ -2369,6 +2369,26 @@ class Controller:
         with self.__model_lock:
             self.__model.remove_listener(listener)
 
+    def prioritize_path_pair_scan(self, path_pair_id: str) -> None:
+        """Move the browser-selected pair ahead of an in-flight full scan."""
+        path_pairs_by_id = getattr(self, "_Controller__path_pairs_by_id", {})
+        if not isinstance(path_pair_id, str) or not path_pair_id or (
+            path_pairs_by_id and path_pair_id not in path_pairs_by_id
+        ):
+            return
+        scan_processes = (
+            getattr(self, "_Controller__local_scan_process", None),
+            getattr(self, "_Controller__remote_scan_process", None),
+        )
+        for scan_process in scan_processes:
+            if scan_process is None:
+                continue
+            prioritize = getattr(scan_process, "prioritize_scan", None)
+            if callable(prioritize):
+                prioritize(path_pair_id)
+            else:
+                scan_process.force_scan(path_pair_id)
+
     def add_remote_delete_success_listener(self, listener: Callable[[ModelFile], None]):
         with self.__remote_delete_success_listeners_lock:
             if listener not in self.__remote_delete_success_listeners:

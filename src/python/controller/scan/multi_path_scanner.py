@@ -2,6 +2,7 @@
 
 import logging
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import threading
 from typing import Callable, List, Optional
 
 from .scanner_process import IScanner, ScannerError, ScanProgressCallback
@@ -88,6 +89,8 @@ class MultiPathLocalScanner(IScanner):
         self.__scan_target_path_pair_ids: Optional[set[str]] = None
         self.__progress_callback: Optional[ScanProgressCallback] = None
         self.__failed_path_pair_ids: set[str | None] = set()
+        self.__priority_lock = threading.Lock()
+        self.__priority_path_pair_ids: set[str] = set()
 
     @overrides(IScanner)
     def set_base_logger(self, base_logger: logging.Logger) -> None:
@@ -103,6 +106,11 @@ class MultiPathLocalScanner(IScanner):
 
     def set_scan_target_path_pair_ids(self, path_pair_ids: Optional[set[str]]) -> None:
         self.__scan_target_path_pair_ids = None if path_pair_ids is None else set(path_pair_ids)
+
+    def prioritize_path_pair(self, path_pair_id: str) -> None:
+        """Reserve one extra startup worker for a newly selected pair."""
+        with self.__priority_lock:
+            self.__priority_path_pair_ids.add(path_pair_id)
 
     @overrides(IScanner)
     def scanned_path_pair_ids(self) -> set[str | None]:
@@ -133,7 +141,7 @@ class MultiPathLocalScanner(IScanner):
                     raise
                 return scanner, err.files or [], err
 
-        scan_results = _run_bounded_scan_tasks(scanners, scan_one, "local-scan")
+        scan_results = self.__run_priority_bounded_tasks(scanners, scan_one)
         aggregation_started = self.__begin_stage(DURATION_LOCAL_SCAN_AGGREGATION)
         try:
             for scanner, files, err in scan_results:
@@ -159,6 +167,71 @@ class MultiPathLocalScanner(IScanner):
                 files=all_files,
             )
         return all_files
+
+    def __take_priority_index(self, scanners: List[LocalScanner], remaining: List[int]) -> Optional[int]:
+        with self.__priority_lock:
+            for index in remaining:
+                path_pair_id = scanners[index].path_pair_id
+                if path_pair_id in self.__priority_path_pair_ids:
+                    self.__priority_path_pair_ids.discard(path_pair_id)
+                    return index
+            # Drop requests for pairs not participating in this generation.
+            active_ids = {scanners[index].path_pair_id for index in remaining}
+            self.__priority_path_pair_ids.intersection_update(active_ids)
+        return None
+
+    def __run_priority_bounded_tasks(
+        self,
+        scanners: List[LocalScanner],
+        scan_one: Callable[[LocalScanner], tuple[LocalScanner, List[SystemFile], Optional[ScannerError]]],
+    ) -> List[tuple[LocalScanner, List[SystemFile], Optional[ScannerError]]]:
+        """Run four ordinary pairs while reserving one slot for UI priority."""
+        if not scanners:
+            return []
+        normal_workers = min(4, len(scanners))
+        total_workers = min(normal_workers + 1, len(scanners))
+        completed: dict[int, tuple[LocalScanner, List[SystemFile], Optional[ScannerError]]] = {}
+        pending: dict[object, int] = {}
+        remaining = list(range(len(scanners)))
+        fatal_error: Optional[Exception] = None
+
+        with ThreadPoolExecutor(max_workers=total_workers, thread_name_prefix="local-scan") as executor:
+            def submit(index: int) -> None:
+                remaining.remove(index)
+                pending[executor.submit(scan_one, scanners[index])] = index
+
+            while remaining and len(pending) < normal_workers:
+                submit(remaining[0])
+
+            while pending:
+                priority_index = self.__take_priority_index(scanners, remaining)
+                if priority_index is not None and len(pending) < total_workers:
+                    submit(priority_index)
+                    diagnostics = self.__performance_diagnostics
+                    if diagnostics is not None:
+                        try:
+                            diagnostics.increment("scan_priority_targeted_runs")
+                        except Exception:
+                            pass
+
+                done, _ = wait(tuple(pending), timeout=0.05, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = pending.pop(future)
+                    try:
+                        completed[index] = future.result()
+                    except Exception as error:
+                        fatal_error = error
+                if fatal_error is not None:
+                    for future in pending:
+                        future.cancel()
+                    break
+                while remaining and len(pending) < normal_workers:
+                    priority_index = self.__take_priority_index(scanners, remaining)
+                    submit(priority_index if priority_index is not None else remaining[0])
+
+        if fatal_error is not None:
+            raise fatal_error
+        return [completed[index] for index in range(len(scanners))]
 
     def __begin_stage(self, metric: str) -> object:
         diagnostics = self.__performance_diagnostics

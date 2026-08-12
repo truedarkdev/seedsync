@@ -511,6 +511,13 @@ class ScannerProcess:
         self.__scan_worker_control_connection: object | None = None
         self.__scan_worker_pending_status: object | None = None
         self.__scan_worker_force_pending = False
+        self.__scan_worker_target_path_pair_ids: Optional[set[str]] = None
+        self.__priority_interrupt_event = threading.Event()
+        self.__priority_target_lock = threading.Lock()
+        self.__priority_target_path_pair_ids: set[str] = set()
+        self.__priority_requires_full_followup = False
+        self.__inline_scan_active = threading.Event()
+        self.__inline_scan_target_path_pair_ids: Optional[set[str]] = None
         self.__scan_generation = 0
         self.__session_token = uuid.uuid4().hex
         self.__thread: Optional[threading.Thread] = None
@@ -594,15 +601,27 @@ class ScannerProcess:
         if self.verbose:
             self.logger.debug("Running a scan")
         flow_id = "{}:{}".format(self.__scanner.__class__.__name__, int(timestamp_start.timestamp() * 1000))
+        priority_target_path_pair_ids = self.__drain_priority_target_path_pair_ids()
+        scan_target_path_pair_ids = priority_target_path_pair_ids \
+            if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
+        is_priority_targeted = bool(priority_target_path_pair_ids)
         self.__record_breadcrumb(
             "scan_started",
             {
                 "scanner": self.__scanner.__class__.__name__,
                 "interval_ms": self.__interval_in_ms,
+                "is_priority_targeted": is_priority_targeted,
+                "target_path_pair_count": len(scan_target_path_pair_ids or ()),
             },
             flow_id=flow_id,
+            path_pair_id=next(iter(scan_target_path_pair_ids))
+            if scan_target_path_pair_ids is not None and len(scan_target_path_pair_ids) == 1 else None,
         )
-        scan_target_path_pair_ids = self.__drain_scan_target_path_pair_ids()
+        if is_priority_targeted:
+            # A priority queued before worker creation is already being
+            # honored by this targeted generation; do not interrupt it.
+            self.__priority_interrupt_event.clear()
+            self.__increment_diagnostic("scan_priority_targeted_runs")
         assert self.__queue is not None
         spawn_context = multiprocessing.get_context("spawn")
         receive_connection, send_connection = spawn_context.Pipe(duplex=False)
@@ -620,6 +639,7 @@ class ScannerProcess:
         worker.start()
         send_connection.close()
         self.__scan_worker = worker
+        self.__scan_worker_target_path_pair_ids = scan_target_path_pair_ids
         self.__scan_worker_started_at = timestamp_start
         self.__scan_worker_control_connection = receive_connection
         # A failed-to-start or very small one-shot worker may already have
@@ -634,7 +654,9 @@ class ScannerProcess:
         flow_id = "{}:{}".format(self.__scanner.__class__.__name__, int(timestamp_start.timestamp() * 1000))
         self.__record_breadcrumb("scan_started", {"scanner": self.__scanner.__class__.__name__,
                                                    "interval_ms": self.__interval_in_ms}, flow_id=flow_id)
-        scan_target_path_pair_ids = self.__drain_scan_target_path_pair_ids()
+        priority_target_path_pair_ids = self.__drain_priority_target_path_pair_ids()
+        scan_target_path_pair_ids = priority_target_path_pair_ids \
+            if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
         setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
         if callable(setter):
             setter(scan_target_path_pair_ids)
@@ -673,6 +695,8 @@ class ScannerProcess:
                     session_token=self.__session_token,
                 ))
         self.__scanner.set_progress_callback(publish_progress)
+        self.__inline_scan_target_path_pair_ids = scan_target_path_pair_ids
+        self.__inline_scan_active.set()
         try:
             files = self.__scanner.scan()
             malformed = self.__scanner.pop_malformed_status_only_file_ids()
@@ -719,6 +743,8 @@ class ScannerProcess:
                                                        "managed_extract_file_count": len(managed),
                                                        "error_message": error_message}, event_type="failure", flow_id=flow_id)
         finally:
+            self.__inline_scan_active.clear()
+            self.__inline_scan_target_path_pair_ids = None
             self.__scanner.set_progress_callback(None)
             if callable(setter):
                 setter(None)
@@ -733,7 +759,21 @@ class ScannerProcess:
         delta_in_ms = int((datetime.now() - timestamp_start).total_seconds() * 1000)
         if self.verbose:
             self.logger.debug("Scan took {:.3f}s".format(float(delta_in_ms) / 1000.0))
-        if delta_in_ms < self.__interval_in_ms:
+        priority_followup_pending = False
+        if self.__priority_requires_full_followup and scan_target_path_pair_ids is not None:
+            if self.__has_pending_priority_targets():
+                priority_followup_pending = True
+            else:
+                self.__priority_requires_full_followup = False
+                assert self.__scan_target_queue is not None
+                self.__scan_target_queue.put(None)
+                self.__increment_diagnostic("scan_priority_full_followups")
+                self.__record_breadcrumb(
+                    "scan_priority_full_followup_scheduled",
+                    {"scanner": self.__scanner.__class__.__name__},
+                )
+                priority_followup_pending = True
+        if not priority_followup_pending and delta_in_ms < self.__interval_in_ms:
             assert self.__wake_event is not None
             self.__wake_event.wait(timeout=float(self.__interval_in_ms - delta_in_ms) / 1000.0)
             self.__wake_event.clear()
@@ -754,8 +794,20 @@ class ScannerProcess:
             if self.__wake_event.wait(timeout=0.05):
                 self.__wake_event.clear()
                 self.__scan_worker_force_pending = True
+            if self.__priority_interrupt_event.is_set():
+                self.__priority_interrupt_event.clear()
+                if self.__scan_worker_target_path_pair_ids is None:
+                    self.__priority_requires_full_followup = True
+                    self.__scan_worker_force_pending = True
+                    self.__increment_diagnostic("scan_priority_interrupts")
+                    self.__record_breadcrumb(
+                        "scan_priority_interrupted_full",
+                        {"scanner": self.__scanner.__class__.__name__},
+                    )
+                    self.__teardown_scan_worker()
             return
 
+        completed_target_path_pair_ids = self.__scan_worker_target_path_pair_ids
         try:
             # The child has exited, so its terminal status must be retained;
             # allow a short pipe-delivery window before tearing the endpoint
@@ -778,6 +830,18 @@ class ScannerProcess:
                 self.__last_recoverable_error_message = None
         finally:
             self.__teardown_scan_worker(terminate=False)
+
+        if self.__priority_requires_full_followup and completed_target_path_pair_ids is not None:
+            if not self.__has_pending_priority_targets():
+                self.__priority_requires_full_followup = False
+                assert self.__scan_target_queue is not None
+                self.__scan_target_queue.put(None)
+                self.__increment_diagnostic("scan_priority_full_followups")
+                self.__record_breadcrumb(
+                    "scan_priority_full_followup_scheduled",
+                    {"scanner": self.__scanner.__class__.__name__},
+                )
+            self.__scan_worker_force_pending = True
 
         delta_in_ms = int((datetime.now() - started_at).total_seconds() * 1000) if started_at is not None else 0
         if self.verbose:
@@ -843,6 +907,7 @@ class ScannerProcess:
         self.__scan_worker_control_connection = None
         self.__scan_worker_pending_status = None
         self.__scan_worker_started_at = None
+        self.__scan_worker_target_path_pair_ids = None
         if connection is not None:
             connection.close()
         if worker is None:
@@ -947,6 +1012,68 @@ class ScannerProcess:
         self.__scan_target_queue.put(path_pair_id)
         assert self.__wake_event is not None
         self.__wake_event.set()
+
+    def prioritize_scan(self, path_pair_id: str) -> None:
+        """Move one selected pair ahead of ordinary full-scan work."""
+        if not isinstance(path_pair_id, str) or not path_pair_id:
+            return
+        if not self.__recycle_scan_worker:
+            self.__increment_diagnostic("scan_priority_requests")
+            self.__record_breadcrumb(
+                "scan_priority_requested",
+                {"scanner": self.__scanner.__class__.__name__},
+                path_pair_id=path_pair_id,
+            )
+            prioritize = getattr(self.__scanner, "prioritize_path_pair", None)
+            if self.__inline_scan_active.is_set():
+                active_targets = self.__inline_scan_target_path_pair_ids
+                if active_targets is None and callable(prioritize):
+                    prioritize(path_pair_id)
+                    return
+                if active_targets is not None and path_pair_id in active_targets:
+                    return
+            with self.__priority_target_lock:
+                self.__priority_target_path_pair_ids.add(path_pair_id)
+            if self.__scan_generation == 0:
+                self.__priority_requires_full_followup = True
+            assert self.__wake_event is not None
+            self.__wake_event.set()
+            return
+        with self.__priority_target_lock:
+            active_targets = self.__scan_worker_target_path_pair_ids
+            if active_targets is not None and path_pair_id in active_targets:
+                return
+            self.__priority_target_path_pair_ids.add(path_pair_id)
+        if self.__scan_generation == 0:
+            self.__priority_requires_full_followup = True
+        self.__increment_diagnostic("scan_priority_requests")
+        self.__record_breadcrumb(
+            "scan_priority_requested",
+            {"scanner": self.__scanner.__class__.__name__},
+            path_pair_id=path_pair_id,
+        )
+        self.__priority_interrupt_event.set()
+        assert self.__wake_event is not None
+        self.__wake_event.set()
+
+    def __drain_priority_target_path_pair_ids(self) -> set[str]:
+        with self.__priority_target_lock:
+            path_pair_ids = set(self.__priority_target_path_pair_ids)
+            self.__priority_target_path_pair_ids.clear()
+        return path_pair_ids
+
+    def __has_pending_priority_targets(self) -> bool:
+        with self.__priority_target_lock:
+            return bool(self.__priority_target_path_pair_ids)
+
+    def __increment_diagnostic(self, counter: str) -> None:
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            diagnostics.increment(counter)
+        except Exception:
+            pass
 
     def __drain_scan_target_path_pair_ids(self) -> Optional[set[str]]:
         scan_target_path_pair_ids: set[str] = set()

@@ -430,6 +430,33 @@ class TestMultiPathLocalScanner(unittest.TestCase):
         self.assertIn("pair-5", published_ids)
         self.assertIn("pair-6", published_ids)
 
+    def test_selected_pair_uses_reserved_worker_while_first_four_are_busy(self):
+        release = threading.Event()
+        started = [threading.Event() for _ in range(6)]
+        scanners = [
+            _BlockingPathPairScanner(
+                "pair-{}".format(index + 1),
+                started[index],
+                release,
+                block=index < 4,
+            )
+            for index in range(6)
+        ]
+        scanner = MultiPathLocalScanner(scanners)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(scanner.scan()))
+        thread.start()
+        self.assertTrue(all(started[index].wait(timeout=2) for index in range(4)))
+
+        scanner.prioritize_path_pair("pair-6")
+
+        self.assertTrue(started[5].wait(timeout=2))
+        self.assertFalse(started[4].is_set())
+        release.set()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(6, len(result[0]))
+
     def test_reports_recoverable_error_so_partial_local_scan_cannot_be_authoritative(self):
         successful_file = SystemFile("movie.mkv", 1234, False)
         successful_scanner = MagicMock()

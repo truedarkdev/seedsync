@@ -34,6 +34,7 @@ class TestModelApi(unittest.TestCase):
             logger=logging.getLogger("test-model-api-web"),
             args=SimpleNamespace(html_path=None), config=config, status=Status(),
         )
+        self.controller._Controller__context = context
         self.app = WebApp(context, self.controller)
         ModelApiHandler(self.controller).add_routes(self.app)
         self.client = TestApp(self.app)
@@ -265,6 +266,21 @@ class TestModelApi(unittest.TestCase):
         self.assertIn('"records":[{', update)
         self.assertEqual(changed.file_id, json.loads(update.split("data: ", 1)[1])["records"][0]["file_id"])
         stream.close()
+
+    def test_scoped_stream_prioritizes_selected_pair_before_initial_page(self):
+        self.model.add_file(self._file("root", "pair-a"))
+        handler = ModelApiHandler(self.controller)
+        environ: dict[str, object] = {}
+        setup_testing_defaults(environ)
+        environ["QUERY_STRING"] = "limit=1"
+        bottle.request.bind(environ)
+        bottle.response.bind()
+
+        with patch.object(self.controller, "prioritize_path_pair_scan") as prioritize:
+            stream = handler._ModelApiHandler__handle_stream("pair-a")
+            prioritize.assert_called_once_with("pair-a")
+            next(stream)
+            stream.close()
 
     def test_listener_bounds_reset_and_cleanup(self):
         listener = ScopedModelListener("pair-a")

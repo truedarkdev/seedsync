@@ -696,6 +696,79 @@ class TestScannerProcess(unittest.TestCase):
 
         self.assertLess(time.monotonic() - started_at, 0.2)
 
+    def test_prioritize_scan_interrupts_full_worker_then_schedules_selected_pair_and_full_followup(self):
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+        worker = MagicMock()
+        worker.pid = 1
+        worker.is_alive.side_effect = [True, True, False, False]
+        process._ScannerProcess__scan_worker = worker
+        process._ScannerProcess__scan_worker_started_at = datetime.now()
+        process._ScannerProcess__scan_worker_control_connection = _MessageConnection([])
+        process._ScannerProcess__scan_worker_target_path_pair_ids = None
+        process._ScannerProcess__scan_generation = 1
+
+        process.force_scan()
+        process.prioritize_scan("pair-6")
+        process._ScannerProcess__poll_scan_worker()
+
+        worker.terminate.assert_called_once_with()
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+        self.assertTrue(process._ScannerProcess__priority_requires_full_followup)
+
+        completed_worker = MagicMock()
+        completed_worker.pid = 2
+        completed_worker.is_alive.return_value = False
+        process._ScannerProcess__scan_worker = completed_worker
+        process._ScannerProcess__scan_worker_started_at = datetime.now()
+        process._ScannerProcess__scan_worker_control_connection = _MessageConnection([])
+        process._ScannerProcess__scan_worker_target_path_pair_ids = {"pair-6"}
+        process._ScannerProcess__poll_scan_worker()
+
+        self.assertFalse(process._ScannerProcess__priority_requires_full_followup)
+        self.assertIsNone(process._ScannerProcess__drain_scan_target_path_pair_ids())
+
+    def test_priority_target_is_drained_before_queued_full_scan(self):
+        process = ScannerProcess(
+            scanner=DummyScanner(), interval_in_ms=1000, verbose=False,
+            recycle_scan_worker=True,
+        )
+        self.addCleanup(process.close_queues)
+
+        process.force_scan()
+        process.prioritize_scan("pair-6")
+
+        self.assertEqual({"pair-6"}, process._ScannerProcess__drain_priority_target_path_pair_ids())
+        self.assertIsNone(process._ScannerProcess__drain_scan_target_path_pair_ids())
+
+    def test_inline_full_scan_reserves_selected_pair_inside_active_generation(self):
+        scanner = DummyScanner()
+        scanner.prioritize_path_pair = MagicMock()
+        process = ScannerProcess(scanner=scanner, interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__inline_scan_active.set()
+        process._ScannerProcess__inline_scan_target_path_pair_ids = None
+
+        process.prioritize_scan("pair-6")
+
+        scanner.prioritize_path_pair.assert_called_once_with("pair-6")
+        self.assertFalse(process._ScannerProcess__has_pending_priority_targets())
+
+    def test_inline_initial_priority_runs_target_then_skips_interval_for_full_followup(self):
+        process = ScannerProcess(scanner=DummyScanner(), interval_in_ms=1000, verbose=False)
+        self.addCleanup(process.close_queues)
+        process.prioritize_scan("pair-6")
+
+        started_at = time.monotonic()
+        process.run_loop()
+
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertFalse(process._ScannerProcess__priority_requires_full_followup)
+        self.assertIsNone(process._ScannerProcess__scan_target_queue.get_nowait())
+
     def test_create_scanner_worker_uses_explicit_spawn_context(self):
         spawn_context = MagicMock()
         worker = MagicMock()
