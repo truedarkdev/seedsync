@@ -184,13 +184,13 @@ class _BoundedWSGIServer(WSGIServer):
         while True:
             item = request_queue.get()
             try:
-                if item is _WORKER_SHUTDOWN:
+                if isinstance(item, _WorkerShutdown):
                     return
                 request, client_address = item
                 self._process_request_from_worker(request, client_address)
             finally:
                 request_queue.task_done()
-                if releases_stream_slot and item is not _WORKER_SHUTDOWN:
+                if releases_stream_slot and not isinstance(item, _WorkerShutdown):
                     self._stream_admission.release()
 
     def _process_request_from_worker(
