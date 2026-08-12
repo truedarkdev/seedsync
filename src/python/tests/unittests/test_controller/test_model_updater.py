@@ -27,11 +27,14 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
+    DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
     DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
     DURATION_MODEL_UPDATE_TRACE_SETUP,
     MODEL_REBUILD_REASON_MOVE_RETRY_DUE,
+    PerformanceDiagnosticsCollector,
 )
+from common.breadcrumb_trace import BreadcrumbTraceCollector
 from controller.scan.scanner_process import ScannerProcess, ScannerResult
 from lftp import LftpJobStatus
 from model import Model, ModelFile
@@ -62,11 +65,13 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual([
             call(DURATION_MODEL_UPDATE_TRACE_SETUP),
             call(DURATION_MODEL_UPDATE_LOCK_WAIT),
+            call(DURATION_MODEL_UPDATE_LOCK_HOLD),
             call(DURATION_MODEL_UPDATE_TRACE_FINALIZATION),
         ], diagnostics.begin_duration.call_args_list)
         self.assertEqual([
             call(DURATION_MODEL_UPDATE_TRACE_SETUP, (DURATION_MODEL_UPDATE_TRACE_SETUP,)),
             call(DURATION_MODEL_UPDATE_LOCK_WAIT, (DURATION_MODEL_UPDATE_LOCK_WAIT,)),
+            call(DURATION_MODEL_UPDATE_LOCK_HOLD, (DURATION_MODEL_UPDATE_LOCK_HOLD,)),
             call(DURATION_MODEL_UPDATE_TRACE_FINALIZATION, (DURATION_MODEL_UPDATE_TRACE_FINALIZATION,)),
         ], diagnostics.finish_duration.call_args_list)
 
@@ -197,6 +202,133 @@ class TestModelUpdater(unittest.TestCase):
             ("begin", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
             ("finish", DURATION_MODEL_UPDATE_BUILD_FINALIZATION),
         ], diagnostics.events)
+
+    def test_update_records_fixed_choice_and_scan_cardinalities_without_scan_identity_labels(self):
+        remote = ScannerResult(
+            datetime.now(), [SystemFile("sample-remote-root", 1)],
+            scanned_path_pair_ids={"path-pair-a"}, completed_path_pair_ids={"path-pair-a"},
+        )
+        local = ScannerResult(
+            datetime.now(), [SystemFile("sample-local-root", 1), SystemFile("second", 1)],
+            scanned_path_pair_ids={"path-pair-a"}, unknown_path_pair_ids={"path-pair-a"},
+        )
+        controller, builder = self._make_progressive_update_controller(remote, local)
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        controller._Controller__context.performance_diagnostics = diagnostics
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        controller._Controller__model.file_count = 3
+        controller._Controller__model.tree_file_count = 5
+        builder.has_pending_active_transfer_delta.return_value = False
+        builder.has_changes.return_value = False
+
+        ModelUpdater(controller).update()
+
+        snapshot = diagnostics.snapshot()
+        self.assertEqual(1, snapshot["counters"]["model_update_choice_noop"])
+        self.assertEqual(1, snapshot["counters"]["remote_scan_result_observations"])
+        self.assertEqual(1, snapshot["counters"]["local_scan_result_observations"])
+        self.assertEqual(1, snapshot["gauges"]["remote_scan_result_root_count"])
+        self.assertEqual(2, snapshot["gauges"]["local_scan_result_root_count"])
+        self.assertEqual(1, snapshot["gauges"]["remote_scan_result_completed_pair_count"])
+        self.assertEqual(1, snapshot["gauges"]["local_scan_result_unknown_pair_count"])
+        self.assertEqual(1, snapshot["durations"][DURATION_MODEL_UPDATE_LOCK_HOLD]["count"])
+        self.assertNotIn("path-pair-a", str(snapshot))
+        self.assertNotIn("sample-remote-root", str(snapshot))
+
+    def test_full_build_and_sse_publication_share_authoritative_version_correlation(self):
+        builder = ModelBuilder()
+        first_root = SystemFile("root-a", 1)
+        first_root.path_pair_id = "pair-a"
+        second_root = SystemFile("root-b", 1)
+        second_root.path_pair_id = "pair-b"
+        builder.set_remote_files([first_root, second_root])
+        controller, _ = self._make_progressive_update_controller(
+            None, model_builder=builder, model=Model(),
+        )
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__stop_resume_trace_cycle_id = 7
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+
+        def record_breadcrumb(**kwargs):
+            trace.record(
+                "controller", kwargs["message"], kwargs["details"],
+                stage=kwargs["stage"], event_type=kwargs["event_type"],
+                corr_id=kwargs["corr_id"], flow_id=kwargs["flow_id"],
+                trace_scope=kwargs["trace_scope"],
+            )
+
+        controller._Controller__record_breadcrumb = record_breadcrumb
+
+        ModelUpdater(controller).update()
+        controller.get_model_global_version = lambda: controller._Controller__model.version
+
+        from web.handler.model_api import ModelApiHandler
+        ModelApiHandler(controller, breadcrumb_trace=trace)._ModelApiHandler__sse(
+            "scoped", "model-page", {}, controller._Controller__model.scope_version("pair-a"),
+            controller._Controller__model.version,
+        )
+        entries = trace.snapshot()["entries"]
+        completion = next(entry for entry in entries if entry["message"] == "model_build_completed")
+        publication = next(entry for entry in entries if entry["message"] == "model_scoped_sse_published")
+        self.assertEqual("model_update", completion["stage"])
+        self.assertEqual({
+            "model_version": 2, "model_root_count": 2, "model_tree_file_count": 2,
+        }, completion["details"])
+        self.assertEqual("model_version:2", completion["corr_id"])
+        self.assertEqual(completion["corr_id"], completion["flow_id"])
+        self.assertEqual(completion["corr_id"], publication["corr_id"])
+        self.assertEqual(completion["flow_id"], publication["flow_id"])
+        self.assertEqual({"model_version": 2, "scope_version": 1}, publication["details"])
+
+    def test_disabled_choice_attribution_does_not_read_model_output_cardinality(self):
+        class CountingModel(Model):
+            def __init__(self):
+                super().__init__()
+                self.file_count_reads = 0
+                self.tree_file_count_reads = 0
+
+            @property
+            def file_count(self):
+                self.file_count_reads += 1
+                return super().file_count
+
+            @property
+            def tree_file_count(self):
+                self.tree_file_count_reads += 1
+                return super().tree_file_count
+
+        model = CountingModel()
+        controller, builder = self._make_progressive_update_controller(None, model=model)
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: False)
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        builder.has_pending_active_transfer_delta.return_value = False
+        builder.has_changes.return_value = False
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(0, model.file_count_reads)
+        self.assertEqual(0, model.tree_file_count_reads)
+
+    def test_disabled_scan_attribution_skips_collector_cardinality_publication(self):
+        scan = ScannerResult(
+            datetime.now(), [SystemFile("sample-root", 1)],
+            scanned_path_pair_ids={"path-pair-a"}, completed_path_pair_ids={"path-pair-a"},
+        )
+        controller, builder = self._make_progressive_update_controller(scan, scan)
+        diagnostics = MagicMock()
+        diagnostics.is_enabled.return_value = False
+        controller._Controller__context.performance_diagnostics = diagnostics
+        controller._Controller__work_state_lock = RLock()
+        controller._Controller__stop_resume_trace_cycle_id = 0
+        builder.has_pending_active_transfer_delta.return_value = False
+        builder.has_changes.return_value = False
+
+        ModelUpdater(controller).update()
+
+        diagnostics.set_gauges.assert_not_called()
+        diagnostics.increment.assert_not_called()
 
     def test_remote_lifecycle_requires_result_on_staggered_or_no_event_tick(self):
         final_scan = SimpleNamespace(is_scan_final=True, failed=False, unknown_path_pair_ids=set())

@@ -14,7 +14,13 @@ from typing import Iterator, Optional
 import bottle
 from bottle import HTTPResponse
 
-from common import PerformanceDiagnosticsCollector, overrides
+from common import BreadcrumbTraceCollector, PerformanceDiagnosticsCollector, overrides
+from common.performance_diagnostics import (
+    DURATION_MODEL_SCOPED_SERIALIZATION,
+    DURATION_MODEL_SCOPED_SSE_EMISSION,
+    DURATION_MODEL_SUMMARY_SERIALIZATION,
+    DURATION_MODEL_SUMMARY_SSE_EMISSION,
+)
 from controller import Controller
 from controller.controller import (
     MODEL_LEGACY_SCOPE_ID,
@@ -183,9 +189,15 @@ class ModelApiHandler(IHandler):
     _KEEPALIVE_INTERVAL_SECONDS = 5.0
     _SUMMARY_MIN_INTERVAL_SECONDS = 0.5
 
-    def __init__(self, controller: Controller, performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
+    def __init__(
+        self,
+        controller: Controller,
+        performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None,
+        breadcrumb_trace: Optional[BreadcrumbTraceCollector] = None,
+    ):
         self.__controller = controller
         self.__performance_diagnostics = performance_diagnostics
+        self.__breadcrumb_trace = breadcrumb_trace
 
     @overrides(IHandler)
     def add_routes(self, web_app: WebApp) -> None:
@@ -210,12 +222,86 @@ class ModelApiHandler(IHandler):
             required_scope="stream", allow_sessionless_ui=True,
         )(self.__handle_stream)
 
-    @staticmethod
-    def __json_response(payload: object, status: int = 200) -> HTTPResponse:
-        return HTTPResponse(
-            body=json.dumps(payload), status=status,
-            headers={"Content-Type": "application/json"},
-        )
+    def __record_duration(self, metric: str, operation) -> object:
+        diagnostics = self.__performance_diagnostics
+        started_at = None
+        try:
+            started_at = diagnostics.begin_duration(metric) if diagnostics is not None else None
+        except Exception:
+            pass
+        try:
+            return operation()
+        finally:
+            if diagnostics is not None:
+                try:
+                    diagnostics.finish_duration(metric, started_at)
+                except Exception:
+                    pass
+
+    def __json_response(self, payload: object, status: int = 200, *, summary: bool = False) -> HTTPResponse:
+        metric = DURATION_MODEL_SUMMARY_SERIALIZATION if summary else DURATION_MODEL_SCOPED_SERIALIZATION
+        counter = "model_summary_serializations" if summary else "model_page_serializations"
+        diagnostics = self.__performance_diagnostics
+        if diagnostics is not None:
+            try:
+                diagnostics.increment(counter)
+            except Exception:
+                pass
+        body = self.__record_duration(metric, lambda: json.dumps(payload))
+        return HTTPResponse(body=body, status=status, headers={"Content-Type": "application/json"})
+
+    def __sse(
+        self, publication: str, event: str, payload: dict[str, object], version: Optional[int] = None,
+        global_model_version: Optional[int] = None,
+    ) -> str:
+        serialization_metric = DURATION_MODEL_SUMMARY_SERIALIZATION if publication == "summary" \
+            else DURATION_MODEL_SCOPED_SERIALIZATION
+        emission_metric = DURATION_MODEL_SUMMARY_SSE_EMISSION if publication == "summary" \
+            else DURATION_MODEL_SCOPED_SSE_EMISSION
+        counter = "model_summary_sse_emissions" if publication == "summary" else "model_scoped_sse_emissions"
+
+        def format_event() -> str:
+            event_id = "id: {}\n".format(version) if version is not None else ""
+            return "{}event: {}\ndata: {}\n\n".format(
+                event_id, event, json.dumps(payload, separators=(",", ":"))
+            )
+
+        rendered = self.__record_duration(serialization_metric, format_event)
+
+        def publish() -> str:
+            diagnostics = self.__performance_diagnostics
+            if diagnostics is not None:
+                try:
+                    diagnostics.increment(counter)
+                except Exception:
+                    pass
+            trace = self.__breadcrumb_trace
+            if trace is not None:
+                try:
+                    if not trace.is_enabled():
+                        return rendered
+                    global_version = version if publication == "summary" else global_model_version
+                    if not isinstance(global_version, int):
+                        return rendered
+                    correlation = "model_version:{}".format(global_version)
+                    details = {"model_version": global_version}
+                    if publication == "scoped" and isinstance(version, int):
+                        details["scope_version"] = version
+                    trace.record(
+                        "model_api",
+                        "model_summary_sse_published" if publication == "summary" else "model_scoped_sse_published",
+                        details,
+                        stage="model_publication",
+                        event_type="state_transition",
+                        corr_id=correlation,
+                        flow_id=correlation,
+                        trace_scope="aggregate",
+                    )
+                except Exception:
+                    pass
+            return rendered
+
+        return self.__record_duration(emission_metric, publish)  # type: ignore[return-value]
 
     @staticmethod
     def __validate_scope_id(path_pair_id: str) -> str:
@@ -306,7 +392,9 @@ class ModelApiHandler(IHandler):
         return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
     @classmethod
-    def __public_page(cls, page: dict[str, object], query_signature: str) -> dict[str, object]:
+    def __public_page(
+        cls, page: dict[str, object], query_signature: str, *, preserve_global_model_version: bool = False,
+    ) -> dict[str, object]:
         next_cursor_file_id = page.pop("next_cursor_file_id", None)
         next_cursor_sort_key = page.pop("next_cursor_sort_key", None)
         version = page.get("model_version")
@@ -320,10 +408,13 @@ class ModelApiHandler(IHandler):
             next_cursor_sort_key if isinstance(next_cursor_sort_key, tuple) else None,
             query_signature,
         )
+        if not preserve_global_model_version:
+            page.pop("_global_model_version", None)
         return page
 
     def __get_page(
-        self, scope_id: str, parent_file_id: Optional[str], *, add_listener: Optional[ScopedModelListener] = None
+        self, scope_id: str, parent_file_id: Optional[str], *, add_listener: Optional[ScopedModelListener] = None,
+        preserve_global_model_version: bool = False,
     ) -> dict[str, object]:
         limit = self.__read_limit()
         sort_mode, status_filter, name_filter, query_signature = self.__read_query()
@@ -344,12 +435,12 @@ class ModelApiHandler(IHandler):
                 )
         except ModelPageCursorError:
             return {"error": "invalid_model_cursor"}
-        return self.__public_page(page, query_signature)
+        return self.__public_page(
+            page, query_signature, preserve_global_model_version=preserve_global_model_version,
+        )
 
     def __handle_summary(self) -> HTTPResponse:
-        if self.__performance_diagnostics is not None:
-            self.__performance_diagnostics.increment("model_summary_serializations")
-        return self.__json_response(self.__controller.get_model_summary())
+        return self.__json_response(self.__controller.get_model_summary(), summary=True)
 
     def __handle_summary_stream(self) -> Iterator[str]:
         listener = SummaryModelListener()
@@ -364,11 +455,11 @@ class ModelApiHandler(IHandler):
                 last_keepalive_at = time.monotonic()
                 last_summary_at = time.monotonic()
                 pending_event: Optional[dict[str, object]] = None
-                yield self.__sse("model-summary", summary, version if isinstance(version, int) else None)
+                yield self.__sse("summary", "model-summary", summary, version if isinstance(version, int) else None)
                 if reconnect_id:
                     # Replay is unavailable, but the just-emitted snapshot is
                     # already the complete normalized recovery payload.
-                    yield self.__sse("model-summary", summary, version if isinstance(version, int) else None)
+                    yield self.__sse("summary", "model-summary", summary, version if isinstance(version, int) else None)
                 while True:
                     event = listener.take_next_event()
                     if event is not None:
@@ -388,7 +479,7 @@ class ModelApiHandler(IHandler):
                             max_age_seconds=self._SUMMARY_MIN_INTERVAL_SECONDS
                         )
                         update_version = snapshot.get("model_version") if isinstance(snapshot, dict) else None
-                        yield self.__sse("model-summary", snapshot,
+                        yield self.__sse("summary", "model-summary", snapshot,
                                          update_version if isinstance(update_version, int) else None)
                         pending_event = None
                         last_summary_at = time.monotonic()
@@ -410,8 +501,6 @@ class ModelApiHandler(IHandler):
     def __handle_roots(self, path_pair_id: str) -> HTTPResponse:
         scope_id = self.__validate_scope_id(path_pair_id)
         page = self.__get_page(scope_id, None)
-        if self.__performance_diagnostics is not None:
-            self.__performance_diagnostics.increment("model_page_serializations")
         return self.__json_response(
             page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
         )
@@ -420,17 +509,8 @@ class ModelApiHandler(IHandler):
         scope_id = self.__validate_scope_id(path_pair_id)
         parent_file_id = self.__read_parent_file_id()
         page = self.__get_page(scope_id, parent_file_id)
-        if self.__performance_diagnostics is not None:
-            self.__performance_diagnostics.increment("model_page_serializations")
         return self.__json_response(
             page, 409 if page.get("error") == "cursor_reset_required" else 400 if page.get("error") else 200
-        )
-
-    @staticmethod
-    def __sse(event: str, payload: dict[str, object], version: Optional[int] = None) -> str:
-        event_id = "id: {}\n".format(version) if version is not None else ""
-        return "{}event: {}\ndata: {}\n\n".format(
-            event_id, event, json.dumps(payload, separators=(",", ":"))
         )
 
     def __handle_stream(self, path_pair_id: str) -> Iterator[str]:
@@ -439,7 +519,9 @@ class ModelApiHandler(IHandler):
         if callable(prioritize):
             prioritize(scope_id)
         listener = ScopedModelListener(scope_id)
-        page = self.__get_page(scope_id, None, add_listener=listener)
+        page = self.__get_page(
+            scope_id, None, add_listener=listener, preserve_global_model_version=True,
+        )
         if page.get("error"):
             listener.close()
             return self.__json_response(page, 409 if page.get("error") == "cursor_reset_required" else 400)
@@ -450,18 +532,24 @@ class ModelApiHandler(IHandler):
         def stream() -> Iterator[str]:
             try:
                 version = page.get("model_version")
+                global_model_version = page.pop("_global_model_version", None)
                 last_keepalive_at = time.monotonic()
-                yield self.__sse("model-page", page, version if isinstance(version, int) else None)
+                yield self.__sse(
+                    "scoped", "model-page", page, version if isinstance(version, int) else None,
+                    global_model_version if isinstance(global_model_version, int) else None,
+                )
                 if reconnect_id:
                     yield self.__sse(
-                        "model-reset",
+                        "scoped", "model-reset",
                         {"model_version": version, "reason": "replay_unavailable"},
                         version if isinstance(version, int) else None,
+                        global_model_version if isinstance(global_model_version, int) else None,
                     )
                 while True:
                     event = listener.take_next_event()
                     if event is not None:
                         event_name = event.pop("event")
+                        event_global_model_version = None
                         if event_name == "model-invalidate":
                             changed_ids = event.get("file_ids")
                             updates = self.__controller.get_model_root_updates(
@@ -471,11 +559,19 @@ class ModelApiHandler(IHandler):
                             event["records"] = updates["records"]
                             event["removed_file_ids"] = updates["removed_file_ids"]
                             event["model_version"] = updates["model_version"]
+                            captured = updates.get("_global_model_version")
+                            event_global_model_version = captured if isinstance(captured, int) else None
+                        elif event_name == "model-reset":
+                            versions = self.__controller.get_model_scope_version_snapshot(scope_id)
+                            event["model_version"] = versions["model_version"]
+                            captured = versions.get("_global_model_version")
+                            event_global_model_version = captured if isinstance(captured, int) else None
                         event_version = event.get("model_version")
                         yield self.__sse(
-                            event_name if isinstance(event_name, str) else "model-reset",
+                            "scoped", event_name if isinstance(event_name, str) else "model-reset",
                             event,
                             event_version if isinstance(event_version, int) else None,
+                            event_global_model_version,
                         )
                         last_keepalive_at = time.monotonic()
                     elif time.monotonic() - last_keepalive_at >= self._KEEPALIVE_INTERVAL_SECONDS:

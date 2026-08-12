@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from webtest import TestApp
 
-from common import Config, Status
+from common import BreadcrumbTraceCollector, Config, Status
+from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
 from model import Model, ModelFile
@@ -41,6 +42,108 @@ class TestModelApi(unittest.TestCase):
 
     def test_model_sse_keepalive_matches_global_stream_closure_cadence(self):
         self.assertEqual(5.0, ModelApiHandler._KEEPALIVE_INTERVAL_SECONDS)
+
+    def test_sse_publication_uses_context_supplied_bounded_collectors_without_payload_metadata(self):
+        diagnostics_enabled = [True]
+        breadcrumbs_enabled = [True]
+        diagnostics = PerformanceDiagnosticsCollector(lambda: diagnostics_enabled[0])
+        breadcrumbs = BreadcrumbTraceCollector(lambda: breadcrumbs_enabled[0], max_entries=8)
+        self.model.add_file(self._file("sample-root-name", "pair-a"))
+        handler = ModelApiHandler(self.controller, diagnostics, breadcrumbs)
+        environ: dict[str, object] = {}
+        setup_testing_defaults(environ)
+        environ["QUERY_STRING"] = "limit=1"
+        bottle.request.bind(environ)
+        bottle.response.bind()
+
+        stream = handler._ModelApiHandler__handle_stream("pair-a")
+        self.assertIn("event: model-page", next(stream))
+        stream.close()
+
+        snapshot = diagnostics.snapshot()
+        self.assertEqual(1, snapshot["counters"]["model_scoped_sse_emissions"])
+        self.assertEqual(1, snapshot["durations"]["model_scoped_serialization"]["count"])
+        self.assertEqual(1, snapshot["durations"]["model_scoped_sse_emission"]["count"])
+        trace = breadcrumbs.snapshot()
+        self.assertEqual("model_api", trace["entries"][-1]["source"])
+        self.assertEqual("model_scoped_sse_published", trace["entries"][-1]["message"])
+        self.assertEqual({"model_version": 1, "scope_version": 1}, trace["entries"][-1]["details"])
+        self.assertNotIn("sample-root-name", str(trace))
+
+        diagnostics_enabled[0] = False
+        breadcrumbs_enabled[0] = False
+        disabled_handler = ModelApiHandler(self.controller, diagnostics, breadcrumbs)
+        stream = disabled_handler._ModelApiHandler__handle_summary_stream()
+        self.assertIn("event: model-summary", next(stream))
+        stream.close()
+        self.assertEqual(0, diagnostics.snapshot()["counters"]["model_summary_sse_emissions"])
+        self.assertEqual(1, len(breadcrumbs.snapshot()["entries"]))
+
+    def test_scoped_sse_correlates_to_global_version_without_exposing_scope_identity(self):
+        breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        self.model.add_file(self._file("root-a", "pair-a"))
+        self.model.add_file(self._file("root-b", "pair-b"))
+        self.assertEqual(2, self.model.version)
+        self.assertEqual(1, self.model.scope_version("pair-a"))
+
+        ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)._ModelApiHandler__sse(
+            "scoped", "model-page", {}, self.model.scope_version("pair-a"), self.model.version,
+        )
+
+        entry = breadcrumbs.snapshot()["entries"][-1]
+        self.assertEqual("model_version:2", entry["corr_id"])
+        self.assertEqual("model_version:2", entry["flow_id"])
+        self.assertEqual({"model_version": 2, "scope_version": 1}, entry["details"])
+        self.assertNotIn("pair-a", str(entry))
+
+    def test_scoped_sse_uses_snapshot_global_version_after_a_concurrent_advance(self):
+        breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        self.model.add_file(self._file("root-a", "pair-a"))
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)
+        environ: dict[str, object] = {}
+        setup_testing_defaults(environ)
+        environ["QUERY_STRING"] = "limit=1"
+        bottle.request.bind(environ)
+        bottle.response.bind()
+
+        stream = handler._ModelApiHandler__handle_stream("pair-a")
+        # The scoped page was captured at global version 1. A different scope
+        # advances the live model before this generator serializes that page.
+        self.model.add_file(self._file("root-b", "pair-b"))
+        emitted = next(stream)
+        stream.close()
+
+        entry = breadcrumbs.snapshot()["entries"][-1]
+        self.assertEqual("model_version:1", entry["corr_id"])
+        self.assertEqual({"model_version": 1, "scope_version": 1}, entry["details"])
+        self.assertNotIn("_global_model_version", emitted)
+
+    def test_coalesced_scoped_reset_captures_global_version_without_transport_leak(self):
+        breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        root = self._file("root-a", "pair-a")
+        self.model.add_file(root)
+        handler = ModelApiHandler(self.controller, breadcrumb_trace=breadcrumbs)
+        environ: dict[str, object] = {}
+        setup_testing_defaults(environ)
+        environ["QUERY_STRING"] = "limit=1"
+        bottle.request.bind(environ)
+        bottle.response.bind()
+
+        with patch.object(ScopedModelListener, "_MAX_IDENTITIES", 0):
+            stream = handler._ModelApiHandler__handle_stream("pair-a")
+            next(stream)
+            changed = self._file("root-a", "pair-a")
+            changed.local_size = 4
+            self.model.update_file(changed)
+            emitted = next(stream)
+            stream.close()
+
+        entry = breadcrumbs.snapshot()["entries"][-1]
+        self.assertIn("event: model-reset", emitted)
+        self.assertNotIn("_global_model_version", emitted)
+        self.assertEqual("model_version:2", entry["corr_id"])
+        self.assertEqual("model_version:2", entry["flow_id"])
+        self.assertEqual({"model_version": 2, "scope_version": 2}, entry["details"])
 
     @staticmethod
     def _file(name: str, pair: str | None, directory: bool = False) -> ModelFile:

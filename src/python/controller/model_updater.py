@@ -22,6 +22,7 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC,
     DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
+    DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
@@ -1206,9 +1207,20 @@ class ModelUpdater(_ControllerCoreAccess):
                             diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_WAIT, lock_wait_started)
                         except Exception:
                             pass
+                lock_hold_started = None
+                try:
+                    lock_hold_started = diagnostics.begin_duration(DURATION_MODEL_UPDATE_LOCK_HOLD) \
+                        if diagnostics is not None else None
+                except Exception:
+                    pass
                 try:
                     build_triggered = self._update_once()
                 finally:
+                    if diagnostics is not None:
+                        try:
+                            diagnostics.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, lock_hold_started)
+                        except Exception:
+                            pass
                     work_state_lock.release()
         finally:
             # Keep the no-rebuild case observable and finish only after all
@@ -1483,6 +1495,47 @@ class ModelUpdater(_ControllerCoreAccess):
             except TypeError:
                 return 0
 
+        def record_scan_result_attribution(source: str, result: ScannerResult) -> None:
+            """Expose fixed scan cardinalities without retaining scan identities."""
+            if diagnostics is None:
+                return
+            try:
+                if not diagnostics.is_enabled():
+                    return
+            except Exception:
+                return
+            metrics = {
+                "local": (
+                    "local_scan_result_observations", "local_scan_result_root_count",
+                    "local_scan_result_scanned_pair_count", "local_scan_result_completed_pair_count",
+                    "local_scan_result_unknown_pair_count",
+                ),
+                "remote": (
+                    "remote_scan_result_observations", "remote_scan_result_root_count",
+                    "remote_scan_result_scanned_pair_count", "remote_scan_result_completed_pair_count",
+                    "remote_scan_result_unknown_pair_count",
+                ),
+                "active": (
+                    "active_scan_result_observations", "active_scan_result_root_count",
+                    "active_scan_result_scanned_pair_count", "active_scan_result_completed_pair_count",
+                    "active_scan_result_unknown_pair_count",
+                ),
+            }
+            metric_names = metrics.get(source)
+            if metric_names is None:
+                return
+            observations, root_count, scanned_pair_count, completed_pair_count, unknown_pair_count = metric_names
+            try:
+                diagnostics.increment(observations)
+                diagnostics.set_gauges({
+                    root_count: len(result.files),
+                    scanned_pair_count: scan_pair_count(result, "scanned_path_pair_ids"),
+                    completed_pair_count: scan_pair_count(result, "completed_path_pair_ids"),
+                    unknown_pair_count: scan_pair_count(result, "unknown_path_pair_ids"),
+                })
+            except Exception:
+                pass
+
         # Report the effective authority for this tick.  A final progressive
         # result becomes authoritative immediately after this publication
         # bracket, so expose that outcome in the breadcrumb without retaining
@@ -1694,6 +1747,7 @@ class ModelUpdater(_ControllerCoreAccess):
         # Update model builder state.
         remote_files: list[SystemFile] = []
         if latest_remote_scan is not None:
+            record_scan_result_attribution("remote", latest_remote_scan)
             remote_scan_failed = bool(getattr(latest_remote_scan, "failed", False))
             if progressive_mode:
                 remote_files = joint_remote_files
@@ -1732,6 +1786,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 corr_id=controller._Controller__trace_corr_id_from_files(remote_files, "remote_scan"),
             )
         if latest_local_scan is not None:
+            record_scan_result_attribution("local", latest_local_scan)
             # A failed local scan may contain a partial/empty result. Keep the
             # last authoritative local snapshot and its history until a
             # healthy scan proves absence.
@@ -1845,6 +1900,7 @@ class ModelUpdater(_ControllerCoreAccess):
             if callable(recorder):
                 recorder(local_reconciled_ids, remote_reconciled_ids)
         if latest_active_scan is not None:
+            record_scan_result_attribution("active", latest_active_scan)
             active_scan_files = list(latest_active_scan.files)
             handoff_file_ids = controller._Controller__successful_final_move_handoff_file_ids
             if handoff_file_ids:
@@ -2322,7 +2378,6 @@ class ModelUpdater(_ControllerCoreAccess):
                         diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
                     except Exception:
                         pass
-
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
             # the builder cache, retain their exact event tokens for adoption;
@@ -2962,4 +3017,54 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 if callable(refresh_identities):
                     refresh_identities()
+            try:
+                model_version = getattr(controller._Controller__model, "version", None)
+                if isinstance(model_version, int):
+                    correlation = "model_version:{}".format(model_version)
+                    controller._Controller__record_breadcrumb(
+                        stage="model_update",
+                        message="model_build_completed",
+                        details={
+                            "model_version": model_version,
+                            "model_root_count": getattr(controller._Controller__model, "file_count", 0),
+                            "model_tree_file_count": getattr(controller._Controller__model, "tree_file_count", 0),
+                        },
+                        event_type="state_transition",
+                        corr_id=correlation,
+                        flow_id=correlation,
+                        trace_scope="aggregate",
+                    )
+            except Exception:
+                pass
+        diagnostics_enabled = False
+        if diagnostics is not None:
+            try:
+                diagnostics_enabled = bool(diagnostics.is_enabled())
+            except Exception:
+                diagnostics_enabled = False
+        if diagnostics_enabled:
+            try:
+                if full_build_triggered:
+                    choice = "full"
+                elif progressive_delta_applied:
+                    choice = "progressive"
+                elif active_transfer_delta_applied:
+                    choice = "active"
+                else:
+                    choice = "noop"
+                with controller._Controller__model_lock:
+                    output_root_count = getattr(controller._Controller__model, "file_count", 0)
+                    output_tree_file_count = getattr(controller._Controller__model, "tree_file_count", 0)
+                diagnostics.increment({
+                    "full": "model_update_choice_full",
+                    "progressive": "model_update_choice_progressive",
+                    "active": "model_update_choice_active",
+                    "noop": "model_update_choice_noop",
+                }[choice])
+                diagnostics.set_gauges({
+                    "model_update_output_root_count": output_root_count,
+                    "model_update_output_tree_file_count": output_tree_file_count,
+                })
+            except Exception:
+                pass
         return full_build_triggered or progressive_delta_applied or active_transfer_delta_applied

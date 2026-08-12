@@ -70,7 +70,9 @@ class WebAppBuilder:
         self.auto_queue_handler = AutoQueueHandler(auto_queue_persist)
         self.status_handler = StatusHandler(context.status)
         self.model_api_handler = ModelApiHandler(
-            self.__controller, getattr(context, "performance_diagnostics", None)
+            self.__controller,
+            getattr(context, "performance_diagnostics", None),
+            getattr(context, "breadcrumb_trace", None),
         )
         self.breadcrumb_trace_handler = BreadcrumbTraceHandler(context)
         self.performance_diagnostics_handler = PerformanceDiagnosticsHandler(context, self.__controller)

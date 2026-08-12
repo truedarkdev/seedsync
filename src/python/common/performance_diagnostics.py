@@ -52,7 +52,12 @@ DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE = "model_update_lifecycle_maintenanc
 DURATION_MODEL_UPDATE_BUILD_FINALIZATION = "model_update_build_finalization"
 DURATION_MODEL_UPDATE_TRACE_SETUP = "model_update_trace_setup"
 DURATION_MODEL_UPDATE_LOCK_WAIT = "model_update_lock_wait"
+DURATION_MODEL_UPDATE_LOCK_HOLD = "model_update_lock_hold"
 DURATION_MODEL_UPDATE_TRACE_FINALIZATION = "model_update_trace_finalization"
+DURATION_MODEL_SUMMARY_SERIALIZATION = "model_summary_serialization"
+DURATION_MODEL_SCOPED_SERIALIZATION = "model_scoped_serialization"
+DURATION_MODEL_SUMMARY_SSE_EMISSION = "model_summary_sse_emission"
+DURATION_MODEL_SCOPED_SSE_EMISSION = "model_scoped_sse_emission"
 # Fixed model-rebuild trigger names.  These are intentionally closed-world
 # labels: diagnostics must never accept caller-provided paths or identifiers.
 MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION = "terminalizable_collision"
@@ -111,7 +116,10 @@ _DURATION_METRICS_ORDER = (
     DURATION_MODEL_UPDATE_SCAN_INTAKE, DURATION_MODEL_UPDATE_STATUS_INGESTION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC, DURATION_MODEL_UPDATE_LIFECYCLE_MAINTENANCE,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION, DURATION_MODEL_UPDATE_TRACE_SETUP,
-    DURATION_MODEL_UPDATE_LOCK_WAIT, DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+    DURATION_MODEL_UPDATE_LOCK_WAIT, DURATION_MODEL_UPDATE_LOCK_HOLD,
+    DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
+    DURATION_MODEL_SUMMARY_SERIALIZATION, DURATION_MODEL_SCOPED_SERIALIZATION,
+    DURATION_MODEL_SUMMARY_SSE_EMISSION, DURATION_MODEL_SCOPED_SSE_EMISSION,
 )
 
 _ATTRIBUTION_GROUPS = {
@@ -165,9 +173,14 @@ _COUNTERS = frozenset((
     "model_full_snapshot_requests", "model_full_snapshot_listener_registrations",
     "model_scoped_snapshot_registrations",
     "model_summary_snapshot_registrations", "model_page_serializations", "model_summary_serializations",
+    "model_summary_sse_emissions", "model_scoped_sse_emissions",
+    "model_update_choice_full", "model_update_choice_progressive",
+    "model_update_choice_active", "model_update_choice_noop",
+    "local_scan_result_observations", "remote_scan_result_observations", "active_scan_result_observations",
     "model_rebuild_terminalizable_collision", "model_rebuild_move_retry_due",
     "model_rebuild_collision_retry", "model_rebuild_deferred_move_pending",
     "progressive_delta_publications", "progressive_delta_root_visits",
+    "active_transfer_delta_publications", "active_transfer_delta_root_visits",
     "scan_priority_requests", "scan_priority_interrupts",
     "scan_priority_targeted_runs", "scan_priority_full_followups",
     "model_builder_cache_invalidation_local_files", "model_builder_cache_invalidation_remote_files",
@@ -187,6 +200,13 @@ _GAUGES = frozenset((
     "model_root_count", "model_tree_file_count", "model_listener_count", "path_pair_count", "active_download_count",
     "active_extract_count", "active_command_count", "controller_active_runtime_work",
     "controller_next_deadline_ms",
+    "model_update_output_root_count", "model_update_output_tree_file_count",
+    "local_scan_result_root_count", "local_scan_result_scanned_pair_count",
+    "local_scan_result_completed_pair_count", "local_scan_result_unknown_pair_count",
+    "remote_scan_result_root_count", "remote_scan_result_scanned_pair_count",
+    "remote_scan_result_completed_pair_count", "remote_scan_result_unknown_pair_count",
+    "active_scan_result_root_count", "active_scan_result_scanned_pair_count",
+    "active_scan_result_completed_pair_count", "active_scan_result_unknown_pair_count",
 ))
 _DURATION_METRICS = frozenset(_DURATION_METRICS_ORDER)
 _MAX_NUMERIC_VALUE = (1 << 63) - 1

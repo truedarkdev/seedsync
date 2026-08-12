@@ -32,7 +32,12 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
     DURATION_MODEL_UPDATE_STATUS_INGESTION,
     DURATION_MODEL_UPDATE,
+    DURATION_MODEL_UPDATE_LOCK_HOLD,
     DURATION_MODEL_UPDATE_LOCK_WAIT,
+    DURATION_MODEL_SUMMARY_SERIALIZATION,
+    DURATION_MODEL_SCOPED_SERIALIZATION,
+    DURATION_MODEL_SUMMARY_SSE_EMISSION,
+    DURATION_MODEL_SCOPED_SSE_EMISSION,
     DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
     DURATION_MODEL_UPDATE_TRACE_SETUP,
     MODEL_REBUILD_REASON_COLLISION_RETRY,
@@ -57,6 +62,43 @@ class _FailingSampler:
 
 
 class TestPerformanceDiagnosticsCollector(unittest.TestCase):
+    def test_backend_attribution_schema_is_closed_world_and_hot_toggle_safe(self):
+        enabled = [False]
+        collector = PerformanceDiagnosticsCollector(lambda: enabled[0])
+        for metric in (
+            DURATION_MODEL_UPDATE_LOCK_HOLD,
+            DURATION_MODEL_SUMMARY_SERIALIZATION,
+            DURATION_MODEL_SCOPED_SERIALIZATION,
+            DURATION_MODEL_SUMMARY_SSE_EMISSION,
+            DURATION_MODEL_SCOPED_SSE_EMISSION,
+        ):
+            self.assertIsNone(collector.begin_duration(metric))
+        collector.increment("model_update_choice_full")
+        collector.set_gauges({"model_update_output_root_count": 3})
+        self.assertEqual(0, collector.snapshot()["counters"]["model_update_choice_full"])
+
+        enabled[0] = True
+        started = collector.begin_duration(DURATION_MODEL_UPDATE_LOCK_HOLD)
+        collector.finish_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, started)
+        collector.increment("model_update_choice_full")
+        collector.increment("active_transfer_delta_publications")
+        collector.increment("active_transfer_delta_root_visits", 2)
+        collector.increment("local_scan_result_observations")
+        collector.set_gauges({
+            "model_update_output_root_count": 3,
+            "local_scan_result_completed_pair_count": 2,
+            "untrusted_label_/private/path": 9,
+        })
+        snapshot = collector.snapshot()
+        self.assertEqual(1, snapshot["durations"][DURATION_MODEL_UPDATE_LOCK_HOLD]["count"])
+        self.assertEqual(1, snapshot["counters"]["model_update_choice_full"])
+        self.assertEqual(1, snapshot["counters"]["active_transfer_delta_publications"])
+        self.assertEqual(2, snapshot["counters"]["active_transfer_delta_root_visits"])
+        self.assertEqual(1, snapshot["counters"]["local_scan_result_observations"])
+        self.assertEqual(3, snapshot["gauges"]["model_update_output_root_count"])
+        self.assertEqual(2, snapshot["gauges"]["local_scan_result_completed_pair_count"])
+        self.assertNotIn("untrusted_label_/private/path", str(snapshot))
+
     def test_rebuild_reason_counters_are_fixed_and_bounded(self):
         collector = PerformanceDiagnosticsCollector(lambda: True)
         collector.increment("model_rebuild_collision_retry", 2)
@@ -282,6 +324,7 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
             DURATION_MODEL_UPDATE_TRACE_SETUP,
             DURATION_MODEL_UPDATE_LOCK_WAIT,
+            DURATION_MODEL_UPDATE_LOCK_HOLD,
             DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
         )
         tokens = [collector.begin_duration(metric) for metric in metrics]
@@ -320,6 +363,9 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
             (DURATION_MODEL_UPDATE_TRACE_FINALIZATION, 0.01),
         ):
             collector.observe_duration(metric, cpu, cpu)
+        # Lock hold intentionally overlaps every in-lock update stage; it is
+        # a separate signal and must not inflate the disjoint attribution.
+        collector.observe_duration(DURATION_MODEL_UPDATE_LOCK_HOLD, 0.5, 0.5)
 
         clock[0] = 5.0
         collector.record_sample({}, close_window_at=clock[0])

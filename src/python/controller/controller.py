@@ -2616,6 +2616,9 @@ class Controller:
             next_cursor_file_id = page_files[-1].file_id
         return {
             "model_version": version,
+            # Private handler correlation captured by the same model-lock
+            # snapshot as this scoped page. It is stripped before transport.
+            "_global_model_version": self.__model.version,
             "path_pair_id": scope_id,
             "parent_file_id": parent_file_id,
             "limit": limit,
@@ -2696,8 +2699,18 @@ class Controller:
                     removed_root_ids.append(root_id)
             return {
                 "model_version": self.__model.scope_version(expected_path_pair_id),
+                "_global_model_version": self.__model.version,
                 "records": records,
                 "removed_file_ids": removed_root_ids,
+            }
+
+    def get_model_scope_version_snapshot(self, scope_id: str) -> dict[str, int]:
+        """Capture scoped and global versions atomically for an SSE reset."""
+        expected_path_pair_id = None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id
+        with self.__model_lock:
+            return {
+                "model_version": self.__model.scope_version(expected_path_pair_id),
+                "_global_model_version": self.__model.version,
             }
 
     def get_model_summary(self, max_age_seconds: float = 0.0) -> dict[str, object]:

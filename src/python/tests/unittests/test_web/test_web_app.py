@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlparse
 
-from common import Config
+from common import BreadcrumbTraceCollector, Config, PerformanceDiagnosticsCollector
 from web.auth_store import ApiKeyStore
 from web.handler.admin import AdminHandler
 from webtest import TestApp
@@ -193,6 +193,17 @@ class TestWebAppStream(unittest.TestCase):
             builder.config_handler._ConfigHandler__lftp_reconfigure_request,
             controller.request_lftp_reconfigure,
         )
+
+    def test_builder_injects_context_diagnostics_and_breadcrumb_collectors_into_model_publication(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        breadcrumbs = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        self.context.performance_diagnostics = diagnostics
+        self.context.breadcrumb_trace = breadcrumbs
+
+        builder = WebAppBuilder(self.context, MagicMock(), MagicMock())
+
+        self.assertIs(builder.model_api_handler._ModelApiHandler__performance_diagnostics, diagnostics)
+        self.assertIs(builder.model_api_handler._ModelApiHandler__breadcrumb_trace, breadcrumbs)
 
 class TestWebAppHostValidation(unittest.TestCase):
     def setUp(self):
