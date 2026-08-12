@@ -144,6 +144,7 @@ class TestBoundedWSGIServer(unittest.TestCase):
         server._normal_request_queue = Queue(maxsize=1)
         server._stream_request_queue = Queue(maxsize=stream_capacity)
         server._stream_admission = BoundedSemaphore(stream_capacity)
+        server._worker_shutdown_queues = []
         server.shutdown_request = MagicMock()
         return server
 
@@ -184,6 +185,16 @@ class TestBoundedWSGIServer(unittest.TestCase):
 
         self.assertTrue(server._worker_shutdown.is_set())
         self.assertTrue(all(not worker.is_alive() for worker in server._workers))
+
+    def test_idle_worker_blocks_without_timeout_polling(self):
+        server = object.__new__(_BoundedWSGIServer)
+        request_queue = MagicMock()
+        request_queue.get.return_value = web_app_job._WORKER_SHUTDOWN
+
+        server._worker_loop(request_queue)
+
+        request_queue.get.assert_called_once_with()
+        request_queue.task_done.assert_called_once_with()
 
     def test_supported_stream_capacity_is_admitted_without_waiting_for_disconnect(self):
         server = self._routing_server()
@@ -287,9 +298,10 @@ class TestBoundedWSGIServer(unittest.TestCase):
                 server = object.__new__(_BoundedWSGIServer)
                 server._worker_shutdown = Event()
                 server._stream_admission = BoundedSemaphore(1)
-                stream_queue = Queue(maxsize=1)
+                stream_queue = Queue(maxsize=2)
                 stream_request = _FakeSocket(b"GET /server/stream HTTP/1.1\r\n\r\n")
                 stream_queue.put_nowait((stream_request, ("127.0.0.1", 1001)))
+                stream_queue.put_nowait(web_app_job._WORKER_SHUTDOWN)
                 self.assertTrue(server._stream_admission.acquire(blocking=False))
 
                 def finish_request(request, client_address):
@@ -438,11 +450,13 @@ class TestBoundedWSGIServer(unittest.TestCase):
 
     def test_stream_admitted_before_shutdown_is_drained_and_releases_slot(self):
         server = self._routing_server(stream_capacity=1)
+        server._stream_request_queue = Queue(maxsize=2)
         stream_request = _FakeSocket(b"GET /server/stream HTTP/1.1\r\n\r\n")
         server.finish_request = MagicMock()
         server.handle_error = MagicMock()
 
         server.process_request(stream_request, ("127.0.0.1", 1001))
+        server._worker_shutdown_queues = [server._stream_request_queue]
         server.stop_accepting()
         server._worker_loop(server._stream_request_queue, releases_stream_slot=True)
 

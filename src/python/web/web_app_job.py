@@ -5,7 +5,7 @@ import socket
 import time
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler
-from queue import Empty, Full, Queue
+from queue import Full, Queue
 from threading import BoundedSemaphore, Event, Lock, Thread
 from types import TracebackType
 from typing import Protocol, TypeAlias, runtime_checkable
@@ -21,6 +21,14 @@ from common import overrides, Job, Context
 
 ClientAddress: TypeAlias = tuple[str, int] | tuple[str, int, int, int]
 QueuedRequest: TypeAlias = tuple[object, ClientAddress]
+
+
+class _WorkerShutdown:
+    pass
+
+
+_WORKER_SHUTDOWN = _WorkerShutdown()
+WorkerQueueItem: TypeAlias = QueuedRequest | _WorkerShutdown
 WSGIHeaders: TypeAlias = list[tuple[str, str]]
 WSGIExcInfo: TypeAlias = (
     tuple[type[BaseException], BaseException, TracebackType]
@@ -129,10 +137,18 @@ class _BoundedWSGIServer(WSGIServer):
     ) -> None:
         self._worker_shutdown = Event()
         self._request_admission_lock = Lock()
-        self._normal_request_queue: Queue[QueuedRequest] = Queue(maxsize=self.normal_queue_size)
-        self._stream_request_queue: Queue[QueuedRequest] = Queue(maxsize=self.stream_queue_size)
+        # Reserve one terminal slot per worker. Real-request admission below
+        # still enforces the documented logical queue sizes, so shutdown can
+        # wake every blocked worker without waiting for a request slot.
+        self._normal_request_queue: Queue[WorkerQueueItem] = Queue(
+            maxsize=self.normal_queue_size + self.normal_worker_count
+        )
+        self._stream_request_queue: Queue[WorkerQueueItem] = Queue(
+            maxsize=self.stream_queue_size + self.stream_worker_count
+        )
         self._stream_admission = BoundedSemaphore(self.stream_capacity)
         self._workers: list[Thread] = []
+        self._worker_shutdown_queues: list[Queue[WorkerQueueItem]] = []
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
         self._start_workers("SeedSyncWebWorker", self._normal_request_queue, self.normal_worker_count)
         self._start_workers(
@@ -145,7 +161,7 @@ class _BoundedWSGIServer(WSGIServer):
     def _start_workers(
         self,
         name_prefix: str,
-        request_queue: Queue[QueuedRequest],
+        request_queue: Queue[WorkerQueueItem],
         worker_count: int,
         releases_stream_slot: bool = False,
     ) -> None:
@@ -158,23 +174,23 @@ class _BoundedWSGIServer(WSGIServer):
             )
             worker.start()
             self._workers.append(worker)
+            self._worker_shutdown_queues.append(request_queue)
 
     def _worker_loop(
         self,
-        request_queue: Queue[QueuedRequest],
+        request_queue: Queue[WorkerQueueItem],
         releases_stream_slot: bool = False,
     ) -> None:
-        while not self._worker_shutdown.is_set() or not request_queue.empty():
+        while True:
+            item = request_queue.get()
             try:
-                request, client_address = request_queue.get(timeout=0.1)
-            except Empty:
-                continue
-
-            try:
+                if item is _WORKER_SHUTDOWN:
+                    return
+                request, client_address = item
                 self._process_request_from_worker(request, client_address)
             finally:
                 request_queue.task_done()
-                if releases_stream_slot:
+                if releases_stream_slot and item is not _WORKER_SHUTDOWN:
                     self._stream_admission.release()
 
     def _process_request_from_worker(
@@ -209,6 +225,9 @@ class _BoundedWSGIServer(WSGIServer):
             request_queue = (
                 self._stream_request_queue if is_stream_request else self._normal_request_queue
             )
+            if not is_stream_request and request_queue.qsize() >= self.normal_queue_size:
+                _call_request_lifecycle(self.shutdown_request, request)
+                return
             try:
                 request_queue.put_nowait((request, client_address))
             except Full:
@@ -287,7 +306,16 @@ class _BoundedWSGIServer(WSGIServer):
 
     def stop_accepting(self) -> None:
         with self._request_admission_lock:
+            if self._worker_shutdown.is_set():
+                return
             self._worker_shutdown.set()
+            worker_queues = list(getattr(self, "_worker_shutdown_queues", ()))
+        # Queue one terminal marker per live worker after admission is closed.
+        # FIFO ordering drains requests admitted before shutdown, while a
+        # blocking get leaves every idle worker asleep until real work or this
+        # one-time stop signal arrives.
+        for worker_queue in worker_queues:
+            worker_queue.put(_WORKER_SHUTDOWN)
 
     def server_close(self) -> None:
         self.stop_accepting()
