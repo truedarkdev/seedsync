@@ -1,3 +1,10 @@
+services:
+  remote:
+    networks:
+      default:
+        aliases:
+          - ${PERF_REMOTE_ADDRESS:?PERF_REMOTE_ADDRESS must name the external-network remote alias}
+
 networks:
   default:
     external: true

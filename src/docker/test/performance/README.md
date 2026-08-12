@@ -23,7 +23,10 @@ By default, Compose creates an isolated project-scoped bridge network for the
 lab. On a host whose Docker bridge address pools are exhausted, set
 `PERF_EXTERNAL_NETWORK` to an existing test-only bridge network. The lab then
 attaches its uniquely named containers to that network instead of creating a
-new one; it never removes or modifies the external network.
+new one; it never removes or modifies the external network. Also set
+`PERF_REMOTE_ADDRESS` to that run's exact remote container name when the
+external network can contain other Compose projects; this prevents the generic
+`remote` service alias from resolving another retained fixture.
 
 Run the candidate against the same retained fixture with a different run ID:
 

@@ -21,4 +21,6 @@ RUN chmod 755 /tmp/scan_fs.py
 
 EXPOSE 1234
 VOLUME ["/home/remoteuser/files"]
+HEALTHCHECK --interval=1s --timeout=1s --start-period=1s --retries=30 \
+    CMD ssh-keyscan -T 1 -p 1234 127.0.0.1 >/dev/null 2>&1 || exit 1
 CMD ["/usr/sbin/sshd", "-D", "-e"]

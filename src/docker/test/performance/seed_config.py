@@ -47,7 +47,7 @@ def _seed_persist(config_dir: Path, move_failure_mode: str) -> None:
 
 
 def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mode: str = "on",
-                move_failure_mode: str = "stale") -> None:
+                move_failure_mode: str = "stale", remote_address: str = "remote") -> None:
     if not api_token.strip():
         raise ValueError("api token must be nonblank")
     if pairs < 1 or pairs > 6:
@@ -56,6 +56,8 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
         raise ValueError("breadcrumb_mode must be on or off")
     if move_failure_mode not in {"stale", "none"}:
         raise ValueError("move_failure_mode must be stale or none")
+    if not remote_address.strip():
+        raise ValueError("remote_address must be nonblank")
     breadcrumb_enabled = "True" if breadcrumb_mode == "on" else "False"
     config_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -94,7 +96,7 @@ config_api_redact_remote_details = True
 
 [Lftp]
 transfer_backend = lftp
-remote_address = remote
+remote_address = {remote_address}
 remote_username = remoteuser
 remote_password = remotepass
 remote_port = 1234
@@ -189,10 +191,19 @@ def main() -> int:
     parser.add_argument("--pairs", type=int, default=6)
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"), default="on")
     parser.add_argument("--move-failure-mode", choices=("stale", "none"), default="stale")
+    parser.add_argument("--remote-address", default="remote")
     args = parser.parse_args()
-    seed_config(args.config_dir, args.api_token, args.pairs, args.breadcrumb_mode, args.move_failure_mode)
+    seed_config(
+        args.config_dir,
+        args.api_token,
+        args.pairs,
+        args.breadcrumb_mode,
+        args.move_failure_mode,
+        args.remote_address,
+    )
     print(json.dumps({"schema": "seedsync-performance-lab.config.v1", "pairs": args.pairs,
-                      "breadcrumb_mode": args.breadcrumb_mode, "move_failure_mode": args.move_failure_mode}))
+                      "breadcrumb_mode": args.breadcrumb_mode, "move_failure_mode": args.move_failure_mode,
+                      "remote_address": args.remote_address}))
     return 0
 
 

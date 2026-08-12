@@ -56,6 +56,8 @@ services:
       - "${PERF_BREADCRUMB_MODE:-on}"
       - --move-failure-mode
       - "${PERF_MOVE_FAILURE_MODE:-stale}"
+      - --remote-address
+      - "${PERF_REMOTE_ADDRESS:-remote}"
 
   remote:
     build:
@@ -84,7 +86,7 @@ services:
       fixture:
         condition: service_completed_successfully
       remote:
-        condition: service_started
+        condition: service_healthy
     environment:
       SEEDSYNC_E2E_API_TOKEN: ${PERF_API_TOKEN}
       SEEDSYNC_WEB_BIND_HOST: 0.0.0.0

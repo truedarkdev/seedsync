@@ -255,6 +255,17 @@ def test_compose_uses_isolated_default_network_with_optional_external_overlay():
     assert "external: true" in external_source
     assert "name: ${PERF_EXTERNAL_NETWORK:?PERF_EXTERNAL_NETWORK must name an existing Docker network}" \
         in external_source
+    assert "${PERF_REMOTE_ADDRESS:?PERF_REMOTE_ADDRESS must name the external-network remote alias}" \
+        in external_source
+
+
+def test_compose_waits_for_remote_ssh_health_before_starting_app():
+    compose_source = (PERF_DIR / "compose.yml").read_text(encoding="utf-8")
+    remote_dockerfile = (PERF_DIR / "remote.Dockerfile").read_text(encoding="utf-8")
+
+    assert "condition: service_healthy" in compose_source
+    assert "HEALTHCHECK" in remote_dockerfile
+    assert "ssh-keyscan -T 1 -p 1234 127.0.0.1" in remote_dockerfile
 
 
 def test_measure_captures_one_sanitized_ownership_artifact_after_resource_measurement():
@@ -309,6 +320,21 @@ def test_seeded_api_key_uses_current_store_hash_format(tmp_path):
     assert config.notifications.delete_complete is True
     persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
     assert len(persisted["move_failure_counts"]) == 1
+
+
+def test_seed_config_accepts_unique_remote_address(tmp_path):
+    config_dir = tmp_path / "config"
+
+    seed_config(
+        config_dir,
+        "local-test-token",
+        pairs=2,
+        breadcrumb_mode="off",
+        remote_address="seedsync-performance-lab-remote-1",
+    )
+
+    config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert config.lftp.remote_address == "seedsync-performance-lab-remote-1"
 
 
 def test_seed_can_omit_move_failure_for_trigger_isolation(tmp_path):
