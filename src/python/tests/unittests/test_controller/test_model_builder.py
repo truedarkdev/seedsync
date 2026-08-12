@@ -9,7 +9,7 @@ import time
 import unittest
 import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -5161,6 +5161,28 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_stop_resume_trace_cycle_context({"lftp_status_source": "fresh_healthy"})
         self.model_builder.finish_stop_resume_trace_cycle(recent_model, False)
         self.assertEqual(first_count + 2, len(self.__trace_entries(collector)))
+
+    def test_no_rebuild_trace_queries_only_runtime_candidates(self):
+        remote_files = [SystemFile("idle-{}.bin".format(index), 1000, False) for index in range(500)]
+        active_file = SystemFile("active.bin", 1000, False)
+        remote_files.append(active_file)
+        status = LftpJobStatus(7, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "")
+        status.total_transfer_state = LftpJobStatus.TransferState(250, 1000, 25, 50, 15)
+        collector = self.__enable_trace()
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.begin_stop_resume_trace_cycle(40)
+        model = self.model_builder.build_model()
+        initial_count = len(self.__trace_entries(collector))
+        model_proxy = MagicMock(wraps=model)
+        model_proxy.get_file_ids.side_effect = AssertionError("full model walk is forbidden")
+
+        self.model_builder.begin_stop_resume_trace_cycle(41)
+        self.model_builder.finish_stop_resume_trace_cycle(model_proxy, False)
+
+        model_proxy.get_file_ids.assert_not_called()
+        model_proxy.get_file.assert_called_once_with("active.bin")
+        self.assertEqual(initial_count + 1, len(self.__trace_entries(collector)))
 
     def test_trace_alternating_events_keep_unchanged_arbitration_coalesced(self):
         remote_file = SystemFile("interleave.bin", 1000, False)

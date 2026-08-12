@@ -352,7 +352,15 @@ class ModelBuilder:
     def finish_stop_resume_trace_cycle(self, model: Model, build_triggered: bool) -> None:
         if not self.__is_stop_resume_trace_enabled() or build_triggered:
             return
-        for file_id in model.get_file_ids():
+        # Every relevant trace subject is already owned by one of these
+        # runtime sets. Walking the complete model here made a no-rebuild
+        # breadcrumb cycle O(all scanned roots) even when no transfer existed.
+        candidate_file_ids = set(self.__recent_live_transfer_snapshots)
+        candidate_file_ids.update(self.__retained_stopped_transfer_snapshots)
+        candidate_file_ids.update(self.__lftp_statuses)
+        candidate_file_ids.update(self.__stopped_files)
+        candidate_file_ids.update(self.__active_file_ids)
+        for file_id in candidate_file_ids:
             try:
                 model_file = model.get_file(file_id)
             except ModelError:
