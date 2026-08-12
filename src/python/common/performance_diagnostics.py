@@ -179,10 +179,14 @@ _COUNTERS = frozenset((
     "model_builder_cache_invalidation_move_failed_files", "model_builder_cache_invalidation_final_move_succeeded_files",
     "model_builder_cache_invalidation_validation_statuses", "model_builder_cache_invalidation_clear",
     "model_builder_cache_invalidation_explicit",
+    "controller_job_wakes", "controller_job_wake_startup",
+    "controller_job_wake_event", "controller_job_wake_deadline",
+    "controller_job_idle_cycles", "controller_job_active_cycles",
 ))
 _GAUGES = frozenset((
     "model_root_count", "model_tree_file_count", "model_listener_count", "path_pair_count", "active_download_count",
-    "active_extract_count", "active_command_count",
+    "active_extract_count", "active_command_count", "controller_active_runtime_work",
+    "controller_next_deadline_ms",
 ))
 _DURATION_METRICS = frozenset(_DURATION_METRICS_ORDER)
 _MAX_NUMERIC_VALUE = (1 << 63) - 1

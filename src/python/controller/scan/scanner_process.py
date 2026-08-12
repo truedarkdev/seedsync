@@ -482,7 +482,8 @@ class ScannerProcess:
                  verbose: bool = True,
                  breadcrumb_trace: Optional[_BreadcrumbEmitter] = None,
                  recycle_scan_worker: bool = False,
-                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None):
+                 performance_diagnostics: Optional[PerformanceDiagnosticsCollector] = None,
+                 result_available_callback: Optional[Callable[[], None]] = None):
         """
         Create a scanner process
         :param scanner: IScanner implementation
@@ -505,6 +506,7 @@ class ScannerProcess:
         self.__breadcrumb_trace = breadcrumb_trace
         self.__recycle_scan_worker = recycle_scan_worker
         self.__performance_diagnostics = performance_diagnostics
+        self.__result_available_callback = result_available_callback
         self.__ingested_duration_tokens: deque[tuple[str, int, int]] = deque(maxlen=64)
         self.__scan_worker: Optional[multiprocessing.Process] = None
         self.__scan_worker_started_at: Optional[datetime] = None
@@ -590,6 +592,7 @@ class ScannerProcess:
             self.logger.debug("Scanner coordinator caught an exception", exc_info=True)
             with self.__exception_lock:
                 self.__exception = error
+            self.__notify_result_available()
         finally:
             self.run_cleanup()
 
@@ -673,7 +676,7 @@ class ScannerProcess:
                 system_file.path_pair_name = path_pair_name
             progress_files_by_pair.setdefault(path_pair_id, []).extend(files)
             assert self.__queue is not None
-            _publish_bounded_result(self.__queue, ScannerResult(
+            self.__publish_result(ScannerResult(
                 datetime.now(), files,
                 scanned_path_pair_ids={path_pair_id},
                 generation=self.__scan_generation,
@@ -684,7 +687,7 @@ class ScannerProcess:
                 session_token=self.__session_token,
             ))
             if complete:
-                _publish_bounded_result(self.__queue, ScannerResult(
+                self.__publish_result(ScannerResult(
                     datetime.now(), list(progress_files_by_pair.get(path_pair_id, [])),
                     scanned_path_pair_ids={path_pair_id},
                     generation=self.__scan_generation,
@@ -750,7 +753,7 @@ class ScannerProcess:
                 setter(None)
         assert self.__queue is not None
         assert self.__queue is not None
-        _publish_bounded_result(self.__queue, result)
+        self.__publish_result(result)
         # Do not retain the completed graph in this long-lived coordinator.
         del result
         del files
@@ -880,7 +883,7 @@ class ScannerProcess:
                 if isinstance(result, ScannerResult):
                     self.__ingest_duration_aggregates(result)
                     assert self.__queue is not None
-                    _publish_bounded_result(self.__queue, result)
+                    self.__publish_result(result)
             else:
                 status = message
         return status
@@ -899,6 +902,21 @@ class ScannerProcess:
         for metric, aggregate in aggregates.items():
             if isinstance(metric, str):
                 diagnostics.observe_duration_aggregate(metric, aggregate, expected_generation=token[2])
+
+    def __publish_result(self, result: ScannerResult) -> None:
+        assert self.__queue is not None
+        _publish_bounded_result(self.__queue, result)
+        self.__notify_result_available()
+
+    def __notify_result_available(self) -> None:
+        callback = self.__result_available_callback
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            # A wake hook is advisory and must never break scanning.
+            pass
 
     def __teardown_scan_worker(self, terminate: bool = True) -> None:
         worker = self.__scan_worker

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterable, List, Optional, Protocol, Sequence, Set, Tuple, cast
-from threading import Event, Lock, RLock
+from threading import Condition, Event, Lock, RLock
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from queue import Queue
 from enum import Enum
@@ -167,6 +167,8 @@ class Controller:
     __MAX_MOVE_FAILURES = 4
     __MOVE_RETRY_DELAYS = (2, 10, 30)
     __AUXILIARY_WORKER_IDLE_GRACE_IN_SECS = 2.0
+    _ACTIVE_PROCESS_INTERVAL_SECONDS = 0.1
+    _IDLE_HEALTH_INTERVAL_SECONDS = 5.0
 
     __context: Context
     __persist: ControllerPersist
@@ -200,6 +202,7 @@ class Controller:
     __pending_auto_purge_file_ids: set[str]
     __last_lftp_statuses: Optional[list[LftpJobStatus]]
     __next_lftp_status_poll_at: Optional[datetime]
+    __lftp_idle_status_authoritative: bool
     __lftp_status_cache_expires_at: Optional[datetime]
     __active_command_processes: list[Controller.CommandProcessWrapper]
     __reported_dead_workers: set[int]
@@ -550,6 +553,7 @@ class Controller:
         self.__exclude_patterns = ""
         self.__last_lftp_statuses = []
         self.__next_lftp_status_poll_at = None
+        self.__lftp_idle_status_authoritative = False
         self.__lftp_status_poll_retry_seconds = 1
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
@@ -568,6 +572,8 @@ class Controller:
         self.__context = context
         self.__persist = persist
         self.logger = context.logger.getChild("Controller")
+        self.__process_wake_condition = Condition()
+        self.__process_wake_generation = 0
         self.__target_archive_trace_logger = self.logger.getChild("TargetArchiveTrace")
         self.__target_archive_trace_file_id = os.environ.get("SEEDSYNC_TARGET_ARCHIVE_TRACE_FILE_ID")
         if self.__target_archive_trace_file_id is not None and not self.__target_archive_trace_file_id.strip():
@@ -742,6 +748,7 @@ class Controller:
         self.__pending_auto_purge_file_ids = set()
         self.__last_lftp_statuses = []
         self.__next_lftp_status_poll_at = None
+        self.__lftp_idle_status_authoritative = False
         (
             self.__lftp_status_poll_retry_seconds,
             self.__lftp_status_cache_max_age_seconds
@@ -1028,6 +1035,7 @@ class Controller:
             verbose=False,
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
             recycle_scan_worker=False,
+            result_available_callback=self.wake_process,
         )
         local_scan_process = ScannerProcess(
             scanner=local_scanner,
@@ -1039,6 +1047,7 @@ class Controller:
             # has no large serialized scanfs response to discard.  Keeping it
             # inline avoids spawning/importing Python every ten seconds.
             recycle_scan_worker=False,
+            result_available_callback=self.wake_process,
         )
         remote_scan_process = ScannerProcess(
             scanner=remote_scanner,
@@ -1048,6 +1057,7 @@ class Controller:
             breadcrumb_trace=self.__context.breadcrumb_trace.create_emitter(),
             recycle_scan_worker=True,
             performance_diagnostics=getattr(self.__context, "performance_diagnostics", None),
+            result_available_callback=self.wake_process,
         )
 
         old_path_pairs_by_id = self.__path_pairs_by_id
@@ -1524,6 +1534,7 @@ class Controller:
             self.__path_pair_refresh_requested = True
             self.__path_pair_refresh_generation += 1
             requested_generation = self.__path_pair_refresh_generation
+        self.wake_process()
 
         if not wait:
             return
@@ -1545,6 +1556,100 @@ class Controller:
     def request_lftp_reconfigure(self):
         with self.__lftp_reconfigure_lock:
             self.__lftp_reconfigure_requested = True
+        self.__lftp_idle_status_authoritative = False
+        self.__next_lftp_status_poll_at = None
+        self.wake_process()
+
+    def wake_process(self) -> None:
+        """Notify the controller job that new runtime work is available."""
+        condition = getattr(self, "_Controller__process_wake_condition", None)
+        if condition is None:
+            condition = Condition()
+            self.__process_wake_condition = condition
+            self.__process_wake_generation = 0
+        with condition:
+            self.__process_wake_generation = getattr(self, "_Controller__process_wake_generation", 0) + 1
+            condition.notify_all()
+
+    def process_wake_generation(self) -> int:
+        condition = getattr(self, "_Controller__process_wake_condition", None)
+        if condition is None:
+            self.__process_wake_condition = Condition()
+            self.__process_wake_generation = 0
+            return 0
+        with condition:
+            return getattr(self, "_Controller__process_wake_generation", 0)
+
+    def wait_for_process_wake(self, observed_generation: int, timeout: float) -> bool:
+        """Wait without losing a notification that races with controller work."""
+        condition = getattr(self, "_Controller__process_wake_condition", None)
+        if condition is None:
+            condition = Condition()
+            self.__process_wake_condition = condition
+            self.__process_wake_generation = 0
+        with condition:
+            return condition.wait_for(
+                lambda: getattr(self, "_Controller__process_wake_generation", 0) != observed_generation,
+                timeout=max(0.0, timeout),
+            )
+
+    def has_active_runtime_work(self) -> bool:
+        """Return whether progress or command state needs the 100 ms cadence."""
+        try:
+            with self.__work_state_lock:
+                if self.__pending_completion_file_names or self.__pending_queue_dispatches or \
+                        self.__pending_command_dispatch_file_ids or self.__pending_extract_file_ids or \
+                        self.__pending_validation_file_ids or self.__move_attempt_reservations:
+                    return True
+            if self.__active_downloading_file_names or self.__active_extracting_file_names or \
+                    self.__active_command_processes or not self.__command_queue.empty():
+                return True
+            if any(
+                status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
+                for status in (self.__last_lftp_statuses or [])
+            ):
+                return True
+            future = self.__collision_compare_future
+            if future is not None and not future.done():
+                return True
+            with self.__path_pair_refresh_lock:
+                if self.__path_pair_refresh_requested:
+                    return True
+            with self.__lftp_reconfigure_lock:
+                return self.__lftp_reconfigure_requested
+        except Exception:
+            return True
+
+    def next_process_delay_seconds(self) -> float:
+        """Return the nearest real runtime or bounded health deadline."""
+        if self.has_active_runtime_work():
+            return self._ACTIVE_PROCESS_INTERVAL_SECONDS
+        now = datetime.now()
+        now_monotonic = time.monotonic()
+        delays = [self._IDLE_HEALTH_INTERVAL_SECONDS]
+        next_lftp_poll = self.__next_lftp_status_poll_at
+        if next_lftp_poll is None:
+            if not self.__lftp_idle_status_authoritative:
+                delays.append(0.0)
+        else:
+            delays.append(max(0.0, (next_lftp_poll - now).total_seconds()))
+        next_active_scan = getattr(self, "_Controller__next_active_scan_force_at", None)
+        if isinstance(next_active_scan, datetime):
+            delays.append(max(0.0, (next_active_scan - now).total_seconds()))
+        retry_delays = [
+            max(0.0, (due_at - now).total_seconds())
+            for due_at in getattr(self, "_Controller__move_retry_due", {}).values()
+            if isinstance(due_at, datetime)
+        ]
+        if retry_delays:
+            delays.append(min(retry_delays))
+        for deadline in (
+            getattr(self, "_Controller__extract_idle_deadline_monotonic", None),
+            getattr(self, "_Controller__validate_idle_deadline_monotonic", None),
+        ):
+            if isinstance(deadline, (int, float)):
+                delays.append(max(0.0, float(deadline) - now_monotonic))
+        return min(delays)
 
     def __consume_lftp_reconfigure_request(self) -> bool:
         with self.__lftp_reconfigure_lock:
@@ -1683,6 +1788,7 @@ class Controller:
                 self.__local_scan_process.force_scan()
                 self.__remote_scan_process.force_scan()
                 self.__next_lftp_status_poll_at = None
+                self.__lftp_idle_status_authoritative = False
                 old_active_scan_process_stopped = stop_process(old_active_scan_process)
                 stop_process(old_local_scan_process)
                 stop_process(old_remote_scan_process)
@@ -2796,6 +2902,7 @@ class Controller:
                 )
             return
 
+        self.wake_process()
         self.__record_command_breadcrumb(
             command=command,
             message="command_queued",
@@ -4191,6 +4298,7 @@ class Controller:
                 claimed_source, destination, source_signature, destination_signature,
                 cancel_event,
             )
+            self.__collision_compare_future.add_done_callback(lambda _future: self.wake_process())
             self.__collision_compare_future.add_done_callback(
                 lambda completed_future: self.__restore_cancelled_collision_claim(
                     completed_future,
@@ -5480,6 +5588,7 @@ class Controller:
                         # transport snapshot in the updater that follows this
                         # command drain.
                         self.__next_lftp_status_poll_at = None
+                        self.__lftp_idle_status_authoritative = False
                         is_new_transfer_lifecycle = stop_boundary or file.state not in (
                             ModelFile.State.QUEUED,
                             ModelFile.State.DOWNLOADING,
@@ -5595,6 +5704,7 @@ class Controller:
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None
+                    self.__lftp_idle_status_authoritative = False
                     self.__record_command_breadcrumb(
                         command=command,
                         message="command_dispatched",

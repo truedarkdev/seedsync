@@ -317,6 +317,20 @@ class TestScannerProcess(unittest.TestCase):
         self.assertIsNone(self.process._ScannerProcess__scan_worker)
         self.assertIsNotNone(self.process.pop_latest_result())
 
+    def test_result_publication_notifies_controller_wake_callback(self):
+        wake = MagicMock()
+        self.process = ScannerProcess(
+            scanner=DummyScanner(),
+            interval_in_ms=1000,
+            result_available_callback=wake,
+        )
+        result = ScannerResult(datetime.now(), [])
+
+        self.process._ScannerProcess__publish_result(result)
+
+        wake.assert_called_once_with()
+        self.assertIs(result, self.process.pop_latest_result())
+
     def test_real_spawn_with_production_breadcrumb_and_log_transport(self):
         self._scan_run_patcher.stop()
         collector = BreadcrumbTraceCollector(lambda: True)

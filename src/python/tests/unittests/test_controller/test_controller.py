@@ -48,6 +48,8 @@ class TestController(unittest.TestCase):
         self.controller.logger = MagicMock()
         self.controller._Controller__command_queue = Queue()
         self.controller._Controller__command_flow_lock = Lock()
+        self.controller._Controller__process_wake_condition = threading.Condition()
+        self.controller._Controller__process_wake_generation = 0
         self.controller._Controller__active_command_processes = []
         self.controller._Controller__active_downloading_file_names = []
         self.controller._Controller__active_extracting_file_names = []
@@ -135,6 +137,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__path_pair_staging_paths = {}
         self.controller._Controller__last_lftp_statuses = []
         self.controller._Controller__next_lftp_status_poll_at = None
+        self.controller._Controller__lftp_idle_status_authoritative = False
         self.controller._Controller__lftp_status_poll_retry_seconds = 1
         self.controller._Controller__lftp_status_cache_expires_at = None
         self.controller._Controller__lftp_status_cache_max_age_seconds = 3
@@ -154,6 +157,29 @@ class TestController(unittest.TestCase):
         future = getattr(self.controller, "_Controller__collision_compare_future", None)
         self.assertIsNotNone(future)
         future.result(timeout=5)
+
+    def test_process_wait_notification_is_generation_safe(self):
+        generation = self.controller.process_wake_generation()
+        self.controller.wake_process()
+
+        self.assertTrue(self.controller.wait_for_process_wake(generation, 0))
+        self.assertEqual(generation + 1, self.controller.process_wake_generation())
+
+    def test_idle_process_delay_uses_health_deadline_without_polling(self):
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__lftp_idle_status_authoritative = True
+
+        self.assertFalse(self.controller.has_active_runtime_work())
+        self.assertEqual(Controller._IDLE_HEALTH_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
+
+    def test_active_transfer_process_delay_remains_100ms(self):
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__active_downloading_file_names = [("active.bin", None, None)]
+
+        self.assertTrue(self.controller.has_active_runtime_work())
+        self.assertEqual(Controller._ACTIVE_PROCESS_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
 
     def _configure_real_model_autoqueue_pipeline(self, pair: PathPair, auto_delete_remote: bool = False):
         """Use production ModelUpdater/AutoQueue wiring, not listener mocks."""
@@ -1360,17 +1386,25 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller._Controller__lftp_status_poll_retry_active)
 
     @patch("controller.model_updater.datetime")
-    def test_update_model_schedules_idle_status_poll_one_second_out_without_building(self, datetime_mock):
+    def test_update_model_disarms_poll_after_authoritative_idle_status_without_building(self, datetime_mock):
         now = datetime(2026, 4, 4, 12, 0, 0)
         datetime_mock.now.return_value = now
         self.controller._Controller__lftp.status.return_value = []
         self.controller._Controller__model_builder.has_changes.return_value = False
+        self.controller._Controller__temp_diag = MagicMock()
 
         self.controller._Controller__update_model()
         self.controller._Controller__update_model()
 
-        self.assertEqual(now + timedelta(seconds=1), self.controller._Controller__next_lftp_status_poll_at)
+        self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
+        self.assertTrue(self.controller._Controller__lftp_idle_status_authoritative)
         self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        self.assertEqual(
+            "cached_idle",
+            self.controller._Controller__temp_diag.call_args_list[-1].kwargs["lftp_status_source"],
+        )
+        self.assertTrue(self.controller._Controller__temp_diag.call_args_list[-1].kwargs["lftp_status_poll_healthy"])
+        self.assertFalse(self.controller._Controller__temp_diag.call_args_list[-1].kwargs["lftp_status_snapshot_fresh"])
         self.controller._Controller__model_builder.build_model.assert_not_called()
 
     def test_queue_forces_immediate_lftp_status_poll_after_idle_cooldown(self):
@@ -1383,12 +1417,15 @@ class TestController(unittest.TestCase):
         self.controller._Controller__model = model
         self.controller._Controller__next_lftp_status_poll_at = datetime.now() + timedelta(seconds=1)
         command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        wake_generation = self.controller.process_wake_generation()
 
         self.controller.queue_command(command)
+        self.assertGreater(self.controller.process_wake_generation(), wake_generation)
         self.controller._Controller__process_commands()
 
         self.controller._Controller__lftp.queue.assert_called_once()
         self.assertIsNone(self.controller._Controller__next_lftp_status_poll_at)
+        self.assertFalse(self.controller._Controller__lftp_idle_status_authoritative)
 
     def test_exit_ignores_lftp_teardown_failure_and_continues_shutdown(self):
         self.controller._Controller__started = True

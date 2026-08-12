@@ -2,7 +2,6 @@
 
 import sys
 import threading
-import time
 from abc import ABC, abstractmethod
 from types import TracebackType
 
@@ -61,7 +60,7 @@ class Job(threading.Thread, ABC):
                 self.shutdown_flag.set()
                 break
 
-            time.sleep(self._get_sleep_interval_in_secs())
+            self._wait_for_next_execution()
 
         # ... Clean shutdown code here ...
         self.logger.debug("Calling cleanup for {}".format(self.name))
@@ -110,6 +109,10 @@ class Job(threading.Thread, ABC):
         :return:
         """
         return Job._DEFAULT_SLEEP_INTERVAL_IN_SECS
+
+    def _wait_for_next_execution(self) -> None:
+        """Sleep interruptibly until the next ordinary execution deadline."""
+        self.shutdown_flag.wait(timeout=self._get_sleep_interval_in_secs())
 
     @abstractmethod
     def setup(self):

@@ -51,7 +51,6 @@ if TYPE_CHECKING:
 
 
 _ACTIVE_LFTP_STATUS_POLL_INTERVAL = timedelta(milliseconds=100)
-_IDLE_LFTP_STATUS_POLL_INTERVAL = timedelta(seconds=1)
 
 _MODEL_REBUILD_REASON_COUNTERS = {
     MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION: "model_rebuild_terminalizable_collision",
@@ -763,6 +762,7 @@ class _ControllerCoreAccess:
     _Controller__pending_auto_purge_file_ids: set[str]
     _Controller__last_lftp_statuses: Optional[list[LftpJobStatus]]
     _Controller__next_lftp_status_poll_at: Optional[datetime]
+    _Controller__lftp_idle_status_authoritative: bool
     _Controller__lftp_status_poll_retry_seconds: int
     _Controller__lftp_status_cache_expires_at: Optional[datetime]
     _Controller__lftp_status_cache_max_age_seconds: int
@@ -1262,6 +1262,8 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__last_lftp_statuses = []
         if not hasattr(controller, "_Controller__next_lftp_status_poll_at"):
             controller._Controller__next_lftp_status_poll_at = None
+        if not hasattr(controller, "_Controller__lftp_idle_status_authoritative"):
+            controller._Controller__lftp_idle_status_authoritative = False
         if not hasattr(controller, "_Controller__lftp_status_poll_retry_seconds"):
             controller._Controller__lftp_status_poll_retry_seconds = 1
         if not hasattr(controller, "_Controller__lftp_status_cache_expires_at"):
@@ -1489,7 +1491,7 @@ class ModelUpdater(_ControllerCoreAccess):
 
         stage_timer.switch(DURATION_MODEL_UPDATE_STATUS_INGESTION)
         # Grab the Lftp status.
-        lftp_statuses: Optional[list[LftpJobStatus]] = []
+        lftp_statuses: list[LftpJobStatus] = []
         lftp_status_poll_healthy = True
         lftp_status_snapshot_fresh = True
         lftp_status_source = "fresh_healthy"
@@ -1497,8 +1499,14 @@ class ModelUpdater(_ControllerCoreAccess):
         now = datetime.now()
         current_lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
         lftp_status_poll_due = (
-            controller._Controller__next_lftp_status_poll_at is None
-            or now >= controller._Controller__next_lftp_status_poll_at
+            (
+                controller._Controller__next_lftp_status_poll_at is None
+                and not controller._Controller__lftp_idle_status_authoritative
+            )
+            or (
+                controller._Controller__next_lftp_status_poll_at is not None
+                and now >= controller._Controller__next_lftp_status_poll_at
+            )
             or (
                 controller._Controller__last_lftp_statuses
                 and not current_lftp_status_poll_healthy
@@ -1506,16 +1514,19 @@ class ModelUpdater(_ControllerCoreAccess):
             )
         )
         if not lftp_status_poll_due:
+            lftp_status_snapshot_fresh = False
             if controller._Controller__last_lftp_statuses:
                 lftp_statuses = controller._Controller__last_lftp_statuses
-                lftp_status_snapshot_fresh = False
                 lftp_status_source = "cached_retry"
+            elif controller._Controller__lftp_idle_status_authoritative:
+                lftp_status_source = "cached_idle"
             else:
                 lftp_status_poll_healthy = False
                 lftp_status_source = "retry_empty"
         else:
             try:
-                lftp_statuses = controller._Controller__lftp.status()
+                polled_lftp_statuses = controller._Controller__lftp.status()
+                lftp_statuses = polled_lftp_statuses if polled_lftp_statuses is not None else []
                 lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
                 poll_finished_at = datetime.now()
                 if lftp_status_poll_healthy:
@@ -1532,12 +1543,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
                         for status in lftp_statuses
                     )
-                    controller._Controller__next_lftp_status_poll_at = poll_finished_at + (
-                        _ACTIVE_LFTP_STATUS_POLL_INTERVAL if active_transfer
-                        else _IDLE_LFTP_STATUS_POLL_INTERVAL
+                    controller._Controller__lftp_idle_status_authoritative = not active_transfer
+                    controller._Controller__next_lftp_status_poll_at = (
+                        poll_finished_at + _ACTIVE_LFTP_STATUS_POLL_INTERVAL if active_transfer else None
                     )
                     lftp_status_source = "fresh_healthy"
                 else:
+                    controller._Controller__lftp_idle_status_authoritative = False
                     controller._Controller__lftp_status_poll_retry_active = True
                     controller._Controller__next_lftp_status_poll_at = poll_finished_at + timedelta(
                         seconds=controller._Controller__lftp_status_poll_retry_seconds
@@ -1559,6 +1571,7 @@ class ModelUpdater(_ControllerCoreAccess):
                 lftp_statuses = []
                 lftp_status_poll_healthy = False
                 controller._Controller__lftp_status_poll_retry_active = True
+                controller._Controller__lftp_idle_status_authoritative = False
                 poll_finished_at = datetime.now()
                 controller._Controller__next_lftp_status_poll_at = poll_finished_at + timedelta(
                     seconds=controller._Controller__lftp_status_poll_retry_seconds
@@ -1582,33 +1595,33 @@ class ModelUpdater(_ControllerCoreAccess):
             controller._Controller__malformed_status_only_file_ids.update(latest_active_scan.malformed_status_only_file_ids)
 
         # Update list of active file names.
-        if lftp_statuses is not None:
-            active_status_file_ids = {status.file_id for status in lftp_statuses}
-            controller._Controller__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
-            lftp_statuses = [
-                status for status in lftp_statuses
-                if status.file_id not in controller._Controller__malformed_status_only_file_ids
-            ]
-            if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
-                reconcile_pending_queues = getattr(
-                    controller, "_reconcile_pending_queue_dispatches_from_fresh_status", None
-                )
-                if callable(reconcile_pending_queues):
-                    reconcile_pending_queues({status.file_id for status in lftp_statuses})
-                confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
-                if callable(confirm_download_starts):
-                    confirm_download_starts(lftp_statuses)
-            current_downloading_file_names = [
-                (s.name, s.path_pair_id, s.path_pair_name)
-                for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
-            ]
-            self._handle_lftp_completion_detection(
-                current_downloading_file_names,
-                lftp_status_poll_healthy or bool(lftp_statuses),
+        active_status_file_ids = {status.file_id for status in lftp_statuses}
+        controller._Controller__malformed_status_only_file_ids.intersection_update(active_status_file_ids)
+        lftp_statuses = [
+            status for status in lftp_statuses
+            if status.file_id not in controller._Controller__malformed_status_only_file_ids
+        ]
+        if lftp_status_snapshot_fresh and lftp_status_poll_healthy:
+            reconcile_pending_queues = getattr(
+                controller, "_reconcile_pending_queue_dispatches_from_fresh_status", None
             )
-            controller._Controller__active_downloading_file_names = current_downloading_file_names
+            if callable(reconcile_pending_queues):
+                reconcile_pending_queues({status.file_id for status in lftp_statuses})
+            confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
+            if callable(confirm_download_starts):
+                confirm_download_starts(lftp_statuses)
+        current_downloading_file_names = [
+            (s.name, s.path_pair_id, s.path_pair_name)
+            for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
+        ]
+        self._handle_lftp_completion_detection(
+            current_downloading_file_names,
+            lftp_status_poll_healthy or bool(lftp_statuses),
+        )
+        controller._Controller__active_downloading_file_names = current_downloading_file_names
         if controller._Controller__malformed_status_only_file_ids != previous_malformed_status_only_file_ids:
             controller._Controller__next_lftp_status_poll_at = None
+            controller._Controller__lftp_idle_status_authoritative = False
         if latest_extract_statuses is not None:
             controller._Controller__active_extracting_file_names = [
                 controller._Controller__active_extracting_file_tuple(s)
@@ -1621,7 +1634,7 @@ class ModelUpdater(_ControllerCoreAccess):
             lftp_status_source=lftp_status_source,
             lftp_status_poll_healthy=lftp_status_poll_healthy,
             lftp_status_snapshot_fresh=lftp_status_snapshot_fresh,
-            lftp_status_count=len(lftp_statuses) if lftp_statuses is not None else None,
+            lftp_status_count=len(lftp_statuses),
             active_downloading_count=len(controller._Controller__active_downloading_file_names),
             active_extracting_count=len(controller._Controller__active_extracting_file_names),
             last_lftp_status_count=(
@@ -1648,7 +1661,7 @@ class ModelUpdater(_ControllerCoreAccess):
             "lftp_status_source": lftp_status_source,
             "lftp_status_healthy": lftp_status_poll_healthy,
             "lftp_status_fresh": lftp_status_snapshot_fresh,
-            "lftp_status_count": len(lftp_statuses) if lftp_statuses is not None else None,
+            "lftp_status_count": len(lftp_statuses),
             "active_scan_arrived": latest_active_scan is not None,
             "local_scan_arrived": latest_local_scan is not None,
             "remote_scan_arrived": latest_remote_scan is not None,
@@ -1817,12 +1830,11 @@ class ModelUpdater(_ControllerCoreAccess):
                 event_type="state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
             )
-        if lftp_statuses is not None:
-            model_builder.set_lftp_statuses(lftp_statuses)
-            if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
-                model_builder.evict_recent_live_transfer_snapshots_missing_roots(
-                    {status.file_id for status in lftp_statuses}
-                )
+        model_builder.set_lftp_statuses(lftp_statuses)
+        if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
+            model_builder.evict_recent_live_transfer_snapshots_missing_roots(
+                {status.file_id for status in lftp_statuses}
+            )
         if latest_extract_statuses is not None:
             model_builder.set_extract_statuses(latest_extract_statuses.statuses)
             controller._Controller__record_breadcrumb(

@@ -1,7 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 import time
 
 
@@ -99,10 +99,10 @@ class TestJob(unittest.TestCase):
         # noinspection PyTypeChecker
         job = DummyTerminatingJob("DummyTerminatingJob", context)
 
-        with patch("common.job.time.sleep") as mock_sleep:
-            job.start()
-            self.assertTrue(job.wait_until_setup_complete(1))
-            job.join(1)
+        job.shutdown_flag.wait = MagicMock(return_value=True)
+        job.start()
+        self.assertTrue(job.wait_until_setup_complete(1))
+        job.join(1)
 
         self.assertFalse(job.is_alive())
-        mock_sleep.assert_called_once_with(Job._DEFAULT_SLEEP_INTERVAL_IN_SECS)
+        job.shutdown_flag.wait.assert_called_once_with(timeout=Job._DEFAULT_SLEEP_INTERVAL_IN_SECS)

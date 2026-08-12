@@ -2,7 +2,6 @@
 
 import unittest
 from unittest.mock import MagicMock
-from unittest.mock import patch
 
 from controller import ControllerJob
 
@@ -12,6 +11,10 @@ class TestControllerJob(unittest.TestCase):
         self.context = MagicMock()
         self.context.logger = MagicMock()
         self.controller = MagicMock()
+        self.controller.process_wake_generation.return_value = 0
+        self.controller.has_active_runtime_work.return_value = False
+        self.controller.next_process_delay_seconds.return_value = 5.0
+        self.controller.wait_for_process_wake.return_value = False
         self.auto_queue = MagicMock()
         self.job = ControllerJob(
             context=self.context,
@@ -43,16 +46,32 @@ class TestControllerJob(unittest.TestCase):
         self.controller.process.assert_called_once_with()
         self.auto_queue.process.assert_called_once_with()
 
-    def test_run_uses_controller_specific_sleep_interval(self):
+    def test_idle_run_waits_for_controller_deadline(self):
         self.controller.process.side_effect = self.job.terminate
 
-        with patch("common.job.time.sleep") as mock_sleep:
-            self.job.start()
-            self.assertTrue(self.job.wait_until_setup_complete(1))
-            self.job.join(1)
+        self.job.start()
+        self.assertTrue(self.job.wait_until_setup_complete(1))
+        self.job.join(1)
 
         self.assertFalse(self.job.is_alive())
-        mock_sleep.assert_called_once_with(ControllerJob._SLEEP_INTERVAL_IN_SECS)
+        self.controller.next_process_delay_seconds.assert_called_once_with()
+        self.controller.wait_for_process_wake.assert_called_once_with(0, 5.0)
+
+    def test_active_run_preserves_100ms_deadline(self):
+        self.controller.has_active_runtime_work.return_value = True
+        self.controller.next_process_delay_seconds.return_value = 0.1
+        self.controller.process.side_effect = self.job.terminate
+
+        self.job.start()
+        self.assertTrue(self.job.wait_until_setup_complete(1))
+        self.job.join(1)
+
+        self.controller.wait_for_process_wake.assert_called_once_with(0, 0.1)
+
+    def test_terminate_wakes_controller_wait(self):
+        self.job.terminate()
+
+        self.controller.wake_process.assert_called_once_with()
 
     def test_cleanup_exits_controller(self):
         self.job.cleanup()
