@@ -7,6 +7,19 @@ model-tree nodes. The fixture is stored in retained Docker named volumes and
 is marked with a topology fingerprint; changing the requested topology on a
 retained volume fails instead of regenerating it.
 
+Set `PERF_PROFILE=mixed` for the split profile: pair 01 is a small ordinary
+active pair with `auto_queue=false` and a deterministic remote-only
+`active-queue-target/remote-only-target.bin`; pair 02 is a
+200,000-files-per-side high-cardinality-idle pair. `PERF_HIGH_CARD_ENABLED=off`
+disables only that pair in seeded config for an A/B run while retaining the
+same filesystem and `fixture_fingerprint`; roles, counts, enabled state, and
+the separate `config_fingerprint` are recorded in the manifest and
+`path_pairs.json`. The default profile and six-pair behavior are unchanged.
+Manifest topology records physical fixture expectations separately from
+`enabled_expected_merged_model_tree_nodes` and
+`enabled_expected_model_tree_file_count`; the former gates the >=200k fixture
+requirement while the latter drives the enabled experiment's model target.
+
 The lab must be given the exact app image under test:
 
 ~~~sh
@@ -18,6 +31,12 @@ src/docker/test/performance/lab.sh status
 src/docker/test/performance/lab.sh measure baseline
 src/docker/test/performance/lab.sh stop
 ~~~
+
+Worker self-check (implementation lane): run the focused
+`src/docker/test/performance/tests/test_performance_lab.py` pytest file and
+`git diff --check`. Verifier/final validation (acceptance lane) must run the
+Docker-served app and Playwright against the exact image; worker self-checks
+are not final verification.
 
 By default, Compose creates an isolated project-scoped bridge network for the
 lab. On a host whose Docker bridge address pools are exhausted, set

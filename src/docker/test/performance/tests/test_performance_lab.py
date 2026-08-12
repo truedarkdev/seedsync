@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import stat
@@ -12,7 +13,14 @@ sys.path.insert(0, str(PERF_DIR))
 sys.path.insert(0, str(PERF_DIR.parents[2] / "python"))
 
 from capture_metrics import FIXED_METRICS, latest_model_status, summarize
-from generate_fixture import generate_fixture
+import generate_fixture as fixture_module
+from generate_fixture import (
+    MIXED_HIGH_CARD_NODES,
+    config_fingerprint,
+    generate_fixture,
+    normalize_topology_spec,
+    topology_fingerprint,
+)
 import sanitize_docker_state
 from seed_config import seed_config
 from common.config import Config
@@ -34,6 +42,140 @@ def test_fixture_is_deterministic_and_idempotent(tmp_path):
     assert (local_root / ".seedsync-performance-fixture.json").exists()
     if os.name == "posix":
         assert stat.S_IMODE((local_root / "path-pair-01" / "bucket-000").stat().st_mode) == 0o775
+
+
+def test_mixed_profile_normalizes_roles_counts_and_enabled_state():
+    spec = normalize_topology_spec("mixed", high_card_enabled=False)
+    assert [pair["role"] for pair in spec["pairs"]] == ["ordinary-active", "high-cardinality-idle"]
+    assert spec["pairs"][0]["auto_queue"] is False
+    assert spec["pairs"][0]["nodes_local"] == spec["pairs"][0]["nodes_remote"] == 64
+    assert spec["pairs"][1]["nodes_local"] == spec["pairs"][1]["nodes_remote"] == MIXED_HIGH_CARD_NODES
+    assert spec["pairs"][1]["enabled"] is False
+    target = spec["pairs"][0]["remote_only_targets"][0]
+    assert target["relative_path"].endswith("remote-only-target.bin")
+    assert target["size_bytes"] >= 32 * 1024 * 1024
+
+
+def test_mixed_profile_rejects_misleading_topology_overrides():
+    with pytest.raises(ValueError, match="exactly two pairs"):
+        normalize_topology_spec("mixed", pairs=1)
+    with pytest.raises(ValueError, match="nodes_per_pair"):
+        normalize_topology_spec("mixed", nodes_per_pair=4)
+
+
+def test_run_metadata_mixed_profile_does_not_claim_uniform_nodes_per_pair():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    assert '"nodes_per_pair": requested_nodes if os.environ["PERF_PROFILE"] == "uniform" else None' in lab_source
+    assert '"pair_node_counts"' in lab_source
+
+
+def test_mixed_fingerprints_are_deterministic_and_enabled_ab_is_data_stable():
+    enabled = normalize_topology_spec("mixed", high_card_enabled=True)
+    disabled = normalize_topology_spec("mixed", high_card_enabled=False)
+    assert topology_fingerprint(enabled) == topology_fingerprint(disabled)
+    assert config_fingerprint(enabled) != config_fingerprint(disabled)
+    assert topology_fingerprint(enabled) == topology_fingerprint(normalize_topology_spec("mixed"))
+
+
+def test_fixture_retained_topology_mismatch_is_rejected(tmp_path):
+    local_root, remote_root, manifest = tmp_path / "local", tmp_path / "remote", tmp_path / "manifest.json"
+    generate_fixture(local_root, remote_root, manifest, pairs=1, nodes_per_pair=4)
+    with pytest.raises(RuntimeError, match="different topology|do not match"):
+        generate_fixture(local_root, remote_root, manifest, pairs=2, nodes_per_pair=4)
+
+
+def test_mixed_config_records_roles_enabled_and_remote_target(tmp_path):
+    config_dir = tmp_path / "config"
+    seed_config(config_dir, "local-test-token", profile="mixed", high_card_enabled=False)
+    payload = json.loads((config_dir / "path_pairs.json").read_text(encoding="utf-8"))
+    assert payload["profile"] == "mixed"
+    assert payload["topology_fingerprint"] == topology_fingerprint(payload["experiment_spec"])
+    assert payload["config_fingerprint"] == config_fingerprint(payload["experiment_spec"])
+    assert [(pair["role"], pair["enabled"], pair["auto_queue"]) for pair in payload["path_pairs"]] == [
+        ("ordinary-active", True, False), ("high-cardinality-idle", False, True)
+    ]
+    assert payload["path_pairs"][0]["remote_only_targets"][0]["relative_path"].endswith("remote-only-target.bin")
+
+
+def test_mixed_retained_manifest_reuses_fixture_but_refreshes_enabled_expectations(tmp_path, monkeypatch):
+    monkeypatch.setattr(fixture_module, "MIXED_HIGH_CARD_NODES", 4)
+    local_root, remote_root = tmp_path / "local", tmp_path / "remote"
+    enabled_manifest = generate_fixture(local_root, remote_root, tmp_path / "enabled.json", profile="mixed")
+    disabled_manifest = generate_fixture(
+        local_root, remote_root, tmp_path / "disabled.json", profile="mixed", high_card_enabled=False
+    )
+    assert disabled_manifest["fixture_fingerprint"] == enabled_manifest["fixture_fingerprint"]
+    assert disabled_manifest["config_fingerprint"] != enabled_manifest["config_fingerprint"]
+    assert disabled_manifest["topology"]["enabled_expected_merged_model_tree_nodes"] < enabled_manifest["topology"]["enabled_expected_merged_model_tree_nodes"]
+    assert disabled_manifest["topology"]["enabled_pair_ids"] == ["pair-01"]
+    assert disabled_manifest["topology"]["local_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES
+    assert disabled_manifest["topology"]["remote_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES + 1
+    assert disabled_manifest["topology"]["local_directory_nodes"] + 1 == disabled_manifest["topology"]["remote_directory_nodes"]
+    target = remote_root / "path-pair-01" / "active-queue-target" / "remote-only-target.bin"
+    assert target.stat().st_size == 32 * 1024 * 1024
+
+
+def test_legacy_uniform_marker_is_validated_and_migrated_without_regeneration(tmp_path):
+    local_root, remote_root = tmp_path / "local", tmp_path / "remote"
+    original = generate_fixture(local_root, remote_root, tmp_path / "original.json", pairs=1, nodes_per_pair=4)
+    legacy_topology = {
+        key: value for key, value in original["topology"].items()
+        if key not in {
+            "expected_merged_nodes_by_pair", "expected_file_counts_by_pair",
+            "enabled_pair_ids", "enabled_expected_merged_model_tree_nodes",
+            "enabled_expected_model_tree_file_count",
+            "remote_only_directory_nodes", "local_file_nodes", "remote_file_nodes",
+            "local_directory_nodes", "remote_directory_nodes",
+        }
+    }
+    legacy_pairs = [{key: pair[key] for key in ("id", "name", "local_path", "remote_path", "directory", "nodes_per_side")} for pair in original["path_pairs"]]
+    legacy_fingerprint = hashlib.sha256(json.dumps(legacy_topology, sort_keys=True).encode("utf-8")).hexdigest()
+    legacy_manifest = {
+        "schema": "seedsync.performance-lab.fixture.v1",
+        "fixture_fingerprint": legacy_fingerprint,
+        "synthetic_only": True,
+        "topology": legacy_topology,
+        "path_pairs": legacy_pairs,
+    }
+    marker = {"fixture_fingerprint": legacy_fingerprint, "request_fingerprint": legacy_fingerprint, "manifest": legacy_manifest}
+    for root in (local_root, remote_root):
+        (root / ".seedsync-performance-fixture.json").write_text(json.dumps(marker), encoding="utf-8")
+    migrated = generate_fixture(local_root, remote_root, tmp_path / "migrated.json", pairs=1, nodes_per_pair=4)
+    assert migrated["data_topology_spec"]["profile"] == "uniform"
+    assert migrated["fixture_fingerprint"] == legacy_fingerprint
+    assert (local_root / "path-pair-01" / "bucket-000" / "node-00000000.bin").exists()
+    repeated = generate_fixture(local_root, remote_root, tmp_path / "migrated-again.json", pairs=1, nodes_per_pair=4)
+    assert repeated["fixture_fingerprint"] == migrated["fixture_fingerprint"]
+    assert repeated["config_fingerprint"] == migrated["config_fingerprint"]
+
+
+def test_seed_config_cli_metadata_uses_normalized_profile_counts():
+    source = (PERF_DIR / "seed_config.py").read_text(encoding="utf-8")
+    assert '"pairs": len(spec["pairs"])' in source
+    assert '"requested_pairs": args.pairs' in source
+    assert '"pair_node_counts"' in source
+    assert '"config_fingerprint": config_fingerprint(spec)' in source
+
+
+def test_capture_uses_physical_cardinality_but_enabled_model_expectation():
+    manifest = {
+        "fixture_fingerprint": "fixture",
+        "config_fingerprint": "config",
+        "topology": {
+            "expected_merged_model_tree_nodes": 200001,
+            "expected_model_tree_file_count": 200001,
+            "enabled_expected_merged_model_tree_nodes": 100,
+            "enabled_expected_model_tree_file_count": 100,
+        },
+    }
+    summary = summarize(_diagnostics(model_count=100), manifest, "baseline", min_cpu_percent=50,
+                        min_high_cpu_samples=3, breadcrumb_mode="on")
+    assert summary["physical_expected_merged_model_tree_nodes"] == 200001
+    assert summary["enabled_expected_merged_model_tree_nodes"] == 100
+    assert summary["baseline_checks"]["expected_merged_model_tree_nodes"] is True
+    assert summary["baseline_checks"]["model_tree_file_count_near_target"] is True
+    assert summary["baseline_valid"] is True
+    assert summary["config_fingerprint"] == "config"
 
 
 def _diagnostics(model_count=200001):
@@ -361,3 +503,11 @@ def test_seed_can_omit_move_failure_for_trigger_isolation(tmp_path):
     assert persisted["move_failure_counts"] == {}
     if os.name == "posix":
         assert stat.S_IMODE(config_dir.stat().st_mode) == 0o770
+
+
+def test_mixed_disabled_pair_is_absent_from_seeded_persist(tmp_path):
+    config_dir = tmp_path / "config"
+    seed_config(config_dir, "local-test-token", profile="mixed", high_card_enabled=False)
+    persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
+    assert persisted["downloaded"]
+    assert all(json.loads(file_id)[0] == "pair-01" for file_id in persisted["downloaded"])

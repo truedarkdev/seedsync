@@ -17,6 +17,8 @@ PERF_MOVE_FAILURE_MODE="${PERF_MOVE_FAILURE_MODE:-stale}"
 PERF_REMOTE_ADDRESS="${PERF_REMOTE_ADDRESS:-remote}"
 PERF_PAIRS="${PERF_PAIRS:-6}"
 PERF_NODES_PER_PAIR="${PERF_NODES_PER_PAIR:-32000}"
+PERF_PROFILE="${PERF_PROFILE:-uniform}"
+PERF_HIGH_CARD_ENABLED="${PERF_HIGH_CARD_ENABLED:-on}"
 PERF_HOST_PORT="${PERF_HOST_PORT:-18800}"
 PERF_MEASURE_TIMEOUT_SECONDS="${PERF_MEASURE_TIMEOUT_SECONDS:-900}"
 PERF_SETTLED_SAMPLES="${PERF_SETTLED_SAMPLES:-6}"
@@ -39,8 +41,17 @@ if [[ "$PERF_MOVE_FAILURE_MODE" != stale && "$PERF_MOVE_FAILURE_MODE" != none ]]
   echo "PERF_MOVE_FAILURE_MODE must be stale or none" >&2
   exit 2
 fi
+if [[ "$PERF_PROFILE" != uniform && "$PERF_PROFILE" != mixed ]]; then
+  echo "PERF_PROFILE must be uniform or mixed" >&2
+  exit 2
+fi
+if [[ "$PERF_HIGH_CARD_ENABLED" != on && "$PERF_HIGH_CARD_ENABLED" != off ]]; then
+  echo "PERF_HIGH_CARD_ENABLED must be on or off" >&2
+  exit 2
+fi
 
 export PERF_IMAGE PERF_API_TOKEN PERF_BREADCRUMB_MODE PERF_MOVE_FAILURE_MODE PERF_REMOTE_ADDRESS PERF_PAIRS PERF_NODES_PER_PAIR PERF_HOST_PORT
+export PERF_PROFILE PERF_HIGH_CARD_ENABLED
 export PERF_POST_TARGET_OBSERVATION_SECONDS
 export PERF_LAB_SOURCE_DIR="$SCRIPT_DIR"
 export PERF_ARTIFACT_DIR="$ARTIFACT_DIR"
@@ -70,6 +81,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 path = Path(sys.argv[1])
+import sys as _sys
+_sys.path.insert(0, os.environ["PERF_LAB_SOURCE_DIR"])
+from generate_fixture import normalize_topology_spec
+requested_pairs = int(os.environ["PERF_PAIRS"])
+requested_nodes = int(os.environ["PERF_NODES_PER_PAIR"])
+topology_spec = normalize_topology_spec(
+    os.environ["PERF_PROFILE"], requested_pairs, requested_nodes,
+    os.environ["PERF_HIGH_CARD_ENABLED"] == "on",
+)
 payload = {
     "schema": "seedsync.performance-lab.run.v1",
     "phase": sys.argv[2],
@@ -79,8 +99,20 @@ payload = {
     "breadcrumb_mode": os.environ["PERF_BREADCRUMB_MODE"],
     "move_failure_mode": os.environ["PERF_MOVE_FAILURE_MODE"],
     "remote_address": os.environ["PERF_REMOTE_ADDRESS"],
-    "pairs": int(os.environ["PERF_PAIRS"]),
-    "nodes_per_pair": int(os.environ["PERF_NODES_PER_PAIR"]),
+    "pairs": len(topology_spec["pairs"]),
+    "nodes_per_pair": requested_nodes if os.environ["PERF_PROFILE"] == "uniform" else None,
+    "requested_pairs": requested_pairs,
+    "requested_nodes_per_pair": requested_nodes,
+    "profile": os.environ["PERF_PROFILE"],
+    "high_card_enabled": os.environ["PERF_HIGH_CARD_ENABLED"] == "on",
+    "topology_spec": topology_spec,
+    "pair_node_counts": {
+        pair["id"]: {
+            "local": pair["nodes_local"], "remote": pair["nodes_remote"],
+            "enabled": pair["enabled"], "role": pair["role"],
+        }
+        for pair in topology_spec["pairs"]
+    },
     "host_port": int(os.environ["PERF_HOST_PORT"]),
     "post_target_observation_seconds": int(os.environ["PERF_POST_TARGET_OBSERVATION_SECONDS"]),
     "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -347,7 +379,8 @@ PY
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     topology = json.load(handle)["topology"]
-print(topology["expected_merged_model_tree_nodes"])
+print(topology.get("enabled_expected_merged_model_tree_nodes",
+                   topology["expected_merged_model_tree_nodes"]))
 PY
 )"
   local deadline=$(( $(date +%s) + PERF_MEASURE_TIMEOUT_SECONDS ))

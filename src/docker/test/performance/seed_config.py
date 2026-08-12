@@ -12,8 +12,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-
-PAIR_LOCAL_DIRECTORIES = ("path-pair-01", "path-pair-02", "path-pair-03", "path-pair-04", "path-pair-05", "path-pair-06")
+from generate_fixture import _data_spec, config_fingerprint, normalize_topology_spec, topology_fingerprint
 
 
 def _hash_secret(secret: str) -> str:
@@ -30,8 +29,8 @@ def _synthetic_file_id(pair_id: str, index: int) -> str:
     return json.dumps([pair_id, "node-{0:08d}.{1}".format(index, extension)], separators=(",", ":"))
 
 
-def _seed_persist(config_dir: Path, move_failure_mode: str) -> None:
-    downloaded = [_synthetic_file_id("pair-{0:02d}".format((index % 6) + 1), index)
+def _seed_persist(config_dir: Path, move_failure_mode: str, pair_ids: list[str]) -> None:
+    downloaded = [_synthetic_file_id(pair_ids[index % len(pair_ids)], index)
                   for index in range(24)]
     controller = {
         "downloaded": downloaded,
@@ -47,7 +46,8 @@ def _seed_persist(config_dir: Path, move_failure_mode: str) -> None:
 
 
 def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mode: str = "on",
-                move_failure_mode: str = "stale", remote_address: str = "remote") -> None:
+                move_failure_mode: str = "stale", remote_address: str = "remote",
+                profile: str = "uniform", high_card_enabled: bool = True) -> None:
     if not api_token.strip():
         raise ValueError("api token must be nonblank")
     if pairs < 1 or pairs > 6:
@@ -69,16 +69,22 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
     except (AttributeError, PermissionError, OSError):
         pass
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    spec = normalize_topology_spec(profile, pairs, high_card_enabled=high_card_enabled)
     pair_entries = [
         {
-            "id": "pair-{0:02d}".format(number),
-            "name": "Performance Pair {0:02d}".format(number),
-            "remote_path": "/home/remoteuser/files/{}".format(PAIR_LOCAL_DIRECTORIES[number - 1]),
-            "local_path": "/mounts/{}".format(PAIR_LOCAL_DIRECTORIES[number - 1]),
-            "enabled": True,
-            "auto_queue": True,
+            "id": pair["id"],
+            "name": "Performance Pair {0:02d}".format(int(pair["id"][-2:])),
+            "remote_path": "/home/remoteuser/files/{}".format(pair["directory"]),
+            "local_path": "/mounts/{}".format(pair["directory"]),
+            "directory": pair["directory"],
+            "role": pair["role"],
+            "nodes_local": pair["nodes_local"],
+            "nodes_remote": pair["nodes_remote"],
+            "enabled": pair["enabled"],
+            "auto_queue": pair["auto_queue"],
+            "remote_only_targets": pair["remote_only_targets"],
         }
-        for number in range(1, pairs + 1)
+        for pair in spec["pairs"]
     ]
     settings = f"""[General]
 log_level = INFO
@@ -157,7 +163,11 @@ delete_complete = True
 """
     (config_dir / "settings.cfg").write_text(settings, encoding="utf-8")
     (config_dir / "path_pairs.json").write_text(
-        json.dumps({"version": 1, "path_pairs": pair_entries}, indent=2) + "\n",
+        json.dumps({"version": 1, "profile": profile,
+                    "topology_fingerprint": topology_fingerprint(spec),
+                    "config_fingerprint": config_fingerprint(spec),
+                    "data_topology_spec": _data_spec(spec),
+                    "experiment_spec": spec, "path_pairs": pair_entries}, indent=2) + "\n",
         encoding="utf-8",
     )
     api_key = {
@@ -174,7 +184,11 @@ delete_complete = True
                     "browser_handover_claimed_version": ""}, indent=2) + "\n",
         encoding="utf-8",
     )
-    _seed_persist(config_dir, move_failure_mode)
+    _seed_persist(
+        config_dir,
+        move_failure_mode,
+        [pair["id"] for pair in spec["pairs"] if pair["enabled"]],
+    )
     for path in (config_dir / "settings.cfg", config_dir / "path_pairs.json", config_dir / "api-keys.json",
                  config_dir / "controller.persist", config_dir / "autoqueue.persist"):
         path.chmod(0o660)
@@ -192,7 +206,12 @@ def main() -> int:
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"), default="on")
     parser.add_argument("--move-failure-mode", choices=("stale", "none"), default="stale")
     parser.add_argument("--remote-address", default="remote")
+    parser.add_argument("--profile", choices=("uniform", "mixed"), default="uniform")
+    parser.add_argument("--high-card-enabled", choices=("on", "off"), default="on")
     args = parser.parse_args()
+    spec = normalize_topology_spec(
+        args.profile, args.pairs, high_card_enabled=args.high_card_enabled == "on"
+    )
     seed_config(
         args.config_dir,
         args.api_token,
@@ -200,8 +219,20 @@ def main() -> int:
         args.breadcrumb_mode,
         args.move_failure_mode,
         args.remote_address,
+        args.profile,
+        args.high_card_enabled == "on",
     )
-    print(json.dumps({"schema": "seedsync-performance-lab.config.v1", "pairs": args.pairs,
+    print(json.dumps({"schema": "seedsync-performance-lab.config.v1", "pairs": len(spec["pairs"]),
+                      "requested_pairs": args.pairs,
+                      "profile": args.profile, "high_card_enabled": args.high_card_enabled == "on",
+                      "pair_node_counts": {
+                          pair["id"]: {
+                              "local": pair["nodes_local"], "remote": pair["nodes_remote"],
+                              "enabled": pair["enabled"], "role": pair["role"],
+                          }
+                          for pair in spec["pairs"]
+                      },
+                      "config_fingerprint": config_fingerprint(spec),
                       "breadcrumb_mode": args.breadcrumb_mode, "move_failure_mode": args.move_failure_mode,
                       "remote_address": args.remote_address}))
     return 0

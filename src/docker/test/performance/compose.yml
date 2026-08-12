@@ -29,6 +29,10 @@ services:
       - "${PERF_PAIRS:-6}"
       - --nodes-per-pair
       - "${PERF_NODES_PER_PAIR:-32000}"
+      - --profile
+      - "${PERF_PROFILE:-uniform}"
+      - --high-card-enabled
+      - "${PERF_HIGH_CARD_ENABLED:-on}"
 
   config_seed:
     image: ${PERF_FIXTURE_IMAGE:-python:3.12-slim}
@@ -58,6 +62,10 @@ services:
       - "${PERF_MOVE_FAILURE_MODE:-stale}"
       - --remote-address
       - "${PERF_REMOTE_ADDRESS:-remote}"
+      - --profile
+      - "${PERF_PROFILE:-uniform}"
+      - --high-card-enabled
+      - "${PERF_HIGH_CARD_ENABLED:-on}"
 
   remote:
     build:

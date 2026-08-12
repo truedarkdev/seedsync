@@ -192,8 +192,18 @@ def summarize(
     """Return a phase-aware summary; ``expected_stage`` is retained for API compatibility."""
     windows = _windows(diagnostics)
     topology = manifest.get("topology") if isinstance(manifest.get("topology"), dict) else {}
-    expected_file_count = int(topology.get("expected_model_tree_file_count", 0) or 0)
-    expected_merged_nodes = int(topology.get("expected_merged_model_tree_nodes", 0) or 0)
+    physical_expected_file_count = int(
+        topology.get("expected_model_tree_file_count", 0) or 0
+    )
+    physical_expected_merged_nodes = int(
+        topology.get("expected_merged_model_tree_nodes", 0) or 0
+    )
+    expected_file_count = int(
+        topology.get("enabled_expected_model_tree_file_count", physical_expected_file_count) or 0
+    )
+    expected_merged_nodes = int(
+        topology.get("enabled_expected_merged_model_tree_nodes", physical_expected_merged_nodes) or 0
+    )
     model_values = [entry["model_tree_file_count"] for entry in windows if entry.get("model_tree_file_count") is not None]
     observed_model_count = model_values[-1] if model_values else None
     model_count_valid = (
@@ -255,7 +265,7 @@ def summarize(
         metric for metric, values in post_metrics.items()
         if metric in FIXED_METRICS and float(values.get("total_cpu_seconds") or 0.0) > 0.0
     )
-    expected_cardinality_valid = expected_merged_nodes >= minimum_merged_nodes
+    expected_cardinality_valid = physical_expected_merged_nodes >= minimum_merged_nodes
     baseline_checks = {
         "expected_merged_model_tree_nodes": expected_cardinality_valid,
         "model_tree_file_count_near_target": model_count_valid,
@@ -278,11 +288,16 @@ def summarize(
         "schema": "seedsync.performance-lab.metrics.v2",
         "label": label,
         "fixture_fingerprint": manifest.get("fixture_fingerprint"),
+        "config_fingerprint": manifest.get("config_fingerprint"),
         "diagnostics_schema": diagnostics.get("schema"),
         "sample_count": len(diagnostics.get("samples", [])) if isinstance(diagnostics.get("samples"), list) else 0,
         "expected_baseline_stage": expected_stage,
+        "physical_expected_merged_model_tree_nodes": physical_expected_merged_nodes,
+        "enabled_expected_merged_model_tree_nodes": expected_merged_nodes,
         "expected_merged_model_tree_nodes": expected_merged_nodes,
         "minimum_expected_merged_model_tree_nodes": minimum_merged_nodes,
+        "physical_expected_model_tree_file_count": physical_expected_file_count,
+        "enabled_expected_model_tree_file_count": expected_file_count,
         "expected_model_tree_file_count": expected_file_count,
         "expected_model_tree_node_count": expected_merged_nodes,
         "observed_model_tree_file_count": observed_model_count,
