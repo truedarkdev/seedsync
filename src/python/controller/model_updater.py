@@ -211,6 +211,7 @@ class _ProgressiveScanAccumulator:
         self.__incomplete_pairs: set[Optional[str]] = set()
         self.__completed_pairs: set[Optional[str]] = set()
         self.__session_has_progressive_evidence = False
+        self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
 
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
@@ -227,6 +228,7 @@ class _ProgressiveScanAccumulator:
         self.__authoritative.clear()
         self.__completed_pairs.clear()
         self.__session_has_progressive_evidence = False
+        self.__last_touched_keys.clear()
 
     @property
     def session_token(self) -> Optional[str]:
@@ -273,6 +275,7 @@ class _ProgressiveScanAccumulator:
         )
 
     def apply(self, events: Sequence[ScannerResult]) -> Optional[ScannerResult]:
+        self.__last_touched_keys = set()
         if not events:
             return None
         if self.__session_token is None:
@@ -319,6 +322,7 @@ class _ProgressiveScanAccumulator:
                 self.__completed_pairs.add(pair_id)
                 self.__incomplete_pairs.discard(pair_id)
                 for key in [key for key in self.__committed if key[0] == pair_id]:
+                    self.__last_touched_keys.add(key)
                     self.__committed.pop(key, None)
                     self.__authoritative.pop(key, None)
             for file in latest.files:
@@ -327,6 +331,7 @@ class _ProgressiveScanAccumulator:
                 )
                 self.__committed[(pair_id, file.name)] = file
                 self.__authoritative[(pair_id, file.name)] = file
+                self.__last_touched_keys.add((pair_id, file.name))
             return latest
         accepted = [
             event if event.is_progress else self.__legacy_result_as_progress_snapshot(event)
@@ -417,6 +422,7 @@ class _ProgressiveScanAccumulator:
                         continue
                     working[file.name] = file
                     self.__authoritative[(pair_id, file.name)] = file
+                    self.__last_touched_keys.add((pair_id, file.name))
                 if full_snapshot:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(working)
                 # A progressive completion marker can arrive after earlier
@@ -424,6 +430,12 @@ class _ProgressiveScanAccumulator:
                 # let it complete a pair or prove absence; the same scan's
                 # lossless full snapshot is the authority boundary.
                 if full_snapshot and pair_id in event.completed_path_pair_ids:
+                    self.__last_touched_keys.update(
+                        key for key in self.__committed if key[0] == pair_id
+                    )
+                    self.__last_touched_keys.update(
+                        (pair_id, name) for name in working
+                    )
                     manifest_names = self.__manifests.get(generation, {}).get(pair_id)
                     if manifest_names is not None:
                         for name in list(working):
@@ -493,6 +505,10 @@ class _ProgressiveScanAccumulator:
         """Return whether this session supplied non-empty scan evidence."""
         return self.__session_has_progressive_evidence
 
+    def touched_keys(self) -> set[tuple[Optional[str], str]]:
+        """Return only root identities changed by the most recent drain."""
+        return set(self.__last_touched_keys)
+
 
 class _JointProgressiveReconciler:
     """Gate new roots until local and remote evidence agree for that root."""
@@ -502,7 +518,7 @@ class _JointProgressiveReconciler:
             tuple[Optional[str], str], tuple[Optional[SystemFile], Optional[SystemFile]]
         ] = {}
 
-    def reconcile(
+    def __reconcile(
         self,
         local_snapshot: dict[tuple[Optional[str], str], SystemFile],
         local_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
@@ -514,13 +530,17 @@ class _JointProgressiveReconciler:
         remote_completed: set[Optional[str]],
         enabled_pair_ids: set[Optional[str]],
         remote_excluded_keys: Optional[set[tuple[Optional[str], str]]] = None,
+        candidate_keys: Optional[set[tuple[Optional[str], str]]] = None,
     ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
         remote_excluded_keys = remote_excluded_keys or set()
-        keys = set(self.__published)
-        keys.update(local_snapshot)
-        keys.update(remote_snapshot)
-        keys.update(local_authority)
-        keys.update(remote_authority)
+        if candidate_keys is None:
+            keys = set(self.__published)
+            keys.update(local_snapshot)
+            keys.update(remote_snapshot)
+            keys.update(local_authority)
+            keys.update(remote_authority)
+        else:
+            keys = set(candidate_keys)
         for pair_id, name in keys:
             if pair_id not in enabled_pair_ids:
                 continue
@@ -544,9 +564,14 @@ class _JointProgressiveReconciler:
 
         local_files: list[SystemFile] = []
         remote_files: list[SystemFile] = []
-        for (pair_id, _), (local_file, remote_file) in self.__published.items():
+        output_keys = set(self.__published) if candidate_keys is None else set(candidate_keys)
+        for pair_id, name in output_keys:
             if pair_id not in enabled_pair_ids:
                 continue
+            published = self.__published.get((pair_id, name))
+            if published is None:
+                continue
+            local_file, remote_file = published
             if local_file is not None:
                 local_files.append(local_file)
             if remote_file is not None:
@@ -555,6 +580,46 @@ class _JointProgressiveReconciler:
         unknown_local_pairs.update(enabled_pair_ids - set(local_completed))
         unknown_local_pairs.update(enabled_pair_ids - set(remote_completed))
         return local_files, remote_files, unknown_local_pairs
+
+    def reconcile(
+        self,
+        local_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        local_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        local_incomplete: set[Optional[str]],
+        local_completed: set[Optional[str]],
+        remote_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        remote_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        remote_incomplete: set[Optional[str]],
+        remote_completed: set[Optional[str]],
+        enabled_pair_ids: set[Optional[str]],
+        remote_excluded_keys: Optional[set[tuple[Optional[str], str]]] = None,
+    ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
+        return self.__reconcile(
+            local_snapshot, local_authority, local_incomplete, local_completed,
+            remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+            enabled_pair_ids, remote_excluded_keys,
+        )
+
+    def reconcile_delta(
+        self,
+        local_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        local_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        local_incomplete: set[Optional[str]],
+        local_completed: set[Optional[str]],
+        remote_snapshot: dict[tuple[Optional[str], str], SystemFile],
+        remote_authority: dict[tuple[Optional[str], str], Optional[SystemFile]],
+        remote_incomplete: set[Optional[str]],
+        remote_completed: set[Optional[str]],
+        enabled_pair_ids: set[Optional[str]],
+        candidate_keys: set[tuple[Optional[str], str]],
+        remote_excluded_keys: Optional[set[tuple[Optional[str], str]]] = None,
+    ) -> tuple[list[SystemFile], list[SystemFile], set[Optional[str]]]:
+        """Reconcile and materialize only roots touched by the current drain."""
+        return self.__reconcile(
+            local_snapshot, local_authority, local_incomplete, local_completed,
+            remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+            enabled_pair_ids, remote_excluded_keys, candidate_keys,
+        )
 
 
 def _filter_progressive_remote_state(
@@ -1253,10 +1318,23 @@ class ModelUpdater(_ControllerCoreAccess):
                 return False
             return bool(getattr(result, "files", ()))
 
+        def side_touched_keys(
+            side: str, result: Optional[ScannerResult],
+        ) -> set[tuple[Optional[str], str]]:
+            accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
+            if isinstance(accumulator, _ProgressiveScanAccumulator):
+                return accumulator.touched_keys()
+            if result is None:
+                return set()
+            return {
+                (file.path_pair_id, file.name) for file in result.files
+            }
+
         joint_local_files: list[SystemFile] = []
         joint_remote_files: list[SystemFile] = []
         joint_unknown_local_ids: set[Optional[str]] = set()
         joint_remote_excluded_keys: set[tuple[Optional[str], str]] = set()
+        progressive_joint_delta_keys: set[tuple[Optional[str], str]] = set()
         if progressive_mode and joint_reconciler is not None:
             # Standing authority is already represented by the builder after
             # a progressive final publication.  Do not walk every retained
@@ -1278,13 +1356,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 enabled_pair_ids = set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys())
                 if not enabled_pair_ids:
                     enabled_pair_ids = {None}
-                joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
-                    local_snapshot, local_authority, local_incomplete,
-                    local_completed,
-                    remote_snapshot, remote_authority, remote_incomplete,
-                    remote_completed,
-                    enabled_pair_ids,
-                    joint_remote_excluded_keys,
+                progressive_joint_delta_keys = side_touched_keys("local", latest_local_scan) \
+                    | side_touched_keys("remote", latest_remote_scan)
+                joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile_delta(
+                    local_snapshot, local_authority, local_incomplete, local_completed,
+                    remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+                    enabled_pair_ids, progressive_joint_delta_keys, joint_remote_excluded_keys,
                 )
 
         def scan_final_relevant(side: str, result: Optional[ScannerResult]) -> bool:
@@ -1312,13 +1389,26 @@ class ModelUpdater(_ControllerCoreAccess):
         joint_reconciliation_final = remote_scan_final_relevant and local_scan_final_relevant \
             and not joint_unknown_local_ids \
             and (not progressive_mode or progressive_scan_event_arrived)
+        if progressive_mode and joint_reconciler is not None and joint_reconciliation_final:
+            joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile(
+                local_snapshot, local_authority, local_incomplete, local_completed,
+                remote_snapshot, remote_authority, remote_incomplete, remote_completed,
+                enabled_pair_ids, joint_remote_excluded_keys,
+            )
         progressive_joint_first_partial_publication = (
             progressive_mode
             and not joint_reconciliation_final
             and not bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
             and not bool(getattr(controller, "_Controller__progressive_joint_first_publication", False))
-            and bool(joint_local_files)
-            and bool(joint_remote_files)
+            and bool(joint_local_files or joint_remote_files)
+            and side_has_session_progressive_evidence("local", latest_local_scan)
+            and side_has_session_progressive_evidence("remote", latest_remote_scan)
+        )
+        progressive_joint_partial_publication = (
+            progressive_mode
+            and not joint_reconciliation_final
+            and bool(progressive_joint_delta_keys)
+            and bool(joint_local_files or joint_remote_files)
             and side_has_session_progressive_evidence("local", latest_local_scan)
             and side_has_session_progressive_evidence("remote", latest_remote_scan)
         )
@@ -1326,7 +1416,7 @@ class ModelUpdater(_ControllerCoreAccess):
             not progressive_mode
             or (
                 progressive_scan_event_arrived
-                and (joint_reconciliation_final or progressive_joint_first_partial_publication)
+                and (joint_reconciliation_final or progressive_joint_partial_publication)
             )
         )
 
@@ -1621,11 +1711,12 @@ class ModelUpdater(_ControllerCoreAccess):
                 setter_unknown_local(unknown_local_ids)
         if progressive_mode and joint_reconciler is not None:
             if progressive_joint_publication_allowed:
-                model_builder.set_local_files(joint_local_files)
-                model_builder.set_remote_files(joint_remote_files)
-                setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
-                if callable(setter_unknown_local):
-                    setter_unknown_local(joint_unknown_local_ids)
+                if joint_reconciliation_final:
+                    model_builder.set_local_files(joint_local_files)
+                    model_builder.set_remote_files(joint_remote_files)
+                    setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
+                    if callable(setter_unknown_local):
+                        setter_unknown_local(joint_unknown_local_ids)
                 if progressive_joint_first_partial_publication:
                     controller._Controller__progressive_joint_first_publication = True
             if joint_reconciliation_final:
@@ -1954,8 +2045,69 @@ class ModelUpdater(_ControllerCoreAccess):
                     remote_file_ids,
                     protected_file_ids,
                 )
-        build_triggered = model_builder.has_changes()
-        if build_triggered:
+        progressive_delta_applied = False
+        progressive_delta_eligible = (
+            progressive_mode
+            and progressive_joint_partial_publication
+            and progressive_joint_publication_allowed
+            and not lftp_statuses
+            and not controller._Controller__active_downloading_file_names
+            and not controller._Controller__active_extracting_file_names
+            and not controller._Controller__pending_completion_file_names
+            and latest_extract_statuses is None
+            and latest_validation_statuses is None
+            and not latest_extracted_results
+            and not latest_failed_results
+            and not model_builder.has_changes()
+        )
+        if progressive_delta_eligible:
+            partial_model = model_builder.build_progressive_roots(
+                joint_local_files,
+                joint_remote_files,
+                joint_unknown_local_ids,
+            )
+            delta_file_ids = {
+                ModelFile.build_file_id(name, path_pair_id)
+                for path_pair_id, name in progressive_joint_delta_keys
+            }
+
+            def tree_file_count(file: ModelFile) -> int:
+                return 1 + sum(tree_file_count(child) for child in file.get_children())
+
+            with controller._Controller__model_lock:
+                current_tree_count = getattr(model, "tree_file_count", 0)
+                next_tree_count = current_tree_count if type(current_tree_count) is int else 0
+                for file_id in delta_file_ids:
+                    try:
+                        new_file = partial_model.get_file(file_id)
+                    except ModelError:
+                        # Partial authority may add or update roots, never
+                        # prove their absence. Final reconciliation owns
+                        # removals and marker pruning.
+                        continue
+                    try:
+                        old_file = model.get_file(file_id)
+                    except ModelError:
+                        model.add_file(new_file)
+                        next_tree_count += tree_file_count(new_file)
+                        progressive_delta_applied = True
+                    else:
+                        if old_file != new_file:
+                            model.update_file(new_file)
+                            next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
+                            progressive_delta_applied = True
+                if progressive_delta_applied:
+                    model.set_tree_file_count(max(0, next_tree_count))
+            if diagnostics is not None:
+                try:
+                    diagnostics.increment("progressive_delta_root_visits", len(delta_file_ids))
+                    if progressive_delta_applied:
+                        diagnostics.increment("progressive_delta_publications")
+                except Exception:
+                    pass
+
+        full_build_triggered = model_builder.has_changes() and not progressive_delta_eligible
+        if full_build_triggered:
             diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
             try:
                 started_at = diagnostics.begin_duration(DURATION_MODEL_BUILD) if diagnostics is not None else None
@@ -2579,8 +2731,8 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__recover_interrupted_downloads(remote_files)
         if latest_local_scan is not None:
             controller._Controller__context.status.controller.latest_local_scan_time = latest_local_scan.timestamp
-        if build_triggered:
+        if full_build_triggered:
             with controller._Controller__model_lock:
                 controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                 model_builder.adopt_applied_model(new_model, controller._Controller__model)
-        return build_triggered
+        return full_build_triggered or progressive_delta_applied

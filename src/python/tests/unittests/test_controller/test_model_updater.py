@@ -1194,7 +1194,7 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_downloaded_files.assert_not_called()
         model_builder.set_downloaded_timestamps.assert_not_called()
 
-    def test_first_progressive_baseline_still_streams_partial_remote_state(self):
+    def test_first_progressive_baseline_streams_through_root_delta_builder(self):
         partial = self._progressive_result(final=False, unknown={None})
         controller, model_builder = self._make_progressive_update_controller(
             partial,
@@ -1204,9 +1204,80 @@ class TestModelUpdater(unittest.TestCase):
 
         ModelUpdater(controller).update()
 
-        model_builder.set_remote_files.assert_called_once_with(partial.files)
-        model_builder.set_local_files.assert_called_once_with(partial.files)
-        model_builder.set_unknown_local_path_pair_ids.assert_called_once_with({None})
+        model_builder.build_progressive_roots.assert_called_once_with(
+            partial.files,
+            partial.files,
+            {None},
+        )
+        model_builder.set_remote_files.assert_not_called()
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_unknown_local_path_pair_ids.assert_not_called()
+        model_builder.build_model.assert_not_called()
+
+    def test_partial_progressive_delta_does_not_mask_pending_full_builder_change(self):
+        partial = self._progressive_result(final=False, unknown={None})
+        controller, model_builder = self._make_progressive_update_controller(
+            partial,
+            local_scan=partial,
+            authoritative=False,
+        )
+        model_builder.has_changes.return_value = True
+
+        ModelUpdater(controller).update()
+
+        model_builder.build_progressive_roots.assert_not_called()
+        model_builder.build_model.assert_called_once_with()
+
+    def test_progressive_startup_publishes_each_root_wave_before_one_final_build(self):
+        def result(files, *, final=False):
+            return ScannerResult(
+                datetime.now(), files,
+                scanned_path_pair_ids={None},
+                generation=1,
+                is_progress=True,
+                completed_path_pair_ids={None} if final else set(),
+                is_scan_final=final,
+                unknown_path_pair_ids=set() if final else {None},
+                is_full_snapshot=final,
+                full_snapshot_path_pair_ids={None} if final else set(),
+            )
+
+        first_remote = SystemFile("first.bin", 10)
+        first_local = SystemFile("first.bin", 5)
+        second_remote = SystemFile("second.bin", 20)
+        second_local = SystemFile("second.bin", 7)
+        final_remote = [first_remote, second_remote]
+        final_local = [first_local, second_local]
+        builder = ModelBuilder()
+        model = Model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+            model_builder=builder, model=model,
+        )
+        controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            result([first_remote]), result([second_remote]), result(final_remote, final=True),
+        ]
+        controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+            result([first_local]), result([second_local]), result(final_local, final=True),
+        ]
+        initial_model = builder.build_model()
+        builder.adopt_applied_model(initial_model, model)
+        original_delta_builder = builder.build_progressive_roots
+        original_full_builder = builder.build_model
+        builder.build_progressive_roots = MagicMock(wraps=original_delta_builder)
+        builder.build_model = MagicMock(wraps=original_full_builder)
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        self.assertEqual({"first.bin"}, model.get_file_names())
+        updater.update()
+        self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
+        self.assertEqual(2, builder.build_progressive_roots.call_count)
+        builder.build_model.assert_not_called()
+
+        updater.update()
+        self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
+        builder.build_model.assert_called_once_with()
 
     def test_progressive_scanner_session_change_reopens_initial_publication_window(self):
         process = object.__new__(ScannerProcess)
@@ -1302,17 +1373,21 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         self.assertTrue(controller._Controller__progressive_joint_first_publication)
-        model_builder.set_local_files.assert_called_once()
-        model_builder.set_remote_files.assert_called_once()
+        model_builder.build_progressive_roots.assert_called_once()
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
         model_builder.reset_mock()
 
         updater.update()
         self.assertTrue(controller._Controller__progressive_joint_first_publication)
+        model_builder.build_progressive_roots.assert_called_once()
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
+        model_builder.reset_mock()
 
         updater.update()
         self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        model_builder.build_progressive_roots.assert_not_called()
         model_builder.set_local_files.assert_called_once()
         model_builder.set_remote_files.assert_called_once()
 

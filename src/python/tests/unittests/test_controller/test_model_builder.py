@@ -84,6 +84,32 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.set_local_files([local_file])
         return ModelFile.build_file_id(file_name, path_pair_id)
 
+    def test_progressive_root_build_does_not_walk_or_replace_retained_roots(self):
+        pair_a = SystemFile("a.bin", 10, False)
+        pair_a.path_pair_id = "pair-a"
+        pair_b = SystemFile("b.bin", 20, False)
+        pair_b.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([pair_a, pair_b])
+        self.model_builder.set_downloaded_files(set())
+        retained_model = self.model_builder.build_model()
+
+        changed_a = SystemFile("a.bin", 11, False)
+        changed_a.path_pair_id = "pair-a"
+        delta_model = self.model_builder.build_progressive_roots(
+            [], [changed_a], {"pair-a"},
+        )
+
+        self.assertEqual({ModelFile.build_file_id("a.bin", "pair-a")}, delta_model.get_file_ids())
+        self.assertEqual(11, delta_model.get_file(ModelFile.build_file_id("a.bin", "pair-a")).remote_size)
+        self.assertIs(retained_model, self.model_builder.build_model())
+        self.assertEqual(
+            {
+                ModelFile.build_file_id("a.bin", "pair-a"),
+                ModelFile.build_file_id("b.bin", "pair-b"),
+            },
+            retained_model.get_file_ids(),
+        )
+
     def test_build_model_suppresses_temp_model_logs_without_mutating_shared_dummy_logger(self):
         root_logger = logging.getLogger()
         root_level = root_logger.level

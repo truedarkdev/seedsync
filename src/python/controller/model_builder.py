@@ -1820,6 +1820,72 @@ class ModelBuilder:
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES, started_at)
 
+    def build_progressive_roots(
+        self,
+        local_files: List[SystemFile],
+        remote_files: List[SystemFile],
+        unknown_local_path_pair_ids: Set[Optional[str]],
+    ) -> Model:
+        """Render a progressive root delta without walking retained roots.
+
+        Partial scan publications are presence-only hints; destructive
+        authority remains with ``build_model`` at the final reconciliation
+        boundary.  A short-lived builder reuses the standing non-scan inputs
+        while its local/remote maps contain only roots touched by this wave.
+        """
+        partial = ModelBuilder()
+        partial.logger = self.logger
+        partial.__target_archive_trace_logger = self.__target_archive_trace_logger
+        selected_pair_ids = {
+            file.path_pair_id for file in local_files + remote_files
+        }
+        selected_file_ids = {
+            self.__root_file_id(file.name, file.path_pair_id)
+            for file in local_files + remote_files
+        }
+
+        partial.__local_files = {
+            self.__root_file_id(file.name, file.path_pair_id): file for file in local_files
+        }
+        partial.__remote_files = {
+            self.__root_file_id(file.name, file.path_pair_id): file for file in remote_files
+        }
+        partial.__active_files = {
+            file_id: file for file_id, file in self.__active_files.items()
+            if file_id in selected_file_ids or file.path_pair_id in selected_pair_ids
+        }
+        partial.__active_file_ids = set(self.__active_file_ids).intersection(selected_file_ids)
+        partial.__lftp_statuses = {
+            file_id: status for file_id, status in self.__lftp_statuses.items()
+            if file_id in selected_file_ids or status.path_pair_id in selected_pair_ids
+        }
+        partial.__recent_live_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
+            if file_id in selected_file_ids or snapshot.root_file_id in selected_file_ids
+        }
+        partial.__retained_stopped_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
+            if file_id in selected_file_ids or snapshot.root_file_id in selected_file_ids
+        }
+        partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
+        partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__extract_statuses = {
+            file_id: status for file_id, status in self.__extract_statuses.items()
+            if getattr(status, "path_pair_id", None) in selected_pair_ids
+        }
+        partial.__extracted_files = set(self.__extracted_files)
+        partial.__stopped_files = set(self.__stopped_files)
+        partial.__validation_statuses = {
+            file_id: status for file_id, status in self.__validation_statuses.items()
+            if getattr(status, "path_pair_id", None) in selected_pair_ids
+        }
+        partial.__move_failed_files = set(self.__move_failed_files)
+        partial.__final_move_succeeded_files = set(self.__final_move_succeeded_files)
+        partial.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
+        partial.__local_root_paths = dict(self.__local_root_paths)
+        partial.__local_staging_paths = dict(self.__local_staging_paths)
+        return partial.build_model()
+
     def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES)
         try:
