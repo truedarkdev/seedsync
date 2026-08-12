@@ -602,7 +602,7 @@ export class ViewFileService {
                                     ViewFile.Status.VALIDATED,
                                     ViewFile.Status.CORRUPT,
                                     ViewFile.Status.MOVE_FAILED].includes(status)
-                                    && localPresent;
+                                    && (localPresent || status === ViewFile.Status.MOVE_FAILED);
         const isRemotelyDeletable: boolean = [ViewFile.Status.DEFAULT,
                                     ViewFile.Status.STOPPED,
                                     ViewFile.Status.DOWNLOADED,

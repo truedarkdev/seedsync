@@ -1342,12 +1342,18 @@ class Controller:
         self.__transfer_lifecycle_epochs[file_id] = self.__transfer_lifecycle_epochs.get(file_id, 0) + 1
 
     def _record_path_pair_reconciliation(
-            self, local_path_pair_ids: set[str | None], remote_path_pair_ids: set[str | None]) -> None:
+            self,
+            local_path_pair_ids: Optional[set[str | None]],
+            remote_path_pair_ids: Optional[set[str | None]],
+    ) -> None:
+        """Replace standing per-side authority after a scan-side event."""
         if not hasattr(self, "_Controller__reconciled_local_path_pair_ids"):
             self.__reconciled_local_path_pair_ids = set()
             self.__reconciled_remote_path_pair_ids = set()
-        self.__reconciled_local_path_pair_ids.update(local_path_pair_ids)
-        self.__reconciled_remote_path_pair_ids.update(remote_path_pair_ids)
+        if local_path_pair_ids is not None:
+            self.__reconciled_local_path_pair_ids = set(local_path_pair_ids)
+        if remote_path_pair_ids is not None:
+            self.__reconciled_remote_path_pair_ids = set(remote_path_pair_ids)
 
     def validate_path_pair_relocation(self, existing: PathPair, updated: PathPair) -> None:
         """Preflight an enabled-pair alias switch without moving user data."""
@@ -1434,7 +1440,8 @@ class Controller:
         with self.__work_state_lock:
             return self.__path_pair_busy_file_ids_locked(pair_id)
 
-    def __path_pair_busy_file_ids_locked(self, pair_id: str) -> set[str]:
+    def __path_pair_busy_file_ids_locked(
+            self, pair_id: str, ignored_dispatch_file_id: Optional[str] = None) -> set[str]:
         file_ids: set[str] = set()
         for name, entry_pair_id, _ in (
             list(self.__active_downloading_file_names) +
@@ -1446,7 +1453,7 @@ class Controller:
         file_ids.update(file_id for file_id in self.__queue_dispatch_pending() if self.__file_id_targets_path_pair(file_id, pair_id))
         file_ids.update(
             file_id for file_id in getattr(self, "_Controller__pending_command_dispatch_file_ids", set())
-            if self.__file_id_targets_path_pair(file_id, pair_id)
+            if file_id != ignored_dispatch_file_id and self.__file_id_targets_path_pair(file_id, pair_id)
         )
         file_ids.update(file_id for file_id in getattr(self, "_Controller__pending_extract_file_ids", set()) if self.__file_id_targets_path_pair(file_id, pair_id))
         file_ids.update(file_id for file_id in getattr(self, "_Controller__pending_validation_file_ids", set()) if self.__file_id_targets_path_pair(file_id, pair_id))
@@ -5094,6 +5101,62 @@ class Controller:
         except OSError:
             return True
 
+    def __absent_move_failure_repair_blocker(self, file: ModelFile) -> Optional[str]:
+        """Return why an explicit metadata-only Delete Local repair is unsafe."""
+        path_pair = self.__get_path_pair(file.path_pair_id)
+        if file.path_pair_id is None or path_pair is None or getattr(path_pair, "enabled", False) is not True:
+            return "Final move reset requires an enabled path pair"
+        if file.state != ModelFile.State.MOVE_FAILED or file.local_present or file.local_size is not None:
+            return "Final move reset requires authoritative local absence"
+        if self.__persist.move_failure_counts.get(file.file_id, 0) < Controller.__MAX_MOVE_FAILURES:
+            return "Final move reset requires a terminal failure marker"
+        if not file.remote_present or file.remote_size is None or not file.remote_has_transferable_content:
+            return "Final move reset requires transferable remote content"
+        if not bool(getattr(self, "_Controller__last_local_reconciliation_healthy", False)) or \
+                not bool(getattr(self, "_Controller__last_remote_reconciliation_healthy", False)) or \
+                not self.is_path_pair_reconciled(file.path_pair_id):
+            return "Final move reset requires current local and remote scans"
+
+        status_cache_expires_at = getattr(self, "_Controller__lftp_status_cache_expires_at", None)
+        current_status_authority = bool(getattr(self, "_Controller__lftp_idle_status_authoritative", False)) or (
+            isinstance(status_cache_expires_at, datetime) and datetime.now() <= status_cache_expires_at
+        )
+        if getattr(self.__lftp, "last_status_poll_healthy", False) is not True or \
+                bool(getattr(self, "_Controller__lftp_status_poll_retry_active", False)) or \
+                not current_status_authority:
+            return "Final move reset requires current transfer status"
+        if file.file_id in self.__model_builder.get_unresolved_staging_collision_file_ids() or \
+                self._has_active_collision_comparison(file.name, file.path_pair_id):
+            return "Final move reset is blocked by unresolved staging work"
+
+        if file.file_id in self.__path_pair_busy_file_ids_locked(
+                file.path_pair_id, ignored_dispatch_file_id=file.file_id
+        ) or file.file_id in getattr(self, "_Controller__move_retry_due", {}):
+            return "Final move reset is blocked by active transfer work"
+        return None
+
+    def __complete_delete_local_lifecycle(self, file_id: str, path_pair_id: Optional[str]) -> None:
+        """Apply the shared metadata transition after a confirmed local delete."""
+        self.__advance_transfer_lifecycle(file_id)
+        self.__persist.move_failure_counts.pop(file_id, None)
+        self._reset_move_retry_rebuild_gate(file_id)
+        self.__deferred_move_file_ids.discard(file_id)
+        self.__move_retry_due.pop(file_id, None)
+        self.__pending_completion_file_names = {
+            entry for entry in self.__pending_completion_file_names
+            if ModelFile.build_file_id(entry[0], entry[1]) != file_id
+        }
+        getattr(self, "_Controller__pending_completion_progress_floors", {}).pop(file_id, None)
+        getattr(self, "_Controller__successful_final_move_handoff_file_ids", set()).discard(file_id)
+        self.__persist.final_move_succeeded_file_names.discard(file_id)
+        getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(file_id)
+        self._sync_final_move_succeeded_files_to_model()
+        self.__model_builder.set_move_failed_files({
+            failed_file_id for failed_file_id, count in self.__persist.move_failure_counts.items()
+            if count >= Controller.__MAX_MOVE_FAILURES
+        })
+        self.__reset_download_start_after_local_delete(file_id, path_pair_id)
+
     @staticmethod
     def __is_delete_command_action(action: "Controller.Command.Action") -> bool:
         return action in (
@@ -5892,7 +5955,29 @@ class Controller:
                     )
                     continue
                 elif file.local_size is None:
-                    _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
+                    if file.state != ModelFile.State.MOVE_FAILED:
+                        _notify_failure(command, "File '{}' does not exist locally".format(command.filename), 404, file)
+                        continue
+                    repair_blocker = self.__absent_move_failure_repair_blocker(file)
+                    if repair_blocker is not None:
+                        _notify_failure(command, repair_blocker, 409, file)
+                        continue
+                    self.__persist.stopped_file_names.add(file.file_id)
+                    self.__validate_process.clear(file.file_id)
+                    self.__complete_delete_local_lifecycle(file.file_id, file.path_pair_id)
+                    for callback in command.callbacks:
+                        callback.on_success()
+                    self.__record_command_breadcrumb(
+                        command=command,
+                        message="command_finished",
+                        details={
+                            "command": "DELETE_LOCAL",
+                            "mode": "failed_move_metadata_repair",
+                            "lifecycle_phase": "dispatch",
+                            "completion": "completed",
+                        },
+                        file=file,
+                    )
                     continue
                 elif self.__has_ambiguous_split_local_target(file):
                     _notify_failure(
@@ -6455,35 +6540,7 @@ class Controller:
                         else:
                             command_process.post_callback()
                             if command_process.command.action == Controller.Command.Action.DELETE_LOCAL:
-                                self.__advance_transfer_lifecycle(command_process.file_id)
-                                self.__persist.move_failure_counts.pop(command_process.file_id, None)
-                                self._reset_move_retry_rebuild_gate(command_process.file_id)
-                                self.__deferred_move_file_ids.discard(command_process.file_id)
-                                self.__move_retry_due.pop(command_process.file_id, None)
-                                self.__pending_completion_file_names = {
-                                    entry for entry in self.__pending_completion_file_names
-                                    if ModelFile.build_file_id(entry[0], entry[1]) != command_process.file_id
-                                }
-                                getattr(
-                                    self,
-                                    "_Controller__pending_completion_progress_floors",
-                                    {},
-                                ).pop(command_process.file_id, None)
-                                getattr(
-                                    self,
-                                    "_Controller__successful_final_move_handoff_file_ids",
-                                    set(),
-                                ).discard(command_process.file_id)
-                                self.__persist.final_move_succeeded_file_names.discard(command_process.file_id)
-                                getattr(self, "_Controller__current_process_final_publication_file_ids", set()).discard(
-                                    command_process.file_id
-                                )
-                                self._sync_final_move_succeeded_files_to_model()
-                                self.__model_builder.set_move_failed_files({
-                                    file_id for file_id, count in self.__persist.move_failure_counts.items()
-                                    if count >= Controller.__MAX_MOVE_FAILURES
-                                })
-                                self.__reset_download_start_after_local_delete(
+                                self.__complete_delete_local_lifecycle(
                                     command_process.file_id,
                                     getattr(command_process.event_file, "path_pair_id", None),
                                 )

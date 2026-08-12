@@ -1062,6 +1062,8 @@ class TestModelUpdater(unittest.TestCase):
             _Controller__exclude_patterns="",
             _Controller__last_remote_reconciliation_healthy=False,
             _Controller__last_local_reconciliation_healthy=False,
+            _Controller__reconciled_local_path_pair_ids=set(),
+            _Controller__reconciled_remote_path_pair_ids=set(),
             _Controller__path_pairs_by_id={},
             _Controller__progressive_joint_authoritative=authoritative,
             _Controller__MAX_MOVE_FAILURES=4,
@@ -1072,6 +1074,12 @@ class TestModelUpdater(unittest.TestCase):
             _Controller__should_auto_purge_local_file=MagicMock(return_value=False),
             _sync_final_move_succeeded_files_to_model=MagicMock(),
         )
+        def record_reconciliation(local_ids, remote_ids):
+            if local_ids is not None:
+                controller._Controller__reconciled_local_path_pair_ids = set(local_ids)
+            if remote_ids is not None:
+                controller._Controller__reconciled_remote_path_pair_ids = set(remote_ids)
+        controller._record_path_pair_reconciliation = record_reconciliation
         controller._Controller__remote_scan_process.pop_latest_result.return_value = remote_scan
         controller._Controller__local_scan_process.pop_latest_result.return_value = local_scan
         controller._Controller__active_scan_process.pop_latest_result.return_value = None
@@ -1138,6 +1146,8 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        self.assertEqual({None}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({None}, controller._Controller__reconciled_remote_path_pair_ids)
         model_builder.reset_mock()
 
         updater.update()
@@ -1361,6 +1371,8 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        self.assertEqual({None}, controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual({None}, controller._Controller__reconciled_remote_path_pair_ids)
         model_builder.reset_mock()
 
         new_remote = process(
@@ -1392,6 +1404,8 @@ class TestModelUpdater(unittest.TestCase):
         # budget from the reconciler's retained last-good rows.
         updater.update()
         self.assertFalse(controller._Controller__progressive_joint_first_publication)
+        self.assertEqual(set(), controller._Controller__reconciled_local_path_pair_ids)
+        self.assertEqual(set(), controller._Controller__reconciled_remote_path_pair_ids)
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
 

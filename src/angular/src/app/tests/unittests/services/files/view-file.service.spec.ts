@@ -184,12 +184,12 @@ describe("Testing view file service", () => {
         expect(count).toBe(1);
     }));
 
-    it("should expose only retry move and reliable local delete for move failed", fakeAsync(() => {
+    it("should expose explicit local reset for move failed even when local content is absent", fakeAsync(() => {
         mockModelService._files.next(Immutable.Map<string, ModelFile>().set("movie", new ModelFile({
             file_id: "movie",
             name: "movie",
             state: ModelFile.State.MOVE_FAILED,
-            local_size: 100,
+            local_size: null,
             remote_size: 100,
             is_stoppable: true,
             is_extractable: true
@@ -208,6 +208,24 @@ describe("Testing view file service", () => {
         expect(file.isExtractable).toBe(false);
         expect(file.isRemotelyDeletable).toBe(false);
         expect(file.isValidatable).toBe(false);
+    }));
+
+    it("should keep local delete disabled for other absent-local states", fakeAsync(() => {
+        mockModelService._files.next(Immutable.Map<string, ModelFile>().set("movie", new ModelFile({
+            file_id: "movie",
+            name: "movie",
+            state: ModelFile.State.DEFAULT,
+            local_size: null,
+            remote_size: 100
+        })));
+        tick();
+
+        let file: ViewFile = null;
+        viewService.files.subscribe(files => file = files.get(0));
+        tick();
+
+        expect(file.status).toBe(ViewFile.Status.DEFAULT);
+        expect(file.isLocallyDeletable).toBe(false);
     }));
 
     it("should refine only ordinary downloaded state to final move succeeded", fakeAsync(() => {

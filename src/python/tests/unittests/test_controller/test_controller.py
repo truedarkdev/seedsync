@@ -2159,6 +2159,41 @@ class TestController(unittest.TestCase):
         self.assertEqual(3, self.controller._Controller__active_scanner.set_active_files.call_count)
         self.controller._Controller__active_scanner.set_active_files.assert_any_call(["a"])
 
+    def test_path_pair_reconciliation_authority_invalidates_failed_pair_only(self):
+        self.controller._Controller__path_pairs_by_id = {
+            "pair-a": SimpleNamespace(local_path="/local/a"),
+            "pair-b": SimpleNamespace(local_path="/local/b"),
+        }
+        self.controller._Controller__reconciled_local_path_pair_ids = {"pair-a"}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {"pair-a"}
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__remote_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-a"}, failed=True,
+                is_targeted_scan=True, unknown_path_pair_ids={"pair-a"},
+            ),
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"},
+                is_targeted_scan=True,
+            ),
+        ]
+        self.controller._Controller__local_scan_process.pop_latest_result.side_effect = [
+            ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={"pair-b"},
+                is_targeted_scan=True,
+            ),
+            None,
+        ]
+
+        self.controller._Controller__update_model()
+        self.controller._Controller__update_model()
+
+        self.assertTrue(self.controller._Controller__last_local_reconciliation_healthy)
+        self.assertTrue(self.controller._Controller__last_remote_reconciliation_healthy)
+        self.assertFalse(self.controller.is_path_pair_reconciled("pair-a"))
+        self.assertTrue(self.controller.is_path_pair_reconciled("pair-b"))
+
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_rebuilds_runtime_state_and_forces_rescan(self, scanner_process_cls):
         pair_a = PathPair(
@@ -5999,6 +6034,123 @@ class TestController(unittest.TestCase):
         callback.on_failure.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
+    def _prepare_absent_terminal_move_delete(self):
+        pair = PathPair(
+            id="movies",
+            name="Movies",
+            remote_path="downloads/public/Movies",
+            local_path="/local/movies",
+            enabled=True,
+        )
+        file = ModelFile("Example Series", True)
+        file.path_pair_id = pair.id
+        file.path_pair_name = pair.name
+        file.remote_size = 137
+        file.local_size = None
+        file.state = ModelFile.State.MOVE_FAILED
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__path_pairs_by_id = {pair.id: pair}
+        self.controller._Controller__persist.move_failure_counts = {file.file_id: 4}
+        self.controller._Controller__persist.downloaded_file_names = {file.file_id}
+        self.controller._Controller__persist.downloaded_timestamps = {file.file_id: 123.0}
+        self.controller._Controller__persist.stopped_file_names = {file.file_id}
+        self.controller._Controller__reconciled_local_path_pair_ids = {pair.id}
+        self.controller._Controller__reconciled_remote_path_pair_ids = {pair.id}
+        self.controller._Controller__last_local_reconciliation_healthy = True
+        self.controller._Controller__last_remote_reconciliation_healthy = True
+        self.controller._Controller__lftp.last_status_poll_healthy = True
+        self.controller._Controller__lftp_status_poll_retry_active = False
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__lftp_status_cache_expires_at = datetime.now() - timedelta(seconds=30)
+        self.controller._Controller__last_lftp_statuses = []
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__model_builder.get_unresolved_staging_collision_file_ids.return_value = set()
+        return file
+
+    @patch("controller.controller.DeleteLocalProcess")
+    def test_delete_local_explicitly_repairs_absent_terminal_move_failure_metadata(self, delete_local_process):
+        file = self._prepare_absent_terminal_move_delete()
+        self.controller._Controller__download_start_state[file.file_id] = DownloadStartLifecycleEntry(
+            "notified", file.path_pair_id, datetime.now()
+        )
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        delete_local_process.assert_not_called()
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        self.controller._Controller__validate_process.clear.assert_called_once_with(file.file_id)
+        self.assertEqual({}, self.controller._Controller__persist.move_failure_counts)
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({file.file_id: 123.0}, self.controller._Controller__persist.downloaded_timestamps)
+        self.assertEqual({file.file_id}, self.controller._Controller__persist.stopped_file_names)
+        self.assertEqual("fresh_after_delete", self.controller._Controller__download_start_state[file.file_id].state)
+        self.controller._Controller__model_builder.set_move_failed_files.assert_called_with(set())
+        self.controller._Controller__model_builder.has_unresolved_staging_collision.assert_not_called()
+
+    @patch("controller.controller.DeleteLocalProcess")
+    def test_delete_local_absent_terminal_move_failure_repair_fails_closed(self, delete_local_process):
+        cases = (
+            ("unreconciled", lambda file: self.controller._Controller__reconciled_local_path_pair_ids.clear()),
+            ("remote absent", lambda file: setattr(file, "remote_present", False)),
+            ("collision", lambda file: self.controller._Controller__model_builder.get_unresolved_staging_collision_file_ids.configure_mock(
+                return_value={file.file_id}
+            )),
+            ("active transfer", lambda file: self.controller._Controller__last_lftp_statuses.append(
+                SimpleNamespace(
+                    file_id=file.file_id,
+                    path_pair_id=file.path_pair_id,
+                    state=LftpJobStatus.State.RUNNING,
+                )
+            )),
+            ("pending completion", lambda file: self.controller._Controller__pending_completion_file_names.add(
+                (file.name, file.path_pair_id, file.path_pair_name)
+            )),
+            ("disabled pair", lambda file: setattr(
+                self.controller._Controller__path_pairs_by_id[file.path_pair_id], "enabled", False
+            )),
+            ("unscoped file", lambda file: setattr(file, "path_pair_id", None)),
+        )
+        for label, make_unsafe in cases:
+            with self.subTest(label=label):
+                file = self._prepare_absent_terminal_move_delete()
+                persisted_file_id = file.file_id
+                make_unsafe(file)
+                callback = MagicMock()
+                command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+                command.add_callback(callback)
+
+                self.controller.queue_command(command)
+                self.controller._Controller__process_commands()
+
+                callback.on_success.assert_not_called()
+                callback.on_failure.assert_called_once()
+                self.assertEqual(409, callback.on_failure.call_args.args[1])
+                self.assertEqual(4, self.controller._Controller__persist.move_failure_counts[persisted_file_id])
+        delete_local_process.assert_not_called()
+
+    @patch("controller.controller.DeleteLocalProcess")
+    def test_delete_local_absent_non_move_failure_remains_missing(self, delete_local_process):
+        file = ModelFile("missing", False)
+        file.remote_size = 10
+        file.local_size = None
+        file.state = ModelFile.State.DEFAULT
+        self.controller._Controller__model.get_file.return_value = file
+        callback = MagicMock()
+        command = Controller.Command(Controller.Command.Action.DELETE_LOCAL, file.file_id)
+        command.add_callback(callback)
+
+        self.controller.queue_command(command)
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_not_called()
+        callback.on_failure.assert_called_once_with("File 'missing' does not exist locally", 404)
+        delete_local_process.assert_not_called()
+
     def test_delete_local_command_lifecycle_breadcrumbs_keep_same_flow_id(self):
         file = ModelFile("dup", False)
         file.path_pair_id = "movies"
@@ -7245,31 +7397,31 @@ class TestController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
-            destination = os.path.join(final_root, "Maid")
+            destination = os.path.join(final_root, "Example Directory")
             claim = os.path.join(staging_root, ".seedsync-retire-" + "f" * 48)
-            os.makedirs(os.path.join(claim, "S01", "Maid")); os.makedirs(destination)
+            os.makedirs(os.path.join(claim, "S01", "Example Directory")); os.makedirs(destination)
             self.controller._Controller__staging_path = staging_root
             self.controller._Controller__legacy_local_path = final_root
 
             self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                             self.controller._Controller__move_from_staging("Maid"))
+                             self.controller._Controller__move_from_staging("Example Directory"))
             self.assertFalse(os.path.lexists(claim))
 
     def test_completed_move_retains_nonempty_or_sidecar_retired_directory_claim(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
-            destination = os.path.join(final_root, "Maid")
+            destination = os.path.join(final_root, "Example Directory")
             nonempty_claim = os.path.join(staging_root, ".seedsync-retire-" + "1" * 48)
             sidecar_claim = os.path.join(staging_root, ".seedsync-retire-" + "2" * 48)
             os.makedirs(nonempty_claim); os.makedirs(sidecar_claim); os.makedirs(destination)
             Path(os.path.join(nonempty_claim, "payload")).write_bytes(b"do-not-delete")
-            Controller._Controller__write_collision_claim_sidecar(sidecar_claim + ".json", "Maid", None)
+            Controller._Controller__write_collision_claim_sidecar(sidecar_claim + ".json", "Example Directory", None)
             self.controller._Controller__staging_path = staging_root
             self.controller._Controller__legacy_local_path = final_root
 
             self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                             self.controller._Controller__move_from_staging("Maid"))
+                             self.controller._Controller__move_from_staging("Example Directory"))
             self.assertTrue(os.path.isdir(nonempty_claim))
             self.assertTrue(os.path.exists(os.path.join(nonempty_claim, "payload")))
             self.assertTrue(os.path.isdir(sidecar_claim))
@@ -7279,7 +7431,7 @@ class TestController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
-            destination = os.path.join(final_root, "Maid")
+            destination = os.path.join(final_root, "Example Directory")
             claim = os.path.join(staging_root, ".seedsync-retire-" + "3" * 48)
             nested = os.path.join(claim, "S01")
             os.makedirs(nested); os.makedirs(destination)
@@ -7292,7 +7444,7 @@ class TestController(unittest.TestCase):
                         patch.object(Controller, "_Controller__linux_mountinfo_mountpoints", return_value=[mount_point]), \
                         patch("controller.controller.os.path.ismount", return_value=False):
                     self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                                     self.controller._Controller__move_from_staging("Maid"))
+                                     self.controller._Controller__move_from_staging("Example Directory"))
 
             self.assertTrue(os.path.isdir(claim))
             self.assertTrue(os.path.isdir(nested))
@@ -7301,7 +7453,7 @@ class TestController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
-            destination = os.path.join(final_root, "Maid")
+            destination = os.path.join(final_root, "Example Directory")
             claim = os.path.join(staging_root, ".seedsync-retire-" + "4" * 48)
             nested = os.path.join(claim, "one", "two")
             os.makedirs(nested); os.makedirs(destination)
@@ -7310,7 +7462,7 @@ class TestController(unittest.TestCase):
 
             with patch("controller.controller._EMPTY_RETIRED_DIRECTORY_TREE_LIMIT", 2):
                 self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                                 self.controller._Controller__move_from_staging("Maid"))
+                                 self.controller._Controller__move_from_staging("Example Directory"))
 
             self.assertTrue(os.path.isdir(claim))
             self.assertTrue(os.path.isdir(nested))
@@ -7319,7 +7471,7 @@ class TestController(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
             final_root = os.path.join(temp_dir, "final")
-            destination = os.path.join(final_root, "Maid")
+            destination = os.path.join(final_root, "Example Directory")
             claim = os.path.join(staging_root, ".seedsync-retire-" + "5" * 48)
             os.makedirs(os.path.join(claim, "one")); os.makedirs(os.path.join(claim, "two")); os.makedirs(destination)
             self.controller._Controller__staging_path = staging_root
@@ -7327,7 +7479,7 @@ class TestController(unittest.TestCase):
 
             with patch("controller.controller._EMPTY_RETIRED_DIRECTORY_TREE_LIMIT", 2):
                 self.assertEqual(Controller.MoveFromStagingResult.ALREADY_COMPLETED,
-                                 self.controller._Controller__move_from_staging("Maid"))
+                                 self.controller._Controller__move_from_staging("Example Directory"))
 
             self.assertTrue(os.path.isdir(claim))
             self.assertTrue(os.path.isdir(os.path.join(claim, "one")))

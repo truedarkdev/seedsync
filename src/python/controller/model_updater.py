@@ -698,6 +698,7 @@ def _pop_scan_updates(controller: "Controller", side: str, process: object) -> O
         session_token = getattr(process, "session_token", None)
         if accumulator.session_token is not None and accumulator.session_token != session_token:
             setattr(controller, "_Controller__progressive_scan_session_changed", True)
+            setattr(controller, "_Controller__progressive_{}_scan_session_changed".format(side), True)
         accumulator.set_session_token(session_token)
         return accumulator.apply(events)
     pop_latest = getattr(process, "pop_latest_result", None)
@@ -1327,6 +1328,8 @@ class ModelUpdater(_ControllerCoreAccess):
         if not hasattr(controller, "_Controller__progressive_joint_first_publication"):
             controller._Controller__progressive_joint_first_publication = False
         controller._Controller__progressive_scan_session_changed = False
+        controller._Controller__progressive_local_scan_session_changed = False
+        controller._Controller__progressive_remote_scan_session_changed = False
 
         stage_timer.switch(DURATION_MODEL_UPDATE_SCAN_INTAKE)
         # Grab the latest scan results.
@@ -1782,22 +1785,45 @@ class ModelUpdater(_ControllerCoreAccess):
                 controller._Controller__last_remote_reconciliation_healthy = True
                 controller._Controller__progressive_joint_first_publication = True
                 controller._Controller__progressive_joint_authoritative = True
-        healthy_local_ids: set[str | None] = set()
-        healthy_remote_ids: set[str | None] = set()
-        if latest_local_scan is not None and not bool(getattr(latest_local_scan, "failed", False)) and \
-                bool(getattr(latest_local_scan, "is_scan_final", True)):
-            raw_ids = getattr(latest_local_scan, "scanned_path_pair_ids", {None})
-            if isinstance(raw_ids, set):
-                healthy_local_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
-        if latest_remote_scan is not None and not bool(getattr(latest_remote_scan, "failed", False)) and \
-                bool(getattr(latest_remote_scan, "is_scan_final", True)):
-            raw_ids = getattr(latest_remote_scan, "scanned_path_pair_ids", {None})
-            if isinstance(raw_ids, set):
-                healthy_remote_ids = {item for item in raw_ids if item is None or isinstance(item, str)}
-        if healthy_local_ids or healthy_remote_ids:
+        def reconciled_pair_ids(
+                side: str, result: Optional[ScannerResult]) -> Optional[set[str | None]]:
+            session_changed = bool(getattr(
+                controller, "_Controller__progressive_{}_scan_session_changed".format(side), False
+            ))
+            if result is None and not session_changed:
+                return None
+            current = set(getattr(
+                controller, "_Controller__reconciled_{}_path_pair_ids".format(side), set()
+            ))
+            if progressive_mode:
+                accumulator = getattr(
+                    controller, "_Controller__progressive_{}_scan_state".format(side), None
+                )
+                return accumulator.completed_pairs() \
+                    if isinstance(accumulator, _ProgressiveScanAccumulator) else set()
+
+            raw_scanned = getattr(result, "scanned_path_pair_ids", {None})
+            scanned = set(raw_scanned) if isinstance(raw_scanned, set) else set()
+            raw_unknown = getattr(result, "unknown_path_pair_ids", set())
+            unknown = set(raw_unknown) if isinstance(raw_unknown, set) else set()
+            affected = {
+                item for item in scanned | unknown if item is None or isinstance(item, str)
+            }
+            healthy = not bool(getattr(result, "failed", False)) \
+                and bool(getattr(result, "is_scan_final", True)) and not unknown
+            covered = affected if healthy else set()
+            if not bool(getattr(result, "is_targeted_scan", False)):
+                return covered
+            current.difference_update(affected)
+            current.update(covered)
+            return current
+
+        local_reconciled_ids = reconciled_pair_ids("local", latest_local_scan)
+        remote_reconciled_ids = reconciled_pair_ids("remote", latest_remote_scan)
+        if local_reconciled_ids is not None or remote_reconciled_ids is not None:
             recorder = getattr(controller, "_record_path_pair_reconciliation", None)
             if callable(recorder):
-                recorder(healthy_local_ids, healthy_remote_ids)
+                recorder(local_reconciled_ids, remote_reconciled_ids)
         if latest_active_scan is not None:
             active_scan_files = list(latest_active_scan.files)
             handoff_file_ids = controller._Controller__successful_final_move_handoff_file_ids
