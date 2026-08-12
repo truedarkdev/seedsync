@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import time
+from threading import Event
 from typing import Callable, Optional
 
 from ..web_app import IStreamHandler
@@ -97,6 +98,10 @@ class ModelStreamHandler(IStreamHandler):
         self.initial_model_files: list[ModelFile] | None = None
         self.first_run = True
         self.__stream_emit_sequence = 0
+
+    @overrides(IStreamHandler)
+    def set_wake_event(self, wake_event: Event) -> None:
+        self.model_listener.set_wake_event(wake_event)
 
     def __trace_enabled_at_emit(self) -> bool:
         """Check the live gate and fail closed if the diagnostic hook fails."""

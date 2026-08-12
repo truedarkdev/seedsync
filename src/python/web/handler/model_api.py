@@ -8,7 +8,7 @@ import base64
 from collections import OrderedDict
 import json
 import time
-from threading import Lock
+from threading import Event, Lock
 from typing import Iterator, Optional
 
 import bottle
@@ -49,6 +49,7 @@ class ScopedModelListener(IModelListener):
         self.__identity_bytes = 0
         self.__closed = False
         self.__lock = Lock()
+        self.__available = Event()
 
     def file_added(self, file: ModelFile) -> None:
         pass
@@ -83,6 +84,7 @@ class ScopedModelListener(IModelListener):
                 self.__changes.clear()
                 self.__identity_bytes = 0
                 self.__reset_version = version
+            self.__available.set()
 
     def take_next_event(self) -> Optional[dict[str, object]]:
         with self.__lock:
@@ -91,17 +93,22 @@ class ScopedModelListener(IModelListener):
             if self.__reset_version is not None:
                 version = self.__reset_version
                 self.__reset_version = None
+                self.__available.clear()
                 return {"event": "model-reset", "model_version": version, "reason": "coalesced"}
             if not self.__changes:
                 return None
             changes = list(self.__changes.items())
             self.__changes.clear()
             self.__identity_bytes = 0
+            self.__available.clear()
         return {
             "event": "model-invalidate",
             "model_version": max(version for _, version in changes),
             "file_ids": [file_id for file_id, _ in changes],
         }
+
+    def wait_for_event(self, timeout: float) -> bool:
+        return self.__available.wait(timeout=max(0.0, timeout))
 
     def close(self) -> None:
         with self.__lock:
@@ -109,6 +116,7 @@ class ScopedModelListener(IModelListener):
             self.__changes.clear()
             self.__identity_bytes = 0
             self.__reset_version = None
+            self.__available.set()
 
 
 class SummaryModelListener(IModelListener):
@@ -120,6 +128,7 @@ class SummaryModelListener(IModelListener):
         self.__reset = False
         self.__closed = False
         self.__lock = Lock()
+        self.__available = Event()
 
     def file_added(self, file: ModelFile) -> None: pass
     def file_removed(self, file: ModelFile) -> None: pass
@@ -138,6 +147,7 @@ class SummaryModelListener(IModelListener):
             if len(self.__scopes) > self._MAX_SCOPES:
                 self.__scopes.clear()
                 self.__reset = True
+            self.__available.set()
 
     def take_next_event(self) -> Optional[dict[str, object]]:
         with self.__lock:
@@ -145,17 +155,23 @@ class SummaryModelListener(IModelListener):
                 return None
             if self.__reset:
                 self.__reset = False
+                self.__available.clear()
                 return {"event": "model-summary-reset", "reason": "coalesced"}
             if not self.__scopes:
                 return None
             scopes = list(self.__scopes)
             self.__scopes.clear()
+            self.__available.clear()
             return {"event": "model-summary-update", "path_pair_ids": scopes}
+
+    def wait_for_event(self, timeout: float) -> bool:
+        return self.__available.wait(timeout=max(0.0, timeout))
 
     def close(self) -> None:
         with self.__lock:
             self.__closed = True
             self.__scopes.clear()
+            self.__available.set()
 
 
 class ModelApiHandler(IHandler):
@@ -381,7 +397,11 @@ class ModelApiHandler(IHandler):
                         yield ": keepalive\n\n"
                         last_keepalive_at = time.monotonic()
                     else:
-                        time.sleep(0.1)
+                        now = time.monotonic()
+                        deadlines = [last_keepalive_at + self._KEEPALIVE_INTERVAL_SECONDS]
+                        if pending_event is not None:
+                            deadlines.append(last_summary_at + self._SUMMARY_MIN_INTERVAL_SECONDS)
+                        listener.wait_for_event(min(deadlines) - now)
             finally:
                 listener.close()
                 self.__controller.remove_model_listener(listener)
@@ -465,7 +485,9 @@ class ModelApiHandler(IHandler):
                         yield ": keepalive\n\n"
                         last_keepalive_at = time.monotonic()
                     else:
-                        time.sleep(0.1)
+                        listener.wait_for_event(
+                            last_keepalive_at + self._KEEPALIVE_INTERVAL_SECONDS - time.monotonic()
+                        )
             finally:
                 listener.close()
                 self.__controller.remove_model_listener(listener)

@@ -80,6 +80,22 @@ class TestWebAppStream(unittest.TestCase):
 
         sleep.assert_called_once_with(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
 
+    def test_idle_stream_blocks_on_event_until_stop(self):
+        cleanup_log = []
+        self.web_app.add_streaming_handler(QueueStreamHandler, values=[], cleanup_log=cleanup_log)
+
+        wake_event = MagicMock()
+        wake_event.wait.side_effect = lambda timeout: self.web_app.stop()
+        with patch("web.web_app.Event", return_value=wake_event), patch("web.web_app.time.sleep") as sleep:
+            stream = self.web_app._WebApp__web_stream()
+            with self.assertRaises(StopIteration):
+                next(stream)
+
+        wake_event.wait.assert_called_once_with(timeout=WebApp._STREAM_IDLE_WAIT_SECONDS)
+        wake_event.set.assert_called_once_with()
+        sleep.assert_not_called()
+        self.assertEqual([True], cleanup_log)
+
     def test_dashboard_path_pair_deep_link_serves_index_html(self):
         with tempfile.TemporaryDirectory() as html_path:
             with open(os.path.join(html_path, "index.html"), "w") as html_file:

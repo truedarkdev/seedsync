@@ -2,8 +2,8 @@
 
 import copy
 import logging
+from threading import Event, Lock
 import time
-from threading import Lock
 from typing import TYPE_CHECKING, Protocol, TypeGuard
 
 from ..web_app import IStreamHandler
@@ -97,6 +97,10 @@ class LogStreamHandler(IStreamHandler):
         self.logger = logger
         self.handler = QueueLogHandler()
         self.serialize = SerializeLogRecord()
+
+    @overrides(IStreamHandler)
+    def set_wake_event(self, wake_event: Event) -> None:
+        self.handler.set_wake_event(wake_event)
 
     # noinspection PyUnresolvedReferences
     @classmethod

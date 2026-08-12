@@ -7,6 +7,7 @@ from typing import Type, Optional, Tuple, overload
 from abc import ABC, abstractmethod
 from functools import wraps
 import time
+from threading import Event, Lock
 from urllib.parse import urlparse
 
 import bottle
@@ -37,6 +38,10 @@ class IStreamHandler(ABC):
     """
     def __init__(self, **kwargs: object) -> None:
         del kwargs
+
+    def set_wake_event(self, wake_event: Event) -> None:
+        """Bind the aggregate stream wakeup; handlers without queues ignore it."""
+        del wake_event
 
     @abstractmethod
     def setup(self) -> None:
@@ -83,7 +88,7 @@ class WebApp(bottle.Bottle):
     """
     _AUTH_SCOPES = {"read", "write", "stream", "admin"}
     _LEGACY_UNAUTHENTICATED_SCOPES = {"read", "write", "stream"}
-    _STREAM_POLL_INTERVAL_IN_MS = 100
+    _STREAM_IDLE_WAIT_SECONDS = 5.0
     _STREAM_EVENT_YIELD_INTERVAL_IN_MS = 10
     _CONTENT_SECURITY_POLICY = "connect-src 'self' https://api.github.com"
     _X_CONTENT_TYPE_OPTIONS = "nosniff"
@@ -115,6 +120,8 @@ class WebApp(bottle.Bottle):
             self.__auth_store.activate_browser_handover(self.__config)
         self.logger.info("Html path set to: {}".format(self.__html_path))
         self._stop = False
+        self.__stream_wake_lock = Lock()
+        self.__stream_wake_events: set[Event] = set()
         self.__streaming_handlers: list[
             tuple[Type[IStreamHandler], dict[str, object], str]
         ] = []
@@ -243,6 +250,10 @@ class WebApp(bottle.Bottle):
         :return:
         """
         object.__setattr__(self, "_stop", True)
+        with self.__stream_wake_lock:
+            wake_events = list(self.__stream_wake_events)
+        for wake_event in wake_events:
+            wake_event.set()
 
     def route(self, path: Optional[str] = None, method: str = "GET",
               callback: Optional[Callable[..., object]] = None,
@@ -1398,6 +1409,7 @@ class WebApp(bottle.Bottle):
         return response
 
     def __web_stream(self) -> Iterator[str]:
+        wake_event = Event()
         # Initialize all the handlers
         request_scopes = self.__request_auth_scopes()
         handlers = [
@@ -1405,6 +1417,8 @@ class WebApp(bottle.Bottle):
             for (cls, kwargs, required_scope) in self.__streaming_handlers
             if required_scope == "stream" or required_scope in request_scopes
         ]
+        with self.__stream_wake_lock:
+            self.__stream_wake_events.add(wake_event)
 
         try:
             # Setup the response header
@@ -1413,10 +1427,15 @@ class WebApp(bottle.Bottle):
 
             # Call setup on all handlers
             for handler in handlers:
+                handler.set_wake_event(wake_event)
                 handler.setup()
 
             # Get streaming values until the connection closes
             while not self._stop:
+                # Clear before inspecting queues. A producer racing after the
+                # clear either leaves a queued value for this pass or sets the
+                # event and makes the wait below return immediately.
+                wake_event.clear()
                 emitted_value = False
                 for handler in handlers:
                     value = handler.get_value()
@@ -1426,9 +1445,11 @@ class WebApp(bottle.Bottle):
                         time.sleep(WebApp._STREAM_EVENT_YIELD_INTERVAL_IN_MS / 1000)
 
                 if not emitted_value:
-                    time.sleep(WebApp._STREAM_POLL_INTERVAL_IN_MS / 1000)
+                    wake_event.wait(timeout=WebApp._STREAM_IDLE_WAIT_SECONDS)
 
         finally:
+            with self.__stream_wake_lock:
+                self.__stream_wake_events.discard(wake_event)
             self.logger.debug("Stream connection stopped by {}".format(
                 "server" if self._stop else "client"
             ))

@@ -1,5 +1,6 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
+from threading import Event
 from typing import Optional
 
 from ..web_app import IStreamHandler
@@ -27,6 +28,10 @@ class StatusStreamHandler(IStreamHandler):
         self.serialize = SerializeStatus()
         self.status_listener = StatusListener(status)
         self.first_run = True
+
+    @overrides(IStreamHandler)
+    def set_wake_event(self, wake_event: Event) -> None:
+        self.status_listener.set_wake_event(wake_event)
 
     @overrides(IStreamHandler)
     def setup(self):

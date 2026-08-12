@@ -1,6 +1,7 @@
 import unittest
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
+from threading import Event
 
 
 UTILS_PATH = Path(__file__).resolve().parents[3] / "web" / "utils.py"
@@ -62,3 +63,15 @@ class TestStreamQueue(unittest.TestCase):
         self.assertEqual(3, queue.get_next_event())
         self.assertEqual(4, queue.get_next_event())
         self.assertIsNone(queue.get_next_event())
+
+    def test_bound_wake_event_is_set_for_existing_and_new_values(self):
+        queue = StreamQueue(maxsize=2)
+        wake_event = Event()
+        queue.put("existing")
+
+        queue.set_wake_event(wake_event)
+        self.assertTrue(wake_event.is_set())
+
+        wake_event.clear()
+        queue.put("new")
+        self.assertTrue(wake_event.is_set())

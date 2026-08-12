@@ -2,7 +2,7 @@ import json
 import logging
 import unittest
 from wsgiref.util import setup_testing_defaults
-from threading import RLock
+from threading import RLock, Timer
 from types import SimpleNamespace
 from urllib.parse import quote
 from unittest.mock import patch
@@ -13,7 +13,7 @@ from common import Config, Status
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
 from model import Model, ModelFile
-from web.handler.model_api import ModelApiHandler, ScopedModelListener
+from web.handler.model_api import ModelApiHandler, ScopedModelListener, SummaryModelListener
 from web.web_app import WebApp
 import bottle
 
@@ -292,6 +292,28 @@ class TestModelApi(unittest.TestCase):
         listener.close()
         listener.model_version_changed(999, "pair-a", "ignored")
         self.assertIsNone(listener.take_next_event())
+
+    def test_scoped_listener_waits_until_a_matching_event(self):
+        listener = ScopedModelListener("pair-a")
+        timer = Timer(0.01, lambda: listener.model_version_changed(1, "pair-a", "file-a"))
+        timer.start()
+        try:
+            self.assertTrue(listener.wait_for_event(1.0))
+            self.assertEqual(["file-a"], listener.take_next_event()["file_ids"])
+        finally:
+            timer.join()
+            listener.close()
+
+    def test_summary_listener_waits_until_an_event(self):
+        listener = SummaryModelListener()
+        timer = Timer(0.01, lambda: listener.model_version_changed(1, "pair-a", "file-a"))
+        timer.start()
+        try:
+            self.assertTrue(listener.wait_for_event(1.0))
+            self.assertEqual(["pair-a"], listener.take_next_event()["path_pair_ids"])
+        finally:
+            timer.join()
+            listener.close()
 
     def test_scoped_patch_boundary_caps_enriched_roots_at_transport_limit(self):
         roots = []
