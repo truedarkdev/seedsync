@@ -1528,9 +1528,24 @@ class ModelUpdater(_ControllerCoreAccess):
                 lftp_status_source = "retry_empty"
         else:
             try:
-                polled_lftp_statuses = controller._Controller__lftp.status()
+                get_status_snapshot = getattr(controller, "_get_lftp_status_snapshot", None)
+                snapshot = (
+                    get_status_snapshot() if callable(get_status_snapshot) else
+                    (list(controller._Controller__lftp.status() or []),
+                     bool(getattr(controller._Controller__lftp, "last_status_poll_healthy", True)))
+                )
+                if snapshot is None:
+                    # The controller-owned LFTP worker is still waiting for a
+                    # prompt. Never make this updater tick wait for it.
+                    lftp_status_snapshot_fresh = False
+                    lftp_status_poll_healthy = False
+                    lftp_statuses = list(controller._Controller__last_lftp_statuses or [])
+                    lftp_status_source = "cached_inflight" if lftp_statuses else "inflight_empty"
+                    controller._Controller__lftp_idle_status_authoritative = False
+                    controller._Controller__next_lftp_status_poll_at = None
+                    raise StopIteration
+                polled_lftp_statuses, lftp_status_poll_healthy = snapshot
                 lftp_statuses = polled_lftp_statuses if polled_lftp_statuses is not None else []
-                lftp_status_poll_healthy = getattr(controller._Controller__lftp, "last_status_poll_healthy", True)
                 poll_finished_at = datetime.now()
                 if lftp_status_poll_healthy:
                     recovering_from_unhealthy_poll = controller._Controller__lftp_status_poll_retry_active
@@ -1569,6 +1584,8 @@ class ModelUpdater(_ControllerCoreAccess):
                         lftp_status_source = "fresh_unhealthy"
                     else:
                         lftp_status_source = "unhealthy_empty"
+            except StopIteration:
+                pass
             except (LftpError, LftpJobStatusParserError) as e:
                 controller.logger.warning("Caught transfer backend error: {}".format(str(e)))
                 lftp_statuses = []
@@ -1613,6 +1630,9 @@ class ModelUpdater(_ControllerCoreAccess):
             confirm_download_starts = getattr(controller, "_confirm_fresh_healthy_download_starts", None)
             if callable(confirm_download_starts):
                 confirm_download_starts(lftp_statuses)
+        pending_statuses = getattr(controller, "_lftp_statuses_with_pending_dispatches", None)
+        if callable(pending_statuses):
+            lftp_statuses = pending_statuses(lftp_statuses)
         current_downloading_file_names = [
             (s.name, s.path_pair_id, s.path_pair_name)
             for s in lftp_statuses if s.state == LftpJobStatus.State.RUNNING
@@ -2181,11 +2201,109 @@ class ModelUpdater(_ControllerCoreAccess):
                             progressive_delta_applied = True
                 if progressive_delta_applied:
                     model.set_tree_file_count(max(0, next_tree_count))
+                    refresh_identities = getattr(
+                        controller, "_refresh_model_file_command_identities_locked", None
+                    )
+                    if callable(refresh_identities):
+                        refresh_identities()
             if diagnostics is not None:
                 try:
                     diagnostics.increment("progressive_delta_root_visits", len(delta_file_ids))
                     if progressive_delta_applied:
                         diagnostics.increment("progressive_delta_publications")
+                except Exception:
+                    pass
+
+        # A live transfer status is the only input that can safely repaint an
+        # already-visible root without walking the rest of the model.  The
+        # builder owns the invalidation contract; any scan, marker, lifecycle,
+        # completion, extraction, validation, or ambiguous status condition
+        # returns no ids here and retains the ordinary full-build path.
+        active_transfer_delta_applied = False
+        active_delta_selector = getattr(model_builder, "active_transfer_delta_file_ids", None)
+        active_delta_pending = getattr(model_builder, "has_pending_active_transfer_delta", None)
+        active_delta_builder = getattr(model_builder, "build_active_transfer_roots", None)
+        active_delta_authorizer = getattr(model_builder, "authorize_active_transfer_delta", None)
+        active_delta_adopter = getattr(model_builder, "adopt_active_transfer_delta", None)
+        active_delta_file_ids: Optional[set[str]] = None
+        if callable(active_delta_pending) and bool(active_delta_pending()) and \
+                callable(active_delta_selector) and callable(active_delta_builder) and \
+                callable(active_delta_authorizer) and callable(active_delta_adopter):
+            try:
+                with controller._Controller__model_lock:
+                    def root_exists(file_id: str) -> bool:
+                        try:
+                            model.get_file(file_id)
+                            return True
+                        except ModelError:
+                            return False
+                    candidate_file_ids = active_delta_selector(root_exists)
+            except Exception:
+                candidate_file_ids = None
+            if isinstance(candidate_file_ids, set) and candidate_file_ids and all(
+                    isinstance(file_id, str) for file_id in candidate_file_ids):
+                active_delta_file_ids = candidate_file_ids
+        if active_delta_file_ids is not None:
+            try:
+                partial_build = active_delta_builder(active_delta_file_ids)
+                partial_model = partial_build.model
+            except Exception:
+                # A temporary renderer is an optimization only.  Preserve the
+                # dirty builder and let the established full reconciliation
+                # rebuild instead of aborting this controller tick.
+                partial_build = None
+                partial_model = None
+
+            def tree_file_count(file: ModelFile) -> int:
+                return 1 + sum(tree_file_count(child) for child in file.get_children())
+
+            with controller._Controller__model_lock:
+                try:
+                    authorized = partial_build is not None and partial_model is not None and \
+                        bool(active_delta_authorizer(
+                            root_exists, active_delta_file_ids, partial_build,
+                        ))
+                except Exception:
+                    authorized = False
+                if not authorized:
+                    partial_model = None
+                if partial_model is None:
+                    replacement_roots = []
+                else:
+                    current_tree_count = getattr(model, "tree_file_count", 0)
+                    next_tree_count = current_tree_count if type(current_tree_count) is int else 0
+                    replacement_roots: list[tuple[ModelFile, ModelFile]] = []
+                    for file_id in active_delta_file_ids:
+                        try:
+                            old_file = model.get_file(file_id)
+                            new_file = partial_model.get_file(file_id)
+                        except ModelError:
+                            replacement_roots = []
+                            break
+                        replacement_roots.append((old_file, new_file))
+                if replacement_roots:
+                    for old_file, new_file in replacement_roots:
+                        if old_file != new_file:
+                            model.update_file(new_file)
+                            next_tree_count += tree_file_count(new_file) - tree_file_count(old_file)
+                            active_transfer_delta_applied = True
+                    if active_transfer_delta_applied:
+                        model.set_tree_file_count(max(0, next_tree_count))
+                        refresh_identities = getattr(
+                            controller, "_refresh_model_file_command_identities_locked", None
+                        )
+                        if callable(refresh_identities):
+                            refresh_identities()
+                    # Even when the rendered root happens to be equal, the
+                    # builder can safely cache the live authoritative model;
+                    # otherwise the unchanged status would force a needless
+                    # full rebuild next tick.
+                    active_delta_adopter(model, active_delta_file_ids, partial_build)
+            if diagnostics is not None:
+                try:
+                    diagnostics.increment("active_transfer_delta_root_visits", len(active_delta_file_ids))
+                    if active_transfer_delta_applied:
+                        diagnostics.increment("active_transfer_delta_publications")
                 except Exception:
                     pass
 
@@ -2204,6 +2322,15 @@ class ModelUpdater(_ControllerCoreAccess):
                         diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
                     except Exception:
                         pass
+
+            # A small set of completion side effects is applied directly to
+            # the model objects from this build.  If those setters invalidate
+            # the builder cache, retain their exact event tokens for adoption;
+            # every other invalidation remains a required catch-up build.
+            applied_builder_invalidation_tokens: set[int] = set()
+            token_matches_file = getattr(
+                model_builder, "invalidation_token_matches_file", None
+            )
 
             with controller._Controller__model_lock:
                 def pending_completion_file_ids():
@@ -2306,7 +2433,12 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller._mark_current_process_final_publication(file.file_id)
                     if file.file_id not in persist.downloaded_file_names:
                         persist.downloaded_file_names.add(file.file_id)
-                        model_builder.set_downloaded_files(persist.downloaded_file_names)
+                        invalidation_token = model_builder.set_downloaded_files(
+                            persist.downloaded_file_names
+                        )
+                        if isinstance(invalidation_token, int) and callable(token_matches_file) and \
+                                token_matches_file(invalidation_token, file.file_id):
+                            applied_builder_invalidation_tokens.add(invalidation_token)
                     controller._complete_download_start_lifecycle(file.file_id)
                     controller.clear_extracted_marker(file)
                     if controller._Controller__target_archive_trace_selector_matches_file(
@@ -2351,10 +2483,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         file.path_pair_id,
                         file.path_pair_name,
                     ))
-                    model_builder.set_move_failed_files({
+                    invalidation_token = model_builder.set_move_failed_files({
                         file_id for file_id, failures in persist.move_failure_counts.items()
                         if failures >= controller._Controller__MAX_MOVE_FAILURES
                     })
+                    if isinstance(invalidation_token, int) and callable(token_matches_file) and \
+                            token_matches_file(invalidation_token, file.file_id):
+                        applied_builder_invalidation_tokens.add(invalidation_token)
                     controller._sync_final_move_succeeded_files_to_model()
                     file.state = ModelFile.State.MOVE_FAILED
                     file.download_progress = None
@@ -2817,5 +2952,14 @@ class ModelUpdater(_ControllerCoreAccess):
         if full_build_triggered:
             with controller._Controller__model_lock:
                 controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
-                model_builder.adopt_applied_model(new_model, controller._Controller__model)
-        return full_build_triggered or progressive_delta_applied
+                model_builder.adopt_applied_model(
+                    new_model,
+                    controller._Controller__model,
+                    applied_builder_invalidation_tokens,
+                )
+                refresh_identities = getattr(
+                    controller, "_refresh_model_file_command_identities_locked", None
+                )
+                if callable(refresh_identities):
+                    refresh_identities()
+        return full_build_triggered or progressive_delta_applied or active_transfer_delta_applied

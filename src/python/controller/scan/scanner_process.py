@@ -130,6 +130,14 @@ class _ScannerQueueReleaseMarker:
 
 _PUBLISH_LOCK = threading.Lock()
 
+# A scanner can publish progress while the model updater is consuming it.  A
+# consumer that drains until ``queue.Empty`` can therefore starve forever when
+# publication replenishes each item it removes.  Keep one updater tick bounded
+# while retaining the rest of the queue for the next tick.  This matches the
+# coordinator queue capacity and counts every queue item, including release
+# markers, toward the budget.
+_MAX_SCAN_QUEUE_ITEMS_PER_POP = 128
+
 
 def _is_authoritative_scan_result(item: object) -> bool:
     return isinstance(item, ScannerResult) and (item.is_scan_final or item.is_full_snapshot)
@@ -495,7 +503,9 @@ class ScannerProcess:
         # coordinator-facing queue local avoids a second multiprocessing
         # feeder thread and gives the same bounded/drop-oldest semantics to
         # both inline and recycled scans.
-        self.__queue: Optional[queue.Queue[ScannerResult | _ScannerQueueReleaseMarker]] = queue.Queue(maxsize=128)
+        self.__queue: Optional[queue.Queue[ScannerResult | _ScannerQueueReleaseMarker]] = queue.Queue(
+            maxsize=128,
+        )
         self.__queue_is_multiprocessing = False
         self.__scan_target_queue: Optional[queue.Queue[Optional[str]]] = queue.Queue()
         self.__wake_event: Optional[threading.Event] = threading.Event()
@@ -582,6 +592,14 @@ class ScannerProcess:
             self.__exception = None
         if exception is not None:
             raise exception
+
+    def has_pending_results(self) -> bool:
+        """Return whether this scanner still has unread queue entries."""
+        result_queue = self.__queue
+        if result_queue is None:
+            return False
+        with result_queue.mutex:
+            return bool(result_queue.queue)
 
     def __thread_main(self) -> None:
         try:
@@ -979,15 +997,18 @@ class ScannerProcess:
             path_pair_name=path_pair_name if path_pair_name is not None else self.__trace_path_pair_name(),
         )
 
-    def pop_latest_result(self) -> Optional[ScannerResult]:
+    def pop_latest_result(self, max_items: int = _MAX_SCAN_QUEUE_ITEMS_PER_POP) -> Optional[ScannerResult]:
         """
         Process-safe method to retrieve latest scan result
         Returns None if no new scan result was generated since the last time
-        this method was called
+        this method was called.  At most ``max_items`` queue entries are
+        consumed; entries left behind are observed by a later tick.
         :return:
         """
+        if max_items <= 0:
+            return None
         latest_scan = None
-        while True:
+        for _ in range(max_items):
             try:
                 assert self.__queue is not None
                 item = self.__queue.get(block=False)
@@ -1001,15 +1022,18 @@ class ScannerProcess:
                 return latest_scan
         return latest_scan
 
-    def pop_results(self) -> List[ScannerResult]:
+    def pop_results(self, max_items: int = _MAX_SCAN_QUEUE_ITEMS_PER_POP) -> List[ScannerResult]:
         """Drain queued scan events in publication order.
 
         ``pop_latest_result`` remains for legacy callers that intentionally
         coalesce snapshots.  Progressive reconciliation uses this bounded
-        drain so a manifest and root batches cannot be dropped between ticks.
+        drain so a manifest and root batches cannot be dropped between ticks;
+        entries remaining after ``max_items`` are consumed by a later tick.
         """
+        if max_items <= 0:
+            return []
         results: List[ScannerResult] = []
-        while True:
+        for _ in range(max_items):
             try:
                 assert self.__queue is not None
                 item = self.__queue.get(block=False)
@@ -1026,8 +1050,24 @@ class ScannerProcess:
 
     def force_scan(self, path_pair_id: Optional[str] = None) -> None:
         """Force process to wake and do an immediate scan"""
-        assert self.__scan_target_queue is not None
-        self.__scan_target_queue.put(path_pair_id)
+        target_queue = self.__scan_target_queue
+        assert target_queue is not None
+        # Coalesce force requests while a scan is active.  The queue is only
+        # used by this coordinator thread, but its mutex gives the producer
+        # side an atomic inspect/merge boundary with the drain at scan start.
+        with target_queue.mutex:
+            pending = list(target_queue.queue)
+            if path_pair_id is None:
+                if None not in pending:
+                    target_queue.queue.clear()
+                    target_queue.unfinished_tasks = 0
+                    target_queue._put(None)
+                    target_queue.unfinished_tasks += 1
+                    target_queue.not_empty.notify()
+            elif None not in pending and path_pair_id not in pending:
+                target_queue._put(path_pair_id)
+                target_queue.unfinished_tasks += 1
+                target_queue.not_empty.notify()
         assert self.__wake_event is not None
         self.__wake_event.set()
 

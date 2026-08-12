@@ -413,8 +413,95 @@ class TestController(unittest.TestCase):
 
     # noinspection PyMethodMayBeStatic
     def __wait_for_initial_model(self):
-        while len(self.controller.get_model_files()) < 5:
+        deadline = time.monotonic() + 15.0
+        previous_identity_snapshot = None
+        settled_observations = 0
+        last_reasons = ("initial model has not been observed",)
+        while time.monotonic() < deadline:
+            observed_wake_generation = self.controller.process_wake_generation()
             self.controller.process()
+            settled, reasons, identity_snapshot = self.__initial_model_settlement_state()
+            if settled and previous_identity_snapshot == identity_snapshot:
+                settled_observations += 1
+                if settled_observations >= 2:
+                    return
+            else:
+                settled_observations = 0
+            last_reasons = reasons
+            if settled and previous_identity_snapshot != identity_snapshot:
+                last_reasons = reasons + ("model identities changed",)
+            previous_identity_snapshot = identity_snapshot
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = min(max(0.0, self.controller.next_process_delay_seconds()), remaining)
+            self.controller.wait_for_process_wake(observed_wake_generation, timeout)
+        self.fail(
+            "Initial model did not reach an authoritative settled state: {}".format(
+                ", ".join(last_reasons)
+            )
+        )
+
+    def __initial_model_settlement_state(self):
+        reasons = []
+        required_root_identities = {
+            (file.file_id, file.name, file.path_pair_id)
+            for file in self.initial_state.values()
+        }
+        identity_snapshot = tuple(self.controller.get_model_file_command_identities())
+        model_root_identities = set(identity_snapshot)
+        if not required_root_identities.issubset(model_root_identities):
+            reasons.append("required root identities missing")
+
+        # Root presence alone can reflect a progressive scan chunk.  Require
+        # both sides to have recorded authoritative reconciliation for the
+        # legacy root before allowing listeners/commands to observe the model.
+        if not self.controller.is_path_pair_reconciled(None):
+            reasons.append("legacy local/remote reconciliation incomplete")
+
+        # A scanner result can race the first model publication.  Inspect only
+        # the result queues, not the controller's broader periodic work state.
+        for label, attribute in (
+                ("active", "_Controller__active_scan_process"),
+                ("local", "_Controller__local_scan_process"),
+                ("remote", "_Controller__remote_scan_process")):
+            scanner_process = getattr(self.controller, attribute, None)
+            has_pending_results = getattr(scanner_process, "has_pending_results", None)
+            if not callable(has_pending_results):
+                reasons.append("{} scanner pending state unavailable".format(label))
+                continue
+            try:
+                if has_pending_results():
+                    reasons.append("{} scanner results pending".format(label))
+            except Exception:
+                reasons.append("{} scanner pending state unavailable".format(label))
+
+        refresh_lock = getattr(self.controller, "_Controller__path_pair_refresh_lock", None)
+        try:
+            if refresh_lock is None:
+                refresh_requested = bool(
+                    getattr(self.controller, "_Controller__path_pair_refresh_requested", False)
+                )
+            else:
+                with refresh_lock:
+                    refresh_requested = bool(
+                        getattr(self.controller, "_Controller__path_pair_refresh_requested", False)
+                    )
+        except Exception:
+            refresh_requested = True
+        if refresh_requested:
+            reasons.append("path-pair refresh pending")
+
+        model_builder = getattr(self.controller, "_Controller__model_builder", None)
+        has_changes = getattr(model_builder, "has_changes", None)
+        if callable(has_changes):
+            try:
+                if has_changes():
+                    reasons.append("model publication pending")
+            except Exception:
+                reasons.append("model publication state unavailable")
+
+        return not reasons, tuple(reasons), identity_snapshot
 
     def __process_until(self, predicate, message, max_iterations=2000):
         for _ in range(max_iterations):
@@ -842,24 +929,28 @@ class TestController(unittest.TestCase):
         command = Controller.Command(Controller.Command.Action.QUEUE, "rc")
         command.add_callback(callback)
         self.controller.queue_command(command)
-        # Process until done
-        while True:
+        final_target = os.path.join(TestController.temp_dir, "local", "rc")
+        staging_target = os.path.join(TestController.temp_dir, "local", "incomplete", "rc")
+
+        downloaded_file = self.__wait_for_model_file(
+            "rc",
+            lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
+            "Timed out waiting for rc file queue to finish",
+            max_iterations=4000,
+        )
+
+        for _ in range(20):
             self.controller.process()
-            call = listener.file_updated.call_args
-            if call:
-                new_file = call[0][1]
-                self.assertEqual("rc", new_file.name)
-                if new_file.local_size == 10*1024:
-                    break
 
         # Verify
         listener.file_added.assert_not_called()
         listener.file_removed.assert_not_called()
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
-        fcmp = cmp(os.path.join(TestController.temp_dir, "remote", "rc"),
-                   os.path.join(TestController.temp_dir, "local", "rc"))
-        self.assertTrue(fcmp)
+        self.assertEqual(ModelFile.State.DOWNLOADED, downloaded_file.state)
+        self.assertTrue(os.path.exists(final_target))
+        self.assertFalse(os.path.exists(staging_target))
+        self.assertTrue(cmp(os.path.join(TestController.temp_dir, "remote", "rc"), final_target))
 
     def test_command_queue_invalid(self):
         self.controller = Controller(self.context, self.controller_persist)

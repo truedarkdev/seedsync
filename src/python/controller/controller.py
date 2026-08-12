@@ -77,6 +77,11 @@ RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
 # command/file identities (which remain the legacy unscoped file ids).
 MODEL_LEGACY_SCOPE_ID = "__legacy__"
 
+# Primitive root metadata used to resolve web commands without copying model
+# trees.  The tuple is (file_id, name, path_pair_id); callers must treat the
+# returned collection and values as immutable.
+ModelFileCommandIdentity = tuple[str, str, Optional[str]]
+
 
 class _PathPairTransferBackend(Protocol):
     def set_path_pairs(self, path_pairs: list[PathPair]) -> None: ...
@@ -142,6 +147,20 @@ class DownloadStartLifecycleEntry:
 @dataclass
 class PendingQueueDispatch:
     accepted_at_monotonic: float
+    name: str = ""
+    path_pair_id: Optional[str] = None
+    is_dir: bool = False
+    operation_sequence: int = 0
+
+
+@dataclass
+class _LftpOperation:
+    action: str
+    future: Future[object]
+    file_id: Optional[str] = None
+    operation_sequence: int = 0
+    pending_dispatch: Optional[PendingQueueDispatch] = None
+    download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None
 
 
 _COLLISION_COMPARE_MAX_BYTES = 16 * 1024 * 1024 * 1024
@@ -168,12 +187,13 @@ class Controller:
     __MOVE_RETRY_DELAYS = (2, 10, 30)
     __AUXILIARY_WORKER_IDLE_GRACE_IN_SECS = 2.0
     _ACTIVE_PROCESS_INTERVAL_SECONDS = 0.1
-    _IDLE_HEALTH_INTERVAL_SECONDS = 5.0
+    _IDLE_HEALTH_INTERVAL_SECONDS = 10.0
 
     __context: Context
     __persist: ControllerPersist
     __command_queue: Queue[Controller.Command]
     __model: Model
+    __model_file_command_identities: tuple[ModelFileCommandIdentity, ...]
     __model_builder: ModelBuilder
     __updater: ModelUpdater
     __path_pairs_by_id: dict[str, PathPair]
@@ -226,6 +246,7 @@ class Controller:
     _Controller__context: Context
     _Controller__persist: ControllerPersist
     _Controller__model: Model
+    _Controller__model_file_command_identities: tuple[ModelFileCommandIdentity, ...]
     _Controller__model_builder: ModelBuilder
     _Controller__path_pairs_by_id: dict[str, PathPair]
     _Controller__active_scan_process: ScannerProcess
@@ -565,6 +586,12 @@ class Controller:
         self.__startup_failed = False
         self.__lftp_reconfigure_lock = Lock()
         self.__lftp_reconfigure_requested = False
+        self.__lftp_executor: Optional[ThreadPoolExecutor] = None
+        self.__lftp_executor_closing = False
+        self.__lftp_operations: list[_LftpOperation] = []
+        self.__lftp_operation_sequences: dict[str, int] = {}
+        self.__lftp_failed_operation_sequences: set[tuple[str, int]] = set()
+        self.__lftp_status_future: Optional[Future[object]] = None
 
     def __init__(self,
                  context: Context,
@@ -605,6 +632,10 @@ class Controller:
         # Lock for the model. Listeners may re-enter controller model access
         # while the model updater is mutating the model, so this must be reentrant.
         self.__model_lock = RLock()
+        # Immutable root identity snapshot for command resolution.  Readers
+        # return this tuple without taking the model lock; the model updater
+        # replaces it atomically after each authoritative publication.
+        self.__model_file_command_identities = ()
         self.__model_summary_cache: Optional[dict[str, object]] = None
         self.__model_summary_cache_at = 0.0
         self.__remote_delete_success_listeners = []
@@ -757,6 +788,12 @@ class Controller:
         ))
         self.__lftp_status_cache_expires_at = None
         self.__lftp_status_poll_retry_active = False
+        self.__lftp_executor = None
+        self.__lftp_executor_closing = False
+        self.__lftp_operations = []
+        self.__lftp_operation_sequences = {}
+        self.__lftp_failed_operation_sequences = set()
+        self.__lftp_status_future = None
 
         # Keep track of active command processes
         self.__active_command_processes = []
@@ -879,6 +916,223 @@ class Controller:
             else:
                 self.__lftp.xfer_verify = False
         self.__lftp.set_verbose_logging(Controller.__runtime_bool_or_default(general_cfg.verbose, False))
+
+    def __uses_async_lftp_owner(self) -> bool:
+        """Only the real LFTP backend owns its PTY through this executor."""
+        backend_name = getattr(self.__lftp, "backend_name", None)
+        return isinstance(self.__lftp, Lftp) or backend_name == "lftp"
+
+    def __ensure_lftp_executor(self) -> Optional[ThreadPoolExecutor]:
+        if not self.__uses_async_lftp_owner() or getattr(self, "_Controller__lftp_executor_closing", False):
+            return None
+        executor = getattr(self, "_Controller__lftp_executor", None)
+        if executor is None:
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="seedsync-lftp")
+            self.__lftp_executor = executor
+        return executor
+
+    def __submit_lftp_operation(
+            self,
+            action: str,
+            operation: Callable[[], object],
+            file_id: Optional[str] = None,
+            operation_sequence: int = 0,
+            pending_dispatch: Optional[PendingQueueDispatch] = None,
+            download_start_lifecycle_before: Optional[DownloadStartLifecycleEntry] = None,
+    ) -> bool:
+        executor = self.__ensure_lftp_executor()
+        if executor is None:
+            return False
+        try:
+            future = executor.submit(operation)
+        except RuntimeError:
+            return False
+        future.add_done_callback(lambda _future: self.wake_process())
+        if action == "status":
+            self.__lftp_status_future = future
+        else:
+            operations = getattr(self, "_Controller__lftp_operations", None)
+            if not isinstance(operations, list):
+                operations = []
+                self.__lftp_operations = operations
+            operations.append(
+                _LftpOperation(
+                    action,
+                    future,
+                    file_id,
+                    operation_sequence,
+                    pending_dispatch,
+                    download_start_lifecycle_before,
+                )
+            )
+        return True
+
+    def __next_lftp_operation_sequence(self, file_id: str) -> int:
+        sequences = getattr(self, "_Controller__lftp_operation_sequences", None)
+        if not isinstance(sequences, dict):
+            sequences = {}
+            self.__lftp_operation_sequences = sequences
+        sequence = sequences.get(file_id, 0) + 1
+        sequences[file_id] = sequence
+        return sequence
+
+    def __lftp_operation_is_current(self, operation: _LftpOperation) -> bool:
+        return operation.file_id is None or (
+            self.__lftp_operation_sequences.get(operation.file_id, 0) == operation.operation_sequence
+        )
+
+    def __download_start_lifecycle_snapshot(
+            self, file_id: str
+    ) -> Optional[DownloadStartLifecycleEntry]:
+        with self.__download_start_lock:
+            return self.__download_start_state.get(file_id)
+
+    def __restore_failed_queue_lifecycle(
+            self,
+            file_id: str,
+            previous: Optional[DownloadStartLifecycleEntry],
+    ) -> None:
+        # Queue admission arms an eligible entry after submit.  On a current
+        # worker failure, remove that newly-created eligibility so a retry can
+        # arm a fresh lifecycle.  Preserve older suppressed/notified state.
+        with self.__download_start_lock:
+            if previous is not None and previous.state != "eligible":
+                self.__download_start_state[file_id] = previous
+            else:
+                self.__download_start_state.pop(file_id, None)
+
+    def __restore_failed_stop_lifecycle(
+            self,
+            file_id: str,
+            previous: Optional[DownloadStartLifecycleEntry],
+    ) -> None:
+        if previous is None:
+            return
+        with self.__download_start_lock:
+            self.__download_start_state[file_id] = previous
+
+    def __drain_lftp_operations(self) -> None:
+        operations = getattr(self, "_Controller__lftp_operations", [])
+        failed_operation_sequences = getattr(
+            self, "_Controller__lftp_failed_operation_sequences", None
+        )
+        if not isinstance(failed_operation_sequences, set):
+            failed_operation_sequences = set()
+            self.__lftp_failed_operation_sequences = failed_operation_sequences
+        remaining: list[_LftpOperation] = []
+        for operation in operations:
+            if not operation.future.done():
+                remaining.append(operation)
+                continue
+            try:
+                result = operation.future.result()
+                failed = operation.action in ("queue", "stop") and result is False
+            except Exception as exc:
+                result = None
+                failed = True
+                self.logger.warning("Asynchronous lftp %s failed: %s", operation.action, exc)
+            if (
+                failed
+                and operation.action == "queue"
+                and operation.file_id is not None
+            ):
+                failed_operation_sequences.difference_update({
+                    entry for entry in failed_operation_sequences
+                    if entry[0] == operation.file_id
+                })
+                failed_operation_sequences.add(
+                    (operation.file_id, operation.operation_sequence)
+                )
+            stop_predecessor_key = None
+            stop_predecessor_failed = False
+            if (
+                operation.action == "stop"
+                and getattr(operation, "file_id", None) is not None
+                and getattr(operation, "pending_dispatch", None) is not None
+            ):
+                stop_predecessor_key = (
+                    operation.file_id,
+                    operation.pending_dispatch.operation_sequence,
+                )
+                stop_predecessor_failed = stop_predecessor_key in failed_operation_sequences
+                failed_operation_sequences.discard(stop_predecessor_key)
+            if not failed or not self.__lftp_operation_is_current(operation):
+                continue
+            if operation.action == "queue" and operation.file_id is not None:
+                pending = self.__queue_dispatch_pending()
+                dispatch = pending.get(operation.file_id)
+                if dispatch is not None and dispatch.operation_sequence == operation.operation_sequence:
+                    pending.pop(operation.file_id, None)
+                self.__restore_failed_queue_lifecycle(
+                    operation.file_id,
+                    getattr(operation, "download_start_lifecycle_before", None),
+                )
+            elif operation.action == "stop" and operation.file_id is not None:
+                self.__persist.stopped_file_names.discard(operation.file_id)
+                predecessor_failed = (
+                    operation.pending_dispatch is not None
+                    and stop_predecessor_failed
+                )
+                if operation.pending_dispatch is not None and not predecessor_failed:
+                    pending = self.__queue_dispatch_pending()
+                    if operation.file_id not in pending:
+                        pending[operation.file_id] = operation.pending_dispatch
+                self.__restore_failed_stop_lifecycle(
+                    operation.file_id,
+                    getattr(operation, "download_start_lifecycle_before", None),
+                )
+            elif operation.action == "reconfigure":
+                self.__restore_lftp_reconfigure_request()
+            self.__next_lftp_status_poll_at = None
+            self.__lftp_idle_status_authoritative = False
+        self.__lftp_operations = remaining
+
+    def _get_lftp_status_snapshot(self) -> Optional[tuple[list[LftpJobStatus], bool]]:
+        """Return a completed snapshot, or None while the one PTY poll is in flight."""
+        if not self.__uses_async_lftp_owner():
+            statuses = self.__lftp.status()
+            return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
+        future = getattr(self, "_Controller__lftp_status_future", None)
+        if future is None:
+            def poll() -> tuple[list[LftpJobStatus], bool]:
+                statuses = self.__lftp.status()
+                return (list(statuses or []), bool(getattr(self.__lftp, "last_status_poll_healthy", True)))
+            if not self.__submit_lftp_operation("status", poll):
+                return None
+            return None
+        if not future.done():
+            return None
+        self.__lftp_status_future = None
+        try:
+            return cast(tuple[list[LftpJobStatus], bool], future.result())
+        except Exception as exc:
+            # A worker-side status exception must become an unhealthy poll,
+            # not an exception escaping the controller loop.  The updater
+            # applies its normal bounded retry cadence to this snapshot.
+            self.logger.warning("Asynchronous lftp status poll failed: %s", exc)
+            return (list(getattr(self, "_Controller__last_lftp_statuses", None) or []), False)
+
+    def _lftp_statuses_with_pending_dispatches(
+            self, statuses: list[LftpJobStatus]
+    ) -> list[LftpJobStatus]:
+        """Make accepted queue intent visible before LFTP can acknowledge its prompt."""
+        result = list(statuses)
+        seen = {status.file_id for status in result}
+        for file_id, dispatch in self.__queue_dispatch_pending().items():
+            if file_id in seen or self.__is_explicitly_stopped(dispatch.name, dispatch.path_pair_id):
+                continue
+            status = LftpJobStatus(
+                -dispatch.operation_sequence,
+                LftpJobStatus.Type.MIRROR if dispatch.is_dir else LftpJobStatus.Type.PGET,
+                LftpJobStatus.State.QUEUED,
+                dispatch.name,
+                "",
+            )
+            status.path_pair_id = dispatch.path_pair_id
+            path_pair = self.__get_path_pair(dispatch.path_pair_id)
+            status.path_pair_name = path_pair.name if path_pair is not None else None
+            result.append(status)
+        return result
 
     def __get_enabled_path_pairs(self) -> List[PathPair]:
         if self.__context.path_pair_manager is None:
@@ -1611,9 +1865,32 @@ class Controller:
             if self.__active_downloading_file_names or self.__active_extracting_file_names or \
                     self.__active_command_processes or not self.__command_queue.empty():
                 return True
+            for scan_process in (
+                    self.__active_scan_process, self.__local_scan_process, self.__remote_scan_process):
+                has_pending_results = getattr(scan_process, "has_pending_results", None)
+                if callable(has_pending_results):
+                    try:
+                        pending = has_pending_results()
+                    except Exception:
+                        pending = False
+                    if isinstance(pending, bool) and pending:
+                        return True
             if any(
                 status.state in (LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING)
                 for status in (self.__last_lftp_statuses or [])
+            ):
+                return True
+            # A real-LFTP status poll owns the PTY until its future settles.
+            # Keep the controller on the bounded active cadence while it is
+            # pending; the future completion callback wakes it immediately.
+            status_future = getattr(self, "_Controller__lftp_status_future", None)
+            if status_future is not None and not status_future.done():
+                return True
+            operations = getattr(self, "_Controller__lftp_operations", None)
+            if isinstance(operations, list) and any(
+                    getattr(operation, "future", None) is not None and
+                    not operation.future.done()
+                    for operation in operations
             ):
                 return True
             future = self.__collision_compare_future
@@ -1874,6 +2151,9 @@ class Controller:
             self.__startup_failed = True
             raise
         self.__started = True
+        # Startup configuration is intentionally synchronous. From here on,
+        # every LFTP PTY interaction is serialized by this sole owner.
+        self.__ensure_lftp_executor()
         self.__record_breadcrumb(
             stage="controller",
             message="start",
@@ -1919,6 +2199,7 @@ class Controller:
             if not self.__started:
                 raise ControllerError("Cannot process, controller is not started")
             self.__propagate_exceptions()
+            self.__drain_lftp_operations()
             stage_timer.switch(DURATION_CONTROLLER_CLEANUP_COMMANDS)
             self.__cleanup_commands()
             stage_timer.switch(DURATION_CONTROLLER_PROCESS_COMMANDS)
@@ -1934,12 +2215,26 @@ class Controller:
                     self.__mark_path_pair_refresh_completed(refresh_generation)
             lftp_reconfigure_requested = self.__consume_lftp_reconfigure_request()
             if lftp_reconfigure_requested:
-                try:
-                    self.__configure_lftp()
-                    self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
-                except Exception:
-                    self.__restore_lftp_reconfigure_request()
-                    self.logger.exception("Ignoring lftp reconfigure failure")
+                if self.__uses_async_lftp_owner():
+                    def reconfigure_lftp() -> object:
+                        # Publish the derived exclusion state only after all
+                        # PTY-backed settings have been accepted.  A failure
+                        # therefore leaves both runtime and controller state
+                        # on the previous configuration until the request is
+                        # retried.
+                        self.__configure_lftp()
+                        self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
+                        return None
+
+                    if not self.__submit_lftp_operation("reconfigure", reconfigure_lftp):
+                        self.__restore_lftp_reconfigure_request()
+                else:
+                    try:
+                        self.__configure_lftp()
+                        self.__exclude_patterns = Controller.__get_exclude_patterns(self.__context)
+                    except Exception:
+                        self.__restore_lftp_reconfigure_request()
+                        self.logger.exception("Ignoring lftp reconfigure failure")
             stage_timer.switch(DURATION_MODEL_UPDATE)
             self.__updater.update()
             stage_timer.switch(DURATION_CONTROLLER_AUXILIARY_REAP)
@@ -2032,7 +2327,44 @@ class Controller:
         self.__shutdown_collision_compare_worker()
         if self.__started or getattr(self, "_Controller__startup_failed", False):
             try:
-                self.__lftp.exit()
+                self.__lftp_executor_closing = True
+                executor = getattr(self, "_Controller__lftp_executor", None)
+                if executor is not None and self.__uses_async_lftp_owner():
+                    # exit is queued behind any in-flight PTY operation. Do
+                    # not wait indefinitely during process shutdown.
+                    try:
+                        try:
+                            future = executor.submit(self.__lftp.exit)
+                        except RuntimeError:
+                            # A concurrent/previous teardown may have closed
+                            # the pool between the state check and submit.
+                            # There is no safe direct PTY fallback here.
+                            self.logger.warning("Lftp executor was already closed during teardown")
+                        else:
+                            try:
+                                future.result(timeout=self.__JOIN_TIMEOUT_IN_SECS)
+                            except TimeoutError:
+                                self.logger.warning(
+                                    "Lftp executor did not exit within %ss; continuing teardown",
+                                    self.__JOIN_TIMEOUT_IN_SECS,
+                                )
+                                force_close = getattr(self.__lftp, "force_close", None)
+                                if callable(force_close):
+                                    self.__best_effort_teardown(
+                                        "lftp forced close",
+                                        force_close,
+                                    )
+                                try:
+                                    future.result(timeout=0.5)
+                                except TimeoutError:
+                                    self.logger.warning(
+                                        "Lftp executor remained blocked after forced close"
+                                    )
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        self.__lftp_executor = None
+                else:
+                    self.__lftp.exit()
             except LftpError as exc:
                 self.logger.warning("Ignoring lftp teardown failure: {}".format(exc))
             except Exception:
@@ -2059,6 +2391,23 @@ class Controller:
         with self.__model_lock:
             model_files = self.__get_model_files()
         return model_files
+
+    def get_model_file_command_identities(self) -> tuple[ModelFileCommandIdentity, ...]:
+        """Return immutable root identities needed to resolve commands.
+
+        Unlike :meth:`get_model_files`, this API never copies a ``ModelFile``
+        or traverses its children.  The tuple is replaced only after an
+        authoritative model publication, so each read sees one coherent root
+        snapshot without retaining model references.
+        """
+        return getattr(self, "_Controller__model_file_command_identities", ())
+
+    def _refresh_model_file_command_identities_locked(self) -> None:
+        """Publish a root identity snapshot while the model lock is held."""
+        self.__model_file_command_identities = tuple(
+            (file.file_id, file.name, file.path_pair_id)
+            for file in self.__model.iter_files_by_id()
+        )
 
     def _get_model_root_references(self) -> List[ModelFile]:
         """Shallow, controller-internal root snapshot for same-process consumers.
@@ -5401,13 +5750,41 @@ class Controller:
                     exclude_patterns = self.__transfer_exclude_patterns(file_id, is_dir)
                     if exclude_patterns:
                         queue_kwargs["exclude_patterns"] = exclude_patterns
-                    self.__lftp.queue(
-                        file_name,
-                        is_dir,
-                        remote_base_dir_path=path_pair.remote_path if path_pair is not None else None,
-                        local_base_dir_path=staging_path,
-                        **queue_kwargs
-                    )
+                    def queue_lftp(
+                            file_name: str = file_name,
+                            is_dir: bool = is_dir,
+                            remote_base_dir_path: Optional[str] =
+                                path_pair.remote_path if path_pair is not None else None,
+                            local_base_dir_path: Optional[str] = staging_path,
+                            queue_kwargs: dict[str, object] = queue_kwargs,
+                    ) -> object:
+                        return self.__lftp.queue(
+                            file_name,
+                            is_dir,
+                            remote_base_dir_path=remote_base_dir_path,
+                            local_base_dir_path=local_base_dir_path,
+                            **queue_kwargs
+                        )
+                    if self.__uses_async_lftp_owner():
+                        operation_sequence = self.__next_lftp_operation_sequence(file_id)
+                        self.__queue_dispatch_pending()[file_id] = PendingQueueDispatch(
+                            time.monotonic(), file_name, path_pair_id, is_dir, operation_sequence
+                        )
+                        if not self.__submit_lftp_operation(
+                                "queue", queue_lftp, file_id, operation_sequence):
+                            pending = self.__queue_dispatch_pending()
+                            dispatch = pending.get(file_id)
+                            if dispatch is not None and dispatch.operation_sequence == operation_sequence:
+                                pending.pop(file_id, None)
+                            self.logger.warning(
+                                "Failed to recover interrupted download '%s' from '%s': "
+                                "transfer backend is shutting down",
+                                file_name,
+                                staging_path,
+                            )
+                            continue
+                    else:
+                        queue_lftp()
                     self.logger.info("Recovered interrupted download '%s' from '%s'", file_name, staging_path)
                 except (LftpError, RcloneTransferError) as error:
                     self.logger.warning(
@@ -5615,6 +5992,8 @@ class Controller:
                     )
                     continue
                 else:
+                    operation_sequence = None
+                    lifecycle_before_queue = None
                     try:
                         path_pair = self.__get_path_pair(file.path_pair_id)
                         local_base_dir_path = self.__get_staging_path(file.path_pair_id if path_pair else None)
@@ -5634,14 +6013,39 @@ class Controller:
                         exclude_patterns = self.__transfer_exclude_patterns(file.file_id, file.is_dir)
                         if exclude_patterns:
                             queue_kwargs["exclude_patterns"] = exclude_patterns
-                        self.__lftp.queue(
-                            file.name,
-                            file.is_dir,
-                            remote_base_dir_path=path_pair.remote_path if path_pair else None,
-                            local_base_dir_path=local_base_dir_path,
-                            **queue_kwargs
+                        operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
+                        lifecycle_before_queue = self.__download_start_lifecycle_snapshot(file.file_id)
+                        dispatch = PendingQueueDispatch(
+                            time.monotonic(), file.name, file.path_pair_id, file.is_dir, operation_sequence
                         )
-                        pending_queue_dispatches[file.file_id] = PendingQueueDispatch(time.monotonic())
+                        # Install the visible intent before submitting. This
+                        # is deliberately local: Queue HTTP acknowledgement
+                        # must not wait for the LFTP prompt.
+                        pending_queue_dispatches[file.file_id] = dispatch
+                        def queue_lftp(
+                                file_name: str = file.name,
+                                is_dir: bool = file.is_dir,
+                                remote_base_dir_path: Optional[str] = path_pair.remote_path if path_pair else None,
+                                local_base_dir_path: Optional[str] = local_base_dir_path,
+                                queue_kwargs: dict[str, object] = queue_kwargs,
+                        ) -> object:
+                            return self.__lftp.queue(
+                                file_name,
+                                is_dir,
+                                remote_base_dir_path=remote_base_dir_path,
+                                local_base_dir_path=local_base_dir_path,
+                                **queue_kwargs
+                            )
+                        if self.__uses_async_lftp_owner():
+                            if not self.__submit_lftp_operation(
+                                    "queue", queue_lftp, file.file_id, operation_sequence,
+                                    download_start_lifecycle_before=lifecycle_before_queue):
+                                pending_queue_dispatches.pop(file.file_id, None)
+                                _notify_failure(command, "Transfer backend is shutting down", 503, file)
+                                continue
+                        else:
+                            if queue_lftp() is False:
+                                raise LftpError("Transfer backend rejected queue request")
                         # If the prior acknowledgement was never observable,
                         # this successful explicit retry resets the bounded
                         # ambiguity window. Beyond that window Queue is
@@ -5701,6 +6105,17 @@ class Controller:
                             file=file,
                         )
                     except (LftpError, RcloneTransferError) as e:
+                        dispatch = pending_queue_dispatches.get(file.file_id)
+                        if (
+                            dispatch is not None
+                            and (operation_sequence is None or
+                                 dispatch.operation_sequence == operation_sequence)
+                        ):
+                            pending_queue_dispatches.pop(file.file_id, None)
+                        self.__restore_failed_queue_lifecycle(
+                            file.file_id,
+                            lifecycle_before_queue,
+                        )
                         _notify_failure(command, "Transfer backend error: {}".format(str(e)), 500, file)
                         continue
 
@@ -5735,6 +6150,7 @@ class Controller:
                         remote_path = "/".join([path_pair.remote_path.rstrip("/"), file.name])
                         local_path = self.__path_pair_staging_paths.get(file.path_pair_id, path_pair.local_path)
                     stopped_marked = file.file_id in self.__persist.stopped_file_names
+                    lifecycle_before_stop = self.__download_start_lifecycle_snapshot(file.file_id)
                     self.__log_stop_resume_trace(
                         "stop",
                         file.file_id,
@@ -5746,24 +6162,55 @@ class Controller:
                         local_base_dir_path,
                         stopped_marked
                     )
-                    killed = self.__lftp.kill(
-                        file.name,
-                        path_pair_id=file.path_pair_id,
-                        remote_path=remote_path,
-                        local_path=local_path
-                    )
-                    if not killed:
-                        _notify_failure(
-                            command,
-                            "File '{}' could not be stopped".format(command.filename),
-                            409,
-                            file
-                        )
-                        continue
+                    previous_pending_dispatch = pending_queue_dispatches.get(file.file_id)
                     self.__persist.stopped_file_names.add(file.file_id)
                     pending_queue_dispatches.pop(file.file_id, None)
                     stopped_queue_lifecycle_ids.add(file.file_id)
                     self.__suppress_download_start_lifecycle(file.file_id)
+                    operation_sequence = self.__next_lftp_operation_sequence(file.file_id)
+                    def kill_lftp(
+                            file_name: str = file.name,
+                            path_pair_id: Optional[str] = file.path_pair_id,
+                            remote_path: Optional[str] = remote_path,
+                            local_path: Optional[str] = local_path,
+                    ) -> object:
+                        return self.__lftp.kill(
+                            file_name,
+                            path_pair_id=path_pair_id,
+                            remote_path=remote_path,
+                            local_path=local_path
+                        )
+                    if self.__uses_async_lftp_owner():
+                        if not self.__submit_lftp_operation(
+                                "stop", kill_lftp, file.file_id, operation_sequence,
+                                previous_pending_dispatch,
+                                lifecycle_before_stop):
+                            self.__persist.stopped_file_names.discard(file.file_id)
+                            if previous_pending_dispatch is not None:
+                                pending_queue_dispatches[file.file_id] = previous_pending_dispatch
+                            self.__restore_failed_stop_lifecycle(
+                                file.file_id,
+                                lifecycle_before_stop,
+                            )
+                            _notify_failure(command, "Transfer backend is shutting down", 503, file)
+                            continue
+                    else:
+                        killed = kill_lftp()
+                        if not killed:
+                            self.__persist.stopped_file_names.discard(file.file_id)
+                            if previous_pending_dispatch is not None:
+                                pending_queue_dispatches[file.file_id] = previous_pending_dispatch
+                            self.__restore_failed_stop_lifecycle(
+                                file.file_id,
+                                lifecycle_before_stop,
+                            )
+                            _notify_failure(
+                                command,
+                                "File '{}' could not be stopped".format(command.filename),
+                                409,
+                                file
+                            )
+                            continue
                     # Force the next model refresh to observe the post-stop lftp state
                     # instead of reusing the pre-stop running snapshot for one more cycle.
                     self.__next_lftp_status_poll_at = None

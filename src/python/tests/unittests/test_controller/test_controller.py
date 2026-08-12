@@ -9,6 +9,7 @@ import threading
 import time
 import tempfile
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from queue import Queue
 from threading import Lock
@@ -19,8 +20,8 @@ from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersis
 from controller.model_updater import ModelUpdater
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
-from controller.scan import MultiPathActiveScanner, ScannerResult
-from controller.controller import ControllerError, DownloadStartLifecycleEntry
+from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
+from controller.controller import ControllerError, DownloadStartLifecycleEntry, PendingQueueDispatch
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
 from common.performance_diagnostics import (
@@ -171,6 +172,7 @@ class TestController(unittest.TestCase):
         self.controller._Controller__lftp_idle_status_authoritative = True
 
         self.assertFalse(self.controller.has_active_runtime_work())
+        self.assertEqual(10.0, Controller._IDLE_HEALTH_INTERVAL_SECONDS)
         self.assertEqual(Controller._IDLE_HEALTH_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
 
     def test_active_transfer_process_delay_remains_100ms(self):
@@ -180,6 +182,449 @@ class TestController(unittest.TestCase):
 
         self.assertTrue(self.controller.has_active_runtime_work())
         self.assertEqual(Controller._ACTIVE_PROCESS_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
+
+    def test_pending_scan_results_keep_active_cadence_until_bounded_drain_finishes(self):
+        process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__queue.maxsize = 256
+        for index in range(130):
+            process._ScannerProcess__publish_result(ScannerResult(
+                datetime.now(), [SystemFile("root-{}".format(index), index)],
+                scanned_path_pair_ids={"pair"}, is_progress=True, is_scan_final=False,
+            ))
+        final = ScannerResult(
+            datetime.now(), [SystemFile("final", 1)], scanned_path_pair_ids={"pair"},
+            is_progress=True, is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+        process._ScannerProcess__publish_result(final)
+        self.controller._Controller__active_scan_process = process
+        self.controller._Controller__lftp_idle_status_authoritative = True
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+
+        self.assertTrue(self.controller.has_active_runtime_work())
+        self.assertEqual(Controller._ACTIVE_PROCESS_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
+        self.assertTrue(process.has_pending_results())
+
+        first_batch = process.pop_results()
+        self.assertEqual(128, len(first_batch))
+        self.assertTrue(self.controller.has_active_runtime_work())
+        self.assertEqual(Controller._ACTIVE_PROCESS_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
+        second_batch = process.pop_results()
+        self.assertIn(final, second_batch)
+        self.assertFalse(process.has_pending_results())
+        self.assertFalse(self.controller.has_active_runtime_work())
+        self.assertEqual(Controller._IDLE_HEALTH_INTERVAL_SECONDS, self.controller.next_process_delay_seconds())
+
+    def test_pending_results_from_each_scan_process_keep_scheduler_active(self):
+        processes = []
+        for attribute in (
+                "_Controller__active_scan_process",
+                "_Controller__local_scan_process",
+                "_Controller__remote_scan_process"):
+            process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+            self.addCleanup(process.close_queues)
+            process._ScannerProcess__publish_result(ScannerResult(
+                datetime.now(), [SystemFile(attribute, 1)], scanned_path_pair_ids={"pair"},
+            ))
+            setattr(self.controller, attribute, process)
+            processes.append(process)
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__lftp_idle_status_authoritative = True
+
+        self.assertTrue(self.controller.has_active_runtime_work())
+        for index, process in enumerate(processes):
+            self.assertIsNotNone(process.pop_latest_result())
+            self.assertEqual(index < len(processes) - 1, self.controller.has_active_runtime_work())
+
+    def test_pending_async_lftp_status_future_keeps_bounded_scheduler_cadence(self):
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__active_downloading_file_names = []
+        self.controller._Controller__active_extracting_file_names = []
+        pending_status = Future()
+        self.controller._Controller__lftp_status_future = pending_status
+
+        self.assertTrue(self.controller.has_active_runtime_work())
+        self.assertEqual(
+            Controller._ACTIVE_PROCESS_INTERVAL_SECONDS,
+            self.controller.next_process_delay_seconds(),
+        )
+        self.assertEqual(
+            Controller._ACTIVE_PROCESS_INTERVAL_SECONDS,
+            self.controller.next_process_delay_seconds(),
+        )
+
+        pending_status.set_result(([], True))
+        self.controller._Controller__lftp_status_future = None
+
+    def test_pending_async_lftp_operations_keep_bounded_scheduler_cadence(self):
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__collision_compare_future = None
+        self.controller._Controller__active_downloading_file_names = []
+        self.controller._Controller__active_extracting_file_names = []
+        self.controller._Controller__lftp_status_future = None
+        self.controller._Controller__lftp_idle_status_authoritative = False
+        self.controller._Controller__next_lftp_status_poll_at = None
+
+        for action in ("queue", "stop", "reconfigure"):
+            with self.subTest(action=action):
+                pending_operation = Future()
+                self.controller._Controller__lftp_operations = [
+                    SimpleNamespace(action=action, future=pending_operation)
+                ]
+                self.assertTrue(self.controller.has_active_runtime_work())
+                self.assertEqual(
+                    Controller._ACTIVE_PROCESS_INTERVAL_SECONDS,
+                    self.controller.next_process_delay_seconds(),
+                )
+                self.assertEqual(
+                    Controller._ACTIVE_PROCESS_INTERVAL_SECONDS,
+                    self.controller.next_process_delay_seconds(),
+                )
+
+                pending_operation.set_result(None)
+                self.controller._Controller__drain_lftp_operations()
+                self.assertFalse(self.controller.has_active_runtime_work())
+
+    def test_async_lftp_queue_accepts_without_waiting_and_publishes_synthetic_status(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 100
+        file.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        queued = threading.Event()
+        release = threading.Event()
+
+        def blocking_queue(*_args, **_kwargs):
+            queued.set()
+            release.wait(2)
+
+        self.controller._Controller__lftp.queue.side_effect = blocking_queue
+        command = Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        started_at = time.monotonic()
+        self.controller._Controller__process_commands()
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertTrue(queued.wait(1))
+        callback.on_success.assert_called_once_with()
+        pending = self.controller._Controller__pending_queue_dispatches[file.file_id]
+        self.assertEqual(file.name, pending.name)
+        synthetic = self.controller._lftp_statuses_with_pending_dispatches([])
+        self.assertEqual([file.file_id], [status.file_id for status in synthetic])
+        release.set()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_async_lftp_status_uses_one_inflight_future_then_completed_snapshot(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        started = threading.Event()
+        release = threading.Event()
+        status = LftpJobStatus(1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "movie.mkv", "")
+
+        def blocking_status():
+            started.set()
+            release.wait(2)
+            return [status]
+
+        self.controller._Controller__lftp.status.side_effect = blocking_status
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        self.assertTrue(started.wait(1))
+        self.assertIsNone(self.controller._get_lftp_status_snapshot())
+        self.assertEqual(1, self.controller._Controller__lftp.status.call_count)
+        observed_generation = self.controller.process_wake_generation()
+        release.set()
+        deadline = time.monotonic() + 1
+        snapshot = None
+        while snapshot is None and time.monotonic() < deadline:
+            snapshot = self.controller._get_lftp_status_snapshot()
+            if snapshot is None:
+                time.sleep(0.01)
+        self.assertEqual(([status], True), snapshot)
+        self.assertTrue(self.controller.wait_for_process_wake(observed_generation, 1))
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_async_lftp_status_future_failure_becomes_bounded_unhealthy_snapshot(self):
+        self.controller._Controller__lftp.backend_name = "lftp"
+        failed_future = Future()
+        failed_future.set_exception(RuntimeError("status worker failed"))
+        self.controller._Controller__lftp_status_future = failed_future
+
+        snapshot = self.controller._get_lftp_status_snapshot()
+
+        self.assertEqual(([], False), snapshot)
+        self.assertIsNone(self.controller._Controller__lftp_status_future)
+
+    def test_lftp_executor_teardown_closes_pool_when_exit_submit_races(self):
+        executor = MagicMock()
+        executor.submit.side_effect = RuntimeError("executor already closed")
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp_executor = executor
+        self.controller._Controller__lftp_executor_closing = False
+        self.controller._Controller__started = True
+
+        self.controller.exit()
+
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        self.assertIsNone(self.controller._Controller__lftp_executor)
+
+    def test_lftp_executor_forced_close_releases_blocked_exit(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self._set_exit_worker_processes_not_alive()
+        release = threading.Event()
+        started = threading.Event()
+
+        def blocked_exit():
+            started.set()
+            release.wait(5)
+
+        self.controller._Controller__lftp.exit.side_effect = blocked_exit
+        self.controller._Controller__lftp.force_close.side_effect = release.set
+        self.controller._Controller__ensure_lftp_executor()
+
+        started_at = time.monotonic()
+        self.controller.exit()
+
+        self.assertLess(time.monotonic() - started_at, 3.5)
+        self.assertTrue(started.is_set())
+        self.controller._Controller__lftp.force_close.assert_called_once_with()
+        self.assertIsNone(self.controller._Controller__lftp_executor)
+
+    def test_failed_queue_completion_removes_current_pending_dispatch(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        operation_future = Future()
+        operation_future.set_exception(RuntimeError("queue failed"))
+        self.controller._Controller__pending_queue_dispatches = {
+            file_id: PendingQueueDispatch(0.0, "movie.mkv", None, False, 1),
+        }
+        self.controller._Controller__lftp_operation_sequences = {file_id: 1}
+        self.controller._Controller__lftp_operations = [
+            SimpleNamespace(
+                action="queue",
+                future=operation_future,
+                file_id=file_id,
+                operation_sequence=1,
+            )
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertNotIn(file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_stale_stop_failure_cannot_clear_newer_stopped_intent(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        operation_future = Future()
+        operation_future.set_exception(RuntimeError("stale stop failed"))
+        self.controller._Controller__persist.stopped_file_names.add(file_id)
+        self.controller._Controller__lftp_operation_sequences = {file_id: 2}
+        self.controller._Controller__lftp_operations = [
+            SimpleNamespace(
+                action="stop",
+                future=operation_future,
+                file_id=file_id,
+                operation_sequence=1,
+            )
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertIn(file_id, self.controller._Controller__persist.stopped_file_names)
+
+    def test_failed_stop_completion_restores_prior_pending_queue_intent(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        prior_dispatch = PendingQueueDispatch(0.0, "movie.mkv", None, False, 1)
+        operation_future = Future()
+        operation_future.set_exception(RuntimeError("stop failed"))
+        self.controller._Controller__persist.stopped_file_names.add(file_id)
+        self.controller._Controller__lftp_operation_sequences = {file_id: 2}
+        self.controller._Controller__lftp_operations = [
+            SimpleNamespace(
+                action="stop",
+                future=operation_future,
+                file_id=file_id,
+                operation_sequence=2,
+                pending_dispatch=prior_dispatch,
+            )
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertNotIn(file_id, self.controller._Controller__persist.stopped_file_names)
+        self.assertIs(prior_dispatch, self.controller._Controller__pending_queue_dispatches[file_id])
+
+    def test_stale_queue_and_current_stop_failures_do_not_restore_synthetic_queue(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        prior_dispatch = PendingQueueDispatch(0.0, "movie.mkv", None, False, 1)
+        queue_future = Future()
+        queue_future.set_exception(RuntimeError("queue failed"))
+        stop_future = Future()
+        stop_future.set_exception(RuntimeError("stop failed"))
+        self.controller._Controller__pending_queue_dispatches = {}
+        self.controller._Controller__persist.stopped_file_names.add(file_id)
+        self.controller._Controller__lftp_operation_sequences = {file_id: 2}
+        self.controller._Controller__lftp_operations = [
+            SimpleNamespace(
+                action="queue",
+                future=queue_future,
+                file_id=file_id,
+                operation_sequence=1,
+            ),
+            SimpleNamespace(
+                action="stop",
+                future=stop_future,
+                file_id=file_id,
+                operation_sequence=2,
+                pending_dispatch=prior_dispatch,
+                download_start_lifecycle_before=None,
+            ),
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertNotIn(file_id, self.controller._Controller__pending_queue_dispatches)
+
+    def test_repeated_queue_failures_keep_one_failed_sequence_per_file(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        self.controller._Controller__lftp_failed_operation_sequences = set()
+        for sequence in range(1, 21):
+            operation_future = Future()
+            operation_future.set_exception(RuntimeError("queue failed"))
+            self.controller._Controller__lftp_operation_sequences = {file_id: sequence}
+            self.controller._Controller__lftp_operations = [
+                SimpleNamespace(
+                    action="queue",
+                    future=operation_future,
+                    file_id=file_id,
+                    operation_sequence=sequence,
+                )
+            ]
+
+            self.controller._Controller__drain_lftp_operations()
+
+        self.assertEqual(
+            {(file_id, 20)},
+            self.controller._Controller__lftp_failed_operation_sequences,
+        )
+
+    def test_async_stop_failure_restores_eligible_start_lifecycle_for_running_status(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 100
+        file.state = ModelFile.State.DOWNLOADING
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp.kill.return_value = False
+        self.controller._Controller__pending_queue_dispatches = {}
+        listener = MagicMock()
+        self.controller.add_download_start_listener(listener)
+        self.controller._Controller__arm_download_start_lifecycle(file.file_id)
+        self.controller._Controller__pending_queue_dispatches[file.file_id] = PendingQueueDispatch(
+            0.0, file.name, file.path_pair_id, file.is_dir, 1
+        )
+
+        self.controller.queue_command(
+            Controller.Command(Controller.Command.Action.STOP, file.file_id)
+        )
+        self.controller._Controller__process_commands()
+        operation = self.controller._Controller__lftp_operations[0]
+        operation.future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+
+        running = LftpJobStatus(
+            1,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            file.name,
+            "",
+        )
+        self.controller._confirm_fresh_healthy_download_starts([running])
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        listener.assert_called_once_with(file)
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_async_queue_failure_clears_lifecycle_so_retry_can_notify_once(self):
+        file = ModelFile("movie.mkv", False)
+        file.remote_size = 100
+        file.state = ModelFile.State.DEFAULT
+        model = Model()
+        model.set_base_logger(self.controller.logger)
+        model.add_file(file)
+        self.controller._Controller__model = model
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__lftp.queue.side_effect = [
+            RuntimeError("queue failed"),
+            None,
+        ]
+        listener = MagicMock()
+        self.controller.add_download_start_listener(listener)
+
+        self.controller.queue_command(
+            Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        )
+        self.controller._Controller__process_commands()
+        first_operation = self.controller._Controller__lftp_operations[0]
+        with self.assertRaises(RuntimeError):
+            first_operation.future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+        self.assertNotIn(file.file_id, self.controller._Controller__download_start_state)
+
+        self.controller.queue_command(
+            Controller.Command(Controller.Command.Action.QUEUE, file.file_id)
+        )
+        self.controller._Controller__process_commands()
+        second_operation = self.controller._Controller__lftp_operations[0]
+        second_operation.future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+
+        running = LftpJobStatus(
+            2,
+            LftpJobStatus.Type.PGET,
+            LftpJobStatus.State.RUNNING,
+            file.name,
+            "",
+        )
+        self.controller._confirm_fresh_healthy_download_starts([running])
+        self.controller._confirm_fresh_healthy_download_starts([running])
+
+        listener.assert_called_once_with(file)
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
+
+    def test_stale_queue_failure_cannot_remove_newer_pending_dispatch(self):
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        operation_future = Future()
+        operation_future.set_exception(RuntimeError("stale queue failed"))
+        newer_lifecycle = DownloadStartLifecycleEntry("eligible", None, datetime.now())
+        self.controller._Controller__download_start_state[file_id] = newer_lifecycle
+        self.controller._Controller__pending_queue_dispatches = {
+            file_id: PendingQueueDispatch(0.0, "movie.mkv", None, False, 2),
+        }
+        self.controller._Controller__lftp_operation_sequences = {file_id: 2}
+        self.controller._Controller__lftp_operations = [
+            SimpleNamespace(
+                action="queue",
+                future=operation_future,
+                file_id=file_id,
+                operation_sequence=1,
+            )
+        ]
+
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertEqual(
+            2,
+            self.controller._Controller__pending_queue_dispatches[file_id].operation_sequence,
+        )
+        self.assertIs(newer_lifecycle, self.controller._Controller__download_start_state[file_id])
 
     def _configure_real_model_autoqueue_pipeline(self, pair: PathPair, auto_delete_remote: bool = False):
         """Use production ModelUpdater/AutoQueue wiring, not listener mocks."""
@@ -1347,7 +1792,7 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(0, self.controller._Controller__lftp.status.call_count)
         self.controller._Controller__model_builder.set_lftp_statuses.assert_called_once_with([])
-        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_called_once_with(set())
+        self.controller._Controller__model_builder.evict_recent_live_transfer_snapshots_missing_roots.assert_not_called()
         self.controller._Controller__active_scanner.set_active_files.assert_called_once_with([])
 
     def test_update_model_skips_status_poll_during_healthy_cooldown_with_cache(self):
@@ -1917,6 +2362,34 @@ class TestController(unittest.TestCase):
 
         self.controller._Controller__configure_lftp.assert_called_once_with()
         self.assertTrue(self.controller._Controller__lftp_reconfigure_requested)
+
+    def test_async_lftp_reconfigure_publishes_exclusions_only_after_success(self):
+        self.controller._Controller__started = True
+        self.controller._Controller__lftp.backend_name = "lftp"
+        self.controller._Controller__propagate_exceptions = MagicMock()
+        self.controller._Controller__cleanup_commands = MagicMock()
+        self.controller._Controller__process_commands = MagicMock()
+        self.controller._Controller__updater.update = MagicMock()
+        self.controller._Controller__log_memory_usage = MagicMock()
+        self.controller._Controller__context.config.general = SimpleNamespace(
+            verbose=True,
+            exclude_patterns="new-pattern",
+        )
+        self.controller._Controller__configure_lftp = MagicMock(
+            side_effect=RuntimeError("reconfigure failed")
+        )
+        self.controller._Controller__exclude_patterns = "stale"
+        self.controller.request_lftp_reconfigure()
+
+        self.controller.process()
+        future = self.controller._Controller__lftp_operations[0].future
+        with self.assertRaises(RuntimeError):
+            future.result(timeout=1)
+        self.controller._Controller__drain_lftp_operations()
+
+        self.assertEqual("stale", self.controller._Controller__exclude_patterns)
+        self.assertTrue(self.controller._Controller__lftp_reconfigure_requested)
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
 
     def test_update_model_records_scan_and_extract_breadcrumbs(self):
         remote_scan = SimpleNamespace(
@@ -9361,6 +9834,30 @@ class TestController(unittest.TestCase):
             local_base_dir_path="/local/incomplete"
         )
         self.assertEqual({}, self.controller._Controller__download_start_state)
+
+    def test_recover_interrupted_downloads_uses_async_owner_for_real_lftp(self):
+        self.controller._Controller__persist.downloaded_file_names = set()
+        self.controller._Controller__lftp.backend_name = "lftp"
+        queued = threading.Event()
+        release = threading.Event()
+
+        def blocking_queue(*_args, **_kwargs):
+            queued.set()
+            release.wait(2)
+
+        self.controller._Controller__lftp.queue.side_effect = blocking_queue
+        remote_file = SimpleNamespace(name="movie.mkv", path_pair_id=None)
+        with patch("controller.controller.os.listdir", return_value=["movie.mkv.lftp"]), \
+                patch("controller.controller.os.path.isdir", return_value=False):
+            started_at = time.monotonic()
+            self.controller._Controller__recover_interrupted_downloads([remote_file])
+
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertTrue(queued.wait(1))
+        file_id = ModelFile.build_file_id("movie.mkv", None)
+        self.assertIn(file_id, self.controller._Controller__pending_queue_dispatches)
+        release.set()
+        self.controller._Controller__lftp_executor.shutdown(wait=True)
 
     def test_recover_interrupted_downloads_skips_previously_downloaded_path_pair_file(self):
         file_id = ModelFile.build_file_id("dup.mkv", "movies")

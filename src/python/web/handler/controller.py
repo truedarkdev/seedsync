@@ -197,40 +197,40 @@ class ControllerHandler(IHandler):
             if guard_response:
                 return None, None, guard_response
 
-        model_files = self.__controller.get_model_files()
+        model_file_identities = self.__controller.get_model_file_command_identities()
 
         if file_id is not None:
-            matches = [model_file for model_file in model_files if model_file.file_id == file_id]
+            matches = [identity for identity in model_file_identities if identity[0] == file_id]
             if len(matches) != 1:
                 return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
-            guard_response = self.__check_file_name_safe(matches[0].name)
+            guard_response = self.__check_file_name_safe(matches[0][1])
             if guard_response:
                 return None, None, guard_response
-            return file_id, matches[0].name, None
+            return file_id, matches[0][1], None
 
         if path_pair_id is not None:
             matches = [
-                model_file for model_file in model_files
-                if model_file.name == file_name and model_file.path_pair_id == path_pair_id
+                identity for identity in model_file_identities
+                if identity[1] == file_name and identity[2] == path_pair_id
             ]
             if len(matches) != 1:
                 return None, None, HTTPResponse(body="File identity did not match exactly one file", status=400)
-            guard_response = self.__check_file_name_safe(matches[0].file_id)
+            guard_response = self.__check_file_name_safe(matches[0][0])
             if guard_response:
                 return None, None, guard_response
-            guard_response = self.__check_file_name_safe(matches[0].name)
+            guard_response = self.__check_file_name_safe(matches[0][1])
             if guard_response:
                 return None, None, guard_response
-            return matches[0].file_id, matches[0].name, None
+            return matches[0][0], matches[0][1], None
 
-        matches = [model_file for model_file in model_files if model_file.name == file_name]
+        matches = [identity for identity in model_file_identities if identity[1] == file_name]
         if len(matches) > 1:
             return None, None, HTTPResponse(
                 body="File name '{}' is ambiguous; resend with file_id".format(file_name),
                 status=400
             )
         if len(matches) == 1:
-            return file_name, matches[0].name, None
+            return file_name, matches[0][1], None
         return file_name, file_name, None
 
     def __handle_action_queue(self, file_name: str) -> HTTPResponse:

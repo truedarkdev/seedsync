@@ -1310,17 +1310,21 @@ class TestModelUpdater(unittest.TestCase):
         original_full_builder = builder.build_model
         builder.build_progressive_roots = MagicMock(wraps=original_delta_builder)
         builder.build_model = MagicMock(wraps=original_full_builder)
+        controller._refresh_model_file_command_identities_locked = MagicMock()
         updater = ModelUpdater(controller)
 
         updater.update()
         self.assertEqual({"first.bin"}, model.get_file_names())
+        controller._refresh_model_file_command_identities_locked.assert_called_once_with()
         updater.update()
         self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
+        self.assertEqual(2, controller._refresh_model_file_command_identities_locked.call_count)
         self.assertEqual(2, builder.build_progressive_roots.call_count)
         builder.build_model.assert_not_called()
 
         updater.update()
         self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
+        self.assertEqual(3, controller._refresh_model_file_command_identities_locked.call_count)
         builder.build_model.assert_called_once_with()
 
     def test_progressive_scanner_session_change_reopens_initial_publication_window(self):
@@ -1514,6 +1518,124 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIsNotNone(next_poll)
         self.assertGreater(next_poll, datetime.now())
         self.assertLessEqual(next_poll - datetime.now(), timedelta(milliseconds=100))
+
+    def test_active_lftp_status_updates_existing_root_without_full_build(self):
+        builder = ModelBuilder()
+        remote_root = SystemFile("root", 100, False)
+        builder.set_remote_files([remote_root])
+        live_model = builder.build_model()
+        before_version = live_model.version
+        listener = MagicMock()
+        live_model.add_listener(listener)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+        self.assertEqual(before_version + 1, live_model.version)
+        self.assertEqual(1, live_model.file_count)
+        self.assertEqual(1, live_model.tree_file_count)
+        listener.file_updated.assert_called_once()
+        self.assertFalse(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+    def test_active_scan_and_fresh_lftp_progress_share_bounded_root_delta(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("root", 25, False)],
+        )
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+        self.assertFalse(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+    def test_running_to_queued_pending_completion_uses_full_reconciliation(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        builder.set_local_files([SystemFile("root", 20, False, is_staging=True)])
+        running = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        running.total_transfer_state = LftpJobStatus.TransferState(65, 100, 65, 10, 4)
+        builder.set_lftp_statuses([running])
+        live_model = builder.build_model()
+        builder.adopt_applied_model(live_model, live_model)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._Controller__prev_downloading_file_names = {("root", None, None)}
+        queued = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "root", "",
+        )
+        controller._Controller__lftp.status.return_value = [queued]
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_called_once()
+        self.assertTrue(controller._Controller__pending_completion_file_names)
+
+    def test_active_delta_authorization_rejection_publishes_only_full_reconciliation(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        listener = MagicMock()
+        live_model.add_listener(listener)
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        builder.authorize_active_transfer_delta = MagicMock(return_value=False)
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_called_once()
+        listener.file_updated.assert_called_once()
+        self.assertEqual(25, live_model.get_file("root").transferred_size)
+
+    def test_clean_idle_tick_skips_active_delta_model_root_lookup(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([SystemFile("root", 100, False)])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        live_model.get_file_ids = MagicMock(side_effect=AssertionError("idle delta must not inspect roots"))
+
+        ModelUpdater(controller).update()
+
+        live_model.get_file_ids.assert_not_called()
 
     def _make_lftp_completion_controller(self, prev_downloading_file_names=None):
         controller = SimpleNamespace(

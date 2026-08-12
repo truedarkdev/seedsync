@@ -423,7 +423,12 @@ class Lftp:
             raise LftpError("Lftp process terminated before {}: {}".format(context, out))
 
     @with_check_process
-    def __run_command(self, command: str, timeout_seconds: Optional[int] = None, require_prompt_ready: bool = True, status_poll: bool = False) -> str:
+    def __run_command(self,
+                      command: str,
+                      timeout_seconds: Optional[int] = None,
+                      require_prompt_ready: bool = True,
+                      status_poll: bool = False,
+                      low_latency: bool = False) -> str:
         self.__last_command_timed_out = False
         restore_delaybeforesend = None
         restore_delayafterread = None
@@ -432,6 +437,7 @@ class Lftp:
         log_command_output = self.__log_command_output and not status_poll
         if status_poll:
             status_poll_timeout_seconds = STATUS_POLL_PROMPT_READY_TIMEOUT_SECONDS if timeout_seconds == 0 else timeout_seconds
+        if status_poll or low_latency:
             restore_delaybeforesend = getattr(self.__process, "delaybeforesend", None)
             restore_delayafterread = getattr(self.__process, "delayafterread", None)
             if restore_delaybeforesend is not None:
@@ -920,7 +926,11 @@ class Lftp:
             ])
         command = " ".join(parts)
         self.logger.debug("queue command: %s", command)
-        self.__run_command(command, require_prompt_ready=False)  # type: ignore[arg-type]
+        self.__run_command(
+            command,
+            require_prompt_ready=False,
+            low_latency=True,
+        )  # type: ignore[arg-type]
 
     def kill(self,
              name: str,
@@ -969,7 +979,6 @@ class Lftp:
             return statuses, matching_jobs, status_poll_healthy
 
         killed_any = False
-        previous_match_signature: Optional[tuple[tuple[int, LftpJobStatus.State], ...]] = None
         attempts = 0
         while attempts < MAX_KILL_MATCH_ATTEMPTS:
             statuses, matching_jobs, status_poll_healthy = find_matching_jobs()
@@ -981,27 +990,32 @@ class Lftp:
                     time.sleep(0.05)
                     continue
                 break
-            match_signature = tuple((job.id, job.state) for job in matching_jobs)
-            if match_signature == previous_match_signature:
-                self.logger.warning("Kill did not converge for job '{}' after repeated matching polls".format(name))
-                break
-            previous_match_signature = match_signature
             attempts += 1
-            job_to_kill = matching_jobs[0]
-            killed_any = True
-            # Note: there's a chance that job ids change between when we called status
-            #       and when we execute the kill command
-            #       in this case the wrong job may be killed, there's nothing we can do about it
-            if job_to_kill.state == LftpJobStatus.State.RUNNING:
-                self.logger.debug("Killing running job '{}'...".format(name))
-                self.__run_command("kill {}".format(job_to_kill.id), require_prompt_ready=False)  # type: ignore[arg-type]
-            elif job_to_kill.state == LftpJobStatus.State.QUEUED:
-                self.logger.debug("Killing queued job '{}'...".format(name))
-                self.__run_command("queue --delete {}".format(job_to_kill.id), require_prompt_ready=False)  # type: ignore[arg-type]
-            else:
-                raise NotImplementedError("Unsupported state {}".format(str(job_to_kill.state)))
-        else:
-            self.logger.warning("Kill reached max attempts for job '{}'".format(name))
+            # The snapshot can contain duplicate jobs for the same file.  Send
+            # every matching id before returning, while avoiding synchronous
+            # convergence polls.  The next controller refresh remains
+            # responsible for publishing the authoritative post-stop state.
+            for job_to_kill in matching_jobs:
+                killed_any = True
+                # Note: there's a chance that job ids change between when we called status
+                #       and when we execute the kill command.
+                if job_to_kill.state == LftpJobStatus.State.RUNNING:
+                    self.logger.debug("Killing running job '{}'...".format(name))
+                    self.__run_command(
+                        "kill {}".format(job_to_kill.id),
+                        require_prompt_ready=False,
+                        low_latency=True,
+                    )  # type: ignore[arg-type]
+                elif job_to_kill.state == LftpJobStatus.State.QUEUED:
+                    self.logger.debug("Killing queued job '{}'...".format(name))
+                    self.__run_command(
+                        "queue --delete {}".format(job_to_kill.id),
+                        require_prompt_ready=False,
+                        low_latency=True,
+                    )  # type: ignore[arg-type]
+                else:
+                    raise NotImplementedError("Unsupported state {}".format(str(job_to_kill.state)))
+            break
 
         if not killed_any:
             self.logger.debug("Kill failed to find job '{}'".format(name))
@@ -1025,6 +1039,13 @@ class Lftp:
         self.kill_all()
         self.__process.sendline("exit")
         self.__process.close(force=True)
+
+    def force_close(self) -> None:
+        """Interrupt a blocked PTY operation during controller teardown only."""
+        try:
+            self.__process.close(force=True)
+        except (OSError, pexpect.exceptions.ExceptionPexpect):
+            self.logger.debug("Lftp process was already closed during forced teardown")
 
     # Mark decorators as static (must be at end of class)
     # Source: https://stackoverflow.com/a/3422823

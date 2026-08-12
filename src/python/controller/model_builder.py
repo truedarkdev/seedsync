@@ -6,7 +6,7 @@ from datetime import datetime
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, cast
+from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, cast
 import math
 import json
 import time
@@ -68,6 +68,14 @@ class _BuiltRootFile:
     seen_file_ids: set[str]
 
 
+@dataclass
+class _ActiveTransferRootBuild:
+    """Isolated render and runtime state for an active-transfer root delta."""
+    model: Model
+    recent_live_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
+    retained_stopped_transfer_snapshots: dict[str, _RecentLiveTransferSnapshot]
+
+
 class ModelBuilder:
     """
     ModelBuilder combines all the difference sources of file system info
@@ -108,6 +116,24 @@ class ModelBuilder:
         self.__local_staging_paths: dict[Optional[str], str] = {}
         self.__suppressed_ambiguous_extracted_file_names: set[str] = set()
         self.__cached_model: Optional[Model] = None
+        # A cache miss by itself does not say whether rebuilding one root is
+        # sound.  Keep the input categories that caused it until an
+        # authoritative full build (or a proven active-transfer delta) has
+        # been applied.  This deliberately fails closed: a new setter must be
+        # explicitly classified before it can participate in a partial build.
+        self.__invalidation_reasons: set[str] = set()
+        self.__next_invalidation_token = 0
+        self.__pending_invalidation_tokens: dict[
+            int, tuple[str, Optional[frozenset[str]]]
+        ] = {}
+        self.__lftp_touched_root_file_ids: set[str] = set()
+        self.__active_touched_root_file_ids: set[str] = set()
+        self.__lftp_regressed_root_file_ids: set[str] = set()
+        self.__source_name_counts: dict[str, int] = {}
+        self.__status_only_file_names: dict[str, str] = {}
+        self.__status_only_name_counts: dict[str, int] = {}
+        self.__active_only_file_names: dict[str, str] = {}
+        self.__active_only_name_counts: dict[str, int] = {}
         self.__cached_unresolved_staging_collision_file_ids: set[str] = set()
         self.__cached_terminalizable_staging_collision_file_ids: set[str] = set()
         self.__stop_resume_trace_cycle_id: Optional[int] = None
@@ -135,9 +161,83 @@ class ModelBuilder:
         except Exception:
             pass
 
-    def __invalidate_cache(self, counter: str) -> None:
+    def __invalidate_cache(
+            self,
+            counter: str,
+            touched_lftp_root_file_ids: Optional[Set[str]] = None,
+            touched_active_root_file_ids: Optional[Set[str]] = None,
+            affected_file_ids: Optional[Set[str]] = None,
+    ) -> int:
         self.__cached_model = None
+        self.__invalidation_reasons.add(counter)
+        if counter == MODEL_BUILDER_INVALIDATION_LFTP_STATUSES and touched_lftp_root_file_ids:
+            self.__lftp_touched_root_file_ids.update(touched_lftp_root_file_ids)
+        if counter == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES and touched_active_root_file_ids:
+            self.__active_touched_root_file_ids.update(touched_active_root_file_ids)
+        self.__next_invalidation_token += 1
+        token = self.__next_invalidation_token
+        if affected_file_ids is None:
+            if counter == MODEL_BUILDER_INVALIDATION_LFTP_STATUSES:
+                affected_file_ids = touched_lftp_root_file_ids
+            elif counter == MODEL_BUILDER_INVALIDATION_ACTIVE_FILES:
+                affected_file_ids = touched_active_root_file_ids
+        self.__pending_invalidation_tokens[token] = (
+            counter,
+            None if affected_file_ids is None else frozenset(affected_file_ids),
+        )
         self.__record_cache_invalidation(counter)
+        return token
+
+    def __refresh_source_name_counts(self) -> None:
+        counts: dict[str, int] = {}
+        for file_id in set(self.__local_files).union(self.__remote_files):
+            source = self.__local_files.get(file_id) or self.__remote_files[file_id]
+            counts[source.name] = counts.get(source.name, 0) + 1
+        self.__source_name_counts = counts
+        self.__status_only_file_names = {
+            file_id: status.name for file_id, status in self.__lftp_statuses.items()
+            if file_id not in self.__local_files and file_id not in self.__remote_files
+        }
+        status_counts: dict[str, int] = {}
+        for name in self.__status_only_file_names.values():
+            status_counts[name] = status_counts.get(name, 0) + 1
+        self.__status_only_name_counts = status_counts
+        self.__active_only_file_names = {
+            file_id: file.name for file_id, file in self.__active_files.items()
+            if file_id not in self.__local_files and file_id not in self.__remote_files
+        }
+        active_counts: dict[str, int] = {}
+        for name in self.__active_only_file_names.values():
+            active_counts[name] = active_counts.get(name, 0) + 1
+        self.__active_only_name_counts = active_counts
+
+    def __update_status_only_name_count(self, file_id: str) -> None:
+        previous_name = self.__status_only_file_names.pop(file_id, None)
+        if previous_name is not None:
+            remaining = self.__status_only_name_counts.get(previous_name, 0) - 1
+            if remaining > 0:
+                self.__status_only_name_counts[previous_name] = remaining
+            else:
+                self.__status_only_name_counts.pop(previous_name, None)
+        status = self.__lftp_statuses.get(file_id)
+        if status is None or file_id in self.__local_files or file_id in self.__remote_files:
+            return
+        self.__status_only_file_names[file_id] = status.name
+        self.__status_only_name_counts[status.name] = self.__status_only_name_counts.get(status.name, 0) + 1
+
+    def __update_active_only_name_count(self, file_id: str) -> None:
+        previous_name = self.__active_only_file_names.pop(file_id, None)
+        if previous_name is not None:
+            remaining = self.__active_only_name_counts.get(previous_name, 0) - 1
+            if remaining > 0:
+                self.__active_only_name_counts[previous_name] = remaining
+            else:
+                self.__active_only_name_counts.pop(previous_name, None)
+        active_file = self.__active_files.get(file_id)
+        if active_file is None or file_id in self.__local_files or file_id in self.__remote_files:
+            return
+        self.__active_only_file_names[file_id] = active_file.name
+        self.__active_only_name_counts[active_file.name] = self.__active_only_name_counts.get(active_file.name, 0) + 1
 
     def __begin_duration(self, metric: str) -> object:
         diagnostics = self.__performance_diagnostics
@@ -1505,20 +1605,30 @@ class ModelBuilder:
     def set_active_files(self, active_files: List[SystemFile]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES)
         try:
-            had_active_files = bool(self.__active_files)
-            self.__active_file_ids = set()
-            self.__active_files = {}
+            previous_active_files = self.__active_files
+            next_active_file_ids: set[str] = set()
+            next_active_files: dict[str, SystemFile] = {}
             for file in active_files:
                 # Active scanners read the staging path.  Some scanner paths do
                 # not carry that location tag into their SystemFile roots, so make
                 # the semantic boundary explicit here without changing sidecar or
                 # collision metadata.
                 self.__mark_active_tree_staging(file)
-                self.__collect_active_file_ids(file, self.__active_file_ids)
-                self.__active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
-            # Invalidate the cache
-            if had_active_files or len(active_files) > 0:
-                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_ACTIVE_FILES)
+                self.__collect_active_file_ids(file, next_active_file_ids)
+                next_active_files[self.__root_file_id(file.name, file.path_pair_id)] = file
+            if next_active_files != previous_active_files:
+                self.__active_files = next_active_files
+                self.__active_file_ids = next_active_file_ids
+                touched_file_ids = {
+                    file_id for file_id in set(previous_active_files).union(next_active_files)
+                    if previous_active_files.get(file_id) != next_active_files.get(file_id)
+                }
+                for file_id in touched_file_ids:
+                    self.__update_active_only_name_count(file_id)
+                self.__invalidate_cache(
+                    MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+                    touched_active_root_file_ids=touched_file_ids,
+                )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_ACTIVE_FILES, started_at)
 
@@ -1526,6 +1636,7 @@ class ModelBuilder:
         """Drop exact active-scan roots during a completed move handoff."""
         if not file_ids:
             return
+        removed_active_file_ids = set(self.__active_files).intersection(file_ids)
         retained_active_files = {
             root_file_id: active_file
             for root_file_id, active_file in self.__active_files.items()
@@ -1537,7 +1648,12 @@ class ModelBuilder:
         self.__active_file_ids = set()
         for active_file in retained_active_files.values():
             self.__collect_active_file_ids(active_file, self.__active_file_ids)
-        self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_ACTIVE_FILES)
+        self.__invalidate_cache(
+            MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+            touched_active_root_file_ids=removed_active_file_ids,
+        )
+        for file_id in removed_active_file_ids:
+            self.__update_active_only_name_count(file_id)
 
     @staticmethod
     def __mark_active_tree_staging(system_file: SystemFile) -> None:
@@ -1810,6 +1926,7 @@ class ModelBuilder:
             # Invalidate the cache
             if next_local_files != prev_local_files:
                 self.__local_files = next_local_files
+                self.__refresh_source_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LOCAL_FILES)
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LOCAL_FILES, started_at)
@@ -1824,6 +1941,7 @@ class ModelBuilder:
             # Invalidate the cache
             if next_remote_files != prev_remote_files:
                 self.__remote_files = next_remote_files
+                self.__refresh_source_name_counts()
                 self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_REMOTE_FILES)
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_REMOTE_FILES, started_at)
@@ -1894,6 +2012,124 @@ class ModelBuilder:
         partial.__local_staging_paths = dict(self.__local_staging_paths)
         return partial.build_model()
 
+    def has_pending_active_transfer_delta(self) -> bool:
+        """Cheap hot-path gate; does not inspect model roots or source maps."""
+        return MODEL_BUILDER_INVALIDATION_LFTP_STATUSES in self.__invalidation_reasons
+
+    def active_transfer_delta_file_ids(
+            self, known_root_file_ids: Set[str] | Callable[[str], bool],
+    ) -> Optional[set[str]]:
+        """Return roots eligible for a status-only partial publication.
+
+        Status disappearance, a new status-only root, or every non-status
+        invalidation requires the normal full model build.  In particular,
+        this method never grants partial authority to remove a root.
+        """
+        if not self.__invalidation_reasons.issubset({
+                MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+                MODEL_BUILDER_INVALIDATION_ACTIVE_FILES,
+        }) or MODEL_BUILDER_INVALIDATION_LFTP_STATUSES not in self.__invalidation_reasons:
+            return None
+        file_ids = set(self.__lftp_touched_root_file_ids)
+        if callable(known_root_file_ids):
+            try:
+                roots_known = all(known_root_file_ids(file_id) for file_id in file_ids)
+            except Exception:
+                roots_known = False
+        else:
+            roots_known = file_ids.issubset(known_root_file_ids)
+        if not file_ids or not roots_known:
+            return None
+        if self.__lftp_regressed_root_file_ids.intersection(file_ids):
+            return None
+        if not self.__active_touched_root_file_ids.issubset(file_ids):
+            return None
+        for file_id in file_ids:
+            status = self.__lftp_statuses.get(file_id)
+            if status is None or status.file_id != file_id or status.state not in (
+                    LftpJobStatus.State.QUEUED, LftpJobStatus.State.RUNNING):
+                return None
+        if not self.__active_transfer_delta_global_state_is_safe(file_ids):
+            return None
+        return file_ids
+
+    def __active_transfer_delta_global_state_is_safe(self, root_file_ids: Set[str]) -> bool:
+        """Reject root deltas whose rendering depends on global root visibility.
+
+        ``build_model`` suppresses legacy name-only extraction markers when a
+        name is ambiguous across path pairs.  Rendering one root cannot prove
+        that absence, so reject the fast path before creating a misleading
+        EXTRACTED state.  Collision and local-only winner caches are only
+        authoritative after full builds; this delta never updates them.
+        """
+        selected_names = {
+            (self.__remote_files.get(file_id) or self.__local_files.get(file_id)).name
+            for file_id in root_file_ids
+            if self.__remote_files.get(file_id) is not None or self.__local_files.get(file_id) is not None
+        }
+        if not selected_names.intersection(self.__extracted_files):
+            return True
+        return all(
+            self.__source_name_counts.get(name, 0) + self.__status_only_name_counts.get(name, 0) +
+            self.__active_only_name_counts.get(name, 0) <= 1
+            for name in selected_names
+        )
+
+    def build_active_transfer_roots(self, root_file_ids: Set[str]) -> _ActiveTransferRootBuild:
+        """Build only existing roots whose live LFTP status changed.
+
+        The sibling API intentionally filters by canonical root id rather
+        than path pair.  A pair may legitimately contain multiple roots (and
+        path-pair names can repeat), so widening to a pair would defeat the
+        bounded work guarantee.
+        """
+        partial = ModelBuilder()
+        partial.logger = self.logger
+        partial.__target_archive_trace_logger = self.__target_archive_trace_logger
+        partial.__local_files = {
+            file_id: file for file_id, file in self.__local_files.items()
+            if file_id in root_file_ids
+        }
+        partial.__remote_files = {
+            file_id: file for file_id, file in self.__remote_files.items()
+            if file_id in root_file_ids
+        }
+        partial.__active_files = {
+            file_id: file for file_id, file in self.__active_files.items()
+            if file_id in root_file_ids
+        }
+        partial.__active_file_ids = set()
+        for active_file in partial.__active_files.values():
+            partial.__collect_active_file_ids(active_file, partial.__active_file_ids)
+        partial.__lftp_statuses = {
+            file_id: status for file_id, status in self.__lftp_statuses.items()
+            if file_id in root_file_ids
+        }
+        partial.__recent_live_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__recent_live_transfer_snapshots.items()
+            if file_id in root_file_ids or snapshot.root_file_id in root_file_ids
+        }
+        partial.__retained_stopped_transfer_snapshots = {
+            file_id: snapshot for file_id, snapshot in self.__retained_stopped_transfer_snapshots.items()
+            if file_id in root_file_ids or snapshot.root_file_id in root_file_ids
+        }
+        partial.__downloaded_files = None if self.__downloaded_files is None else set(self.__downloaded_files)
+        partial.__downloaded_timestamps = dict(self.__downloaded_timestamps)
+        partial.__extract_statuses = dict(self.__extract_statuses)
+        partial.__extracted_files = set(self.__extracted_files)
+        partial.__stopped_files = set(self.__stopped_files)
+        partial.__validation_statuses = dict(self.__validation_statuses)
+        partial.__move_failed_files = set(self.__move_failed_files)
+        partial.__final_move_succeeded_files = set(self.__final_move_succeeded_files)
+        partial.__unknown_local_path_pair_ids = set(self.__unknown_local_path_pair_ids)
+        partial.__local_root_paths = dict(self.__local_root_paths)
+        partial.__local_staging_paths = dict(self.__local_staging_paths)
+        return _ActiveTransferRootBuild(
+            model=partial.build_model(),
+            recent_live_transfer_snapshots=dict(partial.__recent_live_transfer_snapshots),
+            retained_stopped_transfer_snapshots=dict(partial.__retained_stopped_transfer_snapshots),
+        )
+
     def set_lftp_statuses(self, lftp_statuses: List[LftpJobStatus]) -> None:
         started_at = self.__begin_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES)
         try:
@@ -1901,7 +2137,23 @@ class ModelBuilder:
             self.__lftp_statuses = {file.file_id: file for file in lftp_statuses}
             # Invalidate the cache
             if self.__lftp_statuses != prev_lftp_statuses:
-                self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
+                touched_file_ids = {
+                    file_id for file_id in set(prev_lftp_statuses).union(self.__lftp_statuses)
+                    if prev_lftp_statuses.get(file_id) != self.__lftp_statuses.get(file_id)
+                }
+                self.__lftp_regressed_root_file_ids.update({
+                    file_id for file_id in touched_file_ids
+                    if prev_lftp_statuses.get(file_id) is not None and
+                    prev_lftp_statuses[file_id].state == LftpJobStatus.State.RUNNING and
+                    (self.__lftp_statuses.get(file_id) is None or
+                     self.__lftp_statuses[file_id].state != LftpJobStatus.State.RUNNING)
+                })
+                for file_id in touched_file_ids:
+                    self.__update_status_only_name_count(file_id)
+                self.__invalidate_cache(
+                    MODEL_BUILDER_INVALIDATION_LFTP_STATUSES,
+                    touched_file_ids,
+                )
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_LFTP_STATUSES, started_at)
 
@@ -1918,12 +2170,23 @@ class ModelBuilder:
         if removed:
             self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_LFTP_STATUSES)
 
-    def set_downloaded_files(self, downloaded_files: Set[str]) -> None:
+    def set_downloaded_files(self, downloaded_files: Set[str]) -> Optional[int]:
         prev_downloaded_files = self.__downloaded_files
         self.__downloaded_files = set(downloaded_files)
         # Invalidate the cache
         if self.__downloaded_files != prev_downloaded_files:
-            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES)
+            changed_file_ids = set(self.__downloaded_files or set())
+            changed_file_ids.update(prev_downloaded_files or set())
+            changed_file_ids = {
+                file_id for file_id in changed_file_ids
+                if (file_id in (self.__downloaded_files or set())) !=
+                (file_id in (prev_downloaded_files or set()))
+            }
+            return self.__invalidate_cache(
+                MODEL_BUILDER_INVALIDATION_DOWNLOADED_FILES,
+                affected_file_ids=changed_file_ids,
+            )
+        return None
 
     def set_unknown_local_path_pair_ids(self, path_pair_ids: Set[Optional[str]]) -> None:
         """Keep persisted markers from becoming Deleted while local evidence is incomplete."""
@@ -1966,11 +2229,16 @@ class ModelBuilder:
         finally:
             self.__finish_duration(DURATION_MODEL_BUILDER_SET_STOPPED_FILES, started_at)
 
-    def set_move_failed_files(self, move_failed_files: Set[str]) -> None:
+    def set_move_failed_files(self, move_failed_files: Set[str]) -> Optional[int]:
         previous = self.__move_failed_files
         self.__move_failed_files = set(move_failed_files)
         if self.__move_failed_files != previous:
-            self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES)
+            changed_file_ids = self.__move_failed_files.symmetric_difference(previous)
+            return self.__invalidate_cache(
+                MODEL_BUILDER_INVALIDATION_MOVE_FAILED_FILES,
+                affected_file_ids=changed_file_ids,
+            )
+        return None
 
     def set_final_move_succeeded_files(self, file_ids: Set[str]) -> None:
         previous = self.__final_move_succeeded_files
@@ -1988,6 +2256,11 @@ class ModelBuilder:
         self.__local_files.clear()
         self.__active_files.clear()
         self.__remote_files.clear()
+        self.__source_name_counts.clear()
+        self.__status_only_file_names.clear()
+        self.__status_only_name_counts.clear()
+        self.__active_only_file_names.clear()
+        self.__active_only_name_counts.clear()
         self.__active_file_ids.clear()
         self.__lftp_statuses.clear()
         self.__recent_live_transfer_snapshots.clear()
@@ -2021,16 +2294,78 @@ class ModelBuilder:
     def request_rebuild(self) -> None:
         self.__invalidate_cache(MODEL_BUILDER_INVALIDATION_EXPLICIT)
 
-    def adopt_applied_model(self, built_model: Model, applied_model: Model) -> None:
+    def invalidation_token_matches_file(self, token: int, file_id: str) -> bool:
+        """Return whether a token changed exactly one known file identity."""
+        event = self.__pending_invalidation_tokens.get(token)
+        return event is not None and event[1] == frozenset({file_id})
+
+    def adopt_applied_model(
+            self,
+            built_model: Model,
+            applied_model: Model,
+            applied_invalidation_tokens: Optional[Set[int]] = None,
+    ) -> None:
         """Alias the cache to the controller's live model after a successful diff.
 
         Source setters may invalidate the cache while the updater is applying
         side effects from a build.  Only the exact model returned by this
-        build may be replaced; otherwise an intervening invalidation must be
-        preserved for the next update cycle.
+        build may be replaced.  The updater may additionally identify exact
+        invalidation tokens whose side effect was applied directly to the live
+        model; unrelated or later invalidations remain dirty for the next
+        update cycle.
         """
         if self.__cached_model is built_model:
             self.__cached_model = applied_model
+            self.__pending_invalidation_tokens.clear()
+            return
+        if not self.__pending_invalidation_tokens or not applied_invalidation_tokens:
+            return
+        if not set(self.__pending_invalidation_tokens).issubset(applied_invalidation_tokens):
+            return
+        self.__cached_model = applied_model
+        self.__invalidation_reasons.clear()
+        self.__pending_invalidation_tokens.clear()
+        self.__lftp_touched_root_file_ids.clear()
+        self.__active_touched_root_file_ids.clear()
+        self.__lftp_regressed_root_file_ids.clear()
+
+    def authorize_active_transfer_delta(
+            self, known_root_file_ids: Set[str] | Callable[[str], bool], root_file_ids: Set[str],
+            partial_build: _ActiveTransferRootBuild,
+    ) -> bool:
+        """Validate a staged delta before it can mutate the live Model."""
+        return self.active_transfer_delta_file_ids(known_root_file_ids) == set(root_file_ids) and \
+            partial_build.model.get_file_ids() == set(root_file_ids)
+
+    def adopt_active_transfer_delta(
+            self, applied_model: Model, root_file_ids: Set[str],
+            partial_build: _ActiveTransferRootBuild,
+    ) -> None:
+        """Commit staged transfer floors after an authorized live publication."""
+        def replace_snapshot_roots(
+                target: dict[str, _RecentLiveTransferSnapshot],
+                staged: dict[str, _RecentLiveTransferSnapshot],
+        ) -> None:
+            relevant = lambda key, snapshot: key in root_file_ids or snapshot.root_file_id in root_file_ids
+            for key, snapshot in list(target.items()):
+                if relevant(key, snapshot):
+                    target.pop(key, None)
+            target.update({key: snapshot for key, snapshot in staged.items() if relevant(key, snapshot)})
+
+        replace_snapshot_roots(
+            self.__recent_live_transfer_snapshots,
+            partial_build.recent_live_transfer_snapshots,
+        )
+        replace_snapshot_roots(
+            self.__retained_stopped_transfer_snapshots,
+            partial_build.retained_stopped_transfer_snapshots,
+        )
+        self.__cached_model = applied_model
+        self.__invalidation_reasons.clear()
+        self.__pending_invalidation_tokens.clear()
+        self.__lftp_touched_root_file_ids.clear()
+        self.__active_touched_root_file_ids.clear()
+        self.__lftp_regressed_root_file_ids.clear()
 
     def build_model(self) -> Model:
         if self.__cached_model is not None:
@@ -2265,6 +2600,11 @@ class ModelBuilder:
         self.__sweep_recent_live_transfer_snapshots(seen_file_ids)
         model.set_tree_file_count(len(seen_file_ids))
         self.__cached_model = model
+        self.__invalidation_reasons.clear()
+        self.__pending_invalidation_tokens.clear()
+        self.__lftp_touched_root_file_ids.clear()
+        self.__active_touched_root_file_ids.clear()
+        self.__lftp_regressed_root_file_ids.clear()
         return model
 
     def __resolve_root_transfer_state(

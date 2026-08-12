@@ -29,6 +29,12 @@ class TestControllerHandler(BaseTestWebApp):
         self.web_app = self.web_app_builder.build()
         self.test_app = self.build_browser_test_app(auth_secret=self.integration_admin_secret)
         self.controller.get_model_files = MagicMock(return_value=[])
+        self.controller.get_model_file_command_identities = MagicMock(
+            side_effect=lambda: tuple(
+                (model_file.file_id, model_file.name, model_file.path_pair_id)
+                for model_file in self.controller.get_model_files()
+            )
+        )
 
     @staticmethod
     def __model_file(name: str, file_id: str, path_pair_id: str = None):
@@ -72,6 +78,49 @@ class TestControllerHandler(BaseTestWebApp):
         command = self.controller.queue_command.call_args[0][0]
         self.assertEqual(Controller.Command.Action.QUEUE, command.action)
         self.assertEqual("value\"with\"doublequote", command.filename)
+
+    def test_queue_resolution_uses_immutable_identities_without_full_model_snapshot(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.get_model_files.side_effect = AssertionError(
+            "command resolution must not request deep-copied model files"
+        )
+        self.controller.get_model_file_command_identities.side_effect = None
+        self.controller.get_model_file_command_identities.return_value = (
+            ("movie-id", "movie.mkv", None),
+        )
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post(
+            "/server/command/queue/movie.mkv?file_id=movie-id"
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.controller.get_model_files.assert_not_called()
+        self.controller.get_model_file_command_identities.assert_called_once_with()
+        command = self.controller.queue_command.call_args.args[0]
+        self.assertEqual("movie-id", command.filename)
+
+    def test_queue_resolution_accepts_unique_name_without_identity(self):
+        def side_effect(cmd: Controller.Command):
+            cmd.callbacks[0].on_success()
+
+        self.controller.get_model_files.side_effect = AssertionError(
+            "command resolution must not request deep-copied model files"
+        )
+        self.controller.get_model_file_command_identities.side_effect = None
+        self.controller.get_model_file_command_identities.return_value = (
+            ("movie-id", "movie.mkv", None),
+        )
+        self.controller.queue_command = MagicMock(side_effect=side_effect)
+
+        response = self.test_app.post("/server/command/queue/movie.mkv")
+
+        self.assertEqual(200, response.status_code)
+        self.controller.get_model_files.assert_not_called()
+        command = self.controller.queue_command.call_args.args[0]
+        self.assertEqual("movie.mkv", command.filename)
 
     def test_queue_rejects_ascii_control_characters(self):
         for control_char in ("\n", "\r", "\t", "\x01", "\x7f"):

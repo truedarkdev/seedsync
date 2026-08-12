@@ -138,6 +138,8 @@ class TestLftp(unittest.TestCase):
         lftp._Lftp__consecutive_status_errors = 0
         lftp._Lftp__last_command_timed_out = False
         lftp._Lftp__last_status_poll_healthy = True
+        lftp._Lftp__base_remote_dir_path = "/remote/default"
+        lftp._Lftp__base_local_dir_path = "/local/default"
         lftp._Lftp__path_pairs_by_id = {}
         lftp._Lftp__job_status_parser = MagicMock()
         lftp._Lftp__job_status_parser.parse.return_value = []
@@ -160,7 +162,8 @@ class TestLftp(unittest.TestCase):
 
         lftp._Lftp__run_command.assert_called_once_with(
             "queue pget -c \"/remote/movies/dup\" -o \"/local/movies/\"",
-            require_prompt_ready=False
+            require_prompt_ready=False,
+            low_latency=True,
         )
         lftp.logger.debug.assert_called_once_with(
             "queue command: %s",
@@ -174,8 +177,29 @@ class TestLftp(unittest.TestCase):
 
         lftp._Lftp__run_command.assert_called_once_with(
             "queue mirror -c \"/remote/movies/dup\" \"/local/movies/\"",
-            require_prompt_ready=False
+            require_prompt_ready=False,
+            low_latency=True,
         )
+
+    def test_queue_control_command_uses_zero_pexpect_delays_and_normal_prompt_wait(self):
+        lftp = self._build_status_poll_test_lftp()
+        lftp._Lftp__process.before = b"queue accepted"
+
+        def assert_zero_delays(*_args, **_kwargs):
+            self.assertEqual(0, lftp._Lftp__process.delaybeforesend)
+            self.assertEqual(0, lftp._Lftp__process.delayafterread)
+
+        lftp._Lftp__process.sendline.side_effect = assert_zero_delays
+        lftp._Lftp__process.expect.side_effect = assert_zero_delays
+
+        lftp.queue("queued.bin", False)
+
+        self.assertEqual(7, lftp._Lftp__process.delaybeforesend)
+        self.assertEqual(11, lftp._Lftp__process.delayafterread)
+        lftp._Lftp__process.sendline.assert_called_once_with(
+            'queue pget -c "/remote/default/queued.bin" -o "/local/default/"'
+        )
+        lftp._Lftp__process.expect.assert_called_once_with("prompt>", timeout=30)
 
     def test_kill_matches_duplicate_names_by_remote_path(self):
         lftp = self._build_test_lftp()
@@ -204,7 +228,11 @@ class TestLftp(unittest.TestCase):
         killed = lftp.kill("dup", path_pair_id="tv", remote_path="/remote/tv/dup", local_path="/local/tv")
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 9", require_prompt_ready=False)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 9",
+            require_prompt_ready=False,
+            low_latency=True,
+        )
 
     def test_status_annotates_path_pairs_from_job_paths(self):
         lftp = self._build_test_lftp()
@@ -2011,7 +2039,11 @@ class TestLftpKillPathMatching(unittest.TestCase):
         )
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 11",
+            require_prompt_ready=False,
+            low_latency=True,
+        )
 
     def test_kill_removes_all_matching_running_jobs(self):
         lftp = TestLftp._build_test_lftp()
@@ -2034,11 +2066,7 @@ class TestLftpKillPathMatching(unittest.TestCase):
             remote_path="/remote/downloads/dup.bin",
             local_path="/local/incomplete/dup.bin.lftp"
         )
-        lftp.status = MagicMock(side_effect=[
-            [status_1, status_2],
-            [status_2],
-            []
-        ])
+        lftp.status = MagicMock(return_value=[status_1, status_2])
 
         killed = lftp.kill(
             "dup.bin",
@@ -2051,6 +2079,11 @@ class TestLftpKillPathMatching(unittest.TestCase):
             [("kill 3",), ("kill 4",)],
             [call.args for call in lftp._Lftp__run_command.call_args_list]
         )
+        self.assertEqual(1, lftp.status.call_count)
+        self.assertTrue(all(call.kwargs == {
+            "require_prompt_ready": False,
+            "low_latency": True,
+        } for call in lftp._Lftp__run_command.call_args_list))
 
     def test_kill_does_not_retry_nonmatching_nonempty_status(self):
         lftp = TestLftp._build_test_lftp()
@@ -2097,10 +2130,12 @@ class TestLftpKillPathMatching(unittest.TestCase):
         )
 
         self.assertTrue(killed)
-        lftp._Lftp__run_command.assert_called_once_with("kill 3", require_prompt_ready=False)
-        lftp.logger.warning.assert_called_once_with(
-            "Kill did not converge for job 'dup.bin' after repeated matching polls"
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 3",
+            require_prompt_ready=False,
+            low_latency=True,
         )
+        self.assertEqual(1, lftp.status.call_count)
 
     def test_kill_retries_empty_status_before_giving_up(self):
         lftp = TestLftp._build_test_lftp()
@@ -2116,7 +2151,6 @@ class TestLftpKillPathMatching(unittest.TestCase):
         polls = iter([
             ([], False),
             ([status], True),
-            ([], True),
         ])
 
         def status_side_effect():
@@ -2130,9 +2164,11 @@ class TestLftpKillPathMatching(unittest.TestCase):
             killed = lftp.kill("rc")
 
         self.assertTrue(killed)
-        self.assertEqual(3, lftp.status.call_count)
+        self.assertEqual(2, lftp.status.call_count)
         sleep.assert_called_once_with(0.05)
-        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 11", require_prompt_ready=False, low_latency=True,
+        )
 
     def test_kill_retries_parser_failure_before_giving_up(self):
         lftp = TestLftp._build_test_lftp()
@@ -2148,7 +2184,6 @@ class TestLftpKillPathMatching(unittest.TestCase):
         polls = iter([
             (None, False),
             ([status], True),
-            ([], True),
         ])
 
         def status_side_effect():
@@ -2162,9 +2197,11 @@ class TestLftpKillPathMatching(unittest.TestCase):
             killed = lftp.kill("rc")
 
         self.assertTrue(killed)
-        self.assertEqual(3, lftp.status.call_count)
+        self.assertEqual(2, lftp.status.call_count)
         sleep.assert_called_once_with(0.05)
-        lftp._Lftp__run_command.assert_called_once_with("kill 11", require_prompt_ready=False)
+        lftp._Lftp__run_command.assert_called_once_with(
+            "kill 11", require_prompt_ready=False, low_latency=True,
+        )
 
     def test_kill_retries_transient_empty_between_multiple_matches(self):
         lftp = TestLftp._build_test_lftp()
@@ -2186,12 +2223,7 @@ class TestLftpKillPathMatching(unittest.TestCase):
             remote_path="/remote/rc",
             local_path="/local/incomplete/rc.lftp"
         )
-        polls = iter([
-            ([first_status, second_status], True),
-            ([], False),
-            ([second_status], True),
-            ([], True),
-        ])
+        polls = iter([([first_status, second_status], True)])
 
         def status_side_effect():
             statuses, healthy = next(polls)
@@ -2204,9 +2236,9 @@ class TestLftpKillPathMatching(unittest.TestCase):
             killed = lftp.kill("rc")
 
         self.assertTrue(killed)
-        self.assertEqual(4, lftp.status.call_count)
+        self.assertEqual(1, lftp.status.call_count)
         self.assertEqual(
             [("kill 11",), ("kill 12",)],
             [call.args for call in lftp._Lftp__run_command.call_args_list]
         )
-        sleep.assert_called_once_with(0.05)
+        sleep.assert_not_called()

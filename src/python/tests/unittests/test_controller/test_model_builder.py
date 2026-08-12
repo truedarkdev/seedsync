@@ -110,6 +110,246 @@ class TestModelBuilder(unittest.TestCase):
             retained_model.get_file_ids(),
         )
 
+    def test_active_transfer_delta_builds_only_known_changed_root_and_adopts_live_model(self):
+        active = SystemFile("active.bin", 100, False)
+        retained = SystemFile("retained.bin", 200, False)
+        self.model_builder.set_remote_files([active, retained])
+        live_model = self.model_builder.build_model()
+
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "active.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertEqual({"active.bin"}, self.model_builder.active_transfer_delta_file_ids(
+            live_model.get_file_ids(),
+        ))
+        partial_build = self.model_builder.build_active_transfer_roots({"active.bin"})
+        partial_model = partial_build.model
+        self.assertEqual({"active.bin"}, partial_model.get_file_ids())
+        old_active = live_model.get_file("active.bin")
+        new_active = partial_model.get_file("active.bin")
+        live_model.update_file(new_active)
+        live_model.set_tree_file_count(
+            live_model.tree_file_count + 1 - 1
+        )
+
+        self.assertTrue(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), {"active.bin"}, partial_build,
+        ))
+        self.model_builder.adopt_active_transfer_delta(live_model, {"active.bin"}, partial_build)
+        self.assertFalse(self.model_builder.has_changes())
+        self.assertEqual(25, live_model.get_file("active.bin").transferred_size)
+        self.assertEqual(200, live_model.get_file("retained.bin").remote_size)
+        self.assertNotEqual(old_active, new_active)
+
+    def test_active_transfer_delta_falls_back_for_unknown_or_terminal_status_root(self):
+        self.model_builder.set_remote_files([SystemFile("known.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+
+        unknown = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "unknown.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([unknown])
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+        # Re-establish a cached baseline, then prove that status disappearance
+        # is never treated as partial-root removal authority.
+        self.model_builder.build_model()
+        self.model_builder.set_lftp_statuses([])
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+    def test_active_transfer_delta_uses_scoped_identity_not_same_basename_pair(self):
+        first = SystemFile("release.bin", 100, False)
+        first.path_pair_id = "first"
+        second = SystemFile("release.bin", 200, False)
+        second.path_pair_id = "second"
+        self.model_builder.set_remote_files([first, second])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        status.path_pair_id = "second"
+        status.total_transfer_state = LftpJobStatus.TransferState(50, 200, 25, 10, 15)
+        self.model_builder.set_lftp_statuses([status])
+
+        second_id = ModelFile.build_file_id("release.bin", "second")
+        self.assertEqual({second_id}, self.model_builder.active_transfer_delta_file_ids(
+            live_model.get_file_ids(),
+        ))
+        self.assertEqual({second_id}, self.model_builder.build_active_transfer_roots(
+            {second_id},
+        ).model.get_file_ids())
+
+    def test_active_transfer_delta_falls_back_when_scan_or_persist_inputs_change(self):
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "root.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_stopped_files({"root.bin"})
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+        self.model_builder.build_model()
+        running = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([running])
+        self.model_builder.set_remote_files([SystemFile("root.bin", 101, False)])
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+    def test_active_transfer_delta_adoption_does_not_mask_later_full_reconciliation(self):
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(20, 100, 20, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+        partial = self.model_builder.build_active_transfer_roots({"root.bin"})
+        live_model.update_file(partial.model.get_file("root.bin"))
+        self.assertTrue(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), {"root.bin"}, partial,
+        ))
+        self.model_builder.adopt_active_transfer_delta(live_model, {"root.bin"}, partial)
+
+        self.model_builder.set_remote_files([SystemFile("root.bin", 101, False)])
+        self.assertTrue(self.model_builder.has_changes())
+        self.assertEqual(101, self.model_builder.build_model().get_file("root.bin").remote_size)
+
+    def test_active_transfer_delta_rejects_active_root_outside_changed_status_roots(self):
+        self.model_builder.set_remote_files([
+            SystemFile("first.bin", 100, False),
+            SystemFile("second.bin", 100, False),
+        ])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "first.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([status])
+        self.model_builder.set_active_files([SystemFile("second.bin", 10, False)])
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+    def test_active_transfer_delta_rejects_legacy_extraction_name_ambiguity(self):
+        first = SystemFile("release.bin", 100, False)
+        first.path_pair_id = "first"
+        second = SystemFile("release.bin", 100, False)
+        second.path_pair_id = "second"
+        self.model_builder.set_remote_files([first, second])
+        self.model_builder.set_extracted_files({"release.bin"})
+        live_model = self.model_builder.build_model()
+        self.assertNotEqual(ModelFile.State.EXTRACTED, live_model.get_file(
+            ModelFile.build_file_id("release.bin", "first"),
+        ).state)
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        status.path_pair_id = "first"
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(live_model.get_file_ids()))
+
+    def test_active_transfer_delta_selector_does_not_walk_effective_source_maps(self):
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([status])
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__build_effective_local_files",
+                side_effect=AssertionError("selector must not walk source maps"),
+        ):
+            self.assertEqual({"root.bin"}, self.model_builder.active_transfer_delta_file_ids(
+                lambda file_id: file_id == "root.bin",
+            ))
+
+    def test_active_transfer_delta_rejects_legacy_extraction_ambiguity_with_status_only_root(self):
+        self.model_builder.set_remote_files([SystemFile("release.bin", 100, False)])
+        self.model_builder.set_extracted_files({"release.bin"})
+        first = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        second = LftpJobStatus(
+            2, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        second.path_pair_id = "other"
+        self.model_builder.set_lftp_statuses([first, second])
+        live_model = self.model_builder.build_model()
+        changed_first = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        changed_first.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([changed_first, second])
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(
+            lambda file_id: file_id in live_model.get_file_ids(),
+        ))
+
+    def test_active_transfer_delta_rejects_legacy_extraction_ambiguity_with_active_only_root(self):
+        selected = SystemFile("release.bin", 100, False)
+        selected.path_pair_id = "selected"
+        self.model_builder.set_remote_files([selected])
+        self.model_builder.set_extracted_files({"release.bin"})
+        active_only = SystemFile("release.bin", 10, False)
+        active_only.path_pair_id = "active-only"
+        self.model_builder.set_active_files([active_only])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "release.bin", "",
+        )
+        status.path_pair_id = "selected"
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        self.model_builder.set_lftp_statuses([status])
+
+        self.assertIsNone(self.model_builder.active_transfer_delta_file_ids(
+            lambda file_id: file_id == ModelFile.build_file_id("release.bin", "selected"),
+        ))
+
+    def test_active_transfer_delta_commits_recent_snapshot_for_later_status_absence(self):
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        self.model_builder.set_local_files([SystemFile("root.bin", 20, False, is_staging=True)])
+        live_model = self.model_builder.build_model()
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "",
+        )
+        status.total_transfer_state = LftpJobStatus.TransferState(65, 100, 65, 10, 4)
+        self.model_builder.set_lftp_statuses([status])
+        partial = self.model_builder.build_active_transfer_roots({"root.bin"})
+        self.assertTrue(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), {"root.bin"}, partial,
+        ))
+        live_model.update_file(partial.model.get_file("root.bin"))
+        self.model_builder.adopt_active_transfer_delta(live_model, {"root.bin"}, partial)
+
+        self.assertEqual(65, self.model_builder._ModelBuilder__recent_live_transfer_snapshots[
+            "root.bin"
+        ].size_local)
+        self.model_builder.set_lftp_statuses([])
+        reconciled = self.model_builder.build_model()
+        self.assertEqual(65, reconciled.get_file("root.bin").transferred_size)
+
+    def test_active_transfer_delta_authorization_rejection_leaves_live_model_untouched(self):
+        self.model_builder.set_remote_files([SystemFile("root.bin", 100, False)])
+        live_model = self.model_builder.build_model()
+        before_version = live_model.version
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root.bin", "",
+        )
+        self.model_builder.set_lftp_statuses([status])
+        partial = self.model_builder.build_active_transfer_roots({"root.bin"})
+        self.model_builder.set_remote_files([SystemFile("root.bin", 101, False)])
+
+        self.assertFalse(self.model_builder.authorize_active_transfer_delta(
+            live_model.get_file_ids(), {"root.bin"}, partial,
+        ))
+        self.assertEqual(before_version, live_model.version)
+        self.assertTrue(self.model_builder.has_changes())
+
     def test_build_model_suppresses_temp_model_logs_without_mutating_shared_dummy_logger(self):
         root_logger = logging.getLogger()
         root_level = root_logger.level
@@ -198,6 +438,108 @@ class TestModelBuilder(unittest.TestCase):
         rebuilt_model = self.model_builder.build_model()
         self.assertIsNot(live_model, rebuilt_model)
         self.assertEqual(11, rebuilt_model.get_file("root").remote_size)
+
+    def test_adopt_applied_model_accepts_explicitly_applied_side_effect(self):
+        self.model_builder.set_remote_files([SystemFile("root", 10, False)])
+        built_model = self.model_builder.build_model()
+        downloaded_token = self.model_builder.set_downloaded_files({"root"})
+        self.assertTrue(self.model_builder.invalidation_token_matches_file(
+            downloaded_token, "root",
+        ))
+        live_model = Model()
+        applied_file = built_model.get_file("root")
+        applied_file.state = ModelFile.State.DOWNLOADED
+        live_model.add_file(applied_file)
+
+        self.model_builder.adopt_applied_model(
+            built_model,
+            live_model,
+            {downloaded_token},
+        )
+
+        self.assertIs(live_model, self.model_builder.build_model())
+        self.assertFalse(self.model_builder.has_changes())
+
+    def test_adopt_applied_model_preserves_unacknowledged_invalidation(self):
+        self.model_builder.set_remote_files([SystemFile("root", 10, False)])
+        built_model = self.model_builder.build_model()
+        self.model_builder.set_downloaded_files({"root"})
+        self.model_builder.set_remote_files([SystemFile("root", 11, False)])
+        live_model = Model()
+
+        self.model_builder.adopt_applied_model(
+            built_model,
+            live_model,
+            set(),
+        )
+
+        rebuilt_model = self.model_builder.build_model()
+        self.assertIsNot(live_model, rebuilt_model)
+        self.assertEqual(11, rebuilt_model.get_file("root").remote_size)
+
+    def test_adopt_applied_model_does_not_merge_same_category_downloaded_events(self):
+        self.model_builder.set_remote_files([
+            SystemFile("first", 10, False),
+            SystemFile("second", 10, False),
+        ])
+        built_model = self.model_builder.build_model()
+        self.model_builder.set_downloaded_files({"first"})
+        second_token = self.model_builder.set_downloaded_files({"first", "second"})
+        live_model = Model()
+        applied_file = built_model.get_file("second")
+        applied_file.state = ModelFile.State.DOWNLOADED
+        live_model.add_file(applied_file)
+
+        self.model_builder.adopt_applied_model(
+            built_model,
+            live_model,
+            {second_token},
+        )
+
+        rebuilt_model = self.model_builder.build_model()
+        self.assertIsNot(live_model, rebuilt_model)
+        self.assertEqual(ModelFile.State.DELETED, rebuilt_model.get_file("first").state)
+        self.assertEqual(ModelFile.State.DELETED, rebuilt_model.get_file("second").state)
+
+    def test_adopt_applied_model_does_not_merge_same_category_move_failure_events(self):
+        self.model_builder.set_remote_files([
+            SystemFile("first", 10, False),
+            SystemFile("second", 10, False),
+        ])
+        built_model = self.model_builder.build_model()
+        self.model_builder.set_move_failed_files({"first"})
+        second_token = self.model_builder.set_move_failed_files({"first", "second"})
+        live_model = Model()
+        applied_file = built_model.get_file("second")
+        applied_file.state = ModelFile.State.MOVE_FAILED
+        live_model.add_file(applied_file)
+
+        self.model_builder.adopt_applied_model(
+            built_model,
+            live_model,
+            {second_token},
+        )
+
+        rebuilt_model = self.model_builder.build_model()
+        self.assertIsNot(live_model, rebuilt_model)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, rebuilt_model.get_file("first").state)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, rebuilt_model.get_file("second").state)
+
+    def test_invalidation_token_requires_exact_single_file_event(self):
+        self.model_builder.set_remote_files([
+            SystemFile("first", 10, False),
+            SystemFile("second", 10, False),
+        ])
+        self.model_builder.build_model()
+        downloaded_token = self.model_builder.set_downloaded_files({"first", "second"})
+        move_failed_token = self.model_builder.set_move_failed_files({"first", "second"})
+
+        self.assertFalse(self.model_builder.invalidation_token_matches_file(
+            downloaded_token, "second",
+        ))
+        self.assertFalse(self.model_builder.invalidation_token_matches_file(
+            move_failed_token, "second",
+        ))
 
     def test_equal_remote_scan_preserves_shared_system_tree_and_cached_model(self):
         retained_root = SystemFile("root", 10, True)
@@ -4699,12 +5041,13 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.build_model()
         self.assertFalse(self.model_builder.has_changes())
 
-        # Invalidates even on same active files
+        # Equal active snapshots are no-ops; rebuilding them would starve
+        # status-only root deltas behind a full model walk.
         self.model_builder.set_active_files([
             SystemFile("a", 10),
             SystemFile("b", 20)
         ])
-        self.assertTrue(self.model_builder.has_changes())
+        self.assertFalse(self.model_builder.has_changes())
         self.model_builder.build_model()
 
         # Invalidates when the active overlay is cleared after previously being populated
@@ -4762,7 +5105,7 @@ class TestModelBuilder(unittest.TestCase):
 
         self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_LOCAL_FILES])
         self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_REMOTE_FILES])
-        self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_ACTIVE_FILES])
+        self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_ACTIVE_FILES])
         self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_LFTP_STATUSES])
         self.assertEqual(2, counters[MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS])
         self.assertEqual(1, counters[MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS])

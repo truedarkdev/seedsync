@@ -6,10 +6,12 @@ import multiprocessing
 import logging
 import pickle
 import queue
+import threading
 from collections import deque
 from datetime import datetime
 import sys
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -330,6 +332,117 @@ class TestScannerProcess(unittest.TestCase):
 
         wake.assert_called_once_with()
         self.assertIs(result, self.process.pop_latest_result())
+
+    def test_latest_result_pop_is_bounded_when_queue_is_replenished(self):
+        class ReplenishedQueue:
+            def __init__(self):
+                self.calls = 0
+
+            def get(self, block=False):
+                self.calls += 1
+                return ScannerResult(
+                    datetime.now(), [SystemFile("root-{}".format(self.calls), self.calls)],
+                    generation=self.calls,
+                )
+
+        process = object.__new__(ScannerProcess)
+        process.logger = MagicMock()
+        queue = ReplenishedQueue()
+        process._ScannerProcess__queue = queue
+
+        latest = process.pop_latest_result(max_items=7)
+
+        self.assertIsNotNone(latest)
+        self.assertEqual(7, queue.calls)
+        self.assertEqual(7, latest.generation)
+
+        # The producer remains active, but each subsequent controller tick
+        # still consumes only its own bounded window and sees that window's
+        # newest snapshot.
+        latest = process.pop_latest_result(max_items=7)
+        self.assertEqual(14, queue.calls)
+        self.assertEqual(14, latest.generation)
+
+    def test_pending_results_tracks_drained_queue_during_put_get_interleaving(self):
+        process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        result_queue = process._ScannerProcess__queue
+        self.assertIsNotNone(result_queue)
+        enqueued = threading.Event()
+        allow_put_return = threading.Event()
+        original_put = queue.Queue.put
+
+        def delayed_put(instance, item, block=True, timeout=None):
+            result = original_put(instance, item, block=block, timeout=timeout)
+            if instance is result_queue:
+                enqueued.set()
+                self.assertTrue(allow_put_return.wait(2))
+            return result
+
+        result = ScannerResult(datetime.now(), [])
+        with patch.object(queue.Queue, "put", delayed_put):
+            producer = threading.Thread(target=result_queue.put, args=(result,))
+            producer.start()
+            self.assertTrue(enqueued.wait(2))
+            self.assertIs(result, process.pop_latest_result())
+            allow_put_return.set()
+            producer.join(2)
+
+        self.assertFalse(producer.is_alive())
+        self.assertFalse(process.has_pending_results())
+
+    def test_bounded_pop_results_keeps_final_snapshot_pending_until_later_tick(self):
+        process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__queue.maxsize = 256
+        ordinary = [
+            ScannerResult(
+                datetime.now(), [SystemFile("root-{}".format(index), index)],
+                scanned_path_pair_ids={"pair"}, is_progress=True, is_scan_final=False,
+            )
+            for index in range(130)
+        ]
+        final = ScannerResult(
+            datetime.now(), [SystemFile("final", 1)], scanned_path_pair_ids={"pair"},
+            is_progress=True, is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+        for result in ordinary + [final]:
+            process._ScannerProcess__publish_result(result)
+
+        first_batch = process.pop_results()
+
+        self.assertEqual(128, len(first_batch))
+        self.assertTrue(process.has_pending_results())
+        second_batch = process.pop_results()
+        self.assertIn(final, second_batch)
+        self.assertFalse(process.has_pending_results())
+
+    def test_release_marker_counts_toward_bounded_pop_and_does_not_hide_final_snapshot(self):
+        process = ScannerProcess(scanner=SimpleNamespace(), interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        process._ScannerProcess__queue.maxsize = 256
+        process._ScannerProcess__queue.put_nowait(_ScannerQueueReleaseMarker())
+        ordinary = [
+            ScannerResult(
+                datetime.now(), [SystemFile("root-{}".format(index), index)],
+                scanned_path_pair_ids={"pair"}, is_progress=True, is_scan_final=False,
+            )
+            for index in range(128)
+        ]
+        final = ScannerResult(
+            datetime.now(), [SystemFile("final", 1)], scanned_path_pair_ids={"pair"},
+            is_progress=True, is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+        )
+        for result in ordinary + [final]:
+            process._ScannerProcess__publish_result(result)
+
+        first_batch = process.pop_results()
+
+        self.assertEqual(127, len(first_batch))
+        self.assertTrue(process.has_pending_results())
+        second_batch = process.pop_results()
+        self.assertIn(final, second_batch)
+        self.assertFalse(process.has_pending_results())
 
     def test_real_spawn_with_production_breadcrumb_and_log_transport(self):
         self._scan_run_patcher.stop()
@@ -709,6 +822,45 @@ class TestScannerProcess(unittest.TestCase):
         process.run_loop()
 
         self.assertLess(time.monotonic() - started_at, 0.2)
+
+    def test_force_scan_coalesces_requests_during_active_scan(self):
+        started = threading.Event()
+        release = threading.Event()
+        active_lock = threading.Lock()
+        active_count = 0
+        max_active_count = 0
+        scan_calls = 0
+
+        def scan():
+            nonlocal active_count, max_active_count, scan_calls
+            scan_calls += 1
+            with active_lock:
+                active_count += 1
+                max_active_count = max(max_active_count, active_count)
+            started.set()
+            self.assertTrue(release.wait(2))
+            with active_lock:
+                active_count -= 1
+            return []
+
+        scanner = DummyScanner()
+        scanner.scan = scan
+        process = ScannerProcess(scanner=scanner, interval_in_ms=0, verbose=False)
+        self.addCleanup(process.close_queues)
+        process.force_scan()
+        worker = threading.Thread(target=process.run_loop)
+        worker.start()
+        self.assertTrue(started.wait(2))
+        for path_pair_id in (None, "pair-a", "pair-a", "pair-b", None, "pair-c"):
+            process.force_scan(path_pair_id)
+        with process._ScannerProcess__scan_target_queue.mutex:
+            self.assertEqual([None], list(process._ScannerProcess__scan_target_queue.queue))
+        release.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(1, max_active_count)
+        process.run_loop()
+        self.assertEqual(2, scan_calls)
 
     def test_prioritize_scan_interrupts_full_worker_then_schedules_selected_pair_and_full_followup(self):
         process = ScannerProcess(
