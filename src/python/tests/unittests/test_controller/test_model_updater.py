@@ -957,6 +957,72 @@ class TestModelUpdater(unittest.TestCase):
         ])
         self.assertEqual({("pair", "unchanged.bin")}, accumulator.touched_keys())
 
+    def test_progressive_full_snapshot_touches_only_actual_pair_changes(self):
+        accumulator = _ProgressiveScanAccumulator()
+        original = [
+            SystemFile("removed.bin", 1),
+            SystemFile("changed.bin", 2),
+            SystemFile("same.bin", 3),
+        ]
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), original, scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        unchanged = [SystemFile("removed.bin", 1), SystemFile("changed.bin", 2), SystemFile("same.bin", 3)]
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), unchanged, scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertEqual(set(), accumulator.touched_keys())
+
+        updated = [
+            SystemFile("changed.bin", 4),
+            SystemFile("same.bin", 3),
+            SystemFile("added.bin", 5),
+        ]
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), updated, scanned_path_pair_ids={"pair"}, generation=3,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+        self.assertEqual(
+            {("pair", "removed.bin"), ("pair", "changed.bin"), ("pair", "added.bin")},
+            accumulator.touched_keys(),
+        )
+        self.assertEqual(
+            {("pair", "changed.bin"), ("pair", "same.bin"), ("pair", "added.bin")},
+            set(accumulator.snapshot()),
+        )
+        self.assertEqual(
+            {("pair", "changed.bin"), ("pair", "same.bin"), ("pair", "added.bin")},
+            set(accumulator.authority()),
+        )
+
+    def test_progressive_accumulator_proves_repeated_empty_full_snapshot(self):
+        accumulator = _ProgressiveScanAccumulator()
+        for generation in (1, 2):
+            accumulator.apply([
+                ScannerResult(
+                    datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=generation,
+                    is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                    is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+                ),
+            ])
+            self.assertEqual(set(), accumulator.touched_keys())
+            self.assertEqual(set(), set(accumulator.snapshot()))
+            self.assertEqual(
+                set() if generation == 1 else {"pair"},
+                accumulator.final_comparison_proven_pairs(),
+            )
+
     def test_joint_session_refresh_keeps_last_good_output_unknown_until_both_sides_refresh(self):
         local_accumulator = _ProgressiveScanAccumulator()
         remote_accumulator = _ProgressiveScanAccumulator()
@@ -1528,6 +1594,66 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.build_model.assert_not_called()
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
+
+    def test_unchanged_remote_full_snapshot_skips_renderer_and_full_build(self):
+        remote_token = "remote-unchanged-final"
+        local_token = "local-standing-final"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        unchanged_remote = self._progressive_final_result(remote_token, generation=2)
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [unchanged_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        model_builder.reset_mock()
+        updater.update()
+
+        model_builder.build_progressive_roots.assert_not_called()
+        model_builder.build_model.assert_not_called()
+
+    def test_unchanged_completed_generation_skips_declared_pair_publication(self):
+        remote_token = "remote-unchanged-declared-final"
+        local_token = "local-standing-declared-final"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        unchanged_remote = self._progressive_final_result(remote_token, generation=2)
+        builder = ModelBuilder()
+        model = Model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False, model_builder=builder, model=model,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [unchanged_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        builder.build_authoritative_pair_roots = MagicMock(
+            wraps=builder.build_authoritative_pair_roots,
+        )
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        builder.set_local_files = MagicMock(wraps=builder.set_local_files)
+        builder.set_remote_files = MagicMock(wraps=builder.set_remote_files)
+        updater.update()
+
+        builder.build_authoritative_pair_roots.assert_not_called()
+        builder.build_model.assert_not_called()
+        builder.set_local_files.assert_not_called()
+        builder.set_remote_files.assert_not_called()
+        self.assertTrue(controller._Controller__progressive_joint_authoritative)
+        self.assertTrue(controller._Controller__last_local_reconciliation_healthy)
+        self.assertTrue(controller._Controller__last_remote_reconciliation_healthy)
 
     def test_later_progressive_final_event_republishes_against_standing_authority(self):
         remote_token = "remote-later-final"

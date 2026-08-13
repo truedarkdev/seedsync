@@ -274,6 +274,10 @@ class _ProgressiveScanAccumulator:
     def __init__(self) -> None:
         self.__session_token: Optional[str] = None
         self.__committed_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
+        # A completed pair may be intentionally empty.  Keep that authority
+        # separate from the file map so a later empty full snapshot can be
+        # proven unchanged without confusing it with a fresh accumulator.
+        self.__committed_pairs: set[Optional[str]] = set()
         self.__working: dict[int, dict[Optional[str], dict[str, SystemFile]]] = {}
         self.__manifests: dict[int, dict[Optional[str], Optional[set[str]]]] = {}
         self.__active_generation: dict[Optional[str], int] = {}
@@ -283,6 +287,7 @@ class _ProgressiveScanAccumulator:
         self.__completed_pairs: set[Optional[str]] = set()
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
+        self.__last_final_comparison_proven_pairs: set[Optional[str]] = set()
 
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
@@ -300,6 +305,7 @@ class _ProgressiveScanAccumulator:
         self.__completed_pairs.clear()
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys.clear()
+        self.__last_final_comparison_proven_pairs.clear()
 
     @property
     def session_token(self) -> Optional[str]:
@@ -347,6 +353,7 @@ class _ProgressiveScanAccumulator:
 
     def apply(self, events: Sequence[ScannerResult]) -> Optional[ScannerResult]:
         self.__last_touched_keys = set()
+        self.__last_final_comparison_proven_pairs = set()
         if not events:
             return None
         if self.__session_token is None:
@@ -396,6 +403,7 @@ class _ProgressiveScanAccumulator:
                     self.__last_touched_keys.add((pair_id, name))
                 self.__committed_by_pair.pop(pair_id, None)
                 self.__authoritative_by_pair.pop(pair_id, None)
+                self.__committed_pairs.add(pair_id)
             for file in latest.files:
                 pair_id = file.path_pair_id if file.path_pair_id in selected_ids else (
                     next(iter(selected_ids)) if len(selected_ids) == 1 else file.path_pair_id
@@ -464,6 +472,8 @@ class _ProgressiveScanAccumulator:
                 full_snapshot_ids = set(getattr(event, "full_snapshot_path_pair_ids", set()))
                 full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
                     and pair_id in full_snapshot_ids
+                previous_committed = self.__committed_by_pair.get(pair_id, {})
+                comparison_proven = pair_id in self.__committed_pairs
                 if full_snapshot:
                     # The final aggregate is lossless even when intermediate
                     # queue events were dropped. Rebuild this pair from it;
@@ -487,7 +497,10 @@ class _ProgressiveScanAccumulator:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
                         continue
-                    previous_file = working.get(file.name)
+                    previous_file = (
+                        previous_committed.get(file.name)
+                        if full_snapshot else working.get(file.name)
+                    )
                     working[file.name] = file
                     self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
                     # A new progressive generation starts from committed
@@ -502,12 +515,6 @@ class _ProgressiveScanAccumulator:
                 # let it complete a pair or prove absence; the same scan's
                 # lossless full snapshot is the authority boundary.
                 if full_snapshot and pair_id in event.completed_path_pair_ids:
-                    self.__last_touched_keys.update(
-                        (pair_id, name) for name in self.__committed_by_pair.get(pair_id, {})
-                    )
-                    self.__last_touched_keys.update(
-                        (pair_id, name) for name in working
-                    )
                     manifest_names = self.__manifests.get(generation, {}).get(pair_id)
                     if manifest_names is not None:
                         for name in list(working):
@@ -515,11 +522,19 @@ class _ProgressiveScanAccumulator:
                                 working.pop(name, None)
                         for name in manifest_names:
                             self.__authoritative_by_pair.setdefault(pair_id, {}).setdefault(name, None)
+                    self.__last_touched_keys.update(
+                        (pair_id, name)
+                        for name in set(previous_committed).union(working)
+                        if previous_committed.get(name) != working.get(name)
+                    )
                     for name, file in working.items():
                         self.__committed_by_pair.setdefault(pair_id, {})[name] = file
                     for name in [name for name in self.__committed_by_pair.get(pair_id, {}) if name not in working]:
                         self.__committed_by_pair[pair_id].pop(name, None)
                         self.__authoritative_by_pair.get(pair_id, {}).pop(name, None)
+                    if comparison_proven:
+                        self.__last_final_comparison_proven_pairs.add(pair_id)
+                    self.__committed_pairs.add(pair_id)
                     completed.add(pair_id)
                     self.__incomplete_pairs.discard(pair_id)
                     self.__completed_pairs.add(pair_id)
@@ -598,6 +613,10 @@ class _ProgressiveScanAccumulator:
 
     def completed_pairs(self) -> set[Optional[str]]:
         return set(self.__completed_pairs)
+
+    def final_comparison_proven_pairs(self) -> set[Optional[str]]:
+        """Return final pairs compared against prior accumulator authority."""
+        return set(self.__last_final_comparison_proven_pairs)
 
     def has_session_progressive_evidence(self) -> bool:
         """Return whether this session supplied non-empty scan evidence."""
@@ -1611,7 +1630,32 @@ class ModelUpdater(_ControllerCoreAccess):
                 not joint_unknown_local_ids.intersection(scoped_final_pair_ids)
             )) \
             and (not progressive_mode or progressive_scan_event_arrived)
-        if progressive_mode and joint_reconciler is not None and joint_reconciliation_final:
+
+        def final_event_comparison_proven(
+                side: str, result: Optional[ScannerResult],
+        ) -> bool:
+            if result is None or not bool(getattr(result, "is_scan_final", True)) or \
+                    bool(getattr(result, "failed", False)) or \
+                    bool(getattr(result, "unknown_path_pair_ids", set())):
+                return True
+            pair_ids = set(getattr(result, "completed_path_pair_ids", set()))
+            accumulator = getattr(controller, "_Controller__progressive_{}_scan_state".format(side), None)
+            return bool(pair_ids) and isinstance(accumulator, _ProgressiveScanAccumulator) and \
+                pair_ids.issubset(accumulator.final_comparison_proven_pairs())
+
+        progressive_final_noop_proven = (
+            final_event_comparison_proven("local", latest_local_scan)
+            and final_event_comparison_proven("remote", latest_remote_scan)
+        )
+        progressive_final_publication_required = (
+            not progressive_mode
+            or not joint_reconciliation_final
+            or not bool(getattr(controller, "_Controller__progressive_joint_authoritative", False))
+            or bool(progressive_joint_delta_keys)
+            or not progressive_final_noop_proven
+        )
+        if progressive_mode and joint_reconciler is not None and joint_reconciliation_final and \
+                progressive_final_publication_required:
             if scoped_final_pair_ids:
                 joint_local_files, joint_remote_files, joint_unknown_local_ids = joint_reconciler.reconcile_pairs(
                     local_snapshot, local_authority, local_incomplete, local_completed,
@@ -1645,7 +1689,10 @@ class ModelUpdater(_ControllerCoreAccess):
             not progressive_mode
             or (
                 progressive_scan_event_arrived
-                and (joint_reconciliation_final or progressive_joint_partial_publication)
+                and (
+                    (joint_reconciliation_final and progressive_final_publication_required)
+                    or progressive_joint_partial_publication
+                )
             )
         )
 
