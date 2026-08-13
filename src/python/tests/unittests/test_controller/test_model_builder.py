@@ -5981,8 +5981,13 @@ class TestModelBuilder(unittest.TestCase):
         entries = self.__trace_entries(collector)
         messages = [entry["message"] for entry in entries]
         self.assertEqual(
-            {"persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication"},
-            set(messages),
+            [
+                "persist_authority_before",
+                "persist_authority_after",
+                "model_candidate",
+                "model_live_publication",
+            ],
+            messages,
         )
         before = next(entry for entry in entries if entry["message"] == "persist_authority_before")
         after = next(entry for entry in entries if entry["message"] == "persist_authority_after")
@@ -6029,6 +6034,76 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual("absent", missing_entry["details"]["candidate_state"])
         self.assertNotIn(subject_name, str(missing_entry))
         self.assertNotIn(subject_id, str(missing_entry))
+
+    def test_stable_downloaded_model_requires_explicit_lifecycle_marker_for_persist_trace(self):
+        collector = self.__enable_trace()
+        remote_files = [
+            SystemFile("stable-{}.bin".format(index), 100, False)
+            for index in range(256)
+        ]
+        local_files = [
+            SystemFile("stable-{}.bin".format(index), 100, False)
+            for index in range(256)
+        ]
+        self.model_builder.set_remote_files(remote_files)
+        self.model_builder.set_local_files(local_files)
+
+        recorder = self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_lifecycle_persist_breadcrumb",
+                wraps=recorder,
+        ) as record:
+            model = self.model_builder.build_model()
+
+        self.assertEqual(256, len(model.get_file_ids()))
+        record.assert_not_called()
+        self.assertEqual([], [
+            entry for entry in self.__trace_entries(collector)
+            if entry["message"] in {"persist_authority_before", "persist_authority_after"}
+        ])
+
+        subject_id = ModelFile.build_file_id("stable-0.bin", None)
+        self.model_builder.set_downloaded_files({subject_id})
+        recorder = self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_lifecycle_persist_breadcrumb",
+                wraps=recorder,
+        ) as record:
+            self.model_builder.build_model()
+
+        self.assertEqual(
+            ["persist_authority_before", "persist_authority_after"],
+            [call.args[0] for call in record.call_args_list],
+        )
+        entries = self.__trace_entries(collector)
+        self.assertEqual(
+            {"persist_authority_before", "persist_authority_after"},
+            {
+                entry["message"] for entry in entries
+                if entry["message"] in {"persist_authority_before", "persist_authority_after"}
+            },
+        )
+
+        final_move_subject_id = ModelFile.build_file_id("stable-1.bin", None)
+        self.model_builder.set_downloaded_files(set())
+        self.model_builder.set_final_move_succeeded_files({final_move_subject_id})
+        recorder = self.model_builder._ModelBuilder__record_lifecycle_persist_breadcrumb
+        with patch.object(
+                self.model_builder,
+                "_ModelBuilder__record_lifecycle_persist_breadcrumb",
+                wraps=recorder,
+        ) as record:
+            self.model_builder.build_model()
+
+        self.assertEqual(
+            ["persist_authority_before", "persist_authority_after"],
+            [call.args[0] for call in record.call_args_list],
+        )
+        before_details = record.call_args_list[0].args[2]
+        self.assertFalse(before_details["downloaded_marker_present"])
+        self.assertTrue(before_details["final_move_marker_present"])
 
     def test_lifecycle_recorders_do_not_enumerate_marker_sets_while_trace_disabled(self):
         class IterationSentinel:

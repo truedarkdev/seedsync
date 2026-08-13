@@ -3650,8 +3650,7 @@ class ModelBuilder:
         model_file.final_move_succeeded = model_file.file_id in self.__final_move_succeeded_files
         downloaded_marker_present = model_file.file_id in (self.__downloaded_files or set())
         final_move_marker_present = model_file.file_id in self.__final_move_succeeded_files
-        lifecycle_subject = downloaded_marker_present or final_move_marker_present or \
-            model_file.state == ModelFile.State.DOWNLOADED
+        lifecycle_subject = downloaded_marker_present or final_move_marker_present
         if lifecycle_subject:
             self.__record_lifecycle_persist_breadcrumb("persist_authority_before", model_file, {
                 "local_present": local is not None,
