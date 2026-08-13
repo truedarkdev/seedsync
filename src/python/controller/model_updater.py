@@ -2426,9 +2426,17 @@ class ModelUpdater(_ControllerCoreAccess):
             and not model_builder.has_changes()
         )
         if progressive_delta_eligible:
+            progressive_local_delta_files = [
+                file for file in joint_local_files
+                if (file.path_pair_id, file.name) in progressive_joint_delta_keys
+            ]
+            progressive_remote_delta_files = [
+                file for file in joint_remote_files
+                if (file.path_pair_id, file.name) in progressive_joint_delta_keys
+            ]
             partial_model = model_builder.build_progressive_roots(
-                joint_local_files,
-                joint_remote_files,
+                progressive_local_delta_files,
+                progressive_remote_delta_files,
                 joint_unknown_local_ids,
             )
             delta_file_ids = {

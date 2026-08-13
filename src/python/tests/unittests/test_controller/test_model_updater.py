@@ -2284,8 +2284,20 @@ class TestModelUpdater(unittest.TestCase):
                 full_snapshot_path_pair_ids={None} if final else set(),
             )
 
-        first_remote = SystemFile("first.bin", 10)
-        first_local = SystemFile("first.bin", 5)
+        def deep_first_root(size: int) -> SystemFile:
+            root = SystemFile("first.bin", size, True)
+            parent = root
+            for depth in range(24):
+                child = SystemFile(f"nested-{depth}", size, True)
+                parent.add_child(child)
+                parent = child
+            parent.add_child(SystemFile("payload.bin", size, False))
+            return root
+
+        # The first progressive wave is deliberately deep and retained.  The
+        # second wave must not pass it into the partial renderer again.
+        first_remote = deep_first_root(10)
+        first_local = deep_first_root(5)
         second_remote = SystemFile("second.bin", 20)
         second_local = SystemFile("second.bin", 7)
         final_remote = [first_remote, second_remote]
@@ -2313,11 +2325,18 @@ class TestModelUpdater(unittest.TestCase):
 
         updater.update()
         self.assertEqual({"first.bin"}, model.get_file_names())
+        retained_first_root = model.get_file("first.bin")
         controller._refresh_model_file_command_identities_locked.assert_called_once_with()
         updater.update()
         self.assertEqual({"first.bin", "second.bin"}, model.get_file_names())
+        self.assertIs(retained_first_root, model.get_file("first.bin"))
         self.assertEqual(2, controller._refresh_model_file_command_identities_locked.call_count)
         self.assertEqual(2, builder.build_progressive_roots.call_count)
+        first_delta_call, second_delta_call = builder.build_progressive_roots.call_args_list
+        self.assertEqual({"first.bin"}, {file.name for file in first_delta_call.args[0]})
+        self.assertEqual({"first.bin"}, {file.name for file in first_delta_call.args[1]})
+        self.assertEqual({"second.bin"}, {file.name for file in second_delta_call.args[0]})
+        self.assertEqual({"second.bin"}, {file.name for file in second_delta_call.args[1]})
         builder.build_model.assert_not_called()
 
         updater.update()
