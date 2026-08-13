@@ -16,6 +16,15 @@ PUBLIC_EXPORTS = [
     "AutoQueuePattern", "IScanner", "ScannerResult", "ScannerProcess", "ScannerError",
     "ValidateProcess", "ValidateStatus", "ValidateStatusResult",
 ]
+SCAN_PUBLIC_EXPORTS = [
+    "IScanner", "ScannerResult", "ScannerProcess", "ScannerError",
+    "ActiveScanner", "MultiPathActiveScanner", "LocalScanner",
+    "MultiPathLocalScanner", "MultiPathRemoteScanner", "RemoteScanLease", "RemoteScanner",
+]
+SCAN_MODULE_EXPORTS = [
+    "scanner_process", "active_scanner", "multi_path_active_scanner", "local_scanner",
+    "multi_path_scanner", "remote_scanner",
+]
 
 
 class TestControllerPackage(unittest.TestCase):
@@ -69,6 +78,72 @@ print(json.dumps({
         self.assertEqual(sorted(PUBLIC_EXPORTS), imports["wildcard_exports"])
         self.assertTrue(imports["unknown_attribute_raises"])
 
+    def test_scan_package_preserves_exports_and_unknown_attribute_behavior(self):
+        script = """
+import json
+
+import controller.scan as scan
+from controller.scan import (
+    IScanner, ScannerResult, ScannerProcess, ScannerError,
+    ActiveScanner, MultiPathActiveScanner, LocalScanner,
+    MultiPathLocalScanner, MultiPathRemoteScanner, RemoteScanLease, RemoteScanner,
+)
+from controller.scan import (
+    scanner_process, active_scanner, multi_path_active_scanner,
+    local_scanner, multi_path_scanner, remote_scanner,
+)
+from controller.scan.scanner_process import ScannerProcess as DirectScannerProcess
+
+namespace = {}
+exec("from controller.scan import *", namespace)
+try:
+    getattr(scan, "NotAnExport")
+except AttributeError:
+    unknown_attribute_raises = True
+else:
+    unknown_attribute_raises = False
+
+print(json.dumps({
+    "explicit_exports": [
+        IScanner.__name__, ScannerResult.__name__, ScannerProcess.__name__, ScannerError.__name__,
+        ActiveScanner.__name__, MultiPathActiveScanner.__name__, LocalScanner.__name__,
+        MultiPathLocalScanner.__name__, MultiPathRemoteScanner.__name__,
+        RemoteScanLease.__name__, RemoteScanner.__name__,
+    ],
+    "module_identities": [
+        scanner_process.__name__, active_scanner.__name__, multi_path_active_scanner.__name__,
+        local_scanner.__name__, multi_path_scanner.__name__, remote_scanner.__name__,
+    ],
+    "scanner_identity_preserved": ScannerProcess is DirectScannerProcess,
+    "wildcard_exports": sorted(name for name in namespace if not name.startswith("__")),
+    "unknown_attribute_raises": unknown_attribute_raises,
+}))
+"""
+        environment = os.environ.copy()
+        python_path = str(PYTHON_ROOT)
+        if environment.get("PYTHONPATH"):
+            python_path += os.pathsep + environment["PYTHONPATH"]
+        environment["PYTHONPATH"] = python_path
+
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=PYTHON_ROOT,
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        imports = json.loads(result.stdout)
+
+        self.assertEqual(sorted(SCAN_PUBLIC_EXPORTS), sorted(imports["explicit_exports"]))
+        self.assertTrue(imports["scanner_identity_preserved"])
+        self.assertEqual(sorted(SCAN_PUBLIC_EXPORTS + SCAN_MODULE_EXPORTS), imports["wildcard_exports"])
+        self.assertEqual(
+            [f"controller.scan.{name}" for name in SCAN_MODULE_EXPORTS],
+            imports["module_identities"],
+        )
+        self.assertTrue(imports["unknown_attribute_raises"])
+
     def test_scanner_submodule_import_does_not_load_unrelated_controller_modules(self):
         script = """
 import json
@@ -86,9 +161,17 @@ unrelated = {
     "controller.validate",
     "controller.validate.validate_process",
 }
+siblings = {
+    "controller.scan.active_scanner",
+    "controller.scan.multi_path_active_scanner",
+    "controller.scan.local_scanner",
+    "controller.scan.multi_path_scanner",
+    "controller.scan.remote_scanner",
+}
 print(json.dumps({
     "scanner_loaded": "controller.scan.scanner_process" in sys.modules,
     "unrelated_loaded": sorted(unrelated.intersection(sys.modules)),
+    "siblings_loaded": sorted(siblings.intersection(sys.modules)),
 }))
 """
         environment = os.environ.copy()
@@ -109,3 +192,4 @@ print(json.dumps({
 
         self.assertTrue(imports["scanner_loaded"])
         self.assertEqual([], imports["unrelated_loaded"])
+        self.assertEqual([], imports["siblings_loaded"])
