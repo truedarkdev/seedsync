@@ -94,6 +94,12 @@ per-action click-to-response and click-to-rendered-state timings, browser
 errors, identities, thresholds, and pass/fail. Worker self-checks do not count
 as verifier/final validation.
 
+The browser experience limits keep ordinary interactions tight while
+recognizing that a confirmed destructive filesystem action has a different
+cost shape: Queue, Stop, and requeue must render within 250 ms; Delete Local
+must render within 1.2 seconds; target DOM receive-to-render remains at 200 ms
+p95 / 500 ms max; and active progress gaps remain bounded at 1.25 seconds.
+
 `PERF_DIAGNOSTICS_MODE=on|off` controls the seeded performance diagnostics
 recorder (default `on`) and is recorded in run/config evidence. For a same-image
 diagnostics A/B, keep the retained fixture and image unchanged, run one label

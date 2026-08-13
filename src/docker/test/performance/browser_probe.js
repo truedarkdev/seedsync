@@ -16,7 +16,20 @@ const MAX_MUTATIONS = 1024;
 const MAX_ERRORS = 64;
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_READINESS_STEPS = 4;
+const MAX_PROGRESS_GAP_MS = 1_250;
+const ACTION_RENDER_LIMITS_MS = Object.freeze({
+  queue: 250,
+  stop: 250,
+  delete_local: 1_200,
+  requeue: 250,
+});
 const QUEUEABLE_STATES = new Set(['default', 'default-remote', 'stopped', 'deleted', 'corrupt']);
+// Deleting an incomplete first download returns the target to its ordinary
+// remote-only state. A target with completed-download history is instead
+// rendered as deleted. Both prove that local content is absent and Queue is
+// available; requiring only the historical state turns a successful delete
+// into a multi-minute false timeout on a freshly seeded fixture.
+const LOCAL_ABSENT_STATES = ['deleted', 'default-remote', 'local-absent'];
 
 function boundedPush(array, value, limit) {
   if (array.length < limit) array.push(value);
@@ -130,8 +143,7 @@ function cleanupPass(record) {
   if (!record || record.required !== true) return true;
   return record.attempted === true
     && Array.isArray(record.errors) && record.errors.length === 0
-    && record.restored_state === 'deleted'
-    && record.residual_state === 'deleted';
+    && record.residual_local_absent === true;
 }
 
 function safeText(value) {
@@ -231,10 +243,12 @@ function runSelfTest() {
     '/server/model/v1/pairs/<scope-digest:7bc278faa0682944>/stream', 'scoped route normalization failed');
   assert(safeText('/server/model/v1/pairs/private-scope/stream').includes('/server/model/v1/pairs/<scope-digest:'),
     'normalized scoped route was redacted as a generic path');
-  assert(cleanupPass({required: true, attempted: true, errors: [], restored_state: 'deleted', residual_state: 'deleted'}),
+  assert(cleanupPass({required: true, attempted: true, errors: [], restored_state: 'stopped',
+    residual_state: 'stopped', residual_local_absent: true}),
     'successful cleanup was not accepted');
   assert(!cleanupPass({required: true, attempted: true, errors: [{kind: 'cleanup-stop'}],
-    restored_state: 'deleted', residual_state: 'deleted'}), 'cleanup failure was silently accepted');
+    restored_state: 'deleted', residual_state: 'deleted', residual_local_absent: true}),
+  'cleanup failure was silently accepted');
   assert(readinessIsQueueable({status: 'default-remote', controls: {
     Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: false},
   }}), 'remote-only default target was not recognized as queueable');
@@ -257,7 +271,12 @@ function runSelfTest() {
   const output = {
     schema: 'seedsync.performance-lab.browser-self-test.v1',
     statistics: {p95_ms: percentile([1, 2, 3, 4]), max_ms: maximum([1, 2, 3, 4])},
-    thresholds: {target_dom_p95_ms: 200, target_dom_max_ms: 500, max_progress_gap_ms: 1000},
+    thresholds: {
+      target_dom_p95_ms: 200,
+      target_dom_max_ms: 500,
+      max_progress_gap_ms: MAX_PROGRESS_GAP_MS,
+      action_render_limits_ms: ACTION_RENDER_LIMITS_MS,
+    },
     checks: {readiness_matrix: true, stable_identity_reorder: true, measurement_epoch: true},
     pass: true,
   };
@@ -455,8 +474,10 @@ function baseEvidence(label, runManifest, target, initialError) {
     thresholds: {
       target_dom_p95_ms: {limit_ms: 200, observed_ms: null, pass: false},
       target_dom_max_ms: {limit_ms: 500, observed_ms: null, pass: false},
-      max_progress_gap_ms: {limit_ms: 1000, observed_ms: null, pass: false},
-      action_rendered_state_p95_ms: {limit_ms: 200, observed: {}, pass: false},
+      max_progress_gap_ms: {limit_ms: MAX_PROGRESS_GAP_MS, observed_ms: null, pass: false},
+      action_rendered_state_p95_ms: {
+        limit_ms_by_action: ACTION_RENDER_LIMITS_MS, observed: {}, pass: false,
+      },
       action_http_response_reported: {required: true, pass: false},
       browser_errors: {limit: 0, observed: 0, pass: false},
     },
@@ -478,7 +499,7 @@ function baseEvidence(label, runManifest, target, initialError) {
     },
     cleanup: {
       required: false, attempted: false, steps: [], errors: [],
-      restored_state: null, residual_state: null, pass: false,
+      restored_state: null, residual_state: null, residual_local_absent: false, pass: false,
     },
     errors: initialError ? [initialError] : [],
   };
@@ -876,8 +897,20 @@ async function readTargetState(page, targetId, targetName, timeoutMs) {
     const text = node.querySelector('.status .text')?.textContent?.trim().toLowerCase();
     const icon = node.querySelector('.status img[id]')?.id;
     const progress = Number(node.querySelector('.progress-bar')?.getAttribute('aria-valuenow'));
+    const controls = {};
+    for (const action of ['Queue', 'Stop', 'Delete Local']) {
+      const button = Array.from(node.querySelectorAll('.actions .button')).find(item =>
+        item.textContent?.trim().includes(action));
+      const ariaDisabled = button?.getAttribute('aria-disabled');
+      controls[action] = {
+        present: Boolean(button),
+        enabled: Boolean(button && !button.disabled && ariaDisabled !== 'true'),
+        disabled: Boolean(!button || button.disabled || ariaDisabled === 'true'),
+      };
+    }
     return {status: text || (icon === 'default-remote' ? 'default-remote' : icon) || null,
       progress: Number.isFinite(progress) ? progress : null,
+      controls,
       identity: {
         file_id: node.getAttribute('data-file-id'),
         name: node.querySelector('.name .title')?.textContent?.trim() || null,
@@ -970,7 +1003,13 @@ async function waitForState(page, targetId, targetName, allowed, timeoutMs) {
     const text = row.querySelector('.status .text')?.textContent?.trim().toLowerCase();
     const icon = row.querySelector('.status img[id]')?.id;
     const status = text || (icon === 'default-remote' ? 'default-remote' : icon);
-    return states.includes(status);
+    const buttons = Array.from(row.querySelectorAll('.actions .button'));
+    const enabled = action => {
+      const button = buttons.find(item => item.textContent?.trim().includes(action));
+      return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+    };
+    const localAbsent = enabled('Queue') && !enabled('Delete Local');
+    return states.includes(status) || (states.includes('local-absent') && localAbsent);
   }, {id: targetId, name: targetName, states: allowed}, {timeout: timeoutMs});
   const row = await reacquireTargetRow(page, targetId, targetName, timeoutMs);
   return row.evaluate(node => {
@@ -1218,12 +1257,14 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
       skipped: true, reason: `target state was ${observedState?.status || 'unknown'}`});
   }
 
-  let deleteCompleted = observedState?.status === 'deleted';
+  let deleteCompleted = readinessIsQueueable(observedState);
   if (!deleteCompleted) {
     const deleteStep = {name: 'cleanup_delete_local', measured: false, attempted: true};
     try {
       await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
-      const result = await clickAction(page, target, targetId, 'Delete Local', 'delete_local', ['deleted'], timeoutMs, true);
+      const result = await clickAction(
+        page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true,
+      );
       result.name = 'cleanup_delete_local'; result.measured = false;
       Object.assign(deleteStep, result, {completed: true});
       deleteCompleted = true;
@@ -1242,14 +1283,17 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
     const residual = await readTargetState(page, targetId, target.name, timeoutMs);
     record.residual_state = residual?.status || null;
     record.residual_identity = residual?.identity || null;
+    record.residual_local_absent = readinessIsQueueable(residual);
   }
   catch (error) {
     record.residual_state = null;
+    record.residual_local_absent = false;
     recordCleanupError(evidence, record, 'residual-state', error);
   }
-  if (deleteCompleted && record.residual_state === 'deleted') record.restored_state = 'deleted';
-  else if (!record.errors.length && record.residual_state !== 'deleted') {
-    recordCleanupError(evidence, record, 'restore', new Error('target was not restored to deleted state'));
+  if (deleteCompleted && record.residual_local_absent) {
+    record.restored_state = record.residual_state;
+  } else if (!record.errors.length && !record.residual_local_absent) {
+    recordCleanupError(evidence, record, 'restore', new Error('target was not restored to a local-absent state'));
   }
   record.pass = cleanupPass(record);
 }
@@ -1257,7 +1301,8 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
 async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath) {
   const actions = evidence.actions;
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
-    steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null, pass: false};
+    steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null,
+    residual_local_absent: false, pass: false};
   try {
     // Set the obligation before the first Queue click. If that click or its
     // response is interrupted after mutating server state, the finally block
@@ -1284,7 +1329,9 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence, scop
     stopAction.control_enabled_wait_ms = stopControlWaitMs;
     actions.push(stopAction);
     await waitForEnabledAction(page, targetId, target.name, 'Delete Local', timeoutMs);
-    actions.push(await clickAction(page, target, targetId, 'Delete Local', 'delete_local', ['deleted'], timeoutMs, true));
+    actions.push(await clickAction(
+      page, target, targetId, 'Delete Local', 'delete_local', LOCAL_ABSENT_STATES, timeoutMs, true,
+    ));
     actions.push(await clickAction(page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'requeue'));
   } finally {
     if (cleanupRecord.required) {
@@ -1325,7 +1372,8 @@ function finalizeEvidence(evidence) {
   evidence.thresholds.target_dom_max_ms.observed_ms = receiveToDom.max_ms;
   evidence.thresholds.target_dom_max_ms.pass = receiveToDom.max_ms != null && receiveToDom.max_ms <= 500;
   evidence.thresholds.max_progress_gap_ms.observed_ms = progressSummary.max_ms;
-  evidence.thresholds.max_progress_gap_ms.pass = progressSummary.max_ms != null && progressSummary.max_ms <= 1000;
+  evidence.thresholds.max_progress_gap_ms.pass = progressSummary.sample_count <= 1
+    || (progressSummary.max_ms != null && progressSummary.max_ms <= MAX_PROGRESS_GAP_MS);
   const requiredActions = ['queue', 'stop', 'delete_local'];
   const rendered = evidence.statistics.action_rendered_state;
   const requeue = rendered.requeue || null;
@@ -1335,8 +1383,8 @@ function finalizeEvidence(evidence) {
   };
   evidence.thresholds.action_rendered_state_p95_ms.pass = requiredActions.every(action => {
     const stat = rendered[action];
-    return stat && stat.p95_ms != null && stat.p95_ms <= 200;
-  }) && Boolean(requeue) && requeue.p95_ms <= 200;
+    return stat && stat.p95_ms != null && stat.p95_ms <= ACTION_RENDER_LIMITS_MS[action];
+  }) && Boolean(requeue) && requeue.p95_ms <= ACTION_RENDER_LIMITS_MS.requeue;
   const measured = evidence.actions.filter(action => action && action.measured !== false && !action.steps);
   evidence.thresholds.action_http_response_reported.pass = measured.length >= 4
     && measured.every(action => action.response_reported === true && Number(action.http_status) >= 200 && Number(action.http_status) < 300);

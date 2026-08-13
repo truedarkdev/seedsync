@@ -1188,6 +1188,10 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "lastSignature" in source and "if (signature === lastSignature) return" in source
     assert "waitForEnabledAction" in source
     assert "control_enabled_wait_ms" in source
+    assert "MAX_PROGRESS_GAP_MS = 1_250" in source
+    assert "delete_local: 1_200" in source
+    assert "ACTION_RENDER_LIMITS_MS[action]" in source
+    assert "progressSummary.sample_count <= 1" in source
     progress_gap = source[source.index("function progressGap"):source.index("function latencyStats")]
     assert "progress > 0 && progress < 100" in progress_gap
     assert "status !== 'stopped'" in progress_gap and "status !== 'downloaded'" in progress_gap
@@ -1209,8 +1213,9 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     finally_block = source[source.index("} finally {"):source.index("function baseEvidence")]
     assert "await closeQuietly(context);" in finally_block
     assert "await closeQuietly(browser);" in finally_block
-    assert "['deleted']" in source
-    assert "record.restored_state = 'deleted'" in source
+    assert "const LOCAL_ABSENT_STATES = ['deleted', 'default-remote', 'local-absent']" in source
+    assert "record.residual_local_absent = readinessIsQueueable(residual)" in source
+    assert "record.restored_state = record.residual_state" in source
     assert "run_id_digest" in source and "image_tag_digest" in source and "project_digest" in source
     assert "stableDigest" in source
     assert "image: runManifest" not in source and "project: runManifest" not in source
