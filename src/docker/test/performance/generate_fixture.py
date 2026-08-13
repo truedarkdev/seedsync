@@ -71,7 +71,10 @@ def normalize_topology_spec(
                 "auto_queue": False,
                 "remote_only_targets": [
                     {
-                        "relative_path": "path-pair-01/active-queue-target/remote-only-target.bin",
+                        # Keep the active remote-only file at the pair root so
+                        # the dashboard's v1 root-page transport renders it
+                        # directly; child pages are not part of this harness.
+                        "relative_path": "path-pair-01/remote-only-target.bin",
                         "size_bytes": 32 * 1024 * 1024,
                     }
                 ],
@@ -361,11 +364,18 @@ def generate_fixture(
             _set_owner(target_path.parent, 1000, 1000, 0o775)
             _set_owner(target_path, 1000, 1000, 0o664)
             remote_only_count += 1
-            remote_only_directory_count += 1
+            pair_root = remote_root / directory
+            try:
+                remote_only_directory_count += len(target_path.parent.relative_to(pair_root).parts)
+            except ValueError:
+                remote_only_directory_count += 0
         directory_count_per_side += local_directories
         expected_nodes_by_pair[pair_id] = (
             pair["nodes_local"] + local_directories - 1
-            + len(pair["remote_only_targets"]) * 2
+            + sum(
+                1 + len((remote_root / target["relative_path"]).parent.relative_to(remote_root / directory).parts)
+                for target in pair["remote_only_targets"]
+            )
         )
         expected_file_counts_by_pair[pair_id] = pair["nodes_local"] + len(pair["remote_only_targets"])
     file_nodes_per_side = sum(pair["nodes_local"] for pair in spec["pairs"])

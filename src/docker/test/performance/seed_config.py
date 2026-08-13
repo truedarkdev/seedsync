@@ -15,6 +15,12 @@ from pathlib import Path
 from generate_fixture import _data_spec, config_fingerprint, normalize_topology_spec, topology_fingerprint
 
 
+# Mixed-profile transfer must remain observable for the browser timeline while
+# leaving the historical uniform profile unchanged.  This is a synthetic
+# fixture setting, not a production default.
+MIXED_RATE_LIMIT_BYTES_PER_SECOND = 2_000_000
+
+
 def _hash_secret(secret: str) -> str:
     salt = os.urandom(16)
     digest = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 200_000)
@@ -47,18 +53,22 @@ def _seed_persist(config_dir: Path, move_failure_mode: str, pair_ids: list[str])
 
 def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mode: str = "on",
                 move_failure_mode: str = "stale", remote_address: str = "remote",
-                profile: str = "uniform", high_card_enabled: bool = True) -> None:
+                profile: str = "uniform", high_card_enabled: bool = True,
+                diagnostics_mode: str = "on") -> None:
     if not api_token.strip():
         raise ValueError("api token must be nonblank")
     if pairs < 1 or pairs > 6:
         raise ValueError("pairs must be between 1 and 6")
     if breadcrumb_mode not in {"on", "off"}:
         raise ValueError("breadcrumb_mode must be on or off")
+    if diagnostics_mode not in {"on", "off"}:
+        raise ValueError("diagnostics_mode must be on or off")
     if move_failure_mode not in {"stale", "none"}:
         raise ValueError("move_failure_mode must be stale or none")
     if not remote_address.strip():
         raise ValueError("remote_address must be nonblank")
     breadcrumb_enabled = "True" if breadcrumb_mode == "on" else "False"
+    diagnostics_enabled = "True" if diagnostics_mode == "on" else "False"
     config_dir.mkdir(parents=True, exist_ok=True)
     try:
         os.chown(config_dir, 99, 100)
@@ -70,6 +80,7 @@ def seed_config(config_dir: Path, api_token: str, pairs: int = 6, breadcrumb_mod
         pass
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     spec = normalize_topology_spec(profile, pairs, high_card_enabled=high_card_enabled)
+    rate_limit = MIXED_RATE_LIMIT_BYTES_PER_SECOND if profile == "mixed" else 0
     pair_entries = [
         {
             "id": pair["id"],
@@ -95,7 +106,7 @@ browser_handover_recovery_version =
 disable_browser_auth = False
 breadcrumb_trace_enabled = {breadcrumb_enabled}
 breadcrumb_trace_retention_depth = 128
-performance_diagnostics_enabled = True
+performance_diagnostics_enabled = {diagnostics_enabled}
 performance_diagnostics_retention_depth = 120
 performance_diagnostics_sample_interval_seconds = 5
 config_api_redact_remote_details = True
@@ -117,7 +128,7 @@ num_max_connections_per_root_file = 4
 num_max_connections_per_dir_file = 4
 num_max_total_connections = 16
 use_temp_file = True
-rate_limit = 0
+rate_limit = {rate_limit}
 net_socket_buffer = 8M
 staging_path =
 protocol = sftp
@@ -164,6 +175,8 @@ delete_complete = True
     (config_dir / "settings.cfg").write_text(settings, encoding="utf-8")
     (config_dir / "path_pairs.json").write_text(
         json.dumps({"version": 1, "profile": profile,
+                    "diagnostics_mode": diagnostics_mode,
+                    "rate_limit_bytes_per_second": rate_limit,
                     "topology_fingerprint": topology_fingerprint(spec),
                     "config_fingerprint": config_fingerprint(spec),
                     "data_topology_spec": _data_spec(spec),
@@ -201,30 +214,36 @@ delete_complete = True
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-dir", type=Path, required=True)
-    parser.add_argument("--api-token", required=True)
     parser.add_argument("--pairs", type=int, default=6)
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"), default="on")
     parser.add_argument("--move-failure-mode", choices=("stale", "none"), default="stale")
     parser.add_argument("--remote-address", default="remote")
     parser.add_argument("--profile", choices=("uniform", "mixed"), default="uniform")
     parser.add_argument("--high-card-enabled", choices=("on", "off"), default="on")
+    parser.add_argument("--diagnostics-mode", choices=("on", "off"), default="on")
     args = parser.parse_args()
+    api_token = os.environ.get("PERF_API_TOKEN", "")
+    if not api_token.strip():
+        parser.error("PERF_API_TOKEN must be set to a nonblank value in the environment")
     spec = normalize_topology_spec(
         args.profile, args.pairs, high_card_enabled=args.high_card_enabled == "on"
     )
     seed_config(
         args.config_dir,
-        args.api_token,
+        api_token,
         args.pairs,
         args.breadcrumb_mode,
         args.move_failure_mode,
         args.remote_address,
         args.profile,
         args.high_card_enabled == "on",
+        args.diagnostics_mode,
     )
+    rate_limit = MIXED_RATE_LIMIT_BYTES_PER_SECOND if args.profile == "mixed" else 0
     print(json.dumps({"schema": "seedsync-performance-lab.config.v1", "pairs": len(spec["pairs"]),
                       "requested_pairs": args.pairs,
                       "profile": args.profile, "high_card_enabled": args.high_card_enabled == "on",
+                      "diagnostics_mode": args.diagnostics_mode,
                       "pair_node_counts": {
                           pair["id"]: {
                               "local": pair["nodes_local"], "remote": pair["nodes_remote"],
@@ -233,6 +252,7 @@ def main() -> int:
                           for pair in spec["pairs"]
                       },
                       "config_fingerprint": config_fingerprint(spec),
+                      "rate_limit_bytes_per_second": rate_limit,
                       "breadcrumb_mode": args.breadcrumb_mode, "move_failure_mode": args.move_failure_mode,
                       "remote_address": args.remote_address}))
     return 0

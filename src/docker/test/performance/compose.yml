@@ -52,12 +52,12 @@ services:
       - /lab/seed_config.py
       - --config-dir
       - /config
-      - --api-token
-      - "${PERF_API_TOKEN}"
       - --pairs
       - "${PERF_PAIRS:-6}"
       - --breadcrumb-mode
       - "${PERF_BREADCRUMB_MODE:-on}"
+      - --diagnostics-mode
+      - "${PERF_DIAGNOSTICS_MODE:-on}"
       - --move-failure-mode
       - "${PERF_MOVE_FAILURE_MODE:-stale}"
       - --remote-address

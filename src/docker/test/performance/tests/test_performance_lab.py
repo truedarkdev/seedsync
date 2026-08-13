@@ -2,7 +2,10 @@ import json
 import hashlib
 import os
 import re
+import shlex
+import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -12,7 +15,14 @@ PERF_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PERF_DIR))
 sys.path.insert(0, str(PERF_DIR.parents[2] / "python"))
 
-from capture_metrics import FIXED_METRICS, latest_model_status, summarize
+from capture_metrics import (
+    FIXED_METRICS,
+    latest_model_status,
+    latest_model_summary_status,
+    summarize,
+    summarize_docker_stats,
+    summarize_external,
+)
 import generate_fixture as fixture_module
 from generate_fixture import (
     MIXED_HIGH_CARD_NODES,
@@ -52,7 +62,7 @@ def test_mixed_profile_normalizes_roles_counts_and_enabled_state():
     assert spec["pairs"][1]["nodes_local"] == spec["pairs"][1]["nodes_remote"] == MIXED_HIGH_CARD_NODES
     assert spec["pairs"][1]["enabled"] is False
     target = spec["pairs"][0]["remote_only_targets"][0]
-    assert target["relative_path"].endswith("remote-only-target.bin")
+    assert target["relative_path"] == "path-pair-01/remote-only-target.bin"
     assert target["size_bytes"] >= 32 * 1024 * 1024
 
 
@@ -94,7 +104,7 @@ def test_mixed_config_records_roles_enabled_and_remote_target(tmp_path):
     assert [(pair["role"], pair["enabled"], pair["auto_queue"]) for pair in payload["path_pairs"]] == [
         ("ordinary-active", True, False), ("high-cardinality-idle", False, True)
     ]
-    assert payload["path_pairs"][0]["remote_only_targets"][0]["relative_path"].endswith("remote-only-target.bin")
+    assert payload["path_pairs"][0]["remote_only_targets"][0]["relative_path"] == "path-pair-01/remote-only-target.bin"
 
 
 def test_mixed_retained_manifest_reuses_fixture_but_refreshes_enabled_expectations(tmp_path, monkeypatch):
@@ -110,8 +120,8 @@ def test_mixed_retained_manifest_reuses_fixture_but_refreshes_enabled_expectatio
     assert disabled_manifest["topology"]["enabled_pair_ids"] == ["pair-01"]
     assert disabled_manifest["topology"]["local_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES
     assert disabled_manifest["topology"]["remote_file_nodes"] == 64 + fixture_module.MIXED_HIGH_CARD_NODES + 1
-    assert disabled_manifest["topology"]["local_directory_nodes"] + 1 == disabled_manifest["topology"]["remote_directory_nodes"]
-    target = remote_root / "path-pair-01" / "active-queue-target" / "remote-only-target.bin"
+    assert disabled_manifest["topology"]["local_directory_nodes"] == disabled_manifest["topology"]["remote_directory_nodes"]
+    target = remote_root / "path-pair-01" / "remote-only-target.bin"
     assert target.stat().st_size == 32 * 1024 * 1024
 
 
@@ -155,6 +165,46 @@ def test_seed_config_cli_metadata_uses_normalized_profile_counts():
     assert '"requested_pairs": args.pairs' in source
     assert '"pair_node_counts"' in source
     assert '"config_fingerprint": config_fingerprint(spec)' in source
+
+
+def test_seed_config_cli_reads_token_from_environment_only(tmp_path):
+    source = (PERF_DIR / "seed_config.py").read_text(encoding="utf-8")
+    compose = (PERF_DIR / "compose.yml").read_text(encoding="utf-8")
+    lab = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    assert "--api-token" not in source
+    assert "--api-token" not in compose
+    assert "--api-token" not in lab
+    token = "env-only-performance-token"
+    env = os.environ.copy()
+    env["PERF_API_TOKEN"] = token
+    config_dir = tmp_path / "config"
+    result = subprocess.run(
+        [sys.executable, str(PERF_DIR / "seed_config.py"), "--config-dir", str(config_dir), "--pairs", "1"],
+        capture_output=True, text=True, env=env, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert token not in result.stdout and token not in result.stderr
+    assert (config_dir / "settings.cfg").exists()
+    missing_env = env.copy()
+    missing_env.pop("PERF_API_TOKEN", None)
+    missing = subprocess.run(
+        [sys.executable, str(PERF_DIR / "seed_config.py"), "--config-dir", str(tmp_path / "missing")],
+        capture_output=True, text=True, env=missing_env, check=False,
+    )
+    assert missing.returncode != 0
+    assert "PERF_API_TOKEN" in missing.stderr
+    assert token not in missing.stdout and token not in missing.stderr
+
+
+def test_browser_dashboard_selects_pair_before_waiting_for_file_list():
+    source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
+    dashboard = source[source.find("await page.goto(new URL('/dashboard'"):source.find("await traverseTargetRows")]
+    assert "waitForDashboardShell(page, timeoutMs)" in dashboard
+    assert dashboard.index("selectPairFromSidebar(page, target.pair_name, timeoutMs)") < dashboard.index(
+        "page.locator('#file-list').waitFor({state: 'visible', timeout: timeoutMs})"
+    )
+    assert "const modeHandle = await page.waitForFunction" in source
+    assert "return 'direct'" in source and "return link ? 'sidebar' : false" in source
 
 
 def test_capture_uses_physical_cardinality_but_enabled_model_expectation():
@@ -220,7 +270,7 @@ def test_metrics_require_attributed_cpu_and_record_idle_phase():
     )
     assert summary["baseline_valid"] is True
     assert summary["full_scan_phase"]["dominant_stage"] == "local_scan_filesystem_traversal"
-    assert summary["settled_idle_phase"]["sample_count"] == 1
+    assert summary["settled_idle_phase"]["sample_count"] == 0
     assert summary["breadcrumb"]["mode"] == "on"
     assert summary["steady_idle_target_met"] is False
 
@@ -346,6 +396,212 @@ def test_latest_model_status_rejects_invalid_sequence_without_hiding_other_field
     assert latest_model_status(diagnostics) == (200001, None, 0)
 
 
+def test_model_summary_status_is_bounded_and_aggregates_cardinality_without_ids():
+    summary = {
+        "model_version": 7,
+        "path_pairs": [
+            {"path_pair_id": "private-a", "root_count": 2, "active_count": 1, "queued_count": 0, "completed_count": 1},
+            {"path_pair_id": "private-b", "root_count": 3, "active_count": 0, "queued_count": 2, "completed_count": 1},
+        ],
+    }
+    status = latest_model_summary_status(summary)
+    assert status == {
+        "root_count": 5, "model_version": 7, "pair_count": 2,
+        "active_count": 1, "queued_count": 2, "completed_count": 2,
+    }
+    assert "private-a" not in json.dumps(status)
+    assert latest_model_summary_status({"model_version": 1, "path_pairs": [{"root_count": "bad"}]})["root_count"] is None
+
+
+def test_external_summary_requires_stable_model_version_and_sanitized_docker_stats():
+    manifest = {
+        "fixture_fingerprint": "fixture", "config_fingerprint": "config",
+        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+                         "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}]}],
+    }
+    samples = [
+        {"sample_index": 1, "t_epoch_ms": 1000, "root_count": 2, "model_version": 4},
+        {"sample_index": 2, "t_epoch_ms": 2000, "root_count": 2, "model_version": 4},
+    ]
+    stats = [
+        {"t_epoch_ms": 1000, "cpu_percent": 8.0, "memory_percent": 3.0, "process_count": 4},
+        {"t_epoch_ms": 3000, "cpu_percent": 0.8, "memory_percent": 3.2, "process_count": 4},
+    ]
+    summary = summarize_external(samples, stats, manifest, "baseline", "off",
+        {"model_target_epoch_ms": 2000, "post_scan_settled_idle_observation_ms": 1000}, target_index=1,
+        remote_docker_stats=[
+            {"t_epoch_ms": 1000, "cpu_percent": 2.0, "memory_percent": 4.0},
+            {"t_epoch_ms": 3000, "cpu_percent": 2.1, "memory_percent": 4.1},
+        ])
+    assert summary["measurement_mode"] == "external-summary"
+    assert summary["baseline_valid"] is True
+    assert summary["model_version_stable"] is True
+    assert summary["external_docker_stats"]["sample_count"] == 2
+    assert summary["post_target_external_docker_stats"]["sample_count"] == 1
+    assert summary["steady_idle_target_met"] is True
+    assert summary["acceptance_valid"] is True
+
+
+def test_external_stats_parser_drops_malformed_samples():
+    summary = summarize_docker_stats([
+        {"t_epoch_ms": 1, "cpu_percent": 1.0, "memory_percent": 2.0},
+        {"t_epoch_ms": "bad", "cpu_percent": 3.0, "memory_percent": 4.0},
+    ])
+    assert summary["sample_count"] == 1
+
+
+def _settled_diagnostics(cpus):
+    metrics = {"model_update_builder_sync": {
+        "count": 1, "total_wall_seconds": 0.01, "total_cpu_seconds": 0.01,
+        "wall_time_percent": 1.0, "cpu_percent_one_core": 1.0,
+    }}
+    return {
+        "schema": "seedsync.performance-diagnostics.v1",
+        "counters": {"duration_spans_dropped": 0},
+        "samples": [{
+            "sequence": index + 1, "process_cpu_percent_one_core": cpu,
+            "cgroup_cpu_percent_one_core": cpu,
+            "gauges": {"model_tree_file_count": 200001},
+            "stage_window": {"elapsed_seconds": 1.0, "metrics": metrics if index < 2 else {}},
+        } for index, cpu in enumerate(cpus)],
+    }
+
+
+def test_app_cpu_acceptance_uses_settled_average_and_reports_peak_secondary():
+    manifest = {"fixture_fingerprint": "fixture", "topology": {
+        "expected_merged_model_tree_nodes": 200001,
+        "expected_model_tree_file_count": 200001,
+    }}
+    passed = summarize(_settled_diagnostics([75, 80, 0.8, 1.2, 1.0]), manifest, "candidate",
+                       min_high_cpu_samples=3, target_sequence=2, breadcrumb_mode="on")
+    assert passed["app_cpu_threshold_percent"] == 1.0
+    assert passed["app_cpu_average_percent_one_core"] == 1.0
+    assert passed["app_cpu_peak_percent_one_core"] == 1.2
+    assert passed["app_cpu_acceptance_pass"] is True
+    assert passed["acceptance_valid"] is True
+
+    failed = summarize(_settled_diagnostics([75, 80, 8.0, 12.5, 9.0]), manifest, "candidate",
+                       min_high_cpu_samples=3, target_sequence=2, breadcrumb_mode="on")
+    assert failed["app_cpu_average_percent_one_core"] > 1.0
+    assert failed["app_cpu_peak_percent_one_core"] == 12.5
+    assert failed["acceptance_valid"] is False
+
+
+def test_capture_cli_enforces_app_average_gate_for_candidate_and_baseline(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    diagnostics = tmp_path / "diagnostics.json"
+    output = tmp_path / "summary.json"
+    manifest.write_text(json.dumps({"fixture_fingerprint": "fixture", "topology": {
+        "expected_merged_model_tree_nodes": 200001,
+        "expected_model_tree_file_count": 200001,
+    }}), encoding="utf-8")
+    diagnostics.write_text(json.dumps(_settled_diagnostics([75, 80, 8.0, 12.5, 9.0])), encoding="utf-8")
+    command = [sys.executable, str(PERF_DIR / "capture_metrics.py"),
+               "--diagnostics", str(diagnostics), "--manifest", str(manifest),
+               "--output", str(output), "--label"]
+    candidate = subprocess.run(command + ["candidate", "--target-sequence", "2"], capture_output=True, text=True)
+    baseline = subprocess.run(command + ["baseline", "--target-sequence", "2"], capture_output=True, text=True)
+    capped = subprocess.run(command + ["candidate", "--target-sequence", "2",
+                                       "--settled-idle-cpu-percent", "2.0"],
+                            capture_output=True, text=True)
+    assert candidate.returncode == 2
+    assert baseline.returncode == 2
+    assert capped.returncode == 2
+    assert "no more than 1.0 for acceptance" in capped.stderr
+    summary = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["app_cpu_average_percent_one_core"] > 1.0
+    assert summary["acceptance_valid"] is False
+
+
+def test_capture_cli_rejects_empty_remote_helper_series_in_diagnostics_on_and_off(tmp_path):
+    manifest = tmp_path / "manifest.json"
+    diagnostics = tmp_path / "diagnostics.json"
+    app_stats = tmp_path / "app-stats.json"
+    remote_stats = tmp_path / "remote-stats.json"
+    model_summary = tmp_path / "model-summary.json"
+    timing = tmp_path / "timing.json"
+    output = tmp_path / "summary.json"
+    manifest.write_text(json.dumps({"fixture_fingerprint": "fixture", "topology": {
+        "expected_merged_model_tree_nodes": 200001,
+        "expected_model_tree_file_count": 200001,
+    }, "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+                        "remote_only_targets": []}]}), encoding="utf-8")
+    diagnostics.write_text(json.dumps(_settled_diagnostics([75, 80, 0.8, 1.0, 1.0])), encoding="utf-8")
+    app_stats.write_text(json.dumps({"samples": [
+        {"t_epoch_ms": 1000, "cpu_percent": 0.8, "memory_percent": 2.0},
+        {"t_epoch_ms": 2000, "cpu_percent": 0.9, "memory_percent": 2.1},
+    ]}), encoding="utf-8")
+    remote_stats.write_text(json.dumps({"samples": [
+        {"t_epoch_ms": "invalid", "cpu_percent": -1, "memory_percent": "invalid"},
+    ]}), encoding="utf-8")
+    model_summary.write_text(json.dumps({"samples": [
+        {"t_epoch_ms": 1000, "root_count": 1, "model_version": 1},
+        {"t_epoch_ms": 2000, "root_count": 1, "model_version": 1},
+    ]}), encoding="utf-8")
+    timing.write_text(json.dumps({"model_target_epoch_ms": 1000}), encoding="utf-8")
+    diagnostics_result = subprocess.run([
+        sys.executable, str(PERF_DIR / "capture_metrics.py"), "--diagnostics", str(diagnostics),
+        "--docker-stats", str(app_stats), "--manifest", str(manifest), "--output", str(output),
+        "--label", "candidate", "--target-sequence", "2", "--phase-timing", str(timing),
+    ], capture_output=True, text=True)
+    external_result = subprocess.run([
+        sys.executable, str(PERF_DIR / "capture_metrics.py"), "--mode", "external-summary",
+        "--model-summary", str(model_summary), "--docker-stats", str(app_stats),
+        "--remote-docker-stats", str(remote_stats),
+        "--manifest", str(manifest), "--output", str(output), "--label", "candidate",
+        "--target-sequence", "1", "--phase-timing", str(timing),
+    ], capture_output=True, text=True)
+    assert diagnostics_result.returncode == 2
+    assert external_result.returncode == 2
+    summary = json.loads(output.read_text(encoding="utf-8"))
+    assert summary["acceptance_checks"]["remote_helper_stats_available"] is False
+    assert summary["acceptance_valid"] is False
+
+
+def test_lab_rejects_unsafe_run_ids_and_cpu_threshold_above_acceptance_cap():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    assert "^[a-z0-9][a-z0-9_-]{0,63}$" in lab_source
+    assert '"run_id": os.environ["PERF_RUN_ID"]' not in lab_source
+    assert '"run_id_digest": hashlib.sha256' in lab_source
+    assert "> 1.0" in lab_source
+    wsl = shutil.which("wsl")
+    if wsl is None:
+        pytest.skip("WSL is unavailable for shell-level validation checks")
+    wsl_lab = str(PERF_DIR).replace("C:", "/mnt/c").replace("\\", "/") + "/lab.sh"
+    for run_id in ("../escape", "a/b", "UpperCase", "a\\b"):
+        command = f"PERF_IMAGE=synthetic PERF_RUN_ID={shlex.quote(run_id)} bash {shlex.quote(wsl_lab)} status"
+        result = subprocess.run([wsl, "bash", "-c", command], capture_output=True, text=True)
+        assert result.returncode == 2
+        assert "PERF_RUN_ID must be a lowercase safe slug" in result.stderr
+    command = f"PERF_IMAGE=synthetic PERF_SETTLED_IDLE_CPU_PERCENT=1.1 bash {shlex.quote(wsl_lab)} status"
+    result = subprocess.run([wsl, "bash", "-c", command], capture_output=True, text=True)
+    assert result.returncode == 2
+    assert "no more than 1.0 for acceptance" in result.stderr
+
+
+def test_external_summary_separates_app_and_remote_helper_resource_roles():
+    manifest = {"fixture_fingerprint": "fixture", "config_fingerprint": "config",
+                "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+                                 "remote_only_targets": []}]}
+    model_samples = [
+        {"t_epoch_ms": 1000, "root_count": 1, "model_version": 4},
+        {"t_epoch_ms": 2000, "root_count": 1, "model_version": 4},
+    ]
+    summary = summarize_external(
+        model_samples,
+        [{"t_epoch_ms": 1000, "cpu_percent": 1.2, "memory_percent": 3.0},
+         {"t_epoch_ms": 3000, "cpu_percent": 0.8, "memory_percent": 3.1}],
+        manifest, "candidate", "off", {"model_target_epoch_ms": 500}, target_index=1,
+        remote_docker_stats=[{"t_epoch_ms": 1000, "cpu_percent": 42.0, "memory_percent": 11.0},
+                             {"t_epoch_ms": 3000, "cpu_percent": 38.0, "memory_percent": 11.2}],
+    )
+    assert summary["app_docker_stats"]["role"] == "app"
+    assert summary["remote_helper_docker_stats"]["role"] == "remote-helper"
+    assert summary["post_target_app_docker_stats"]["average_cpu_percent_one_core"] == 1.0
+    assert summary["post_target_remote_helper_docker_stats"]["average_cpu_percent_one_core"] == 40.0
+    assert summary["app_cpu_acceptance_pass"] is True
+
+
 def test_docker_state_summaries_drop_private_inspect_payload_fields(tmp_path):
     sentinel = "PRIVATE_SENTINEL_TOKEN"
     private_fields = (
@@ -364,29 +620,72 @@ def test_docker_state_summaries_drop_private_inspect_payload_fields(tmp_path):
     container = json.loads(container_path.read_text(encoding="utf-8"))
     assert set(container) == {
         "schema", "role", "status", "running", "started_at", "finished_at",
-        "restart_count", "image", "platform", "size_rw_bytes", "size_rootfs_bytes",
+        "restart_count", "image_tag_digest", "platform", "size_rw_bytes", "size_rootfs_bytes",
         "mount_count", "resource_limits",
     }
     assert set(container["resource_limits"]) == {"nano_cpus", "memory_bytes", "pids_limit"}
 
-    image_fields = "\t".join(["amd64", "linux", "2026-01-01T00:00:00Z", "123", "2", *private_fields])
+    image_fields = "\t".join(["amd64", "linux", "2026-01-01T00:00:00Z", "123", "2", "sha256:immutable-image", *private_fields])
     image_path = tmp_path / "image.json"
     sanitize_docker_state._image(str(image_path), "app", image_fields)
     image = json.loads(image_path.read_text(encoding="utf-8"))
-    assert set(image) == {"schema", "role", "architecture", "os", "created_at", "size_bytes", "layer_count"}
+    assert set(image) == {"schema", "role", "architecture", "os", "created_at", "size_bytes", "layer_count", "identity_digest"}
+    assert len(image["identity_digest"]) == 64
     serialized = json.dumps({"container": container, "image": image})
     assert sentinel not in serialized
     assert "/config/private-mount" not in serialized
     assert "--command-with-secret" not in serialized
     assert "private-container-id" not in serialized
+    assert "immutable-image" not in serialized
 
 
 def test_lab_never_retains_raw_docker_logs_inspect_or_process_output():
     lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
     assert "docker logs" not in lab_source
-    assert "docker inspect \"$app_id\" >" not in lab_source
+    assert "docker inspect \"$app_id\" > \"$ARTIFACT_DIR" not in lab_source
     assert "docker top \"$app_id\" >" not in lab_source
     assert "app-exited-state.json" in lab_source
+
+
+def test_lab_sanitizes_user_controlled_docker_identifiers_and_compose_state():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    sanitizer = (PERF_DIR / "sanitize_docker_state.py").read_text(encoding="utf-8")
+    assert '"project_digest"' in lab_source
+    assert '"image_tag_digest"' in lab_source
+    assert '"remote_address_digest"' in lab_source
+    assert "compose-state.v1" in lab_source
+    assert 'compose ps >' not in lab_source
+    assert 'compose ps | tee' not in lab_source
+    assert '"image_tag_digest": _digest(image)' in sanitizer
+    assert '"image": image' not in sanitizer
+
+
+def test_browser_delete_local_requires_live_project_service_volume_and_marker_binding():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    browser_source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
+    assert "validate_browser_target_binding" in lab_source
+    assert "com.docker.compose.project" in lab_source
+    assert "com.docker.compose.service" in lab_source
+    assert 'item.get("Destination") == "/mounts"' in lab_source
+    assert "perf_local_fixture" in lab_source
+    assert ".seedsync-performance-fixture.json" in lab_source
+    assert "browser-target-binding.v1" in lab_source
+    assert "container_id_digest" in lab_source and "source_name_digest" in lab_source
+    assert "--binding" in lab_source and "bindingPath" in browser_source
+    assert "validated live app/project/service/volume/fixture binding" in browser_source
+    assert lab_source.index("validate_browser_target_binding") < lab_source.index(
+        "PERF_BROWSER_DESTRUCTIVE_APPROVED" , lab_source.index("browser()")
+    )
+
+
+def test_readme_documents_mixed_profile_through_browser_and_cpu_gate():
+    readme = (PERF_DIR / "README.md").read_text(encoding="utf-8")
+    flow = readme[readme.index("export PERF_PROFILE=mixed"):readme.index("Worker self-check", readme.index("export PERF_PROFILE=mixed"))]
+    browser_flow = readme[readme.index("For a browser timeline"):readme.index("The browser lane")]
+    assert "PERF_PROFILE=mixed" in flow and "PERF_PROFILE=mixed" in browser_flow
+    assert "lab.sh prepare" in flow and "lab.sh start" in browser_flow and "lab.sh browser candidate" in browser_flow
+    assert "settled app-container CPU average" in readme
+    assert "remote-helper" in readme
 
 
 def test_compose_uses_isolated_default_network_with_optional_external_overlay():
@@ -511,3 +810,166 @@ def test_mixed_disabled_pair_is_absent_from_seeded_persist(tmp_path):
     persisted = json.loads((config_dir / "controller.persist").read_text(encoding="utf-8"))
     assert persisted["downloaded"]
     assert all(json.loads(file_id)[0] == "pair-01" for file_id in persisted["downloaded"])
+
+
+def test_mixed_rate_limit_is_recorded_and_uniform_default_is_unchanged(tmp_path):
+    mixed_dir = tmp_path / "mixed-config"
+    uniform_dir = tmp_path / "uniform-config"
+    seed_config(mixed_dir, "local-test-token", profile="mixed", high_card_enabled=False)
+    seed_config(uniform_dir, "local-test-token", pairs=2, profile="uniform")
+
+    mixed_config = Config.from_file(str(mixed_dir / "settings.cfg"))
+    uniform_config = Config.from_file(str(uniform_dir / "settings.cfg"))
+    assert int(mixed_config.lftp.rate_limit) == 2_000_000
+    assert int(uniform_config.lftp.rate_limit) == 0
+    mixed_pairs = json.loads((mixed_dir / "path_pairs.json").read_text(encoding="utf-8"))
+    assert mixed_pairs["rate_limit_bytes_per_second"] == 2_000_000
+    assert mixed_pairs["diagnostics_mode"] == "on"
+
+
+def test_diagnostics_mode_is_seeded_and_recorded(tmp_path):
+    config_dir = tmp_path / "config"
+    seed_config(config_dir, "local-test-token", diagnostics_mode="off")
+    config = Config.from_file(str(config_dir / "settings.cfg"))
+    assert config.general.performance_diagnostics_enabled is False
+    payload = json.loads((config_dir / "path_pairs.json").read_text(encoding="utf-8"))
+    assert payload["diagnostics_mode"] == "off"
+
+
+def test_browser_harness_is_lazy_configurable_and_manifest_driven():
+    source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    assert "--self-test" in source
+    assert "process.env.PERF_API_TOKEN" in source
+    assert "require(moduleName)" in source
+    assert "PERF_PLAYWRIGHT_MODULE" in source
+    assert "NODE_PATH" in lab_source
+    assert "ordinary-active" in source and "remote_only_targets" in source
+    assert "active-queue-target" not in source and "remote-only-target.bin" not in source
+    assert "path_segments: parts[0] === pair.directory ? parts.slice(1) : parts" in source
+    assert "selectPairFromSidebar" in source and "visibleRowByName" in source
+    assert "MutationObserver" in source and "EventSource" in source
+    assert "eventSourceApply" in source and "receive_to_dom_ms" in source
+    assert "target_dom_latency" in source and "latencyStats" in source
+    assert "latestRelevantApply" in source and "/server/model/v1/" in source
+    assert "String(item.pathname || '') === String(scopedPath || '')" in source
+    assert "findScopedModelPath" in source and "model-summary" not in source
+    assert "target.pair_id === 'pair-01'" in source
+    assert "JSON.stringify(target).includes('pair-01')" in source
+    for event_name in ("model-page", "model-invalidate", "model-patch", "model-reset"):
+        assert event_name in source
+    assert "lastSignature" in source and "if (signature === lastSignature) return" in source
+    assert "waitForEnabledAction" in source
+    assert "control_enabled_wait_ms" in source
+    progress_gap = source[source.index("function progressGap"):source.index("function latencyStats")]
+    assert "progress > 0 && progress < 100" in progress_gap
+    assert "status !== 'stopped'" in progress_gap and "status !== 'downloaded'" in progress_gap
+    assert "await exerciseActions(page, target, targetId, timeoutMs, evidence)" in source
+    assert "readTargetId(page, target.name, timeoutMs)" in source
+    assert "async function readTargetId(page, name, timeoutMs)" in source
+    assert "const actions = evidence.actions" in source
+    assert "const cleanupRecord =" in source and "record.steps.push" in source
+    assert "evidence.actions = await exerciseActions" not in source
+    assert "expected_request_aborts" in source and "net::ERR_ABORTED" in source
+    assert "isNavigationRequest" in source and "resourceType" in source
+    assert "waitForActiveMaterialization" in source
+    active_materialization = source[
+        source.index("async function waitForActiveMaterialization"):
+        source.index("async function waitForEnabledAction")
+    ]
+    assert "progress > 0 && progress < 100" in active_materialization
+    assert "status === 'downloading'" not in active_materialization
+    finally_block = source[source.index("} finally {"):source.index("function baseEvidence")]
+    assert "await closeQuietly(context);" in finally_block
+    assert "await closeQuietly(browser);" in finally_block
+    assert "['deleted']" in source
+    assert "record.restored_state = 'deleted'" in source
+    assert "run_id_digest" in source and "image_tag_digest" in source and "project_digest" in source
+    assert "stableDigest" in source
+    assert "image: runManifest" not in source and "project: runManifest" not in source
+    assert "requestfailed" in source and "pageerror" in source
+    assert "Remember browser" in source and "first-run claim" in source
+    assert ".toLowerCase()" in source and "body.includes('remembered browser')" in source
+    assert "browser)" in lab_source and "--run-manifest" in lab_source
+    assert "PERF_HOST_PORT" in lab_source
+    assert "PERF_BROWSER_DESTRUCTIVE_APPROVED" in source
+    assert "PERF_BROWSER_DESTRUCTIVE_APPROVED" in lab_source
+    assert "Browser probe Delete Local targets" in lab_source
+    assert '"same_image_identity"' in lab_source
+    assert 'identity_digest' in lab_source
+    assert '--docker-stats "$app_docker_stats_series"' in lab_source
+    assert '--remote-docker-stats "$remote_docker_stats_series"' in lab_source
+    assert 'sample_docker_stats "$remote_docker_stats_series" remote-helper' in lab_source
+    assert '"model_target_epoch_ms": target' in lab_source
+    assert "summary_success_count" in lab_source
+    assert 'target_index="$summary_success_count"' in lab_source
+    assert "--image-identity-digest" in lab_source
+    assert "image_identity_digest" in source and "image_tag_digest" in source
+    assert "normalizeAppPath" in source and "<scope-digest:" in source
+    action_slice = source[source.index("async function exerciseActions"):source.index("function finalizeEvidence")]
+    assert "try {" in action_slice and "finally" in action_slice
+    assert "residual_state" in source and "cleanup.pass" in source
+    assert "PERF_DIAGNOSTICS_MODE" in lab_source
+    assert "model/v1/summary" in lab_source
+    assert "stats-sample" in lab_source and "docker-stats-series" in lab_source
+    assert "external-summary" in lab_source
+    assert "diagnostics-mode" in (PERF_DIR / "compose.yml").read_text(encoding="utf-8")
+    main_slice = source[source.find("async function main"):source.find("function baseEvidence")]
+    assert "process.env.PERF_API_TOKEN" in main_slice
+    assert "--api-token" not in main_slice
+
+
+def test_browser_self_test_is_documented_as_worker_check():
+    readme = (PERF_DIR / "README.md").read_text(encoding="utf-8")
+    assert "browser_probe.js --self-test" in readme
+    assert "worker self-check" in readme.lower()
+    assert "verifier/final validation" in readme
+
+
+def test_browser_probe_self_test_runs_without_playwright():
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is unavailable for the browser probe self-test")
+    result = subprocess.run(
+        [node, str(PERF_DIR / "browser_probe.js"), "--self-test"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["schema"] == "seedsync.performance-lab.browser-self-test.v1"
+    assert payload["pass"] is True
+
+
+def test_browser_probe_refuses_delete_actions_without_explicit_approval(tmp_path):
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("Node is unavailable for the browser probe approval check")
+    manifest_path = tmp_path / "fixture-manifest.json"
+    output_path = tmp_path / "browser-timeline.json"
+    manifest_path.write_text(json.dumps({
+        "schema": "seedsync.performance-lab.fixture.v1",
+        "synthetic_only": True,
+        "path_pairs": [{
+            "id": "pair-01",
+            "name": "Performance Pair 01",
+            "role": "ordinary-active",
+            "directory": "path-pair-01",
+            "local_path": "/mounts/path-pair-01",
+            "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}],
+        }],
+    }), encoding="utf-8")
+    environment = os.environ.copy()
+    environment["PERF_API_TOKEN"] = "synthetic-test-token"
+    environment.pop("PERF_BROWSER_DESTRUCTIVE_APPROVED", None)
+    result = subprocess.run([
+        node, str(PERF_DIR / "browser_probe.js"),
+        "--label", "candidate",
+        "--base-url", "http://127.0.0.1:18800",
+        "--manifest", str(manifest_path),
+        "--output", str(output_path),
+    ], capture_output=True, text=True, check=False, env=environment)
+    assert result.returncode != 0
+    payload = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload["pass"] is False
+    assert payload["failure_classification"] == "destructive-approval"
+    assert "PERF_BROWSER_DESTRUCTIVE_APPROVED=on" in result.stderr

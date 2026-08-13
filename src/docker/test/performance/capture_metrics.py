@@ -45,6 +45,7 @@ MODEL_BUILDER_INVALIDATION_COUNTERS = frozenset((
     "model_builder_cache_invalidation_clear",
     "model_builder_cache_invalidation_explicit",
 ))
+DEFAULT_SETTLED_IDLE_CPU_PERCENT = 1.0
 
 
 def _number(value: object) -> float | None:
@@ -63,6 +64,14 @@ def _sample_model_file_count(sample: dict[str, object]) -> int | None:
         return None
     value = gauges.get("model_tree_file_count")
     return int(value) if type(value) is int else None
+
+
+def percentile(values: Iterable[float], percentile_rank: float = 0.95) -> float | None:
+    numbers = sorted(float(value) for value in values if type(value) in (int, float) and value >= 0)
+    if not numbers:
+        return None
+    index = max(0, min(len(numbers) - 1, int(len(numbers) * percentile_rank + 0.999999) - 1))
+    return round(numbers[index], 3)
 
 
 def latest_model_status(
@@ -91,6 +100,205 @@ def latest_model_status(
     build_count = model_build.get("count") if isinstance(model_build, dict) else None
     build_count_value = build_count if type(build_count) is int and build_count >= 0 else None
     return model_count, sequence_value, build_count_value
+
+
+def latest_model_summary_status(summary: dict[str, object]) -> dict[str, int | None]:
+    """Reduce the authenticated model summary to bounded readiness fields.
+
+    The summary endpoint intentionally exposes only root-level aggregates.  We
+    retain no pair names, IDs, paths, or file records; ``root_count`` is the
+    cardinality used by the diagnostics-off readiness loop and ``model_version``
+    is the stability boundary.
+    """
+    if not isinstance(summary, dict):
+        return {"root_count": None, "model_version": None, "pair_count": None,
+                "active_count": None, "queued_count": None, "completed_count": None}
+    version = summary.get("model_version")
+    version = version if type(version) is int and version >= 0 else None
+    pairs = summary.get("path_pairs")
+    if not isinstance(pairs, list):
+        return {"root_count": None, "model_version": version, "pair_count": None,
+                "active_count": None, "queued_count": None, "completed_count": None}
+    totals = {"root_count": 0, "active_count": 0, "queued_count": 0, "completed_count": 0}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            return {"root_count": None, "model_version": version, "pair_count": None,
+                    "active_count": None, "queued_count": None, "completed_count": None}
+        for field in totals:
+            value = pair.get(field)
+            if type(value) is not int or value < 0:
+                return {"root_count": None, "model_version": version, "pair_count": None,
+                        "active_count": None, "queued_count": None, "completed_count": None}
+            totals[field] += value
+    return {**totals, "model_version": version, "pair_count": len(pairs)}
+
+
+def summarize_docker_stats(
+    samples: list[dict[str, object]], role: str | None = None,
+) -> dict[str, object]:
+    """Summarize sanitized external Docker CPU/memory samples."""
+    valid = []
+    for sample in samples if isinstance(samples, list) else []:
+        if not isinstance(sample, dict):
+            continue
+        cpu, memory, at_ms = sample.get("cpu_percent"), sample.get("memory_percent"), sample.get("t_epoch_ms")
+        if type(cpu) not in (int, float) or cpu < 0 or type(memory) not in (int, float) or memory < 0:
+            continue
+        if type(at_ms) is not int or at_ms < 0:
+            continue
+        valid.append({"cpu_percent": float(cpu), "memory_percent": float(memory), "t_epoch_ms": at_ms})
+    cpus = [item["cpu_percent"] for item in valid]
+    memories = [item["memory_percent"] for item in valid]
+    average_cpu = (sum(cpus) / len(cpus)) if cpus else None
+    average_memory = (sum(memories) / len(memories)) if memories else None
+    return {
+        "sample_count": len(valid),
+        "role": role,
+        "average_cpu_percent_one_core": average_cpu,
+        "peak_cpu_percent_one_core": max(cpus, default=None),
+        "average_memory_percent": average_memory,
+        "cpu_percent_p95": percentile(cpus),
+        "cpu_percent_max": max(cpus, default=None),
+        "memory_percent_p95": percentile(memories),
+        "memory_percent_max": max(memories, default=None),
+        "first_epoch_ms": valid[0]["t_epoch_ms"] if valid else None,
+        "last_epoch_ms": valid[-1]["t_epoch_ms"] if valid else None,
+    }
+
+
+def _expected_summary_root_count(manifest: dict[str, object]) -> int:
+    """Derive the synthetic fixture's compact-summary root cardinality.
+
+    Fixture buckets contain 2,048 files per first-level root.  Remote-only
+    targets seeded directly beneath the pair root add one compact root.
+    """
+    pairs = manifest.get("path_pairs") if isinstance(manifest, dict) else None
+    if not isinstance(pairs, list):
+        return 0
+    total = 0
+    for pair in pairs:
+        if not isinstance(pair, dict) or pair.get("enabled") is False:
+            continue
+        nodes = pair.get("nodes_local")
+        if type(nodes) is not int or nodes < 0:
+            continue
+        total += (nodes + 2047) // 2048
+        directory = pair.get("directory")
+        for target in pair.get("remote_only_targets", []):
+            if not isinstance(target, dict):
+                continue
+            parts = [part for part in str(target.get("relative_path", "")).split("/") if part]
+            if parts and parts[0] == directory:
+                parts = parts[1:]
+            if len(parts) == 1:
+                total += 1
+    return total
+
+
+def summarize_external(
+    model_samples: list[dict[str, object]], docker_stats: list[dict[str, object]],
+    manifest: dict[str, object], label: str, breadcrumb_mode: str | None = None,
+    phase_timing: dict[str, object] | None = None,
+    target_index: int | None = None,
+    remote_docker_stats: list[dict[str, object]] | None = None,
+    settled_idle_cpu_percent: float = DEFAULT_SETTLED_IDLE_CPU_PERCENT,
+) -> dict[str, object]:
+    """Summarize the diagnostics-off readiness and external resource lane."""
+    expected = _expected_summary_root_count(manifest)
+    normalized = [sample for sample in model_samples if isinstance(sample, dict)]
+    observed = normalized[-1] if normalized else {}
+    stable = False
+    if target_index is not None and 0 <= target_index < len(normalized):
+        target = normalized[target_index]
+        stable = (
+            target.get("root_count") == expected and type(target.get("model_version")) is int
+            and target_index > 0 and normalized[target_index - 1].get("model_version") == target.get("model_version")
+        )
+    stats = summarize_docker_stats(docker_stats, "app")
+    remote_stats = summarize_docker_stats(remote_docker_stats or [], "remote-helper")
+    timing = phase_timing if isinstance(phase_timing, dict) else {}
+    scan_sample_count = target_index + 1 if target_index is not None and 0 <= target_index < len(normalized) else len(normalized)
+    baseline_checks = {
+        "expected_summary_root_cardinality": observed.get("root_count") == expected and expected > 0,
+        "model_version_stable": stable,
+        "external_docker_stats_available": stats["sample_count"] > 0,
+        "breadcrumb_mode_recorded": breadcrumb_mode in {"on", "off"},
+    }
+    target_ms = timing.get("model_target_epoch_ms")
+    post_stats = [sample for sample in docker_stats if isinstance(sample, dict)
+                  and isinstance(target_ms, int) and type(sample.get("t_epoch_ms")) is int
+                  and sample["t_epoch_ms"] >= target_ms]
+    post_stats_summary = summarize_docker_stats(post_stats, "app")
+    post_remote_stats = [sample for sample in (remote_docker_stats or []) if isinstance(sample, dict)
+                         and isinstance(target_ms, int) and type(sample.get("t_epoch_ms")) is int
+                         and sample["t_epoch_ms"] >= target_ms]
+    post_remote_stats_summary = summarize_docker_stats(post_remote_stats, "remote-helper")
+    app_average = post_stats_summary.get("average_cpu_percent_one_core")
+    app_cpu_acceptance_applicable = target_index is not None and bool(post_stats)
+    app_cpu_acceptance_pass = (
+        app_cpu_acceptance_applicable and type(app_average) in (int, float)
+        and float(app_average) <= settled_idle_cpu_percent
+    )
+    acceptance_checks = {
+        "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
+        "app_cpu_average_within_threshold": app_cpu_acceptance_pass,
+        "remote_helper_stats_available": remote_stats["sample_count"] > 0,
+        "remote_helper_post_target_stats_available": post_remote_stats_summary["sample_count"] > 0,
+    }
+    if target_index is not None:
+        baseline_checks["app_cpu_average_within_threshold"] = app_cpu_acceptance_pass
+        baseline_checks["remote_helper_stats_available"] = remote_stats["sample_count"] > 0
+        baseline_checks["remote_helper_post_target_stats_available"] = post_remote_stats_summary["sample_count"] > 0
+    baseline_valid = label != "baseline" or all(baseline_checks.values())
+    return {
+        "schema": "seedsync.performance-lab.metrics.v2",
+        "label": label,
+        "measurement_mode": "external-summary",
+        "fixture_fingerprint": manifest.get("fixture_fingerprint"),
+        "config_fingerprint": manifest.get("config_fingerprint"),
+        "diagnostics_schema": None,
+        "sample_count": len(normalized),
+        "expected_summary_root_cardinality": expected,
+        "observed_summary_root_cardinality": observed.get("root_count"),
+        "model_version": observed.get("model_version"),
+        "model_version_stable": stable,
+        "baseline_checks": baseline_checks,
+        "baseline_valid": baseline_valid,
+        "acceptance_checks": acceptance_checks,
+        "acceptance_valid": all(acceptance_checks.values()),
+        "app_cpu_threshold_percent": settled_idle_cpu_percent,
+        "app_cpu_average_percent_one_core": app_average,
+        "app_cpu_peak_percent_one_core": post_stats_summary.get("peak_cpu_percent_one_core"),
+        "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
+        "app_cpu_acceptance_pass": app_cpu_acceptance_pass,
+        "full_scan_phase": {
+            "name": "full_scan", "sample_count": scan_sample_count,
+            "model_target_epoch_ms": target_ms,
+            "model_target_version": normalized[target_index].get("model_version")
+                if target_index is not None and 0 <= target_index < len(normalized) else None,
+        },
+        "settled_idle_phase": {
+            "name": "settled_idle", "sample_count": len(post_stats),
+            "app_docker_stats": post_stats_summary,
+            "remote_helper_docker_stats": post_remote_stats_summary,
+        },
+        "post_target_phase": {
+            "name": "post_target", "sample_count": len(post_stats),
+            "app_docker_stats": post_stats_summary,
+            "remote_helper_docker_stats": post_remote_stats_summary,
+        },
+        "phase_timing": timing,
+        "external_docker_stats": stats,
+        "app_docker_stats": stats,
+        "remote_helper_docker_stats": remote_stats,
+        "post_target_external_docker_stats": post_stats_summary,
+        "post_target_app_docker_stats": post_stats_summary,
+        "post_target_remote_helper_docker_stats": post_remote_stats_summary,
+        "fixed_stage_cpu_attribution": [],
+        "missing_fixed_metrics": list(FIXED_METRICS),
+        "breadcrumb": {"mode": breadcrumb_mode},
+        "steady_idle_target_met": app_cpu_acceptance_pass,
+    }
 
 
 def _windows(diagnostics: dict[str, object]) -> list[dict[str, object]]:
@@ -185,7 +393,8 @@ def summarize(
     diagnostics: dict[str, object], manifest: dict[str, object], label: str,
     expected_stage: str | None = None, min_cpu_percent: float = 50.0,
     min_high_cpu_samples: int = 3, model_count_tolerance: float = 0.15,
-    minimum_merged_nodes: int = 200_000, settled_idle_cpu_percent: float = 10.0,
+    minimum_merged_nodes: int = 200_000,
+    settled_idle_cpu_percent: float = DEFAULT_SETTLED_IDLE_CPU_PERCENT,
     breadcrumbs: dict[str, object] | None = None, breadcrumb_mode: str | None = None,
     target_sequence: int | None = None,
 ) -> dict[str, object]:
@@ -280,10 +489,16 @@ def summarize(
         )
     baseline_valid = label != "baseline" or all(baseline_checks.values())
     post_target_all = _phase(post_target_windows, "post_target_all")
-    steady_idle_target_met = (
-        len(post_target_windows) >= min_high_cpu_samples and
-        float(post_target_all["peak_cpu_percent_one_core"]) < settled_idle_cpu_percent
+    app_cpu_acceptance_applicable = target_sequence is not None and len(post_target_windows) >= min_high_cpu_samples
+    app_cpu_average = post_target_all["average_cpu_percent_one_core"] if app_cpu_acceptance_applicable else None
+    app_cpu_acceptance_pass = (
+        app_cpu_acceptance_applicable and type(app_cpu_average) in (int, float)
+        and float(app_cpu_average) <= settled_idle_cpu_percent
     )
+    if target_sequence is not None:
+        baseline_checks["app_cpu_average_within_threshold"] = app_cpu_acceptance_pass
+    baseline_valid = label != "baseline" or all(baseline_checks.values())
+    steady_idle_target_met = app_cpu_acceptance_pass
     return {
         "schema": "seedsync.performance-lab.metrics.v2",
         "label": label,
@@ -321,10 +536,20 @@ def summarize(
         "baseline_checks": baseline_checks,
         "baseline_valid": baseline_valid,
         "full_scan_phase": _phase(full_scan_windows if target_sequence is not None else active_windows, "full_scan"),
-        "settled_idle_phase": _phase(post_settled_windows if target_sequence is not None else settled_windows, "settled_idle"),
-        "post_target_phase": _phase(post_active_windows, "post_target"),
+        "settled_idle_phase": _phase(post_target_windows if target_sequence is not None else settled_windows, "settled_idle"),
+        "post_target_phase": _phase(post_target_windows, "post_target"),
         "post_target_all_phase": post_target_all,
         "steady_idle_target_met": steady_idle_target_met,
+        "acceptance_checks": {
+            "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
+            "app_cpu_average_within_threshold": app_cpu_acceptance_pass,
+        },
+        "acceptance_valid": app_cpu_acceptance_pass,
+        "app_cpu_threshold_percent": settled_idle_cpu_percent,
+        "app_cpu_average_percent_one_core": app_cpu_average,
+        "app_cpu_peak_percent_one_core": post_target_all["peak_cpu_percent_one_core"] if app_cpu_acceptance_applicable else None,
+        "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
+        "app_cpu_acceptance_pass": app_cpu_acceptance_pass,
         "missing_fixed_metrics": [metric for metric in FIXED_METRICS if metric not in active_metrics],
         "active_stage": diagnostics.get("active_stage"),
         "active_scanner_stage": diagnostics.get("active_scanner_stage"),
@@ -333,7 +558,11 @@ def summarize(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--diagnostics", type=Path, required=True)
+    parser.add_argument("--mode", choices=("diagnostics", "external-summary"), default="diagnostics")
+    parser.add_argument("--diagnostics", type=Path)
+    parser.add_argument("--model-summary", type=Path)
+    parser.add_argument("--docker-stats", type=Path)
+    parser.add_argument("--remote-docker-stats", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--label", choices=("baseline", "candidate"), required=True)
@@ -342,24 +571,102 @@ def main() -> int:
     parser.add_argument("--min-high-cpu-samples", type=int, default=3)
     parser.add_argument("--model-count-tolerance", type=float, default=0.15)
     parser.add_argument("--minimum-merged-nodes", type=int, default=200_000)
-    parser.add_argument("--settled-idle-cpu-percent", type=float, default=10.0)
+    parser.add_argument("--settled-idle-cpu-percent", type=float, default=DEFAULT_SETTLED_IDLE_CPU_PERCENT)
     parser.add_argument("--breadcrumbs", type=Path)
+    parser.add_argument("--phase-timing", type=Path)
     parser.add_argument("--breadcrumb-mode", choices=("on", "off"))
     parser.add_argument("--target-sequence", type=int)
     args = parser.parse_args()
-    diagnostics = json.loads(args.diagnostics.read_text(encoding="utf-8"))
+    if not 0.0 < args.settled_idle_cpu_percent <= DEFAULT_SETTLED_IDLE_CPU_PERCENT:
+        parser.error("--settled-idle-cpu-percent must be greater than 0 and no more than 1.0 for acceptance")
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
-    breadcrumbs = json.loads(args.breadcrumbs.read_text(encoding="utf-8")) if args.breadcrumbs else None
-    summary = summarize(
-        diagnostics, manifest, args.label, args.expected_stage, args.min_cpu_percent,
-        args.min_high_cpu_samples, args.model_count_tolerance, args.minimum_merged_nodes,
-        args.settled_idle_cpu_percent, breadcrumbs, args.breadcrumb_mode,
-        args.target_sequence,
-    )
+    if args.mode == "external-summary":
+        if not args.model_summary or not args.docker_stats:
+            parser.error("--model-summary and --docker-stats are required for --mode external-summary")
+        model_payload = json.loads(args.model_summary.read_text(encoding="utf-8"))
+        stats_payload = json.loads(args.docker_stats.read_text(encoding="utf-8"))
+        remote_stats_payload = json.loads(args.remote_docker_stats.read_text(encoding="utf-8")) \
+            if args.remote_docker_stats else {}
+        timing_path = args.phase_timing
+        timing = json.loads(timing_path.read_text(encoding="utf-8")) if timing_path else None
+        model_samples = model_payload.get("samples", []) if isinstance(model_payload, dict) else []
+        docker_samples = stats_payload.get("samples", []) if isinstance(stats_payload, dict) else []
+        remote_docker_samples = remote_stats_payload.get("samples", []) \
+            if isinstance(remote_stats_payload, dict) else []
+        summary = summarize_external(model_samples, docker_samples, manifest, args.label,
+                                     args.breadcrumb_mode, timing, args.target_sequence,
+                                     remote_docker_samples, args.settled_idle_cpu_percent)
+    else:
+        if not args.diagnostics:
+            parser.error("--diagnostics is required for --mode diagnostics")
+        diagnostics = json.loads(args.diagnostics.read_text(encoding="utf-8"))
+        breadcrumbs = json.loads(args.breadcrumbs.read_text(encoding="utf-8")) if args.breadcrumbs else None
+        summary = summarize(
+            diagnostics, manifest, args.label, args.expected_stage, args.min_cpu_percent,
+            args.min_high_cpu_samples, args.model_count_tolerance, args.minimum_merged_nodes,
+            args.settled_idle_cpu_percent, breadcrumbs, args.breadcrumb_mode,
+            args.target_sequence,
+        )
+        if args.docker_stats:
+            stats_payload = json.loads(args.docker_stats.read_text(encoding="utf-8"))
+            docker_samples = stats_payload.get("samples", []) if isinstance(stats_payload, dict) else []
+            timing = json.loads(args.phase_timing.read_text(encoding="utf-8")) \
+                if args.phase_timing else {}
+            target_ms = timing.get("model_target_epoch_ms") if isinstance(timing, dict) else None
+            post_stats = [
+                sample for sample in docker_samples if isinstance(sample, dict)
+                and type(target_ms) is int and type(sample.get("t_epoch_ms")) is int
+                and sample["t_epoch_ms"] >= target_ms
+            ]
+            summary["external_docker_stats"] = summarize_docker_stats(docker_samples, "app")
+            summary["post_target_external_docker_stats"] = summarize_docker_stats(post_stats, "app")
+            remote_samples_payload = json.loads(args.remote_docker_stats.read_text(encoding="utf-8")) \
+                if args.remote_docker_stats else {}
+            remote_samples = remote_samples_payload.get("samples", []) \
+                if isinstance(remote_samples_payload, dict) else []
+            post_remote = [sample for sample in remote_samples if isinstance(sample, dict)
+                           and type(target_ms) is int and type(sample.get("t_epoch_ms")) is int
+                           and sample["t_epoch_ms"] >= target_ms]
+            summary["app_docker_stats"] = summarize_docker_stats(docker_samples, "app")
+            summary["remote_helper_docker_stats"] = summarize_docker_stats(remote_samples, "remote-helper")
+            summary["post_target_app_docker_stats"] = summarize_docker_stats(post_stats, "app")
+            summary["post_target_remote_helper_docker_stats"] = summarize_docker_stats(post_remote, "remote-helper")
+            summary["settled_idle_phase"]["app_docker_stats"] = summary["post_target_app_docker_stats"]
+            summary["settled_idle_phase"]["remote_helper_docker_stats"] = summary["post_target_remote_helper_docker_stats"]
+            summary["post_target_phase"]["app_docker_stats"] = summary["post_target_app_docker_stats"]
+            summary["post_target_phase"]["remote_helper_docker_stats"] = summary["post_target_remote_helper_docker_stats"]
+            app_stats = summary["post_target_app_docker_stats"]
+            app_average = app_stats.get("average_cpu_percent_one_core")
+            applicable = args.target_sequence is not None and bool(post_stats)
+            passed = applicable and type(app_average) in (int, float) \
+                and float(app_average) <= args.settled_idle_cpu_percent
+            summary["app_cpu_threshold_percent"] = args.settled_idle_cpu_percent
+            summary["app_cpu_average_percent_one_core"] = app_average
+            summary["app_cpu_peak_percent_one_core"] = app_stats.get("peak_cpu_percent_one_core")
+            summary["app_cpu_acceptance_applicable"] = applicable
+            summary["app_cpu_acceptance_pass"] = passed
+            remote_stats = summary["remote_helper_docker_stats"]
+            remote_post_stats = summary["post_target_remote_helper_docker_stats"]
+            remote_available = remote_stats["sample_count"] > 0
+            remote_post_available = remote_post_stats["sample_count"] > 0
+            summary["acceptance_checks"] = {
+                "app_cpu_acceptance_applicable": applicable,
+                "app_cpu_average_within_threshold": passed,
+                "remote_helper_stats_available": remote_available,
+                "remote_helper_post_target_stats_available": remote_post_available,
+            }
+            summary["acceptance_valid"] = passed and remote_available and remote_post_available
+            if args.target_sequence is not None:
+                summary["baseline_checks"]["remote_helper_stats_available"] = remote_available
+                summary["baseline_checks"]["remote_helper_post_target_stats_available"] = remote_post_available
+                summary["baseline_valid"] = args.label != "baseline" or all(summary["baseline_checks"].values())
+            summary["steady_idle_target_met"] = passed
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, sort_keys=True))
-    return 0 if args.label != "baseline" or bool(summary["baseline_valid"]) else 2
+    acceptance_valid = bool(summary.get("acceptance_valid", False))
+    baseline_valid = args.label != "baseline" or bool(summary.get("baseline_valid"))
+    return 0 if acceptance_valid and baseline_valid else 2
 
 
 if __name__ == "__main__":
