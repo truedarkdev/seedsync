@@ -167,6 +167,29 @@ def _request_model_rebuild(model_builder: ModelBuilder, diagnostics: object, rea
         pass
 
 
+def _filter_actionable_move_retry_ids(
+        model_builder: ModelBuilder,
+        due_retry_ids: Sequence[str],
+) -> tuple[list[str], set[str]]:
+    """Keep due markers whose current builder sources prove retry work.
+
+    Durable move-failure markers can outlive the model root that created them.
+    A marker is actionable only when the current canonical root is either fully
+    covered by the effective local source or still has an unresolved staging
+    collision.  Source lookups intentionally happen before invalidating the
+    global model cache so stale/non-root markers remain no-ops.
+    """
+    actionable_ids: list[str] = []
+    collision_ids: set[str] = set()
+    for file_id in due_retry_ids:
+        if model_builder.has_unresolved_staging_collision(file_id):
+            actionable_ids.append(file_id)
+            collision_ids.add(file_id)
+        elif model_builder.has_complete_local_coverage(file_id):
+            actionable_ids.append(file_id)
+    return actionable_ids, collision_ids
+
+
 class _ModelUpdateStageTimer:
     """Switch between fixed, bounded model-update diagnostic stages."""
 
@@ -2120,11 +2143,13 @@ class ModelUpdater(_ControllerCoreAccess):
             getattr(controller, "_Controller__MAX_MOVE_FAILURES", 4),
             retry_now,
         )
-        if due_retry_ids:
-            unresolved_collision_ids = set(model_builder.get_unresolved_staging_collision_file_ids())
-            reason = MODEL_REBUILD_REASON_COLLISION_RETRY if any(
-                file_id in unresolved_collision_ids for file_id in due_retry_ids
-            ) else MODEL_REBUILD_REASON_MOVE_RETRY_DUE
+        actionable_due_retry_ids, collision_due_retry_ids = _filter_actionable_move_retry_ids(
+            model_builder,
+            due_retry_ids,
+        )
+        if actionable_due_retry_ids:
+            reason = MODEL_REBUILD_REASON_COLLISION_RETRY if collision_due_retry_ids \
+                else MODEL_REBUILD_REASON_MOVE_RETRY_DUE
             _request_model_rebuild(model_builder, diagnostics, reason)
 
         stage_timer.switch(DURATION_MODEL_UPDATE_BUILD_FINALIZATION)

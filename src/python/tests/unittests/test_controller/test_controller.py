@@ -9003,8 +9003,11 @@ class TestController(unittest.TestCase):
     def test_model_updater_due_move_failure_rebuilds_once_until_due_edge_rearms(self):
         builder = ModelBuilder()
         builder.set_base_logger(self.controller.logger)
-        builder.set_local_files([])
-        builder.set_remote_files([])
+        # The durable marker is actionable only while current builder sources
+        # still prove the canonical retry root exists and is complete.
+        retry_root = SystemFile("retry", 1, False)
+        builder.set_local_files([retry_root])
+        builder.set_remote_files([retry_root])
         builder.set_active_files([])
         self.controller._Controller__model_builder = builder
         self.controller._Controller__model = builder.build_model()

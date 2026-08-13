@@ -21,6 +21,7 @@ from controller.model_updater import (
     _pop_scan_updates,
     _ModelUpdateStageTimer,
     _MoveRetryRebuildGate,
+    _filter_actionable_move_retry_ids,
     _request_model_rebuild,
 )
 from common.performance_diagnostics import (
@@ -173,6 +174,177 @@ class TestModelUpdater(unittest.TestCase):
 
         _request_model_rebuild(builder, diagnostics, "file:/private/path")
         diagnostics.increment.assert_not_called()
+
+    def test_stale_move_retry_marker_is_not_actionable(self):
+        builder = MagicMock()
+        builder.has_unresolved_staging_collision.return_value = False
+        builder.has_complete_local_coverage.return_value = False
+
+        actionable, collisions = _filter_actionable_move_retry_ids(
+            builder, ["stale-id", "child-id"],
+        )
+
+        self.assertEqual([], actionable)
+        self.assertEqual(set(), collisions)
+        builder.has_unresolved_staging_collision.assert_has_calls([
+            call("stale-id"), call("child-id"),
+        ])
+        builder.has_complete_local_coverage.assert_has_calls([
+            call("stale-id"), call("child-id"),
+        ])
+
+    def test_complete_move_retry_marker_is_actionable_once_per_gate_token(self):
+        builder = MagicMock()
+        builder.has_unresolved_staging_collision.return_value = False
+        builder.has_complete_local_coverage.return_value = True
+        gate = _MoveRetryRebuildGate()
+        now = datetime.now()
+        failure_counts = {"retry": 1}
+
+        first_due = gate.due_ids(failure_counts, {}, 4, now)
+        actionable, collisions = _filter_actionable_move_retry_ids(builder, first_due)
+        self.assertEqual(["retry"], actionable)
+        self.assertEqual(set(), collisions)
+
+        second_due = gate.due_ids(failure_counts, {}, 4, now)
+        actionable, collisions = _filter_actionable_move_retry_ids(builder, second_due)
+        self.assertEqual([], actionable)
+        self.assertEqual(set(), collisions)
+
+    def test_unresolved_collision_move_retry_marker_is_actionable(self):
+        builder = MagicMock()
+        builder.has_unresolved_staging_collision.side_effect = lambda file_id: file_id == "collision"
+        builder.has_complete_local_coverage.return_value = False
+
+        actionable, collisions = _filter_actionable_move_retry_ids(
+            builder, ["collision"],
+        )
+
+        self.assertEqual(["collision"], actionable)
+        self.assertEqual({"collision"}, collisions)
+
+    def test_stale_due_marker_does_not_invalidate_or_build_global_model(self):
+        controller, model_builder = self._make_progressive_update_controller(None)
+        controller._Controller__persist.move_failure_counts = {"stale-id": 1}
+
+        ModelUpdater(controller).update()
+
+        model_builder.request_rebuild.assert_not_called()
+        model_builder.build_model.assert_not_called()
+
+    def test_complete_due_marker_requests_one_rebuild_until_token_changes(self):
+        controller, model_builder = self._make_progressive_update_controller(None)
+        controller._Controller__persist.move_failure_counts = {"retry": 1}
+        model_builder.has_complete_local_coverage.return_value = True
+
+        updater = ModelUpdater(controller)
+        updater.update()
+        updater.update()
+
+        model_builder.request_rebuild.assert_called_once_with()
+
+    def test_real_builder_stale_child_then_canonical_root_rearms_retry_rebuild(self):
+        builder = ModelBuilder()
+        builder.set_remote_files([])
+        builder.set_local_files([])
+        builder.set_active_files([])
+        model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, model_builder=builder, model=model,
+        )
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(
+            lambda: True,
+        )
+        controller._reserve_move_attempt = MagicMock(return_value=False)
+        controller._Controller__persist.move_failure_counts = {"stale-child": 1}
+        updater = ModelUpdater(controller)
+
+        with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
+                patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+            updater.update()
+            self.assertEqual(0, request_rebuild.call_count)
+            self.assertEqual(0, build_model.call_count)
+            self.assertEqual(
+                0,
+                controller._Controller__context.performance_diagnostics.snapshot()["counters"].get(
+                    "model_rebuild_move_retry_due", 0,
+                ),
+            )
+
+            retry_root = SystemFile("retry", 1, False)
+            builder.set_remote_files([retry_root])
+            builder.set_local_files([retry_root])
+            controller._Controller__persist.move_failure_counts = {"retry": 1}
+
+            updater.update()
+            updater.update()
+
+        self.assertEqual(1, request_rebuild.call_count)
+        self.assertEqual(1, build_model.call_count)
+        self.assertEqual(
+            1,
+            controller._Controller__context.performance_diagnostics.snapshot()["counters"].get(
+                "model_rebuild_move_retry_due", 0,
+            ),
+        )
+
+    def test_real_builder_retry_reason_counters_are_edge_triggered_for_complete_and_collision(self):
+        cases = []
+        complete_root = SystemFile("complete", 1, False)
+        cases.append((
+            "complete",
+            [complete_root],
+            [complete_root],
+            "model_rebuild_move_retry_due",
+        ))
+        collision_remote = SystemFile("collision", 20, True)
+        collision_remote.add_child(SystemFile("covered.mkv", 10, False))
+        collision_remote.add_child(SystemFile("missing.mkv", 10, False))
+        collision_local = SystemFile("collision", 10, True)
+        collision_leaf = SystemFile("covered.mkv", 10, False, is_staging=True)
+        collision_leaf.has_staging_collision = True
+        collision_local.add_child(collision_leaf)
+        cases.append((
+            "collision",
+            [collision_remote],
+            [collision_local],
+            "model_rebuild_collision_retry",
+        ))
+
+        for root_name, remote_files, local_files, reason_counter in cases:
+            with self.subTest(root_name=root_name):
+                builder = ModelBuilder()
+                builder.set_remote_files(remote_files)
+                builder.set_local_files(local_files)
+                builder.set_active_files([])
+                model = builder.build_model()
+                controller, _ = self._make_progressive_update_controller(
+                    None, model_builder=builder, model=model,
+                )
+                controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(
+                    lambda: True,
+                )
+                controller._reserve_move_attempt = MagicMock(return_value=False)
+                controller._Controller__persist.move_failure_counts = {
+                    ModelFile.build_file_id(root_name, None): 1,
+                }
+                updater = ModelUpdater(controller)
+
+                with patch.object(builder, "request_rebuild", wraps=builder.request_rebuild) as request_rebuild, \
+                        patch.object(builder, "build_model", wraps=builder.build_model) as build_model:
+                    updater.update()
+                    updater.update()
+
+                snapshot = controller._Controller__context.performance_diagnostics.snapshot()
+                self.assertEqual(1, request_rebuild.call_count)
+                self.assertEqual(1, build_model.call_count)
+                self.assertEqual(1, snapshot["counters"].get(reason_counter, 0))
+                other_counter = (
+                    "model_rebuild_collision_retry"
+                    if reason_counter == "model_rebuild_move_retry_due"
+                    else "model_rebuild_move_retry_due"
+                )
+                self.assertEqual(0, snapshot["counters"].get(other_counter, 0))
 
     def test_model_update_stage_timer_switches_fixed_stages_and_closes_on_finish_error(self):
         class Diagnostics:
@@ -1146,6 +1318,8 @@ class TestModelUpdater(unittest.TestCase):
         if model_builder is None:
             model_builder = MagicMock()
             model_builder.has_changes.return_value = False
+            model_builder.has_complete_local_coverage.return_value = False
+            model_builder.has_unresolved_staging_collision.return_value = False
             model_builder.get_terminalizable_staging_collision_file_ids.return_value = set()
             model_builder.get_unresolved_staging_collision_file_ids.return_value = set()
         if model is None:
