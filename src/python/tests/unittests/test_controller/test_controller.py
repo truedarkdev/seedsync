@@ -2772,6 +2772,51 @@ class TestController(unittest.TestCase):
         self.assertFalse(self.controller._Controller__last_local_reconciliation_healthy)
         self.assertFalse(self.controller.is_path_pair_reconciled("pair-a"))
 
+    def test_local_inventory_runtime_generation_invalidates_changed_scopes_and_removes_disabled_scopes(self):
+        pair_a = PathPair(id="pair-a", name="Pair A", remote_path="/remote/a", local_path="/local/a")
+        pair_b = PathPair(id="pair-b", name="Pair B", remote_path="/remote/b", local_path="/local/b")
+        local_a = SystemFile("file-a", 7); local_a.path_pair_id = "pair-a"
+        local_b = SystemFile("file-b", 11); local_b.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([local_a, local_b])
+        builder.record_local_inventory_completion({"pair-a", "pair-b"})
+        self.controller._Controller__model_builder = builder
+        self.controller._Controller__model = Model()
+        self.controller._Controller__model_lock = threading.RLock()
+
+        # Restarting the same runtime keeps last-good values but makes them
+        # non-authoritative until the replacement generation completes.
+        self.controller._Controller__begin_local_inventory_runtime_generation(
+            {"pair-a": pair_a, "pair-b": pair_b},
+            {"pair-a": "/local/a/incomplete", "pair-b": "/local/b/incomplete"},
+            {"pair-a": pair_a, "pair-b": pair_b},
+            {"pair-a": "/local/a/incomplete", "pair-b": "/local/b/incomplete"},
+        )
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("scanning", inventory["pair-a"].state)
+        self.assertEqual(7, inventory["pair-a"].size)
+
+        # A relocated/configured identity is stale rather than up to date.
+        relocated_a = PathPair(id="pair-a", name="Pair A", remote_path="/remote/a", local_path="/local/a-new")
+        self.controller._Controller__begin_local_inventory_runtime_generation(
+            {"pair-a": pair_a, "pair-b": pair_b},
+            {"pair-a": "/local/a/incomplete", "pair-b": "/local/b/incomplete"},
+            {"pair-a": relocated_a},
+            {"pair-a": "/local/a-new/incomplete"},
+        )
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("stale", inventory["pair-a"].state)
+        self.assertNotIn("pair-b", inventory)
+
+        # Re-enabling a removed scope has no retained runtime authority.
+        self.controller._Controller__begin_local_inventory_runtime_generation(
+            {"pair-a": relocated_a}, {"pair-a": "/local/a-new/incomplete"},
+            {"pair-a": relocated_a, "pair-b": pair_b},
+            {"pair-a": "/local/a-new/incomplete", "pair-b": "/local/b/incomplete"},
+        )
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertNotIn("pair-b", inventory)
+
     @patch("controller.controller.ScannerProcess")
     def test_refresh_path_pairs_resyncs_pair_scoped_download_timestamps(self, scanner_process_cls):
         movies_pair = PathPair(

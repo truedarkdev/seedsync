@@ -1685,6 +1685,20 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertNotEqual(ModelFile.State.DELETED, model.get_file("a").state)
 
+    def test_identityless_local_scan_failure_passes_all_enabled_scopes_to_inventory(self):
+        """An unattributed failure is not evidence that other configured roots are healthy."""
+        failed_local_scan = ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={None}, failed=True,
+        )
+        controller, builder = self._make_progressive_update_controller(None, failed_local_scan)
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+
+        ModelUpdater(controller).update()
+
+        builder.observe_local_scan_result.assert_called_once_with(
+            {None}, set(), set(), True, {"pair-a", "pair-b"},
+        )
+
     def _make_controller(self, downloaded_file_names, extracted_file_names, stopped_file_names, path_pairs_by_id=None):
         persist = SimpleNamespace(
             downloaded_file_names=downloaded_file_names,

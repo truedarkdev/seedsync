@@ -1,5 +1,6 @@
 <app-path-pair-stats *ngIf="showOverview"></app-path-pair-stats>
 <ng-container *ngIf="showDetailView">
+    <app-path-pair-identity *ngIf="selectedPathPair" [pathPair]="selectedPathPair"></app-path-pair-identity>
     <app-file-options></app-file-options>
     <app-file-list></app-file-list>
 </ng-container>

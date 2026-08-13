@@ -4,10 +4,25 @@
          [class.active]="hasActiveTransfers(stat)">
         <div class="card-header">
             <span class="pair-name">{{ stat.pathPairName }}</span>
-            <span class="file-count">{{ stat.totalFiles }} file{{ stat.totalFiles !== 1 ? "s" : "" }}</span>
+            <span class="scan-state" [ngClass]="stat.localLibraryState">
+                <span class="state-dot" aria-hidden="true"></span>{{ localLibraryStateLabel(stat.localLibraryState) }}
+            </span>
         </div>
 
         <div class="card-body">
+            <section class="local-library">
+                <h3>Local library</h3>
+                <div class="library-values">
+                    <span>{{ formatLocalFileCount(stat.localFileCount) }} files</span>
+                    <span class="separator">|</span>
+                    <span *ngIf="stat.localLibrarySize === null">&mdash; local</span>
+                    <span *ngIf="stat.localLibrarySize !== null">{{ stat.localLibrarySize | fileSize:2 }} local</span>
+                </div>
+                <p class="library-detail" *ngIf="stat.localLibraryDetail">{{ stat.localLibraryDetail }}</p>
+            </section>
+
+            <section class="transfers">
+                <h3>Transfers</h3>
             <div class="progress-section">
                 <div class="progress">
                     <div class="progress-bar"
@@ -37,12 +52,8 @@
                 </div>
             </div>
 
-            <div class="info-row">
-                <div class="size-info">
-                    <span class="local">{{ stat.totalLocalSize | fileSize:2 }}</span>
-                    <span class="separator">/</span>
-                    <span class="remote">{{ stat.totalRemoteSize | fileSize:2 }}</span>
-                </div>
+            <div class="transfer-meta" *ngIf="hasActiveTransfers(stat); else noActiveTransfers">
+                <span class="transfer-bytes">{{ stat.totalLocalSize | fileSize:2 }} / {{ stat.totalRemoteSize | fileSize:2 }}</span>
                 <div class="meta-info">
                     <div class="speed-info" *ngIf="stat.totalSpeed > 0">
                         <span class="speed">{{ stat.totalSpeed | fileSize:2 }}/s</span>
@@ -52,6 +63,8 @@
                     </div>
                 </div>
             </div>
+            <ng-template #noActiveTransfers><p class="no-active-transfers">No active transfers</p></ng-template>
+            </section>
         </div>
     </div>
 </div>

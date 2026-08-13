@@ -1324,6 +1324,7 @@ class _ControllerCoreAccess:
     def _Controller__trace_target_archive_event(
         self, event: str, payload: dict[str, object]
     ) -> None: ...
+    def notify_model_summary_changed(self) -> None: ...
 
 
 class ModelUpdater(_ControllerCoreAccess):
@@ -1828,6 +1829,8 @@ class ModelUpdater(_ControllerCoreAccess):
         controller = self._controller
         diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
         model_builder = controller._Controller__model_builder
+        inventory_revision_getter = getattr(model_builder, "local_library_inventory_revision", None)
+        local_inventory_revision_before = inventory_revision_getter() if callable(inventory_revision_getter) else None
         persist = controller._Controller__persist
         model = controller._Controller__model
         if not isinstance(getattr(persist, "move_failure_counts", None), dict):
@@ -2441,6 +2444,18 @@ class ModelUpdater(_ControllerCoreAccess):
             local_scan_failed = bool(getattr(latest_local_scan, "failed", False))
             local_final = bool(getattr(latest_local_scan, "is_scan_final", True)) and \
                 not bool(getattr(latest_local_scan, "unknown_path_pair_ids", set()))
+            inventory_observer = getattr(model_builder, "observe_local_scan_result", None)
+            if callable(inventory_observer):
+                raw_scanned_ids = getattr(latest_local_scan, "scanned_path_pair_ids", set())
+                raw_completed_ids = getattr(latest_local_scan, "completed_path_pair_ids", set())
+                raw_unknown_ids = getattr(latest_local_scan, "unknown_path_pair_ids", set())
+                inventory_observer(
+                    set(raw_scanned_ids) if isinstance(raw_scanned_ids, set) else set(),
+                    set(raw_completed_ids) if isinstance(raw_completed_ids, set) else set(),
+                    set(raw_unknown_ids) if isinstance(raw_unknown_ids, set) else set(),
+                    local_scan_failed,
+                    set(getattr(controller, "_Controller__path_pairs_by_id", {}).keys()) or {None},
+                )
             if local_final and not progressive_mode:
                 controller._Controller__last_local_reconciliation_healthy = not local_scan_failed
             recovered_extracted_file_ids = []
@@ -2449,6 +2464,12 @@ class ModelUpdater(_ControllerCoreAccess):
                     model_builder.set_local_files(_merge_targeted_legacy_scan_files(
                         controller, "local", latest_local_scan, latest_local_scan.files,
                     ))
+                    inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
+                    if callable(inventory_completion):
+                        completed_ids = set(getattr(latest_local_scan, "completed_path_pair_ids", set()))
+                        if not completed_ids:
+                            completed_ids = set(getattr(latest_local_scan, "scanned_path_pair_ids", {None}))
+                        inventory_completion(completed_ids)
                 raw_recovered_ids = getattr(latest_local_scan, "managed_extract_file_ids", [])
                 if isinstance(raw_recovered_ids, (list, tuple, set)):
                     recovered_items = cast(list[object] | tuple[object, ...] | set[object], raw_recovered_ids)
@@ -2544,6 +2565,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     elif not authoritative_pair_delta_builds:
                         model_builder.set_local_files(joint_local_files)
                         model_builder.set_remote_files(joint_remote_files)
+                        inventory_completion = getattr(model_builder, "record_local_inventory_completion", None)
+                        if callable(inventory_completion):
+                            inventory_completion(set(scoped_final_pair_ids or set()))
                     setter_unknown_local = getattr(model_builder, "set_unknown_local_path_pair_ids", None)
                     if (not authoritative_pair_delta_builds or authoritative_pair_fallback_required) and \
                             callable(setter_unknown_local):
@@ -4171,6 +4195,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     )
             except Exception:
                 pass
+        if local_inventory_revision_before is not None and callable(inventory_revision_getter) and \
+                inventory_revision_getter() != local_inventory_revision_before:
+            summary_notifier = getattr(controller, "notify_model_summary_changed", None)
+            if callable(summary_notifier):
+                summary_notifier()
         diagnostics_enabled = False
         if diagnostics is not None:
             try:

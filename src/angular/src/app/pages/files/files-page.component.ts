@@ -11,17 +11,19 @@ import {ModelFileService} from "../../services/files/model-file.service";
 import {FileOptionsComponent} from "./file-options.component";
 import {FileListComponent} from "./file-list.component";
 import {PathPairStatsComponent} from "./path-pair-stats.component";
+import {PathPairIdentityComponent} from "./path-pair-identity.component";
 
 @Component({
     selector: "app-files-page",
     standalone: true,
-    imports: [CommonModule, FileOptionsComponent, FileListComponent, PathPairStatsComponent],
+    imports: [CommonModule, FileOptionsComponent, FileListComponent, PathPairStatsComponent, PathPairIdentityComponent],
     templateUrl: "./files-page.component.html"
 })
 
 export class FilesPageComponent implements OnInit, OnDestroy {
     public showOverview = false;
     public showDetailView = false;
+    public selectedPathPair: PathPair | null = null;
 
     private readonly _destroy$ = new Subject<void>();
     private _pathPairs: PathPair[] = [];
@@ -82,6 +84,7 @@ export class FilesPageComponent implements OnInit, OnDestroy {
 
         const enabledPathPairs = (this._pathPairs || []).filter(pair => pair.enabled);
         const selectedPathPair = this._resolveSelectedPathPair(enabledPathPairs);
+        this.selectedPathPair = selectedPathPair;
         const hasMultipleEnabledPathPairs = enabledPathPairs.length > 1;
 
         this.showOverview = hasMultipleEnabledPathPairs && selectedPathPair == null;

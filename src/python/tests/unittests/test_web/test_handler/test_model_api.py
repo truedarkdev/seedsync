@@ -13,7 +13,9 @@ from common import BreadcrumbTraceCollector, Config, Status
 from common.performance_diagnostics import PerformanceDiagnosticsCollector
 from controller import Controller
 from controller.controller import MODEL_LEGACY_SCOPE_ID
+from controller.model_builder import ModelBuilder
 from model import Model, ModelFile
+from system import SystemFile
 from web.handler.model_api import ModelApiHandler, ScopedModelListener, SummaryModelListener
 from web.web_app import WebApp
 import bottle
@@ -590,6 +592,49 @@ class TestModelApi(unittest.TestCase):
         self.assertEqual(60, path_pair["remaining_bytes"])
         self.assertEqual(12, path_pair["active_eta_seconds_max"])
         self.assertEqual(1, path_pair["active_count"])
+
+    def test_summary_exposes_scan_owned_local_inventory_without_walking_the_model_tree(self):
+        root = SystemFile("sample-directory", 0, is_dir=True)
+        root.path_pair_id = "pair-a"
+        nested = SystemFile("nested", 0, is_dir=True)
+        nested.add_child(SystemFile("first-file", 7))
+        root.add_child(nested)
+        standalone = SystemFile("second-file", 11)
+        standalone.path_pair_id = "pair-a"
+        builder = ModelBuilder()
+        builder.set_local_files([root, standalone])
+        builder.record_local_inventory_completion({"pair-a"})
+        self.controller._Controller__model_builder = builder
+
+        summary = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual(2, summary["local_library_file_count"])
+        self.assertEqual(18, summary["local_library_size"])
+        self.assertEqual("up_to_date", summary["local_library_state"])
+
+        builder.observe_local_scan_result({"pair-a"}, set(), set(), False)
+        scanning = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual(2, scanning["local_library_file_count"])
+        self.assertEqual(18, scanning["local_library_size"])
+        self.assertEqual("scanning", scanning["local_library_state"])
+
+        builder.observe_local_scan_result({"pair-a"}, set(), {"pair-a"}, True)
+        stale = self.client.get("/server/model/v1/summary").json["path_pairs"][0]
+        self.assertEqual("stale", stale["local_library_state"])
+
+    def test_identityless_multi_pair_local_scan_failure_marks_every_configured_scope_stale(self):
+        builder = ModelBuilder()
+        for pair_id, size in (("pair-a", 7), ("pair-b", 11)):
+            file = SystemFile("file-{}".format(pair_id), size)
+            file.path_pair_id = pair_id
+            builder.set_local_files(list(builder.local_source_roots_snapshot()) + [file])
+        builder.record_local_inventory_completion({"pair-a", "pair-b"})
+
+        builder.observe_local_scan_result({None}, set(), set(), True, {"pair-a", "pair-b"})
+        _, inventory = builder.local_library_inventory_snapshot()
+        self.assertEqual("stale", inventory["pair-a"].state)
+        self.assertEqual("stale", inventory["pair-b"].state)
+        self.assertEqual(7, inventory["pair-a"].size)
+        self.assertEqual(11, inventory["pair-b"].size)
 
     def test_summary_bytes_and_speed_match_legacy_path_pair_card(self):
         downloading = self._file("down", "pair-a")

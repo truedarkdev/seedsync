@@ -18,6 +18,13 @@ import {ModelFileService} from "../../../../services/files/model-file.service";
 class StubPathPairStatsComponent {}
 
 @Component({
+    selector: "app-path-pair-identity",
+    standalone: true,
+    template: ""
+})
+class StubPathPairIdentityComponent {}
+
+@Component({
     selector: "app-file-options",
     standalone: true,
     template: ""
@@ -106,7 +113,10 @@ describe("Testing files page component", () => {
             ]
         });
         TestBed.overrideComponent(FilesPageComponent, {
-            set: {imports: [CommonModule, StubPathPairStatsComponent, StubFileOptionsComponent, StubFileListComponent]}
+            set: {imports: [
+                CommonModule, StubPathPairStatsComponent, StubPathPairIdentityComponent,
+                StubFileOptionsComponent, StubFileListComponent
+            ]}
         });
 
         fixture = TestBed.createComponent(FilesPageComponent);
@@ -133,6 +143,8 @@ describe("Testing files page component", () => {
         expect(component.showOverview).toBe(true);
         expect(component.showDetailView).toBe(false);
         expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith(null);
+        expect(modelFileService.activateScope).not.toHaveBeenCalled();
+        expect(modelFileService.deactivateScope).toHaveBeenCalled();
         expect(fixture.nativeElement.querySelector("app-path-pair-stats")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-options")).toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).toBeNull();
@@ -250,6 +262,7 @@ describe("Testing files page component", () => {
         expect(component.showDetailView).toBe(true);
         expect(viewFileFilterService.setPathPairFilter).toHaveBeenCalledWith("movies-id");
         expect(fixture.nativeElement.querySelector("app-path-pair-stats")).toBeNull();
+        expect(fixture.nativeElement.querySelector("app-path-pair-identity")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-options")).not.toBeNull();
         expect(fixture.nativeElement.querySelector("app-file-list")).not.toBeNull();
 

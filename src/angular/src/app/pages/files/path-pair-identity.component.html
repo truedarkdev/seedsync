@@ -1,0 +1,13 @@
+<section class="path-pair-identity" *ngIf="pathPair">
+    <div class="identity-main">
+        <h1>{{ pathPair.name }}</h1>
+        <span class="library-summary">{{ formatFileCount() }} files &middot; <ng-container *ngIf="library.size === null; else librarySize">&mdash; local</ng-container><ng-template #librarySize>{{ library.size | fileSize:2 }} local</ng-template></span>
+    </div>
+    <div class="scan-status" [ngClass]="library.state">
+        <span class="state-dot" aria-hidden="true"></span>
+        <div>
+            <strong>{{ stateLabel() }}</strong>
+            <span *ngIf="detail()">{{ detail() }}</span>
+        </div>
+    </div>
+</section>

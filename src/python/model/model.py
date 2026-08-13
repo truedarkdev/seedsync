@@ -150,6 +150,20 @@ class Model:
             if callable(callback):
                 callback(self.scope_version(scope_id), scope_id, file_id)
 
+    def notify_summary_changed(self) -> None:
+        """Wake compact-summary listeners without inventing a file mutation.
+
+        Scan inventory freshness is derived alongside the model source graph,
+        but an empty or failed scan may not change a visible root.  Summary
+        listeners still need one bounded wake-up for that state transition.
+        """
+        with self.__listeners_lock:
+            listeners = list(self.__listeners)
+        for listener in listeners:
+            callback = getattr(listener, "model_summary_changed", None)
+            if callable(callback):
+                callback()
+
     def __advance_version(self, file: ModelFile) -> None:
         self.__version += 1
         scope_id = file.path_pair_id

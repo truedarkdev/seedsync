@@ -663,6 +663,7 @@ class Controller:
         self.__model_file_command_identities = ()
         self.__model_summary_cache: Optional[dict[str, object]] = None
         self.__model_summary_cache_at = 0.0
+        self.__model_summary_cache_inventory_revision = -1
         self.__remote_delete_success_listeners = []
         self.__remote_delete_success_listeners_lock = Lock()
         self.__download_start_listeners = []
@@ -1383,6 +1384,10 @@ class Controller:
             self.__local_scan_process = local_scan_process
             self.__remote_scan_process = remote_scan_process
             self.__sync_persist_to_model_builder_if_ready()
+            self.__begin_local_inventory_runtime_generation(
+                old_path_pairs_by_id, old_path_pair_staging_paths,
+                path_pairs_by_id, path_pair_staging_paths,
+            )
         except Exception as activation_exc:
             # Some builders mutate transfer/model configuration before they
             # fail. Restore every parent-owned reference and configuration so
@@ -1449,6 +1454,36 @@ class Controller:
                 pair_id, fallback_staging_path or self.__staging_path
             )
         self.__model_builder.set_local_root_paths(local_root_paths, local_staging_paths)
+
+    @staticmethod
+    def __local_inventory_path_identity(pair: PathPair, staging_path: Optional[str]) -> tuple[object, ...]:
+        """The configured roots that make retained local scan evidence comparable."""
+        return pair.remote_path, pair.local_path, staging_path
+
+    def __begin_local_inventory_runtime_generation(
+            self,
+            old_path_pairs_by_id: Dict[str, PathPair], old_path_pair_staging_paths: Dict[str, str],
+            path_pairs_by_id: Dict[str, PathPair], path_pair_staging_paths: Dict[str, str],
+    ) -> None:
+        """Delegate inventory freshness to the existing path-pair runtime transition."""
+        builder = self.__model_builder
+        begin = getattr(type(builder), "begin_local_inventory_runtime_generation", None)
+        revision_getter = getattr(type(builder), "local_library_inventory_revision", None)
+        if not callable(begin) or not callable(revision_getter):
+            return
+        enabled_scopes: set[Optional[str]] = set(path_pairs_by_id) or {None}
+        changed_scopes = {
+            path_pair_id for path_pair_id, pair in path_pairs_by_id.items()
+            if path_pair_id not in old_path_pairs_by_id or
+            self.__local_inventory_path_identity(pair, path_pair_staging_paths.get(path_pair_id)) !=
+            self.__local_inventory_path_identity(
+                old_path_pairs_by_id[path_pair_id], old_path_pair_staging_paths.get(path_pair_id),
+            )
+        }
+        before = revision_getter(builder)
+        begin(builder, enabled_scopes, changed_scopes)
+        if revision_getter(builder) != before:
+            self.notify_model_summary_changed()
 
     def __record_path_pair_runtime_error(self, error_msg: str):
         self.__path_pair_runtime_error = error_msg
@@ -2033,6 +2068,10 @@ class Controller:
         self.__reconciled_local_path_pair_ids = set()
         self.__reconciled_remote_path_pair_ids = set()
         self.__current_process_final_publication_file_ids = set()
+        self.__begin_local_inventory_runtime_generation(
+            self.__path_pairs_by_id, self.__path_pair_staging_paths,
+            self.__path_pairs_by_id, self.__path_pair_staging_paths,
+        )
         with self.__work_state_lock:
             active_files = list(
                 getattr(self, "_Controller__active_downloading_file_names", []) +
@@ -2160,6 +2199,10 @@ class Controller:
         self.__reconciled_local_path_pair_ids = set()
         self.__reconciled_remote_path_pair_ids = set()
         self.__current_process_final_publication_file_ids = set()
+        self.__begin_local_inventory_runtime_generation(
+            self.__path_pairs_by_id, self.__path_pair_staging_paths,
+            self.__path_pairs_by_id, self.__path_pair_staging_paths,
+        )
         self.__preflight_runtime_storage_roots(
             list(self.__path_pairs_by_id.values()),
             self.__path_pair_staging_paths,
@@ -2752,26 +2795,27 @@ class Controller:
         """Return compact root-only counts; deliberately no file tree records."""
         with self.__model_lock:
             now = time.monotonic()
+            inventory_snapshot = getattr(
+                getattr(self, "_Controller__model_builder", None), "local_library_inventory_snapshot", None,
+            )
+            inventory_revision, local_inventory = inventory_snapshot() if callable(inventory_snapshot) else (0, {})
             cached_summary = getattr(self, "_Controller__model_summary_cache", None)
             cached_at = getattr(self, "_Controller__model_summary_cache_at", 0.0)
             if (
                 max_age_seconds > 0 and isinstance(cached_summary, dict)
                 and cached_summary.get("model_version") == self.__model.version
+                and getattr(self, "_Controller__model_summary_cache_inventory_revision", -1) == inventory_revision
                 and now - cached_at < max_age_seconds
             ):
                 return cached_summary
             summaries: dict[str, dict[str, object]] = {}
-            reconciled_local_scopes = {
-                self._model_scope_id(value) for value in self.__reconciled_local_path_pair_ids
-            }
-            reconciled_remote_scopes = {
-                self._model_scope_id(value) for value in self.__reconciled_remote_path_pair_ids
-            }
-            for file in self.__model.iter_files():
-                scope_id = self._model_scope_id(file.path_pair_id)
-                summary = summaries.setdefault(scope_id, {
+
+            def summary_for(scope_id: str) -> dict[str, object]:
+                inventory = local_inventory.get(None if scope_id == MODEL_LEGACY_SCOPE_ID else scope_id)
+                path_pair = getattr(self, "_Controller__path_pairs_by_id", {}).get(scope_id)
+                return summaries.setdefault(scope_id, {
                     "path_pair_id": scope_id,
-                    "path_pair_name": file.path_pair_name,
+                    "path_pair_name": getattr(path_pair, "name", None),
                     "root_count": 0,
                     "remote_size": 0,
                     "local_size": 0,
@@ -2786,7 +2830,22 @@ class Controller:
                     "visible_state_counts": {},
                     "reconciled_local": scope_id in reconciled_local_scopes,
                     "reconciled_remote": scope_id in reconciled_remote_scopes,
+                    "local_library_file_count": getattr(inventory, "file_count", None),
+                    "local_library_size": getattr(inventory, "size", None),
+                    "local_library_state": getattr(inventory, "state", "waiting_for_scan"),
                 })
+
+            reconciled_local_scopes = {
+                self._model_scope_id(value) for value in self.__reconciled_local_path_pair_ids
+            }
+            reconciled_remote_scopes = {
+                self._model_scope_id(value) for value in self.__reconciled_remote_path_pair_ids
+            }
+            for inventory_pair_id in local_inventory:
+                summary_for(self._model_scope_id(inventory_pair_id))
+            for file in self.__model.iter_files():
+                scope_id = self._model_scope_id(file.path_pair_id)
+                summary = summary_for(scope_id)
                 if summary["path_pair_name"] is None and file.path_pair_name is not None:
                     summary["path_pair_name"] = file.path_pair_name
                 summary["root_count"] = int(summary["root_count"]) + 1
@@ -2832,7 +2891,13 @@ class Controller:
             }
             self.__model_summary_cache = summary
             self.__model_summary_cache_at = now
+            self.__model_summary_cache_inventory_revision = inventory_revision
             return summary
+
+    def notify_model_summary_changed(self) -> None:
+        """Publish a bounded summary-only state change without altering roots."""
+        with self.__model_lock:
+            self.__model.notify_summary_changed()
 
     def get_model_summary_and_add_listener(self, listener: IModelListener) -> dict[str, object]:
         """Atomically subscribe a compact-summary stream after its snapshot."""

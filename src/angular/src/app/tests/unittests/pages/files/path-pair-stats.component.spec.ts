@@ -38,10 +38,15 @@ describe("Testing path-pair stats component", () => {
     it("uses compact summaries and stays live without file records", () => {
         pairs.setPathPairs([pair("movies", "Movies")]);
         model.setSummaries([{path_pair_id: "movies", root_count: 2, remote_size: 1000, transferred_size: 500,
+            local_library_file_count: 10400, local_library_size: 320, local_library_state: "scanning",
             downloading_speed: 250, active_count: 1, queued_count: 0, completed_count: 1}]);
         fixture.detectChanges();
         expect(model.startSummaryStream).toHaveBeenCalled();
         expect(fixture.componentInstance.stats[0].overallProgress).toBe(50);
+        expect(fixture.componentInstance.formatLocalFileCount(fixture.componentInstance.stats[0].localFileCount)).toBe("10.4k");
+        expect(fixture.nativeElement.textContent).toContain("Local library");
+        expect(fixture.nativeElement.textContent).toContain("Showing last complete scan");
+        expect(fixture.nativeElement.querySelector(".scan-state.scanning .state-dot")).not.toBeNull();
 
         model.setSummaries([{path_pair_id: "movies", root_count: 2, remote_size: 1000, transferred_size: 1000,
             downloading_speed: 0, active_count: 0, queued_count: 0, completed_count: 2}]);
@@ -52,5 +57,38 @@ describe("Testing path-pair stats component", () => {
         fixture.detectChanges();
         fixture.destroy();
         expect(model.stopSummaryStream).toHaveBeenCalled();
+    });
+
+    it("keeps explicit unknown inventory values unknown rather than displaying zero", () => {
+        pairs.setPathPairs([pair("movies", "Movies")]);
+        model.setSummaries([{
+            path_pair_id: "movies", local_library_file_count: null,
+            local_library_size: null, local_library_state: "waiting_for_scan"
+        }]);
+        fixture.detectChanges();
+
+        const stat = fixture.componentInstance.stats[0];
+        expect(stat.localFileCount).toBeNull();
+        expect(stat.localLibrarySize).toBeNull();
+        expect(fixture.nativeElement.textContent).toContain("Waiting for scan");
+        expect(fixture.nativeElement.textContent).toContain("— files");
+        expect(fixture.nativeElement.textContent).not.toContain("Showing last complete scan");
+    });
+
+    it("keeps a long pair name and scan state inside the responsive card header", () => {
+        pairs.setPathPairs([pair("long", "A deliberately long neutral pair name for a narrow dashboard")]);
+        model.setSummaries([{
+            path_pair_id: "long", local_library_file_count: 1,
+            local_library_size: 1, local_library_state: "scanning"
+        }]);
+        fixture.detectChanges();
+
+        const header = fixture.nativeElement.querySelector(".card-header");
+        const name = fixture.nativeElement.querySelector(".pair-name");
+        const state = fixture.nativeElement.querySelector(".scan-state.scanning");
+        expect(header).not.toBeNull();
+        expect(name).not.toBeNull();
+        expect(state).not.toBeNull();
+        expect(name.textContent).toContain("deliberately long neutral pair name");
     });
 });

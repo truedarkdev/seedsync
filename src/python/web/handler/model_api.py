@@ -155,6 +155,13 @@ class SummaryModelListener(IModelListener):
                 self.__reset = True
             self.__available.set()
 
+    def model_summary_changed(self) -> None:
+        with self.__lock:
+            if self.__closed:
+                return
+            self.__reset = True
+            self.__available.set()
+
     def take_next_event(self) -> Optional[dict[str, object]]:
         with self.__lock:
             if self.__closed:

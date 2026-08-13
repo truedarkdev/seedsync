@@ -6,11 +6,17 @@ import {takeUntil} from "rxjs/operators";
 import {PathPairService, PathPair} from "../../services/settings/path-pair.service";
 import {FileSizePipe} from "../../common/file-size.pipe";
 import {ModelFileService} from "../../services/files/model-file.service";
+import {
+    formatLocalFileCount, localLibraryDetail, localLibraryStateLabel, localLibrarySummary, LocalLibraryState
+} from "./path-pair-local-library";
 
 export interface PathPairStat {
     pathPairId: string;
     pathPairName: string;
-    totalFiles: number;
+    localFileCount: number | null;
+    localLibrarySize: number | null;
+    localLibraryState: LocalLibraryState;
+    localLibraryDetail: string | null;
     downloadingCount: number;
     queuedCount: number;
     downloadedCount: number;
@@ -100,6 +106,10 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         return `${seconds}s`;
     }
 
+    formatLocalFileCount(count: number | null): string { return formatLocalFileCount(count); }
+
+    localLibraryStateLabel(state: LocalLibraryState): string { return localLibraryStateLabel(state); }
+
     private _updateStats(): void {
         const enabledPairs = this._pathPairs.filter(pair => pair.enabled);
         if (enabledPairs.length === 0) {
@@ -118,6 +128,7 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
 
     private _buildStat(pathPair: PathPair, summary: any): PathPairStat {
         const current = summary || {};
+        const library = localLibrarySummary(current);
         const totalRemoteSize = Number(current.remote_size) || 0;
         const completedSize = Math.min(Math.max(Number(current.transferred_size) || 0, 0), totalRemoteSize);
         const totalSpeed = Number(current.downloading_speed) || 0;
@@ -127,7 +138,10 @@ export class PathPairStatsComponent implements OnInit, OnDestroy {
         return {
             pathPairId: pathPair.id,
             pathPairName: pathPair.name,
-            totalFiles: Number(current.root_count) || 0,
+            localFileCount: library.fileCount,
+            localLibrarySize: library.size,
+            localLibraryState: library.state,
+            localLibraryDetail: localLibraryDetail(library.state, library.fileCount !== null && library.size !== null),
             downloadingCount: Number(current.active_count) || 0,
             queuedCount: Number(current.queued_count) || 0,
             downloadedCount: Number(current.completed_count) || 0,

@@ -6,7 +6,7 @@ from datetime import datetime
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, cast
+from typing import Callable, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple, cast
 import math
 import json
 import time
@@ -104,6 +104,14 @@ class _AuthoritativePairBuild:
     invalidation_tokens: frozenset[int]
 
 
+@dataclass(frozen=True)
+class _LocalLibraryInventory:
+    """One bounded, scan-owned local-library aggregate for a path pair."""
+    file_count: Optional[int]
+    size: Optional[int]
+    state: str
+
+
 class ModelBuilder:
     """
     ModelBuilder combines all the difference sources of file system info
@@ -134,6 +142,11 @@ class ModelBuilder:
         # source maps; full reconciliation deliberately flattens them at its
         # existing global-build boundary.
         self.__local_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
+        # This is derived while authoritative local source trees are replaced.
+        # It deliberately never participates in model rendering or tree
+        # traversal on the web-summary path.
+        self.__local_library_inventory_by_pair: dict[Optional[str], _LocalLibraryInventory] = {}
+        self.__local_library_inventory_revision = 0
         self.__active_files: dict[str, SystemFile] = {}
         self.__remote_files_by_pair: dict[Optional[str], dict[str, SystemFile]] = {}
         self.__active_file_ids: set[str] = set()
@@ -255,6 +268,121 @@ class ModelBuilder:
         return tuple(
             file for files in self.__local_files_by_pair.values() for file in files.values()
         )
+
+    def local_library_inventory_snapshot(
+            self,
+    ) -> tuple[int, dict[Optional[str], _LocalLibraryInventory]]:
+        """Return immutable-value inventory state without walking local trees."""
+        return self.__local_library_inventory_revision, self.__local_library_inventory_by_pair
+
+    def local_library_inventory_revision(self) -> int:
+        return self.__local_library_inventory_revision
+
+    @staticmethod
+    def __local_regular_file_inventory(files: Iterable[SystemFile]) -> tuple[int, int]:
+        """Count only regular scan leaves while source authority is published."""
+        file_count = 0
+        total_size = 0
+
+        def visit(file: SystemFile) -> None:
+            nonlocal file_count, total_size
+            if file.is_dir:
+                for child in file.iter_children():
+                    visit(child)
+                return
+            file_count += 1
+            total_size += file.size
+
+        for root in files:
+            visit(root)
+        return file_count, total_size
+
+    def __replace_local_library_inventory(
+            self, updated: dict[Optional[str], _LocalLibraryInventory],
+    ) -> None:
+        if updated != self.__local_library_inventory_by_pair:
+            # Copy-on-write lets compact summary reads take the existing
+            # controller model lock without sharing a mutable aggregate map.
+            self.__local_library_inventory_by_pair = updated
+            self.__local_library_inventory_revision += 1
+
+    def begin_local_inventory_runtime_generation(
+            self, enabled_path_pair_ids: Set[Optional[str]], changed_path_pair_ids: Set[Optional[str]],
+    ) -> None:
+        """Invalidate scan freshness at the controller-owned runtime boundary.
+
+        The caller supplies configuration scope and identity changes; this
+        derived cache deliberately never reads configuration itself.  A prior
+        aggregate may remain visible while a same-root generation rescans, but
+        it cannot stay authoritative across a new runtime generation.
+        """
+        enabled = {
+            path_pair_id for path_pair_id in enabled_path_pair_ids
+            if path_pair_id is None or isinstance(path_pair_id, str)
+        }
+        changed = set(changed_path_pair_ids)
+        updated = {
+            path_pair_id: inventory
+            for path_pair_id, inventory in self.__local_library_inventory_by_pair.items()
+            if path_pair_id in enabled
+        }
+        for path_pair_id, existing in list(updated.items()):
+            updated[path_pair_id] = _LocalLibraryInventory(
+                existing.file_count,
+                existing.size,
+                "stale" if path_pair_id in changed else "scanning",
+            )
+        self.__replace_local_library_inventory(updated)
+
+    def observe_local_scan_result(
+            self, scanned_path_pair_ids: Set[Optional[str]], completed_path_pair_ids: Set[Optional[str]],
+            unknown_path_pair_ids: Set[Optional[str]], failed: bool,
+            enabled_path_pair_ids: Optional[Set[Optional[str]]] = None,
+    ) -> None:
+        """Publish scan freshness without treating partial trees as inventory."""
+        affected = set(scanned_path_pair_ids).union(completed_path_pair_ids, unknown_path_pair_ids)
+        explicit_pair_ids = {path_pair_id for path_pair_id in affected if isinstance(path_pair_id, str)}
+        configured_scopes = {
+            path_pair_id for path_pair_id in (enabled_path_pair_ids or set())
+            if path_pair_id is None or isinstance(path_pair_id, str)
+        }
+        # Scanner failures can be emitted before a multi-path scanner has
+        # attributed a pair.  ``None`` is the legacy scope, not evidence that
+        # every configured pair except legacy stayed healthy.
+        if failed and configured_scopes and not explicit_pair_ids:
+            affected = configured_scopes
+        elif not affected:
+            affected = configured_scopes or {None}
+        updated = dict(self.__local_library_inventory_by_pair)
+        for path_pair_id in affected:
+            if path_pair_id is not None and not isinstance(path_pair_id, str):
+                continue
+            existing = updated.get(path_pair_id)
+            if failed or path_pair_id in unknown_path_pair_ids:
+                updated[path_pair_id] = _LocalLibraryInventory(
+                    existing.file_count if existing is not None else None,
+                    existing.size if existing is not None else None,
+                    "stale" if existing is not None else "waiting_for_scan",
+                )
+            else:
+                updated[path_pair_id] = _LocalLibraryInventory(
+                    existing.file_count if existing is not None else None,
+                    existing.size if existing is not None else None,
+                    "scanning",
+                )
+        self.__replace_local_library_inventory(updated)
+
+    def record_local_inventory_completion(self, path_pair_ids: Set[Optional[str]]) -> None:
+        """Replace inventory only after a completed authoritative local pair."""
+        updated = dict(self.__local_library_inventory_by_pair)
+        for path_pair_id in path_pair_ids:
+            if path_pair_id is not None and not isinstance(path_pair_id, str):
+                continue
+            file_count, total_size = self.__local_regular_file_inventory(
+                self.__local_files_by_pair.get(path_pair_id, {}).values()
+            )
+            updated[path_pair_id] = _LocalLibraryInventory(file_count, total_size, "up_to_date")
+        self.__replace_local_library_inventory(updated)
 
     def remote_source_roots_snapshot(self) -> tuple[SystemFile, ...]:
         """Return an on-demand ownership-census snapshot of remote roots."""
@@ -2468,6 +2596,7 @@ class ModelBuilder:
     ) -> None:
         """Commit staged pair authority only after the live model accepted it."""
         self.__replace_authoritative_pair_sources(pair_build)
+        self.record_local_inventory_completion({pair_build.path_pair_id})
         selected_pair_ids = {pair_build.path_pair_id}
         selected_root_ids = set(pair_build.previous_local_files).union(pair_build.previous_remote_files)
         selected_root_ids.update(pair_build.local_files)
@@ -2517,6 +2646,7 @@ class ModelBuilder:
     ) -> None:
         """Keep a final scan authoritative when its live delta is rejected."""
         self.__replace_authoritative_pair_sources(pair_build)
+        self.record_local_inventory_completion({pair_build.path_pair_id})
         self.__unknown_local_path_pair_ids = set(pair_build.unknown_local_path_pair_ids)
         self.request_rebuild()
 
@@ -2554,6 +2684,7 @@ class ModelBuilder:
             set(),
             frozenset(),
         ))
+        self.record_local_inventory_completion({path_pair_id})
         self.__unknown_local_path_pair_ids = set(unknown_local_path_pair_ids)
         self.request_rebuild()
 
@@ -2940,6 +3071,7 @@ class ModelBuilder:
 
     def clear(self) -> None:
         self.__local_files_by_pair.clear()
+        self.__replace_local_library_inventory({})
         self.__active_files.clear()
         self.__remote_files_by_pair.clear()
         self.__source_name_counts.clear()
