@@ -18,6 +18,17 @@ from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
 from common.performance_diagnostics import (
+    CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
+    CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
+    CANDIDATE_PAIR_FALLBACK_REASON_EXCEPTION,
+    CANDIDATE_PAIR_FALLBACK_REASON_MISSING_MODEL,
+    CANDIDATE_PAIR_FALLBACK_REASON_PREREQUISITES,
+    CANDIDATE_UNRELATED_LIFECYCLE_REASON_MULTIPLE,
+    CANDIDATE_UNRELATED_LIFECYCLE_REASON_PENDING_COMPLETION,
+    CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY,
+    COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
+    COUNTER_CANDIDATE_PAIR_FALLBACK,
+    COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     DURATION_MODEL_BUILD,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_BUILDER_SYNC,
@@ -158,10 +169,14 @@ class _MoveRetryRebuildGate:
 class _CandidateLifecycleFallback:
     """Make staged pair authority durable if its shared lifecycle raises."""
 
-    def __init__(self, model_builder: ModelBuilder, pair_build: object, committer: object):
+    def __init__(
+            self, model_builder: ModelBuilder, pair_build: object, committer: object,
+            attribution: Optional[Callable[[], None]] = None,
+    ):
         self._model_builder = model_builder
         self._pair_build = pair_build
         self._committer = committer
+        self._attribution = attribution
 
     def __enter__(self) -> "_CandidateLifecycleFallback":
         return self
@@ -170,6 +185,11 @@ class _CandidateLifecycleFallback:
         if exc_type is None or self._pair_build is None:
             return False
         try:
+            if callable(self._attribution):
+                try:
+                    self._attribution()
+                except Exception:
+                    pass
             if callable(self._committer):
                 self._committer(self._pair_build)
             else:
@@ -2469,12 +2489,50 @@ class ModelUpdater(_ControllerCoreAccess):
         )
         pair_authorizer = getattr(model_builder, "authorize_authoritative_pair_delta", None)
         pair_adopter = getattr(model_builder, "adopt_authoritative_pair_delta", None)
+
+        def record_candidate_attribution(
+                counter: str, message: str, reason: str, *,
+                staged_pair_count: int = 0, committer_available: bool = False,
+        ) -> None:
+            """Publish only closed-world candidate control-flow attribution."""
+            try:
+                diagnostics.increment(counter)
+            except Exception:
+                pass
+            recorder = getattr(controller, "_Controller__record_breadcrumb", None)
+            if callable(recorder):
+                try:
+                    recorder(
+                        stage="model",
+                        message=message,
+                        details={
+                            "reason": reason,
+                            "staged_pair_count": staged_pair_count,
+                            "committer_available": committer_available,
+                        },
+                        event_type="state_transition",
+                        corr_id="model_update:aggregate",
+                        trace_scope="aggregate",
+                    )
+                except Exception:
+                    pass
+
+        def record_candidate_lifecycle_fallback() -> None:
+            record_candidate_attribution(
+                COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
+                "candidate_lifecycle_fallback",
+                CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
+                staged_pair_count=1,
+                committer_available=callable(pair_fallback_committer),
+            )
+
         if authoritative_pair_delta_builds:
             # The staged transaction is intentionally one non-legacy pair.
             # Startup recovery consumes global remote authority, so it retains
             # the ordinary full build until that lifecycle is complete.
             pair_build = authoritative_pair_delta_builds[0] \
                 if len(authoritative_pair_delta_builds) == 1 else None
+            pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_PREREQUISITES
             pair_safe = pair_build is not None and pair_build.path_pair_id is not None and \
                 bool(getattr(controller, "_Controller__startup_recovery_done", False)) and \
                 callable(pair_authorizer) and callable(pair_adopter)
@@ -2492,8 +2550,12 @@ class ModelUpdater(_ControllerCoreAccess):
                             except ModelError:
                                 return False
 
-                        if not pair_authorizer(root_exists, pair_build) or pair_build.model is None:
+                        if not pair_authorizer(root_exists, pair_build):
                             pair_safe = False
+                            pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED
+                        elif pair_build.model is None:
+                            pair_safe = False
+                            pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_MISSING_MODEL
                         else:
                             previous_root_ids = set(pair_build.previous_local_files).union(
                                 pair_build.previous_remote_files
@@ -2510,9 +2572,17 @@ class ModelUpdater(_ControllerCoreAccess):
                             authoritative_pair_build = pair_build
                 except Exception:
                     pair_safe = False
+                    pair_fallback_reason = CANDIDATE_PAIR_FALLBACK_REASON_EXCEPTION
                     authoritative_pair_candidate = None
                     authoritative_pair_build = None
             if not pair_safe:
+                record_candidate_attribution(
+                    COUNTER_CANDIDATE_PAIR_FALLBACK,
+                    "candidate_pair_fallback",
+                    pair_fallback_reason,
+                    staged_pair_count=len(authoritative_pair_delta_builds),
+                    committer_available=callable(pair_fallback_committer),
+                )
                 if callable(pair_fallback_committer):
                     for staged_pair_build in authoritative_pair_delta_builds:
                         pair_fallback_committer(staged_pair_build)
@@ -2688,18 +2758,23 @@ class ModelUpdater(_ControllerCoreAccess):
                 return bool(actionable_ids)
 
             unrelated_candidate_lifecycle_work_deferred = False
+            unrelated_candidate_lifecycle_deferred_reasons: set[str] = set()
 
-            def defer_unrelated_candidate_lifecycle_work() -> None:
+            def defer_unrelated_candidate_lifecycle_work(reason: str) -> None:
                 nonlocal unrelated_candidate_lifecycle_work_deferred
                 if authoritative_pair_build is None or unrelated_candidate_lifecycle_work_deferred:
+                    if authoritative_pair_build is not None:
+                        unrelated_candidate_lifecycle_deferred_reasons.add(reason)
                     return
                 # Reused unrelated roots must not receive unversioned in-place
                 # lifecycle mutations. Keep their established global path
                 # dirty after this selected pair publishes.
                 unrelated_candidate_lifecycle_work_deferred = True
+                unrelated_candidate_lifecycle_deferred_reasons.add(reason)
 
             with _CandidateLifecycleFallback(
                     model_builder, authoritative_pair_build, pair_fallback_committer,
+                    record_candidate_lifecycle_fallback,
             ), controller._Controller__model_lock:
                 def pending_completion_file_ids():
                     return {
@@ -2920,7 +2995,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     if not candidate_lifecycle_allows(file_id):
                         if 0 < count < controller._Controller__MAX_MOVE_FAILURES and \
                                 candidate_has_actionable_unrelated_retry(file_id):
-                            defer_unrelated_candidate_lifecycle_work()
+                            defer_unrelated_candidate_lifecycle_work(
+                                CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY,
+                            )
                         continue
                     if count <= 0 or count >= controller._Controller__MAX_MOVE_FAILURES:
                         continue
@@ -3101,7 +3178,9 @@ class ModelUpdater(_ControllerCoreAccess):
                         if (failure_count > 0 or
                                 file_id in controller._Controller__deferred_move_file_ids) and \
                                 candidate_has_actionable_unrelated_retry(file_id):
-                            defer_unrelated_candidate_lifecycle_work()
+                            defer_unrelated_candidate_lifecycle_work(
+                                CANDIDATE_UNRELATED_LIFECYCLE_REASON_PENDING_COMPLETION,
+                            )
                         continue
                     if file_id in attempted_move_file_ids:
                         continue
@@ -3316,6 +3395,7 @@ class ModelUpdater(_ControllerCoreAccess):
             if authoritative_pair_build is not None:
                 with _CandidateLifecycleFallback(
                         model_builder, authoritative_pair_build, pair_fallback_committer,
+                        record_candidate_lifecycle_fallback,
                 ), controller._Controller__model_lock:
                     controller._Controller__model.set_tree_file_count(new_model.tree_file_count)
                     pair_adopter(
@@ -3333,6 +3413,15 @@ class ModelUpdater(_ControllerCoreAccess):
                     # This is deliberately after scoped adoption: otherwise
                     # the staged-token cleanup would consume the deferred
                     # unrelated-work rebuild together with the selected pair.
+                    reason = next(iter(unrelated_candidate_lifecycle_deferred_reasons)) \
+                        if len(unrelated_candidate_lifecycle_deferred_reasons) == 1 \
+                        else CANDIDATE_UNRELATED_LIFECYCLE_REASON_MULTIPLE
+                    record_candidate_attribution(
+                        COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
+                        "unrelated_candidate_lifecycle_deferred",
+                        reason,
+                        staged_pair_count=1,
+                    )
                     model_builder.request_rebuild()
 
         if remote_auto_purge_reconciliation_healthy and controller._Controller__pending_auto_purge_file_ids:

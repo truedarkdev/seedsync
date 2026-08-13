@@ -40,6 +40,10 @@ from common.performance_diagnostics import (
     DURATION_MODEL_SCOPED_SSE_EMISSION,
     DURATION_MODEL_UPDATE_TRACE_FINALIZATION,
     DURATION_MODEL_UPDATE_TRACE_SETUP,
+    CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
+    COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
+    COUNTER_CANDIDATE_PAIR_FALLBACK,
+    COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     MODEL_REBUILD_REASON_COLLISION_RETRY,
     FixedDurationRecorder,
     PerformanceDiagnosticsCollector,
@@ -114,6 +118,9 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         collector.increment("controller_job_wake_deadline")
         collector.increment("controller_job_idle_cycles", 2)
         collector.increment("controller_job_active_cycles")
+        collector.increment(COUNTER_CANDIDATE_PAIR_FALLBACK)
+        collector.increment(COUNTER_CANDIDATE_LIFECYCLE_FALLBACK)
+        collector.increment(COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED)
         collector.increment("model_rebuild_collision_retry", -1)
         collector.increment("model_rebuild:/private/path")
         snapshot = collector.snapshot()
@@ -130,8 +137,12 @@ class TestPerformanceDiagnosticsCollector(unittest.TestCase):
         self.assertEqual(1, snapshot["counters"]["controller_job_wake_deadline"])
         self.assertEqual(2, snapshot["counters"]["controller_job_idle_cycles"])
         self.assertEqual(1, snapshot["counters"]["controller_job_active_cycles"])
+        self.assertEqual(1, snapshot["counters"][COUNTER_CANDIDATE_PAIR_FALLBACK])
+        self.assertEqual(1, snapshot["counters"][COUNTER_CANDIDATE_LIFECYCLE_FALLBACK])
+        self.assertEqual(1, snapshot["counters"][COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED])
         self.assertNotIn("model_rebuild:/private/path", snapshot["counters"])
         self.assertEqual("collision_retry", MODEL_REBUILD_REASON_COLLISION_RETRY)
+        self.assertEqual("authorization_rejected", CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED)
 
     def test_samples_are_bounded_numeric_and_track_peaks(self):
         collector = PerformanceDiagnosticsCollector(lambda: True, retention_depth=2)

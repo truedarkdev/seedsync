@@ -25,6 +25,12 @@ from controller.model_updater import (
     _request_model_rebuild,
 )
 from common.performance_diagnostics import (
+    CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
+    CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
+    CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY,
+    COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
+    COUNTER_CANDIDATE_PAIR_FALLBACK,
+    COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     DURATION_MODEL_UPDATE_BUILD_FINALIZATION,
     DURATION_MODEL_UPDATE_SCAN_INTAKE,
     DURATION_MODEL_UPDATE_STATE_PREPARATION,
@@ -1609,6 +1615,7 @@ class TestModelUpdater(unittest.TestCase):
             final_remote, local_scan=final_local, model_builder=builder, model=live_model,
         )
         controller._Controller__path_pairs_by_id = {"pair-a": MagicMock()}
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
         live_model.add_file = MagicMock(side_effect=RuntimeError("candidate lifecycle failure"))
 
         with self.assertRaisesRegex(RuntimeError, "candidate lifecycle failure"):
@@ -1618,6 +1625,17 @@ class TestModelUpdater(unittest.TestCase):
         self.assertIn(new_id, builder._ModelBuilder__local_files_by_pair["pair-a"])
         self.assertIn(new_id, builder._ModelBuilder__remote_files_by_pair["pair-a"])
         self.assertTrue(builder.has_changes())
+        counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
+        self.assertEqual(1, counters[COUNTER_CANDIDATE_LIFECYCLE_FALLBACK])
+        lifecycle_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "candidate_lifecycle_fallback"
+        ]
+        self.assertEqual(1, len(lifecycle_calls))
+        self.assertEqual(
+            CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
+            lifecycle_calls[0].kwargs["details"]["reason"],
+        )
 
     def test_pair_candidate_waits_for_startup_recovery(self):
         old = SystemFile("old.bin", 10, False)
@@ -1869,6 +1887,16 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(builder.has_changes())
         counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
         self.assertEqual(1, counters["model_rebuild_terminalizable_collision"])
+        self.assertEqual(1, counters[COUNTER_CANDIDATE_PAIR_FALLBACK])
+        fallback_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "candidate_pair_fallback"
+        ]
+        self.assertEqual(1, len(fallback_calls))
+        self.assertEqual(
+            CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED,
+            fallback_calls[0].kwargs["details"]["reason"],
+        )
 
     def test_pair_candidate_ignores_unrelated_stale_move_failure_marker(self):
         old = SystemFile("old.bin", 10, False)
@@ -1920,6 +1948,65 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_model.assert_not_called()
         builder.request_rebuild.assert_not_called()
         self.assertFalse(builder.has_changes())
+
+    def test_pair_candidate_attributes_actionable_unrelated_retry_deferral(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        retry_remote = SystemFile("retry.bin", 10, False)
+        retry_remote.path_pair_id = "pair-b"
+        retry_local = SystemFile("retry.bin", 10, False)
+        retry_local.path_pair_id = "pair-b"
+        builder = ModelBuilder()
+        builder.set_local_files([old, retry_local])
+        builder.set_remote_files([old, retry_remote])
+        builder.set_downloaded_files(set())
+        builder.set_downloaded_timestamps({})
+        builder.set_extracted_files(set())
+        builder.set_stopped_files(set())
+        builder.set_move_failed_files(set())
+        builder.set_final_move_succeeded_files(set())
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        live_model = builder.build_model()
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        builder.request_rebuild = MagicMock(wraps=builder.request_rebuild)
+        replacement_local = SystemFile("new.bin", 10, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        retry_id = ModelFile.build_file_id("retry.bin", "pair-b")
+        controller._Controller__persist.move_failure_counts = {retry_id: 1}
+        controller._Controller__move_retry_due = {retry_id: datetime.now() + timedelta(minutes=1)}
+        controller._Controller__context.performance_diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+
+        ModelUpdater(controller).update()
+
+        builder.build_model.assert_not_called()
+        builder.request_rebuild.assert_called_once()
+        counters = controller._Controller__context.performance_diagnostics.snapshot()["counters"]
+        self.assertEqual(1, counters[COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED])
+        deferred_calls = [
+            call for call in controller._Controller__record_breadcrumb.call_args_list
+            if call.kwargs.get("message") == "unrelated_candidate_lifecycle_deferred"
+        ]
+        self.assertEqual(1, len(deferred_calls))
+        self.assertEqual(
+            CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY,
+            deferred_calls[0].kwargs["details"]["reason"],
+        )
 
     def test_multi_pair_final_with_new_duplicate_basenames_uses_global_build(self):
         old_a = SystemFile("old-a.bin", 10, False)

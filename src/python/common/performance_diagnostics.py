@@ -64,6 +64,20 @@ MODEL_REBUILD_REASON_TERMINALIZABLE_COLLISION = "terminalizable_collision"
 MODEL_REBUILD_REASON_MOVE_RETRY_DUE = "move_retry_due"
 MODEL_REBUILD_REASON_COLLISION_RETRY = "collision_retry"
 MODEL_REBUILD_REASON_DEFERRED_MOVE_PENDING = "deferred_move_pending"
+# Fixed candidate-transaction attribution. These identify only the closed
+# control-flow boundary that requested a global follow-up; they never carry
+# file identities, paths, exception text, or caller-provided labels.
+COUNTER_CANDIDATE_PAIR_FALLBACK = "candidate_pair_fallback"
+COUNTER_CANDIDATE_LIFECYCLE_FALLBACK = "candidate_lifecycle_fallback"
+COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED = "unrelated_candidate_lifecycle_deferred"
+CANDIDATE_PAIR_FALLBACK_REASON_PREREQUISITES = "prerequisites"
+CANDIDATE_PAIR_FALLBACK_REASON_AUTHORIZATION_REJECTED = "authorization_rejected"
+CANDIDATE_PAIR_FALLBACK_REASON_MISSING_MODEL = "missing_model"
+CANDIDATE_PAIR_FALLBACK_REASON_EXCEPTION = "exception"
+CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION = "exception"
+CANDIDATE_UNRELATED_LIFECYCLE_REASON_RETRY = "retry"
+CANDIDATE_UNRELATED_LIFECYCLE_REASON_PENDING_COMPLETION = "pending_completion"
+CANDIDATE_UNRELATED_LIFECYCLE_REASON_MULTIPLE = "multiple"
 # Fixed ModelBuilder cache-invalidation sources.  These labels intentionally
 # carry no file, path-pair, or cardinality data.
 MODEL_BUILDER_INVALIDATION_LOCAL_FILES = "model_builder_cache_invalidation_local_files"
@@ -179,6 +193,8 @@ _COUNTERS = frozenset((
     "local_scan_result_observations", "remote_scan_result_observations", "active_scan_result_observations",
     "model_rebuild_terminalizable_collision", "model_rebuild_move_retry_due",
     "model_rebuild_collision_retry", "model_rebuild_deferred_move_pending",
+    COUNTER_CANDIDATE_PAIR_FALLBACK, COUNTER_CANDIDATE_LIFECYCLE_FALLBACK,
+    COUNTER_UNRELATED_CANDIDATE_LIFECYCLE_DEFERRED,
     "progressive_delta_publications", "progressive_delta_root_visits",
     "active_transfer_delta_publications", "active_transfer_delta_root_visits",
     "scan_priority_requests", "scan_priority_interrupts",
