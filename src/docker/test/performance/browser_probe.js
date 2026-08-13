@@ -15,6 +15,8 @@ const MAX_EVENTS = 256;
 const MAX_MUTATIONS = 1024;
 const MAX_ERRORS = 64;
 const DEFAULT_TIMEOUT_MS = 60_000;
+const MAX_READINESS_STEPS = 4;
+const QUEUEABLE_STATES = new Set(['default', 'default-remote', 'stopped', 'deleted', 'corrupt']);
 
 function boundedPush(array, value, limit) {
   if (array.length < limit) array.push(value);
@@ -169,6 +171,22 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function targetIdentityMatches(identity, targetId, targetName) {
+  if (!identity) return false;
+  if (targetId) return String(identity.file_id || '') === String(targetId);
+  return String(identity.name || '') === String(targetName || '');
+}
+
+function targetIdentityMode(targetId) {
+  return targetId ? 'file-id' : 'target-name';
+}
+
+function targetIdentityMismatchError(identity, targetId, targetName) {
+  const expected = targetId ? `file id ${stableDigest(targetId)}` : `target name ${safeText(targetName)}`;
+  const actual = identity?.file_id ? `file id ${stableDigest(identity.file_id)}` : `target name ${safeText(identity?.name)}`;
+  return invalidPrecondition(`target identity mismatch: expected ${expected}, observed ${actual}`);
+}
+
 function runSelfTest() {
   assert(percentile([10, 20, 30, 40]) === 40, 'p95 nearest-rank statistic failed');
   assert(maximum([1, 8, 3]) === 8, 'max statistic failed');
@@ -217,10 +235,30 @@ function runSelfTest() {
     'successful cleanup was not accepted');
   assert(!cleanupPass({required: true, attempted: true, errors: [{kind: 'cleanup-stop'}],
     restored_state: 'deleted', residual_state: 'deleted'}), 'cleanup failure was silently accepted');
+  assert(readinessIsQueueable({status: 'default-remote', controls: {
+    Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: false},
+  }}), 'remote-only default target was not recognized as queueable');
+  assert(readinessIsQueueable({status: 'stopped', controls: {
+    Queue: {enabled: true}, Stop: {enabled: false}, 'Delete Local': {enabled: false},
+  }}), 'stopped remote target was not recognized as queueable');
+  assert(!readinessIsQueueable({status: 'downloaded', controls: {
+    Queue: {enabled: false}, Stop: {enabled: false}, 'Delete Local': {enabled: true},
+  }}), 'local terminal target was incorrectly recognized as queueable');
+  assert(targetIdentityMatches({file_id: 'stable-id', name: 'reordered-title'}, 'stable-id', 'target.bin'),
+    'file-id identity did not take precedence over reordered title');
+  assert(!targetIdentityMatches({file_id: 'other-id', name: 'target.bin'}, 'stable-id', 'target.bin'),
+    'wrong file-id identity was accepted despite matching title');
+  assert(targetIdentityMatches({file_id: null, name: 'target.bin'}, null, 'target.bin'),
+    'exact target-name fallback identity was rejected');
+  assert(!targetIdentityMatches({file_id: null, name: 'target.bin.bak'}, null, 'target.bin'),
+    'non-exact target-name fallback identity was accepted');
+  assert(measuredTargetMutations([{t_ms: 1}, {t_ms: 10}, {t_ms: 11}], 10).length === 2,
+    'pre-queue DOM samples were not excluded from measurement');
   const output = {
     schema: 'seedsync.performance-lab.browser-self-test.v1',
     statistics: {p95_ms: percentile([1, 2, 3, 4]), max_ms: maximum([1, 2, 3, 4])},
     thresholds: {target_dom_p95_ms: 200, target_dom_max_ms: 500, max_progress_gap_ms: 1000},
+    checks: {readiness_matrix: true, stable_identity_reorder: true, measurement_epoch: true},
     pass: true,
   };
   process.stdout.write(`${JSON.stringify(output)}\n`);
@@ -338,18 +376,25 @@ async function main() {
     await traverseTargetRows(page, target, timeoutMs);
     const targetId = await readTargetId(page, target.name, timeoutMs);
     target.file_id_present = Boolean(targetId);
-    await attachTargetObserver(page, targetId, target.name, modelStreamPath);
-    await exerciseActions(page, target, targetId, timeoutMs, evidence);
+    await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath);
     const timeline = await page.evaluate(() => window.__seedSyncPerfTimeline?.snapshot?.() || {});
     evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
     evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
     evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+    evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
+    evidence.measurement.measured_queue_t_ms = timeline.measuredQueueMs ?? evidence.measurement.measured_queue_t_ms;
     finalizeEvidence(evidence);
     writeEvidence(outputFile, evidence);
     if (!evidence.pass) throw new Error('browser timeline thresholds failed');
   } catch (error) {
     evidence.pass = false;
     evidence.failure_classification = classifyFailure(error);
+    if (error && error.precondition) {
+      boundedPush(evidence.preconditions, {
+        action: error.action || null,
+        pre_action: error.precondition,
+      }, MAX_EVENTS);
+    }
     boundedPush(evidence.errors, errorRecord(evidence.failure_classification, error), MAX_ERRORS);
     if (page) {
       try {
@@ -366,6 +411,8 @@ async function main() {
         evidence.samples.event_source_receive = sanitizeTimelinePaths(timeline.eventSourceReceive);
         evidence.samples.event_source_apply = sanitizeTimelinePaths(timeline.eventSourceApply);
         evidence.samples.target_dom_mutations = Array.isArray(timeline.targetDomMutations) ? timeline.targetDomMutations : [];
+        evidence.measurement.epoch_t_ms = timeline.measurementEpochMs ?? evidence.measurement.epoch_t_ms;
+        evidence.measurement.measured_queue_t_ms = timeline.measuredQueueMs ?? evidence.measurement.measured_queue_t_ms;
       }
     } catch (_) {
       // Preserve the primary failure classification while still writing schema.
@@ -414,11 +461,21 @@ function baseEvidence(label, runManifest, target, initialError) {
       browser_errors: {limit: 0, observed: 0, pass: false},
     },
     samples: {event_source_receive: [], event_source_apply: [], target_dom_mutations: [], target_dom_cadence: null, progress: []},
+    measurement: {
+      required: true, epoch_t_ms: null, measured_queue_t_ms: null,
+      post_readiness: false, sample_epoch_source: 'post-measured-queue',
+    },
     actions: [],
     cycles: [],
     max_progress_gap_ms: null,
     statistics: {action_http_response: {}, action_rendered_state: {}, progress_gap: null},
     expected_request_aborts: [],
+    preconditions: [],
+    readiness: {
+      required: true, attempted: false, steps: [],
+      initial_precondition: null, final_precondition: null,
+      normalized: false, pass: false, failure_classification: null,
+    },
     cleanup: {
       required: false, attempted: false, steps: [], errors: [],
       restored_state: null, residual_state: null, pass: false,
@@ -488,11 +545,13 @@ function installPageDiagnostics(page, evidence) {
     const eventSourcePaths = [];
     const targetDomMutations = [];
     const started = performance.now();
+    let measurementEpochMs = null;
+    let measuredQueueMs = null;
     const add = (array, value) => { if (array.length < limit) array.push(value); };
     const relative = () => Number((performance.now() - started).toFixed(3));
     const paths = new WeakMap();
-    const seenEvents = new WeakSet();
-    const eventRecords = new WeakMap();
+    let seenEvents = new WeakSet();
+    let eventRecords = new WeakMap();
     const eventPath = source => {
       try { return new URL(paths.get(source) || '', location.href).pathname; } catch (_) { return null; }
     };
@@ -550,6 +609,7 @@ function installPageDiagnostics(page, evidence) {
       'model-page', 'model-invalidate', 'model-patch', 'model-reset'];
     const latestScopedApply = (applies, atMs, scopedPath) => (applies || [])
       .filter(item => item && Number(item.t_ms) <= Number(atMs)
+        && (measurementEpochMs == null || Number(item.t_ms) >= measurementEpochMs)
         && String(item.pathname || '') === String(scopedPath || '')
         && scopedModelEventTypes.includes(String(item.event_type)))
       .sort((a, b) => Number(a.t_ms) - Number(b.t_ms)).slice(-1)[0] || null;
@@ -569,12 +629,26 @@ function installPageDiagnostics(page, evidence) {
       eventSourcePaths,
       targetDomMutations,
       findScopedModelPath: pathForPair,
+      beginMeasurement() {
+        eventSourceReceive.length = 0;
+        eventSourceApply.length = 0;
+        targetDomMutations.length = 0;
+        seenEvents = new WeakSet();
+        eventRecords = new WeakMap();
+        measurementEpochMs = relative();
+        measuredQueueMs = null;
+        return {epoch_t_ms: measurementEpochMs};
+      },
+      markMeasuredQueue() {
+        measuredQueueMs = relative();
+        return measuredQueueMs;
+      },
       attachTarget(targetId, targetName, scopedPath) {
         const root = document.querySelector('#file-list') || document.body;
         const find = () => Array.from(document.querySelectorAll('#file-list .file')).find(row => {
           const id = row.getAttribute('data-file-id');
           const title = row.querySelector('.name .title')?.textContent?.trim();
-          return (targetId && id === targetId) || title === targetName;
+          return targetId ? id === targetId : title === targetName;
         });
         let lastSignature = null;
         const capture = () => {
@@ -599,17 +673,18 @@ function installPageDiagnostics(page, evidence) {
             receive_to_dom_ms: apply && apply.receive_t_ms != null ? Number((tMs - apply.receive_t_ms).toFixed(3)) : null,
           });
         };
-        capture();
         const observer = new MutationObserver(capture);
         observer.observe(root, {subtree: true, childList: true, attributes: true, characterData: true,
           attributeFilter: ['aria-valuenow', 'class', 'style']});
         window.__seedSyncPerfTimeline.snapshot = () => ({
           eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
           eventSourcePaths: eventSourcePaths.slice(), targetDomMutations: targetDomMutations.slice(),
+          measurementEpochMs, measuredQueueMs,
         });
       },
       snapshot() { return {eventSourceReceive: eventSourceReceive.slice(), eventSourceApply: eventSourceApply.slice(),
-        eventSourcePaths: eventSourcePaths.slice(), targetDomMutations: targetDomMutations.slice()}; },
+        eventSourcePaths: eventSourcePaths.slice(), targetDomMutations: targetDomMutations.slice(),
+        measurementEpochMs, measuredQueueMs}; },
     };
   });
 }
@@ -732,16 +807,62 @@ async function readTargetId(page, name, timeoutMs) {
   return row.getAttribute('data-file-id');
 }
 
+function cssAttributeValue(value) {
+  return String(value)
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+}
+
+function targetRowLocator(page, targetId, targetName) {
+  if (targetId) {
+    return page.locator(`#file-list .file[data-file-id="${cssAttributeValue(targetId)}"]`);
+  }
+  return page.getByText(targetName, {exact: true})
+    .locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " file ")][1]');
+}
+
+async function rowIdentity(row) {
+  return row.evaluate(node => ({
+    file_id: node.getAttribute('data-file-id'),
+    name: node.querySelector('.name .title')?.textContent?.trim() || null,
+  }));
+}
+
+async function verifyTargetIdentity(row, targetId, targetName) {
+  const identity = await rowIdentity(row);
+  const matched = targetIdentityMatches(identity, targetId, targetName);
+  if (!matched) {
+    const error = targetIdentityMismatchError(identity, targetId, targetName);
+    error.precondition = {
+      identity,
+      identity_mode: targetIdentityMode(targetId),
+      identity_match: false,
+    };
+    throw error;
+  }
+  return {
+    identity,
+    identity_mode: targetIdentityMode(targetId),
+    identity_match: true,
+  };
+}
+
 async function reacquireTargetRow(page, targetId, targetName, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  const rows = targetRowLocator(page, targetId, targetName);
   while (Date.now() < deadline) {
-    const rows = page.locator('#file-list .file');
     const count = await rows.count();
     for (let index = 0; index < count; index += 1) {
       const row = rows.nth(index);
-      const id = await row.getAttribute('data-file-id').catch(() => null);
-      const title = (await row.locator('.name .title').innerText().catch(() => '')).trim();
-      if ((targetId && id === targetId) || title === targetName) return row;
+      try {
+        await verifyTargetIdentity(row, targetId, targetName);
+        return row;
+      } catch (_) {
+        // A virtualized/sorted list can remount between count and identity
+        // read. Continue looking for the stable identity until the deadline.
+      }
     }
     await page.mouse.wheel(0, 600);
     await page.waitForTimeout(50);
@@ -756,8 +877,62 @@ async function readTargetState(page, targetId, targetName, timeoutMs) {
     const icon = node.querySelector('.status img[id]')?.id;
     const progress = Number(node.querySelector('.progress-bar')?.getAttribute('aria-valuenow'));
     return {status: text || (icon === 'default-remote' ? 'default-remote' : icon) || null,
-      progress: Number.isFinite(progress) ? progress : null};
+      progress: Number.isFinite(progress) ? progress : null,
+      identity: {
+        file_id: node.getAttribute('data-file-id'),
+        name: node.querySelector('.name .title')?.textContent?.trim() || null,
+      }};
   });
+}
+
+async function readActionPrecondition(page, targetId, targetName, timeoutMs) {
+  const row = await selectTarget(page, targetId, targetName, timeoutMs);
+  await row.locator('.actions').waitFor({state: 'visible', timeout: timeoutMs});
+  return captureActionPrecondition(row, targetId, targetName);
+}
+
+async function captureActionPrecondition(row, targetId, targetName) {
+  const precondition = await row.evaluate(node => {
+    const statusText = node.querySelector('.status .text')?.textContent?.trim().toLowerCase() || null;
+    const statusIcon = node.querySelector('.status img[id]')?.id || null;
+    const progressAttribute = node.querySelector('.progress-bar')?.getAttribute('aria-valuenow');
+    const progress = Number(progressAttribute);
+    const status = statusText || (statusIcon === 'default-remote' ? 'default-remote' : statusIcon);
+    const controls = {};
+    for (const action of ['Queue', 'Stop', 'Delete Local']) {
+      const button = Array.from(node.querySelectorAll('.actions .button')).find(item =>
+        item.textContent?.trim().includes(action));
+      const ariaDisabled = button?.getAttribute('aria-disabled');
+      controls[action] = {
+        present: Boolean(button),
+        enabled: Boolean(button && !button.disabled && ariaDisabled !== 'true'),
+        disabled: Boolean(!button || button.disabled || ariaDisabled === 'true'),
+      };
+    }
+    return {
+      dom: {
+        row_present: true,
+        selected: node.classList.contains('selected'),
+        status_text: statusText,
+        status_icon: statusIcon,
+        progress_attribute: progressAttribute,
+      },
+      status: status || null,
+      progress: Number.isFinite(progress) ? progress : null,
+      controls,
+      identity: {
+        file_id: node.getAttribute('data-file-id'),
+        name: node.querySelector('.name .title')?.textContent?.trim() || null,
+      },
+    };
+  });
+  precondition.identity_mode = targetIdentityMode(targetId);
+  precondition.identity_match = targetIdentityMatches(precondition.identity, targetId, targetName);
+  return precondition;
+}
+
+function preconditionControl(precondition, name) {
+  return precondition?.controls?.[name] || {present: false, enabled: false, disabled: true};
 }
 
 async function attachTargetObserver(page, targetId, targetName, scopedPath) {
@@ -769,7 +944,10 @@ async function attachTargetObserver(page, targetId, targetName, scopedPath) {
 async function selectTarget(page, targetId, targetName, timeoutMs) {
   const row = await reacquireTargetRow(page, targetId, targetName, timeoutMs);
   const selected = await row.evaluate(node => node.classList.contains('selected')).catch(() => false);
-  if (!selected) await row.click();
+  if (!selected) {
+    await verifyTargetIdentity(row, targetId, targetName);
+    await row.click();
+  }
   return reacquireTargetRow(page, targetId, targetName, timeoutMs);
 }
 
@@ -785,8 +963,9 @@ function responseMatcher(action) {
 async function waitForState(page, targetId, targetName, allowed, timeoutMs) {
   await page.waitForFunction(({id, name, states}) => {
     const rows = Array.from(document.querySelectorAll('#file-list .file'));
-    const row = rows.find(item => (id && item.getAttribute('data-file-id') === id)
-      || item.querySelector('.name .title')?.textContent?.trim() === name);
+    const row = rows.find(item => id
+      ? item.getAttribute('data-file-id') === id
+      : item.querySelector('.name .title')?.textContent?.trim() === name);
     if (!row) return false;
     const text = row.querySelector('.status .text')?.textContent?.trim().toLowerCase();
     const icon = row.querySelector('.status img[id]')?.id;
@@ -803,9 +982,9 @@ async function waitForState(page, targetId, targetName, allowed, timeoutMs) {
 
 async function waitForActiveMaterialization(page, targetId, targetName, timeoutMs) {
   await page.waitForFunction(({id, name}) => {
-    const row = Array.from(document.querySelectorAll('#file-list .file')).find(item =>
-      (id && item.getAttribute('data-file-id') === id)
-      || item.querySelector('.name .title')?.textContent?.trim() === name);
+    const row = Array.from(document.querySelectorAll('#file-list .file')).find(item => id
+      ? item.getAttribute('data-file-id') === id
+      : item.querySelector('.name .title')?.textContent?.trim() === name);
     if (!row) return false;
     const status = row.querySelector('.status .text')?.textContent?.trim().toLowerCase()
       || row.querySelector('.status img[id]')?.id;
@@ -822,21 +1001,42 @@ async function waitForActiveMaterialization(page, targetId, targetName, timeoutM
 async function waitForEnabledAction(page, targetId, targetName, actionName, timeoutMs) {
   const startedAt = Date.now();
   await page.waitForFunction(({id, name, action}) => {
-    const row = Array.from(document.querySelectorAll('#file-list .file')).find(item =>
-      (id && item.getAttribute('data-file-id') === id)
-      || item.querySelector('.name .title')?.textContent?.trim() === name);
+    const row = Array.from(document.querySelectorAll('#file-list .file')).find(item => id
+      ? item.getAttribute('data-file-id') === id
+      : item.querySelector('.name .title')?.textContent?.trim() === name);
     const button = row && Array.from(row.querySelectorAll('.actions .button')).find(item =>
       item.textContent?.trim().includes(action));
-    return Boolean(button && !button.disabled);
+    return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
   }, {id: targetId, name: targetName, action: actionName}, {timeout: timeoutMs});
   return Date.now() - startedAt;
 }
 
 async function clickAction(page, target, targetId, name, endpointAction, allowedStates, timeoutMs, confirm, recordName = null) {
-  const row = await selectTarget(page, targetId, target.name, timeoutMs);
-  const button = row.locator('.actions .button').filter({hasText: name}).first();
-  await button.waitFor({state: 'visible', timeout: timeoutMs});
-  if (await button.isDisabled()) throw new Error(`${name} action is disabled`);
+  const deadline = Date.now() + timeoutMs;
+  let row = null;
+  let button = null;
+  let preAction = null;
+  let control = null;
+  while (Date.now() < deadline) {
+    row = await selectTarget(page, targetId, target.name, timeoutMs);
+    button = row.locator('.actions .button').filter({hasText: name}).first();
+    await button.waitFor({state: 'visible', timeout: timeoutMs});
+    preAction = await captureActionPrecondition(row, targetId, target.name);
+    control = preconditionControl(preAction, name);
+    // Angular can remount the row between the enabled-control wait and the
+    // Playwright click. Reacquire and recheck within the same bounded action
+    // window so a transient disabled snapshot is not misreported as a failed
+    // measured action.
+    if (preAction.identity_match && control.enabled && !(await button.isDisabled().catch(() => true))) break;
+    await page.waitForTimeout(25);
+  }
+  if (!preAction?.identity_match || !control?.enabled || !button || await button.isDisabled().catch(() => true)) {
+    const error = new Error(`${name} action is disabled in precondition state ${preAction?.status || 'unknown'}`);
+    error.failure_classification = 'invalid-precondition';
+    error.action = name;
+    error.precondition = preAction;
+    throw error;
+  }
   let confirmationOpenedAt = null;
   if (confirm) {
     await button.click();
@@ -845,6 +1045,8 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
     await dialog.waitFor({state: 'visible', timeout: timeoutMs});
     const confirmButton = dialog.getByRole('button', {name: 'Delete', exact: true});
     await confirmButton.waitFor({state: 'visible', timeout: timeoutMs});
+    const confirmationRow = await reacquireTargetRow(page, targetId, target.name, timeoutMs);
+    const confirmationIdentity = await verifyTargetIdentity(confirmationRow, targetId, target.name);
     const clickAt = await page.evaluate(() => performance.now());
     const responsePromise = page.waitForResponse(responseMatcher(endpointAction), {timeout: timeoutMs});
     await confirmButton.click();
@@ -854,7 +1056,9 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
     const renderedAt = await page.evaluate(() => performance.now());
     return {
       name: recordName || (name === 'Delete Local' ? 'delete_local' : name.toLowerCase()), measured: true,
+      pre_action: preAction,
       endpoint_action: endpointAction, http_status: response.status(), response_reported: true,
+      confirmation_identity_match: confirmationIdentity.identity_match,
       rendered_state: renderedState, click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
       click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
       confirmation_open_to_click_ms: Number((clickAt - confirmationOpenedAt).toFixed(3)),
@@ -863,6 +1067,7 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
     };
   }
   const clickAt = await page.evaluate(() => performance.now());
+  const clickIdentity = await verifyTargetIdentity(row, targetId, target.name);
   const responsePromise = page.waitForResponse(responseMatcher(endpointAction), {timeout: timeoutMs});
   await button.click();
   const response = await responsePromise;
@@ -871,10 +1076,107 @@ async function clickAction(page, target, targetId, name, endpointAction, allowed
   const renderedAt = await page.evaluate(() => performance.now());
   return {
     name: recordName || (name === 'Queue' ? 'queue' : name.toLowerCase()), measured: true,
+    pre_action: preAction,
+    click_identity_match: clickIdentity.identity_match,
     endpoint_action: endpointAction, http_status: response.status(), response_reported: true,
     rendered_state: renderedState, click_to_http_response_ms: Number((responseAt - clickAt).toFixed(3)),
     click_to_rendered_state_ms: Number((renderedAt - clickAt).toFixed(3)),
   };
+}
+
+function invalidPrecondition(message, precondition = null, action = null) {
+  const error = new Error(message);
+  error.failure_classification = 'invalid-precondition';
+  if (action) error.action = action;
+  if (precondition) error.precondition = precondition;
+  return error;
+}
+
+function readinessIsQueueable(precondition) {
+  if (!precondition || !QUEUEABLE_STATES.has(String(precondition.status || ''))) return false;
+  // Queue must be enabled and Delete Local must be disabled. The latter is
+  // the DOM-visible proof that no local copy remains; Queue alone is also
+  // enabled for local-only/default states with retained local content.
+  return precondition.controls?.Queue?.enabled === true
+    && precondition.controls?.['Delete Local']?.enabled !== true;
+}
+
+async function waitForNormalizationPrecondition(page, targetId, targetName, timeoutMs, initial = null) {
+  const startedAt = Date.now();
+  let precondition = initial || await readActionPrecondition(page, targetId, targetName, timeoutMs);
+  while (Date.now() - startedAt < timeoutMs) {
+    if (readinessIsQueueable(precondition)
+        || precondition.controls?.Stop?.enabled === true
+        || precondition.controls?.['Delete Local']?.enabled === true) {
+      return precondition;
+    }
+    await page.waitForTimeout(100);
+    precondition = await readActionPrecondition(page, targetId, targetName, timeoutMs);
+  }
+  throw invalidPrecondition(
+    `synthetic browser target controls did not become ready in state ${precondition.status || 'unknown'}`,
+    precondition,
+  );
+}
+
+async function normalizeTarget(page, target, targetId, timeoutMs, evidence) {
+  const readiness = evidence.readiness;
+  readiness.attempted = true;
+  let precondition = null;
+  try {
+    precondition = await waitForNormalizationPrecondition(
+      page, targetId, target.name, timeoutMs,
+    );
+    readiness.initial_precondition = precondition;
+    for (let index = 0; index <= MAX_READINESS_STEPS; index += 1) {
+      if (readinessIsQueueable(precondition)) {
+        readiness.final_precondition = precondition;
+        readiness.normalized = true;
+        readiness.pass = true;
+        return;
+      }
+      if (index === MAX_READINESS_STEPS) {
+        throw invalidPrecondition('synthetic browser target did not reach remote-only queueable readiness',
+          precondition);
+      }
+
+      let actionName = null;
+      let endpointAction = null;
+      let allowedStates = null;
+      let confirm = false;
+      if (precondition.controls?.Stop?.enabled === true) {
+        actionName = 'Stop';
+        endpointAction = 'stop';
+        allowedStates = ['stopped'];
+      } else if (precondition.controls?.['Delete Local']?.enabled === true) {
+        actionName = 'Delete Local';
+        endpointAction = 'delete_local';
+        allowedStates = [...QUEUEABLE_STATES, 'default-local', 'local only', 'downloaded',
+          'extracting', 'extracted', 'validating', 'validated', 'move_failed', 'move-succeeded'];
+        confirm = true;
+      } else {
+        throw invalidPrecondition(
+          `synthetic browser target has no enabled normalization control in state ${precondition.status || 'unknown'}`,
+          precondition,
+        );
+      }
+
+      const result = await clickAction(
+        page, target, targetId, actionName, endpointAction, allowedStates, timeoutMs, confirm,
+        `normalize_${endpointAction}`,
+      );
+      result.measured = false;
+      readiness.steps.push(result);
+      precondition = await waitForNormalizationPrecondition(
+        page, targetId, target.name, timeoutMs,
+      );
+    }
+  } catch (error) {
+    readiness.final_precondition = precondition || error.precondition || null;
+    readiness.failure_classification = error.failure_classification || 'probe';
+    readiness.pass = false;
+    throw error;
+  }
 }
 
 function recordCleanupError(evidence, record, step, error) {
@@ -892,6 +1194,7 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
     recordCleanupError(evidence, record, 'observe', error);
   }
   record.observed_state = observedState?.status || null;
+  record.observed_identity = observedState?.identity || null;
 
   const stopRequired = !observedState || Boolean(
     ['queued', 'downloading', 'extracting'].includes(observedState.status)
@@ -935,7 +1238,11 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
       skipped: true, reason: 'target was already deleted'});
   }
 
-  try { record.residual_state = (await readTargetState(page, targetId, target.name, timeoutMs))?.status || null; }
+  try {
+    const residual = await readTargetState(page, targetId, target.name, timeoutMs);
+    record.residual_state = residual?.status || null;
+    record.residual_identity = residual?.identity || null;
+  }
   catch (error) {
     record.residual_state = null;
     recordCleanupError(evidence, record, 'residual-state', error);
@@ -947,7 +1254,7 @@ async function cleanupTarget(page, target, targetId, timeoutMs, evidence, record
   record.pass = cleanupPass(record);
 }
 
-async function exerciseActions(page, target, targetId, timeoutMs, evidence) {
+async function exerciseActions(page, target, targetId, timeoutMs, evidence, scopedPath) {
   const actions = evidence.actions;
   const cleanupRecord = {name: 'cleanup', measured: false, required: false, attempted: false,
     steps: [], errors: [], observed_state: null, restored_state: null, residual_state: null, pass: false};
@@ -957,7 +1264,20 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence) {
     // still performs best-effort Stop then Delete Local recovery.
     cleanupRecord.required = true;
     evidence.cleanup.required = true;
-    actions.push(await clickAction(page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'queue'));
+    await normalizeTarget(page, target, targetId, timeoutMs, evidence);
+    // Start target mutation sampling only after readiness normalization. The
+    // normalization actions are evidence, but are not part of measurement.
+    await attachTargetObserver(page, targetId, target.name, scopedPath);
+    const measurementEpoch = await page.evaluate(() =>
+      window.__seedSyncPerfTimeline?.beginMeasurement?.() || null);
+    evidence.measurement.epoch_t_ms = measurementEpoch?.epoch_t_ms ?? null;
+    evidence.measurement.post_readiness = true;
+    const queueAction = await clickAction(
+      page, target, targetId, 'Queue', 'queue', ['queued', 'downloading'], timeoutMs, false, 'queue',
+    );
+    actions.push(queueAction);
+    evidence.measurement.measured_queue_t_ms = await page.evaluate(() =>
+      window.__seedSyncPerfTimeline?.markMeasuredQueue?.() || null);
     await waitForActiveMaterialization(page, targetId, target.name, timeoutMs);
     const stopControlWaitMs = await waitForEnabledAction(page, targetId, target.name, 'Stop', timeoutMs);
     const stopAction = await clickAction(page, target, targetId, 'Stop', 'stop', ['stopped'], timeoutMs, false);
@@ -976,6 +1296,12 @@ async function exerciseActions(page, target, targetId, timeoutMs, evidence) {
 }
 
 function finalizeEvidence(evidence) {
+  const measuredQueueTMs = Number(evidence.measurement?.measured_queue_t_ms);
+  const allTargetMutations = Array.isArray(evidence.samples.target_dom_mutations)
+    ? evidence.samples.target_dom_mutations : [];
+  const targetMutations = measuredTargetMutations(allTargetMutations, measuredQueueTMs);
+  evidence.samples.target_dom_mutations = targetMutations.slice(0, MAX_MUTATIONS);
+  evidence.measurement.sample_count = evidence.samples.target_dom_mutations.length;
   const cadenceSummary = cadence(evidence.samples.target_dom_mutations);
   const progressSummary = progressGap(evidence.samples.target_dom_mutations);
   const receiveToDom = latencyStats(evidence.samples.target_dom_mutations, 'receive_to_dom_ms');
@@ -1022,12 +1348,21 @@ function finalizeEvidence(evidence) {
     && evidence.thresholds.max_progress_gap_ms.pass
     && evidence.thresholds.action_rendered_state_p95_ms.pass
     && evidence.thresholds.action_http_response_reported.pass
+    && evidence.readiness.pass
     && evidence.cleanup.pass
     && evidence.thresholds.browser_errors.pass;
   if (evidence.pass) evidence.failure_classification = 'none';
 }
 
+function measuredTargetMutations(samples, measuredQueueTMs) {
+  const values = Array.isArray(samples) ? samples : [];
+  return Number.isFinite(Number(measuredQueueTMs))
+    ? values.filter(sample => Number(sample?.t_ms) >= Number(measuredQueueTMs))
+    : values;
+}
+
 function classifyFailure(error) {
+  if (error && error.failure_classification) return error.failure_classification;
   const message = String(error && error.message || error || '').toLowerCase();
   if (message.includes('bootstrap')) return 'bootstrap';
   if (message.includes('manifest') || message.includes('target')) return 'fixture-target';

@@ -18,7 +18,7 @@ from generate_fixture import _data_spec, config_fingerprint, normalize_topology_
 # Mixed-profile transfer must remain observable for the browser timeline while
 # leaving the historical uniform profile unchanged.  This is a synthetic
 # fixture setting, not a production default.
-MIXED_RATE_LIMIT_BYTES_PER_SECOND = 2_000_000
+MIXED_RATE_LIMIT_BYTES_PER_SECOND = 64_000
 
 
 def _hash_secret(secret: str) -> str:

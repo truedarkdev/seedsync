@@ -151,6 +151,50 @@ def _stats_sample(path: str, role: str, fields: str) -> None:
     _write(path, payload)
 
 
+def _cgroup_stat(path: str, role: str, boundary: str, phase_ms: str, observed_ms: str, raw: str) -> None:
+    """Append only the fixed usage counter from a cgroup cpu.stat response."""
+    if role not in {"app", "remote-helper"} or boundary not in {"target", "end"}:
+        raise SystemExit("invalid cgroup boundary")
+    try:
+        phase_timestamp = int(phase_ms)
+    except (TypeError, ValueError):
+        phase_timestamp = -1
+    try:
+        observed_timestamp = int(observed_ms)
+    except (TypeError, ValueError):
+        observed_timestamp = -1
+    usage = None
+    for line in raw.splitlines():
+        fields = line.strip().split()
+        if len(fields) == 2 and fields[0] == "usage_usec":
+            try:
+                candidate = int(fields[1])
+            except (TypeError, ValueError):
+                candidate = -1
+            if candidate >= 0:
+                usage = candidate
+            break
+    payload = {
+        "schema": "seedsync.performance-lab.cgroup-cpu-series.v1",
+        "samples": [],
+    }
+    try:
+        existing = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(existing, dict) and existing.get("schema") == payload["schema"] \
+                and isinstance(existing.get("samples"), list):
+            payload["samples"] = existing["samples"]
+    except (OSError, ValueError, TypeError):
+        pass
+    if phase_timestamp >= 0 and observed_timestamp >= 0 and usage is not None:
+        payload["samples"].append({
+            "role": role, "boundary": boundary,
+            "phase_t_epoch_ms": phase_timestamp,
+            "observed_t_epoch_ms": observed_timestamp,
+            "usage_usec": usage,
+        })
+    _write(path, payload)
+
+
 def _processes(path: str, role: str, count: str) -> None:
     _write(
         path,
@@ -174,6 +218,11 @@ def main() -> int:
         _stats(path, role, value)
     elif kind == "stats-sample":
         _stats_sample(path, role, value)
+    elif kind == "cgroup-stat":
+        if len(sys.argv) != 7:
+            raise SystemExit("usage: sanitize_docker_state.py cgroup-stat OUTPUT ROLE BOUNDARY PHASE_EPOCH_MS OBSERVED_EPOCH_MS")
+        # The raw cpu.stat response is read from stdin and is never retained.
+        _cgroup_stat(path, role, sys.argv[4], sys.argv[5], sys.argv[6], sys.stdin.read())
     elif kind == "processes":
         _processes(path, role, value)
     else:

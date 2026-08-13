@@ -37,6 +37,7 @@ PERF_POST_TARGET_POLL_SECONDS="${PERF_POST_TARGET_POLL_SECONDS:-10}"
 # post-target window can incorrectly certify the quiet gap before that refresh
 # restarts, so the default acceptance window spans one complete refresh edge.
 PERF_POST_TARGET_OBSERVATION_SECONDS="${PERF_POST_TARGET_OBSERVATION_SECONDS:-150}"
+PERF_CGROUP_CAPTURE_LAG_MAX_SECONDS=5
 PERF_SETTLED_IDLE_CPU_PERCENT="${PERF_SETTLED_IDLE_CPU_PERCENT:-1.0}"
 # Diagnostics-off readiness is intentionally stricter than the final average:
 # the app must report three consecutive low-CPU observations before the full
@@ -169,10 +170,10 @@ write_compose_summary() {
   app_fields=""
   remote_fields=""
   if [[ -n "$app_id" ]]; then
-    app_fields="$(docker inspect --format '{{.State.Status}}\t{{.State.Running}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}\t{{.RestartCount}}\t{{.Config.Image}}\t{{.Platform}}' "$app_id" 2>/dev/null || true)"
+    app_fields="$(docker inspect --format '{{.State.Status}}{{"\t"}}{{.State.Running}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{.State.FinishedAt}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.Platform}}' "$app_id" 2>/dev/null || true)"
   fi
   if [[ -n "$remote_id" ]]; then
-    remote_fields="$(docker inspect --format '{{.State.Status}}\t{{.State.Running}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}\t{{.RestartCount}}\t{{.Config.Image}}\t{{.Platform}}' "$remote_id" 2>/dev/null || true)"
+    remote_fields="$(docker inspect --format '{{.State.Status}}{{"\t"}}{{.State.Running}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{.State.FinishedAt}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.Platform}}' "$remote_id" 2>/dev/null || true)"
   fi
   python3 - "$output_path" "$PROJECT" "$app_fields" "$remote_fields" <<'PY'
 import hashlib
@@ -248,7 +249,7 @@ write_container_summary() {
   local fields
   # Select fixed fields before they cross into a retained artifact.  The raw
   # inspect object contains environment, mounts, commands, labels, and IDs.
-  fields="$(docker inspect --format '{{.State.Status}}\t{{.State.Running}}\t{{.State.StartedAt}}\t{{.State.FinishedAt}}\t{{.RestartCount}}\t{{.Config.Image}}\t{{.Platform}}\t{{.SizeRw}}\t{{.SizeRootFs}}\t{{.HostConfig.NanoCpus}}\t{{.HostConfig.Memory}}\t{{.HostConfig.PidsLimit}}\t{{len .Mounts}}' "$container_id" 2>/dev/null || true)"
+  fields="$(docker inspect --format '{{.State.Status}}{{"\t"}}{{.State.Running}}{{"\t"}}{{.State.StartedAt}}{{"\t"}}{{.State.FinishedAt}}{{"\t"}}{{.RestartCount}}{{"\t"}}{{.Config.Image}}{{"\t"}}{{.Platform}}{{"\t"}}{{.SizeRw}}{{"\t"}}{{.SizeRootFs}}{{"\t"}}{{.HostConfig.NanoCpus}}{{"\t"}}{{.HostConfig.Memory}}{{"\t"}}{{.HostConfig.PidsLimit}}{{"\t"}}{{len .Mounts}}' "$container_id" 2>/dev/null || true)"
   [[ -n "$fields" ]] || return 0
   python3 "$SCRIPT_DIR/sanitize_docker_state.py" container "$output_path" "$role" "$fields"
 }
@@ -260,7 +261,7 @@ write_image_summary() {
   local image_id fields
   image_id="$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)"
   [[ -n "$image_id" ]] || return 0
-  fields="$(docker image inspect --format '{{.Architecture}}\t{{.Os}}\t{{.Created}}\t{{.Size}}\t{{len .RootFS.Layers}}' "$image_id" 2>/dev/null || true)"
+  fields="$(docker image inspect --format '{{.Architecture}}{{"\t"}}{{.Os}}{{"\t"}}{{.Created}}{{"\t"}}{{.Size}}{{"\t"}}{{len .RootFS.Layers}}' "$image_id" 2>/dev/null || true)"
   fields="${fields}"$'\t'"${image_id}"
   [[ -n "$fields" ]] || return 0
   python3 "$SCRIPT_DIR/sanitize_docker_state.py" image "$output_path" "$role" "$fields"
@@ -271,7 +272,7 @@ write_stats_summary() {
   local output_path="$2"
   local role="$3"
   local fields
-  fields="$(docker stats --no-stream --format '{{.CPUPerc}}\t{{.MemPerc}}\t{{.PIDs}}' "$container_id" 2>/dev/null || true)"
+  fields="$(docker stats --no-stream --format '{{.CPUPerc}}{{"\t"}}{{.MemPerc}}{{"\t"}}{{.PIDs}}' "$container_id" 2>/dev/null || true)"
   [[ -n "$fields" ]] || return 0
   python3 "$SCRIPT_DIR/sanitize_docker_state.py" stats "$output_path" "$role" "$fields"
 }
@@ -284,10 +285,31 @@ sample_docker_stats() {
   local container_id fields timestamp
   container_id="$(compose ps -q "$service" 2>/dev/null || true)"
   [[ -n "$container_id" ]] || return 0
-  fields="$(docker stats --no-stream --format '{{.CPUPerc}}\t{{.MemPerc}}\t{{.PIDs}}' "$container_id" 2>/dev/null || true)"
+  fields="$(docker stats --no-stream --format '{{.CPUPerc}}{{"\t"}}{{.MemPerc}}{{"\t"}}{{.PIDs}}' "$container_id" 2>/dev/null || true)"
   [[ -n "$fields" ]] || return 0
   timestamp="$(date -u +%s%3N)"
   python3 "$SCRIPT_DIR/sanitize_docker_state.py" stats-sample "$output_path" "$role" "${timestamp}"$'\t'"${fields}"
+}
+
+capture_cgroup_cpu_boundary() {
+  local output_path="$1"
+  local role="$2"
+  local boundary="$3"
+  local phase_timestamp="$4"
+  local service="$role" container_id cpu_stat observed_timestamp
+  [[ "$service" == remote-helper ]] && service=remote
+  container_id="$(compose ps -q "$service" 2>/dev/null || true)"
+  [[ -n "$container_id" ]] || {
+    echo "missing live $role container for cgroup CPU boundary" >&2
+    return 1
+  }
+  # Read only the cgroup counter. The sanitizer retains no raw response,
+  # container ID, path, command, or other Docker metadata. A failed read is
+  # fatal so partial boundaries cannot certify a run.
+  cpu_stat="$(docker exec "$container_id" cat /sys/fs/cgroup/cpu.stat 2>/dev/null)"
+  observed_timestamp="$(date -u +%s%3N)"
+  printf '%s' "$cpu_stat" | python3 "$SCRIPT_DIR/sanitize_docker_state.py" \
+    cgroup-stat "$output_path" "$role" "$boundary" "$phase_timestamp" "$observed_timestamp"
 }
 
 write_process_summary() {
@@ -460,9 +482,11 @@ measure() {
   local model_summary_url="$base_url/server/model/v1/summary"
   local app_docker_stats_series="$phase_dir/app-docker-stats-series.json"
   local remote_docker_stats_series="$phase_dir/remote-helper-docker-stats-series.json"
+  local cgroup_cpu_series="$phase_dir/cgroup-cpu-series.json"
   local model_summary_series="$phase_dir/model-summary-samples.json"
   printf '%s\n' '{"schema":"seedsync.performance-lab.container-stats-series.v1","role":"app","samples":[]}' > "$app_docker_stats_series"
   printf '%s\n' '{"schema":"seedsync.performance-lab.container-stats-series.v1","role":"remote-helper","samples":[]}' > "$remote_docker_stats_series"
+  printf '%s\n' '{"schema":"seedsync.performance-lab.cgroup-cpu-series.v1","samples":[]}' > "$cgroup_cpu_series"
   printf '%s\n' '{"schema":"seedsync.performance-lab.model-summary-series.v1","samples":[]}' > "$model_summary_series"
   python3 - "$phase_dir/window-note.json" <<'PY'
 import json, os, sys
@@ -516,10 +540,115 @@ PY
   local summary_stable_count=0 summary_last_version="" summary_last_root_count="" summary_success_count=0
   local summary_quiet_count=0 target_stable_count="" target_quiet_count=""
   local target_root_count="" target_model_version=""
+  local end_diagnostics_path="" end_model_summary_path=""
+  local end_state_validated=0 end_state_root_count="" end_state_model_version=""
+  local end_state_sequence="" end_state_build_count=""
   while (( $(date +%s) < deadline )); do
     index=$((index + 1))
     sample_docker_stats "$app_docker_stats_series" app || true
     sample_docker_stats "$remote_docker_stats_series" remote-helper || true
+    if [[ -n "$target_ms" && -z "$settled_ms" ]]; then
+      local observation_now_ms
+      observation_now_ms="$(date -u +%s%3N)"
+      if (( observation_now_ms < target_ms + (PERF_POST_TARGET_OBSERVATION_SECONDS + PERF_CGROUP_CAPTURE_LAG_MAX_SECONDS) * 1000 )); then
+        # After target, resource-only sampling keeps observer load comparable
+        # for diagnostics on/off. Do not serialize model state on each poll.
+        sleep "$PERF_POST_TARGET_POLL_SECONDS"
+        continue
+      fi
+      local final_valid=0
+      if [[ "$PERF_DIAGNOSTICS_MODE" == off ]]; then
+        end_model_summary_path="$phase_dir/model-summary-at-end.json"
+        if curl --silent --show-error --fail --max-time 120 \
+          -H "Authorization: Bearer $PERF_API_TOKEN" "$model_summary_url" > "$end_model_summary_path"; then
+          read -r final_summary_count final_summary_version <<<"$(python3 - "$end_model_summary_path" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["PERF_LAB_SOURCE_DIR"])
+from capture_metrics import latest_model_summary_status
+status = latest_model_summary_status(json.load(open(sys.argv[1], encoding="utf-8")))
+print(status.get("root_count", ""), status.get("model_version", ""))
+PY
+)"
+          if [[ "$final_summary_count" == "$target_root_count" &&
+                "$final_summary_version" == "$target_model_version" ]]; then
+            final_valid=1
+          fi
+          end_state_root_count="$final_summary_count"
+          end_state_model_version="$final_summary_version"
+        fi
+      else
+        end_diagnostics_path="$phase_dir/diagnostics-at-end.json"
+        if curl --silent --show-error --fail --max-time 120 \
+          -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url" > "$end_diagnostics_path"; then
+          read -r final_count final_sequence final_build_count <<<"$(python3 - "$end_diagnostics_path" <<'PY'
+import json, os, sys
+sys.path.insert(0, os.environ["PERF_LAB_SOURCE_DIR"])
+from capture_metrics import latest_model_status
+count, sequence, build_count = latest_model_status(json.load(open(sys.argv[1], encoding="utf-8")))
+print(count or "", sequence or "", build_count if build_count is not None else "")
+PY
+)"
+          if [[ -n "$final_count" && -n "$final_sequence" && "$final_build_count" == 0 &&
+                "$final_count" == "$target_root_count" ]] &&
+             (( final_sequence >= target_sequence + PERF_SETTLED_SAMPLES )); then
+            final_valid=1
+          fi
+          end_state_root_count="$final_count"
+          end_state_sequence="$final_sequence"
+          end_state_build_count="$final_build_count"
+        fi
+      fi
+      if (( final_valid == 0 )); then
+        # End-state instability invalidates the candidate boundary. Start a
+        # fresh target window; never certify a partial or stale observation.
+        target_ms=""; settled_ms=""; target_index=""; target_sequence=""
+        target_root_count=""; target_model_version=""
+        target_stable_count=""; target_quiet_count=""
+        end_state_validated=0; end_state_root_count=""; end_state_model_version=""
+        end_state_sequence=""; end_state_build_count=""
+        summary_quiet_count=0; summary_stable_count=0
+        summary_last_version=""; summary_last_root_count=""
+        printf '%s\n' '{"schema":"seedsync.performance-lab.cgroup-cpu-series.v1","samples":[]}' > "$cgroup_cpu_series"
+        sleep "$PERF_SAMPLE_SLEEP_SECONDS"
+        continue
+      fi
+      end_state_validated=1
+      local end_phase_ms
+      end_phase_ms="$(date -u +%s%3N)"
+      # The phase boundary is the timestamp immediately before the cgroup
+      # reads. Sanitized records retain each read's later observed timestamp.
+      settled_ms="$end_phase_ms"
+      capture_cgroup_cpu_boundary "$cgroup_cpu_series" app end "$end_phase_ms"
+      capture_cgroup_cpu_boundary "$cgroup_cpu_series" remote-helper end "$end_phase_ms"
+python3 - "$phase_dir/phase-timing.json" "$started_ms" "$first_ms" "$target_ms" "$settled_ms" \
+    "$end_state_validated" "$target_root_count" "$end_state_root_count" "$target_model_version" \
+    "$end_state_model_version" "$target_sequence" "$end_state_sequence" "$end_state_build_count" <<'PY'
+import json, os, sys
+started, first, target, settled = map(int, sys.argv[2:6])
+def integer(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    handle.write(json.dumps({
+        "schema": "seedsync.performance-lab.phase-timing.v1",
+        "started_epoch_ms": started, "first_observation_epoch_ms": first,
+        "model_target_epoch_ms": target, "settled_epoch_ms": settled,
+        "cold_start_to_first_diagnostics_ms": first - started,
+        "startup_to_first_observation_ms": first - started,
+        "full_scan_ms": target - first,
+        "post_scan_settled_idle_observation_ms": settled - target,
+        "post_target_observation_required_seconds": int(os.environ["PERF_POST_TARGET_OBSERVATION_SECONDS"]),
+        "end_state_validated": sys.argv[6] == "1",
+        "target_root_count": integer(sys.argv[7]), "end_root_count": integer(sys.argv[8]),
+        "target_model_version": integer(sys.argv[9]), "end_model_version": integer(sys.argv[10]),
+        "target_sequence": integer(sys.argv[11]), "end_sequence": integer(sys.argv[12]),
+        "end_build_count": integer(sys.argv[13]),
+    }, indent=2) + "\n")
+PY
+      break
+    fi
     if [[ "$PERF_DIAGNOSTICS_MODE" == off ]]; then
       local summary_path=""
       summary_path="$(mktemp "$phase_dir/.model-summary.XXXXXX")"
@@ -624,10 +753,12 @@ PY
         # create gaps in this zero-based boundary.
         target_index="$summary_sample_index"
         target_sequence="$observed_model_version"
-        target_root_count="$observed_summary_count"
-        target_model_version="$observed_model_version"
-        target_stable_count="$summary_stable_count"
-        target_quiet_count="$summary_quiet_count"
+         target_root_count="$observed_summary_count"
+         target_model_version="$observed_model_version"
+         target_stable_count="$summary_stable_count"
+         target_quiet_count="$summary_quiet_count"
+         capture_cgroup_cpu_boundary "$cgroup_cpu_series" app target "$target_ms"
+         capture_cgroup_cpu_boundary "$cgroup_cpu_series" remote-helper target "$target_ms"
         python3 - "$phase_dir/cold-start.json" "$started_ms" "$first_ms" "$target_ms" "$expected_summary_count" "$target_sequence" "$target_index" "$target_stable_count" "$target_quiet_count" "$PERF_SETTLED_IDLE_CPU_PERCENT" "$PERF_POST_TARGET_OBSERVATION_SECONDS" <<'PY'
 import json, sys
 started, first, target, expected, version, sample_index, stable_count, quiet_count = map(int, sys.argv[2:10])
@@ -648,55 +779,9 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
             "required_post_target_observation_seconds": observation_seconds,
         }}, indent=2) + "\n")
 PY
-      elif [[ -n "$target_ms" && -z "$settled_ms" ]]; then
-        if [[ -z "$observed_summary_count" || -z "$observed_model_version" ||
-              "$observed_summary_count" != "$target_root_count" ||
-              "$observed_model_version" != "$target_model_version" ]]; then
-          # A model refresh invalidates the readiness boundary. Start a new
-          # low-CPU suffix and a fresh full observation window.
-          target_ms=""
-          target_index=""
-          target_sequence=""
-          target_root_count=""
-          target_model_version=""
-          target_stable_count=""
-          target_quiet_count=""
-          summary_quiet_count=0
-          sleep "$PERF_SAMPLE_SLEEP_SECONDS"
-          continue
-        fi
-        local observation_now_ms
-        observation_now_ms="$(date -u +%s%3N)"
-        if (( observation_now_ms < target_ms + PERF_POST_TARGET_OBSERVATION_SECONDS * 1000 )); then
-          sleep "$PERF_POST_TARGET_POLL_SECONDS"
-          continue
-        fi
-        settled_ms="$observation_now_ms"
-        python3 - "$phase_dir/phase-timing.json" "$started_ms" "$first_ms" "$target_ms" "$settled_ms" "$target_index" "$target_stable_count" "$target_quiet_count" "$PERF_SETTLED_IDLE_CPU_PERCENT" "$PERF_POST_TARGET_OBSERVATION_SECONDS" <<'PY'
-import json, sys
-started, first, target, settled, sample_index, stable_count, quiet_count = map(int, sys.argv[2:9])
-cpu_threshold = float(sys.argv[9])
-observation_seconds = int(sys.argv[10])
-with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    handle.write(json.dumps({"schema": "seedsync.performance-lab.phase-timing.v1",
-        "started_epoch_ms": started, "first_observation_epoch_ms": first,
-        "model_target_epoch_ms": target, "settled_epoch_ms": settled,
-        "cold_start_to_first_diagnostics_ms": first - started,
-        "startup_to_first_observation_ms": first - started, "full_scan_ms": target - first,
-        "post_scan_settled_idle_observation_ms": settled - target,
-        "post_target_observation_required_seconds": observation_seconds,
-        "target_sample_index": sample_index,
-        "target_readiness": {
-            "condition": "expected root cardinality and model version stable for at least 2 consecutive successful summaries plus 3 consecutive app CPU samples at or below the hard 1.0% gate; reset on cardinality/version change",
-            "model_stable_consecutive_samples": stable_count,
-            "app_cpu_quiet_consecutive_samples": quiet_count,
-            "app_cpu_threshold_percent": cpu_threshold,
-        }}, indent=2) + "\n")
-PY
-        break
-      fi
       sleep "$PERF_SAMPLE_SLEEP_SECONDS"
       continue
+      fi
     fi
     local diagnostics_path="$phase_dir/diagnostics-$(printf '%04d' "$index").json"
     # Monitoring needs only the latest retained sample plus cumulative
@@ -753,8 +838,12 @@ PY
        (( observed_count >= expected_count * 99 / 100 && observed_count <= expected_count * 101 / 100 )); then
       target_ms="$(date -u +%s%3N)"
       target_index="$index"
-      target_sequence="$observed_sequence"
-      cp "$diagnostics_path" "$phase_dir/diagnostics-at-target.json"
+       target_sequence="$observed_sequence"
+       target_root_count="$observed_count"
+       target_model_version="$observed_sequence"
+       cp "$diagnostics_path" "$phase_dir/diagnostics-at-target.json"
+       capture_cgroup_cpu_boundary "$cgroup_cpu_series" app target "$target_ms"
+       capture_cgroup_cpu_boundary "$cgroup_cpu_series" remote-helper target "$target_ms"
       python3 - "$phase_dir/cold-start.json" "$started_ms" "$first_ms" "$target_ms" "$expected_count" "$target_sequence" <<'PY'
 import json, sys
 started, first, target, expected, sequence = map(int, sys.argv[2:])
@@ -771,35 +860,6 @@ payload = {
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     handle.write(json.dumps(payload, indent=2) + "\n")
 PY
-    elif [[ -n "$target_ms" && -z "$settled_ms" && -n "$target_sequence" && -n "$observed_sequence" ]]; then
-      local observation_now_ms
-      observation_now_ms="$(date -u +%s%3N)"
-      if (( observed_sequence < target_sequence + PERF_SETTLED_SAMPLES )) || \
-         (( observation_now_ms < target_ms + PERF_POST_TARGET_OBSERVATION_SECONDS * 1000 )); then
-        # Diagnostics samples arrive every five seconds and the acceptance
-        # window lasts 150 seconds. A ten-second observer cadence still sees
-        # every relevant boundary without becoming measurable idle work.
-        sleep "$PERF_POST_TARGET_POLL_SECONDS"
-        continue
-      fi
-      settled_ms="$observation_now_ms"
-      python3 - "$phase_dir/phase-timing.json" "$started_ms" "$first_ms" "$target_ms" "$settled_ms" <<'PY'
-import json, sys
-started, first, target, settled = map(int, sys.argv[2:])
-with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    handle.write(json.dumps({
-        "schema": "seedsync.performance-lab.phase-timing.v1",
-        "started_epoch_ms": started,
-        "first_observation_epoch_ms": first,
-        "model_target_epoch_ms": target,
-        "settled_epoch_ms": settled,
-        "cold_start_to_first_diagnostics_ms": first - started,
-        "startup_to_first_observation_ms": first - started,
-        "full_scan_ms": target - first,
-        "post_scan_settled_idle_observation_ms": settled - target,
-    }, indent=2) + "\n")
-PY
-      break
     fi
     sleep "$PERF_SAMPLE_SLEEP_SECONDS"
   done
@@ -812,9 +872,11 @@ PY
     # Fetch each potentially expensive support payload exactly once after the
     # timed observation. Their serialization cannot then inflate a later idle
     # sample, while the full retained history remains available for analysis.
-    if ! curl --silent --show-error --fail --max-time 120 \
-      -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url" \
-      > "$phase_dir/diagnostics.json"; then
+    if [[ -n "$end_diagnostics_path" && -f "$end_diagnostics_path" ]]; then
+      cp "$end_diagnostics_path" "$phase_dir/diagnostics.json"
+    elif ! curl --silent --show-error --fail --max-time 120 \
+        -H "Authorization: Bearer $PERF_API_TOKEN" "$diagnostics_url" \
+        > "$phase_dir/diagnostics.json"; then
       echo "Failed to capture final diagnostics history" >&2
       return 1
     fi
@@ -835,6 +897,7 @@ PY
       --breadcrumbs "$phase_dir/breadcrumbs.json" \
       --docker-stats "$app_docker_stats_series" \
       --remote-docker-stats "$remote_docker_stats_series" \
+      --cgroup-stats "$cgroup_cpu_series" \
       --phase-timing "$phase_dir/phase-timing.json" \
       --settled-idle-cpu-percent "$PERF_SETTLED_IDLE_CPU_PERCENT" \
       --breadcrumb-mode "$PERF_BREADCRUMB_MODE" \
@@ -850,6 +913,7 @@ PY
       --model-summary "$model_summary_series" \
       --docker-stats "$app_docker_stats_series" \
       --remote-docker-stats "$remote_docker_stats_series" \
+      --cgroup-stats "$cgroup_cpu_series" \
       --manifest "$ARTIFACT_DIR/fixture-manifest.json" \
       --output "$phase_dir/metrics-summary.json" \
       --label "$label" \
@@ -913,6 +977,12 @@ comparison = {
     "candidate_post_target_app_docker_stats": candidate.get("post_target_app_docker_stats"),
     "baseline_post_target_remote_helper_docker_stats": baseline.get("post_target_remote_helper_docker_stats"),
     "candidate_post_target_remote_helper_docker_stats": candidate.get("post_target_remote_helper_docker_stats"),
+    "baseline_app_cgroup_cpu": baseline.get("app_cgroup_cpu"),
+    "candidate_app_cgroup_cpu": candidate.get("app_cgroup_cpu"),
+    "baseline_remote_helper_cgroup_cpu": baseline.get("remote_helper_cgroup_cpu"),
+    "candidate_remote_helper_cgroup_cpu": candidate.get("remote_helper_cgroup_cpu"),
+    "baseline_cpu_acceptance_source": baseline.get("cpu_acceptance_source"),
+    "candidate_cpu_acceptance_source": candidate.get("cpu_acceptance_source"),
 }
 with open(sys.argv[3], "w", encoding="utf-8") as handle:
     handle.write(json.dumps(comparison, indent=2) + "\n")

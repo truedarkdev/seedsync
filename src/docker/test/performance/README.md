@@ -15,9 +15,10 @@ disables only that pair in seeded config for an A/B run while retaining the
 same filesystem and `fixture_fingerprint`; roles, counts, enabled state, and
 the separate `config_fingerprint` are recorded in the manifest and
 `path_pairs.json`. The default profile and six-pair behavior are unchanged.
-The mixed profile seeds `Lftp.rate_limit` at the synthetic-only
-2,000,000-byte/s default so Queue/Stop progress remains observable. Uniform
-keeps the historical `rate_limit = 0`; the effective value is recorded in
+The mixed profile seeds each LFTP transfer stream with the synthetic-only
+64,000-byte/s limit so Queue/Stop progress remains observable even when the
+configured parallel streams multiply aggregate throughput. Uniform keeps the
+historical `rate_limit = 0`; the configured per-stream value is recorded in
 `settings.cfg`, `path_pairs.json`, `run-manifest.json`, and fixture evidence.
 Manifest topology records physical fixture expectations separately from
 `enabled_expected_merged_model_tree_nodes` and
@@ -105,9 +106,10 @@ fails unless both measurements use that same image identity as well as the
 same fixture fingerprint; matching a mutable image tag alone is insufficient.
 When diagnostics are off, `measure` uses the authenticated
 `/server/model/v1/summary` endpoint for compact root cardinality and stable
-model-version readiness, while sampling sanitized external Docker CPU/memory
-stats on every observation for both modes into separate `app` and
-`remote-helper` series. Off-mode readiness requires the expected root count and
+model-version readiness. Both modes retain sanitized Docker CPU/memory point
+samples for secondary distribution evidence, but the acceptance average comes
+from sanitized target/end cgroup `cpu.stat` `usage_usec` counters for the `app`
+and `remote-helper` containers. Off-mode readiness requires the expected root count and
 model version to remain stable for two successful summaries plus three
 consecutive app-container CPU samples at or below the hard `1.0%` gate; a
 cardinality or version change resets that boundary. The readiness condition,
@@ -116,10 +118,12 @@ are retained in the timing artifacts. The off-mode summary keeps the same
 150-second post-target observation and timing/resource schema, but deliberately
 has no stage attribution; diagnostics-on retains the full stage windows and
 breadcrumb evidence.
-Acceptance requires valid app and remote-helper samples in both the complete
-and post-target windows; missing or malformed remote-helper data fails the
-candidate/baseline result.
-The acceptance gate is the settled app-container CPU average, with an effective
+Acceptance requires exactly one valid target/end cgroup boundary for both app
+and remote helper, monotonic counters, matching phase timestamps, capture lag
+no greater than five seconds, a complete 150-second observed interval, and an
+unchanged healthy model at the end. Missing, duplicate, malformed, wrong-schema,
+or inconsistent evidence fails closed.
+The acceptance gate is the unrounded settled app-container CPU average, with an effective
 default threshold of `1.0` percent of one core; the peak remains secondary
 evidence. The threshold is recorded in each metrics summary and may be changed
 for a worker check with `PERF_SETTLED_IDLE_CPU_PERCENT`, but final acceptance
@@ -186,12 +190,15 @@ baseline for refresh-delta analysis. `PERF_POST_TARGET_OBSERVATION_SECONDS`
 may be shortened only for diagnostic worker self-checks, never final
 performance acceptance.
 
-The observation loop requests only the latest retained diagnostics sample.
-It fetches the full retained history and breadcrumb snapshot once after the
-timed window, so evidence collection does not become the recurring idle load
-being measured. After the model target, it checks that compact view every ten
-seconds; the app's own five-second samples remain the source for final CPU
-classification.
+Before the target, the observation loop requests only the latest retained
+diagnostics sample (or the compact model summary when diagnostics are off).
+After the target, both modes use the same resource-only loop: they sample
+external Docker stats without serializing application model state. One final
+model/diagnostics read proves the end state before the end cgroup counters are
+captured; an invalid or changed end state resets the complete target window.
+The full retained diagnostics history and breadcrumb snapshot are fetched only
+after the timed window, so evidence collection does not become the recurring
+idle load being measured.
 
 After the final diagnostics window and final container resource snapshot,
 `measure` requests the admin ownership census once and writes the sanitized

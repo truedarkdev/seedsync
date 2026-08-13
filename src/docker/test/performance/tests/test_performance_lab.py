@@ -22,6 +22,8 @@ from capture_metrics import (
     summarize,
     summarize_docker_stats,
     summarize_external,
+    summarize_cgroup_cpu,
+    load_cgroup_cpu_payload,
 )
 import generate_fixture as fixture_module
 from generate_fixture import (
@@ -35,6 +37,180 @@ import sanitize_docker_state
 from seed_config import seed_config
 from common.config import Config
 from web.auth_store import ApiKeyStore, _verify_secret
+
+
+def _cgroup_samples(app_target=1_000_000, app_end=2_500_000, lag=100):
+    return [
+        {"role": "app", "boundary": "target", "phase_t_epoch_ms": 1_000,
+         "observed_t_epoch_ms": 1_000 + lag, "usage_usec": app_target},
+        {"role": "app", "boundary": "end", "phase_t_epoch_ms": 151_000,
+         "observed_t_epoch_ms": 151_000 + lag, "usage_usec": app_end},
+        {"role": "remote-helper", "boundary": "target", "phase_t_epoch_ms": 1_000,
+         "observed_t_epoch_ms": 1_000 + lag, "usage_usec": 5_000},
+        {"role": "remote-helper", "boundary": "end", "phase_t_epoch_ms": 151_000,
+         "observed_t_epoch_ms": 151_000 + lag, "usage_usec": 15_000},
+    ]
+
+
+def _cgroup_timing():
+    return {
+        "model_target_epoch_ms": 1_000,
+        "settled_epoch_ms": 151_000,
+        "post_scan_settled_idle_observation_ms": 150_000,
+        "post_target_observation_required_seconds": 150,
+        "end_state_validated": True,
+        "target_root_count": 2, "end_root_count": 2,
+        "target_model_version": 1, "end_model_version": 1,
+    }
+
+
+def test_cgroup_cpu_integration_uses_observed_boundaries_and_rejects_bad_evidence():
+    summary = summarize_cgroup_cpu(_cgroup_samples(), "app", _cgroup_timing())
+    assert summary["valid"] is True
+    assert summary["average_cpu_percent_one_core"] == 1.0
+    assert summary["wall_span_ms"] == 150_000
+    assert summarize_cgroup_cpu([], "app", _cgroup_timing())["valid"] is False
+
+    nonmonotonic = _cgroup_samples(app_end=900_000)
+    assert summarize_cgroup_cpu(nonmonotonic, "app", _cgroup_timing())["valid"] is False
+    delayed = _cgroup_samples(lag=5_001)
+    assert summarize_cgroup_cpu(delayed, "app", _cgroup_timing())["valid"] is False
+    negative_span = _cgroup_samples()
+    negative_span[1]["observed_t_epoch_ms"] = 900
+    assert summarize_cgroup_cpu(negative_span, "app", _cgroup_timing())["valid"] is False
+    assert summarize_cgroup_cpu(_cgroup_samples(app_end=2_500_001), "app", _cgroup_timing())[
+        "average_cpu_percent_one_core"] > 1.0
+
+
+def test_cgroup_payload_rejects_wrong_schema_trailing_malformed_and_duplicate_records(tmp_path):
+    valid = {"schema": "seedsync.performance-lab.cgroup-cpu-series.v1", "samples": _cgroup_samples()}
+    path = tmp_path / "cgroup.json"
+    path.write_text(json.dumps({**valid, "extra": 1}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_cgroup_cpu_payload(path)
+    path.write_text(json.dumps({"schema": "wrong", "samples": valid["samples"]}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_cgroup_cpu_payload(path)
+    malformed = {**valid, "samples": [*valid["samples"], {"role": "app"}]}
+    path.write_text(json.dumps(malformed), encoding="utf-8")
+    with pytest.raises(ValueError):
+        # Payload shape is valid; the strict record validator must reject it.
+        load_cgroup_cpu_payload(path)
+    assert summarize_cgroup_cpu(malformed["samples"], "app", _cgroup_timing())["valid"] is False
+    duplicate = {**valid, "samples": [*valid["samples"], valid["samples"][0]]}
+    assert summarize_cgroup_cpu(duplicate["samples"], "app", _cgroup_timing())["valid"] is False
+
+
+def test_cgroup_cpu_integrated_truth_rejects_point_sample_spike_and_requires_remote():
+    stats = _cgroup_samples(app_target=10, app_end=10 + 100_000)
+    summary = summarize_external(
+        [{"sample_index": 0, "root_count": 2, "model_version": 1, "app_cpu_percent": 0.5},
+         {"sample_index": 1, "root_count": 2, "model_version": 1, "app_cpu_percent": 0.5},
+         {"sample_index": 2, "root_count": 2, "model_version": 1, "app_cpu_percent": 0.5}],
+        [{"t_epoch_ms": 1_000, "cpu_percent": 0.1, "memory_percent": 1.0},
+         {"t_epoch_ms": 151_000, "cpu_percent": 99.0, "memory_percent": 1.0}],
+        _external_manifest(), "candidate", "off", _cgroup_timing(), target_index=2,
+        remote_docker_stats=[{"t_epoch_ms": 1_000, "cpu_percent": 0.1, "memory_percent": 1.0},
+                             {"t_epoch_ms": 151_000, "cpu_percent": 0.1, "memory_percent": 1.0}],
+        cgroup_cpu_stats=stats,
+    )
+    assert summary["cpu_acceptance_source"] == "cgroup_usage_delta"
+    assert summary["app_cpu_average_percent_one_core"] == pytest.approx(0.066667, abs=1e-6)
+    assert summary["app_cgroup_cpu"]["valid"] is True
+    assert summary["acceptance_valid"] is True
+    no_remote = summarize_external(**{
+        "model_samples": [{"sample_index": i, "root_count": 2, "model_version": 1, "app_cpu_percent": 0.5}
+                           for i in range(3)],
+        "docker_stats": [{"t_epoch_ms": 151_000, "cpu_percent": 0.1, "memory_percent": 1.0}],
+        "manifest": _external_manifest(), "label": "candidate", "breadcrumb_mode": "off",
+        "phase_timing": _cgroup_timing(), "target_index": 2,
+        "remote_docker_stats": [{"t_epoch_ms": 151_000, "cpu_percent": 0.1, "memory_percent": 1.0}],
+        "cgroup_cpu_stats": [item for item in stats if item["role"] == "app"],
+    })
+    assert no_remote["acceptance_valid"] is False
+
+
+def test_external_summary_requires_validated_end_state_and_resets_on_end_change():
+    samples = [{"sample_index": i, "root_count": 2, "model_version": 1, "app_cpu_percent": 0.5}
+               for i in range(3)]
+    kwargs = dict(
+        model_samples=samples,
+        docker_stats=[{"t_epoch_ms": 151_000, "cpu_percent": 0.1, "memory_percent": 1.0}],
+        manifest=_external_manifest(), label="candidate", breadcrumb_mode="off",
+        phase_timing=_cgroup_timing(), target_index=2,
+        remote_docker_stats=[{"t_epoch_ms": 151_000, "cpu_percent": 0.1, "memory_percent": 1.0}],
+        cgroup_cpu_stats=_cgroup_samples(app_target=10, app_end=100_010),
+    )
+    missing = dict(kwargs, phase_timing={key: value for key, value in _cgroup_timing().items()
+                                         if key != "end_state_validated"})
+    assert summarize_external(**missing)["acceptance_valid"] is False
+    changed = dict(kwargs, phase_timing={**_cgroup_timing(), "end_model_version": 2})
+    changed_summary = summarize_external(**changed)
+    assert changed_summary["acceptance_checks"]["end_state_validated"] is False
+    assert changed_summary["acceptance_valid"] is False
+
+
+def test_diagnostics_summary_requires_validated_end_state_when_cgroup_is_present():
+    manifest = {"fixture_fingerprint": "fixture", "topology": {
+        "expected_merged_model_tree_nodes": 200001,
+        "expected_model_tree_file_count": 200001,
+    }}
+    timing = {
+        "model_target_epoch_ms": 1_000, "settled_epoch_ms": 151_000,
+        "post_scan_settled_idle_observation_ms": 150_000,
+        "end_state_validated": False, "target_root_count": 200001,
+        "end_root_count": 200001, "target_sequence": 3, "end_sequence": 9,
+        "end_build_count": 0,
+    }
+    diagnostics = _settled_diagnostics([70, 70, 0.5, 0.5, 0.5])
+    summary = summarize(
+        diagnostics, manifest, "candidate", min_high_cpu_samples=2,
+        target_sequence=3, breadcrumb_mode="off",
+        cgroup_cpu_stats=_cgroup_samples(app_target=1_000, app_end=2_000),
+        phase_timing=timing,
+    )
+    assert summary["end_state_validated"] is False
+    assert summary["acceptance_valid"] is False
+    changed_count = {**timing, "end_state_validated": True, "end_root_count": 200000}
+    changed = summarize(
+        diagnostics, manifest, "candidate", min_high_cpu_samples=2,
+        target_sequence=3, breadcrumb_mode="off", cgroup_cpu_stats=_cgroup_samples(
+            app_target=1_000, app_end=2_000), phase_timing=changed_count,
+    )
+    assert changed["acceptance_valid"] is False
+
+
+def test_cgroup_sanitizer_retains_fixed_observed_and_phase_timestamps(tmp_path):
+    output = tmp_path / "cgroup.json"
+    original = sys.stdin
+    try:
+        sys.stdin = type("Input", (), {"read": lambda self: "usage_usec 42\nuser_usec 1\n"})()
+        sanitize_docker_state._cgroup_stat(str(output), "app", "target", "1000", "1007", sys.stdin.read())
+    finally:
+        sys.stdin = original
+    sample = json.loads(output.read_text())["samples"][0]
+    assert sample == {"role": "app", "boundary": "target", "phase_t_epoch_ms": 1000,
+                      "observed_t_epoch_ms": 1007, "usage_usec": 42}
+
+
+def test_lab_has_one_common_resource_only_post_target_path_and_cgroup_boundaries():
+    source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    measure_source = source[source.index("measure()") :]
+    assert measure_source.count('capture_cgroup_cpu_boundary "$cgroup_cpu_series" app target') == 2
+    assert measure_source.count('capture_cgroup_cpu_boundary "$cgroup_cpu_series" app end') == 1
+    assert measure_source.count('capture_cgroup_cpu_boundary "$cgroup_cpu_series" remote-helper end') == 1
+    assert measure_source.count('capture_cgroup_cpu_boundary "$cgroup_cpu_series" remote-helper target') == 2
+    assert measure_source.count('PERF_POST_TARGET_OBSERVATION_SECONDS + PERF_CGROUP_CAPTURE_LAG_MAX_SECONDS') == 1
+    assert 'curl --silent --show-error --fail --max-time 120' in measure_source
+    assert measure_source.count('elif [[ -n "$target_ms"') == 0
+    assert '"$final_count" == "$target_root_count"' in measure_source
+    assert 'docker exec "$container_id" cat /sys/fs/cgroup/cpu.stat 2>/dev/null || true' not in source
+    cgroup_source = source[source.index("capture_cgroup_cpu_boundary()") : source.index("write_process_summary()")]
+    assert 'missing live $role container for cgroup CPU boundary' in cgroup_source
+    assert 'cpu_stat="$(docker exec "$container_id" cat /sys/fs/cgroup/cpu.stat 2>/dev/null)"' in cgroup_source
+    capture_source = (PERF_DIR / "capture_metrics.py").read_text(encoding="utf-8")
+    assert "load_cgroup_samples(args.cgroup_stats)" in capture_source
+    assert "app_average = (cgroup.get(\"average_cpu_percent_one_core\")" in capture_source
 
 
 def test_fixture_is_deterministic_and_idempotent(tmp_path):
@@ -431,7 +607,9 @@ def test_external_summary_requires_stable_model_version_and_sanitized_docker_sta
     ]
     summary = summarize_external(samples, stats, manifest, "baseline", "off",
         {"model_target_epoch_ms": 4000, "post_scan_settled_idle_observation_ms": 150000,
-         "post_target_observation_required_seconds": 150}, target_index=3,
+         "post_target_observation_required_seconds": 150, "end_state_validated": True,
+         "target_root_count": 2, "end_root_count": 2, "target_model_version": 4,
+         "end_model_version": 4}, target_index=3,
         remote_docker_stats=[
             {"t_epoch_ms": 1000, "cpu_percent": 2.0, "memory_percent": 4.0},
             {"t_epoch_ms": 5000, "cpu_percent": 2.1, "memory_percent": 4.1},
@@ -708,7 +886,10 @@ def test_external_summary_separates_app_and_remote_helper_resource_roles():
          {"t_epoch_ms": 3000, "cpu_percent": 0.8, "memory_percent": 3.1}],
         manifest, "candidate", "off", {"model_target_epoch_ms": 500,
                                          "post_scan_settled_idle_observation_ms": 150000,
-                                         "post_target_observation_required_seconds": 150}, target_index=3,
+                                         "post_target_observation_required_seconds": 150,
+                                         "end_state_validated": True, "target_root_count": 1,
+                                         "end_root_count": 1, "target_model_version": 4,
+                                         "end_model_version": 4}, target_index=3,
         remote_docker_stats=[{"t_epoch_ms": 1000, "cpu_percent": 42.0, "memory_percent": 11.0},
                              {"t_epoch_ms": 3000, "cpu_percent": 38.0, "memory_percent": 11.2}],
     )
@@ -775,6 +956,35 @@ def test_lab_sanitizes_user_controlled_docker_identifiers_and_compose_state():
     assert 'compose ps | tee' not in lab_source
     assert '"image_tag_digest": _digest(image)' in sanitizer
     assert '"image": image' not in sanitizer
+
+
+def test_lab_uses_real_go_template_tabs_for_sanitized_docker_fields(tmp_path):
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    templates = re.findall(r"docker (?:image )?inspect --format '([^']*)'", lab_source)
+    templates += re.findall(r"docker stats --no-stream --format '([^']*)'", lab_source)
+    delimited_templates = [template for template in templates if r"\t" in template]
+
+    # A backslash-t outside a Go-template expression is emitted literally by
+    # Docker on some versions.  Keep every fixed-field capture on the actual
+    # tab-producing form consumed by the sanitizer.
+    assert len(delimited_templates) == 6
+    for template in delimited_templates:
+        assert r'{{"\t"}}' in template
+        assert r"\t" not in template.replace(r'{{"\t"}}', "")
+
+    # Representative output from the corrected template must remain split into
+    # the fixed image fields and preserve only the sanitized identity digest.
+    image_fields = "\t".join([
+        "amd64", "linux", "2026-01-01T00:00:00Z", "123", "2", "sha256:fixture-image",
+    ])
+    image_path = tmp_path / "image.json"
+    sanitize_docker_state._image(str(image_path), "app", image_fields)
+    image = json.loads(image_path.read_text(encoding="utf-8"))
+    assert image["architecture"] == "amd64"
+    assert image["os"] == "linux"
+    assert image["size_bytes"] == 123
+    assert image["layer_count"] == 2
+    assert image["identity_digest"] == hashlib.sha256(b"sha256:fixture-image").hexdigest()
 
 
 def test_browser_delete_local_requires_live_project_service_volume_and_marker_binding():
@@ -937,10 +1147,10 @@ def test_mixed_rate_limit_is_recorded_and_uniform_default_is_unchanged(tmp_path)
 
     mixed_config = Config.from_file(str(mixed_dir / "settings.cfg"))
     uniform_config = Config.from_file(str(uniform_dir / "settings.cfg"))
-    assert int(mixed_config.lftp.rate_limit) == 2_000_000
+    assert int(mixed_config.lftp.rate_limit) == 64_000
     assert int(uniform_config.lftp.rate_limit) == 0
     mixed_pairs = json.loads((mixed_dir / "path_pairs.json").read_text(encoding="utf-8"))
-    assert mixed_pairs["rate_limit_bytes_per_second"] == 2_000_000
+    assert mixed_pairs["rate_limit_bytes_per_second"] == 64_000
     assert mixed_pairs["diagnostics_mode"] == "on"
 
 
@@ -981,7 +1191,7 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     progress_gap = source[source.index("function progressGap"):source.index("function latencyStats")]
     assert "progress > 0 && progress < 100" in progress_gap
     assert "status !== 'stopped'" in progress_gap and "status !== 'downloaded'" in progress_gap
-    assert "await exerciseActions(page, target, targetId, timeoutMs, evidence)" in source
+    assert "await exerciseActions(page, target, targetId, timeoutMs, evidence, modelStreamPath)" in source
     assert "readTargetId(page, target.name, timeoutMs)" in source
     assert "async function readTargetId(page, name, timeoutMs)" in source
     assert "const actions = evidence.actions" in source
@@ -1038,6 +1248,25 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert "--api-token" not in main_slice
 
 
+def test_browser_harness_normalizes_manifest_target_and_records_preconditions():
+    source = (PERF_DIR / "browser_probe.js").read_text(encoding="utf-8")
+    assert "MAX_READINESS_STEPS" in source
+    assert "normalizeTarget" in source
+    assert "readActionPrecondition" in source
+    assert "initial_precondition" in source and "final_precondition" in source
+    assert "pre_action" in source and "controls" in source
+    assert "invalid-precondition" in source
+    assert "result.measured = false" in source
+    assert "readinessIsQueueable" in source
+    assert "await normalizeTarget(page, target, targetId, timeoutMs, evidence)" in source
+    assert "&& evidence.readiness.pass" in source
+    assert "beginMeasurement()" in source and "markMeasuredQueue()" in source
+    assert "sample_epoch_source: 'post-measured-queue'" in source
+    assert "targetIdentityMatches" in source and "identity_match" in source
+    assert "targetId ? id === targetId : title === targetName" in source
+    assert "confirmation_identity_match" in source
+
+
 def test_browser_self_test_is_documented_as_worker_check():
     readme = (PERF_DIR / "README.md").read_text(encoding="utf-8")
     assert "browser_probe.js --self-test" in readme
@@ -1056,6 +1285,11 @@ def test_browser_probe_self_test_runs_without_playwright():
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["schema"] == "seedsync.performance-lab.browser-self-test.v1"
+    assert payload["checks"] == {
+        "readiness_matrix": True,
+        "stable_identity_reorder": True,
+        "measurement_epoch": True,
+    }
     assert payload["pass"] is True
 
 

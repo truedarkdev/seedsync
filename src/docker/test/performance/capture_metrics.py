@@ -49,6 +49,10 @@ DEFAULT_SETTLED_IDLE_CPU_PERCENT = 1.0
 DEFAULT_EXTERNAL_READINESS_SAMPLES = 3
 DEFAULT_EXTERNAL_MODEL_STABILITY_SAMPLES = 2
 DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS = 150
+MAX_CGROUP_BOUNDARY_CAPTURE_LAG_MS = 5000
+CGROUP_SAMPLE_FIELDS = frozenset({
+    "role", "boundary", "phase_t_epoch_ms", "observed_t_epoch_ms", "usage_usec",
+})
 
 
 def _number(value: object) -> float | None:
@@ -169,6 +173,119 @@ def summarize_docker_stats(
     }
 
 
+def summarize_cgroup_cpu(
+    samples: list[dict[str, object]] | None,
+    role: str,
+    phase_timing: dict[str, object] | None = None,
+    required_observation_seconds: int = DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS,
+) -> dict[str, object]:
+    """Calculate CPU from the target/end cgroup usage counter delta.
+
+    Docker's point samples are intentionally not used for acceptance: a single
+    summary serialization can be missed between points.  A cgroup ``usage_usec``
+    delta over the complete wall interval measures all work charged to the
+    container, including short spikes and child processes.
+    """
+    result: dict[str, object] = {
+        "role": role,
+        "available": False,
+        "valid": False,
+        "counter_monotonic": False,
+        "wall_span_positive": False,
+        "wall_span_adequate": False,
+        "timing_match": False,
+        "boundary_capture_lag_valid": False,
+        "target_phase_t_epoch_ms": None,
+        "end_phase_t_epoch_ms": None,
+        "target_observed_t_epoch_ms": None,
+        "end_observed_t_epoch_ms": None,
+        "target_usage_usec": None,
+        "end_usage_usec": None,
+        "delta_usage_usec": None,
+        "wall_span_ms": None,
+        "average_cpu_percent_one_core": None,
+        "average_cpu_percent_one_core_display": None,
+        "required_observation_seconds": required_observation_seconds,
+    }
+    if role not in {"app", "remote-helper"} or not isinstance(samples, list):
+        return result
+    valid_samples = []
+    seen_boundaries: set[tuple[str, str]] = set()
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != CGROUP_SAMPLE_FIELDS:
+            return result
+        sample_role = sample.get("role")
+        if sample_role not in {"app", "remote-helper"}:
+            return result
+        boundary = sample.get("boundary")
+        phase_ms = sample.get("phase_t_epoch_ms")
+        observed_ms = sample.get("observed_t_epoch_ms")
+        usage = sample.get("usage_usec")
+        if boundary not in {"target", "end"} or type(phase_ms) is not int or phase_ms < 0 \
+                or type(observed_ms) is not int or observed_ms < 0 \
+                or type(usage) is not int or usage < 0:
+            return result
+        identity = (sample_role, boundary)
+        if identity in seen_boundaries:
+            return result
+        seen_boundaries.add(identity)
+        if sample.get("role") != role:
+            continue
+        valid_samples.append((boundary, phase_ms, observed_ms, usage))
+    targets = [item for item in valid_samples if item[0] == "target"]
+    ends = [item for item in valid_samples if item[0] == "end"]
+    if len(targets) != 1 or len(ends) != 1:
+        return result
+    _, target_phase_ms, target_observed_ms, target_usage = targets[0]
+    _, end_phase_ms, end_observed_ms, end_usage = ends[0]
+    wall_ms = end_observed_ms - target_observed_ms
+    delta_usage = end_usage - target_usage
+    result.update({
+        "available": True,
+        "target_phase_t_epoch_ms": target_phase_ms,
+        "end_phase_t_epoch_ms": end_phase_ms,
+        "target_observed_t_epoch_ms": target_observed_ms,
+        "end_observed_t_epoch_ms": end_observed_ms,
+        "target_usage_usec": target_usage,
+        "end_usage_usec": end_usage,
+        "delta_usage_usec": delta_usage if delta_usage >= 0 else None,
+        "wall_span_ms": wall_ms if wall_ms >= 0 else None,
+        "counter_monotonic": delta_usage >= 0,
+        "wall_span_positive": wall_ms > 0,
+        "wall_span_adequate": wall_ms >= required_observation_seconds * 1000,
+    })
+    timing = phase_timing if isinstance(phase_timing, dict) else {}
+    timing_target = timing.get("model_target_epoch_ms")
+    timing_end = timing.get("settled_epoch_ms")
+    required_timing_elapsed = timing.get("post_scan_settled_idle_observation_ms")
+    target_lag = target_observed_ms - target_phase_ms
+    end_lag = end_observed_ms - end_phase_ms
+    phase_span = end_phase_ms - target_phase_ms
+    result["timing_match"] = (
+        type(timing_target) is int and timing_target == target_phase_ms and
+        type(timing_end) is int and timing_end == end_phase_ms and
+        type(required_timing_elapsed) is int and required_timing_elapsed == phase_span
+    )
+    result["boundary_capture_lag_valid"] = (
+        0 <= target_lag <= MAX_CGROUP_BOUNDARY_CAPTURE_LAG_MS and
+        0 <= end_lag <= MAX_CGROUP_BOUNDARY_CAPTURE_LAG_MS and
+        end_observed_ms >= target_observed_ms
+    )
+    if result["counter_monotonic"] and result["wall_span_positive"]:
+        # usage_usec / elapsed_ms is a fraction of one core; convert to %.
+        result["average_cpu_percent_one_core"] = delta_usage / wall_ms / 10.0
+        result["average_cpu_percent_one_core_display"] = round(
+            result["average_cpu_percent_one_core"], 6
+        )
+    result["valid"] = bool(
+        result["available"] and result["counter_monotonic"] and
+        result["wall_span_positive"] and result["wall_span_adequate"] and
+        result["timing_match"] and result["boundary_capture_lag_valid"] and
+        result["average_cpu_percent_one_core"] is not None
+    )
+    return result
+
+
 def _expected_summary_root_count(manifest: dict[str, object]) -> int:
     """Derive the synthetic fixture's compact-summary root cardinality.
 
@@ -196,6 +313,31 @@ def _expected_summary_root_count(manifest: dict[str, object]) -> int:
             if len(parts) == 1:
                 total += 1
     return total
+
+
+def load_cgroup_cpu_payload(path: Path) -> list[dict[str, object]]:
+    """Load the exact sanitized cgroup evidence schema; reject all variants."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or set(payload) != {"schema", "samples"} \
+            or payload.get("schema") != "seedsync.performance-lab.cgroup-cpu-series.v1" \
+            or not isinstance(payload.get("samples"), list):
+        raise ValueError("invalid cgroup CPU evidence payload")
+    samples = payload["samples"]
+    seen_boundaries: set[tuple[str, str]] = set()
+    for sample in samples:
+        if not isinstance(sample, dict) or set(sample) != CGROUP_SAMPLE_FIELDS:
+            raise ValueError("invalid cgroup CPU evidence record")
+        role, boundary = sample.get("role"), sample.get("boundary")
+        if role not in {"app", "remote-helper"} or boundary not in {"target", "end"} \
+                or type(sample.get("phase_t_epoch_ms")) is not int or sample["phase_t_epoch_ms"] < 0 \
+                or type(sample.get("observed_t_epoch_ms")) is not int or sample["observed_t_epoch_ms"] < 0 \
+                or type(sample.get("usage_usec")) is not int or sample["usage_usec"] < 0:
+            raise ValueError("invalid cgroup CPU evidence record")
+        identity = (role, boundary)
+        if identity in seen_boundaries:
+            raise ValueError("duplicate cgroup CPU evidence boundary")
+        seen_boundaries.add(identity)
+    return samples
 
 
 def _external_target_readiness(
@@ -294,6 +436,7 @@ def summarize_external(
     target_index: int | None = None,
     remote_docker_stats: list[dict[str, object]] | None = None,
     settled_idle_cpu_percent: float = DEFAULT_SETTLED_IDLE_CPU_PERCENT,
+    cgroup_cpu_stats: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
     """Summarize the diagnostics-off readiness and external resource lane."""
     expected = _expected_summary_root_count(manifest)
@@ -314,6 +457,17 @@ def summarize_external(
         type(post_target_elapsed) is int and
         post_target_elapsed >= DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS * 1000
     )
+    end_state_validated = timing.get("end_state_validated") is True
+    target_model_matches = (
+        timing.get("target_root_count") == target_readiness.get("model_cardinality_at_target") and
+        timing.get("target_model_version") == target_readiness.get("model_version_at_target")
+    )
+    end_model_matches = (
+        end_state_validated and
+        target_model_matches and
+        timing.get("target_root_count") == timing.get("end_root_count") and
+        timing.get("target_model_version") == timing.get("end_model_version")
+    )
     scan_sample_count = target_index + 1 if target_index is not None and 0 <= target_index < len(normalized) else len(normalized)
     baseline_checks = {
         "expected_summary_root_cardinality": observed.get("root_count") == expected and expected > 0,
@@ -332,8 +486,15 @@ def summarize_external(
                          and isinstance(target_ms, int) and type(sample.get("t_epoch_ms")) is int
                          and sample["t_epoch_ms"] >= target_ms]
     post_remote_stats_summary = summarize_docker_stats(post_remote_stats, "remote-helper")
-    app_average = post_stats_summary.get("average_cpu_percent_one_core")
-    app_cpu_acceptance_applicable = target_index is not None and bool(post_stats)
+    cgroup = (summarize_cgroup_cpu(cgroup_cpu_stats, "app", timing)
+              if cgroup_cpu_stats is not None else None)
+    remote_cgroup = (summarize_cgroup_cpu(cgroup_cpu_stats, "remote-helper", timing)
+                     if cgroup_cpu_stats is not None else None)
+    app_average = (cgroup.get("average_cpu_percent_one_core") if cgroup is not None
+                   else post_stats_summary.get("average_cpu_percent_one_core"))
+    app_cpu_acceptance_applicable = target_index is not None and (
+        bool(cgroup.get("valid")) if cgroup is not None else bool(post_stats)
+    )
     app_cpu_acceptance_pass = (
         app_cpu_acceptance_applicable and type(app_average) in (int, float)
         and float(app_average) <= settled_idle_cpu_percent
@@ -345,11 +506,21 @@ def summarize_external(
         "app_cpu_average_within_threshold": app_cpu_acceptance_pass,
         "remote_helper_stats_available": remote_stats["sample_count"] > 0,
         "remote_helper_post_target_stats_available": post_remote_stats_summary["sample_count"] > 0,
+        "end_state_validated": end_model_matches,
     }
+    if cgroup is not None:
+        acceptance_checks.update({
+            "app_cgroup_cpu_boundaries_valid": bool(cgroup["valid"]),
+            "remote_helper_cgroup_cpu_boundaries_valid": bool(remote_cgroup and remote_cgroup["valid"]),
+        })
     if target_index is not None:
         baseline_checks["app_cpu_average_within_threshold"] = app_cpu_acceptance_pass
         baseline_checks["remote_helper_stats_available"] = remote_stats["sample_count"] > 0
         baseline_checks["remote_helper_post_target_stats_available"] = post_remote_stats_summary["sample_count"] > 0
+    if cgroup is not None:
+        baseline_checks["app_cgroup_cpu_boundaries_valid"] = bool(cgroup["valid"])
+        baseline_checks["remote_helper_cgroup_cpu_boundaries_valid"] = bool(remote_cgroup and remote_cgroup["valid"])
+    acceptance_checks["end_state_validated"] = end_model_matches
     baseline_valid = label != "baseline" or all(baseline_checks.values())
     return {
         "schema": "seedsync.performance-lab.metrics.v2",
@@ -366,6 +537,7 @@ def summarize_external(
         "target_readiness": target_readiness,
         "post_target_observation_required_seconds": post_target_required,
         "post_target_observation_elapsed_ms": post_target_elapsed,
+        "end_state_validated": end_model_matches,
         "baseline_checks": baseline_checks,
         "baseline_valid": baseline_valid,
         "acceptance_checks": acceptance_checks,
@@ -398,6 +570,9 @@ def summarize_external(
         "post_target_external_docker_stats": post_stats_summary,
         "post_target_app_docker_stats": post_stats_summary,
         "post_target_remote_helper_docker_stats": post_remote_stats_summary,
+        "app_cgroup_cpu": cgroup,
+        "remote_helper_cgroup_cpu": remote_cgroup,
+        "cpu_acceptance_source": "cgroup_usage_delta" if cgroup is not None else "docker_point_samples",
         "fixed_stage_cpu_attribution": [],
         "missing_fixed_metrics": list(FIXED_METRICS),
         "breadcrumb": {"mode": breadcrumb_mode},
@@ -501,6 +676,8 @@ def summarize(
     settled_idle_cpu_percent: float = DEFAULT_SETTLED_IDLE_CPU_PERCENT,
     breadcrumbs: dict[str, object] | None = None, breadcrumb_mode: str | None = None,
     target_sequence: int | None = None,
+    cgroup_cpu_stats: list[dict[str, object]] | None = None,
+    phase_timing: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Return a phase-aware summary; ``expected_stage`` is retained for API compatibility."""
     windows = _windows(diagnostics)
@@ -603,6 +780,36 @@ def summarize(
         baseline_checks["app_cpu_average_within_threshold"] = app_cpu_acceptance_pass
     baseline_valid = label != "baseline" or all(baseline_checks.values())
     steady_idle_target_met = app_cpu_acceptance_pass
+    cgroup = (summarize_cgroup_cpu(cgroup_cpu_stats, "app", phase_timing)
+              if cgroup_cpu_stats is not None else None)
+    remote_cgroup = (summarize_cgroup_cpu(cgroup_cpu_stats, "remote-helper", phase_timing)
+                     if cgroup_cpu_stats is not None else None)
+    if cgroup is not None:
+        app_cpu_average = cgroup.get("average_cpu_percent_one_core")
+        app_cpu_acceptance_applicable = target_sequence is not None and bool(cgroup.get("valid"))
+        app_cpu_acceptance_pass = (
+            app_cpu_acceptance_applicable and type(app_cpu_average) in (int, float)
+            and float(app_cpu_average) <= settled_idle_cpu_percent
+        )
+        steady_idle_target_met = app_cpu_acceptance_pass
+        baseline_checks["app_cpu_average_within_threshold"] = app_cpu_acceptance_pass
+        baseline_checks["app_cgroup_cpu_boundaries_valid"] = bool(cgroup["valid"])
+        baseline_checks["remote_helper_cgroup_cpu_boundaries_valid"] = bool(remote_cgroup and remote_cgroup["valid"])
+        baseline_valid = label != "baseline" or all(baseline_checks.values())
+        end_state_validated = (
+            phase_timing is not None and phase_timing.get("end_state_validated") is True and
+            phase_timing.get("target_sequence") == target_sequence and
+            type(phase_timing.get("end_sequence")) is int and
+            target_sequence is not None and
+            phase_timing["end_sequence"] >= target_sequence + 6 and
+            phase_timing.get("end_build_count") == 0 and
+            phase_timing.get("target_root_count") == phase_timing.get("end_root_count")
+        )
+    else:
+        end_state_validated = True
+    acceptance_valid = app_cpu_acceptance_pass and (
+        cgroup is None or bool(remote_cgroup and remote_cgroup["valid"])
+    )
     return {
         "schema": "seedsync.performance-lab.metrics.v2",
         "label": label,
@@ -647,13 +854,22 @@ def summarize(
         "acceptance_checks": {
             "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
             "app_cpu_average_within_threshold": app_cpu_acceptance_pass,
+            **({
+                "app_cgroup_cpu_boundaries_valid": bool(cgroup["valid"]),
+                "remote_helper_cgroup_boundaries_valid": bool(remote_cgroup and remote_cgroup["valid"]),
+                "end_state_validated": end_state_validated,
+            } if cgroup is not None else {}),
         },
-        "acceptance_valid": app_cpu_acceptance_pass,
+        "acceptance_valid": acceptance_valid and end_state_validated,
         "app_cpu_threshold_percent": settled_idle_cpu_percent,
         "app_cpu_average_percent_one_core": app_cpu_average,
         "app_cpu_peak_percent_one_core": post_target_all["peak_cpu_percent_one_core"] if app_cpu_acceptance_applicable else None,
         "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
         "app_cpu_acceptance_pass": app_cpu_acceptance_pass,
+        "end_state_validated": end_state_validated,
+        "app_cgroup_cpu": cgroup,
+        "remote_helper_cgroup_cpu": remote_cgroup,
+        "cpu_acceptance_source": "cgroup_usage_delta" if cgroup is not None else "diagnostic_point_samples",
         "missing_fixed_metrics": [metric for metric in FIXED_METRICS if metric not in active_metrics],
         "active_stage": diagnostics.get("active_stage"),
         "active_scanner_stage": diagnostics.get("active_scanner_stage"),
@@ -667,6 +883,7 @@ def main() -> int:
     parser.add_argument("--model-summary", type=Path)
     parser.add_argument("--docker-stats", type=Path)
     parser.add_argument("--remote-docker-stats", type=Path)
+    parser.add_argument("--cgroup-stats", type=Path)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--label", choices=("baseline", "candidate"), required=True)
@@ -684,6 +901,8 @@ def main() -> int:
     if not 0.0 < args.settled_idle_cpu_percent <= DEFAULT_SETTLED_IDLE_CPU_PERCENT:
         parser.error("--settled-idle-cpu-percent must be greater than 0 and no more than 1.0 for acceptance")
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    def load_cgroup_samples(path: Path | None) -> list[dict[str, object]] | None:
+        return load_cgroup_cpu_payload(path) if path is not None else None
     if args.mode == "external-summary":
         if not args.model_summary or not args.docker_stats:
             parser.error("--model-summary and --docker-stats are required for --mode external-summary")
@@ -697,9 +916,11 @@ def main() -> int:
         docker_samples = stats_payload.get("samples", []) if isinstance(stats_payload, dict) else []
         remote_docker_samples = remote_stats_payload.get("samples", []) \
             if isinstance(remote_stats_payload, dict) else []
+        cgroup_samples = load_cgroup_samples(args.cgroup_stats)
         summary = summarize_external(model_samples, docker_samples, manifest, args.label,
                                      args.breadcrumb_mode, timing, args.target_sequence,
-                                     remote_docker_samples, args.settled_idle_cpu_percent)
+                                     remote_docker_samples, args.settled_idle_cpu_percent,
+                                     cgroup_samples)
     else:
         if not args.diagnostics:
             parser.error("--diagnostics is required for --mode diagnostics")
@@ -710,6 +931,9 @@ def main() -> int:
             args.min_high_cpu_samples, args.model_count_tolerance, args.minimum_merged_nodes,
             args.settled_idle_cpu_percent, breadcrumbs, args.breadcrumb_mode,
             args.target_sequence,
+            load_cgroup_samples(args.cgroup_stats),
+            (json.loads(args.phase_timing.read_text(encoding="utf-8"))
+             if args.phase_timing else None),
         )
         if args.docker_stats:
             stats_payload = json.loads(args.docker_stats.read_text(encoding="utf-8"))
@@ -740,8 +964,14 @@ def main() -> int:
             summary["post_target_phase"]["app_docker_stats"] = summary["post_target_app_docker_stats"]
             summary["post_target_phase"]["remote_helper_docker_stats"] = summary["post_target_remote_helper_docker_stats"]
             app_stats = summary["post_target_app_docker_stats"]
-            app_average = app_stats.get("average_cpu_percent_one_core")
-            applicable = args.target_sequence is not None and bool(post_stats)
+            cgroup = summary.get("app_cgroup_cpu")
+            remote_cgroup = summary.get("remote_helper_cgroup_cpu")
+            if isinstance(cgroup, dict):
+                app_average = cgroup.get("average_cpu_percent_one_core")
+                applicable = args.target_sequence is not None and bool(cgroup.get("valid"))
+            else:
+                app_average = app_stats.get("average_cpu_percent_one_core")
+                applicable = args.target_sequence is not None and bool(post_stats)
             passed = applicable and type(app_average) in (int, float) \
                 and float(app_average) <= args.settled_idle_cpu_percent
             summary["app_cpu_threshold_percent"] = args.settled_idle_cpu_percent
@@ -758,8 +988,19 @@ def main() -> int:
                 "app_cpu_average_within_threshold": passed,
                 "remote_helper_stats_available": remote_available,
                 "remote_helper_post_target_stats_available": remote_post_available,
+                "end_state_validated": bool(summary.get("end_state_validated")),
             }
-            summary["acceptance_valid"] = passed and remote_available and remote_post_available
+            if isinstance(cgroup, dict):
+                summary["acceptance_checks"].update({
+                    "app_cgroup_cpu_boundaries_valid": bool(cgroup.get("valid")),
+                    "remote_helper_cgroup_boundaries_valid": bool(
+                        isinstance(remote_cgroup, dict) and remote_cgroup.get("valid")
+                    ),
+                })
+            summary["acceptance_valid"] = passed and remote_available and remote_post_available and \
+                bool(summary.get("end_state_validated")) and (
+                not isinstance(cgroup, dict) or bool(remote_cgroup and remote_cgroup.get("valid"))
+            )
             if args.target_sequence is not None:
                 summary["baseline_checks"]["remote_helper_stats_available"] = remote_available
                 summary["baseline_checks"]["remote_helper_post_target_stats_available"] = remote_post_available
