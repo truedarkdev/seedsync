@@ -3592,13 +3592,15 @@ class TestController(unittest.TestCase):
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_downloaded_file_names(self, _):
-        self.controller._Controller__persist.downloaded_file_names = {"keep-id", "stale-id"}
+        keep_id = ModelFile.build_file_id("keep", None)
+        stale_id = ModelFile.build_file_id("stale", None)
+        self.controller._Controller__persist.downloaded_file_names = {keep_id, stale_id}
         self.controller._Controller__persist.downloaded_timestamps = {
-            "keep-id": 10.0,
-            "stale-id": 20.0,
+            keep_id: 10.0,
+            stale_id: 20.0,
         }
         self.controller._Controller__model_builder.has_changes.return_value = True
-        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model_builder.build_model.return_value = self.controller._Controller__model
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
             timestamp=object(),
             files=[],
@@ -3612,21 +3614,23 @@ class TestController(unittest.TestCase):
             error_message=None,
             managed_extract_file_ids=[],
         )
-        self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
+        self.controller._Controller__model.get_file_ids.return_value = {keep_id}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
 
         self.controller._Controller__update_model()
 
-        self.assertEqual({"keep-id"}, self.controller._Controller__persist.downloaded_file_names)
-        self.assertEqual({"keep-id": 10.0}, self.controller._Controller__persist.downloaded_timestamps)
-        self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({"keep-id"})
+        self.assertEqual({keep_id}, self.controller._Controller__persist.downloaded_file_names)
+        self.assertEqual({keep_id: 10.0}, self.controller._Controller__persist.downloaded_timestamps)
+        self.controller._Controller__model_builder.set_downloaded_files.assert_called_once_with({keep_id})
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_extracted_and_final_move_markers(self, _):
-        self.controller._Controller__persist.extracted_file_names = {"keep-id", "stale-id"}
-        self.controller._Controller__persist.final_move_succeeded_file_names = {"keep-id", "stale-id"}
+        keep_id = ModelFile.build_file_id("keep", None)
+        stale_id = ModelFile.build_file_id("stale", None)
+        self.controller._Controller__persist.extracted_file_names = {keep_id, stale_id}
+        self.controller._Controller__persist.final_move_succeeded_file_names = {keep_id, stale_id}
         self.controller._Controller__model_builder.has_changes.return_value = True
-        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model_builder.build_model.return_value = self.controller._Controller__model
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
             timestamp=object(),
             files=[],
@@ -3640,13 +3644,13 @@ class TestController(unittest.TestCase):
             error_message=None,
             managed_extract_file_ids=[],
         )
-        self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
+        self.controller._Controller__model.get_file_ids.return_value = {keep_id}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
 
         self.controller._Controller__update_model()
 
-        self.assertEqual({"keep-id"}, self.controller._Controller__persist.extracted_file_names)
-        self.assertEqual({"keep-id"}, self.controller._Controller__persist.final_move_succeeded_file_names)
+        self.assertEqual({keep_id}, self.controller._Controller__persist.extracted_file_names)
+        self.assertEqual({keep_id}, self.controller._Controller__persist.final_move_succeeded_file_names)
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_failed_local_scan_preserves_snapshot_and_history(self, _):
@@ -3755,7 +3759,12 @@ class TestController(unittest.TestCase):
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
             setattr(self.controller._Controller__persist, attr, {stale_movie_key, *unknown_markers})
         self.controller._Controller__model_builder.has_changes.return_value = True
-        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        authoritative_model = Model()
+        authoritative_model.set_base_logger(self.controller.logger)
+        authoritative_file = ModelFile("orphan-json.mkv", False)
+        authoritative_file.path_pair_id = unknown_pair
+        authoritative_model.add_file(authoritative_file)
+        self.controller._Controller__model_builder.build_model.return_value = authoritative_model
         healthy_remote = SimpleNamespace(timestamp=object(), files=[], failed=False, error_message=None)
         healthy_local = SimpleNamespace(
             timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
@@ -3771,8 +3780,6 @@ class TestController(unittest.TestCase):
 
         # Re-enabling the pair restores only its own retained canonical state.
         self.controller._Controller__path_pairs_by_id[unknown_pair] = MagicMock()
-        self.controller._Controller__model.get_file_ids.return_value = {unknown_canonical}
-        self.controller._Controller__model.get_file_names.return_value = {"orphan-json.mkv"}
         self.controller._Controller__update_model()
         for attr in ("downloaded_file_names", "extracted_file_names", "final_move_succeeded_file_names"):
             self.assertEqual({unknown_canonical}, getattr(self.controller._Controller__persist, attr))
@@ -3836,27 +3843,29 @@ class TestController(unittest.TestCase):
 
     @patch("controller.model_updater.ModelDiffUtil.diff_models", return_value=[])
     def test_update_model_prunes_stale_terminal_move_metadata_after_remote_reconciliation(self, _):
-        self.controller._Controller__persist.move_failure_counts = {"keep-id": 4, "stale-id": 4}
-        self.controller._Controller__move_retry_due = {"stale-id": datetime.now()}
-        self.controller._Controller__deferred_move_file_ids = {"stale-id"}
-        self.controller._Controller__move_attempt_reservations = {"stale-id"}
+        keep_id = ModelFile.build_file_id("keep", None)
+        stale_id = ModelFile.build_file_id("stale", None)
+        self.controller._Controller__persist.move_failure_counts = {keep_id: 4, stale_id: 4}
+        self.controller._Controller__move_retry_due = {stale_id: datetime.now()}
+        self.controller._Controller__deferred_move_file_ids = {stale_id}
+        self.controller._Controller__move_attempt_reservations = {stale_id}
         self.controller._Controller__model_builder.has_changes.return_value = True
-        self.controller._Controller__model_builder.build_model.return_value = MagicMock()
+        self.controller._Controller__model_builder.build_model.return_value = self.controller._Controller__model
         self.controller._Controller__remote_scan_process.pop_latest_result.return_value = SimpleNamespace(
             timestamp=object(), files=[], failed=False, error_message=None
         )
         self.controller._Controller__local_scan_process.pop_latest_result.return_value = SimpleNamespace(
             timestamp=object(), files=[], failed=False, error_message=None, managed_extract_file_ids=[]
         )
-        self.controller._Controller__model.get_file_ids.return_value = {"keep-id"}
+        self.controller._Controller__model.get_file_ids.return_value = {keep_id}
         self.controller._Controller__model.get_file_names.return_value = {"keep"}
 
         self.controller._Controller__update_model()
 
-        self.assertEqual({"keep-id": 4}, self.controller._Controller__persist.move_failure_counts)
-        self.assertNotIn("stale-id", self.controller._Controller__move_retry_due)
-        self.assertNotIn("stale-id", self.controller._Controller__deferred_move_file_ids)
-        self.assertNotIn("stale-id", self.controller._Controller__move_attempt_reservations)
+        self.assertEqual({keep_id: 4}, self.controller._Controller__persist.move_failure_counts)
+        self.assertNotIn(stale_id, self.controller._Controller__move_retry_due)
+        self.assertNotIn(stale_id, self.controller._Controller__deferred_move_file_ids)
+        self.assertNotIn(stale_id, self.controller._Controller__move_attempt_reservations)
 
     def test_update_model_forwards_stopped_file_names(self):
         self.controller._Controller__persist.stopped_file_names = {"stopped-id"}
@@ -8965,9 +8974,9 @@ class TestController(unittest.TestCase):
             self.assertIsNone(terminal_release.eta)
 
             ModelUpdater(self.controller).update()
-            self.assertEqual(3, build_model.call_count)
+            self.assertEqual(2, build_model.call_count)
             ModelUpdater(self.controller).update()
-            self.assertEqual(3, build_model.call_count)
+            self.assertEqual(2, build_model.call_count)
 
     def test_model_updater_unhealthy_then_fresh_empty_poll_without_collision_stays_cached(self):
         builder = ModelBuilder()
