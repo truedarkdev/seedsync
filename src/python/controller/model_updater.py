@@ -2686,6 +2686,37 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 return bool(actionable_ids)
 
+            live_lftp_file_ids = {
+                status.file_id for status in (lftp_statuses or [])
+            }
+
+            def candidate_has_actionable_unrelated_terminal_collision(file_id: str) -> bool:
+                """Whether a reused collision root needs the global lifecycle.
+
+                The builder cache proves only that the source tree once had a
+                terminalizable collision.  It does not prove this tick may
+                mutate the reused live root: stopped, terminal, live, and
+                active-collision roots are all intentionally deferred by the
+                ordinary lifecycle too.  Preserve that single decision model
+                before scheduling a post-adoption full rebuild.
+                """
+                if not (lftp_status_poll_healthy and lftp_status_snapshot_fresh and
+                        lftp_status_source == "fresh_healthy") or \
+                        persist.move_failure_counts.get(file_id, 0) >= \
+                        controller._Controller__MAX_MOVE_FAILURES or \
+                        file_id in live_lftp_file_ids:
+                    return False
+                try:
+                    candidate_file = new_model.get_file(file_id)
+                except ModelError:
+                    return False
+                return candidate_file.state != ModelFile.State.MOVE_FAILED and \
+                    not controller._Controller__is_explicitly_stopped(
+                        candidate_file.name, candidate_file.path_pair_id,
+                    ) and not controller._has_active_collision_comparison(
+                        candidate_file.name, candidate_file.path_pair_id,
+                    )
+
             unrelated_candidate_lifecycle_work_deferred = False
 
             def defer_unrelated_candidate_lifecycle_work() -> None:
@@ -2891,13 +2922,13 @@ class ModelUpdater(_ControllerCoreAccess):
                         terminalizable_collision_file_ids
                     ) if candidate_lifecycle_allows(file_id)
                 }
-                if all_terminalizable_collision_file_ids.difference(
-                        terminalizable_collision_file_ids
+                if any(
+                        candidate_has_actionable_unrelated_terminal_collision(file_id)
+                        for file_id in all_terminalizable_collision_file_ids.difference(
+                            terminalizable_collision_file_ids
+                        )
                 ):
                     defer_unrelated_candidate_lifecycle_work()
-                live_lftp_file_ids = {
-                    status.file_id for status in (lftp_statuses or [])
-                }
                 if lftp_status_poll_healthy and lftp_status_snapshot_fresh and \
                         lftp_status_source == "fresh_healthy":
                     for pending_file_id in terminal_collision_candidate_ids:

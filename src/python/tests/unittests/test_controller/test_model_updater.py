@@ -1802,10 +1802,14 @@ class TestModelUpdater(unittest.TestCase):
     def test_pair_candidate_defers_unrelated_collision_and_retry_lifecycle(self):
         old = SystemFile("old.bin", 10, False)
         old.path_pair_id = "pair-a"
-        idle_remote = SystemFile("idle.bin", 20, False)
+        idle_remote = SystemFile("idle", 20, True)
         idle_remote.path_pair_id = "pair-b"
-        idle_local = SystemFile("idle.bin", 20, False)
+        idle_remote.add_child(SystemFile("entry.bin", 20, False))
+        idle_local = SystemFile("idle", 20, True)
         idle_local.path_pair_id = "pair-b"
+        idle_collision = SystemFile("entry.bin", 20, False, is_staging=True)
+        idle_collision.has_staging_collision = True
+        idle_local.add_child(idle_collision)
         builder = ModelBuilder()
         builder.set_local_files([old, idle_local])
         builder.set_remote_files([old, idle_remote])
@@ -1821,7 +1825,7 @@ class TestModelUpdater(unittest.TestCase):
         builder.build_authoritative_pair_roots = MagicMock(
             wraps=builder.build_authoritative_pair_roots,
         )
-        idle_id = ModelFile.build_file_id("idle.bin", "pair-b")
+        idle_id = ModelFile.build_file_id("idle", "pair-b")
         idle_before = live_model.get_file(idle_id)
         idle_state = idle_before.state
         idle_scope_version = live_model.scope_version("pair-b")
@@ -1867,6 +1871,68 @@ class TestModelUpdater(unittest.TestCase):
         controller._Controller__move_from_staging.assert_not_called()
         builder.request_rebuild.assert_called_once()
         self.assertTrue(builder.has_changes())
+
+    def test_pair_candidate_ignores_unrelated_terminalized_collision(self):
+        old = SystemFile("old.bin", 10, False)
+        old.path_pair_id = "pair-a"
+        idle_remote = SystemFile("idle", 20, True)
+        idle_remote.path_pair_id = "pair-b"
+        idle_remote.add_child(SystemFile("entry.bin", 20, False))
+        idle_local = SystemFile("idle", 20, True)
+        idle_local.path_pair_id = "pair-b"
+        idle_collision = SystemFile("entry.bin", 20, False, is_staging=True)
+        idle_collision.has_staging_collision = True
+        idle_local.add_child(idle_collision)
+        builder = ModelBuilder()
+        builder.set_local_files([old, idle_local])
+        builder.set_remote_files([old, idle_remote])
+        builder.set_downloaded_files(set())
+        builder.set_downloaded_timestamps({})
+        builder.set_extracted_files(set())
+        builder.set_stopped_files(set())
+        idle_id = ModelFile.build_file_id("idle", "pair-b")
+        builder.set_move_failed_files({idle_id})
+        builder.set_final_move_succeeded_files(set())
+        builder.set_unknown_local_path_pair_ids({"pair-b"})
+        live_model = builder.build_model()
+        idle_before = live_model.get_file(idle_id)
+        self.assertEqual(ModelFile.State.MOVE_FAILED, idle_before.state)
+        self.assertIn(idle_id, builder.get_terminalizable_staging_collision_file_ids())
+        builder.build_model = MagicMock(wraps=builder.build_model)
+        # Do not let the pre-candidate maintenance path consume the fixture;
+        # candidate lifecycle receives the same stable cached collision.
+        builder.get_terminalizable_staging_collision_file_ids = MagicMock(
+            side_effect=[set(), {idle_id}],
+        )
+        builder.request_rebuild = MagicMock(wraps=builder.request_rebuild)
+        replacement_local = SystemFile("new.bin", 10, False)
+        replacement_local.path_pair_id = "pair-a"
+        replacement_remote = SystemFile("new.bin", 30, False)
+        replacement_remote.path_pair_id = "pair-a"
+        final_local = ScannerResult(
+            datetime.now(), [replacement_local], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        final_remote = ScannerResult(
+            datetime.now(), [replacement_remote], scanned_path_pair_ids={"pair-a"},
+            is_progress=True, completed_path_pair_ids={"pair-a"}, is_scan_final=True,
+            is_full_snapshot=True, full_snapshot_path_pair_ids={"pair-a"},
+        )
+        controller, _ = self._make_progressive_update_controller(
+            final_remote, local_scan=final_local, model_builder=builder, model=live_model,
+        )
+        controller._Controller__path_pairs_by_id = {"pair-a": MagicMock(), "pair-b": MagicMock()}
+        controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        controller._has_active_collision_comparison = MagicMock(return_value=False)
+
+        ModelUpdater(controller).update()
+
+        self.assertIn(ModelFile.build_file_id("new.bin", "pair-a"), live_model.get_file_ids())
+        self.assertIs(idle_before, live_model.get_file(idle_id))
+        builder.build_model.assert_not_called()
+        builder.request_rebuild.assert_not_called()
+        self.assertFalse(builder.has_changes())
 
     def test_pair_candidate_ignores_unrelated_stale_move_failure_marker(self):
         old = SystemFile("old.bin", 10, False)
