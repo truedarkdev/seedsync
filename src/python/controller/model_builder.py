@@ -21,7 +21,6 @@ from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
     COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
     COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION,
-    COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE,
     COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE,
@@ -2143,7 +2142,8 @@ class ModelBuilder:
         The final-pair path may replace or remove roots, so it is deliberately
         stricter than the presence-only progressive path.  Legacy marker names,
         duplicate basenames across pairs, orphan status roots, incomplete local
-        coverage, and unrelated dirty inputs retain the normal full build.
+        coverage, ambiguous bare-name markers, and unrelated dirty inputs
+        retain the normal full build; canonical cross-pair names stay scoped.
         """
         if path_pair_id is None or path_pair_id in unknown_local_path_pair_ids or \
                 self.__unknown_local_path_pair_ids.symmetric_difference(
@@ -2174,10 +2174,9 @@ class ModelBuilder:
             # only sound interpretation there.
             if name in self.__extracted_files:
                 return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER)
-            # Any remaining global count belongs to another pair.  We never
-            # assign a duplicate basename to a pair-local publication.
-            if self.__source_name_counts.get(name, 0) - old_names.get(name, 0) > 0:
-                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE)
+            # Canonical source identities include the pair, so another
+            # pair's source basename is safe here. Source-less status/active
+            # names still lack that proven source ownership.
             if self.__status_only_name_counts.get(name, 0) > 0:
                 return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME)
             if self.__active_only_name_counts.get(name, 0) > 0:

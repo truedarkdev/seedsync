@@ -24,7 +24,6 @@ from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.performance_diagnostics import (
-    COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE,
     COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
@@ -153,7 +152,7 @@ class TestModelBuilder(unittest.TestCase):
         )
         self.assertFalse(self.model_builder.has_changes())
 
-    def test_authoritative_pair_build_falls_back_for_cross_pair_duplicate_basename(self):
+    def test_authoritative_pair_build_adopts_cross_pair_duplicate_basename(self):
         diagnostics = PerformanceDiagnosticsCollector(lambda: True)
         self.model_builder.set_performance_diagnostics(diagnostics)
         first = SystemFile("shared.bin", 10, False)
@@ -161,18 +160,28 @@ class TestModelBuilder(unittest.TestCase):
         second = SystemFile("shared.bin", 20, False)
         second.path_pair_id = "pair-b"
         self.model_builder.set_remote_files([first, second])
-        self.model_builder.build_model()
+        live_model = self.model_builder.build_model()
+        second_id = ModelFile.build_file_id("shared.bin", "pair-b")
+        untouched_before = live_model.get_file(second_id)
 
         replacement = SystemFile("shared.bin", 30, False)
         replacement.path_pair_id = "pair-a"
 
-        self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
+        pair_build = self.model_builder.build_authoritative_pair_roots(
             "pair-a", [], [replacement], set(),
-        ))
-        self.assertEqual(
-            1,
-            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE],
         )
+        self.assertIsNotNone(pair_build)
+        assert pair_build is not None
+        self.assertTrue(self.model_builder.authorize_authoritative_pair_delta(
+            lambda file_id: file_id in live_model.get_file_ids(), pair_build,
+        ))
+        first_id = ModelFile.build_file_id("shared.bin", "pair-a")
+        live_model.update_file(pair_build.model.get_file(first_id))
+        self.model_builder.adopt_authoritative_pair_delta(live_model, pair_build)
+
+        self.assertEqual(30, live_model.get_file(first_id).remote_size)
+        self.assertIs(untouched_before, live_model.get_file(second_id))
+        self.assertFalse(self.model_builder.has_changes())
 
     def test_authoritative_pair_build_falls_back_for_cross_pair_local_root_arbitration(self):
         for other_is_managed in (True, False):
@@ -210,9 +219,11 @@ class TestModelBuilder(unittest.TestCase):
     def test_authoritative_pair_build_attributes_bare_extracted_marker_without_rejecting_safe_pair(self):
         diagnostics = PerformanceDiagnosticsCollector(lambda: True)
         self.model_builder.set_performance_diagnostics(diagnostics)
-        selected = SystemFile("selected.bin", 10, False)
+        selected = SystemFile("shared.bin", 10, False)
         selected.path_pair_id = "pair-a"
-        self.model_builder.set_remote_files([selected])
+        unrelated = SystemFile("shared.bin", 20, False)
+        unrelated.path_pair_id = "pair-b"
+        self.model_builder.set_remote_files([selected, unrelated])
         self.model_builder.build_model()
 
         self.assertIsNotNone(self.model_builder.build_authoritative_pair_roots(
@@ -223,7 +234,7 @@ class TestModelBuilder(unittest.TestCase):
             diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER],
         )
 
-        self.model_builder.set_extracted_files({"selected.bin"})
+        self.model_builder.set_extracted_files({"shared.bin"})
         self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
             "pair-a", [], [selected], set(),
         ))
