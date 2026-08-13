@@ -2197,7 +2197,17 @@ class Controller:
         except Exception:
             started_at = None
         try:
+            persist_wait_started = time.monotonic()
             with self.__persist.state_transaction():
+                persist_wait_ms = int((time.monotonic() - persist_wait_started) * 1000)
+                if persist_wait_ms >= 100:
+                    self.__record_breadcrumb(
+                        stage="persist_transaction",
+                        message="persist_transaction_lock_acquired",
+                        details={"wait_ms": persist_wait_ms},
+                        event_type="diagnostic",
+                        corr_id="controller-persist",
+                    )
                 self.__process_persist_transaction()
         finally:
             if diagnostics is not None:
@@ -5653,6 +5663,11 @@ class Controller:
     def __complete_delete_local_lifecycle(self, file_id: str, path_pair_id: Optional[str]) -> None:
         """Apply the shared metadata transition after a confirmed local delete."""
         self.__advance_transfer_lifecycle(file_id)
+        confirm_local_deletions = getattr(
+            self.__model_builder, "confirm_local_deletions", None,
+        )
+        if callable(confirm_local_deletions):
+            confirm_local_deletions({file_id})
         self.__persist.move_failure_counts.pop(file_id, None)
         self._reset_move_retry_rebuild_gate(file_id)
         self.__deferred_move_file_ids.discard(file_id)
@@ -6298,7 +6313,10 @@ class Controller:
                         file
                     )
                     continue
-                if not pending_stop and not file.is_stoppable:
+                active_scan_stop_ready = file.file_id in getattr(
+                    self, "_Controller__active_scan_ready_file_ids", set()
+                )
+                if not pending_stop and not file.is_stoppable and not active_scan_stop_ready:
                     _notify_failure(
                         command,
                         "File '{}' could not be stopped".format(command.filename),
@@ -6618,7 +6636,11 @@ class Controller:
                     self.__advance_transfer_lifecycle(file.file_id)
                     self.__queue_delete_local_process(
                         file,
-                        self.__local_scan_process.force_scan,
+                        lambda path_pair_id=file.path_pair_id: (
+                            self.__local_scan_process.force_scan()
+                            if path_pair_id is None
+                            else self.__local_scan_process.force_scan(path_pair_id)
+                        ),
                         command=command
                     )
                     self.__persist.stopped_file_names.add(file.file_id)

@@ -92,6 +92,8 @@ CANDIDATE_UNRELATED_LIFECYCLE_REASON_MULTIPLE = "multiple"
 MODEL_BUILDER_INVALIDATION_LOCAL_FILES = "model_builder_cache_invalidation_local_files"
 MODEL_BUILDER_INVALIDATION_REMOTE_FILES = "model_builder_cache_invalidation_remote_files"
 MODEL_BUILDER_INVALIDATION_ACTIVE_FILES = "model_builder_cache_invalidation_active_files"
+MODEL_BUILDER_INVALIDATION_CONFIRMED_LOCAL_DELETIONS = \
+    "model_builder_cache_invalidation_confirmed_local_deletions"
 MODEL_BUILDER_INVALIDATION_LFTP_STATUSES = "model_builder_cache_invalidation_lftp_statuses"
 MODEL_BUILDER_INVALIDATION_UNKNOWN_LOCAL_PAIRS = "model_builder_cache_invalidation_unknown_local_pairs"
 MODEL_BUILDER_INVALIDATION_LOCAL_ROOT_PATHS = "model_builder_cache_invalidation_local_root_paths"
@@ -216,6 +218,7 @@ _COUNTERS = frozenset((
     "scan_priority_targeted_runs", "scan_priority_full_followups",
     "model_builder_cache_invalidation_local_files", "model_builder_cache_invalidation_remote_files",
     "model_builder_cache_invalidation_active_files", "model_builder_cache_invalidation_lftp_statuses",
+    "model_builder_cache_invalidation_confirmed_local_deletions",
     "model_builder_cache_invalidation_unknown_local_pairs",
     "model_builder_cache_invalidation_local_root_paths", "model_builder_cache_invalidation_downloaded_files",
     "model_builder_cache_invalidation_downloaded_timestamps", "model_builder_cache_invalidation_extract_statuses",

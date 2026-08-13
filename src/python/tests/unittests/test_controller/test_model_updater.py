@@ -2296,6 +2296,8 @@ class TestModelUpdater(unittest.TestCase):
             live_model.get_file(local_id),
             controller._Controller__queue_delete_local_process.call_args.args[0],
         )
+        controller._Controller__queue_delete_local_process.call_args.args[1]()
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with("pair-a")
         builder.build_model.assert_not_called()
 
     def test_unrelated_terminalizable_collision_uses_global_lifecycle_before_candidate(self):
@@ -3066,7 +3068,9 @@ class TestModelUpdater(unittest.TestCase):
 
     def test_partial_progressive_refresh_keeps_active_lftp_updates_immediate(self):
         partial = self._progressive_result(final=False, unknown={None})
-        controller, model_builder = self._make_progressive_update_controller(partial)
+        controller, model_builder = self._make_progressive_update_controller(
+            partial, local_scan=partial, authoritative=False,
+        )
         status = LftpJobStatus(
             1,
             LftpJobStatus.Type.PGET,
@@ -3075,11 +3079,15 @@ class TestModelUpdater(unittest.TestCase):
             "",
         )
         controller._Controller__lftp.status.return_value = [status]
+        model_builder.has_changes.return_value = True
+        model_builder.has_only_pending_active_transfer_delta.return_value = True
         updater = ModelUpdater(controller)
 
         updater.update()
 
         model_builder.set_lftp_statuses.assert_called_once_with([status])
+        model_builder.build_progressive_roots.assert_called_once()
+        model_builder.build_model.assert_not_called()
         next_poll = controller._Controller__next_lftp_status_poll_at
         self.assertIsNotNone(next_poll)
         self.assertGreater(next_poll, datetime.now())
@@ -3135,6 +3143,35 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         self.assertEqual(25, live_model.get_file("root").transferred_size)
+        self.assertFalse(builder.has_changes())
+        builder.build_model.assert_not_called()
+
+    def test_scoped_active_scan_delta_preserves_exact_model_identity(self):
+        builder = ModelBuilder()
+        remote_root = SystemFile("root", 100, False)
+        remote_root.path_pair_id = "pair-a"
+        builder.set_remote_files([remote_root])
+        live_model = builder.build_model()
+        controller, _ = self._make_progressive_update_controller(
+            None, local_scan=None, model_builder=builder, model=live_model,
+        )
+        status = LftpJobStatus(
+            1, LftpJobStatus.Type.PGET, LftpJobStatus.State.RUNNING, "root", "",
+        )
+        status.path_pair_id = "pair-a"
+        status.total_transfer_state = LftpJobStatus.TransferState(25, 100, 25, 10, 8)
+        controller._Controller__lftp.status.return_value = [status]
+        controller._Controller__active_scan_process.pop_latest_result.return_value = ScannerResult(
+            datetime.now(), [SystemFile("root", 25, False)],
+        )
+        original_build = builder.build_model
+        builder.build_model = MagicMock(wraps=original_build)
+
+        ModelUpdater(controller).update()
+
+        scoped_id = ModelFile.build_file_id("root", "pair-a")
+        self.assertEqual({scoped_id}, live_model.get_file_ids())
+        self.assertEqual(25, live_model.get_file(scoped_id).transferred_size)
         self.assertFalse(builder.has_changes())
         builder.build_model.assert_not_called()
 
@@ -3569,12 +3606,40 @@ class TestModelUpdater(unittest.TestCase):
             {completion_entry},
             controller._Controller__pending_completion_file_names,
         )
-        controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
         controller.logger.info.assert_called_once_with(
             "Download completion pending (LFTP job finished): {}".format(
                 ModelFile.build_file_id(*completion_entry[:2])
             )
         )
+
+    def test_handle_lftp_completion_detection_scopes_rescans_per_completed_pair(self):
+        controller = self._make_lftp_completion_controller(
+            prev_downloading_file_names={
+                ("movie.mkv", "movies", "Movies"),
+                ("episode.mkv", "tv", "TV"),
+                ("second-movie.mkv", "movies", "Movies"),
+            }
+        )
+
+        ModelUpdater(controller)._handle_lftp_completion_detection([], True)
+
+        self.assertEqual(
+            [call("movies"), call("tv")],
+            controller._Controller__local_scan_process.force_scan.call_args_list,
+        )
+
+    def test_handle_lftp_completion_detection_uses_one_global_rescan_for_legacy_identity(self):
+        controller = self._make_lftp_completion_controller(
+            prev_downloading_file_names={
+                ("legacy.mkv", None, None),
+                ("movie.mkv", "movies", "Movies"),
+            }
+        )
+
+        ModelUpdater(controller)._handle_lftp_completion_detection([], True)
+
+        controller._Controller__local_scan_process.force_scan.assert_called_once_with()
 
     def test_completion_gate_breadcrumb_is_hot_gated_deduplicated_and_identity_free(self):
         enabled = [False]

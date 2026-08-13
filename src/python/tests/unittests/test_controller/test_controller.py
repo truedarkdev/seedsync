@@ -3342,6 +3342,28 @@ class TestController(unittest.TestCase):
         self.assertNotIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
         self.controller._Controller__lftp.kill.assert_not_called()
 
+    def test_process_commands_stop_uses_current_active_scan_readiness_when_model_flag_lags(self):
+        file = ModelFile("example", False)
+        file.state = ModelFile.State.DOWNLOADING
+        file.is_stoppable = False
+        self.controller._Controller__model.get_file.return_value = file
+        self.controller._Controller__active_scan_ready_file_ids = {file.file_id}
+        self.controller._Controller__lftp.kill.return_value = True
+
+        command = Controller.Command(Controller.Command.Action.STOP, "example")
+        callback = MagicMock()
+        command.add_callback(callback)
+        self.controller.queue_command(command)
+
+        self.controller._Controller__process_commands()
+
+        callback.on_success.assert_called_once_with()
+        callback.on_failure.assert_not_called()
+        self.controller._Controller__lftp.kill.assert_called_once_with(
+            "example", path_pair_id=None, remote_path=None, local_path=None,
+        )
+        self.assertIn(file.file_id, self.controller._Controller__persist.stopped_file_names)
+
     def test_process_commands_reports_not_found_as_404(self):
         self.controller._Controller__model.get_file.side_effect = ModelError("missing")
 
@@ -6202,6 +6224,9 @@ class TestController(unittest.TestCase):
         self.controller._Controller__cleanup_commands()
 
         post_callback.assert_called_once_with()
+        self.controller._Controller__model_builder.confirm_local_deletions.assert_called_once_with(
+            {file.file_id}
+        )
         callback.on_success.assert_called_once_with()
         callback.on_failure.assert_not_called()
         process.join.assert_called_once_with(Controller._Controller__JOIN_TIMEOUT_IN_SECS)
@@ -7102,7 +7127,7 @@ class TestController(unittest.TestCase):
             "nested", None, 58,
         )
         move.assert_called_once()
-        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
         self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
             "nested", None, 17, True,
         )

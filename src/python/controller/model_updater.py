@@ -1604,8 +1604,10 @@ class ModelUpdater(_ControllerCoreAccess):
             if not controller._Controller__is_explicitly_stopped(file_name[0], file_name[1])
         }
         if just_completed_file_names:
+            completed_path_pair_ids: set[Optional[str]] = set()
             for name, path_pair_id, _ in just_completed_file_names:
                 file_id = ModelFile.build_file_id(name, path_pair_id)
+                completed_path_pair_ids.add(path_pair_id)
                 controller.logger.info(
                     "Download completion pending (LFTP job finished): {}".format(
                         file_id
@@ -1620,7 +1622,11 @@ class ModelUpdater(_ControllerCoreAccess):
                     },
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
-            controller._Controller__local_scan_process.force_scan()
+            if None in completed_path_pair_ids:
+                controller._Controller__local_scan_process.force_scan()
+            else:
+                for path_pair_id in sorted(completed_path_pair_ids):
+                    controller._Controller__local_scan_process.force_scan(path_pair_id)
         controller._Controller__prev_downloading_file_names = current_downloading_file_names_set
 
     def _force_active_scan_for_stoppability(
@@ -2589,6 +2595,10 @@ class ModelUpdater(_ControllerCoreAccess):
             recorder = getattr(controller, "_record_path_pair_reconciliation", None)
             if callable(recorder):
                 recorder(local_reconciled_ids, remote_reconciled_ids)
+        # Status identities scope active scanner roots.  Publish them to the
+        # builder first so a same-tick active result cannot create an unscoped
+        # alias beside an already-scoped model root.
+        model_builder.set_lftp_statuses(lftp_statuses)
         if latest_active_scan is not None:
             record_scan_result_attribution("active", latest_active_scan)
             active_scan_files = list(latest_active_scan.files)
@@ -2622,7 +2632,6 @@ class ModelUpdater(_ControllerCoreAccess):
                 event_type="state_transition",
                 corr_id=controller._Controller__trace_corr_id_from_files(latest_active_scan.files, "active_scan"),
             )
-        model_builder.set_lftp_statuses(lftp_statuses)
         if lftp_status_snapshot_fresh and not lftp_status_poll_healthy and not lftp_statuses:
             model_builder.evict_recent_live_transfer_snapshots_missing_roots(
                 {status.file_id for status in lftp_statuses}
@@ -2897,6 +2906,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     protected_file_ids,
                 )
         progressive_delta_applied = False
+        active_only_change = getattr(model_builder, "has_only_pending_active_transfer_delta", None)
         progressive_delta_eligible = (
             progressive_mode
             and progressive_joint_partial_publication
@@ -2904,6 +2914,15 @@ class ModelUpdater(_ControllerCoreAccess):
             and not lftp_statuses
             and not model_builder.has_changes()
         )
+        if (
+            progressive_mode
+            and progressive_joint_partial_publication
+            and progressive_joint_publication_allowed
+            and lftp_statuses
+            and callable(active_only_change)
+            and bool(active_only_change())
+        ):
+            progressive_delta_eligible = True
         if progressive_delta_eligible:
             progressive_local_delta_files = [
                 file for file in joint_local_files
@@ -3095,17 +3114,24 @@ class ModelUpdater(_ControllerCoreAccess):
             try:
                 with controller._Controller__model_lock:
                     def root_exists(file_id: str) -> bool:
-                        try:
-                            model.get_file(file_id)
-                            return True
-                        except ModelError:
-                            return False
+                        return file_id in model.get_file_ids()
                     candidate_file_ids = active_delta_selector(root_exists)
             except Exception:
                 candidate_file_ids = None
             if isinstance(candidate_file_ids, set) and candidate_file_ids and all(
                     isinstance(file_id, str) for file_id in candidate_file_ids):
                 active_delta_file_ids = candidate_file_ids
+            elif self._completion_gate_trace_enabled():
+                delta_diagnostics = getattr(model_builder, "active_transfer_delta_diagnostics", None)
+                details = delta_diagnostics() if callable(delta_diagnostics) else {}
+                controller._Controller__record_breadcrumb(
+                    stage="model_delta",
+                    message="active_transfer_delta_rejected",
+                    details=details,
+                    event_type="diagnostic",
+                    corr_id="model_update:aggregate",
+                    trace_scope="aggregate",
+                )
         if active_delta_file_ids is not None:
             try:
                 partial_build = active_delta_builder(active_delta_file_ids)
@@ -4079,7 +4105,14 @@ class ModelUpdater(_ControllerCoreAccess):
 
         for file_id in auto_purge_candidate_ids:
             file = model.get_file(file_id)
-            controller._Controller__queue_delete_local_process(file, controller._Controller__local_scan_process.force_scan)
+            controller._Controller__queue_delete_local_process(
+                file,
+                lambda path_pair_id=file.path_pair_id: (
+                    controller._Controller__local_scan_process.force_scan()
+                    if path_pair_id is None
+                    else controller._Controller__local_scan_process.force_scan(path_pair_id)
+                ),
+            )
 
         # Update the controller status.
         if latest_remote_scan is not None:
