@@ -487,9 +487,14 @@ class _ProgressiveScanAccumulator:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
                         continue
+                    previous_file = working.get(file.name)
                     working[file.name] = file
                     self.__authoritative_by_pair.setdefault(pair_id, {})[file.name] = file
-                    self.__last_touched_keys.add((pair_id, file.name))
+                    # A new progressive generation starts from committed
+                    # authority.  An unchanged periodic chunk must refresh
+                    # that standing source without re-rendering its root.
+                    if previous_file != file:
+                        self.__last_touched_keys.add((pair_id, file.name))
                 if full_snapshot:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(working)
                 # A progressive completion marker can arrive after earlier

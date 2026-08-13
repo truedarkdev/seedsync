@@ -926,6 +926,37 @@ class TestModelUpdater(unittest.TestCase):
         self.assertEqual([4], [file.size for file in remote_files])
         self.assertEqual(set(), unknown)
 
+    def test_progressive_accumulator_unchanged_new_generation_has_no_delta_keys(self):
+        accumulator = _ProgressiveScanAccumulator()
+        initial = SystemFile("unchanged.bin", 3)
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [initial], scanned_path_pair_ids={"pair"}, generation=1,
+                is_progress=True, completed_path_pair_ids={"pair"}, session_token="session",
+                is_full_snapshot=True, full_snapshot_path_pair_ids={"pair"},
+            ),
+        ])
+
+        unchanged = SystemFile("unchanged.bin", 3)
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [unchanged], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, session_token="session",
+            ),
+        ])
+
+        self.assertEqual(set(), accumulator.touched_keys())
+        self.assertEqual({("pair", "unchanged.bin")}, set(accumulator.snapshot()))
+
+        changed = SystemFile("unchanged.bin", 4)
+        accumulator.apply([
+            ScannerResult(
+                datetime.now(), [changed], scanned_path_pair_ids={"pair"}, generation=2,
+                is_progress=True, session_token="session",
+            ),
+        ])
+        self.assertEqual({("pair", "unchanged.bin")}, accumulator.touched_keys())
+
     def test_joint_session_refresh_keeps_last_good_output_unknown_until_both_sides_refresh(self):
         local_accumulator = _ProgressiveScanAccumulator()
         remote_accumulator = _ProgressiveScanAccumulator()
@@ -1468,6 +1499,35 @@ class TestModelUpdater(unittest.TestCase):
         model_builder.set_local_files.assert_not_called()
         model_builder.set_remote_files.assert_not_called()
         model_builder.build_model.assert_not_called()
+
+    def test_unchanged_remote_progressive_chunk_skips_delta_builder(self):
+        remote_token = "remote-unchanged-chunk"
+        local_token = "local-standing-authority"
+        initial_remote = self._progressive_final_result(remote_token)
+        initial_local = self._progressive_final_result(local_token)
+        unchanged_remote = ScannerResult(
+            datetime.now(), [SystemFile("root", 1)], scanned_path_pair_ids={None}, generation=2,
+            is_progress=True, session_token=remote_token,
+        )
+        controller, model_builder = self._make_progressive_update_controller(
+            None, local_scan=None, authoritative=False,
+        )
+        controller._Controller__remote_scan_process = self._progressive_process(
+            remote_token, [[initial_remote], [unchanged_remote]],
+        )
+        controller._Controller__local_scan_process = self._progressive_process(
+            local_token, [[initial_local], []],
+        )
+        updater = ModelUpdater(controller)
+
+        updater.update()
+        model_builder.reset_mock()
+        updater.update()
+
+        model_builder.build_progressive_roots.assert_not_called()
+        model_builder.build_model.assert_not_called()
+        model_builder.set_local_files.assert_not_called()
+        model_builder.set_remote_files.assert_not_called()
 
     def test_later_progressive_final_event_republishes_against_standing_authority(self):
         remote_token = "remote-later-final"
