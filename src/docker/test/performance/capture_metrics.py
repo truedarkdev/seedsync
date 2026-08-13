@@ -46,6 +46,9 @@ MODEL_BUILDER_INVALIDATION_COUNTERS = frozenset((
     "model_builder_cache_invalidation_explicit",
 ))
 DEFAULT_SETTLED_IDLE_CPU_PERCENT = 1.0
+DEFAULT_EXTERNAL_READINESS_SAMPLES = 3
+DEFAULT_EXTERNAL_MODEL_STABILITY_SAMPLES = 2
+DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS = 150
 
 
 def _number(value: object) -> float | None:
@@ -195,6 +198,95 @@ def _expected_summary_root_count(manifest: dict[str, object]) -> int:
     return total
 
 
+def _external_target_readiness(
+    model_samples: list[dict[str, object]], expected: int,
+    target_index: int | None, settled_idle_cpu_percent: float,
+) -> dict[str, object]:
+    """Validate the bounded diagnostics-off target boundary.
+
+    The shell harness records only compact model-summary fields and the latest
+    sanitized app CPU sample.  This check deliberately requires both a stable
+    root cardinality/model version and a separate consecutive quiet CPU suffix
+    before the target.  A later model change therefore cannot be hidden by an
+    earlier quiet sample.
+    """
+    readiness: dict[str, object] = {
+        "condition": (
+            "target requires the expected root cardinality and model version "
+            "for at least 2 consecutive successful summaries plus 3 "
+            "consecutive app CPU samples at or below the hard 1.0% gate; "
+            "readiness resets on cardinality/version change"
+        ),
+        "target_sample_index": target_index,
+        "target_sample_index_valid": False,
+        "model_cardinality_at_target": None,
+        "model_version_at_target": None,
+        "model_stable_consecutive_samples": 0,
+        "required_model_stable_samples": DEFAULT_EXTERNAL_MODEL_STABILITY_SAMPLES,
+        "app_cpu_quiet_consecutive_samples": 0,
+        "required_app_cpu_quiet_samples": DEFAULT_EXTERNAL_READINESS_SAMPLES,
+        "app_cpu_threshold_percent": settled_idle_cpu_percent,
+        "reset_on_model_change": True,
+        "model_stable_after_target": True,
+        "ready": False,
+    }
+    if target_index is None or not 0 <= target_index < len(model_samples):
+        return readiness
+    target = model_samples[target_index]
+    if not isinstance(target, dict):
+        return readiness
+    sample_index = target.get("sample_index")
+    target_root = target.get("root_count")
+    target_version = target.get("model_version")
+    readiness["target_sample_index_valid"] = type(sample_index) is int and sample_index == target_index
+    readiness["model_cardinality_at_target"] = target_root
+    readiness["model_version_at_target"] = target_version
+    if not readiness["target_sample_index_valid"] or target_index == 0:
+        return readiness
+    if type(target_root) is not int or target_root != expected:
+        return readiness
+    if type(target_version) is not int or target_version < 0:
+        return readiness
+    for sample in model_samples[target_index + 1:]:
+        if (not isinstance(sample, dict) or sample.get("root_count") != target_root or
+                sample.get("model_version") != target_version):
+            readiness["model_stable_after_target"] = False
+            return readiness
+
+    model_streak = 0
+    quiet_streak = 0
+    quiet_suffix_open = True
+    previous_index: int | None = None
+    for position in range(target_index, -1, -1):
+        sample = model_samples[position]
+        if not isinstance(sample, dict):
+            break
+        sample_id = sample.get("sample_index")
+        contiguous = (
+            type(sample_id) is int and
+            (previous_index is None or sample_id == previous_index - 1)
+        )
+        same_model = sample.get("root_count") == expected and sample.get("model_version") == target_version
+        if not contiguous or not same_model:
+            break
+        model_streak += 1
+        cpu = sample.get("app_cpu_percent")
+        quiet = type(cpu) in (int, float) and 0.0 <= float(cpu) <= settled_idle_cpu_percent
+        if quiet_suffix_open and quiet:
+            quiet_streak += 1
+        else:
+            quiet_suffix_open = False
+        previous_index = sample_id
+
+    readiness["model_stable_consecutive_samples"] = model_streak
+    readiness["app_cpu_quiet_consecutive_samples"] = quiet_streak
+    readiness["ready"] = (
+        model_streak >= DEFAULT_EXTERNAL_MODEL_STABILITY_SAMPLES and
+        quiet_streak >= DEFAULT_EXTERNAL_READINESS_SAMPLES
+    )
+    return readiness
+
+
 def summarize_external(
     model_samples: list[dict[str, object]], docker_stats: list[dict[str, object]],
     manifest: dict[str, object], label: str, breadcrumb_mode: str | None = None,
@@ -207,20 +299,27 @@ def summarize_external(
     expected = _expected_summary_root_count(manifest)
     normalized = [sample for sample in model_samples if isinstance(sample, dict)]
     observed = normalized[-1] if normalized else {}
-    stable = False
-    if target_index is not None and 0 <= target_index < len(normalized):
-        target = normalized[target_index]
-        stable = (
-            target.get("root_count") == expected and type(target.get("model_version")) is int
-            and target_index > 0 and normalized[target_index - 1].get("model_version") == target.get("model_version")
-        )
+    target_readiness = _external_target_readiness(
+        normalized, expected, target_index, settled_idle_cpu_percent,
+    )
+    stable = bool(target_readiness["model_stable_consecutive_samples"] >= DEFAULT_EXTERNAL_MODEL_STABILITY_SAMPLES)
     stats = summarize_docker_stats(docker_stats, "app")
     remote_stats = summarize_docker_stats(remote_docker_stats or [], "remote-helper")
     timing = phase_timing if isinstance(phase_timing, dict) else {}
+    post_target_required = timing.get("post_target_observation_required_seconds")
+    post_target_elapsed = timing.get("post_scan_settled_idle_observation_ms")
+    post_target_observation_complete = (
+        type(post_target_required) is int and
+        post_target_required >= DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS and
+        type(post_target_elapsed) is int and
+        post_target_elapsed >= DEFAULT_EXTERNAL_POST_TARGET_OBSERVATION_SECONDS * 1000
+    )
     scan_sample_count = target_index + 1 if target_index is not None and 0 <= target_index < len(normalized) else len(normalized)
     baseline_checks = {
         "expected_summary_root_cardinality": observed.get("root_count") == expected and expected > 0,
         "model_version_stable": stable,
+        "model_target_readiness": bool(target_readiness["ready"]),
+        "post_target_observation_complete": post_target_observation_complete,
         "external_docker_stats_available": stats["sample_count"] > 0,
         "breadcrumb_mode_recorded": breadcrumb_mode in {"on", "off"},
     }
@@ -240,6 +339,8 @@ def summarize_external(
         and float(app_average) <= settled_idle_cpu_percent
     )
     acceptance_checks = {
+        "model_target_readiness": bool(target_readiness["ready"]),
+        "post_target_observation_complete": post_target_observation_complete,
         "app_cpu_acceptance_applicable": app_cpu_acceptance_applicable,
         "app_cpu_average_within_threshold": app_cpu_acceptance_pass,
         "remote_helper_stats_available": remote_stats["sample_count"] > 0,
@@ -262,6 +363,9 @@ def summarize_external(
         "observed_summary_root_cardinality": observed.get("root_count"),
         "model_version": observed.get("model_version"),
         "model_version_stable": stable,
+        "target_readiness": target_readiness,
+        "post_target_observation_required_seconds": post_target_required,
+        "post_target_observation_elapsed_ms": post_target_elapsed,
         "baseline_checks": baseline_checks,
         "baseline_valid": baseline_valid,
         "acceptance_checks": acceptance_checks,

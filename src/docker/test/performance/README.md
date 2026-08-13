@@ -107,7 +107,12 @@ When diagnostics are off, `measure` uses the authenticated
 `/server/model/v1/summary` endpoint for compact root cardinality and stable
 model-version readiness, while sampling sanitized external Docker CPU/memory
 stats on every observation for both modes into separate `app` and
-`remote-helper` series. The off-mode summary keeps the same
+`remote-helper` series. Off-mode readiness requires the expected root count and
+model version to remain stable for two successful summaries plus three
+consecutive app-container CPU samples at or below the hard `1.0%` gate; a
+cardinality or version change resets that boundary. The readiness condition,
+zero-based successful-summary target index, and required observation duration
+are retained in the timing artifacts. The off-mode summary keeps the same
 150-second post-target observation and timing/resource schema, but deliberately
 has no stage attribution; diagnostics-on retains the full stage windows and
 breadcrumb evidence.

@@ -420,18 +420,21 @@ def test_external_summary_requires_stable_model_version_and_sanitized_docker_sta
                          "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}]}],
     }
     samples = [
-        {"sample_index": 1, "t_epoch_ms": 1000, "root_count": 2, "model_version": 4},
-        {"sample_index": 2, "t_epoch_ms": 2000, "root_count": 2, "model_version": 4},
+        {"sample_index": 0, "t_epoch_ms": 1000, "root_count": 2, "model_version": 4, "app_cpu_percent": 8.0},
+        {"sample_index": 1, "t_epoch_ms": 2000, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.8},
+        {"sample_index": 2, "t_epoch_ms": 3000, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.7},
+        {"sample_index": 3, "t_epoch_ms": 4000, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.6},
     ]
     stats = [
         {"t_epoch_ms": 1000, "cpu_percent": 8.0, "memory_percent": 3.0, "process_count": 4},
-        {"t_epoch_ms": 3000, "cpu_percent": 0.8, "memory_percent": 3.2, "process_count": 4},
+        {"t_epoch_ms": 5000, "cpu_percent": 0.8, "memory_percent": 3.2, "process_count": 4},
     ]
     summary = summarize_external(samples, stats, manifest, "baseline", "off",
-        {"model_target_epoch_ms": 2000, "post_scan_settled_idle_observation_ms": 1000}, target_index=1,
+        {"model_target_epoch_ms": 4000, "post_scan_settled_idle_observation_ms": 150000,
+         "post_target_observation_required_seconds": 150}, target_index=3,
         remote_docker_stats=[
             {"t_epoch_ms": 1000, "cpu_percent": 2.0, "memory_percent": 4.0},
-            {"t_epoch_ms": 3000, "cpu_percent": 2.1, "memory_percent": 4.1},
+            {"t_epoch_ms": 5000, "cpu_percent": 2.1, "memory_percent": 4.1},
         ])
     assert summary["measurement_mode"] == "external-summary"
     assert summary["baseline_valid"] is True
@@ -440,6 +443,107 @@ def test_external_summary_requires_stable_model_version_and_sanitized_docker_sta
     assert summary["post_target_external_docker_stats"]["sample_count"] == 1
     assert summary["steady_idle_target_met"] is True
     assert summary["acceptance_valid"] is True
+
+
+def _external_manifest():
+    return {
+        "fixture_fingerprint": "fixture", "config_fingerprint": "config",
+        "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
+                         "remote_only_targets": [{"relative_path": "path-pair-01/remote-only-target.bin"}]}],
+    }
+
+
+def _external_stats():
+    return [{"t_epoch_ms": 1000, "cpu_percent": 0.5, "memory_percent": 3.0}]
+
+
+def test_external_summary_does_not_target_early_stable_cardinality_while_cpu_is_high():
+    samples = [
+        {"sample_index": 0, "root_count": 2, "model_version": 4, "app_cpu_percent": 80.0},
+        {"sample_index": 1, "root_count": 2, "model_version": 4, "app_cpu_percent": 70.0},
+        {"sample_index": 2, "root_count": 2, "model_version": 4, "app_cpu_percent": 60.0},
+    ]
+    summary = summarize_external(samples, _external_stats(), _external_manifest(), "candidate", "off",
+                                  {"model_target_epoch_ms": 3000}, target_index=2,
+                                  remote_docker_stats=_external_stats())
+    assert summary["target_readiness"]["model_stable_consecutive_samples"] == 3
+    assert summary["target_readiness"]["app_cpu_quiet_consecutive_samples"] == 0
+    assert summary["target_readiness"]["ready"] is False
+    assert summary["acceptance_checks"]["model_target_readiness"] is False
+    assert summary["acceptance_valid"] is False
+
+
+def test_external_summary_targets_only_after_consecutive_quiet_samples_and_keeps_zero_based_index():
+    samples = [
+        {"sample_index": 0, "root_count": 2, "model_version": 4, "app_cpu_percent": 80.0},
+        {"sample_index": 1, "root_count": 2, "model_version": 4, "app_cpu_percent": 70.0},
+        {"sample_index": 2, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.8},
+        {"sample_index": 3, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.7},
+        {"sample_index": 4, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.6},
+    ]
+    summary = summarize_external(samples, _external_stats(), _external_manifest(), "candidate", "off",
+                                  {"model_target_epoch_ms": 5000}, target_index=4,
+                                  remote_docker_stats=_external_stats())
+    assert summary["target_readiness"]["target_sample_index_valid"] is True
+    assert summary["target_readiness"]["app_cpu_quiet_consecutive_samples"] == 3
+    assert summary["target_readiness"]["ready"] is True
+    assert summary["full_scan_phase"]["sample_count"] == 5
+
+
+def test_external_summary_resets_readiness_on_model_version_or_cardinality_change():
+    samples = [
+        {"sample_index": 0, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.5},
+        {"sample_index": 1, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.5},
+        {"sample_index": 2, "root_count": 2, "model_version": 5, "app_cpu_percent": 0.5},
+        {"sample_index": 3, "root_count": 2, "model_version": 5, "app_cpu_percent": 0.5},
+        {"sample_index": 4, "root_count": 2, "model_version": 5, "app_cpu_percent": 0.5},
+    ]
+    before_quiet = summarize_external(samples, _external_stats(), _external_manifest(), "candidate", "off",
+                                       {"model_target_epoch_ms": 3000}, target_index=2,
+                                       remote_docker_stats=_external_stats())
+    after_quiet = summarize_external(samples, _external_stats(), _external_manifest(), "candidate", "off",
+                                      {"model_target_epoch_ms": 5000}, target_index=4,
+                                      remote_docker_stats=_external_stats())
+    assert before_quiet["target_readiness"]["ready"] is False
+    assert before_quiet["target_readiness"]["model_stable_consecutive_samples"] == 1
+    assert after_quiet["target_readiness"]["ready"] is True
+    assert after_quiet["target_readiness"]["reset_on_model_change"] is True
+
+
+def test_external_summary_rejects_target_index_mismatch_and_missing_samples():
+    samples = [
+        {"sample_index": 0, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.5},
+        {"sample_index": 1, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.5},
+        {"sample_index": 4, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.5},
+    ]
+    mismatch = summarize_external(samples, _external_stats(), _external_manifest(), "candidate", "off",
+                                   {"model_target_epoch_ms": 3000}, target_index=2,
+                                   remote_docker_stats=_external_stats())
+    missing = summarize_external([], [], _external_manifest(), "candidate", "off", {}, target_index=0)
+    assert mismatch["target_readiness"]["target_sample_index_valid"] is False
+    assert mismatch["acceptance_valid"] is False
+    assert missing["target_readiness"]["target_sample_index_valid"] is False
+    assert missing["acceptance_checks"]["model_target_readiness"] is False
+    assert missing["acceptance_valid"] is False
+
+
+def test_external_summary_requires_full_post_target_observation_window():
+    samples = [
+        {"sample_index": 0, "root_count": 2, "model_version": 4, "app_cpu_percent": 80.0},
+        {"sample_index": 1, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.8},
+        {"sample_index": 2, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.7},
+        {"sample_index": 3, "root_count": 2, "model_version": 4, "app_cpu_percent": 0.6},
+    ]
+    summary = summarize_external(
+        samples, [{"t_epoch_ms": 5000, "cpu_percent": 0.5, "memory_percent": 3.0}],
+        _external_manifest(), "candidate", "off",
+        {"model_target_epoch_ms": 4000, "post_scan_settled_idle_observation_ms": 149999,
+         "post_target_observation_required_seconds": 149}, target_index=3,
+        remote_docker_stats=[{"t_epoch_ms": 5000, "cpu_percent": 0.5, "memory_percent": 3.0}],
+    )
+    assert summary["target_readiness"]["ready"] is True
+    assert summary["acceptance_checks"]["post_target_observation_complete"] is False
+    assert summary["acceptance_valid"] is False
 
 
 def test_external_stats_parser_drops_malformed_samples():
@@ -579,19 +683,32 @@ def test_lab_rejects_unsafe_run_ids_and_cpu_threshold_above_acceptance_cap():
     assert "no more than 1.0 for acceptance" in result.stderr
 
 
+def test_off_mode_summary_failure_breaks_quiet_readiness_suffix():
+    lab_source = (PERF_DIR / "lab.sh").read_text(encoding="utf-8")
+    failure_start = lab_source.index('> "$summary_path"; then')
+    failure_end = lab_source.index("      summary_success_count=", failure_start)
+    failure_block = lab_source[failure_start:failure_end]
+    assert "summary_quiet_count=0" in failure_block
+    assert failure_block.index("summary_quiet_count=0") < failure_block.index("continue")
+
+
 def test_external_summary_separates_app_and_remote_helper_resource_roles():
     manifest = {"fixture_fingerprint": "fixture", "config_fingerprint": "config",
                 "path_pairs": [{"enabled": True, "nodes_local": 64, "directory": "path-pair-01",
                                  "remote_only_targets": []}]}
     model_samples = [
-        {"t_epoch_ms": 1000, "root_count": 1, "model_version": 4},
-        {"t_epoch_ms": 2000, "root_count": 1, "model_version": 4},
+        {"sample_index": 0, "t_epoch_ms": 1000, "root_count": 1, "model_version": 4, "app_cpu_percent": 9.0},
+        {"sample_index": 1, "t_epoch_ms": 2000, "root_count": 1, "model_version": 4, "app_cpu_percent": 0.9},
+        {"sample_index": 2, "t_epoch_ms": 3000, "root_count": 1, "model_version": 4, "app_cpu_percent": 0.8},
+        {"sample_index": 3, "t_epoch_ms": 4000, "root_count": 1, "model_version": 4, "app_cpu_percent": 0.7},
     ]
     summary = summarize_external(
         model_samples,
         [{"t_epoch_ms": 1000, "cpu_percent": 1.2, "memory_percent": 3.0},
          {"t_epoch_ms": 3000, "cpu_percent": 0.8, "memory_percent": 3.1}],
-        manifest, "candidate", "off", {"model_target_epoch_ms": 500}, target_index=1,
+        manifest, "candidate", "off", {"model_target_epoch_ms": 500,
+                                         "post_scan_settled_idle_observation_ms": 150000,
+                                         "post_target_observation_required_seconds": 150}, target_index=3,
         remote_docker_stats=[{"t_epoch_ms": 1000, "cpu_percent": 42.0, "memory_percent": 11.0},
                              {"t_epoch_ms": 3000, "cpu_percent": 38.0, "memory_percent": 11.2}],
     )
@@ -902,7 +1019,9 @@ def test_browser_harness_is_lazy_configurable_and_manifest_driven():
     assert 'sample_docker_stats "$remote_docker_stats_series" remote-helper' in lab_source
     assert '"model_target_epoch_ms": target' in lab_source
     assert "summary_success_count" in lab_source
-    assert 'target_index="$summary_success_count"' in lab_source
+    assert 'target_index="$summary_sample_index"' in lab_source
+    assert 'external_target_argument=(--target-sequence "$target_index")' in lab_source
+    assert "PERF_EXTERNAL_READINESS_SAMPLES=3" in lab_source
     assert "--image-identity-digest" in lab_source
     assert "image_identity_digest" in source and "image_tag_digest" in source
     assert "normalizeAppPath" in source and "<scope-digest:" in source

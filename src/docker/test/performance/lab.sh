@@ -38,6 +38,12 @@ PERF_POST_TARGET_POLL_SECONDS="${PERF_POST_TARGET_POLL_SECONDS:-10}"
 # restarts, so the default acceptance window spans one complete refresh edge.
 PERF_POST_TARGET_OBSERVATION_SECONDS="${PERF_POST_TARGET_OBSERVATION_SECONDS:-150}"
 PERF_SETTLED_IDLE_CPU_PERCENT="${PERF_SETTLED_IDLE_CPU_PERCENT:-1.0}"
+# Diagnostics-off readiness is intentionally stricter than the final average:
+# the app must report three consecutive low-CPU observations before the full
+# post-target window starts. This count is fixed so the <=1% boundary cannot
+# be weakened by a worker override.
+PERF_EXTERNAL_READINESS_SAMPLES=3
+PERF_EXTERNAL_MODEL_STABILITY_SAMPLES=2
 
 if [[ -z "$PERF_IMAGE" ]]; then
   echo "PERF_IMAGE must name the exact SeedSync image or candidate" >&2
@@ -507,7 +513,9 @@ PY
   local deadline=$(( $(date +%s) + PERF_MEASURE_TIMEOUT_SECONDS ))
   local index=0
   local last_success_index=0
-  local summary_stable_count=0 summary_last_version="" summary_success_count=0
+  local summary_stable_count=0 summary_last_version="" summary_last_root_count="" summary_success_count=0
+  local summary_quiet_count=0 target_stable_count="" target_quiet_count=""
+  local target_root_count="" target_model_version=""
   while (( $(date +%s) < deadline )); do
     index=$((index + 1))
     sample_docker_stats "$app_docker_stats_series" app || true
@@ -518,6 +526,10 @@ PY
       if ! curl --silent --show-error --fail --max-time 20 \
         -H "Authorization: Bearer $PERF_API_TOKEN" "$model_summary_url" > "$summary_path"; then
         rm -f -- "$summary_path"
+        # A failed summary leaves no paired model/CPU observation. It must
+        # break the quiet suffix before an external target can be declared;
+        # successful-summary model stability remains intentionally intact.
+        summary_quiet_count=0
         local app_id app_running
         app_id="$(compose ps --all -q app)"
         app_running=""
@@ -532,58 +544,127 @@ PY
         sleep "$PERF_SAMPLE_SLEEP_SECONDS"
         continue
       fi
-      last_success_index="$index"
       summary_success_count=$((summary_success_count + 1))
+      local summary_sample_index=$((summary_success_count - 1))
+      last_success_index="$summary_success_count"
       [[ -n "$first_ms" ]] || first_ms="$(date -u +%s%3N)"
       local observed_summary_count observed_model_version summary_pair_count
-      read -r observed_summary_count observed_model_version summary_pair_count <<<"$(python3 - "$summary_path" <<'PY'
+      local observed_app_cpu
+      read -r observed_summary_count observed_model_version summary_pair_count observed_app_cpu <<<"$(python3 - "$summary_path" "$app_docker_stats_series" <<'PY'
 import json, os, sys
 sys.path.insert(0, os.environ["PERF_LAB_SOURCE_DIR"])
 from capture_metrics import latest_model_summary_status
 status = latest_model_summary_status(json.load(open(sys.argv[1], encoding="utf-8")))
-print(*(str(status.get(key)) if status.get(key) is not None else "" for key in ("root_count", "model_version", "pair_count")))
+app_cpu = ""
+try:
+    stats = json.load(open(sys.argv[2], encoding="utf-8"))
+    samples = stats.get("samples", []) if isinstance(stats, dict) else []
+    if samples and isinstance(samples[-1], dict) and type(samples[-1].get("cpu_percent")) in (int, float):
+        app_cpu = str(samples[-1]["cpu_percent"])
+except (OSError, ValueError, TypeError):
+    pass
+print(*(str(status.get(key)) if status.get(key) is not None else ""
+        for key in ("root_count", "model_version", "pair_count")), app_cpu)
 PY
 )"
-      python3 - "$model_summary_series" "$summary_path" "$index" "$(date -u +%s%3N)" <<'PY'
+      python3 - "$model_summary_series" "$summary_path" "$summary_sample_index" "$(date -u +%s%3N)" "$app_docker_stats_series" <<'PY'
 import json, os, sys
 sys.path.insert(0, os.environ["PERF_LAB_SOURCE_DIR"])
 from capture_metrics import latest_model_summary_status
-series_path, summary_path, sample_index, epoch_ms = sys.argv[1:]
+series_path, summary_path, sample_index, epoch_ms, app_stats_path = sys.argv[1:]
 status = latest_model_summary_status(json.load(open(summary_path, encoding="utf-8")))
+app_cpu = None
+try:
+    stats = json.load(open(app_stats_path, encoding="utf-8"))
+    samples = stats.get("samples", []) if isinstance(stats, dict) else []
+    if samples and isinstance(samples[-1], dict) and type(samples[-1].get("cpu_percent")) in (int, float):
+        app_cpu = samples[-1]["cpu_percent"]
+except (OSError, ValueError, TypeError):
+    pass
 payload = json.loads(open(series_path, encoding="utf-8").read())
-payload.setdefault("samples", []).append({"sample_index": int(sample_index), "t_epoch_ms": int(epoch_ms), **status})
+payload.setdefault("samples", []).append({"sample_index": int(sample_index), "t_epoch_ms": int(epoch_ms),
+                                           "app_cpu_percent": app_cpu, **status})
 open(series_path, "w", encoding="utf-8").write(json.dumps(payload, indent=2) + "\n")
 PY
       rm -f -- "$summary_path"
-      if [[ -n "$observed_model_version" && "$observed_model_version" == "$summary_last_version" ]]; then
+      if [[ -n "$observed_summary_count" && -n "$observed_model_version" &&
+            "$observed_summary_count" == "$summary_last_root_count" &&
+            "$observed_model_version" == "$summary_last_version" ]]; then
         summary_stable_count=$((summary_stable_count + 1))
-      elif [[ -n "$observed_model_version" ]]; then
+      elif [[ -n "$observed_summary_count" && -n "$observed_model_version" ]]; then
         summary_stable_count=1
+        summary_last_root_count="$observed_summary_count"
         summary_last_version="$observed_model_version"
+        summary_quiet_count=0
       else
         summary_stable_count=0
         summary_last_version=""
+        summary_last_root_count=""
+        summary_quiet_count=0
+      fi
+      local low_cpu_sample=0
+      if [[ -n "$observed_app_cpu" ]] &&
+         (( $(awk "BEGIN { print ($observed_app_cpu >= 0 && $observed_app_cpu <= $PERF_SETTLED_IDLE_CPU_PERCENT) }") )); then
+        low_cpu_sample=1
+      fi
+      if (( low_cpu_sample == 1 )) &&
+         [[ -n "$observed_summary_count" && "$observed_summary_count" == "$summary_last_root_count" &&
+            -n "$observed_model_version" && "$observed_model_version" == "$summary_last_version" ]]; then
+        summary_quiet_count=$((summary_quiet_count + 1))
+      else
+        summary_quiet_count=0
       fi
       if [[ -z "$target_ms" && -n "$observed_summary_count" && -n "$observed_model_version" ]] && \
-         (( observed_summary_count == expected_summary_count && summary_stable_count >= 2 )); then
+         (( observed_summary_count == expected_summary_count &&
+            summary_stable_count >= PERF_EXTERNAL_MODEL_STABILITY_SAMPLES &&
+            summary_quiet_count >= PERF_EXTERNAL_READINESS_SAMPLES )); then
         target_ms="$(date -u +%s%3N)"
         # The external summarizer indexes the retained successful-sample
         # array, not poll attempts. Startup curl failures therefore must not
         # create gaps in this zero-based boundary.
-        target_index="$summary_success_count"
+        target_index="$summary_sample_index"
         target_sequence="$observed_model_version"
-        python3 - "$phase_dir/cold-start.json" "$started_ms" "$first_ms" "$target_ms" "$expected_summary_count" "$target_sequence" <<'PY'
+        target_root_count="$observed_summary_count"
+        target_model_version="$observed_model_version"
+        target_stable_count="$summary_stable_count"
+        target_quiet_count="$summary_quiet_count"
+        python3 - "$phase_dir/cold-start.json" "$started_ms" "$first_ms" "$target_ms" "$expected_summary_count" "$target_sequence" "$target_index" "$target_stable_count" "$target_quiet_count" "$PERF_SETTLED_IDLE_CPU_PERCENT" "$PERF_POST_TARGET_OBSERVATION_SECONDS" <<'PY'
 import json, sys
-started, first, target, expected, version = map(int, sys.argv[2:])
+started, first, target, expected, version, sample_index, stable_count, quiet_count = map(int, sys.argv[2:10])
+cpu_threshold = float(sys.argv[10])
+observation_seconds = int(sys.argv[11])
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     handle.write(json.dumps({"schema": "seedsync.performance-lab.cold-start.v1",
         "started_epoch_ms": started, "first_diagnostics_epoch_ms": first,
         "model_target_epoch_ms": target, "startup_to_first_diagnostics_ms": first - started,
         "full_scan_to_model_target_ms": target - first,
         "expected_model_summary_root_cardinality": expected,
-        "target_model_version": version}, indent=2) + "\n")
+        "target_model_version": version, "target_sample_index": sample_index,
+        "target_readiness": {
+            "condition": "expected root cardinality and model version stable for at least 2 consecutive successful summaries plus 3 consecutive app CPU samples at or below the hard 1.0% gate; reset on cardinality/version change",
+            "model_stable_consecutive_samples": stable_count,
+            "app_cpu_quiet_consecutive_samples": quiet_count,
+            "app_cpu_threshold_percent": cpu_threshold,
+            "required_post_target_observation_seconds": observation_seconds,
+        }}, indent=2) + "\n")
 PY
       elif [[ -n "$target_ms" && -z "$settled_ms" ]]; then
+        if [[ -z "$observed_summary_count" || -z "$observed_model_version" ||
+              "$observed_summary_count" != "$target_root_count" ||
+              "$observed_model_version" != "$target_model_version" ]]; then
+          # A model refresh invalidates the readiness boundary. Start a new
+          # low-CPU suffix and a fresh full observation window.
+          target_ms=""
+          target_index=""
+          target_sequence=""
+          target_root_count=""
+          target_model_version=""
+          target_stable_count=""
+          target_quiet_count=""
+          summary_quiet_count=0
+          sleep "$PERF_SAMPLE_SLEEP_SECONDS"
+          continue
+        fi
         local observation_now_ms
         observation_now_ms="$(date -u +%s%3N)"
         if (( observation_now_ms < target_ms + PERF_POST_TARGET_OBSERVATION_SECONDS * 1000 )); then
@@ -591,16 +672,26 @@ PY
           continue
         fi
         settled_ms="$observation_now_ms"
-        python3 - "$phase_dir/phase-timing.json" "$started_ms" "$first_ms" "$target_ms" "$settled_ms" <<'PY'
+        python3 - "$phase_dir/phase-timing.json" "$started_ms" "$first_ms" "$target_ms" "$settled_ms" "$target_index" "$target_stable_count" "$target_quiet_count" "$PERF_SETTLED_IDLE_CPU_PERCENT" "$PERF_POST_TARGET_OBSERVATION_SECONDS" <<'PY'
 import json, sys
-started, first, target, settled = map(int, sys.argv[2:])
+started, first, target, settled, sample_index, stable_count, quiet_count = map(int, sys.argv[2:9])
+cpu_threshold = float(sys.argv[9])
+observation_seconds = int(sys.argv[10])
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     handle.write(json.dumps({"schema": "seedsync.performance-lab.phase-timing.v1",
         "started_epoch_ms": started, "first_observation_epoch_ms": first,
         "model_target_epoch_ms": target, "settled_epoch_ms": settled,
         "cold_start_to_first_diagnostics_ms": first - started,
         "startup_to_first_observation_ms": first - started, "full_scan_ms": target - first,
-        "post_scan_settled_idle_observation_ms": settled - target}, indent=2) + "\n")
+        "post_scan_settled_idle_observation_ms": settled - target,
+        "post_target_observation_required_seconds": observation_seconds,
+        "target_sample_index": sample_index,
+        "target_readiness": {
+            "condition": "expected root cardinality and model version stable for at least 2 consecutive successful summaries plus 3 consecutive app CPU samples at or below the hard 1.0% gate; reset on cardinality/version change",
+            "model_stable_consecutive_samples": stable_count,
+            "app_cpu_quiet_consecutive_samples": quiet_count,
+            "app_cpu_threshold_percent": cpu_threshold,
+        }}, indent=2) + "\n")
 PY
         break
       fi
@@ -752,10 +843,8 @@ PY
     local diagnostics_disabled_path="$phase_dir/diagnostics.json"
     printf '%s\n' '{"schema":"seedsync.performance-diagnostics.v1","enabled":false,"samples":[],"counters":{}}' > "$diagnostics_disabled_path"
     printf '{}\n' > "$phase_dir/breadcrumbs.json"
-    local external_target_index=""
-    if [[ -n "$target_index" ]]; then external_target_index=$((target_index - 1)); fi
     local external_target_argument=()
-    if [[ -n "$external_target_index" ]]; then external_target_argument=(--target-sequence "$external_target_index"); fi
+    if [[ -n "$target_index" ]]; then external_target_argument=(--target-sequence "$target_index"); fi
     python3 "$SCRIPT_DIR/capture_metrics.py" \
       --mode external-summary \
       --model-summary "$model_summary_series" \
