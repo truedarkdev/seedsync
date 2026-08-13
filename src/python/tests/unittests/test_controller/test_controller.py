@@ -13,7 +13,7 @@ from concurrent.futures import Future
 from pathlib import Path
 from queue import Queue
 from threading import Lock
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import ANY, MagicMock, mock_open, patch
 from types import SimpleNamespace
 
 from controller import AutoQueue, AutoQueuePersist, Controller, ControllerPersist, ModelBuilder
@@ -21,7 +21,10 @@ from controller.model_updater import ModelUpdater
 from controller.extract import ExtractRequest, ExtractStatus
 from controller.validate import ValidateProcess
 from controller.scan import MultiPathActiveScanner, ScannerProcess, ScannerResult
-from controller.controller import ControllerError, DownloadStartLifecycleEntry, PendingQueueDispatch
+from controller.controller import (
+    ControllerError, DownloadStartLifecycleEntry, PendingQueueDispatch,
+    _MoveMutationOutcome, _MoveMutationTracker,
+)
 from controller.persist_keys import KEY_SEP, persist_key
 from common import AppError, Config, PathPairError, PathPairManager
 from common.performance_diagnostics import (
@@ -7060,7 +7063,7 @@ class TestController(unittest.TestCase):
 
         self.assertEqual(
             (os.path.normpath("/local/incomplete/movie.mkv"), os.path.normpath("/local/movie.mkv")),
-            tuple(os.path.normpath(path) for path in move.call_args.args)
+            tuple(os.path.normpath(path) for path in move.call_args.args[:2])
         )
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -7082,9 +7085,136 @@ class TestController(unittest.TestCase):
                 os.path.normpath("/local/movies/incomplete/movie.mkv"),
                 os.path.normpath("/local/movies/movie.mkv")
             ),
-            tuple(os.path.normpath(path) for path in move.call_args.args)
+            tuple(os.path.normpath(path) for path in move.call_args.args[:2])
         )
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with("movies")
+
+    @patch.object(Controller, "_Controller__publish_staging_no_replace")
+    @patch("controller.controller.os.path.exists", return_value=True)
+    def test_move_from_staging_invalidates_current_generation_before_rescan(self, _, move):
+        self.controller._Controller__local_scan_process.generation = 58
+        self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
+
+        move.side_effect = lambda *_args: _args[-1].mutated()
+        self.controller._Controller__move_from_staging("nested/movie.mkv")
+
+        self.controller._Controller__updater.begin_final_move_local_root_invalidation.assert_called_once_with(
+            "nested", None, 58,
+        )
+        move.assert_called_once()
+        self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
+        self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
+            "nested", None, 17, True,
+        )
+
+    @patch.object(Controller, "_Controller__publish_staging_no_replace", side_effect=OSError("denied"))
+    @patch("controller.controller.os.path.exists", return_value=True)
+    def test_move_from_staging_cancels_local_invalidation_after_failure(self, _, move):
+        self.controller._Controller__local_scan_process.generation = 58
+        self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
+
+        result = self.controller._Controller__move_from_staging("movie.mkv")
+
+        self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
+        self.controller._Controller__updater.begin_final_move_local_root_invalidation.assert_called_once_with(
+            "movie.mkv", None, 58,
+        )
+        self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
+            "movie.mkv", None, 17, False,
+        )
+        move.assert_called_once()
+
+    def test_native_publish_then_validation_error_retains_mutation_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source.bin")
+            destination = os.path.join(temp_dir, "destination.bin")
+            Path(source).write_bytes(b"payload")
+            tracker = _MoveMutationTracker()
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported",
+                              side_effect=OSError(errno.EIO, "sync failed")):
+                with self.assertRaises(OSError):
+                    Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+
+            self.assertEqual(_MoveMutationOutcome.MUTATED, tracker.outcome)
+            self.assertTrue(os.path.exists(destination))
+
+    def test_fallback_publish_failure_retains_uncertain_mutation_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source.bin")
+            destination = os.path.join(temp_dir, "destination.bin")
+            Path(source).write_bytes(b"payload")
+            tracker = _MoveMutationTracker()
+
+            with patch.object(Controller, "_Controller__rename_no_replace",
+                              side_effect=OSError(errno.EINVAL, "unsupported")), \
+                    patch.object(Controller, "_Controller__copy_to_publish_temporary",
+                                 side_effect=OSError(errno.ENOSPC, "full")):
+                with self.assertRaises(OSError):
+                    Controller._Controller__publish_staging_no_replace(source, destination, tracker)
+
+            self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
+
+    def test_collision_sidecar_partial_write_retains_uncertain_mutation_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = _MoveMutationTracker()
+            sidecar = os.path.join(temp_dir, ".seedsync-retire-" + "a" * 48 + ".json")
+
+            with patch("controller.controller.os.write", side_effect=OSError(errno.EIO, "write failed")):
+                with self.assertRaises(OSError):
+                    Controller._Controller__write_collision_claim_sidecar(
+                        sidecar, "movie.mkv", None, tracker,
+                    )
+
+            self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
+            self.assertTrue(os.path.exists(sidecar))
+
+    def test_collision_sidecar_cleanup_sync_failure_retains_uncertain_mutation_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tracker = _MoveMutationTracker()
+            sidecar = os.path.join(temp_dir, ".seedsync-retire-" + "b" * 48 + ".json")
+            Controller._Controller__write_collision_claim_sidecar(sidecar, "movie.mkv", None)
+
+            with patch.object(Controller, "_Controller__sync_directory_if_supported",
+                              side_effect=OSError(errno.EIO, "sync failed")):
+                with self.assertRaises(OSError):
+                    Controller._Controller__remove_collision_claim_sidecar(sidecar, tracker)
+
+            self.assertEqual(_MoveMutationOutcome.UNCERTAIN, tracker.outcome)
+            self.assertFalse(os.path.exists(sidecar))
+
+    def test_directory_fallback_post_mkdir_validation_failure_retains_mutation_outcome(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            source = os.path.join(temp_dir, "source")
+            destination = os.path.join(temp_dir, "destination")
+            os.mkdir(source)
+            Path(os.path.join(source, "child.bin")).write_bytes(b"payload")
+            tracker = _MoveMutationTracker()
+
+            with patch.object(Controller, "_Controller__same_path_identity", return_value=False):
+                with self.assertRaises(OSError):
+                    Controller._Controller__publish_temporary_directory(source, destination, tracker)
+
+            self.assertEqual(_MoveMutationOutcome.MUTATED, tracker.outcome)
+            self.assertTrue(os.path.isdir(destination))
+
+    @patch("controller.controller.os.path.exists", return_value=True)
+    def test_directory_merge_partial_mutation_commits_local_invalidation(self, _):
+        self.controller._Controller__local_scan_process.generation = 58
+        self.controller._Controller__updater.begin_final_move_local_root_invalidation.return_value = 17
+        self.controller._Controller__safe_existing_directory = MagicMock(return_value=True)
+
+        def partial_merge(*args):
+            args[-1].mutated()
+            return False
+
+        self.controller._Controller__merge_staging_directory_no_replace = MagicMock(side_effect=partial_merge)
+
+        self.assertEqual(Controller.MoveFromStagingResult.CONFLICT,
+                         self.controller._Controller__move_from_staging("directory"))
+        self.controller._Controller__updater.finish_final_move_local_root_invalidation.assert_called_once_with(
+            "directory", None, 17, True,
+        )
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
     def test_move_from_staging_moves_single_file_named_lftp(self, move):
@@ -7102,7 +7232,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("notes.lftp")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"))
+        move.assert_called_once_with(source_file, os.path.join(final_root, "notes.lftp"), ANY)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -7125,7 +7255,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie.mkv")
 
-        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"))
+        move.assert_called_once_with(source_file, os.path.join(final_root, "movie.mkv"), ANY)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
         self.controller.logger.warning.assert_not_called()
         self.controller._Controller__local_scan_process.force_scan.assert_called_once_with()
@@ -7189,7 +7319,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("movie")
 
-        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"))
+        move.assert_called_once_with(source_tree, os.path.join(final_root, "movie"), ANY)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -7580,12 +7710,12 @@ class TestController(unittest.TestCase):
             original_claim = Controller._Controller__claim_collision_source
             claim_raced = False
 
-            def replace_then_claim(path):
+            def replace_then_claim(path, mutation_tracker=None):
                 nonlocal claim_raced
                 if path == source_leaf and not claim_raced:
                     claim_raced = True
                     os.replace(replacement_leaf, source_leaf)
-                return original_claim(self.controller, path)
+                return original_claim(self.controller, path, mutation_tracker)
 
             with patch.object(
                     Controller,
@@ -7995,6 +8125,53 @@ class TestController(unittest.TestCase):
             self.assertEqual([], [entry for entry in os.listdir(os.path.dirname(source))
                                   if entry.startswith(".seedsync-retire-")])
 
+    def test_async_collision_restore_keeps_committed_move_token_until_healthy_scan(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            staging_root = os.path.join(temp_dir, "incomplete")
+            final_root = os.path.join(temp_dir, "final")
+            source = os.path.join(staging_root, "release", "movie.mkv")
+            destination = os.path.join(final_root, "release", "movie.mkv")
+            os.makedirs(os.path.dirname(source)); os.makedirs(os.path.dirname(destination))
+            Path(source).write_bytes(b"equal"); Path(destination).write_bytes(b"equal")
+            self.controller._Controller__staging_path = staging_root
+            self.controller._Controller__legacy_local_path = final_root
+            self.controller._Controller__local_scan_process.generation = 58
+            self.controller._Controller__updater = ModelUpdater(self.controller)
+            accumulator = self.controller._Controller__progressive_local_scan_state
+            root = SystemFile("release", 1)
+            accumulator.apply([ScannerResult(
+                datetime.now(), [root], scanned_path_pair_ids={None}, generation=56,
+                is_progress=True, is_scan_final=True, is_full_snapshot=True,
+                full_snapshot_path_pair_ids={None}, completed_path_pair_ids={None},
+            )])
+
+            self.assertEqual(Controller.MoveFromStagingResult.DEFERRED,
+                             self.controller._Controller__move_from_staging("release"))
+            claim = self.controller._Controller__collision_compare_claim
+            future = self.controller._Controller__collision_compare_future
+            cancel_event = self.controller._Controller__collision_compare_cancel_event
+            self.assertIsNotNone(claim)
+            self.assertIsNotNone(future)
+            future.result(timeout=5)
+            cancel_event.set()
+            self.controller._Controller__restore_cancelled_collision_claim(
+                future, claim[0], claim[1], claim[2], cancel_event,
+                getattr(self.controller, "_Controller__collision_compare_epoch", 0), claim[4],
+            )
+
+            tokens = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+            self.assertEqual({58}, {generation for generation, status in tokens[(None, "release")].values()
+                                   if status == "committed"})
+            self.assertTrue(os.path.exists(source))
+
+            accumulator.apply([ScannerResult(
+                datetime.now(), [], scanned_path_pair_ids={None}, generation=59,
+                is_progress=True, is_scan_final=True, is_full_snapshot=True,
+                full_snapshot_path_pair_ids={None}, completed_path_pair_ids={None},
+            )])
+            self.assertNotIn((None, "release"), accumulator.snapshot())
+            self.assertNotIn((None, "release"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
+
     def test_exit_restores_completed_claim_before_cancellation_callback(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             staging_root = os.path.join(temp_dir, "incomplete")
@@ -8281,7 +8458,7 @@ class TestController(unittest.TestCase):
 
             result = self.controller._Controller__move_from_staging("nested/movie.mkv")
 
-        move.assert_called_once_with(source, destination)
+        move.assert_called_once_with(source, destination, ANY)
         self.assertEqual(Controller.MoveFromStagingResult.COMPLETED, result)
 
     @patch.object(Controller, "_Controller__publish_staging_no_replace")
@@ -8328,7 +8505,7 @@ class TestController(unittest.TestCase):
 
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
-            os.path.normpath(os.path.join("/local", "movie.mkv"))
+            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY,
         )
         self.assertEqual(2, trace_info.call_count)
         attempt_payload = json.loads(trace_info.call_args_list[0][0][1])
@@ -8343,7 +8520,7 @@ class TestController(unittest.TestCase):
 
         move.assert_called_once_with(
             os.path.normpath(os.path.join("/local/incomplete", "movie.mkv")),
-            os.path.normpath(os.path.join("/local", "movie.mkv"))
+            os.path.normpath(os.path.join("/local", "movie.mkv")), ANY,
         )
         self.assertEqual(Controller.MoveFromStagingResult.FAILED, result)
         self.controller.logger.warning.assert_called_once_with(

@@ -1,6 +1,7 @@
 # Copyright 2017, Inderpreet Singh, All rights reserved.
 
 import logging
+import time
 from abc import ABC, abstractmethod
 import multiprocessing
 import threading
@@ -14,6 +15,7 @@ from multiprocessing.synchronize import Event as EventType
 
 from common import AppError
 from common.app_process import ExceptionWrapper
+from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
 from common.performance_diagnostics import FixedDurationRecorder, PerformanceDiagnosticsCollector
 from system import SystemFile
 
@@ -279,16 +281,29 @@ def _publish_bounded_result(output_queue: object,
                 return
 
 
+def _scanner_side(scanner: IScanner) -> str:
+    scanner_name = scanner.__class__.__name__.lower()
+    return "active" if "active" in scanner_name else (
+        "local" if "local" in scanner_name else ("remote" if "remote" in scanner_name else "unknown")
+    )
+
+
+def _scanner_correlation(scanner: IScanner, session_token: str, generation: int) -> str:
+    """Join parent and worker scan events without exposing scan identity."""
+    return "{}:{}:{}".format(_scanner_side(scanner), trace_session_digest(session_token), generation)
+
+
 def _record_scan_breadcrumb(scanner: IScanner, breadcrumb_trace: Optional[_BreadcrumbEmitter], flow_id: str,
                             message: str, details: dict[str, object], event_type: str = "state_transition") -> None:
     if breadcrumb_trace is None:
         return
-    path_pair_id = getattr(scanner, "path_pair_id", None)
-    path_pair_name = getattr(scanner, "path_pair_name", None)
+    scanner_side = _scanner_side(scanner)
+    correlation = "{}:{}:{}".format(
+        scanner_side, details.get("session_digest", ""), details.get("generation", 0),
+    )
     breadcrumb_trace.record("scanner_process", message, details, stage="scan", event_type=event_type,
-                            corr_id=path_pair_id if isinstance(path_pair_id, str) else scanner.__class__.__name__,
-                            flow_id=flow_id, path_pair_id=path_pair_id if isinstance(path_pair_id, str) else None,
-                            path_pair_name=path_pair_name if isinstance(path_pair_name, str) else None)
+                            corr_id=correlation, flow_id=opaque_trace_correlation(flow_id),
+                            trace_scope="flow", scanner_side=scanner_side)
 
 
 def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
@@ -409,14 +424,18 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
                 duration_aggregate_token=(session_token, generation, performance_diagnostics_generation),
             )
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_completed",
-                                    {"scanner": scanner.__class__.__name__, "file_count": len(files),
-                                     "malformed_status_only_file_count": len(malformed),
-                                     "managed_extract_file_count": len(managed)})
+                                    {"file_count": len(files),
+                                     "targeted": scan_target_path_pair_ids is not None,
+                                     "progress": progress_emitted, "failed": False,
+                                     "generation": generation,
+                                     "session_digest": trace_session_digest(session_token),
+                                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000)})
         except ScannerError as error:
             if not error.recoverable:
                 _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
-                                        {"scanner": scanner.__class__.__name__, "recoverable": False,
-                                         "error_message": str(error)}, "failure")
+                                        {"failed": True, "generation": generation,
+                                         "session_digest": trace_session_digest(session_token),
+                                         "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
                 raise
             files = error.files if error.files is not None else []
             malformed = scanner.pop_malformed_status_only_file_ids()
@@ -443,9 +462,11 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             )
             outcome = ("recoverable", str(error))
             _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_failed",
-                                    {"scanner": scanner.__class__.__name__, "recoverable": True,
-                                     "file_count": len(files), "malformed_status_only_file_count": len(malformed),
-                                     "managed_extract_file_count": len(managed), "error_message": str(error)}, "failure")
+                                    {"file_count": len(files), "failed": True,
+                                     "targeted": scan_target_path_pair_ids is not None,
+                                     "generation": generation,
+                                     "session_digest": trace_session_digest(session_token),
+                                     "monotonic_ms": int(time.monotonic_ns() / 1_000_000)}, "failure")
         if result_via_control:
             # A spawn child must not leave a multiprocessing.Queue feeder
             # thread behind.  Send the authoritative aggregate over the
@@ -454,6 +475,18 @@ def _run_scanner_once(scanner: IScanner, output_queue: Optional[object],
             send_control_message(("result", result))
         elif output_queue is not None:
             _publish_bounded_result(output_queue, result)
+        _record_scan_breadcrumb(scanner, breadcrumb_trace, flow_id, "scan_result_published", {
+            "targeted": scan_target_path_pair_ids is not None,
+            "final": bool(result.is_scan_final), "full": bool(result.is_full_snapshot),
+            "progress": bool(result.is_progress), "failed": bool(result.failed),
+            "scanned_pair_count": len(result.scanned_path_pair_ids),
+            "completed_pair_count": len(result.completed_path_pair_ids),
+            "unknown_pair_count": len(result.unknown_path_pair_ids),
+            "root_count": sum(len(files) for files in progress_files_by_pair.values()),
+            "file_count": len(result.files), "generation": generation,
+            "session_digest": trace_session_digest(session_token),
+            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+        })
         # The parent-facing queue/pipe now owns the result; keep no completed
         # scan graph in the coordinator or in this child while it exits.
         del result
@@ -580,6 +613,11 @@ class ScannerProcess:
     def session_token(self) -> str:
         return self.__session_token
 
+    @property
+    def generation(self) -> int:
+        """Return the generation assigned to the currently active scan work."""
+        return self.__scan_generation
+
     def set_mp_log_queue(self, log_queue: MPQueue[logging.LogRecord], log_level: int) -> None:
         self._mp_log_queue = log_queue
         self._mp_log_level = log_level
@@ -648,14 +686,13 @@ class ScannerProcess:
         self.__record_breadcrumb(
             "scan_started",
             {
-                "scanner": self.__scanner.__class__.__name__,
-                "interval_ms": self.__interval_in_ms,
-                "is_priority_targeted": is_priority_targeted,
-                "target_path_pair_count": len(scan_target_path_pair_ids or ()),
+                "targeted": scan_target_path_pair_ids is not None,
+                "scanner_side": _scanner_side(self.__scanner),
+                "generation": self.__scan_generation + 1,
+                "session_digest": trace_session_digest(self.__session_token),
+                "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
             },
             flow_id=flow_id,
-            path_pair_id=next(iter(scan_target_path_pair_ids))
-            if scan_target_path_pair_ids is not None and len(scan_target_path_pair_ids) == 1 else None,
         )
         if is_priority_targeted:
             # A priority queued before worker creation is already being
@@ -692,11 +729,16 @@ class ScannerProcess:
         if self.verbose:
             self.logger.debug("Running a scan")
         flow_id = "{}:{}".format(self.__scanner.__class__.__name__, int(timestamp_start.timestamp() * 1000))
-        self.__record_breadcrumb("scan_started", {"scanner": self.__scanner.__class__.__name__,
-                                                   "interval_ms": self.__interval_in_ms}, flow_id=flow_id)
         priority_target_path_pair_ids = self.__drain_priority_target_path_pair_ids()
         scan_target_path_pair_ids = priority_target_path_pair_ids \
             if priority_target_path_pair_ids else self.__drain_scan_target_path_pair_ids()
+        self.__record_breadcrumb("scan_started", {
+            "targeted": scan_target_path_pair_ids is not None,
+            "scanner_side": _scanner_side(self.__scanner),
+            "generation": self.__scan_generation + 1,
+            "session_digest": trace_session_digest(self.__session_token),
+            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+        }, flow_id=flow_id)
         setter = getattr(self.__scanner, "set_scan_target_path_pair_ids", None)
         if callable(setter):
             setter(scan_target_path_pair_ids)
@@ -762,15 +804,22 @@ class ScannerProcess:
                                     is_targeted_scan=scan_target_path_pair_ids is not None,
                                     session_token=self.__session_token,
                                     unchanged_root_fingerprints_by_pair=unchanged_root_fingerprints_by_pair)
-            self.__record_breadcrumb("scan_completed", {"scanner": self.__scanner.__class__.__name__,
-                                                          "file_count": len(files),
-                                                          "malformed_status_only_file_count": len(malformed),
-                                                          "managed_extract_file_count": len(managed)}, flow_id=flow_id)
+            self.__record_breadcrumb("scan_completed", {
+                "file_count": len(files), "targeted": scan_target_path_pair_ids is not None,
+                "scanner_side": _scanner_side(self.__scanner),
+                "progress": progress_emitted, "failed": False,
+                "generation": self.__scan_generation,
+                "session_digest": trace_session_digest(self.__session_token),
+                "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+            }, flow_id=flow_id)
         except ScannerError as error:
             if not error.recoverable:
-                self.__record_breadcrumb("scan_failed", {"scanner": self.__scanner.__class__.__name__,
-                                                           "recoverable": False, "error_message": str(error)},
-                                         event_type="failure", flow_id=flow_id)
+                self.__record_breadcrumb("scan_failed", {
+                    "failed": True, "generation": self.__scan_generation,
+                    "scanner_side": _scanner_side(self.__scanner),
+                    "session_digest": trace_session_digest(self.__session_token),
+                    "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                }, event_type="failure", flow_id=flow_id)
                 raise
             files = error.files if error.files is not None else []
             malformed = self.__scanner.pop_malformed_status_only_file_ids()
@@ -787,11 +836,14 @@ class ScannerProcess:
                                    unknown_path_pair_ids=failed_ids,
                                    is_targeted_scan=scan_target_path_pair_ids is not None,
                                    session_token=self.__session_token)
-            self.__record_breadcrumb("scan_failed", {"scanner": self.__scanner.__class__.__name__,
-                                                       "recoverable": True, "file_count": len(files),
-                                                       "malformed_status_only_file_count": len(malformed),
-                                                       "managed_extract_file_count": len(managed),
-                                                       "error_message": error_message}, event_type="failure", flow_id=flow_id)
+            self.__record_breadcrumb("scan_failed", {
+                "file_count": len(files), "failed": True,
+                "scanner_side": _scanner_side(self.__scanner),
+                "targeted": scan_target_path_pair_ids is not None,
+                "generation": self.__scan_generation,
+                "session_digest": trace_session_digest(self.__session_token),
+                "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+            }, event_type="failure", flow_id=flow_id)
         finally:
             self.__inline_scan_active.clear()
             self.__inline_scan_target_path_pair_ids = None
@@ -801,6 +853,19 @@ class ScannerProcess:
         assert self.__queue is not None
         assert self.__queue is not None
         self.__publish_result(result)
+        self.__record_breadcrumb("scan_result_published", {
+            "targeted": scan_target_path_pair_ids is not None,
+            "scanner_side": _scanner_side(self.__scanner),
+            "final": bool(result.is_scan_final), "full": bool(result.is_full_snapshot),
+            "progress": bool(result.is_progress), "failed": bool(result.failed),
+            "scanned_pair_count": len(result.scanned_path_pair_ids),
+            "completed_pair_count": len(result.completed_path_pair_ids),
+            "unknown_pair_count": len(result.unknown_path_pair_ids),
+            "root_count": sum(len(files) for files in progress_files_by_pair.values()),
+            "file_count": len(result.files), "generation": self.__scan_generation,
+            "session_digest": trace_session_digest(self.__session_token),
+            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+        }, flow_id=flow_id)
         # Do not retain the completed graph in this long-lived coordinator.
         del result
         del files
@@ -999,7 +1064,9 @@ class ScannerProcess:
         self._mp_log_level = None
 
     def __trace_corr_id(self) -> str:
-        return self.__trace_path_pair_id() or self.__scanner.__class__.__name__
+        return opaque_trace_correlation(
+            self.__trace_path_pair_id() or self.__scanner.__class__.__name__
+        )
 
     def __trace_path_pair_id(self) -> Optional[str]:
         path_pair_id = getattr(self.__scanner, "path_pair_id", None)
@@ -1020,11 +1087,15 @@ class ScannerProcess:
             details,
             stage="scan",
             event_type=event_type,
-            corr_id=corr_id if corr_id is not None else self.__trace_corr_id(),
-            flow_id=flow_id,
-            path_pair_id=path_pair_id if path_pair_id is not None else self.__trace_path_pair_id(),
-            path_pair_name=path_pair_name if path_pair_name is not None else self.__trace_path_pair_name(),
-        )
+            corr_id=corr_id if corr_id is not None else (
+                "{}:{}:{}".format(
+                    details.get("scanner_side", _scanner_side(self.__scanner)),
+                    details.get("session_digest", trace_session_digest(self.__session_token)),
+                    details["generation"],
+                ) if "generation" in details else self.__trace_corr_id()
+            ),
+            flow_id=opaque_trace_correlation(flow_id) if flow_id is not None else None,
+            )
 
     def pop_latest_result(self, max_items: int = _MAX_SCAN_QUEUE_ITEMS_PER_POP) -> Optional[ScannerResult]:
         """

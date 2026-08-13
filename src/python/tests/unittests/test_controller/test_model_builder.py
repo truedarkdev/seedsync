@@ -64,9 +64,9 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder = ModelBuilder()
         self.model_builder.set_base_logger(logger)
 
-    def __enable_trace(self, enabled: bool = True) -> BreadcrumbTraceCollector:
+    def __enable_trace(self, enabled: bool = True, max_entries: int = 128) -> BreadcrumbTraceCollector:
         self.__trace_enabled = [enabled]
-        collector = BreadcrumbTraceCollector(lambda: self.__trace_enabled[0], max_entries=128)
+        collector = BreadcrumbTraceCollector(lambda: self.__trace_enabled[0], max_entries=max_entries)
         self.model_builder.set_stop_resume_trace_breadcrumb(collector.create_emitter())
         return collector
 
@@ -77,6 +77,23 @@ class TestModelBuilder(unittest.TestCase):
         # same-cycle burst before asserting the complete retained window.
         time.sleep(0.05)
         return collector.snapshot()["entries"]
+
+    def __assert_generic_lifecycle_trace_is_private(
+            self, entries: list[dict[str, object]], subject_file_id: str,
+    ) -> None:
+        generic_entries = [
+            entry for entry in entries
+            if entry["message"] in {
+                "persist_authority_before", "persist_authority_after",
+                "model_candidate", "model_live_publication",
+            }
+        ]
+        for entry in generic_entries:
+            self.assertIsNone(entry["file_id"])
+            self.assertIsNone(entry["path_pair_id"])
+            self.assertIsNone(entry["path_pair_name"])
+            self.assertTrue(entry["corr_id"])
+            self.assertNotIn(subject_file_id, str(entry))
 
     def __set_transfer_sources(self, file_name: str, path_pair_id: str, local_size: int = 650) -> str:
         remote_file = SystemFile(file_name, 1000, False)
@@ -5893,7 +5910,11 @@ class TestModelBuilder(unittest.TestCase):
         self.model_builder.begin_stop_resume_trace_cycle(10)
         model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(model, True)
-        self.assertEqual({"active.bin"}, {entry["file_id"] for entry in self.__trace_entries(collector)})
+        entries = self.__trace_entries(collector)
+        self.assertEqual({"active.bin"}, {
+            entry["file_id"] for entry in entries if entry["file_id"] is not None
+        })
+        self.__assert_generic_lifecycle_trace_is_private(entries, "active.bin")
 
     def test_live_status_remains_relevant_after_terminal_reconciliation(self):
         remote_file = SystemFile("done.bin", 100, False)
@@ -5912,7 +5933,11 @@ class TestModelBuilder(unittest.TestCase):
         self.assertEqual(ModelFile.State.DOWNLOADED, model.get_file("done.bin").state)
         self.assertIsNotNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("done.bin")))
         self.assertIsNone(self.model_builder.stop_resume_trace_metadata_for_file(model.get_file("idle.bin")))
-        self.assertEqual({"done.bin"}, {entry["file_id"] for entry in self.__trace_entries(collector)})
+        entries = self.__trace_entries(collector)
+        self.assertEqual({"done.bin"}, {
+            entry["file_id"] for entry in entries if entry["file_id"] is not None
+        })
+        self.__assert_generic_lifecycle_trace_is_private(entries, "done.bin")
 
     def test_disabled_to_enabled_hot_toggle_captures_without_restart(self):
         collector = self.__enable_trace(False)
@@ -5932,6 +5957,90 @@ class TestModelBuilder(unittest.TestCase):
         model = self.model_builder.build_model()
         self.model_builder.finish_stop_resume_trace_cycle(model, True)
         self.assertTrue(self.__trace_entries(collector))
+
+    def test_global_lifecycle_persist_trace_is_hot_gated_private_and_bounded(self):
+        """Downloaded/final-move lifecycle evidence needs no scenario selector."""
+        subject_name = "private-lifecycle-subject.bin"
+        collector = self.__enable_trace(False)
+        remote_file = SystemFile(subject_name, 100, False)
+        self.model_builder.set_remote_files([remote_file])
+        subject_id = ModelFile.build_file_id(subject_name, None)
+        self.model_builder.set_downloaded_files({subject_id})
+
+        self.model_builder.build_model()
+        self.assertEqual([], self.__trace_entries(collector))
+
+        self.__trace_enabled[0] = True
+        collector.sync_enabled_state()
+        self.model_builder.request_rebuild()
+        candidate = self.model_builder.build_model()
+        subject_ids = self.model_builder.record_lifecycle_candidate_publication(candidate, "full_build")
+        self.model_builder.record_lifecycle_live_publication(
+            candidate, candidate, subject_ids, "full_build", "full_model_adopted",
+        )
+        entries = self.__trace_entries(collector)
+        messages = [entry["message"] for entry in entries]
+        self.assertEqual(
+            {"persist_authority_before", "persist_authority_after", "model_candidate", "model_live_publication"},
+            set(messages),
+        )
+        before = next(entry for entry in entries if entry["message"] == "persist_authority_before")
+        after = next(entry for entry in entries if entry["message"] == "persist_authority_after")
+        self.assertEqual("default", before["details"]["pre_state"])
+        self.assertEqual("deleted", after["details"]["state_category"])
+        self.assertEqual("full_model_adopted", next(
+            entry for entry in entries if entry["message"] == "model_live_publication"
+        )["details"]["adoption_kind"])
+        self.assertTrue(all(entry["corr_id"] and entry["file_id"] is None for entry in entries))
+        self.assertNotIn(subject_name, str(entries))
+        self.assertNotIn(subject_id, str(entries))
+
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+        self.assertEqual(len(entries), len(self.__trace_entries(collector)))
+
+        # A fresh global enable clears the process-local dedupe window while
+        # retaining the collector's independent bounded retention contract.
+        self.model_builder.set_stop_resume_trace_breadcrumb(None)
+        self.model_builder.request_rebuild()
+        self.model_builder.build_model()
+        bounded = BreadcrumbTraceCollector(lambda: True, max_entries=2)
+        self.model_builder.set_stop_resume_trace_breadcrumb(bounded)
+        self.model_builder.request_rebuild()
+        candidate = self.model_builder.build_model()
+        subject_ids = self.model_builder.record_lifecycle_candidate_publication(candidate, "full_build")
+        self.model_builder.record_lifecycle_live_publication(
+            candidate, candidate, subject_ids, "full_build", "full_model_adopted",
+        )
+        bounded_entries = bounded.snapshot()["entries"]
+        self.assertEqual(2, len(bounded_entries))
+        self.assertEqual(["model_candidate", "model_live_publication"], [
+            entry["message"] for entry in bounded_entries
+        ])
+
+        self.model_builder.set_downloaded_files({subject_id})
+        empty_candidate = Model()
+        missing_subject_ids = self.model_builder.record_lifecycle_candidate_publication(
+            empty_candidate, "full_build",
+        )
+        self.assertEqual({subject_id}, missing_subject_ids)
+        missing_entry = self.__trace_entries(bounded)[-1]
+        self.assertEqual("model_candidate", missing_entry["message"])
+        self.assertEqual("absent", missing_entry["details"]["candidate_state"])
+        self.assertNotIn(subject_name, str(missing_entry))
+        self.assertNotIn(subject_id, str(missing_entry))
+
+    def test_lifecycle_recorders_do_not_enumerate_marker_sets_while_trace_disabled(self):
+        class IterationSentinel:
+            def __iter__(self):
+                raise AssertionError("disabled lifecycle recorder enumerated markers")
+
+        self.__enable_trace(False)
+        self.model_builder._ModelBuilder__downloaded_files = IterationSentinel()
+        self.model_builder._ModelBuilder__final_move_succeeded_files = IterationSentinel()
+
+        self.assertEqual(set(), self.model_builder.record_lifecycle_candidate_publication(Model(), "full_build"))
+        self.model_builder.record_lifecycle_live_publication(Model(), Model(), {"ignored"}, "full_build", "pending")
 
     def test_build_model_preserves_validation_status_across_rebuilds(self):
         self.model_builder.set_remote_files([SystemFile("a", 100, False)])

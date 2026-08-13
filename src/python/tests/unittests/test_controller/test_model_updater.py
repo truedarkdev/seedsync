@@ -526,6 +526,58 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertIsNone(_pop_scan_updates(controller, "remote", replacement))
         self.assertEqual({}, accumulator.snapshot())
+
+    def test_eager_local_accumulator_preserves_move_token_until_first_session_binding(self):
+        controller = SimpleNamespace()
+        updater = ModelUpdater(controller)
+        accumulator = controller._Controller__progressive_local_scan_state
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 1)], 56)])
+        token = updater.begin_final_move_local_root_invalidation("moved", "pair", 58)
+        accumulator.set_session_token("first-session")
+
+        first_session_scan = self._local_full_snapshot([SystemFile("other", 1)], 59)
+        first_session_scan.session_token = "first-session"
+        accumulator.apply([first_session_scan])
+        self.assertIn(("pair", "moved"), accumulator.snapshot())
+
+        accumulator.set_session_token("replacement-session")
+        replacement_scan = self._local_full_snapshot([SystemFile("other", 1)], 1)
+        replacement_scan.session_token = "replacement-session"
+        accumulator.apply([replacement_scan])
+        self.assertNotIn(("pair", "moved"), accumulator.snapshot())
+        self.assertIsNotNone(token)
+
+    def test_eager_move_token_rebinds_to_replaced_process_before_first_result(self):
+        old_process = object.__new__(ScannerProcess)
+        old_process._ScannerProcess__session_token = "old-session"
+        controller = SimpleNamespace(_Controller__local_scan_process=old_process)
+        updater = ModelUpdater(controller)
+        accumulator = controller._Controller__progressive_local_scan_state
+        self.assertEqual("old-session", accumulator.session_token)
+
+        old_token = updater.begin_final_move_local_root_invalidation("old-root", "pair", 58)
+        replacement_process = object.__new__(ScannerProcess)
+        replacement_process._ScannerProcess__session_token = "replacement-session"
+        controller._Controller__local_scan_process = replacement_process
+        replacement_token = updater.begin_final_move_local_root_invalidation("new-root", "pair", 1)
+
+        self.assertEqual("replacement-session", accumulator.session_token)
+        invalidations = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+        self.assertNotIn(("pair", "old-root"), invalidations)
+        self.assertIn(replacement_token, invalidations[("pair", "new-root")])
+        updater.finish_final_move_local_root_invalidation("old-root", "pair", old_token, True)
+        self.assertIn(replacement_token, invalidations[("pair", "new-root")])
+
+        fresh = SystemFile("fresh-root", 1)
+        fresh.path_pair_id = "pair"
+        replacement_process.pop_results = MagicMock(return_value=[ScannerResult(
+            datetime.now(), [fresh], scanned_path_pair_ids={"pair"}, generation=2,
+            is_progress=True, is_scan_final=True, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"pair"}, completed_path_pair_ids={"pair"},
+            session_token="replacement-session",
+        )])
+        _pop_scan_updates(controller, "local", replacement_process)
+        self.assertEqual({("pair", "fresh-root")}, set(accumulator.snapshot()))
     def test_progressive_remote_exclusions_match_legacy_root_and_nested_filtering(self):
         root_skip = SystemFile("skip.nfo", 5)
         root = SystemFile("Series", 100, True)
@@ -674,6 +726,104 @@ class TestModelUpdater(unittest.TestCase):
         self.assertFalse(result.failed)
         self.assertEqual({("pair", "recovered.bin")}, set(accumulator.snapshot()))
         self.assertEqual(set(), accumulator.incomplete_pairs())
+
+    @staticmethod
+    def _local_full_snapshot(files, generation, pair_id="pair"):
+        for file in files:
+            file.path_pair_id = pair_id
+        return ScannerResult(
+            datetime.now(), files, scanned_path_pair_ids={pair_id}, generation=generation,
+            is_progress=True, root_names={file.name for file in files},
+            completed_path_pair_ids={pair_id}, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={pair_id},
+        )
+
+    def test_progressive_accumulator_invalidates_mixed_pre_move_generations_per_root(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([self._local_full_snapshot(
+            [SystemFile("moved", 1), SystemFile("unrelated", 1), SystemFile("removed", 1)], 56,
+        )])
+        token = accumulator.begin_root_invalidation("pair", "moved", 58)
+
+        result = accumulator.apply([
+            self._local_full_snapshot([SystemFile("unrelated", 2)], 57),
+            self._local_full_snapshot([SystemFile("unrelated", 3)], 58),
+        ])
+
+        files = {file.name: file for file in result.files}
+        self.assertEqual(1, files["moved"].size)
+        self.assertEqual(3, files["unrelated"].size)
+        self.assertNotIn("removed", files)
+        self.assertEqual(1, accumulator.authority()[("pair", "moved")].size)
+
+        accumulator.finish_root_invalidation("pair", "moved", token, True)
+        post_move = accumulator.apply([self._local_full_snapshot(
+            [SystemFile("moved", 4), SystemFile("unrelated", 3)], 59,
+        )])
+        self.assertEqual(4, {file.name: file for file in post_move.files}["moved"].size)
+
+        deletion = accumulator.apply([self._local_full_snapshot([SystemFile("unrelated", 3)], 60)])
+        self.assertNotIn("moved", {file.name: file for file in deletion.files})
+
+    def test_progressive_accumulator_post_move_lossless_absence_clears_invalidation(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 1)], 56)])
+        token = accumulator.begin_root_invalidation("pair", "moved", 58)
+        accumulator.finish_root_invalidation("pair", "moved", token, True)
+
+        deletion = accumulator.apply([self._local_full_snapshot([], 59)])
+
+        self.assertNotIn("moved", {file.name: file for file in deletion.files})
+        self.assertNotIn(("pair", "moved"), accumulator.authority())
+
+    def test_progressive_accumulator_failed_overlapping_move_keeps_prior_token(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 1)], 56)])
+        first = accumulator.begin_root_invalidation("pair", "moved", 58)
+        second = accumulator.begin_root_invalidation("pair", "moved", 59)
+        accumulator.finish_root_invalidation("pair", "moved", second, False)
+
+        stale = accumulator.apply([self._local_full_snapshot([], 58)])
+        self.assertIn("moved", {file.name: file for file in stale.files})
+        accumulator.finish_root_invalidation("pair", "moved", first, True)
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 2)], 59)])
+        self.assertEqual(2, accumulator.snapshot()[("pair", "moved")].size)
+        self.assertIsNotNone(first)
+
+    def test_progressive_accumulator_pending_move_token_survives_healthy_post_generation(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 1)], 56)])
+        token = accumulator.begin_root_invalidation("pair", "moved", 58)
+
+        before_finish = accumulator.apply([self._local_full_snapshot([], 59)])
+        self.assertIn("moved", {file.name: file for file in before_finish.files})
+
+        accumulator.finish_root_invalidation("pair", "moved", token, True)
+        after_finish = accumulator.apply([self._local_full_snapshot([], 60)])
+        self.assertNotIn("moved", {file.name: file for file in after_finish.files})
+
+    def test_progressive_accumulator_committed_token_survives_failed_and_incomplete_generations(self):
+        accumulator = _ProgressiveScanAccumulator()
+        accumulator.apply([self._local_full_snapshot([SystemFile("moved", 1)], 56)])
+        token = accumulator.begin_root_invalidation("pair", "moved", 58)
+        accumulator.finish_root_invalidation("pair", "moved", token, True)
+
+        accumulator.apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=59,
+            is_progress=True, failed=True, unknown_path_pair_ids={"pair"},
+        )])
+        accumulator.apply([ScannerResult(
+            datetime.now(), [], scanned_path_pair_ids={"pair"}, generation=60,
+            is_progress=True, root_names={"moved"}, unknown_path_pair_ids={"pair"},
+        )])
+
+        self.assertIn(("pair", "moved"), accumulator.snapshot())
+        tokens = accumulator._ProgressiveScanAccumulator__move_invalidations_by_root
+        self.assertEqual((58, "committed"), tokens[("pair", "moved")][token])
+
+        accumulator.apply([self._local_full_snapshot([], 61)])
+        self.assertNotIn(("pair", "moved"), accumulator.snapshot())
+        self.assertNotIn(("pair", "moved"), accumulator._ProgressiveScanAccumulator__move_invalidations_by_root)
 
     def test_progressive_accumulator_commits_healthy_pair_when_another_pair_recovers_with_failure(self):
         accumulator = _ProgressiveScanAccumulator()
@@ -2687,6 +2837,74 @@ class TestModelUpdater(unittest.TestCase):
 
         self.assertTrue(controller._Controller__progressive_scan_session_changed)
 
+    def test_lifecycle_scan_breadcrumb_is_hot_gated_and_omits_scan_identity(self):
+        enabled = [False]
+        trace = BreadcrumbTraceCollector(lambda: enabled[0], max_entries=8)
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace), logger=MagicMock(),
+        )
+        process = object.__new__(ScannerProcess)
+        process._ScannerProcess__session_token = "scanner-session-private"
+        result = ScannerResult(
+            datetime.now(), [SystemFile("private-root", 1)], scanned_path_pair_ids={"private-pair"},
+            generation=3, is_progress=True, is_full_snapshot=True,
+            full_snapshot_path_pair_ids={"private-pair"}, completed_path_pair_ids={"private-pair"},
+            session_token="scanner-session-private",
+        )
+        with patch.object(ScannerProcess, "pop_results", return_value=[result]):
+            _pop_scan_updates(controller, "local", process)
+        self.assertEqual([], trace.snapshot()["entries"])
+
+        enabled[0] = True
+        trace.sync_enabled_state()
+        with patch.object(ScannerProcess, "pop_results", return_value=[result]):
+            _pop_scan_updates(controller, "local", process)
+
+        entries = trace.snapshot()["entries"]
+        self.assertTrue(entries)
+        details = entries[-1]["details"]
+        self.assertEqual("local", details["scanner_side"])
+        self.assertIn("accumulator_authoritative_root_count", details)
+        self.assertEqual(1, details["event_count"])
+        self.assertEqual(1, details["full_event_count"])
+        self.assertEqual(1, details["distinct_generation_count"])
+        self.assertEqual(3, details["min_generation"])
+        self.assertEqual(3, details["max_generation"])
+        self.assertEqual(1, details["input_top_level_file_count"])
+        self.assertEqual(1, details["distinct_pair_name_count"])
+        self.assertEqual(0, details["duplicate_pair_name_count"])
+        # The fixture's SystemFile deliberately omits its pair ID while the
+        # event declares one; only the aggregate mismatch count is exported.
+        self.assertEqual(1, details["pair_id_mismatch_count"])
+        self.assertNotIn("private-pair", str(entries))
+        self.assertNotIn("private-root", str(entries))
+        self.assertNotIn("scanner-session-private", str(entries))
+
+        with patch.object(ScannerProcess, "pop_results", return_value=[]):
+            _pop_scan_updates(controller, "local", process)
+        self.assertEqual(len(entries), len(trace.snapshot()["entries"]))
+
+    def test_lifecycle_scan_trace_does_not_build_details_or_tokens_while_disabled(self):
+        trace = BreadcrumbTraceCollector(lambda: False, max_entries=8)
+        controller = SimpleNamespace(
+            _Controller__context=SimpleNamespace(breadcrumb_trace=trace), logger=MagicMock(),
+        )
+        process = object.__new__(ScannerProcess)
+        process._ScannerProcess__session_token = "private-session"
+        result = ScannerResult(
+            datetime.now(), [SystemFile("private-root", 1)], generation=1,
+            scanned_path_pair_ids={None}, is_progress=True,
+        )
+
+        with patch.object(ScannerProcess, "pop_results", return_value=[result]), \
+                patch("controller.model_updater._lifecycle_scan_details",
+                      side_effect=AssertionError("disabled trace must not build details")), \
+                patch.object(_ProgressiveScanAccumulator, "lifecycle_trace_transition_token",
+                             side_effect=AssertionError("disabled trace must not create token")):
+            _pop_scan_updates(controller, "local", process)
+
+        self.assertEqual([], trace.snapshot()["entries"])
+
     def test_replaced_progressive_sessions_ignore_stale_rows_until_new_partial_evidence(self):
         def process(session_token, results):
             scanner_process = ScannerProcess(
@@ -2935,6 +3153,8 @@ class TestModelUpdater(unittest.TestCase):
             None, local_scan=None, model_builder=builder, model=live_model,
         )
         controller._Controller__is_explicitly_stopped = MagicMock(return_value=False)
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=16)
+        controller._Controller__context.breadcrumb_trace = trace
         controller._Controller__prev_downloading_file_names = {("root", None, None)}
         queued = LftpJobStatus(
             1, LftpJobStatus.Type.PGET, LftpJobStatus.State.QUEUED, "root", "",
@@ -2947,6 +3167,16 @@ class TestModelUpdater(unittest.TestCase):
 
         builder.build_model.assert_called_once()
         self.assertTrue(controller._Controller__pending_completion_file_names)
+        entries = trace.snapshot()["entries"]
+        messages = [entry["message"] for entry in entries]
+        self.assertIn("completion_pending_registered", messages)
+        self.assertIn("completion_gate_candidate", messages)
+        candidate = next(entry for entry in entries if entry["message"] == "completion_gate_candidate")
+        self.assertEqual("full_build", candidate["details"]["build_kind"])
+        self.assertTrue(candidate["details"]["candidate_present"])
+        self.assertTrue(candidate["details"]["live_present"])
+        self.assertIn("complete_local_coverage", candidate["details"])
+        self.assertNotIn("root", str(entries))
 
     def test_active_delta_authorization_rejection_publishes_only_full_reconciliation(self):
         builder = ModelBuilder()
@@ -2984,6 +3214,21 @@ class TestModelUpdater(unittest.TestCase):
         ModelUpdater(controller).update()
 
         live_model.get_file_ids.assert_not_called()
+
+    def test_pending_completion_trace_reports_when_no_model_build_runs(self):
+        trace = BreadcrumbTraceCollector(lambda: True, max_entries=8)
+        controller, _ = self._make_progressive_update_controller(None, local_scan=None)
+        controller._Controller__context.breadcrumb_trace = trace
+        controller._Controller__pending_completion_file_names = {("private-root", None, None)}
+
+        ModelUpdater(controller).update()
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(["completion_gate_build_deferred"], [entry["message"] for entry in entries])
+        self.assertEqual(
+            {"build_ran": False, "reason": "no_model_build"}, entries[0]["details"],
+        )
+        self.assertNotIn("private-root", str(entries))
 
     def _make_lftp_completion_controller(self, prev_downloading_file_names=None):
         controller = SimpleNamespace(
@@ -3330,6 +3575,39 @@ class TestModelUpdater(unittest.TestCase):
                 ModelFile.build_file_id(*completion_entry[:2])
             )
         )
+
+    def test_completion_gate_breadcrumb_is_hot_gated_deduplicated_and_identity_free(self):
+        enabled = [False]
+        trace = BreadcrumbTraceCollector(lambda: enabled[0], max_entries=8)
+        controller = self._make_lftp_completion_controller()
+        controller._Controller__context = SimpleNamespace(breadcrumb_trace=trace)
+        updater = ModelUpdater(controller)
+
+        class DetailSentinel(dict):
+            def items(self):
+                raise AssertionError("disabled trace must not enumerate details")
+
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "completion_gate_candidate", DetailSentinel(),
+        )
+        self.assertEqual([], trace.snapshot()["entries"])
+
+        enabled[0] = True
+        trace.sync_enabled_state()
+        details = {"candidate_present": True, "complete_local_coverage": False}
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "completion_gate_candidate", details,
+        )
+        updater._record_completion_gate_breadcrumb(
+            "private-file-id", "completion_gate_candidate", details,
+        )
+
+        entries = trace.snapshot()["entries"]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("completion_gate", entries[0]["stage"])
+        self.assertEqual("completion_gate_candidate", entries[0]["message"])
+        self.assertEqual(details, entries[0]["details"])
+        self.assertNotIn("private-file-id", str(entries))
 
     def test_handle_lftp_completion_detection_skips_when_detection_is_not_ready(self):
         previous_entry = ("movie.mkv", "movies", "Movies")

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
+import time
+from collections import OrderedDict
 from types import SimpleNamespace
 from threading import Lock, RLock
 from datetime import datetime, timedelta
 from typing import Callable, Optional, Sequence, TYPE_CHECKING, cast
 
 from common import Context, PathPair
+from common.breadcrumb_trace import opaque_trace_correlation, trace_session_digest
 from scan_fs import stream_root_fingerprint
 from common.performance_diagnostics import (
     CANDIDATE_LIFECYCLE_FALLBACK_REASON_EXCEPTION,
@@ -293,6 +296,10 @@ class _ProgressiveScanAccumulator:
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys: set[tuple[Optional[str], str]] = set()
         self.__last_final_comparison_proven_pairs: set[Optional[str]] = set()
+        self.__move_invalidations_by_root: dict[
+            tuple[Optional[str], str], dict[int, tuple[int, str]]
+        ] = {}
+        self.__next_move_invalidation_token = 0
 
     def set_session_token(self, session_token: Optional[str]) -> None:
         """Bind active evidence to the current scanner process identity."""
@@ -300,10 +307,17 @@ class _ProgressiveScanAccumulator:
             return
         if self.__session_token == session_token:
             return
+        if self.__session_token is None:
+            # An eager move fence can precede the scanner's first emitted
+            # event. Bind that first session without discarding its token.
+            self.__session_token = session_token
+            return
         self.__session_token = session_token
         self.__working.clear()
         self.__manifests.clear()
         self.__active_generation.clear()
+        self.__committed_by_pair.clear()
+        self.__committed_pairs.clear()
         self.__failed_pairs.clear()
         self.__incomplete_pairs.clear()
         self.__authoritative_by_pair.clear()
@@ -312,11 +326,43 @@ class _ProgressiveScanAccumulator:
         self.__session_has_progressive_evidence = False
         self.__last_touched_keys.clear()
         self.__last_final_comparison_proven_pairs.clear()
+        self.__move_invalidations_by_root.clear()
 
     @property
     def session_token(self) -> Optional[str]:
         """Return the scanner process identity currently bound to this state."""
         return self.__session_token
+
+    def has_move_invalidations(self) -> bool:
+        return bool(self.__move_invalidations_by_root)
+
+    def begin_root_invalidation(
+            self, path_pair_id: Optional[str], root_name: str, generation: int,
+    ) -> Optional[int]:
+        """Register one physical-move attempt against its captured generation."""
+        if not isinstance(root_name, str) or not root_name or not isinstance(generation, int):
+            return None
+        self.__next_move_invalidation_token += 1
+        token = self.__next_move_invalidation_token
+        key = (path_pair_id, root_name)
+        self.__move_invalidations_by_root.setdefault(key, {})[token] = (generation, "pending")
+        return token
+
+    def finish_root_invalidation(
+            self, path_pair_id: Optional[str], root_name: str, token: int, mutated: bool,
+    ) -> None:
+        """Commit a mutated move or cancel only its exact no-mutation attempt."""
+        key = (path_pair_id, root_name)
+        entries = self.__move_invalidations_by_root.get(key)
+        if entries is None or token not in entries:
+            return
+        generation, _ = entries[token]
+        if mutated:
+            entries[token] = (generation, "committed")
+        else:
+            entries.pop(token, None)
+            if not entries:
+                self.__move_invalidations_by_root.pop(key, None)
 
     @staticmethod
     def __pair_for_file(file: SystemFile, result: ScannerResult) -> Optional[str]:
@@ -454,6 +500,23 @@ class _ProgressiveScanAccumulator:
             if not ids:
                 ids = {None}
             for pair_id in ids:
+                full_snapshot_ids = set(getattr(event, "full_snapshot_path_pair_ids", set()))
+                full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
+                    and pair_id in full_snapshot_ids
+                healthy_post_move_snapshot = full_snapshot \
+                    and pair_id in event.completed_path_pair_ids \
+                    and pair_id not in event.unknown_path_pair_ids \
+                    and not event.failed
+                protected_root_names = set()
+                for (invalid_pair_id, root_name), entries in self.__move_invalidations_by_root.items():
+                    if invalid_pair_id != pair_id:
+                        continue
+                    if any(
+                            status == "pending" or generation <= captured_generation or
+                            not healthy_post_move_snapshot
+                            for captured_generation, status in entries.values()
+                    ):
+                        protected_root_names.add(root_name)
                 previous_generation = self.__active_generation.get(pair_id, -1)
                 if generation < previous_generation:
                     continue
@@ -475,6 +538,10 @@ class _ProgressiveScanAccumulator:
                     self.__manifests.setdefault(generation, {})[pair_id] = None
                     self.__failed_pairs.discard((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
+                    for root_name in protected_root_names:
+                        previous_file = previous.get(root_name)
+                        if previous_file is not None:
+                            self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                 touched.add(pair_id)
                 if event.failed:
                     # Any recoverable failed generation may have been caused
@@ -485,14 +552,15 @@ class _ProgressiveScanAccumulator:
                     self.__committed_root_fingerprints.pop(pair_id, None)
                     self.__failed_pairs.add((generation, pair_id))
                     self.__authoritative_by_pair.pop(pair_id, None)
+                    for root_name in protected_root_names:
+                        previous_file = self.__committed_by_pair.get(pair_id, {}).get(root_name)
+                        if previous_file is not None:
+                            self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                     failed = True
                     error_message = event.error_message
                     self.__incomplete_pairs.add(pair_id)
                     continue
                 working = self.__working.setdefault(generation, {}).setdefault(pair_id, {})
-                full_snapshot_ids = set(getattr(event, "full_snapshot_path_pair_ids", set()))
-                full_snapshot = bool(getattr(event, "is_full_snapshot", False)) \
-                    and pair_id in full_snapshot_ids
                 previous_committed = self.__committed_by_pair.get(pair_id, {})
                 previous_fingerprints = self.__committed_root_fingerprints.get(pair_id, {})
                 retained_fingerprints: dict[str, str] = {}
@@ -502,6 +570,11 @@ class _ProgressiveScanAccumulator:
                     # queue events were dropped. Rebuild this pair from it;
                     # failed generations never carry this flag.
                     working.clear()
+                    for root_name in protected_root_names:
+                        previous_file = previous_committed.get(root_name)
+                        if previous_file is not None:
+                            working[root_name] = previous_file
+                            self.__authoritative_by_pair.setdefault(pair_id, {})[root_name] = previous_file
                 manifest = getattr(event, "root_names", None)
                 if manifest is not None:
                     self.__manifests.setdefault(generation, {})[pair_id] = set(manifest)
@@ -512,6 +585,8 @@ class _ProgressiveScanAccumulator:
                     if full_snapshot:
                         authoritative_pair = self.__authoritative_by_pair.setdefault(pair_id, {})
                         for name in self.__committed_by_pair.get(pair_id, {}):
+                            if name in protected_root_names:
+                                continue
                             if name not in manifest:
                                 authoritative_pair[name] = None
                             else:
@@ -547,6 +622,8 @@ class _ProgressiveScanAccumulator:
                     file_pair = self.__pair_for_file(file, event)
                     if file_pair != pair_id and len(ids) > 1:
                         continue
+                    if file.name in protected_root_names:
+                        continue
                     previous_file = (
                         previous_committed.get(file.name)
                         if full_snapshot else working.get(file.name)
@@ -564,7 +641,7 @@ class _ProgressiveScanAccumulator:
                 # root batches were evicted from the bounded queue.  Do not
                 # let it complete a pair or prove absence; the same scan's
                 # lossless full snapshot is the authority boundary.
-                if full_snapshot and pair_id in event.completed_path_pair_ids:
+                if healthy_post_move_snapshot:
                     manifest_names = self.__manifests.get(generation, {}).get(pair_id)
                     if manifest_names is not None:
                         for name in list(working):
@@ -596,6 +673,14 @@ class _ProgressiveScanAccumulator:
                     completed.add(pair_id)
                     self.__incomplete_pairs.discard(pair_id)
                     self.__completed_pairs.add(pair_id)
+                    for key, entries in list(self.__move_invalidations_by_root.items()):
+                        if key[0] != pair_id:
+                            continue
+                        for token, (captured_generation, status) in list(entries.items()):
+                            if status == "committed" and generation > captured_generation:
+                                entries.pop(token, None)
+                        if not entries:
+                            self.__move_invalidations_by_root.pop(key, None)
 
         visible: dict[tuple[Optional[str], str], SystemFile] = {
             (pair_id, name): file
@@ -691,6 +776,30 @@ class _ProgressiveScanAccumulator:
             for pair_id, fingerprints in self.__committed_root_fingerprints.items()
             if pair_id in self.__committed_pairs
         }
+
+    def lifecycle_trace_counts(self) -> dict[str, int]:
+        """Return bounded aggregate state for opt-in lifecycle diagnostics."""
+        return {
+            "accumulator_working_root_count": sum(
+                len(files) for pair_maps in self.__working.values() for files in pair_maps.values()
+            ),
+            "accumulator_committed_root_count": sum(
+                len(files) for files in self.__committed_by_pair.values()
+            ),
+            "accumulator_authoritative_root_count": sum(
+                len(files) for files in self.__authoritative_by_pair.values()
+            ),
+            "accumulator_touched_root_count": len(self.__last_touched_keys),
+        }
+
+    def lifecycle_trace_transition_token(self) -> tuple[object, ...]:
+        """Compare authority transitions locally without exporting identities."""
+        return (
+            frozenset(self.__active_generation.items()),
+            frozenset(self.__completed_pairs),
+            frozenset(self.__incomplete_pairs),
+            frozenset(self.__failed_pairs),
+        )
 
 
 class _JointProgressiveReconciler:
@@ -904,23 +1013,190 @@ def _lifecycle_scanned_path_pair_ids(
     return set(enabled_path_pair_ids) if enabled_path_pair_ids else {None}
 
 
+def _lifecycle_scan_details(
+        events: Sequence[ScannerResult], accumulator: _ProgressiveScanAccumulator,
+        handoff_file_ids: set[str],
+) -> dict[str, object]:
+    """Build the fixed, non-identifying lifecycle breadcrumb payload."""
+    files = [file for event in events for file in getattr(event, "files", ())]
+    event_generations = [
+        int(getattr(event, "generation", 0)) for event in events
+        if isinstance(getattr(event, "generation", None), int)
+    ]
+    file_keys = [
+        (getattr(file, "path_pair_id", None), getattr(file, "name", None))
+        for file in files
+    ]
+    distinct_file_keys = set(file_keys)
+    event_pair_ids = set().union(*(
+        set(getattr(event, "scanned_path_pair_ids", set()) or set()) for event in events
+    ))
+    handoff_root_present = any(
+        ModelFile.build_file_id(file.name, getattr(file, "path_pair_id", None)) in handoff_file_ids
+        for file in files
+    )
+    pair_ids = lambda attribute: set().union(*(
+        set(getattr(event, attribute, set()) or set()) for event in events
+    ))
+    details: dict[str, object] = {
+        "event_count": len(events),
+        "full_event_count": sum(bool(getattr(event, "is_full_snapshot", False)) for event in events),
+        "distinct_generation_count": len(set(event_generations)),
+        "min_generation": min(event_generations, default=0),
+        "max_generation": max(event_generations, default=0),
+        "input_top_level_file_count": len(files),
+        "distinct_pair_name_count": len(distinct_file_keys),
+        "duplicate_pair_name_count": len(file_keys) - len(distinct_file_keys),
+        "pair_id_mismatch_count": sum(
+            pair_id not in event_pair_ids for pair_id, _ in file_keys
+        ),
+        "targeted": any(bool(getattr(event, "is_targeted_scan", False)) for event in events),
+        "generation": max(event_generations, default=0),
+        "final": any(bool(getattr(event, "is_scan_final", True)) for event in events),
+        "full": any(bool(getattr(event, "is_full_snapshot", False)) for event in events),
+        "progress": any(bool(getattr(event, "is_progress", False)) for event in events),
+        "failed": any(bool(getattr(event, "failed", False)) for event in events),
+        "scanned_pair_count": len(pair_ids("scanned_path_pair_ids")),
+        "completed_pair_count": len(pair_ids("completed_path_pair_ids")),
+        "unknown_pair_count": len(pair_ids("unknown_path_pair_ids")),
+        "root_count": sum(len(getattr(event, "root_names", ()) or ()) for event in events),
+        "file_count": len(files),
+        "handoff_root_present": handoff_root_present,
+        "fence": "none",
+        "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+    }
+    details.update(accumulator.lifecycle_trace_counts())
+    return details
+
+
+def _lifecycle_scan_transition_is_meaningful(
+        events: Sequence[ScannerResult], before: dict[str, object], after: dict[str, object],
+        session_changed: bool, authority_state_changed: bool,
+) -> bool:
+    """Keep the bounded trace focused on authority-changing scan transitions."""
+    if session_changed or authority_state_changed:
+        return True
+    if bool(after.get("handoff_root_present", False)) and not bool(before.get("handoff_root_present", False)):
+        return True
+    return any(
+        before.get(key) != after.get(key)
+        for key in (
+            "accumulator_working_root_count", "accumulator_committed_root_count",
+            "accumulator_authoritative_root_count", "accumulator_touched_root_count",
+        )
+    )
+
+
+def _record_lifecycle_scan_breadcrumb(
+        controller: "Controller", side: str, session_token: object,
+        message: str, details: dict[str, object],
+) -> None:
+    """Record a gated aggregate only; diagnostics cannot affect scan intake."""
+    breadcrumb_trace = getattr(getattr(controller, "_Controller__context", None), "breadcrumb_trace", None)
+    if breadcrumb_trace is None:
+        return
+    try:
+        if not breadcrumb_trace.is_enabled():
+            return
+        breadcrumb_trace.record(
+            "model_updater",
+            message,
+            {"scanner_side": side, "session_digest": trace_session_digest(session_token), **details},
+            stage="scan_accumulator",
+            event_type="diagnostic",
+            corr_id="{}:{}".format(side, trace_session_digest(session_token)),
+            trace_scope="flow",
+        )
+    except Exception:
+        logger = getattr(controller, "logger", None)
+        if logger is not None:
+            logger.debug("Ignoring lifecycle scan breadcrumb failure", exc_info=True)
+
+
+def _current_scan_session_token(controller: "Controller", side: str) -> Optional[str]:
+    """Read the current process identity without creating scan work."""
+    process = getattr(controller, "_Controller__{}_scan_process".format(side), None)
+    session_token = getattr(process, "session_token", None)
+    return session_token if isinstance(session_token, str) and session_token else None
+
+
+def _ensure_progressive_scan_state(
+        controller: "Controller", side: str, eager: bool = False, bind_current_session: bool = True,
+) -> _ProgressiveScanAccumulator:
+    """Own one progressive accumulator before either scan intake or a move fence."""
+    state_name = "_Controller__progressive_{}_scan_state".format(side)
+    accumulator = getattr(controller, state_name, None)
+    if not isinstance(accumulator, _ProgressiveScanAccumulator):
+        accumulator = _ProgressiveScanAccumulator()
+        setattr(controller, state_name, accumulator)
+        setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), eager)
+    if bind_current_session:
+        # A move can begin before this process emits its first result. Bind its
+        # identity now so a replacement cannot later inherit a fence captured
+        # for the old scanner session.
+        accumulator.set_session_token(_current_scan_session_token(controller, side))
+    return accumulator
+
+
 def _pop_scan_updates(controller: "Controller", side: str, process: object) -> Optional[ScannerResult]:
     """Drain progressive events when available; preserve legacy mock behavior."""
+    state_name = "_Controller__progressive_{}_scan_state".format(side)
+    if not isinstance(process, ScannerProcess):
+        # Legacy/mock intake has begun. An eager fence must no longer alter
+        # its established scan-result semantics.
+        accumulator = getattr(controller, state_name, None)
+        if isinstance(accumulator, _ProgressiveScanAccumulator):
+            setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), False)
+            if not accumulator.has_move_invalidations() and accumulator.session_token is None:
+                delattr(controller, state_name)
+        pop_latest = getattr(process, "pop_latest_result", None)
+        return pop_latest() if callable(pop_latest) else None
     if isinstance(process, ScannerProcess):
         events = process.pop_results()
-        state_name = "_Controller__progressive_{}_scan_state".format(side)
-        accumulator = getattr(controller, state_name, None)
-        if not isinstance(accumulator, _ProgressiveScanAccumulator):
-            accumulator = _ProgressiveScanAccumulator()
-            setattr(controller, state_name, accumulator)
+        breadcrumb_trace = getattr(
+            getattr(controller, "_Controller__context", None), "breadcrumb_trace", None,
+        )
+        try:
+            trace_enabled = breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
+        except Exception:
+            trace_enabled = False
+        # Detect the replacement before binding it; this keeps the lifecycle
+        # transition observable while eager/begin callers still synchronize
+        # immediately with the current process.
+        accumulator = _ensure_progressive_scan_state(controller, side, bind_current_session=False)
+        setattr(controller, "_Controller__progressive_{}_scan_state_eager".format(side), False)
         session_token = getattr(process, "session_token", None)
-        if accumulator.session_token is not None and accumulator.session_token != session_token:
+        session_changed = accumulator.session_token is not None and accumulator.session_token != session_token
+        before_details: Optional[dict[str, object]] = None
+        before_authority_state: Optional[object] = None
+        if trace_enabled:
+            handoff_file_ids = getattr(
+                controller, "_Controller__successful_final_move_handoff_file_ids", set()
+            )
+            if not isinstance(handoff_file_ids, set):
+                handoff_file_ids = set()
+            before_details = _lifecycle_scan_details(events, accumulator, handoff_file_ids)
+            before_authority_state = accumulator.lifecycle_trace_transition_token()
+        if session_changed:
             setattr(controller, "_Controller__progressive_scan_session_changed", True)
             setattr(controller, "_Controller__progressive_{}_scan_session_changed".format(side), True)
         accumulator.set_session_token(session_token)
-        return accumulator.apply(events)
-    pop_latest = getattr(process, "pop_latest_result", None)
-    return pop_latest() if callable(pop_latest) else None
+        result = accumulator.apply(events)
+        if trace_enabled:
+            after_details = _lifecycle_scan_details(events, accumulator, handoff_file_ids)
+            authority_state_changed = before_authority_state != accumulator.lifecycle_trace_transition_token()
+            if events and _lifecycle_scan_transition_is_meaningful(
+                    events, before_details, after_details, session_changed, authority_state_changed,
+            ):
+                _record_lifecycle_scan_breadcrumb(
+                    controller, side, session_token, "scan_accumulator_before_apply", before_details,
+                )
+                _record_lifecycle_scan_breadcrumb(
+                    controller, side, session_token, "scan_accumulator_after_apply",
+                    after_details,
+                )
+        return result
+    return None
 
 
 def _merge_targeted_legacy_scan_files(
@@ -1057,12 +1333,74 @@ class ModelUpdater(_ControllerCoreAccess):
     # scanner responsive to that cadence without changing the user's normal
     # scan interval or waking it on every controller tick.
     _ACTIVE_SCAN_FORCE_INTERVAL = timedelta(seconds=2)
+    _COMPLETION_GATE_TRACE_SIGNATURE_LIMIT = 64
 
     def __init__(self, controller: object) -> None:
         from .controller import Controller as ControllerType
         if not isinstance(controller, (ControllerType, SimpleNamespace)):
             raise TypeError("ModelUpdater requires the controller core runtime boundary")
         self._controller = cast(_ControllerCoreAccess, controller)
+        _ensure_progressive_scan_state(self._controller, "local", eager=True)
+        # Diagnostic-only dedupe. Correlations are opaque and this cache never
+        # participates in completion, scan, or model authority.
+        self.__completion_gate_trace_signatures: OrderedDict[str, str] = OrderedDict()
+
+    def _completion_gate_trace_enabled(self) -> bool:
+        """Check the global trace gate before diagnostic-only marker reads."""
+        breadcrumb_trace = getattr(
+            getattr(self._controller, "_Controller__context", None), "breadcrumb_trace", None,
+        )
+        try:
+            return breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
+        except Exception:
+            return False
+
+    def _record_completion_gate_breadcrumb(
+            self, file_id: str, message: str, details: dict[str, object],
+    ) -> None:
+        """Emit bounded, identity-free completion-gate transitions when enabled."""
+        breadcrumb_trace = getattr(
+            getattr(self._controller, "_Controller__context", None), "breadcrumb_trace", None,
+        )
+        if breadcrumb_trace is None:
+            return
+        try:
+            # This must precede correlation/signature work and every model
+            # lookup performed by callers solely for diagnostics.
+            if not breadcrumb_trace.is_enabled():
+                return
+            corr_id = "completion:{}".format(opaque_trace_correlation(file_id))
+            signature = json.dumps({"message": message, "details": details}, sort_keys=True)
+            previous_signature = self.__completion_gate_trace_signatures.get(corr_id)
+            if previous_signature == signature:
+                return
+            self.__completion_gate_trace_signatures[corr_id] = signature
+            self.__completion_gate_trace_signatures.move_to_end(corr_id)
+            while len(self.__completion_gate_trace_signatures) > self._COMPLETION_GATE_TRACE_SIGNATURE_LIMIT:
+                self.__completion_gate_trace_signatures.popitem(last=False)
+            breadcrumb_trace.record(
+                "model_updater", message, details,
+                stage="completion_gate", event_type="diagnostic", corr_id=corr_id,
+                trace_scope="flow",
+            )
+        except Exception:
+            logger = getattr(self._controller, "logger", None)
+            if logger is not None:
+                logger.debug("Ignoring completion-gate breadcrumb failure", exc_info=True)
+
+    def begin_final_move_local_root_invalidation(
+            self, root_name: str, path_pair_id: Optional[str], generation: int,
+    ) -> Optional[int]:
+        """Open a local-root invalidation for one physical move attempt."""
+        accumulator = _ensure_progressive_scan_state(self._controller, "local")
+        return accumulator.begin_root_invalidation(path_pair_id, root_name, generation)
+
+    def finish_final_move_local_root_invalidation(
+            self, root_name: str, path_pair_id: Optional[str], token: int, mutated: bool,
+    ) -> None:
+        """Commit or cancel exactly one local-root physical move attempt."""
+        accumulator = _ensure_progressive_scan_state(self._controller, "local")
+        accumulator.finish_root_invalidation(path_pair_id, root_name, token, mutated)
 
     @staticmethod
     def _preserve_pending_completion_progress_floor(
@@ -1267,10 +1605,19 @@ class ModelUpdater(_ControllerCoreAccess):
         }
         if just_completed_file_names:
             for name, path_pair_id, _ in just_completed_file_names:
+                file_id = ModelFile.build_file_id(name, path_pair_id)
                 controller.logger.info(
                     "Download completion pending (LFTP job finished): {}".format(
-                        ModelFile.build_file_id(name, path_pair_id)
+                        file_id
                     )
+                )
+                self._record_completion_gate_breadcrumb(
+                    file_id,
+                    "completion_pending_registered",
+                    {
+                        "registration_source": "lftp_job_finished",
+                        "local_scan_forced": True,
+                    },
                 )
             controller._Controller__pending_completion_file_names.update(just_completed_file_names)
             controller._Controller__local_scan_process.force_scan()
@@ -2216,8 +2563,9 @@ class ModelUpdater(_ControllerCoreAccess):
                 accumulator = getattr(
                     controller, "_Controller__progressive_{}_scan_state".format(side), None
                 )
-                return accumulator.completed_pairs() \
-                    if isinstance(accumulator, _ProgressiveScanAccumulator) else set()
+                if isinstance(accumulator, _ProgressiveScanAccumulator):
+                    return accumulator.completed_pairs()
+                return set(getattr(result, "completed_path_pair_ids", set())) if result is not None else set()
 
             raw_scanned = getattr(result, "scanned_path_pair_ids", {None})
             scanned = set(raw_scanned) if isinstance(raw_scanned, set) else set()
@@ -2827,7 +3175,16 @@ class ModelUpdater(_ControllerCoreAccess):
             model_builder.has_changes() and not progressive_delta_eligible and \
             not authoritative_pair_delta_applied
         )
+        if not full_build_triggered and self._completion_gate_trace_enabled():
+            for file_name, path_pair_id, _ in controller._Controller__pending_completion_file_names:
+                self._record_completion_gate_breadcrumb(
+                    ModelFile.build_file_id(file_name, path_pair_id),
+                    "completion_gate_build_deferred",
+                    {"build_ran": False, "reason": "no_model_build"},
+                )
         global_full_build_triggered = full_build_triggered and not candidate_lifecycle_triggered
+        lifecycle_publication_subject_ids: set[str] = set()
+        lifecycle_publication_build_kind = "none"
         if full_build_triggered:
             diagnostics = getattr(getattr(controller, "_Controller__context", None), "performance_diagnostics", None)
             if candidate_lifecycle_triggered:
@@ -2845,6 +3202,9 @@ class ModelUpdater(_ControllerCoreAccess):
                             diagnostics.finish_duration(DURATION_MODEL_BUILD, started_at)
                         except Exception:
                             pass
+            lifecycle_publication_build_kind = (
+                "authoritative_pair_candidate" if candidate_lifecycle_triggered else "full_build"
+            )
             # A small set of completion side effects is applied directly to
             # the model objects from this build.  If those setters invalidate
             # the builder cache, retain their exact event tokens for adoption;
@@ -3037,7 +3397,7 @@ class ModelUpdater(_ControllerCoreAccess):
                     }
                     controller._Controller__pending_completion_progress_floors.pop(file.file_id, None)
 
-                def run_reserved_automatic_move(file: ModelFile):
+                def run_reserved_automatic_move(file: ModelFile, trace_completion_gate: bool = False):
                     reserve_move = getattr(controller, "_reserve_move_attempt", None)
                     release_move = getattr(controller, "_release_move_attempt", None)
                     move_from_staging = getattr(controller, "_Controller__move_from_staging", None)
@@ -3045,13 +3405,39 @@ class ModelUpdater(_ControllerCoreAccess):
                     # candidate but do not implement the real move boundary.
                     # Production Controllers always expose all three methods.
                     if not callable(reserve_move) or not callable(release_move) or \
-                            not callable(move_from_staging) or not reserve_move(file.file_id):
+                            not callable(move_from_staging):
+                        if trace_completion_gate:
+                            self._record_completion_gate_breadcrumb(
+                                file.file_id, "completion_gate_move_deferred",
+                                {"reason": "move_boundary_unavailable"},
+                            )
+                        return None
+                    if not reserve_move(file.file_id):
+                        if trace_completion_gate:
+                            self._record_completion_gate_breadcrumb(
+                                file.file_id, "completion_gate_move_deferred",
+                                {"reason": "move_reservation_unavailable"},
+                            )
                         return None
                     try:
-                        return move_from_staging(
+                        if trace_completion_gate:
+                            self._record_completion_gate_breadcrumb(
+                                file.file_id, "completion_gate_move_attempted",
+                                {"attempted": True},
+                            )
+                        move_result = move_from_staging(
                             file.name,
                             file.path_pair_id,
                         )
+                        if trace_completion_gate:
+                            self._record_completion_gate_breadcrumb(
+                                file.file_id, "completion_gate_move_result",
+                                {
+                                    "attempted": True,
+                                    "result": getattr(move_result, "name", "unknown").lower(),
+                                },
+                            )
+                        return move_result
                     finally:
                         release_move(file.file_id)
 
@@ -3129,6 +3515,81 @@ class ModelUpdater(_ControllerCoreAccess):
                 # Diff the new model with old model.
                 model_diff = ModelDiffUtil.diff_models(model, new_model)
                 attempted_move_file_ids: set[str] = set()
+                pending_candidate_file_ids = pending_completion_file_ids()
+                diff_file_ids = {
+                    candidate.file_id
+                    for diff in model_diff
+                    for candidate in (
+                        getattr(diff, "old_file", None), getattr(diff, "new_file", None),
+                    )
+                    if candidate is not None
+                }
+                # Completion registration is intentionally decoupled from a
+                # model diff. Capture the candidate gate for every pending
+                # subject before diff processing so a quiet candidate build is
+                # distinguishable from a deferred or incomplete one.
+                for pending_file_id in pending_candidate_file_ids:
+                    lifecycle_allowed = candidate_lifecycle_allows(pending_file_id)
+                    if authoritative_pair_build is None:
+                        pair_relation = "global"
+                    elif lifecycle_allowed:
+                        pair_relation = "selected"
+                    else:
+                        pair_relation = "unselected"
+                    try:
+                        candidate_file = new_model.get_file(pending_file_id)
+                    except ModelError:
+                        candidate_file = None
+                    try:
+                        live_file = model.get_file(pending_file_id)
+                    except ModelError:
+                        live_file = None
+                    coverage = candidate_complete_local_coverage(pending_file_id)
+                    self._record_completion_gate_breadcrumb(
+                        pending_file_id,
+                        "completion_gate_candidate",
+                        {
+                            "build_kind": lifecycle_publication_build_kind,
+                            "candidate_lifecycle": "allowed" if lifecycle_allowed else "deferred",
+                            "candidate_pair_relation": pair_relation,
+                            "candidate_present": candidate_file is not None,
+                            "live_present": live_file is not None,
+                            "candidate_state": (
+                                getattr(getattr(candidate_file, "state", None), "name", "absent").lower()
+                                if candidate_file is not None else "absent"
+                            ),
+                            "local_size_present": (
+                                getattr(candidate_file, "local_size", None) is not None
+                                if candidate_file is not None else False
+                            ),
+                            "remote_size_present": (
+                                getattr(candidate_file, "remote_size", None) is not None
+                                if candidate_file is not None else False
+                            ),
+                            "complete_local_coverage": coverage,
+                            "model_diff_present": pending_file_id in diff_file_ids,
+                        },
+                    )
+                    if not lifecycle_allowed:
+                        self._record_completion_gate_breadcrumb(
+                            pending_file_id,
+                            "completion_gate_decision",
+                            {
+                                "completion_proved": False,
+                                "decision": "deferred",
+                                "reason": "candidate_pair_unselected",
+                            },
+                        )
+                    elif pending_file_id not in diff_file_ids:
+                        self._record_completion_gate_breadcrumb(
+                            pending_file_id,
+                            "completion_gate_decision",
+                            {
+                                "completion_proved": False,
+                                "decision": "deferred",
+                                "reason": "no_model_diff",
+                            },
+                        )
 
                 for file_id, count in persist.move_failure_counts.items():
                     if not candidate_lifecycle_allows(file_id):
@@ -3203,23 +3664,26 @@ class ModelUpdater(_ControllerCoreAccess):
                         discard_pending_completion_file(old_file.file_id)
 
                     completion_proved = False
-                    if (
-                        new_file is not None
-                        and old_file is not None
-                        and new_file.file_id in pending_completion_file_ids()
-                        and not controller._Controller__is_explicitly_stopped(
-                            new_file.name,
-                            new_file.path_pair_id,
-                        )
-                    ):
+                    completion_reason = "not_pending"
+                    completion_candidate = new_file is not None and old_file is not None and \
+                        new_file.file_id in pending_completion_file_ids()
+                    explicitly_stopped = completion_candidate and controller._Controller__is_explicitly_stopped(
+                        new_file.name,
+                        new_file.path_pair_id,
+                    )
+                    if completion_candidate and explicitly_stopped:
+                        completion_reason = "explicitly_stopped"
+                    elif completion_candidate:
                         if new_file.state == ModelFile.State.DEFAULT and new_file.local_size is None:
                             discard_pending_completion_file(new_file.file_id)
+                            completion_reason = "discarded_missing_local"
                         if new_file.state in (
                             ModelFile.State.DOWNLOADED,
                             ModelFile.State.EXTRACTED,
                             ModelFile.State.DELETED,
                         ):
                             completion_proved = True
+                            completion_reason = "terminal_state"
                         elif (
                             old_file.remote_size is not None
                             and new_file.local_size is not None
@@ -3227,6 +3691,20 @@ class ModelUpdater(_ControllerCoreAccess):
                             and candidate_complete_local_coverage(new_file.file_id)
                         ):
                             completion_proved = True
+                            completion_reason = "complete_local_coverage"
+                        elif completion_reason == "not_pending":
+                            completion_reason = "completion_evidence_missing"
+
+                    if new_file is not None and new_file.file_id in pending_candidate_file_ids:
+                        self._record_completion_gate_breadcrumb(
+                            new_file.file_id,
+                            "completion_gate_decision",
+                            {
+                                "completion_proved": completion_proved,
+                                "decision": "attempt_eligible" if completion_proved else "deferred",
+                                "reason": completion_reason,
+                            },
+                        )
 
                     if completion_proved and new_file is not None:
                         failure_count = persist.move_failure_counts.get(new_file.file_id, 0)
@@ -3234,8 +3712,16 @@ class ModelUpdater(_ControllerCoreAccess):
                         if failure_count >= controller._Controller__MAX_MOVE_FAILURES or (
                             retry_due is not None and datetime.now() < retry_due
                         ):
+                            self._record_completion_gate_breadcrumb(
+                                new_file.file_id, "completion_gate_move_deferred",
+                                {
+                                    "reason": "retry_or_failure_limit",
+                                    "failure_limit_reached": failure_count >= controller._Controller__MAX_MOVE_FAILURES,
+                                    "retry_waiting": retry_due is not None and datetime.now() < retry_due,
+                                },
+                            )
                             continue
-                        move_result = run_reserved_automatic_move(new_file)
+                        move_result = run_reserved_automatic_move(new_file, trace_completion_gate=True)
                         if move_result is None:
                             continue
                         attempted_move_file_ids.add(new_file.file_id)
@@ -3528,6 +4014,17 @@ class ModelUpdater(_ControllerCoreAccess):
                         controller._sync_final_move_succeeded_files_to_model()
 
             # The shared lifecycle has now applied its selected-root diff.
+            # Markers can be added while resolving completion, so sample this
+            # candidate at the publication boundary rather than at build
+            # start; otherwise a final-move subject has no trace identity.
+            candidate_recorder = getattr(model_builder, "record_lifecycle_candidate_publication", None)
+            if full_build_triggered and callable(candidate_recorder):
+                try:
+                    recorded_ids = candidate_recorder(new_model, lifecycle_publication_build_kind)
+                    if isinstance(recorded_ids, set) and all(isinstance(file_id, str) for file_id in recorded_ids):
+                        lifecycle_publication_subject_ids = recorded_ids
+                except Exception:
+                    controller.logger.debug("Ignoring lifecycle candidate breadcrumb failure", exc_info=True)
             # Commit candidate authority before later external queues/status
             # work, so an unrelated post-lifecycle failure cannot strand the
             # only authoritative final scan in a temporary candidate.
@@ -3608,6 +4105,19 @@ class ModelUpdater(_ControllerCoreAccess):
                 )
                 if callable(refresh_identities):
                     refresh_identities()
+        if full_build_triggered and lifecycle_publication_subject_ids:
+            live_recorder = getattr(model_builder, "record_lifecycle_live_publication", None)
+            if callable(live_recorder):
+                try:
+                    live_recorder(
+                        new_model, controller._Controller__model, lifecycle_publication_subject_ids,
+                        lifecycle_publication_build_kind,
+                        "authoritative_pair_adopted" if authoritative_pair_delta_applied else (
+                            "full_model_adopted" if global_full_build_triggered else "candidate_not_adopted"
+                        ),
+                    )
+                except Exception:
+                    controller.logger.debug("Ignoring lifecycle live-publication breadcrumb failure", exc_info=True)
         if full_build_triggered:
             try:
                 model_version = getattr(controller._Controller__model, "version", None)

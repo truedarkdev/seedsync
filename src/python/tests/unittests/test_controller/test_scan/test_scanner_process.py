@@ -487,7 +487,11 @@ class TestScannerProcess(unittest.TestCase):
             self.process.join(timeout=5)
             self.assertFalse(self.process.is_alive())
             entries = collector.snapshot()["entries"]
-            self.assertTrue(any(entry["message"] == "scan_started" for entry in entries))
+            started = next(entry for entry in entries if entry["message"] == "scan_started")
+            completed = next(entry for entry in entries if entry["message"] == "scan_completed")
+            published = next(entry for entry in entries if entry["message"] == "scan_result_published")
+            self.assertEqual(started["corr_id"], completed["corr_id"])
+            self.assertEqual(started["corr_id"], published["corr_id"])
         finally:
             if self.process.is_alive():
                 self.process.terminate()
@@ -1727,14 +1731,15 @@ class TestScannerProcess(unittest.TestCase):
 
         deadline = time.monotonic() + 1
         snapshot = collector.snapshot()
-        while len(snapshot["entries"]) < 3 and time.monotonic() < deadline:
+        while len(snapshot["entries"]) < 4 and time.monotonic() < deadline:
             time.sleep(0.001)
             snapshot = collector.snapshot()
-        self.assertEqual(3, len(snapshot["entries"]))
-        self.assertEqual(["movies", "movies", "movies"], [entry["corr_id"] for entry in snapshot["entries"]])
-        self.assertEqual([1, 2, 3], [entry["version"] for entry in snapshot["entries"]])
-        self.assertEqual(["scan", "scan", "extract"], [entry["stage"] for entry in snapshot["entries"]])
-        self.assertEqual(["scan_started", "scan_completed", "extract_completed"],
+        self.assertEqual(4, len(snapshot["entries"]))
+        self.assertEqual(1, len({entry["corr_id"] for entry in snapshot["entries"][:3]}))
+        self.assertEqual("movies", snapshot["entries"][3]["corr_id"])
+        self.assertEqual([1, 2, 3, 4], [entry["version"] for entry in snapshot["entries"]])
+        self.assertEqual(["scan", "scan", "scan", "extract"], [entry["stage"] for entry in snapshot["entries"]])
+        self.assertEqual(["scan_started", "scan_completed", "scan_result_published", "extract_completed"],
                          [entry["message"] for entry in snapshot["entries"]])
         self.assertEqual(
             snapshot["entries"][0]["flow_id"],

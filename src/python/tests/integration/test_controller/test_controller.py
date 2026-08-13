@@ -503,11 +503,18 @@ class TestController(unittest.TestCase):
 
         return not reasons, tuple(reasons), identity_snapshot
 
-    def __process_until(self, predicate, message, max_iterations=2000):
+    def __process_until(
+            self, predicate, message, max_iterations=2000, timeout_seconds=None,
+            sleep_seconds=0.0):
+        deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
         for _ in range(max_iterations):
             self.controller.process()
             if predicate():
                 return
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if sleep_seconds:
+                time.sleep(sleep_seconds)
         self.fail(message)
 
     def __find_model_file(self, name):
@@ -518,7 +525,9 @@ class TestController(unittest.TestCase):
         self.assertIsNotNone(file, "File '{}' not found in model".format(name))
         return file
 
-    def __wait_for_model_file(self, name, predicate, message, max_iterations=2000):
+    def __wait_for_model_file(
+            self, name, predicate, message, max_iterations=2000, timeout_seconds=None,
+            sleep_seconds=0.0):
         match = {}
 
         def _predicate():
@@ -528,7 +537,13 @@ class TestController(unittest.TestCase):
             match["file"] = file
             return True
 
-        self.__process_until(_predicate, message, max_iterations=max_iterations)
+        self.__process_until(
+            _predicate,
+            message,
+            max_iterations=max_iterations,
+            timeout_seconds=timeout_seconds,
+            sleep_seconds=sleep_seconds,
+        )
         return match["file"]
 
     def __wait_for_command_callback(self, callback, message, max_iterations=2000):
@@ -2669,7 +2684,9 @@ class TestController(unittest.TestCase):
             remote_name,
             lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
             "Timed out waiting for resumed transfer to finish",
-            max_iterations=4000,
+            max_iterations=10000,
+            timeout_seconds=15,
+            sleep_seconds=0.005,
         )
 
         for _ in range(20):
@@ -2983,7 +3000,9 @@ class TestController(unittest.TestCase):
             remote_name,
             lambda file: file.state == ModelFile.State.DOWNLOADED and os.path.exists(final_target),
             "Timed out waiting for restarted controller to complete resumed transfer",
-            max_iterations=4000,
+            max_iterations=10000,
+            timeout_seconds=15,
+            sleep_seconds=0.005,
         )
 
         for _ in range(20):

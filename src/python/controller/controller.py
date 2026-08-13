@@ -61,6 +61,7 @@ from common.performance_diagnostics import (
     DURATION_MODEL_UPDATE,
 )
 from common.exclude_patterns import ExactPathExclusion, parse_exclude_patterns
+from common.breadcrumb_trace import opaque_trace_correlation
 from model import ModelError, ModelFile, Model, IModelListener
 from lftp import Lftp, LftpError, LftpJobStatus, LftpJobStatusParserError
 from transfer import RcloneTransferBackend, create_transfer_backend, RcloneTransferError
@@ -71,6 +72,30 @@ from system import SystemFile
 ActiveScannerRuntime = ActiveScanner | MultiPathActiveScanner
 LocalScannerRuntime = LocalScanner | MultiPathLocalScanner
 RemoteScannerRuntime = RemoteScanner | MultiPathRemoteScanner
+
+
+class _MoveMutationOutcome(Enum):
+    """Physical-move evidence used only until its local scan fence is finished."""
+
+    NO_MUTATION = "no_mutation"
+    MUTATED = "mutated"
+    UNCERTAIN = "uncertain"
+
+
+class _MoveMutationTracker:
+    """Fail closed: only an observed no-mutation path may cancel a fence."""
+
+    def __init__(self) -> None:
+        self.outcome = _MoveMutationOutcome.NO_MUTATION
+
+    def mutated(self) -> None:
+        if self.outcome == _MoveMutationOutcome.NO_MUTATION:
+            self.outcome = _MoveMutationOutcome.MUTATED
+
+    def uncertain(self) -> None:
+        if self.outcome == _MoveMutationOutcome.NO_MUTATION:
+            self.outcome = _MoveMutationOutcome.UNCERTAIN
+
 
 # A single-path configuration still has no persisted path-pair id.  The web
 # model API exposes it through this explicit synthetic scope without changing
@@ -3788,7 +3813,8 @@ class Controller:
 
     def __merge_staging_directory_no_replace(
             self, src: str, dst: str, path_pair_id: Optional[str] = None,
-            required_collision_sources: Optional[set[str]] = None) -> bool:
+            required_collision_sources: Optional[set[str]] = None,
+            mutation_tracker: Optional[_MoveMutationTracker] = None) -> bool:
         """Publish missing descendants and retain every collision in staging.
 
         A split-root directory is expected after an interrupted portable
@@ -3802,7 +3828,7 @@ class Controller:
         self.__reject_nested_mounts_or_reparse_points(src)
         self.__reject_nested_mounts_or_reparse_points(dst)
         claim_before_settle = getattr(self, "_Controller__collision_compare_claim", None)
-        settled_claim = self.__settle_collision_claim_for_tree(src, dst)
+        settled_claim = self.__settle_collision_claim_for_tree(src, dst, mutation_tracker)
         if settled_claim == "equal" and required_collision_sources is not None and claim_before_settle is not None:
             required_collision_sources.discard(claim_before_settle[0])
         if settled_claim == "pending":
@@ -3821,7 +3847,7 @@ class Controller:
         active_claimed_path = active_claim[1] if active_claim is not None else None
         active_sidecar_path = active_claim[4] if active_claim is not None and len(active_claim) > 4 else None
         private_claim_artifacts, recovery_overflow = self.__recover_collision_claims(
-            src, path_pair_id, active_claimed_path,
+            src, path_pair_id, active_claimed_path, mutation_tracker,
         )
         if recovery_overflow:
             # No descendant publication has started.  Retain the whole
@@ -3858,12 +3884,12 @@ class Controller:
             try:
                 destination_stat = os.lstat(destination_child)
             except FileNotFoundError:
-                self.__publish_staging_no_replace(source_child, destination_child)
+                self.__publish_staging_no_replace(source_child, destination_child, mutation_tracker)
                 continue
             if stat.S_ISDIR(source_stat.st_mode) and not stat.S_ISLNK(source_stat.st_mode) and \
                     stat.S_ISDIR(destination_stat.st_mode) and not stat.S_ISLNK(destination_stat.st_mode):
                 nested_merge_succeeded = self.__merge_staging_directory_no_replace(
-                    source_child, destination_child, path_pair_id, required_collision_sources
+                    source_child, destination_child, path_pair_id, required_collision_sources, mutation_tracker
                 )
                 if required_collision_sources is not None and not nested_merge_succeeded and any(
                         self.__path_is_within(path, source_child)
@@ -3875,7 +3901,9 @@ class Controller:
                 cached_outcome = self.__cached_collision_outcome(source_child, destination_child)
                 if cached_outcome is not None:
                     continue
-                outcome = self.__claim_and_compare_collision_leaf(source_child, destination_child, path_pair_id)
+                outcome = self.__claim_and_compare_collision_leaf(
+                    source_child, destination_child, path_pair_id, mutation_tracker,
+                )
                 if outcome == "pending":
                     self.__collision_merge_deferred = True
                     continue
@@ -3895,6 +3923,8 @@ class Controller:
             return False
         try:
             os.rmdir(src)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
         except OSError as error:
             if error.errno in (errno.ENOTEMPTY, errno.EEXIST):
                 return False
@@ -4046,16 +4076,26 @@ class Controller:
                 })
             return Controller.MoveFromStagingResult.DEFERRED
 
+        local_root_invalidation: Optional[tuple[str, int]] = None
+        mutation_tracker = _MoveMutationTracker()
         try:
             # Re-resolve immediately before the mutation to narrow the window
             # for a path component to be replaced with a symlink.
             current = self.__resolve_safe_final_move_paths(name, path_pair_id)
             if current is None or current[2:] != (src, dst):
                 return Controller.MoveFromStagingResult.FAILED
+            local_generation = getattr(self.__local_scan_process, "generation", None)
+            updater = getattr(self, "_Controller__updater", None)
+            invalidate = getattr(updater, "begin_final_move_local_root_invalidation", None)
+            root_name = name.replace("\\", "/").split("/", 1)[0]
+            if callable(invalidate) and isinstance(local_generation, int) and root_name:
+                token = invalidate(root_name, path_pair_id, local_generation)
+                if isinstance(token, int):
+                    local_root_invalidation = (root_name, token)
             if self.__safe_existing_directory(src) and self.__safe_existing_directory(dst):
                 self.__collision_merge_deferred = False
                 if not self.__merge_staging_directory_no_replace(
-                        src, dst, path_pair_id, required_collision_sources
+                        src, dst, path_pair_id, required_collision_sources, mutation_tracker
                 ):
                     if self.__collision_merge_deferred:
                         return Controller.MoveFromStagingResult.DEFERRED
@@ -4066,13 +4106,40 @@ class Controller:
                 cached_outcome = self.__cached_collision_outcome(src, dst)
                 if cached_outcome is not None:
                     return Controller.MoveFromStagingResult.CONFLICT
-                outcome = self.__claim_and_compare_collision_leaf(src, dst, path_pair_id)
+                outcome = self.__claim_and_compare_collision_leaf(
+                    src, dst, path_pair_id, mutation_tracker,
+                )
                 if outcome == "pending":
                     return Controller.MoveFromStagingResult.DEFERRED
                 return Controller.MoveFromStagingResult.FAILED
             else:
-                self.__publish_staging_no_replace(src, dst)
+                self.__publish_staging_no_replace(src, dst, mutation_tracker)
+                # The production primitive marks at each physical mutation;
+                # retaining this successful-return mark keeps lightweight
+                # adapters/mocks equally conservative.
+                mutation_tracker.mutated()
             self.logger.info("Moved '%s' from staging '%s' to '%s'", name, staging_path, final_path)
+            breadcrumb_trace = getattr(self.__context, "breadcrumb_trace", None)
+            try:
+                trace_enabled = breadcrumb_trace is not None and breadcrumb_trace.is_enabled()
+            except Exception:
+                trace_enabled = False
+            if trace_enabled:
+                try:
+                    self.__record_breadcrumb(
+                        stage="lifecycle",
+                        message="final_move_before_local_scan",
+                        details={
+                            "scanner_side": "local",
+                            "targeted": path_pair_id is not None,
+                            "monotonic_ms": int(time.monotonic_ns() / 1_000_000),
+                        },
+                        event_type="diagnostic",
+                        corr_id=opaque_trace_correlation(trace_file_id),
+                        trace_scope="flow",
+                    )
+                except Exception:
+                    self.logger.debug("Ignoring final-move lifecycle breadcrumb failure", exc_info=True)
             if should_trace:
                 self.__trace_target_archive_event("move_from_staging_result", {
                     "file_id": trace_file_id,
@@ -4114,7 +4181,18 @@ class Controller:
                     "error": str(error),
                 })
             return Controller.MoveFromStagingResult.FAILED
-
+        finally:
+            if local_root_invalidation is not None:
+                finish = getattr(
+                    getattr(self, "_Controller__updater", None),
+                    "finish_final_move_local_root_invalidation",
+                    None,
+                )
+                if callable(finish):
+                    finish(
+                        local_root_invalidation[0], path_pair_id, local_root_invalidation[1],
+                        mutation_tracker.outcome != _MoveMutationOutcome.NO_MUTATION,
+                    )
     @staticmethod
     def __rename_no_replace(src: str, dst: str) -> None:
         """Atomically publish src at dst without replacing an existing target."""
@@ -4425,7 +4503,9 @@ class Controller:
 
     @classmethod
     def __write_collision_claim_sidecar(
-            cls, sidecar_path: str, original_basename: str, path_pair_id: Optional[str]) -> None:
+            cls, sidecar_path: str, original_basename: str, path_pair_id: Optional[str],
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         if not cls.__collision_claim_basename_is_valid(original_basename) or \
                 not cls.__collision_claim_owner_is_valid(path_pair_id):
             raise OSError(errno.EINVAL, "invalid collision claim ownership")
@@ -4436,8 +4516,9 @@ class Controller:
         if len(payload) > _COLLISION_CLAIM_SIDECAR_MAX_BYTES:
             raise OSError(errno.E2BIG, "collision claim ownership metadata is too large")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        descriptor = os.open(sidecar_path, flags, 0o600)
+        descriptor: Optional[int] = None
         try:
+            descriptor = os.open(sidecar_path, flags, 0o600)
             offset = 0
             while offset < len(payload):
                 written = os.write(descriptor, payload[offset:])
@@ -4445,19 +4526,42 @@ class Controller:
                     raise OSError(errno.EIO, "failed to write collision claim ownership metadata")
                 offset += written
             os.fsync(descriptor)
+        except BaseException:
+            # The ownership sidecar may now be present but malformed or only
+            # partly durable. Its subsequent recovery is deliberately
+            # conservative, so this move cannot claim a proven no-mutation
+            # outcome.
+            if mutation_tracker is not None and descriptor is not None:
+                mutation_tracker.uncertain()
+            raise
         finally:
-            os.close(descriptor)
-        cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+            if descriptor is not None:
+                os.close(descriptor)
+        try:
+            cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+        except BaseException:
+            if mutation_tracker is not None and descriptor is not None:
+                mutation_tracker.uncertain()
+            raise
 
     @classmethod
-    def __remove_collision_claim_sidecar(cls, sidecar_path: Optional[str]) -> None:
+    def __remove_collision_claim_sidecar(
+            cls, sidecar_path: Optional[str], mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         if sidecar_path is None:
             return
         try:
             os.unlink(sidecar_path)
         except FileNotFoundError:
             return
-        cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+        try:
+            cls.__sync_directory_if_supported(os.path.dirname(sidecar_path))
+        except BaseException:
+            # ``unlink`` has changed the durable recovery record; a later
+            # sync failure cannot prove an untouched collision attempt.
+            if mutation_tracker is not None:
+                mutation_tracker.uncertain()
+            raise
 
     def __cleanup_empty_retired_source_claims(self, source_parent: str) -> None:
         """Remove only empty legacy publication claims left after final publish.
@@ -4533,7 +4637,8 @@ class Controller:
 
     def __recover_collision_claims(
             self, source_directory: str, path_pair_id: Optional[str],
-            active_claimed_path: Optional[str] = None) -> tuple[set[str], bool]:
+            active_claimed_path: Optional[str] = None,
+            mutation_tracker: Optional[_MoveMutationTracker] = None) -> tuple[set[str], bool]:
         """Recover only complete, owned private claims before merge traversal.
 
         A claim name alone is deliberately never enough to infer a public name.
@@ -4593,14 +4698,18 @@ class Controller:
                 continue
             try:
                 self.__rename_no_replace(claim, original)
+                if mutation_tracker is not None:
+                    mutation_tracker.mutated()
                 self.__sync_directory_if_supported(source_directory)
-                self.__remove_collision_claim_sidecar(sidecar)
+                self.__remove_collision_claim_sidecar(sidecar, mutation_tracker)
             except OSError as error:
                 self.logger.warning("Retaining private collision claim '%s': restore failed: %s", claim, error)
                 artifacts.update((claim, cast(str, sidecar)))
         return artifacts, False
 
-    def __claim_collision_source(self, source: str) -> str:
+    def __claim_collision_source(
+            self, source: str, mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> str:
         source_parent = os.path.dirname(source)
         for _ in range(16):
             claimed_path = os.path.join(source_parent, ".seedsync-retire-" + secrets.token_hex(24))
@@ -4611,17 +4720,22 @@ class Controller:
             raise OSError(errno.EEXIST, "could not reserve private collision claim", source)
         self.__write_collision_claim_sidecar(
             sidecar_path, os.path.basename(source), getattr(self, "_Controller__collision_claim_path_pair_id", None),
+            mutation_tracker,
         )
         try:
             self.__rename_no_replace(source, claimed_path)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
             self.__sync_directory_if_supported(source_parent)
         except Exception:
-            self.__remove_collision_claim_sidecar(sidecar_path)
+            self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
             raise
         return claimed_path
 
     def __claim_and_compare_collision_leaf(
-            self, source: str, destination: str, path_pair_id: Optional[str] = None) -> str:
+            self, source: str, destination: str, path_pair_id: Optional[str] = None,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> str:
         if not hasattr(self, "_Controller__collision_compare_lock"):
             self.__collision_compare_lock = Lock()
             self.__collision_compare_executor = None
@@ -4635,7 +4749,7 @@ class Controller:
                 return "pending"
             self.__collision_claim_path_pair_id = path_pair_id
             try:
-                claimed_source = self.__claim_collision_source(source)
+                claimed_source = self.__claim_collision_source(source, mutation_tracker)
             finally:
                 self.__collision_claim_path_pair_id = None
             sidecar_path = self.__collision_claim_sidecar_path(claimed_source)
@@ -4645,8 +4759,10 @@ class Controller:
             except OSError:
                 try:
                     self.__rename_no_replace(claimed_source, source)
+                    if mutation_tracker is not None:
+                        mutation_tracker.mutated()
                     self.__sync_directory_if_supported(os.path.dirname(source))
-                    self.__remove_collision_claim_sidecar(sidecar_path)
+                    self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
                 except OSError as restore_error:
                     self.logger.error(
                         "Retained collision claim '%s' for '%s' versus '%s': %s",
@@ -4725,7 +4841,10 @@ class Controller:
                     claimed_source, original_source, destination, restore_error,
                 )
 
-    def __settle_collision_claim_for_tree(self, source_root: str, destination_root: str) -> Optional[str]:
+    def __settle_collision_claim_for_tree(
+            self, source_root: str, destination_root: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> Optional[str]:
         claim = getattr(self, "_Controller__collision_compare_claim", None)
         if claim is None:
             return None
@@ -4755,8 +4874,10 @@ class Controller:
                         outcome = "changed"
                     else:
                         os.unlink(claimed_source)
+                        if mutation_tracker is not None:
+                            mutation_tracker.mutated()
                         self.__sync_directory_if_supported(os.path.dirname(claimed_source))
-                        self.__remove_collision_claim_sidecar(sidecar_path)
+                        self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
                         self.__collision_compare_claim = None
                         self.__collision_compare_key = None
                         self.__collision_compare_result = None
@@ -4765,8 +4886,10 @@ class Controller:
                     outcome = "changed"
             try:
                 self.__rename_no_replace(claimed_source, original_source)
+                if mutation_tracker is not None:
+                    mutation_tracker.mutated()
                 self.__sync_directory_if_supported(os.path.dirname(original_source))
-                self.__remove_collision_claim_sidecar(sidecar_path)
+                self.__remove_collision_claim_sidecar(sidecar_path, mutation_tracker)
                 restored_signature = self.__collision_signature(original_source)
                 current_destination_signature = self.__collision_signature(destination)
                 if outcome in ("mismatch", "error", "over_budget"):
@@ -5135,13 +5258,18 @@ class Controller:
             pass
 
     @classmethod
-    def __publish_regular_file_exclusively(cls, temporary_path: str, dst: str) -> None:
+    def __publish_regular_file_exclusively(
+            cls, temporary_path: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         """Copy a temporary regular file with O_EXCL and verify its identity."""
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_BINARY"):
             flags |= os.O_BINARY
         fd = os.open(dst, flags, 0o600)
+        if mutation_tracker is not None:
+            mutation_tracker.mutated()
         published_stat = os.fstat(fd)
         try:
             with open(temporary_path, "rb") as source, os.fdopen(fd, "wb", closefd=False) as target:
@@ -5164,7 +5292,10 @@ class Controller:
             os.close(fd)
 
     @classmethod
-    def __publish_temporary_directory(cls, temporary_path: str, dst: str) -> None:
+    def __publish_temporary_directory(
+            cls, temporary_path: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         """Materialize a private directory through exclusive entries.
 
         No portable system call atomically renames a directory without replacing
@@ -5176,6 +5307,8 @@ class Controller:
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         temporary_stat = os.lstat(temporary_path)
         os.mkdir(dst, 0o700)
+        if mutation_tracker is not None:
+            mutation_tracker.mutated()
         published_stat = os.lstat(dst)
         directory_fd: Optional[int] = None
         try:
@@ -5189,10 +5322,12 @@ class Controller:
                     destination_child = os.path.join(dst, entry.name)
                     try:
                         cls.__rename_no_replace(entry.path, destination_child)
+                        if mutation_tracker is not None:
+                            mutation_tracker.mutated()
                     except OSError as error:
                         if not cls.__is_no_replace_capability_error(error):
                             raise
-                        cls.__publish_temporary_no_replace(entry.path, destination_child)
+                        cls.__publish_temporary_no_replace(entry.path, destination_child, mutation_tracker)
                     if not cls.__same_path_identity(dst, published_stat):
                         raise OSError(errno.EAGAIN, "final directory changed during publication", dst)
             if directory_fd is not None:
@@ -5213,16 +5348,21 @@ class Controller:
                 os.close(directory_fd)
 
     @classmethod
-    def __publish_temporary_no_replace(cls, temporary_path: str, dst: str) -> None:
+    def __publish_temporary_no_replace(
+            cls, temporary_path: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         """Publish a destination-side temporary object without clobbering dst."""
         temporary_stat = os.lstat(temporary_path)
         expected_manifest = cls.__publication_tree_manifest(temporary_path)
         if stat.S_ISDIR(temporary_stat.st_mode):
-            cls.__publish_temporary_directory(temporary_path, dst)
+            cls.__publish_temporary_directory(temporary_path, dst, mutation_tracker)
             return
         if stat.S_ISLNK(temporary_stat.st_mode):
             link_target = os.readlink(temporary_path)
             os.symlink(link_target, dst)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
             published_stat = os.lstat(dst)
             try:
                 if not stat.S_ISLNK(published_stat.st_mode) or os.readlink(dst) != link_target:
@@ -5242,6 +5382,8 @@ class Controller:
             raise OSError(errno.ENOTSUP, "unsupported temporary publication type", temporary_path)
         try:
             os.link(temporary_path, dst, follow_symlinks=False)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
             if not cls.__same_path_identity(dst, temporary_stat):
                 raise OSError(errno.EAGAIN, "final target changed during publication", dst)
             cls.__sync_directory_if_supported(os.path.dirname(dst))
@@ -5252,11 +5394,14 @@ class Controller:
         except OSError as error:
             if not cls.__can_copy_instead_of_link(error):
                 raise
-            cls.__publish_regular_file_exclusively(temporary_path, dst)
+            cls.__publish_regular_file_exclusively(temporary_path, dst, mutation_tracker)
         os.unlink(temporary_path)
 
     @classmethod
-    def __publish_staging_no_replace(cls, src: str, dst: str) -> None:
+    def __publish_staging_no_replace(
+            cls, src: str, dst: str,
+            mutation_tracker: Optional[_MoveMutationTracker] = None,
+    ) -> None:
         """Publish staging content once; preserve src on collision or failure.
 
         Native no-replace rename remains the fast path.  Filesystems such as
@@ -5268,6 +5413,8 @@ class Controller:
         source_manifest = cls.__publication_tree_manifest(src)
         try:
             cls.__rename_no_replace(src, dst)
+            if mutation_tracker is not None:
+                mutation_tracker.mutated()
             if os.path.lexists(src) or not os.path.lexists(dst):
                 raise OSError(errno.EIO, "native publication did not reach the expected final state", dst)
             published_stat = os.lstat(dst)
@@ -5286,6 +5433,10 @@ class Controller:
                 raise
 
         destination_parent = os.path.dirname(dst)
+        if mutation_tracker is not None:
+            # Capability fallback has begun destination-side private work. A
+            # later failure cannot prove the move was untouched.
+            mutation_tracker.uncertain()
         source_stat = os.lstat(src)
         source_snapshot = cls.__source_tree_snapshot(src)
         source_claim_snapshot = cls.__source_tree_snapshot(src, ignore_root_ctime=True)
@@ -5297,6 +5448,8 @@ class Controller:
             temporary_manifest = cls.__publication_tree_manifest(temporary_path)
             try:
                 cls.__rename_no_replace(temporary_path, dst)
+                if mutation_tracker is not None:
+                    mutation_tracker.mutated()
                 if not os.path.lexists(dst) or os.path.lexists(temporary_path):
                     raise OSError(errno.EIO, "temporary publication did not reach the expected final state", dst)
                 published_stat = os.lstat(dst)
@@ -5308,7 +5461,7 @@ class Controller:
             except OSError as error:
                 if not cls.__is_no_replace_capability_error(error):
                     raise
-                cls.__publish_temporary_no_replace(temporary_path, dst)
+                cls.__publish_temporary_no_replace(temporary_path, dst, mutation_tracker)
             temporary_path = None
             if cls.__source_tree_snapshot(src) != source_snapshot:
                 raise OSError(errno.EAGAIN, "staging source changed during publication", src)

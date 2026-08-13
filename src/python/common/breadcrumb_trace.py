@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import multiprocessing
+import os
 import queue
 import time
 from collections import deque
@@ -12,6 +14,27 @@ from threading import Lock
 from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Protocol, cast
 
 from .redaction import redact_sensitive_text
+
+
+# Kept only in this process so correlations never disclose canonical runtime
+# identities.  Breadcrumbs are diagnostic hints, not a durable identity map.
+_OPAQUE_TRACE_CORRELATION_KEY = os.urandom(16)
+
+
+def opaque_trace_correlation(identity: object) -> str:
+    """Return a short process-local opaque correlation for a canonical identity."""
+    if not isinstance(identity, str):
+        return "unknown"
+    return hashlib.blake2s(
+        identity.encode("utf-8"), key=_OPAQUE_TRACE_CORRELATION_KEY, digest_size=8,
+    ).hexdigest()
+
+
+def trace_session_digest(session_token: object) -> str:
+    """Return a non-identifying digest for a scanner session token."""
+    if not isinstance(session_token, str):
+        return "unknown"
+    return hashlib.sha256(session_token.encode("utf-8")).hexdigest()[:12]
 
 
 class _EnabledGate(Protocol):

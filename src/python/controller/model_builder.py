@@ -15,7 +15,7 @@ import time
 from system import SystemFile
 from lftp import LftpJobStatus
 from model import ModelFile, Model, ModelError
-from common.breadcrumb_trace import BreadcrumbTraceEmitter
+from common.breadcrumb_trace import BreadcrumbTraceEmitter, opaque_trace_correlation
 from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_CROSS_PAIR_TOUCH,
     COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
@@ -399,6 +399,55 @@ class ModelBuilder:
         """Attach the shared opt-in bounded breadcrumb emitter."""
         self.__stop_resume_trace_breadcrumb = emitter
 
+    def record_lifecycle_candidate_publication(self, candidate: Model, build_kind: str) -> set[str]:
+        """Trace global-marker subjects before a candidate reaches the live model."""
+        if not self.__is_stop_resume_trace_enabled():
+            return set()
+        subject_ids = set(self.__downloaded_files or set()) | set(self.__final_move_succeeded_files)
+        for file_id in tuple(subject_ids):
+            try:
+                candidate_file = candidate.get_file(file_id)
+            except ModelError:
+                self.__record_lifecycle_persist_breadcrumb_for_file_id("model_candidate", file_id, {
+                    "candidate_state": "absent",
+                    "build_kind": build_kind,
+                    "adoption_kind": "pending",
+                })
+                continue
+            self.__record_lifecycle_persist_breadcrumb("model_candidate", candidate_file, {
+                "candidate_state": self.__state_category(candidate_file),
+                "build_kind": build_kind,
+                "adoption_kind": "pending",
+            })
+        return subject_ids
+
+    def record_lifecycle_live_publication(
+            self, candidate: Model, live: Model, subject_ids: set[str],
+            build_kind: str, adoption_kind: str,
+    ) -> None:
+        """Trace the resulting live state for the same ephemeral candidate subjects."""
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        for file_id in subject_ids:
+            candidate_state = "absent"
+            live_state = "absent"
+            try:
+                candidate_file = candidate.get_file(file_id)
+                candidate_state = self.__state_category(candidate_file)
+            except ModelError:
+                pass
+            try:
+                live_file = live.get_file(file_id)
+                live_state = self.__state_category(live_file)
+            except ModelError:
+                pass
+            self.__record_lifecycle_persist_breadcrumb_for_file_id("model_live_publication", file_id, {
+                "candidate_state": candidate_state,
+                "live_state": live_state,
+                "build_kind": build_kind,
+                "adoption_kind": adoption_kind,
+            })
+
     def is_stop_resume_trace_enabled(self) -> bool:
         """Expose the current fail-closed diagnostic gate to stream emitters."""
         return self.__is_stop_resume_trace_enabled()
@@ -435,6 +484,44 @@ class ModelBuilder:
             self.__stop_resume_trace_last_signatures.clear()
         self.__stop_resume_trace_last_enabled = enabled
         return enabled
+
+    @staticmethod
+    def __state_category(model_file: ModelFile) -> str:
+        state = getattr(model_file, "state", None)
+        name = getattr(state, "name", None)
+        return name.lower() if isinstance(name, str) else "unknown"
+
+    def __record_lifecycle_persist_breadcrumb(
+            self, event: str, model_file: ModelFile, details: dict[str, object],
+    ) -> None:
+        """Emit deduplicated generic persist-arbitration evidence under the shared gate."""
+        self.__record_lifecycle_persist_breadcrumb_for_file_id(event, model_file.file_id, details)
+
+    def __record_lifecycle_persist_breadcrumb_for_file_id(
+            self, event: str, file_id: str, details: dict[str, object],
+    ) -> None:
+        """Retain a subject's opaque correlation even when a candidate lost it."""
+        if not self.__is_stop_resume_trace_enabled():
+            return
+        try:
+            signature = json.dumps(details, sort_keys=True, default=str)
+            signature_key = (file_id, event)
+            if self.__stop_resume_trace_last_signatures.get(signature_key) == signature:
+                self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+                return
+            self.__stop_resume_trace_last_signatures[signature_key] = signature
+            self.__stop_resume_trace_last_signatures.move_to_end(signature_key)
+            while len(self.__stop_resume_trace_last_signatures) > self.__STOP_RESUME_TRACE_SIGNATURE_CACHE_SIZE:
+                self.__stop_resume_trace_last_signatures.popitem(last=False)
+            breadcrumb = self.__stop_resume_trace_breadcrumb
+            if breadcrumb is not None:
+                breadcrumb.record(
+                    "model_builder", event, {**details, "monotonic_ms": int(time.monotonic_ns() / 1_000_000)},
+                    stage="persist_authority", event_type="diagnostic",
+                    corr_id=opaque_trace_correlation(file_id), trace_scope="flow",
+                )
+        except Exception:
+            self.logger.debug("Ignoring lifecycle persist breadcrumb failure", exc_info=True)
 
     def __is_target_archive_trace_enabled(self) -> bool:
         return self.__target_archive_trace_file_id is not None
@@ -3561,7 +3648,27 @@ class ModelBuilder:
 
     def __determine_state(self, model_file: ModelFile, local: Optional[SystemFile], incomplete_children: bool):
         model_file.final_move_succeeded = model_file.file_id in self.__final_move_succeeded_files
+        downloaded_marker_present = model_file.file_id in (self.__downloaded_files or set())
+        final_move_marker_present = model_file.file_id in self.__final_move_succeeded_files
+        lifecycle_subject = downloaded_marker_present or final_move_marker_present or \
+            model_file.state == ModelFile.State.DOWNLOADED
+        if lifecycle_subject:
+            self.__record_lifecycle_persist_breadcrumb("persist_authority_before", model_file, {
+                "local_present": local is not None,
+                "remote_present": self.__remote_file(model_file.file_id) is not None,
+                "local_size_present": model_file.local_size is not None,
+                "downloaded_marker_present": downloaded_marker_present,
+                "final_move_marker_present": final_move_marker_present,
+                "unknown_local": model_file.path_pair_id in self.__unknown_local_path_pair_ids,
+                "pre_state": self.__state_category(model_file),
+                "fence": "none",
+            })
         self.__check_persist_authority(model_file, incomplete_children)
+        if lifecycle_subject:
+            self.__record_lifecycle_persist_breadcrumb("persist_authority_after", model_file, {
+                "state_category": self.__state_category(model_file),
+                "fence": "none",
+            })
         self.__check_extracting(model_file)
 
         # next we check if root is Extracted
