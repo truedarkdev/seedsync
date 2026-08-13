@@ -24,7 +24,9 @@ from controller.extract import ExtractStatus
 from controller.validate import ValidateStatus
 from common.breadcrumb_trace import BreadcrumbTraceCollector
 from common.performance_diagnostics import (
-    COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY,
+    COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE,
+    COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
+    COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
     DURATION_MODEL_BUILDER_SET_ACTIVE_FILES,
     DURATION_MODEL_BUILDER_SET_LFTP_STATUSES,
@@ -169,7 +171,7 @@ class TestModelBuilder(unittest.TestCase):
         ))
         self.assertEqual(
             1,
-            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY],
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE],
         )
 
     def test_authoritative_pair_build_falls_back_for_cross_pair_local_root_arbitration(self):
@@ -231,6 +233,8 @@ class TestModelBuilder(unittest.TestCase):
         )
 
     def test_authoritative_pair_build_rejects_cross_pair_status_only_duplicate_basename(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(diagnostics)
         selected = SystemFile("release.bin", 10, False)
         selected.path_pair_id = "pair-a"
         self.model_builder.set_remote_files([selected])
@@ -244,8 +248,14 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
             "pair-a", [], [selected], set(),
         ))
+        self.assertEqual(
+            1,
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME],
+        )
 
     def test_authoritative_pair_build_rejects_cross_pair_active_only_duplicate_basename(self):
+        diagnostics = PerformanceDiagnosticsCollector(lambda: True)
+        self.model_builder.set_performance_diagnostics(diagnostics)
         selected = SystemFile("release.bin", 10, False)
         selected.path_pair_id = "pair-a"
         self.model_builder.set_remote_files([selected])
@@ -257,6 +267,10 @@ class TestModelBuilder(unittest.TestCase):
         self.assertIsNone(self.model_builder.build_authoritative_pair_roots(
             "pair-a", [], [selected], set(),
         ))
+        self.assertEqual(
+            1,
+            diagnostics.snapshot()["counters"][COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME],
+        )
 
     def test_authoritative_pair_build_retains_selected_recent_transfer_snapshot(self):
         remote = SystemFile("active.bin", 1000, False)

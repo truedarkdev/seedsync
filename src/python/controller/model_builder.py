@@ -21,7 +21,9 @@ from common.performance_diagnostics import (
     COUNTER_PAIR_SAFETY_REJECT_DIRTY_INPUT,
     COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER,
     COUNTER_PAIR_SAFETY_REJECT_LOCAL_ROOT_ARBITRATION,
-    COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY,
+    COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE,
+    COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME,
+    COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME,
     COUNTER_PAIR_SAFETY_REJECT_ORPHAN_ACTIVE,
     COUNTER_PAIR_SAFETY_REJECT_ORPHAN_STATUS,
     COUNTER_PAIR_SAFETY_REJECT_UNKNOWN_AUTHORITY,
@@ -2174,10 +2176,12 @@ class ModelBuilder:
                 return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_EXTRACTED_BARE_MARKER)
             # Any remaining global count belongs to another pair.  We never
             # assign a duplicate basename to a pair-local publication.
-            if self.__source_name_counts.get(name, 0) - old_names.get(name, 0) > 0 or \
-                    self.__status_only_name_counts.get(name, 0) > 0 or \
-                    self.__active_only_name_counts.get(name, 0) > 0:
-                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_NAME_AMBIGUITY)
+            if self.__source_name_counts.get(name, 0) - old_names.get(name, 0) > 0:
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_SOURCE_DUPLICATE)
+            if self.__status_only_name_counts.get(name, 0) > 0:
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_STATUS_ONLY_NAME)
+            if self.__active_only_name_counts.get(name, 0) > 0:
+                return self.__reject_pair_safety(COUNTER_PAIR_SAFETY_REJECT_ACTIVE_ONLY_NAME)
         # ``build_model`` applies a second, path-aware visibility arbitration:
         # a local-only root is hidden if a managed root shares its configured
         # local root path and basename, and local-only peers choose one winner.
