@@ -2672,6 +2672,20 @@ class ModelUpdater(_ControllerCoreAccess):
                 return authoritative_pair_build is None or \
                     candidate_pair_id(file_id) == authoritative_pair_build.path_pair_id
 
+            def candidate_has_actionable_unrelated_retry(file_id: str) -> bool:
+                """Keep a stale durable marker from invalidating a pair candidate.
+
+                Candidate composition reuses unrelated live roots, so real
+                retry work must return to the ordinary global lifecycle.  A
+                durable failure count by itself is not work: it can outlive
+                the root or its complete/collision source proof.  Reuse the
+                same source-authority predicate as the normal retry gate.
+                """
+                actionable_ids, _ = _filter_actionable_move_retry_ids(
+                    model_builder, [file_id],
+                )
+                return bool(actionable_ids)
+
             unrelated_candidate_lifecycle_work_deferred = False
 
             def defer_unrelated_candidate_lifecycle_work() -> None:
@@ -2911,7 +2925,8 @@ class ModelUpdater(_ControllerCoreAccess):
 
                 for file_id, count in persist.move_failure_counts.items():
                     if not candidate_lifecycle_allows(file_id):
-                        if 0 < count < controller._Controller__MAX_MOVE_FAILURES:
+                        if 0 < count < controller._Controller__MAX_MOVE_FAILURES and \
+                                candidate_has_actionable_unrelated_retry(file_id):
                             defer_unrelated_candidate_lifecycle_work()
                         continue
                     if count <= 0 or count >= controller._Controller__MAX_MOVE_FAILURES:
@@ -3090,7 +3105,9 @@ class ModelUpdater(_ControllerCoreAccess):
                     file_id = ModelFile.build_file_id(file_name, path_pair_id)
                     if not candidate_lifecycle_allows(file_id):
                         failure_count = persist.move_failure_counts.get(file_id, 0)
-                        if failure_count > 0 or file_id in controller._Controller__deferred_move_file_ids:
+                        if (failure_count > 0 or
+                                file_id in controller._Controller__deferred_move_file_ids) and \
+                                candidate_has_actionable_unrelated_retry(file_id):
                             defer_unrelated_candidate_lifecycle_work()
                         continue
                     if file_id in attempted_move_file_ids:
